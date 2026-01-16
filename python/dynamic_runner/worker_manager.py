@@ -1,5 +1,4 @@
 import logging
-import pickle
 import threading
 import time
 from datetime import datetime
@@ -7,7 +6,13 @@ from pathlib import Path
 
 from .binary_info import BinaryInfo
 from .models import ErrorType, ProcessingPhase, TaskResult, WorkerState
-from .task_handler import assign_binary_to_worker, parse_response, worker_completed
+from .task_handler import assign_binary_to_worker, worker_completed
+from .worker_communication import (
+    WorkerCommunicationError,
+    log_pickled_error,
+    receive_worker_messages,
+    send_worker_command,
+)
 from .worker_lifecycle import (
     check_worker_timeout,
     print_phase_status,
@@ -160,10 +165,9 @@ class WorkerManager:
                     if not self._assign_binary_to_worker(worker):
                         if not self.pending_binaries:
                             if allow_stop:
-                                try:
-                                    worker.socket.sendall(b"stop\n")
-                                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                                    crash_msg = f"[Worker {worker_id}] Socket error while sending stop, worker likely crashed: {e}"
+                                success, error = send_worker_command(worker, "stop")
+                                if not success:
+                                    crash_msg = f"[Worker {worker_id}] Socket error while sending stop, worker likely crashed: {error}"
                                     print(crash_msg)
                                     self.manager_logger.error(crash_msg)
                                     self._restart_worker(worker_id)
@@ -190,17 +194,19 @@ class WorkerManager:
 
                     print_phase_status(worker)
 
-                    try:
-                        worker.socket.setblocking(False)
-                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                        crash_msg = f"[Worker {worker_id}] Socket error, worker crashed: {e}"
+                    message = receive_worker_messages(worker)
+
+                    if not message.success:
+                        crash_msg = f"[Worker {worker_id}] {message.error_type.value}: {message.error_message}"
                         print(crash_msg)
                         self.manager_logger.error(crash_msg)
                         if on_failure_increment_failed:
                             with self.lock:
                                 self.stats["failed"] += 1
                         result = TaskResult(
-                            success=False, error_type=ErrorType.RECOVERABLE, error_message=f"Worker socket error: {e}"
+                            success=False,
+                            error_type=ErrorType.RECOVERABLE,
+                            error_message=message.error_message or "Worker communication error",
                         )
                         self._worker_completed(worker, result)
                         self._restart_worker(worker_id)
@@ -208,121 +214,61 @@ class WorkerManager:
                         active_workers.add(worker_id)
                         continue
 
-                    try:
-                        data = worker.socket.recv(1024)
-                        if data:
-                            responses = data.decode("utf-8").strip()
-                            responses = responses.split("\n")
-                            worker.last_keepalive = time.time()
-                            for response in responses:
-                                if response.startswith("error:pickle:"):
-                                    try:
-                                        pickled_data = response[13:].encode("latin-1")
-                                        error_info = pickle.loads(pickled_data)
-                                        error_msg = f"[Worker {worker_id}] Pickled error received:\n"
-                                        error_msg += f"  Exception Type: {error_info.get('type', 'Unknown')}\n"
-                                        error_msg += f"  Exception Message: {error_info.get('message', 'No message')}\n"
-                                        error_msg += f"  Traceback:\n{error_info.get('traceback', 'No traceback')}"
-                                        print(error_msg)
-                                        self.manager_logger.error(error_msg)
-                                        if on_failure_increment_failed:
-                                            with self.lock:
-                                                self.stats["failed"] += 1
-                                        result = TaskResult(
-                                            success=False,
-                                            error_type=ErrorType.NON_RECOVERABLE,
-                                            error_message=error_info.get("message", "Unknown error"),
-                                        )
-                                        self._worker_completed(worker, result)
-                                        self._restart_worker(worker_id)
-                                        worker = self.workers[worker_id]
-                                        active_workers.add(worker_id)
-                                        continue
-                                    except Exception as e:
-                                        unpickle_error = f"[Worker {worker_id}] Failed to unpickle error: {e}"
-                                        print(unpickle_error)
-                                        self.manager_logger.error(unpickle_error)
+                    if message.pickled_error_info:
+                        log_pickled_error(worker_id, message.pickled_error_info, self.manager_logger)
+                        if on_failure_increment_failed:
+                            with self.lock:
+                                self.stats["failed"] += 1
+                        result = TaskResult(
+                            success=False,
+                            error_type=ErrorType.NON_RECOVERABLE,
+                            error_message=message.pickled_error_info.get("message", "Unknown error"),
+                        )
+                        self._worker_completed(worker, result)
+                        self._restart_worker(worker_id)
+                        worker = self.workers[worker_id]
+                        active_workers.add(worker_id)
+                        continue
 
-                                parsed = parse_response(response)
-
-                                if isinstance(parsed, ProcessingPhase):
-                                    worker.phase = parsed
-                                    worker.phase_start_time = time.time()
-                                    worker.last_printed_minute = None
-                                elif isinstance(parsed, TaskResult):
-                                    if parsed.error_type == ErrorType.NON_RECOVERABLE:
-                                        # todo force kill worker after some extra time
-                                        self.manager_logger.error(
-                                            f"[Worker {worker_id}] Non-recoverable error, restarting"
-                                        )
-                                        self._worker_completed(worker, parsed)
-                                        self._restart_worker(worker_id)
-                                        worker = self.workers[worker_id]
-                                        active_workers.add(worker_id)
-                                    else:
-                                        if on_failure_increment_failed and not parsed.success:
-                                            with self.lock:
-                                                self.stats["failed"] += 1
-                                            giveup_msg = f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                                            print(giveup_msg)
-                                            self.manager_logger.warning(giveup_msg)
-                                        self._worker_completed(worker, parsed)
-                                        if not self._assign_binary_to_worker(worker):
-                                            if not self.pending_binaries:
-                                                if allow_stop:
-                                                    worker_log_path = self.log_dir / f"worker_{worker_id}.log"
-                                                    with open(worker_log_path, "a") as f:
-                                                        f.write(
-                                                            f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} stopping (no more tasks)\n"
-                                                        )
-                                                    self.manager_logger.info(
-                                                        f"[Worker {worker_id}] Stopping (no more tasks)"
+                    if message.parsed_responses:
+                        for parsed in message.parsed_responses:
+                            if isinstance(parsed, ProcessingPhase):
+                                worker.phase = parsed
+                                worker.phase_start_time = time.time()
+                                worker.last_printed_minute = None
+                            elif isinstance(parsed, TaskResult):
+                                if parsed.error_type == ErrorType.NON_RECOVERABLE:
+                                    self.manager_logger.error(f"[Worker {worker_id}] Non-recoverable error, restarting")
+                                    self._worker_completed(worker, parsed)
+                                    self._restart_worker(worker_id)
+                                    worker = self.workers[worker_id]
+                                    active_workers.add(worker_id)
+                                else:
+                                    if on_failure_increment_failed and not parsed.success:
+                                        with self.lock:
+                                            self.stats["failed"] += 1
+                                        giveup_msg = f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                                        print(giveup_msg)
+                                        self.manager_logger.warning(giveup_msg)
+                                    self._worker_completed(worker, parsed)
+                                    if not self._assign_binary_to_worker(worker):
+                                        if not self.pending_binaries:
+                                            if allow_stop:
+                                                worker_log_path = self.log_dir / f"worker_{worker_id}.log"
+                                                with open(worker_log_path, "a") as f:
+                                                    f.write(
+                                                        f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} stopping (no more tasks)\n"
                                                     )
-                                                    try:
-                                                        worker.socket.sendall(b"stop\n")
-                                                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                                                        socket_error_msg = (
-                                                            f"[Worker {worker_id}] Socket error while sending stop: {e}"
-                                                        )
-                                                        self.manager_logger.warning(socket_error_msg)
-                                                active_workers.remove(worker_id)
-                        elif not data:
-                            crash_msg = f"[Worker {worker_id}] Socket closed, worker crashed"
-                            print(crash_msg)
-                            self.manager_logger.error(crash_msg)
-                            if on_failure_increment_failed:
-                                with self.lock:
-                                    self.stats["failed"] += 1
-                            result = TaskResult(
-                                success=False, error_type=ErrorType.RECOVERABLE, error_message="Worker socket closed"
-                            )
-                            self._worker_completed(worker, result)
-                            self._restart_worker(worker_id)
-                            worker = self.workers[worker_id]
-                            active_workers.add(worker_id)
-                            continue
-                    except BlockingIOError:
-                        pass
-                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                        crash_msg = f"[Worker {worker_id}] Socket error during recv, worker crashed: {e}"
-                        print(crash_msg)
-                        self.manager_logger.error(crash_msg)
-                        if on_failure_increment_failed:
-                            with self.lock:
-                                self.stats["failed"] += 1
-                        result = TaskResult(
-                            success=False, error_type=ErrorType.RECOVERABLE, error_message=f"Worker socket error: {e}"
-                        )
-                        self._worker_completed(worker, result)
-                        self._restart_worker(worker_id)
-                        worker = self.workers[worker_id]
-                        active_workers.add(worker_id)
-                        continue
-                    finally:
-                        try:
-                            worker.socket.setblocking(True)
-                        except (BrokenPipeError, ConnectionResetError, OSError):
-                            pass
+                                                self.manager_logger.info(
+                                                    f"[Worker {worker_id}] Stopping (no more tasks)"
+                                                )
+                                                success, error = send_worker_command(worker, "stop")
+                                                if not success:
+                                                    socket_error_msg = (
+                                                        f"[Worker {worker_id}] Socket error while sending stop: {error}"
+                                                    )
+                                                    self.manager_logger.warning(socket_error_msg)
+                                            active_workers.remove(worker_id)
 
             if active_workers:
                 threading.Event().wait(0.1)
@@ -374,10 +320,7 @@ class WorkerManager:
                             f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} stopping for OOM processing\n"
                         )
                     self.manager_logger.info(f"[Worker {worker_id}] Stopping for OOM processing")
-                    try:
-                        self.workers[worker_id].socket.sendall(b"stop\n")
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        pass
+                    send_worker_command(self.workers[worker_id], "stop")
                     self.workers[worker_id].process.wait(timeout=5)
                     self.workers[worker_id].socket.close()
                 except Exception:
