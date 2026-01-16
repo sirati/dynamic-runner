@@ -1,4 +1,5 @@
 import logging
+import pickle
 import threading
 import time
 from datetime import datetime
@@ -159,7 +160,16 @@ class WorkerManager:
                     if not self._assign_binary_to_worker(worker):
                         if not self.pending_binaries:
                             if allow_stop:
-                                worker.socket.sendall(b"stop\n")
+                                try:
+                                    worker.socket.sendall(b"stop\n")
+                                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                                    crash_msg = f"[Worker {worker_id}] Socket error while sending stop, worker likely crashed: {e}"
+                                    print(crash_msg)
+                                    self.manager_logger.error(crash_msg)
+                                    self._restart_worker(worker_id)
+                                    worker = self.workers[worker_id]
+                                    active_workers.add(worker_id)
+                                    continue
                             active_workers.remove(worker_id)
                 else:
                     if check_worker_timeout(worker):
@@ -180,7 +190,24 @@ class WorkerManager:
 
                     print_phase_status(worker)
 
-                    worker.socket.setblocking(False)
+                    try:
+                        worker.socket.setblocking(False)
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        crash_msg = f"[Worker {worker_id}] Socket error, worker crashed: {e}"
+                        print(crash_msg)
+                        self.manager_logger.error(crash_msg)
+                        if on_failure_increment_failed:
+                            with self.lock:
+                                self.stats["failed"] += 1
+                        result = TaskResult(
+                            success=False, error_type=ErrorType.RECOVERABLE, error_message=f"Worker socket error: {e}"
+                        )
+                        self._worker_completed(worker, result)
+                        self._restart_worker(worker_id)
+                        worker = self.workers[worker_id]
+                        active_workers.add(worker_id)
+                        continue
+
                     try:
                         data = worker.socket.recv(1024)
                         if data:
@@ -188,6 +215,34 @@ class WorkerManager:
                             responses = responses.split("\n")
                             worker.last_keepalive = time.time()
                             for response in responses:
+                                if response.startswith("error:pickle:"):
+                                    try:
+                                        pickled_data = response[13:].encode("latin-1")
+                                        error_info = pickle.loads(pickled_data)
+                                        error_msg = f"[Worker {worker_id}] Pickled error received:\n"
+                                        error_msg += f"  Exception Type: {error_info.get('type', 'Unknown')}\n"
+                                        error_msg += f"  Exception Message: {error_info.get('message', 'No message')}\n"
+                                        error_msg += f"  Traceback:\n{error_info.get('traceback', 'No traceback')}"
+                                        print(error_msg)
+                                        self.manager_logger.error(error_msg)
+                                        if on_failure_increment_failed:
+                                            with self.lock:
+                                                self.stats["failed"] += 1
+                                        result = TaskResult(
+                                            success=False,
+                                            error_type=ErrorType.NON_RECOVERABLE,
+                                            error_message=error_info.get("message", "Unknown error"),
+                                        )
+                                        self._worker_completed(worker, result)
+                                        self._restart_worker(worker_id)
+                                        worker = self.workers[worker_id]
+                                        active_workers.add(worker_id)
+                                        continue
+                                    except Exception as e:
+                                        unpickle_error = f"[Worker {worker_id}] Failed to unpickle error: {e}"
+                                        print(unpickle_error)
+                                        self.manager_logger.error(unpickle_error)
+
                                 parsed = parse_response(response)
 
                                 if isinstance(parsed, ProcessingPhase):
@@ -223,12 +278,51 @@ class WorkerManager:
                                                     self.manager_logger.info(
                                                         f"[Worker {worker_id}] Stopping (no more tasks)"
                                                     )
-                                                    worker.socket.sendall(b"stop\n")
+                                                    try:
+                                                        worker.socket.sendall(b"stop\n")
+                                                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                                                        socket_error_msg = (
+                                                            f"[Worker {worker_id}] Socket error while sending stop: {e}"
+                                                        )
+                                                        self.manager_logger.warning(socket_error_msg)
                                                 active_workers.remove(worker_id)
+                        elif not data:
+                            crash_msg = f"[Worker {worker_id}] Socket closed, worker crashed"
+                            print(crash_msg)
+                            self.manager_logger.error(crash_msg)
+                            if on_failure_increment_failed:
+                                with self.lock:
+                                    self.stats["failed"] += 1
+                            result = TaskResult(
+                                success=False, error_type=ErrorType.RECOVERABLE, error_message="Worker socket closed"
+                            )
+                            self._worker_completed(worker, result)
+                            self._restart_worker(worker_id)
+                            worker = self.workers[worker_id]
+                            active_workers.add(worker_id)
+                            continue
                     except BlockingIOError:
                         pass
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        crash_msg = f"[Worker {worker_id}] Socket error during recv, worker crashed: {e}"
+                        print(crash_msg)
+                        self.manager_logger.error(crash_msg)
+                        if on_failure_increment_failed:
+                            with self.lock:
+                                self.stats["failed"] += 1
+                        result = TaskResult(
+                            success=False, error_type=ErrorType.RECOVERABLE, error_message=f"Worker socket error: {e}"
+                        )
+                        self._worker_completed(worker, result)
+                        self._restart_worker(worker_id)
+                        worker = self.workers[worker_id]
+                        active_workers.add(worker_id)
+                        continue
                     finally:
-                        worker.socket.setblocking(True)
+                        try:
+                            worker.socket.setblocking(True)
+                        except (BrokenPipeError, ConnectionResetError, OSError):
+                            pass
 
             if active_workers:
                 threading.Event().wait(0.1)
@@ -255,8 +349,8 @@ class WorkerManager:
         self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=False)
 
         if self.failed_tasks:
-            retry_msg = f"[*] Retrying {len(self.failed_tasks)} failed tasks"
-            print(f"\n{retry_msg}")
+            retry_msg = f"\n[*] Retrying {len(self.failed_tasks)} failed tasks"
+            print(retry_msg)
             self.manager_logger.info(retry_msg)
             retry_tasks = self.failed_tasks.copy()
             self.failed_tasks = []
@@ -268,8 +362,8 @@ class WorkerManager:
             self._process_worker_loop(active_workers, allow_stop=True, on_failure_increment_failed=True)
 
         if self.oom_tasks:
-            oom_msg = f"[*] Processing {len(self.oom_tasks)} OOM tasks with single worker"
-            print(f"\n{oom_msg}")
+            oom_msg = f"\n[*] Processing {len(self.oom_tasks)} OOM tasks with single worker"
+            print(oom_msg)
             self.manager_logger.info(oom_msg)
 
             for worker_id in range(1, self.num_workers):
@@ -280,10 +374,13 @@ class WorkerManager:
                             f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} stopping for OOM processing\n"
                         )
                     self.manager_logger.info(f"[Worker {worker_id}] Stopping for OOM processing")
-                    self.workers[worker_id].socket.sendall(b"stop\n")
+                    try:
+                        self.workers[worker_id].socket.sendall(b"stop\n")
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
                     self.workers[worker_id].process.wait(timeout=5)
                     self.workers[worker_id].socket.close()
-                except:
+                except Exception:
                     pass
 
             for oom_task in self.oom_tasks:
