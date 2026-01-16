@@ -87,8 +87,6 @@ class WorkerManager:
 
         self.manager_logger.info(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
 
-        if self.print_pid:
-            print(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
         return worker
 
     def _restart_worker(self, worker_id: int) -> None:
@@ -113,8 +111,6 @@ class WorkerManager:
             f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid} (old PID: {old_worker.process.pid})"
         )
 
-        if self.print_pid:
-            print(f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid}")
         with self.lock:
             self.workers[worker_id] = new_worker
 
@@ -125,9 +121,13 @@ class WorkerManager:
             self.available_memory,
             self.source_dir,
             self.lock,
+            self.manager_logger,
         )
         if assigned:
             self.available_memory = new_memory
+            self.manager_logger.info(
+                f"[Worker {worker.worker_id}] Assigned: {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+            )
         return assigned
 
     def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
@@ -138,6 +138,7 @@ class WorkerManager:
             self.failed_tasks,
             self.stats,
             self.lock,
+            self.manager_logger,
         )
         self.available_memory += released
 
@@ -158,7 +159,6 @@ class WorkerManager:
                                 success, error = send_worker_command(worker, "stop")
                                 if not success:
                                     crash_msg = f"[Worker {worker_id}] Socket error while sending stop, worker likely crashed: {error}"
-                                    print(crash_msg)
                                     self.manager_logger.error(crash_msg)
                                     self._restart_worker(worker_id)
                                     worker = self.workers[worker_id]
@@ -168,7 +168,6 @@ class WorkerManager:
                 else:
                     if check_worker_timeout(worker):
                         timeout_msg = f"[Timeout] Worker {worker_id} timed out - {worker.current_binary.path.name}"
-                        print(timeout_msg)
                         self.manager_logger.warning(timeout_msg)
                         if on_failure_increment_failed:
                             with self.lock:
@@ -182,13 +181,12 @@ class WorkerManager:
                         active_workers.add(worker_id)
                         continue
 
-                    print_phase_status(worker)
+                    print_phase_status(worker, self.manager_logger)
 
                     message = receive_worker_messages(worker)
 
                     if not message.success:
                         crash_msg = f"[Worker {worker_id}] {message.error_type.value}: {message.error_message}"
-                        print(crash_msg)
                         self.manager_logger.error(crash_msg)
                         if on_failure_increment_failed:
                             with self.lock:
@@ -226,6 +224,9 @@ class WorkerManager:
                                 worker.phase = parsed
                                 worker.phase_start_time = time.time()
                                 worker.last_printed_minute = None
+                                self.manager_logger.info(
+                                    f"[Worker {worker_id}] Phase: {parsed.value} - {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                                )
                             elif isinstance(parsed, TaskResult):
                                 if parsed.error_type == ErrorType.NON_RECOVERABLE:
                                     self.manager_logger.error(f"[Worker {worker_id}] Non-recoverable error, restarting")
@@ -238,7 +239,6 @@ class WorkerManager:
                                         with self.lock:
                                             self.stats["failed"] += 1
                                         giveup_msg = f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                                        print(giveup_msg)
                                         self.manager_logger.warning(giveup_msg)
                                     self._worker_completed(worker, parsed)
                                     if not self._assign_binary_to_worker(worker):
@@ -272,8 +272,6 @@ class WorkerManager:
 
         start_msg = f"Starting {self.num_workers} workers with {self.max_memory / (1024**3):.2f}GB memory limit"
         process_msg = f"Processing {self.stats['total']} binaries"
-        print(start_msg)
-        print(process_msg)
         self.manager_logger.info(start_msg)
         self.manager_logger.info(process_msg)
 
@@ -285,8 +283,7 @@ class WorkerManager:
         self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=False)
 
         if self.failed_tasks:
-            retry_msg = f"\n[*] Retrying {len(self.failed_tasks)} failed tasks"
-            print(retry_msg)
+            retry_msg = f"[*] Retrying {len(self.failed_tasks)} failed tasks"
             self.manager_logger.info(retry_msg)
             retry_tasks = self.failed_tasks.copy()
             self.failed_tasks = []
@@ -298,8 +295,7 @@ class WorkerManager:
             self._process_worker_loop(active_workers, allow_stop=True, on_failure_increment_failed=True)
 
         if self.oom_tasks:
-            oom_msg = f"\n[*] Processing {len(self.oom_tasks)} OOM tasks with single worker"
-            print(oom_msg)
+            oom_msg = f"[*] Processing {len(self.oom_tasks)} OOM tasks with single worker"
             self.manager_logger.info(oom_msg)
 
             for worker_id in range(1, self.num_workers):
@@ -338,5 +334,4 @@ class WorkerManager:
                 pass
 
         final_msg = f"[*] Completed: {self.stats['completed']}/{self.stats['total']}, Failed: {self.stats['failed']}/{self.stats['total']}"
-        print(f"\n{final_msg}")
         self.manager_logger.info(final_msg)

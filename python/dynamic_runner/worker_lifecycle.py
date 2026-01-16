@@ -32,21 +32,22 @@ def start_worker(
         str(output_dir),
         "--platform",
         platform_arg,
-        "--log_file",
+        "--log-file",
         str(worker_log_path),
     ]
 
     if skip_existing:
         cmd.append("--skip_existing")
 
-    process = subprocess.Popen(
-        cmd,
-        pass_fds=[child_fd],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
+    stderr_log_path = worker_log_path.parent / f"worker_{worker_id}_stderr.log"
+    with open(stderr_log_path, "a") as stderr_file:
+        process = subprocess.Popen(
+            cmd,
+            pass_fds=[child_fd],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
 
     child_sock.close()
 
@@ -74,7 +75,6 @@ def restart_worker(
     except:
         pass
 
-    print(f"[*] Restarting worker {worker.worker_id}")
     return start_worker(
         worker.worker_id,
         source_dir,
@@ -93,8 +93,8 @@ def check_worker_timeout(worker: WorkerState) -> bool:
     return False
 
 
-def print_phase_status(worker: WorkerState) -> None:
-    """Print status message for long-running phases."""
+def print_phase_status(worker: WorkerState, logger) -> None:
+    """Log status message for long-running phases."""
     if worker.phase in [ProcessingPhase.PHASE_1, ProcessingPhase.PHASE_2] and worker.phase_start_time:
         elapsed = time.time() - worker.phase_start_time
         if elapsed >= 60:
@@ -102,6 +102,6 @@ def print_phase_status(worker: WorkerState) -> None:
             if minutes in [1, 5, 10, 30, 60] or (minutes > 60 and minutes % 60 == 0):
                 if worker.last_printed_minute != minutes:
                     worker.last_printed_minute = minutes
-                    print(
+                    logger.info(
                         f"[Worker {worker.worker_id}] Still in {worker.phase.value}, {minutes} minute(s) elapsed - {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
                     )

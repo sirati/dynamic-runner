@@ -132,6 +132,5 @@ def log_pickled_error(worker_id: int, error_info: dict, logger: logging.Logger) 
     error_msg += f"  Exception Type: {error_info.get('type', 'Unknown')}\n"
     error_msg += f"  Exception Message: {error_info.get('message', 'No message')}\n"
     error_msg += f"  Traceback:\n{error_info.get('traceback', 'No traceback')}"
-    print(error_msg)
     logger.error(error_msg)
     return error_msg

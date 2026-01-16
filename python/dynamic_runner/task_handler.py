@@ -12,6 +12,7 @@ def assign_binary_to_worker(
     available_memory: int,
     source_dir: Path,
     lock: threading.Lock,
+    logger=None,
 ) -> tuple[bool, int]:
     """Try to assign a binary to the worker. Returns (assigned, new_available_memory)."""
     with lock:
@@ -46,6 +47,7 @@ def worker_completed(
     failed_tasks: list[FailedTask],
     stats: dict[str, int],
     lock: threading.Lock,
+    logger=None,
 ) -> int:
     """Mark worker as completed and release memory. Returns released memory amount."""
     with lock:
@@ -56,10 +58,12 @@ def worker_completed(
                 status = f"[{stats['completed']}/{stats['total']}] Completed: {worker.current_binary.path.name}"
                 # if result.warnings > 0 or result.filtered > 0:
                 status += f" (warnings: {result.warnings}, filtered: {result.filtered})"
-                print(status)
+                if logger:
+                    logger.info(status)
             else:
                 if result.error_type == ErrorType.OUT_OF_MEMORY:
-                    print(f"[OOM] {worker.current_binary.path.name}")
+                    if logger:
+                        logger.warning(f"[OOM] {worker.current_binary.path.name}")
                     oom_tasks.append(
                         FailedTask(
                             binary=worker.current_binary,
@@ -68,7 +72,8 @@ def worker_completed(
                         )
                     )
                 elif result.error_type == ErrorType.NON_RECOVERABLE:
-                    print(f"[Worker crashed] {worker.current_binary.path.name}")
+                    if logger:
+                        logger.error(f"[Worker crashed] {worker.current_binary.path.name}")
                     stats["failed"] += 1
                     released_memory = worker.estimated_memory
                     worker.current_binary = None
@@ -78,7 +83,8 @@ def worker_completed(
                     worker.last_keepalive = None
                     return released_memory
                 else:
-                    print(f"[Errored] {worker.current_binary.path.name}")
+                    if logger:
+                        logger.warning(f"[Errored] {worker.current_binary.path.name}")
                     failed_tasks.append(
                         FailedTask(
                             binary=worker.current_binary,
