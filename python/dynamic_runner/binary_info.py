@@ -47,6 +47,7 @@ def build_field_regexes(
     opt_levels: list[str] | None = None,
     version_regex: str | None = None,
     opt_regex: str | None = None,
+    name_regex: str | None = None,
 ) -> FieldRegexes:
     """Build regex patterns for each field based on provided constraints."""
 
@@ -79,13 +80,15 @@ def build_field_regexes(
         opt_level_pattern = r"O([0123s])"
         opt_level_transform = "O"
 
+    binary_name_pattern = name_regex if name_regex else r".+"
+
     return FieldRegexes(
         platform=platform_regex,
         compiler=compiler_regex,
         version=version_pattern,
         opt_level=opt_level_pattern,
         opt_level_transform=opt_level_transform,
-        binary_name=r".+",
+        binary_name=binary_name_pattern,
     )
 
 

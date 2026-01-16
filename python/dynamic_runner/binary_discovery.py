@@ -15,6 +15,7 @@ def find_matching_binaries(
     format_string: str = "platform-compiler-version-optimisationlevel_binaryname",
     version_regex: str | None = None,
     opt_regex: str | None = None,
+    name_regex: str | None = None,
 ) -> list[BinaryInfo]:
     """Find all binaries matching the filter criteria."""
 
@@ -25,6 +26,7 @@ def find_matching_binaries(
         opt_levels=opt_levels,
         version_regex=version_regex,
         opt_regex=opt_regex,
+        name_regex=name_regex,
     )
 
     normalized_opt_levels = None

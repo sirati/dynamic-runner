@@ -88,7 +88,23 @@ def main():
         help="Custom regex for matching optimization level field. Default: [oO]([0123s])",
     )
 
+    parser.add_argument(
+        "--name-regex",
+        type=str,
+        default=None,
+        help="Custom regex for matching binary name field.",
+    )
+
+    parser.add_argument(
+        "--debugs",
+        action="store_true",
+        help="Debug mode: only process binaries with name 'minigzipsh' (sets --name-regex to 'minigzipsh')",
+    )
+
     args = parser.parse_args()
+
+    if args.debugs:
+        args.name_regex = "minigzipsh"
 
     if args.compiler_versions and args.version_regex:
         parser.error("Cannot specify both --compiler-versions and --version-regex")
@@ -149,6 +165,7 @@ def main():
         args.file_format,
         args.version_regex,
         args.opt_regex,
+        args.name_regex,
     )
 
     print(f"Found {len(binaries)} matching binaries")
