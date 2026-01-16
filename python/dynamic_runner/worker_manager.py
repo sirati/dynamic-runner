@@ -85,11 +85,6 @@ class WorkerManager:
             worker_log_path,
         )
 
-        with open(worker_log_path, "a") as f:
-            f.write(
-                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} started with PID {worker.process.pid}\n"
-            )
-
         self.manager_logger.info(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
 
         if self.print_pid:
@@ -113,11 +108,6 @@ class WorkerManager:
             self.skip_existing,
             worker_log_path,
         )
-
-        with open(worker_log_path, "a") as f:
-            f.write(
-                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} restarted with new PID {new_worker.process.pid}\n"
-            )
 
         self.manager_logger.info(
             f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid} (old PID: {old_worker.process.pid})"
