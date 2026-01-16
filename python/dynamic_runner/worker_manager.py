@@ -34,6 +34,7 @@ class WorkerManager:
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
+        self.reserved_memory = num_workers * 300 * 1024 * 1024
         self.source_dir = source_dir
         self.output_dir = output_dir
         self.platform_arg = platform_arg
@@ -59,22 +60,25 @@ class WorkerManager:
 
         file_handler = logging.FileHandler(manager_log_path, mode="a")
         file_handler.setLevel(logging.INFO)
-        formatter = logging.Formatter(
+        file_formatter = logging.Formatter(
             "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
         )
-        file_handler.setFormatter(formatter)
+        file_handler.setFormatter(file_formatter)
         self.manager_logger.addHandler(file_handler)
 
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(formatter)
+        console_formatter = logging.Formatter("%(levelname)s %(asctime)s | %(name)s %(message)s", datefmt="%H:%M")
+        console_handler.setFormatter(console_formatter)
         self.manager_logger.addHandler(console_handler)
 
     def _start_worker(self, worker_id: int) -> WorkerState:
         worker_log_path = self.log_dir / f"worker_{worker_id}.log"
 
         with open(worker_log_path, "a") as f:
-            f.write(f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Manager: Worker {worker_id} starting\n")
+            f.write(
+                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Manager: Worker {worker_id} starting\n"
+            )
 
         worker = start_worker(
             worker_id,
@@ -119,6 +123,7 @@ class WorkerManager:
             worker,
             self.pending_binaries,
             self.available_memory,
+            self.reserved_memory,
             self.source_dir,
             self.lock,
             self.manager_logger,

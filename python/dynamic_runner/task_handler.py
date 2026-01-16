@@ -10,6 +10,7 @@ def assign_binary_to_worker(
     worker: WorkerState,
     pending_binaries: list[BinaryInfo],
     available_memory: int,
+    reserved_memory: int,
     source_dir: Path,
     lock: threading.Lock,
     logger=None,
@@ -21,7 +22,7 @@ def assign_binary_to_worker(
         for i, binary in enumerate(pending_binaries):
             estimated = estimate_memory(binary.size)
 
-            if available_memory - estimated >= 0:
+            if available_memory - estimated >= reserved_memory:
                 pending_binaries.pop(i)
                 worker.current_binary = binary
                 worker.estimated_memory = estimated
