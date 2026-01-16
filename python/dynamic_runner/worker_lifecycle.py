@@ -22,7 +22,7 @@ def start_worker(
     cmd = [
         sys.executable,
         "-m",
-        "tokenizer.low_level",
+        "tokenizer",
         "--dynamic_queue",
         str(child_fd),
         "--source",
