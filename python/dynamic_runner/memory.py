@@ -1,13 +1,29 @@
 import os
 import subprocess
-
+import math
 
 def estimate_memory(binary_size: int) -> int:
-    """Estimate memory consumption: 100MB + 10*binary_size + binary_size^2 / 100MB."""
-    base = 100 * 1024 * 1024  # 100MB
-    linear = 10 * binary_size
-    quadratic = (binary_size * binary_size) // (100 * 1024 * 1024)
-    return base + linear + quadratic
+    """
+    Estimate memory consumption using a power law model.
+    
+    Model: RAM (MiB) = 301.65 * file_size^0.915 + 84.02
+    
+    Args:
+        binary_size: File size in bytes
+    
+    Returns:
+        Estimated RAM usage in bytes (rounded up)
+    """
+    mb = binary_size / 1024 / 1024  # Convert to MiB
+    
+    # Power law coefficients (MiB units)
+    a = 301.65
+    b = 0.915
+    c = 84.02
+    
+    ram_mb = a * (mb ** b) + c
+    
+    return math.ceil(ram_mb * 1024 * 1024)
 
 
 def get_actual_memory_usage() -> int:

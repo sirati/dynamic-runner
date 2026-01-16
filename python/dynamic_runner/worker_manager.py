@@ -1,5 +1,7 @@
+import logging
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .binary_info import BinaryInfo
@@ -40,27 +42,81 @@ class WorkerManager:
         self.oom_tasks: list = []
         self.stats = {"completed": 0, "failed": 0, "total": 0}
 
+        start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = output_dir / "logs" / start_time
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+
+        manager_log_path = self.log_dir / "manager.log"
+        self.manager_logger = logging.getLogger("manager")
+        self.manager_logger.setLevel(logging.INFO)
+        self.manager_logger.propagate = False
+
+        file_handler = logging.FileHandler(manager_log_path, mode="a")
+        file_handler.setLevel(logging.INFO)
+        formatter = logging.Formatter(
+            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        file_handler.setFormatter(formatter)
+        self.manager_logger.addHandler(file_handler)
+
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_handler.setFormatter(formatter)
+        self.manager_logger.addHandler(console_handler)
+
     def _start_worker(self, worker_id: int) -> WorkerState:
+        worker_log_path = self.log_dir / f"worker_{worker_id}.log"
+
+        with open(worker_log_path, "a") as f:
+            f.write(f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} starting\n")
+
         worker = start_worker(
             worker_id,
             self.source_dir,
             self.output_dir,
             self.platform_arg,
             self.skip_existing,
+            worker_log_path,
         )
+
+        with open(worker_log_path, "a") as f:
+            f.write(
+                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} started with PID {worker.process.pid}\n"
+            )
+
+        self.manager_logger.info(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
+
         if self.print_pid:
             print(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
         return worker
 
     def _restart_worker(self, worker_id: int) -> None:
         old_worker = self.workers[worker_id]
+        worker_log_path = self.log_dir / f"worker_{worker_id}.log"
+
+        with open(worker_log_path, "a") as f:
+            f.write(
+                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} restarting (old PID: {old_worker.process.pid})\n"
+            )
+
         new_worker = restart_worker(
             old_worker,
             self.source_dir,
             self.output_dir,
             self.platform_arg,
             self.skip_existing,
+            worker_log_path,
         )
+
+        with open(worker_log_path, "a") as f:
+            f.write(
+                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} restarted with new PID {new_worker.process.pid}\n"
+            )
+
+        self.manager_logger.info(
+            f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid} (old PID: {old_worker.process.pid})"
+        )
+
         if self.print_pid:
             print(f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid}")
         with self.lock:
@@ -107,7 +163,9 @@ class WorkerManager:
                             active_workers.remove(worker_id)
                 else:
                     if check_worker_timeout(worker):
-                        print(f"[Timeout] Worker {worker_id} timed out - {worker.current_binary.path.name}")
+                        timeout_msg = f"[Timeout] Worker {worker_id} timed out - {worker.current_binary.path.name}"
+                        print(timeout_msg)
+                        self.manager_logger.warning(timeout_msg)
                         if on_failure_increment_failed:
                             with self.lock:
                                 self.stats["failed"] += 1
@@ -139,6 +197,9 @@ class WorkerManager:
                                 elif isinstance(parsed, TaskResult):
                                     if parsed.error_type == ErrorType.NON_RECOVERABLE:
                                         # todo force kill worker after some extra time
+                                        self.manager_logger.error(
+                                            f"[Worker {worker_id}] Non-recoverable error, restarting"
+                                        )
                                         self._worker_completed(worker, parsed)
                                         self._restart_worker(worker_id)
                                         worker = self.workers[worker_id]
@@ -147,13 +208,21 @@ class WorkerManager:
                                         if on_failure_increment_failed and not parsed.success:
                                             with self.lock:
                                                 self.stats["failed"] += 1
-                                            print(
-                                                f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                                            )
+                                            giveup_msg = f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                                            print(giveup_msg)
+                                            self.manager_logger.warning(giveup_msg)
                                         self._worker_completed(worker, parsed)
                                         if not self._assign_binary_to_worker(worker):
                                             if not self.pending_binaries:
                                                 if allow_stop:
+                                                    worker_log_path = self.log_dir / f"worker_{worker_id}.log"
+                                                    with open(worker_log_path, "a") as f:
+                                                        f.write(
+                                                            f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} stopping (no more tasks)\n"
+                                                        )
+                                                    self.manager_logger.info(
+                                                        f"[Worker {worker_id}] Stopping (no more tasks)"
+                                                    )
                                                     worker.socket.sendall(b"stop\n")
                                                 active_workers.remove(worker_id)
                     except BlockingIOError:
@@ -171,8 +240,12 @@ class WorkerManager:
         self.stats["completed"] = 0
         self.stats["failed"] = 0
 
-        print(f"Starting {self.num_workers} workers with {self.max_memory / (1024**3):.2f}GB memory limit")
-        print(f"Processing {self.stats['total']} binaries")
+        start_msg = f"Starting {self.num_workers} workers with {self.max_memory / (1024**3):.2f}GB memory limit"
+        process_msg = f"Processing {self.stats['total']} binaries"
+        print(start_msg)
+        print(process_msg)
+        self.manager_logger.info(start_msg)
+        self.manager_logger.info(process_msg)
 
         for i in range(self.num_workers):
             worker = self._start_worker(i)
@@ -182,7 +255,9 @@ class WorkerManager:
         self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=False)
 
         if self.failed_tasks:
-            print(f"\n[*] Retrying {len(self.failed_tasks)} failed tasks")
+            retry_msg = f"[*] Retrying {len(self.failed_tasks)} failed tasks"
+            print(f"\n{retry_msg}")
+            self.manager_logger.info(retry_msg)
             retry_tasks = self.failed_tasks.copy()
             self.failed_tasks = []
 
@@ -193,10 +268,18 @@ class WorkerManager:
             self._process_worker_loop(active_workers, allow_stop=True, on_failure_increment_failed=True)
 
         if self.oom_tasks:
-            print(f"\n[*] Processing {len(self.oom_tasks)} OOM tasks with single worker")
+            oom_msg = f"[*] Processing {len(self.oom_tasks)} OOM tasks with single worker"
+            print(f"\n{oom_msg}")
+            self.manager_logger.info(oom_msg)
 
             for worker_id in range(1, self.num_workers):
                 try:
+                    worker_log_path = self.log_dir / f"worker_{worker_id}.log"
+                    with open(worker_log_path, "a") as f:
+                        f.write(
+                            f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} stopping for OOM processing\n"
+                        )
+                    self.manager_logger.info(f"[Worker {worker_id}] Stopping for OOM processing")
                     self.workers[worker_id].socket.sendall(b"stop\n")
                     self.workers[worker_id].process.wait(timeout=5)
                     self.workers[worker_id].socket.close()
@@ -209,6 +292,12 @@ class WorkerManager:
             active_workers = {0}
             self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=True)
 
+            worker_log_path = self.log_dir / f"worker_0.log"
+            with open(worker_log_path, "a") as f:
+                f.write(
+                    f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker 0 stopping after OOM tasks\n"
+                )
+            self.manager_logger.info("[Worker 0] Stopping after OOM tasks")
             self.workers[0].socket.sendall(b"stop\n")
 
         for worker in self.workers:
@@ -218,6 +307,6 @@ class WorkerManager:
             except:
                 pass
 
-        print(
-            f"\n[*] Completed: {self.stats['completed']}/{self.stats['total']}, Failed: {self.stats['failed']}/{self.stats['total']}"
-        )
+        final_msg = f"[*] Completed: {self.stats['completed']}/{self.stats['total']}, Failed: {self.stats['failed']}/{self.stats['total']}"
+        print(f"\n{final_msg}")
+        self.manager_logger.info(final_msg)

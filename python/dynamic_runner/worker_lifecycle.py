@@ -13,6 +13,7 @@ def start_worker(
     output_dir: Path,
     platform_arg: str,
     skip_existing: bool,
+    worker_log_path: Path,
 ) -> WorkerState:
     """Start a worker process with dynamic_queue mode."""
     parent_sock, child_sock = socket.socketpair()
@@ -31,6 +32,8 @@ def start_worker(
         str(output_dir),
         "--platform",
         platform_arg,
+        "--log_file",
+        str(worker_log_path),
     ]
 
     if skip_existing:
@@ -62,6 +65,7 @@ def restart_worker(
     output_dir: Path,
     platform_arg: str,
     skip_existing: bool,
+    worker_log_path: Path,
 ) -> WorkerState:
     """Restart a worker that encountered a non-recoverable error."""
     try:
@@ -77,6 +81,7 @@ def restart_worker(
         output_dir,
         platform_arg,
         skip_existing,
+        worker_log_path,
     )
 
 
