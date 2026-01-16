@@ -95,6 +95,8 @@ def print_phase_status(worker: WorkerState) -> None:
         if elapsed >= 60:
             minutes = int(elapsed / 60)
             if minutes in [1, 5, 10, 30, 60] or (minutes > 60 and minutes % 60 == 0):
-                print(
-                    f"[Worker {worker.worker_id}] Still in {worker.phase.value}, {minutes} minute(s) elapsed - {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                )
+                if worker.last_printed_minute != minutes:
+                    worker.last_printed_minute = minutes
+                    print(
+                        f"[Worker {worker.worker_id}] Still in {worker.phase.value}, {minutes} minute(s) elapsed - {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                    )

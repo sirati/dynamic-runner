@@ -38,6 +38,7 @@ class WorkerState:
     phase: ProcessingPhase | None = None
     phase_start_time: float | None = None
     last_keepalive: float | None = None
+    last_printed_minute: int | None = None
 
 
 @dataclass

@@ -22,6 +22,7 @@ class WorkerManager:
         output_dir: Path,
         platform_arg: str,
         skip_existing: bool,
+        print_pid: bool,
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
@@ -29,6 +30,7 @@ class WorkerManager:
         self.output_dir = output_dir
         self.platform_arg = platform_arg
         self.skip_existing = skip_existing
+        self.print_pid = print_pid
 
         self.workers: list[WorkerState] = []
         self.available_memory = max_memory
@@ -39,13 +41,16 @@ class WorkerManager:
         self.stats = {"completed": 0, "failed": 0, "total": 0}
 
     def _start_worker(self, worker_id: int) -> WorkerState:
-        return start_worker(
+        worker = start_worker(
             worker_id,
             self.source_dir,
             self.output_dir,
             self.platform_arg,
             self.skip_existing,
         )
+        if self.print_pid:
+            print(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
+        return worker
 
     def _restart_worker(self, worker_id: int) -> None:
         old_worker = self.workers[worker_id]
@@ -56,6 +61,8 @@ class WorkerManager:
             self.platform_arg,
             self.skip_existing,
         )
+        if self.print_pid:
+            print(f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid}")
         with self.lock:
             self.workers[worker_id] = new_worker
 
@@ -128,6 +135,7 @@ class WorkerManager:
                                 if isinstance(parsed, ProcessingPhase):
                                     worker.phase = parsed
                                     worker.phase_start_time = time.time()
+                                    worker.last_printed_minute = None
                                 elif isinstance(parsed, TaskResult):
                                     if parsed.error_type == ErrorType.NON_RECOVERABLE:
                                         # todo force kill worker after some extra time

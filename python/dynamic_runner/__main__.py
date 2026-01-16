@@ -61,6 +61,8 @@ def main():
 
     parser.add_argument("--skip-existing", action="store_true", help="Skip binaries that already have output files")
 
+    parser.add_argument("--pid", action="store_true", help="Print worker PIDs when (re)started")
+
     parser.add_argument("--list-files", action="store_true", help="List all matched files without processing")
 
     parser.add_argument(
@@ -105,6 +107,7 @@ def main():
 
     if args.debugs:
         args.name_regex = "minigzipsh"
+        args.pid = True
 
     if args.compiler_versions and args.version_regex:
         parser.error("Cannot specify both --compiler-versions and --version-regex")
@@ -194,6 +197,7 @@ def main():
         output_dir=output_dir,
         platform_arg="file_prefix",
         skip_existing=args.skip_existing,
+        print_pid=args.pid,
     )
 
     manager.process_binaries(sorted_binaries)
