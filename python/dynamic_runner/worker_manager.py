@@ -94,8 +94,9 @@ class WorkerManager:
 
                 if worker.current_binary is None:
                     if not self._assign_binary_to_worker(worker):
-                        if not self.pending_binaries and allow_stop:
-                            worker.socket.sendall(b"stop\n")
+                        if not self.pending_binaries:
+                            if allow_stop:
+                                worker.socket.sendall(b"stop\n")
                             active_workers.remove(worker_id)
                 else:
                     if check_worker_timeout(worker):
@@ -118,35 +119,35 @@ class WorkerManager:
                     try:
                         data = worker.socket.recv(1024)
                         if data:
-                            response = data.decode("utf-8").strip()
-                            parsed = parse_response(response)
+                            responses = data.decode("utf-8").strip()
+                            responses = responses.split("\n")
+                            worker.last_keepalive = time.time()
+                            for response in responses:
+                                parsed = parse_response(response)
 
-                            if isinstance(parsed, ProcessingPhase):
-                                worker.phase = parsed
-                                worker.phase_start_time = time.time()
-                                if parsed == ProcessingPhase.PHASE_3:
-                                    worker.last_keepalive = time.time()
-                            elif parsed is None:
-                                if worker.phase == ProcessingPhase.PHASE_3:
-                                    worker.last_keepalive = time.time()
-                            elif isinstance(parsed, TaskResult):
-                                if parsed.error_type == ErrorType.NON_RECOVERABLE:
-                                    self._worker_completed(worker, parsed)
-                                    self._restart_worker(worker_id)
-                                    worker = self.workers[worker_id]
-                                    active_workers.add(worker_id)
-                                else:
-                                    if on_failure_increment_failed and not parsed.success:
-                                        with self.lock:
-                                            self.stats["failed"] += 1
-                                        print(
-                                            f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                                        )
-                                    self._worker_completed(worker, parsed)
-                                    if not self._assign_binary_to_worker(worker):
-                                        if not self.pending_binaries and allow_stop:
-                                            worker.socket.sendall(b"stop\n")
-                                            active_workers.remove(worker_id)
+                                if isinstance(parsed, ProcessingPhase):
+                                    worker.phase = parsed
+                                    worker.phase_start_time = time.time()
+                                elif isinstance(parsed, TaskResult):
+                                    if parsed.error_type == ErrorType.NON_RECOVERABLE:
+                                        # todo force kill worker after some extra time
+                                        self._worker_completed(worker, parsed)
+                                        self._restart_worker(worker_id)
+                                        worker = self.workers[worker_id]
+                                        active_workers.add(worker_id)
+                                    else:
+                                        if on_failure_increment_failed and not parsed.success:
+                                            with self.lock:
+                                                self.stats["failed"] += 1
+                                            print(
+                                                f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                                            )
+                                        self._worker_completed(worker, parsed)
+                                        if not self._assign_binary_to_worker(worker):
+                                            if not self.pending_binaries:
+                                                if allow_stop:
+                                                    worker.socket.sendall(b"stop\n")
+                                                active_workers.remove(worker_id)
                     except BlockingIOError:
                         pass
                     finally:
@@ -170,7 +171,7 @@ class WorkerManager:
             self.workers.append(worker)
 
         active_workers = set(range(self.num_workers))
-        self._process_worker_loop(active_workers, allow_stop=True, on_failure_increment_failed=False)
+        self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=False)
 
         if self.failed_tasks:
             print(f"\n[*] Retrying {len(self.failed_tasks)} failed tasks")

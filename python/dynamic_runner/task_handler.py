@@ -54,8 +54,8 @@ def worker_completed(
             if result.success:
                 stats["completed"] += 1
                 status = f"[{stats['completed']}/{stats['total']}] Completed: {worker.current_binary.path.name}"
-                if result.warnings > 0 or result.filtered > 0:
-                    status += f" (warnings: {result.warnings}, filtered: {result.filtered})"
+                # if result.warnings > 0 or result.filtered > 0:
+                status += f" (warnings: {result.warnings}, filtered: {result.filtered})"
                 print(status)
             else:
                 if result.error_type == ErrorType.OUT_OF_MEMORY:
@@ -68,7 +68,7 @@ def worker_completed(
                         )
                     )
                 elif result.error_type == ErrorType.NON_RECOVERABLE:
-                    print(f"[NonRecoverable] {worker.current_binary.path.name}")
+                    print(f"[Worker crashed] {worker.current_binary.path.name}")
                     stats["failed"] += 1
                     released_memory = worker.estimated_memory
                     worker.current_binary = None
@@ -78,9 +78,7 @@ def worker_completed(
                     worker.last_keepalive = None
                     return released_memory
                 else:
-                    print(
-                        f"[Error:{result.error_type.value if result.error_type else 'unknown'}] {worker.current_binary.path.name}"
-                    )
+                    print(f"[Errored] {worker.current_binary.path.name}")
                     failed_tasks.append(
                         FailedTask(
                             binary=worker.current_binary,
@@ -101,6 +99,7 @@ def worker_completed(
 
 def parse_response(response: str) -> TaskResult | ProcessingPhase | None:
     """Parse worker response into TaskResult or phase update."""
+    # print(f"[Received response] {response}")
     if response == "done":
         return TaskResult(success=True)
     elif response.startswith("done:"):
