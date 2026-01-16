@@ -1,56 +1,16 @@
-import os
-import socket
-import subprocess
-import sys
 import threading
 import time
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 
 from .binary_info import BinaryInfo
-from .memory import estimate_memory, get_actual_memory_usage
-
-
-class ErrorType(Enum):
-    OUT_OF_MEMORY = "oom"
-    NON_RECOVERABLE = "non_recoverable"
-    RECOVERABLE = "recoverable"
-
-
-class ProcessingPhase(Enum):
-    PHASE_1 = "phase1"
-    PHASE_2 = "phase2"
-    PHASE_3 = "phase3"
-
-
-@dataclass
-class TaskResult:
-    success: bool
-    error_type: ErrorType | None = None
-    error_message: str | None = None
-    warnings: int = 0
-    filtered: int = 0
-
-
-@dataclass
-class WorkerState:
-    process: subprocess.Popen
-    socket: socket.socket
-    current_binary: BinaryInfo | None
-    estimated_memory: int
-    worker_id: int
-    phase: ProcessingPhase | None = None
-    phase_start_time: float | None = None
-    last_keepalive: float | None = None
-
-
-@dataclass
-class FailedTask:
-    binary: BinaryInfo
-    error_type: ErrorType
-    error_message: str
-    retry_count: int = 0
+from .models import ErrorType, ProcessingPhase, TaskResult, WorkerState
+from .task_handler import assign_binary_to_worker, parse_response, worker_completed
+from .worker_lifecycle import (
+    check_worker_timeout,
+    print_phase_status,
+    restart_worker,
+    start_worker,
+)
 
 
 class WorkerManager:
@@ -74,229 +34,92 @@ class WorkerManager:
         self.available_memory = max_memory
         self.lock = threading.Lock()
         self.pending_binaries: list[BinaryInfo] = []
-        self.failed_tasks: list[FailedTask] = []
-        self.oom_tasks: list[FailedTask] = []
-        self.completed = 0
-        self.failed = 0
-        self.total = 0
+        self.failed_tasks: list = []
+        self.oom_tasks: list = []
+        self.stats = {"completed": 0, "failed": 0, "total": 0}
 
-    def start_worker(self, worker_id: int) -> WorkerState:
-        """Start a worker process with dynamic_queue mode."""
-        parent_sock, child_sock = socket.socketpair()
-
-        child_fd = child_sock.fileno()
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "tokenizer.low_level",
-            "--dynamic_queue",
-            str(child_fd),
-            "--source",
-            str(self.source_dir),
-            "--output",
-            str(self.output_dir),
-            "--platform",
+    def _start_worker(self, worker_id: int) -> WorkerState:
+        return start_worker(
+            worker_id,
+            self.source_dir,
+            self.output_dir,
             self.platform_arg,
-        ]
-
-        if self.skip_existing:
-            cmd.append("--skip_existing")
-
-        process = subprocess.Popen(
-            cmd,
-            pass_fds=[child_fd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            self.skip_existing,
         )
 
-        child_sock.close()
-
-        return WorkerState(
-            process=process,
-            socket=parent_sock,
-            current_binary=None,
-            estimated_memory=0,
-            worker_id=worker_id,
+    def _restart_worker(self, worker_id: int) -> None:
+        old_worker = self.workers[worker_id]
+        new_worker = restart_worker(
+            old_worker,
+            self.source_dir,
+            self.output_dir,
+            self.platform_arg,
+            self.skip_existing,
         )
-
-    def assign_binary_to_worker(self, worker: WorkerState) -> bool:
-        """Try to assign a binary to the worker. Returns True if assigned, False if no suitable binary."""
         with self.lock:
-            actual_usage = get_actual_memory_usage()
-
-            for i, binary in enumerate(self.pending_binaries):
-                estimated = estimate_memory(binary.size)
-
-                if self.available_memory - estimated >= 0:
-                    self.pending_binaries.pop(i)
-                    worker.current_binary = binary
-                    worker.estimated_memory = estimated
-                    self.available_memory -= estimated
-
-                    try:
-                        relative_path = binary.path.relative_to(self.source_dir)
-                    except ValueError:
-                        relative_path = binary.path
-
-                    message = f"{relative_path}\n"
-                    worker.socket.sendall(message.encode("utf-8"))
-
-                    return True
-
-            return False
-
-    def worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
-        """Mark worker as completed and release memory."""
-        with self.lock:
-            if worker.current_binary:
-                if result.success:
-                    self.completed += 1
-                    status = f"[{self.completed}/{self.total}] Completed: {worker.current_binary.path.name}"
-                    if result.warnings > 0 or result.filtered > 0:
-                        status += f" (warnings: {result.warnings}, filtered: {result.filtered})"
-                    print(status)
-                else:
-                    if result.error_type == ErrorType.OUT_OF_MEMORY:
-                        print(f"[OOM] {worker.current_binary.path.name}")
-                        self.oom_tasks.append(
-                            FailedTask(
-                                binary=worker.current_binary,
-                                error_type=result.error_type,
-                                error_message=result.error_message or "",
-                            )
-                        )
-                    elif result.error_type == ErrorType.NON_RECOVERABLE:
-                        print(f"[NonRecoverable] {worker.current_binary.path.name}")
-                        self.failed += 1
-                        return
-                    else:
-                        print(
-                            f"[Error:{result.error_type.value if result.error_type else 'unknown'}] {worker.current_binary.path.name}"
-                        )
-                        self.failed_tasks.append(
-                            FailedTask(
-                                binary=worker.current_binary,
-                                error_type=result.error_type or ErrorType.RECOVERABLE,
-                                error_message=result.error_message or "",
-                            )
-                        )
-
-                self.available_memory += worker.estimated_memory
-                worker.current_binary = None
-                worker.estimated_memory = 0
-                worker.phase = None
-                worker.phase_start_time = None
-                worker.last_keepalive = None
-
-    def parse_response(self, response: str) -> TaskResult | ProcessingPhase | None:
-        """Parse worker response into TaskResult or phase update."""
-        if response == "done":
-            return TaskResult(success=True)
-        elif response.startswith("done:"):
-            parts = response.split(":", 3)
-            warnings = int(parts[1]) if len(parts) > 1 else 0
-            filtered = int(parts[2]) if len(parts) > 2 else 0
-            return TaskResult(success=True, warnings=warnings, filtered=filtered)
-        elif response.startswith("error:"):
-            parts = response.split(":", 2)
-            if len(parts) >= 3:
-                error_type_str = parts[1]
-                error_message = parts[2]
-                try:
-                    error_type = ErrorType(error_type_str)
-                except ValueError:
-                    error_type = ErrorType.RECOVERABLE
-                return TaskResult(success=False, error_type=error_type, error_message=error_message)
-        elif response.startswith("phase:"):
-            phase_str = response.split(":", 1)[1]
-            try:
-                return ProcessingPhase(phase_str)
-            except ValueError:
-                pass
-        elif response == "keepalive":
-            return None
-        return TaskResult(success=False, error_type=ErrorType.RECOVERABLE, error_message="Unknown response")
-
-    def restart_worker(self, worker_id: int) -> None:
-        """Restart a worker that encountered a non-recoverable error."""
-        with self.lock:
-            old_worker = self.workers[worker_id]
-            try:
-                old_worker.process.terminate()
-                old_worker.socket.close()
-            except:
-                pass
-
-            print(f"[*] Restarting worker {worker_id}")
-            new_worker = self.start_worker(worker_id)
             self.workers[worker_id] = new_worker
 
-    def check_worker_timeout(self, worker: WorkerState) -> bool:
-        """Check if worker has timed out based on phase."""
-        if worker.phase == ProcessingPhase.PHASE_3 and worker.last_keepalive:
-            if time.time() - worker.last_keepalive > 10:
-                return True
-        return False
+    def _assign_binary_to_worker(self, worker: WorkerState) -> bool:
+        assigned, new_memory = assign_binary_to_worker(
+            worker,
+            self.pending_binaries,
+            self.available_memory,
+            self.source_dir,
+            self.lock,
+        )
+        if assigned:
+            self.available_memory = new_memory
+        return assigned
 
-    def print_phase_status(self, worker: WorkerState) -> None:
-        """Print status message for long-running phases."""
-        if worker.phase in [ProcessingPhase.PHASE_1, ProcessingPhase.PHASE_2] and worker.phase_start_time:
-            elapsed = time.time() - worker.phase_start_time
-            if elapsed >= 60:
-                minutes = int(elapsed / 60)
-                if minutes in [1, 5, 10, 30, 60] or (minutes > 60 and minutes % 60 == 0):
-                    print(
-                        f"[Worker {worker.worker_id}] Still in {worker.phase.value}, {minutes} minute(s) elapsed - {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                    )
+    def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
+        released = worker_completed(
+            worker,
+            result,
+            self.oom_tasks,
+            self.failed_tasks,
+            self.stats,
+            self.lock,
+        )
+        self.available_memory += released
 
-    def process_binaries(self, binaries: list[BinaryInfo]) -> None:
-        """Main processing loop."""
-        self.pending_binaries = binaries.copy()
-        self.total = len(binaries)
-        self.completed = 0
-        self.failed = 0
-
-        print(f"Starting {self.num_workers} workers with {self.max_memory / (1024**3):.2f}GB memory limit")
-        print(f"Processing {self.total} binaries")
-
-        for i in range(self.num_workers):
-            worker = self.start_worker(i)
-            self.workers.append(worker)
-
-        active_workers = set(range(self.num_workers))
-
+    def _process_worker_loop(
+        self,
+        active_workers: set[int],
+        allow_stop: bool = True,
+        on_failure_increment_failed: bool = False,
+    ) -> None:
         while active_workers or self.pending_binaries:
             for worker_id in list(active_workers):
                 worker = self.workers[worker_id]
 
                 if worker.current_binary is None:
-                    if not self.assign_binary_to_worker(worker):
-                        if not self.pending_binaries:
+                    if not self._assign_binary_to_worker(worker):
+                        if not self.pending_binaries and allow_stop:
                             worker.socket.sendall(b"stop\n")
                             active_workers.remove(worker_id)
                 else:
-                    if self.check_worker_timeout(worker):
+                    if check_worker_timeout(worker):
                         print(f"[Timeout] Worker {worker_id} timed out - {worker.current_binary.path.name}")
+                        if on_failure_increment_failed:
+                            with self.lock:
+                                self.stats["failed"] += 1
                         result = TaskResult(
                             success=False, error_type=ErrorType.RECOVERABLE, error_message="Worker timeout"
                         )
-                        self.worker_completed(worker, result)
-                        self.restart_worker(worker_id)
+                        self._worker_completed(worker, result)
+                        self._restart_worker(worker_id)
                         worker = self.workers[worker_id]
                         active_workers.add(worker_id)
                         continue
 
-                    self.print_phase_status(worker)
+                    print_phase_status(worker)
 
                     worker.socket.setblocking(False)
                     try:
                         data = worker.socket.recv(1024)
                         if data:
                             response = data.decode("utf-8").strip()
-                            parsed = self.parse_response(response)
+                            parsed = parse_response(response)
 
                             if isinstance(parsed, ProcessingPhase):
                                 worker.phase = parsed
@@ -308,14 +131,20 @@ class WorkerManager:
                                     worker.last_keepalive = time.time()
                             elif isinstance(parsed, TaskResult):
                                 if parsed.error_type == ErrorType.NON_RECOVERABLE:
-                                    self.worker_completed(worker, parsed)
-                                    self.restart_worker(worker_id)
+                                    self._worker_completed(worker, parsed)
+                                    self._restart_worker(worker_id)
                                     worker = self.workers[worker_id]
                                     active_workers.add(worker_id)
                                 else:
-                                    self.worker_completed(worker, parsed)
-                                    if not self.assign_binary_to_worker(worker):
-                                        if not self.pending_binaries:
+                                    if on_failure_increment_failed and not parsed.success:
+                                        with self.lock:
+                                            self.stats["failed"] += 1
+                                        print(
+                                            f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                                        )
+                                    self._worker_completed(worker, parsed)
+                                    if not self._assign_binary_to_worker(worker):
+                                        if not self.pending_binaries and allow_stop:
                                             worker.socket.sendall(b"stop\n")
                                             active_workers.remove(worker_id)
                     except BlockingIOError:
@@ -326,6 +155,23 @@ class WorkerManager:
             if active_workers:
                 threading.Event().wait(0.1)
 
+    def process_binaries(self, binaries: list[BinaryInfo]) -> None:
+        """Main processing loop."""
+        self.pending_binaries = binaries.copy()
+        self.stats["total"] = len(binaries)
+        self.stats["completed"] = 0
+        self.stats["failed"] = 0
+
+        print(f"Starting {self.num_workers} workers with {self.max_memory / (1024**3):.2f}GB memory limit")
+        print(f"Processing {self.stats['total']} binaries")
+
+        for i in range(self.num_workers):
+            worker = self._start_worker(i)
+            self.workers.append(worker)
+
+        active_workers = set(range(self.num_workers))
+        self._process_worker_loop(active_workers, allow_stop=True, on_failure_increment_failed=False)
+
         if self.failed_tasks:
             print(f"\n[*] Retrying {len(self.failed_tasks)} failed tasks")
             retry_tasks = self.failed_tasks.copy()
@@ -335,70 +181,7 @@ class WorkerManager:
                 self.pending_binaries.append(failed_task.binary)
 
             active_workers = set(range(self.num_workers))
-
-            while active_workers or self.pending_binaries:
-                for worker_id in list(active_workers):
-                    worker = self.workers[worker_id]
-
-                    if worker.current_binary is None:
-                        if not self.assign_binary_to_worker(worker):
-                            if not self.pending_binaries:
-                                worker.socket.sendall(b"stop\n")
-                                active_workers.remove(worker_id)
-                    else:
-                        if self.check_worker_timeout(worker):
-                            print(f"[Timeout] Worker {worker_id} timed out - {worker.current_binary.path.name}")
-                            self.failed += 1
-                            result = TaskResult(
-                                success=False, error_type=ErrorType.RECOVERABLE, error_message="Worker timeout"
-                            )
-                            self.worker_completed(worker, result)
-                            self.restart_worker(worker_id)
-                            worker = self.workers[worker_id]
-                            active_workers.add(worker_id)
-                            continue
-
-                        self.print_phase_status(worker)
-
-                        worker.socket.setblocking(False)
-                        try:
-                            data = worker.socket.recv(1024)
-                            if data:
-                                response = data.decode("utf-8").strip()
-                                parsed = self.parse_response(response)
-
-                                if isinstance(parsed, ProcessingPhase):
-                                    worker.phase = parsed
-                                    worker.phase_start_time = time.time()
-                                    if parsed == ProcessingPhase.PHASE_3:
-                                        worker.last_keepalive = time.time()
-                                elif parsed is None:
-                                    if worker.phase == ProcessingPhase.PHASE_3:
-                                        worker.last_keepalive = time.time()
-                                elif isinstance(parsed, TaskResult):
-                                    if parsed.error_type == ErrorType.NON_RECOVERABLE:
-                                        self.worker_completed(worker, parsed)
-                                        self.restart_worker(worker_id)
-                                        worker = self.workers[worker_id]
-                                        active_workers.add(worker_id)
-                                    else:
-                                        if not parsed.success:
-                                            self.failed += 1
-                                            print(
-                                                f"[GiveUp] {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
-                                            )
-                                        self.worker_completed(worker, parsed)
-                                        if not self.assign_binary_to_worker(worker):
-                                            if not self.pending_binaries:
-                                                worker.socket.sendall(b"stop\n")
-                                                active_workers.remove(worker_id)
-                        except BlockingIOError:
-                            pass
-                        finally:
-                            worker.socket.setblocking(True)
-
-                if active_workers:
-                    threading.Event().wait(0.1)
+            self._process_worker_loop(active_workers, allow_stop=True, on_failure_increment_failed=True)
 
         if self.oom_tasks:
             print(f"\n[*] Processing {len(self.oom_tasks)} OOM tasks with single worker")
@@ -411,64 +194,13 @@ class WorkerManager:
                 except:
                     pass
 
-            single_worker = self.workers[0]
-
             for oom_task in self.oom_tasks:
                 self.pending_binaries.append(oom_task.binary)
 
-            while self.pending_binaries:
-                if single_worker.current_binary is None:
-                    if not self.assign_binary_to_worker(single_worker):
-                        break
-                else:
-                    if self.check_worker_timeout(single_worker):
-                        print(f"[Timeout] Worker 0 timed out - {single_worker.current_binary.path.name}")
-                        self.failed += 1
-                        result = TaskResult(
-                            success=False, error_type=ErrorType.RECOVERABLE, error_message="Worker timeout"
-                        )
-                        self.worker_completed(single_worker, result)
-                        self.restart_worker(0)
-                        single_worker = self.workers[0]
-                        continue
+            active_workers = {0}
+            self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=True)
 
-                    self.print_phase_status(single_worker)
-
-                    single_worker.socket.setblocking(False)
-                    try:
-                        data = single_worker.socket.recv(1024)
-                        if data:
-                            response = data.decode("utf-8").strip()
-                            parsed = self.parse_response(response)
-
-                            if isinstance(parsed, ProcessingPhase):
-                                single_worker.phase = parsed
-                                single_worker.phase_start_time = time.time()
-                                if parsed == ProcessingPhase.PHASE_3:
-                                    single_worker.last_keepalive = time.time()
-                            elif parsed is None:
-                                if single_worker.phase == ProcessingPhase.PHASE_3:
-                                    single_worker.last_keepalive = time.time()
-                            elif isinstance(parsed, TaskResult):
-                                if parsed.error_type == ErrorType.NON_RECOVERABLE:
-                                    self.worker_completed(single_worker, parsed)
-                                    self.restart_worker(0)
-                                    single_worker = self.workers[0]
-                                else:
-                                    if not parsed.success:
-                                        self.failed += 1
-                                        print(
-                                            f"[GiveUp] {single_worker.current_binary.path.name if single_worker.current_binary else 'unknown'}"
-                                        )
-                                    self.worker_completed(single_worker, parsed)
-                    except BlockingIOError:
-                        pass
-                    finally:
-                        single_worker.socket.setblocking(True)
-
-                threading.Event().wait(0.1)
-
-            single_worker.socket.sendall(b"stop\n")
+            self.workers[0].socket.sendall(b"stop\n")
 
         for worker in self.workers:
             try:
@@ -477,4 +209,6 @@ class WorkerManager:
             except:
                 pass
 
-        print(f"\n[*] Completed: {self.completed}/{self.total}, Failed: {self.failed}/{self.total}")
+        print(
+            f"\n[*] Completed: {self.stats['completed']}/{self.stats['total']}, Failed: {self.stats['failed']}/{self.stats['total']}"
+        )
