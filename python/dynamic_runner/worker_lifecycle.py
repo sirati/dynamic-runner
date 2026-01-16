@@ -39,15 +39,13 @@ def start_worker(
     if skip_existing:
         cmd.append("--skip_existing")
 
-    stderr_log_path = worker_log_path.parent / f"worker_{worker_id}_stderr.log"
-    with open(stderr_log_path, "a") as stderr_file:
-        process = subprocess.Popen(
-            cmd,
-            pass_fds=[child_fd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=stderr_file,
-        )
+    process = subprocess.Popen(
+        cmd,
+        pass_fds=[child_fd],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     child_sock.close()
 

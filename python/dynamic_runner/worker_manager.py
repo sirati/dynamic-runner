@@ -74,7 +74,7 @@ class WorkerManager:
         worker_log_path = self.log_dir / f"worker_{worker_id}.log"
 
         with open(worker_log_path, "a") as f:
-            f.write(f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} starting\n")
+            f.write(f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Manager: Worker {worker_id} starting\n")
 
         worker = start_worker(
             worker_id,
@@ -95,7 +95,7 @@ class WorkerManager:
 
         with open(worker_log_path, "a") as f:
             f.write(
-                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Worker {worker_id} restarting (old PID: {old_worker.process.pid})\n"
+                f"INFO | {datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} | Manager: Worker {worker_id} restarting (old PID: {old_worker.process.pid})\n"
             )
 
         new_worker = restart_worker(
