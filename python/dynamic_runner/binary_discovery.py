@@ -16,6 +16,7 @@ def find_matching_binaries(
     version_regex: str | None = None,
     opt_regex: str | None = None,
     name_regex: str | None = None,
+    exclude_subfolders: list[str] | None = None,
 ) -> list[BinaryInfo]:
     """Find all binaries matching the filter criteria."""
 
@@ -48,7 +49,19 @@ def find_matching_binaries(
 
     binaries: list[BinaryInfo] = []
 
+    exclude_pattern = None
+    if exclude_subfolders:
+        pattern = "(" + "|".join(exclude_subfolders) + ")"
+        exclude_pattern = re.compile(pattern)
+
     for root, dirs, files in os.walk(source_dir):
+        root_path = Path(root)
+        rel_path = root_path.relative_to(source_dir)
+        rel_path_str = str(rel_path)
+
+        if exclude_pattern and rel_path_str != "." and exclude_pattern.search(rel_path_str):
+            dirs[:] = []
+            continue
         for filename in files:
             filepath = Path(root) / filename
 

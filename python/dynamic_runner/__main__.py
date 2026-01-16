@@ -103,6 +103,14 @@ def main():
         help="Debug mode: only process binaries with name 'minigzipsh' (sets --name-regex to 'minigzipsh')",
     )
 
+    parser.add_argument(
+        "--exclude-subfolder",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Subfolders to exclude from source directory. Multiple values are combined with OR logic.",
+    )
+
     args = parser.parse_args()
 
     if args.debugs:
@@ -169,6 +177,7 @@ def main():
         args.version_regex,
         args.opt_regex,
         args.name_regex,
+        args.exclude_subfolder,
     )
 
     print(f"Found {len(binaries)} matching binaries")
