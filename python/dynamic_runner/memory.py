@@ -7,7 +7,9 @@ def estimate_memory(binary_size: int) -> int:
     """
     Estimate memory consumption using a power law model.
 
-    Model: RAM (MiB) = 301.65 * file_size^0.915 + 84.02
+    Model: RAM (MiB) = 430.870 × size^1.051 + 260.15
+
+    R² = 0.9866, RMSE = 203.66 MiB
 
     Args:
         binary_size: File size in bytes
@@ -18,14 +20,13 @@ def estimate_memory(binary_size: int) -> int:
     mb = binary_size / 1024 / 1024  # Convert to MiB
 
     # Power law coefficients (MiB units)
-    # a = 301.65
-    # b = 0.915
-    # c = 84.02
-    a = 110.516624
-    b = 1.368032
-    c = 204.066149
+    a = 430.870
+    b = 1.051
+    c = 260.15
+    rmse = 203.66
 
-    ram_mb = a * (mb**b) + c
+    # we add the RMSE as we want to rather overestimate
+    ram_mb = a * (mb**b) + c + rmse
 
     return math.ceil(ram_mb * 1024 * 1024)
 

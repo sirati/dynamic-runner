@@ -27,7 +27,7 @@ class WorkerManager:
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
-        self.reserved_memory_per_worker = 300 * 1024 * 1024
+        self.reserved_memory_per_worker = 650 * 1024 * 1024
         self.source_dir = source_dir
         self.output_dir = output_dir
         self.platform_arg = platform_arg
@@ -240,7 +240,8 @@ class WorkerManager:
         self._worker_completed(worker, monitor_result.result)
 
         # Restart worker after successful completion if always_restart_worker is enabled
-        if self.always_restart_worker and monitor_result.result.success:
+        # and there are still binaries to process
+        if self.always_restart_worker and monitor_result.result.success and self.pending_binaries:
             self.manager_logger.info(f"[Worker {worker_id}] Restarting worker after successful completion")
             self._restart_worker(worker_id)
             # Don't try to assign to the old worker after restart, return early
