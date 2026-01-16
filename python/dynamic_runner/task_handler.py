@@ -13,9 +13,13 @@ def assign_binary_to_worker(
     reserved_memory: int,
     source_dir: Path,
     lock: threading.Lock,
+    unassigned_tasks: list[BinaryInfo] | None = None,
     logger=None,
 ) -> tuple[bool, int]:
-    """Try to assign a binary to the worker. Returns (assigned, new_available_memory)."""
+    """Try to assign a binary to the worker. Returns (assigned, new_available_memory).
+
+    Tasks that cannot be assigned due to memory constraints are added to unassigned_tasks if provided.
+    """
     with lock:
         actual_usage = get_actual_memory_usage()
 
@@ -37,6 +41,11 @@ def assign_binary_to_worker(
                 worker.socket.sendall(message.encode("utf-8"))
 
                 return True, new_available_memory
+
+        if unassigned_tasks is not None and pending_binaries:
+            for binary in pending_binaries:
+                if binary not in unassigned_tasks:
+                    unassigned_tasks.append(binary)
 
         return False, available_memory
 
