@@ -40,6 +40,15 @@ def assign_binary_to_worker(
                 message = f"{relative_path}\n"
                 worker.socket.sendall(message.encode("utf-8"))
 
+                if logger:
+                    size_mb = binary.size / (1024 * 1024)
+                    estimated_mb = estimated / (1024 * 1024)
+                    logger.info(
+                        f"[Worker {worker.worker_id}] Binary size: {size_mb:.2f}MB, "
+                        f"Estimated memory: {estimated_mb:.2f}MB, "
+                        f"Available after: {new_available_memory / (1024 * 1024):.2f}MB"
+                    )
+
                 return True, new_available_memory
 
         if unassigned_tasks is not None and pending_binaries:

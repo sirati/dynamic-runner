@@ -132,9 +132,8 @@ def _process_single_unassigned_binary(
 def _assign_binary_directly(binary: BinaryInfo, worker: WorkerState, source_dir: Path, logger: logging.Logger) -> bool:
     """Directly assign a binary to a worker without memory checks."""
     try:
-        with worker._lock if hasattr(worker, "_lock") else threading.Lock():
-            worker.current_binary = binary
-            worker.estimated_memory = 0
+        worker.current_binary = binary
+        worker.estimated_memory = 0
 
         try:
             relative_path = binary.path.relative_to(source_dir)
@@ -143,7 +142,11 @@ def _assign_binary_directly(binary: BinaryInfo, worker: WorkerState, source_dir:
 
         message = f"{relative_path}\n"
         worker.socket.sendall(message.encode("utf-8"))
-        logger.info(f"[Worker {worker.worker_id}] Assigned (no limit): {binary.path.name}")
+
+        size_mb = binary.size / (1024 * 1024)
+        logger.info(
+            f"[Worker {worker.worker_id}] Assigned (no limit): {binary.path.name}, Binary size: {size_mb:.2f}MB"
+        )
         return True
     except Exception as e:
         logger.error(f"[Worker {worker.worker_id}] Failed to assign {binary.path.name}: {e}")
