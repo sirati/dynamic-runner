@@ -3,7 +3,7 @@ import re
 import sys
 from pathlib import Path
 
-from .binary_discovery import find_matching_binaries, organize_and_sort_binaries
+from .binary_discovery import filter_existing_outputs, find_matching_binaries, organize_and_sort_binaries
 from .system_resources import parse_cores, parse_memory
 from .worker_manager import WorkerManager
 
@@ -60,6 +60,8 @@ def main():
     )
 
     parser.add_argument("--skip-existing", action="store_true", help="Skip binaries that already have output files")
+
+    parser.add_argument("--always-restart-worker", action="store_true", help="Restart worker after each completed task")
 
     parser.add_argument("--pid", action="store_true", help="Print worker PIDs when (re)started")
 
@@ -199,6 +201,17 @@ def main():
     print("Organizing and sorting binaries...")
     sorted_binaries = organize_and_sort_binaries(binaries)
 
+    # Filter out binaries with existing outputs if --skip-existing is set
+    if args.skip_existing:
+        print("Filtering out binaries with existing output files...")
+        sorted_binaries, skipped_count = filter_existing_outputs(sorted_binaries, source_dir, output_dir)
+        print(f"Skipped {skipped_count} binaries with existing outputs")
+        print(f"Remaining binaries to process: {len(sorted_binaries)}")
+
+        if not sorted_binaries:
+            print("No binaries to process after filtering")
+            return
+
     manager = WorkerManager(
         num_workers=num_cores,
         max_memory=max_memory,
@@ -207,6 +220,7 @@ def main():
         platform_arg="file_prefix",
         skip_existing=args.skip_existing,
         print_pid=args.pid,
+        always_restart_worker=args.always_restart_worker,
     )
 
     manager.process_binaries(sorted_binaries)

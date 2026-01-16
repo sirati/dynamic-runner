@@ -23,6 +23,7 @@ class WorkerManager:
         platform_arg: str,
         skip_existing: bool,
         print_pid: bool,
+        always_restart_worker: bool = False,
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
@@ -32,6 +33,7 @@ class WorkerManager:
         self.platform_arg = platform_arg
         self.skip_existing = skip_existing
         self.print_pid = print_pid
+        self.always_restart_worker = always_restart_worker
 
         self.workers: list[WorkerState] = []
         self.available_memory = max_memory
@@ -237,6 +239,15 @@ class WorkerManager:
 
         self._worker_completed(worker, monitor_result.result)
 
+        # Restart worker after successful completion if always_restart_worker is enabled
+        if self.always_restart_worker and monitor_result.result.success:
+            self.manager_logger.info(f"[Worker {worker_id}] Restarting worker after successful completion")
+            self._restart_worker(worker_id)
+            # Don't try to assign to the old worker after restart, return early
+            return
+
+        # Get updated worker reference in case it was restarted elsewhere
+        worker = self.workers[worker_id]
         if not self._assign_binary_to_worker(worker) and not self.pending_binaries and allow_stop:
             log_to_worker_file(self.log_dir, worker_id, f"Worker {worker_id} stopping (no more tasks)")
             self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")

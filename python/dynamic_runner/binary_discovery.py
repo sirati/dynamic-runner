@@ -127,3 +127,37 @@ def organize_and_sort_binaries(binaries: list[BinaryInfo]) -> list[BinaryInfo]:
         result.extend(group)
 
     return result
+
+
+def filter_existing_outputs(
+    binaries: list[BinaryInfo],
+    source_dir: Path,
+    output_dir: Path,
+) -> tuple[list[BinaryInfo], int]:
+    """Filter out binaries that already have output files.
+
+    Returns:
+        Tuple of (filtered_binaries, skipped_count)
+    """
+    filtered_binaries = []
+    skipped_count = 0
+
+    for binary in binaries:
+        # Get relative path from source_dir
+        try:
+            relative_path = binary.path.relative_to(source_dir)
+        except ValueError:
+            # If binary is not under source_dir, include it
+            filtered_binaries.append(binary)
+            continue
+
+        # Construct expected output path
+        # The output structure should mirror the source structure
+        output_path = output_dir / relative_path.parent / f"{binary.path.name}_output.csv"
+
+        if output_path.exists():
+            skipped_count += 1
+        else:
+            filtered_binaries.append(binary)
+
+    return filtered_binaries, skipped_count
