@@ -26,7 +26,7 @@ class WorkerManager:
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
-        self.reserved_memory = num_workers * 300 * 1024 * 1024
+        self.reserved_memory_per_worker = 300 * 1024 * 1024
         self.source_dir = source_dir
         self.output_dir = output_dir
         self.platform_arg = platform_arg
@@ -47,6 +47,9 @@ class WorkerManager:
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.manager_logger = self._setup_logger()
+
+        # Memory usage log file
+        self.memuse_log_path = output_dir / "memuse.log"
 
     def _setup_logger(self) -> logging.Logger:
         """Setup and configure the manager logger."""
@@ -70,6 +73,33 @@ class WorkerManager:
         logger.addHandler(console_handler)
 
         return logger
+
+    def _log_memory_usage(self, worker: WorkerState, errored: bool) -> None:
+        """Log memory usage to memuse.log file."""
+        if worker.current_binary is None:
+            return
+
+        max_memory = worker.max_memory_current_task
+
+        # Convert to MB
+        binary_size_mb = worker.current_binary.size / (1024 * 1024)
+        max_memory_mb = max_memory / (1024 * 1024)
+
+        # Format: binary_name, size_mb, max_memory_mb[+]
+        binary_name = worker.current_binary.path.name
+        suffix = "+" if errored else ""
+
+        log_line = f"{binary_name}, {binary_size_mb:.2f}, {max_memory_mb:.2f}{suffix}\n"
+
+        try:
+            with open(self.memuse_log_path, "a") as f:
+                f.write(log_line)
+        except Exception as e:
+            self.manager_logger.warning(f"Failed to write to memuse.log: {e}")
+
+        # Reset memory tracking for this worker's next task
+        worker.max_memory_current_task = 0
+        worker.last_memory_check = None
 
     def _start_worker(self, worker_id: int) -> WorkerState:
         """Start a new worker process."""
@@ -117,11 +147,17 @@ class WorkerManager:
     def _assign_binary_to_worker(self, worker: WorkerState, track_unassigned: bool = False) -> bool:
         """Try to assign a binary to the worker."""
         unassigned_list = self.unassigned_tasks if track_unassigned else None
+
+        # Calculate reserved memory based on idle workers
+        # Reserve memory for idle workers (excluding the one we're trying to assign to)
+        idle_workers = sum(1 for w in self.workers if w.current_binary is None)
+        reserved_memory = max(0, (idle_workers - 1) * self.reserved_memory_per_worker)
+
         assigned, new_memory = assign_binary_to_worker(
             worker,
             self.pending_binaries,
             self.available_memory,
-            self.reserved_memory,
+            reserved_memory,
             self.source_dir,
             self.lock,
             unassigned_list,
@@ -135,6 +171,10 @@ class WorkerManager:
 
     def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
         """Mark worker as completed and release memory."""
+        # Log memory usage before completing
+        errored = not result.success
+        self._log_memory_usage(worker, errored)
+
         released = worker_completed(
             worker,
             result,

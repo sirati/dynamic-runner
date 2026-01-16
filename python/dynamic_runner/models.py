@@ -39,6 +39,8 @@ class WorkerState:
     phase_start_time: float | None = None
     last_keepalive: float | None = None
     last_printed_minute: int | None = None
+    last_memory_check: float | None = None
+    max_memory_current_task: int = 0
 
 
 @dataclass

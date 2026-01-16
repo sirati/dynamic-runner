@@ -5,12 +5,43 @@ from .models import ErrorType, ProcessingPhase, TaskResult, WorkerState
 from .worker_communication import log_pickled_error, receive_worker_messages
 from .worker_lifecycle import check_worker_timeout, print_phase_status
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 
 @dataclass
 class WorkerMonitorResult:
     should_restart: bool
     task_completed: bool
     result: TaskResult | None
+
+
+def _get_process_memory(pid: int) -> int:
+    """Get memory usage of a process in bytes. Returns 0 if unavailable."""
+    if psutil is None:
+        return 0
+    try:
+        process = psutil.Process(pid)
+        # Get RSS (Resident Set Size) which is physical memory usage
+        return process.memory_info().rss
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return 0
+
+
+def _check_and_update_memory(worker: WorkerState) -> None:
+    """Check worker memory usage once per second and update max if needed."""
+    current_time = time.time()
+    last_check = worker.last_memory_check or 0
+
+    # Check memory once per second
+    if current_time - last_check >= 1.0:
+        if worker.process and worker.process.poll() is None:
+            memory_usage = _get_process_memory(worker.process.pid)
+            if memory_usage > 0:
+                worker.max_memory_current_task = max(worker.max_memory_current_task, memory_usage)
+        worker.last_memory_check = current_time
 
 
 def monitor_worker_once(
@@ -32,6 +63,9 @@ def monitor_worker_once(
     Returns:
         WorkerMonitorResult indicating what action to take
     """
+    # Check and update memory usage once per second
+    _check_and_update_memory(worker)
+
     if check_worker_timeout(worker):
         binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
         timeout_msg = f"[Timeout] Worker {worker_id} timed out - {binary_name}"
