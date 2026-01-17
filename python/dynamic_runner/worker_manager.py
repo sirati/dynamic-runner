@@ -179,6 +179,7 @@ class WorkerManager:
         if result.assigned:
             self.available_memory = result.new_available_memory
             worker.idle = False
+            worker.opportunistic = False
             binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
             self.manager_logger.info(f"[Worker {worker.worker_id}] Assigned: {binary_name}")
         elif result.memory_insufficient and not worker.idle:
@@ -240,7 +241,7 @@ class WorkerManager:
             return
 
         # Divide by 4 as safety buffer
-        available_opportunistic = overreserved // 4
+        available_opportunistic = overreserved // 2.5
 
         if available_opportunistic <= 0:
             return
@@ -281,6 +282,7 @@ class WorkerManager:
                         worker.current_binary = binary
                         worker.estimated_memory = estimated
                         worker.idle = False
+                        worker.opportunistic = True
 
                         try:
                             relative_path = binary.path.relative_to(self.source_dir)
@@ -299,7 +301,7 @@ class WorkerManager:
                             actual_usage_mb = actual_usage / (1024 * 1024)
                             self.manager_logger.info(
                                 f"[Worker {worker.worker_id}] Opportunistic assignment: {binary_name} "
-                                f"(size: {size_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB, total worker usage: {actual_usage_mb:.0f}MB)"
+                                f"(size: {size_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB, total usage: {actual_usage_mb:.0f}MB)"
                             )
                         except (BrokenPipeError, ConnectionResetError, OSError) as e:
                             self.manager_logger.error(
@@ -309,8 +311,43 @@ class WorkerManager:
                             worker.current_binary = None
                             worker.estimated_memory = 0
                             worker.idle = True
+                            worker.opportunistic = False
                             self._restart_worker(worker.worker_id)
                         break
+
+    def _check_memory_pressure_and_kill_opportunistic(self) -> None:
+        """Check if total memory usage is too high and kill largest opportunistic worker if needed."""
+        actual_usage = self._get_worker_actual_memory_usage()
+
+        if actual_usage > self.max_memory:
+            # Find all opportunistic workers with current tasks
+            opportunistic_workers = [w for w in self.workers if w.opportunistic and w.current_binary is not None]
+
+            if not opportunistic_workers:
+                return
+
+            # Find the one using the most memory (estimated)
+            largest_worker = max(opportunistic_workers, key=lambda w: w.estimated_memory)
+
+            binary_name = largest_worker.current_binary.path.name if largest_worker.current_binary else "unknown"
+            usage_mb = actual_usage / (1024 * 1024)
+            max_mb = self.max_memory / (1024 * 1024)
+            estimated_mb = largest_worker.estimated_memory / (1024 * 1024)
+
+            self.manager_logger.warning(
+                f"[Memory Pressure] Total usage {usage_mb:.0f}MB exceeds limit {max_mb:.0f}MB, "
+                f"killing opportunistic worker {largest_worker.worker_id} ({binary_name}, estimated: {estimated_mb:.0f}MB)"
+            )
+
+            # Release memory and mark as failed
+            self.available_memory += largest_worker.estimated_memory
+            largest_worker.current_binary = None
+            largest_worker.estimated_memory = 0
+            largest_worker.opportunistic = False
+            largest_worker.idle = True
+
+            # Restart the worker
+            self._restart_worker(largest_worker.worker_id)
 
     def _handle_worker_without_task(
         self, worker: WorkerState, worker_id: int, active_workers: set[int], allow_stop: bool
@@ -430,6 +467,9 @@ class WorkerManager:
                 idle_worker_count = sum(1 for w in self.workers if w.idle and w.current_binary is None)
                 if idle_worker_count > 0:
                     self._try_opportunistic_assignment()
+
+                # Check memory pressure and kill opportunistic workers if needed
+                self._check_memory_pressure_and_kill_opportunistic()
 
             if active_workers:
                 threading.Event().wait(0.1)

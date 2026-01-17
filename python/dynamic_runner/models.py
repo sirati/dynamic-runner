@@ -42,6 +42,7 @@ class WorkerState:
     last_memory_check: float | None = None
     max_memory_current_task: int = 0
     idle: bool = False
+    opportunistic: bool = False
 
 
 @dataclass
