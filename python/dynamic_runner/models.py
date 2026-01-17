@@ -41,6 +41,7 @@ class WorkerState:
     last_printed_minute: int | None = None
     last_memory_check: float | None = None
     max_memory_current_task: int = 0
+    idle: bool = False
 
 
 @dataclass

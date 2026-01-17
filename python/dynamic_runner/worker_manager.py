@@ -152,7 +152,7 @@ class WorkerManager:
 
         # Calculate reserved memory based on idle workers
         # Reserve memory for idle workers (excluding the one we're trying to assign to)
-        idle_workers = sum(1 for w in self.workers if w.current_binary is None)
+        idle_workers = sum(1 for w in self.workers if w.current_binary is None and not w.idle)
         reserved_memory = max(0, (idle_workers - 1) * self.reserved_memory_per_worker)
 
         result = assign_binary_to_worker(
@@ -173,8 +173,13 @@ class WorkerManager:
 
         if result.assigned:
             self.available_memory = result.new_available_memory
+            worker.idle = False
             binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
             self.manager_logger.info(f"[Worker {worker.worker_id}] Assigned: {binary_name}")
+        elif result.memory_insufficient and not worker.idle:
+            worker.idle = True
+            self.manager_logger.warning(f"[Worker {worker.worker_id}] Set to idle due to insufficient memory")
+
         return result.assigned
 
     def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
@@ -211,6 +216,7 @@ class WorkerManager:
             active_workers.discard(worker_id)
             return False
 
+        # Worker is idle but binaries remain - keep it in the loop
         return True
 
     def _handle_monitor_result(

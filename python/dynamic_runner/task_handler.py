@@ -12,6 +12,7 @@ class AssignmentResult:
     assigned: bool
     new_available_memory: int
     socket_error: bool = False
+    memory_insufficient: bool = False
 
 
 def assign_binary_to_worker(
@@ -68,12 +69,18 @@ def assign_binary_to_worker(
 
                 return AssignmentResult(assigned=True, new_available_memory=new_available_memory)
 
-        if unassigned_tasks is not None and pending_binaries:
-            for binary in pending_binaries:
-                if binary not in unassigned_tasks:
-                    unassigned_tasks.append(binary)
+        # No binary could be assigned - check if it's due to memory constraints
+        memory_insufficient = False
+        if pending_binaries:
+            memory_insufficient = True
+            if unassigned_tasks is not None:
+                for binary in pending_binaries:
+                    if binary not in unassigned_tasks:
+                        unassigned_tasks.append(binary)
 
-        return AssignmentResult(assigned=False, new_available_memory=available_memory)
+        return AssignmentResult(
+            assigned=False, new_available_memory=available_memory, memory_insufficient=memory_insufficient
+        )
 
 
 def worker_completed(
