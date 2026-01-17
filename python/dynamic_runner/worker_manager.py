@@ -8,7 +8,7 @@ from shared import setup_file_logger
 from .binary_info import BinaryInfo
 from .models import ErrorType, TaskResult, WorkerState
 from .processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
-from .task_handler import AssignmentResult, assign_binary_to_worker, worker_completed
+from .task_handler import assign_binary_to_worker, worker_completed
 from .worker_communication import send_worker_command
 from .worker_lifecycle import restart_worker, start_worker
 from .worker_monitoring import monitor_worker_once
@@ -51,6 +51,7 @@ class WorkerManager:
         self.unassigned_tasks: list[BinaryInfo] = []
         self.pending_worker_assignments: set[int] = set()
         self.stats = {"completed": 0, "failed": 0, "total": 0, "skipped": 0}
+        self.initial_assignment_count = 0
 
         start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_dir = output_dir / "logs" / start_time
@@ -142,14 +143,29 @@ class WorkerManager:
 
         return new_worker
 
-    def _assign_binary_to_worker(self, worker: WorkerState, track_unassigned: bool = False) -> bool:
+    def _assign_binary_to_worker(
+        self, worker: WorkerState, track_unassigned: bool = False, is_initial_phase: bool = False
+    ) -> bool:
         """Try to assign a binary to the worker."""
+        # During initial phase, don't assign if worker already received its initial assignment
+        if is_initial_phase and worker.has_received_initial_assignment:
+            return False
+
         unassigned_list = self.unassigned_tasks if track_unassigned else None
 
         # Calculate reserved memory based on idle workers
         # Reserve memory for idle workers (excluding the one we're trying to assign to)
         idle_workers = sum(1 for w in self.workers if w.current_binary is None and not w.idle)
         reserved_memory = max(0, (idle_workers - 1) * self.reserved_memory_per_worker)
+
+        # Calculate initial phase budget if in initial phase
+        initial_phase_budget = None
+        if is_initial_phase and not worker.has_received_initial_assignment:
+            self.initial_assignment_count += 1
+            if self.initial_assignment_count == 1 or len(self.pending_binaries) == 1:
+                initial_phase_budget = self.max_memory
+            else:
+                initial_phase_budget = self.max_memory // self.initial_assignment_count
 
         result = assign_binary_to_worker(
             worker,
@@ -160,6 +176,7 @@ class WorkerManager:
             self.lock,
             unassigned_list,
             self.manager_logger,
+            initial_phase_budget,
         )
 
         if result.socket_error:
@@ -172,11 +189,42 @@ class WorkerManager:
             self.available_memory = result.new_available_memory
             worker.idle = False
             worker.opportunistic = False
+            if is_initial_phase:
+                worker.has_received_initial_assignment = True
             binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
             self.manager_logger.info(f"[Worker {worker.worker_id}] Assigned: {binary_name}")
         elif result.memory_insufficient and not worker.idle:
             worker.idle = True
-            self.manager_logger.warning(f"[Worker {worker.worker_id}] Set to idle due to insufficient memory")
+            if is_initial_phase:
+                worker.has_received_initial_assignment = True
+
+            # Find smallest binary that doesn't fit the budget
+            budget_info = ""
+            if initial_phase_budget is not None:
+                budget_mb = initial_phase_budget / (1024 * 1024)
+                budget_info = f", budget: {budget_mb:.2f}MB"
+
+                # Find smallest binary that exceeds budget
+                from .memory import estimate_memory
+
+                smallest_out_of_budget = None
+                for binary in self.pending_binaries:
+                    estimated = estimate_memory(binary.size)
+                    if estimated > initial_phase_budget:
+                        if smallest_out_of_budget is None or estimated < estimate_memory(smallest_out_of_budget.size):
+                            smallest_out_of_budget = binary
+
+                if smallest_out_of_budget:
+                    smallest_size_mb = smallest_out_of_budget.size / (1024 * 1024)
+                    smallest_estimated_mb = estimate_memory(smallest_out_of_budget.size) / (1024 * 1024)
+                    budget_info += (
+                        f", smallest out-of-budget: {smallest_out_of_budget.path.name} "
+                        f"({smallest_size_mb:.2f}MB, est: {smallest_estimated_mb:.2f}MB)"
+                    )
+
+            self.manager_logger.warning(
+                f"[Worker {worker.worker_id}] Set to idle due to insufficient memory{budget_info}"
+            )
 
         return result.assigned
 
@@ -296,7 +344,8 @@ class WorkerManager:
                             actual_usage_mb = actual_usage / (1024 * 1024)
                             self.manager_logger.info(
                                 f"[Worker {worker.worker_id}] Opportunistic assignment: {binary_name} "
-                                f"(size: {size_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB, total usage: {actual_usage_mb:.0f}MB)"
+                                f"(size: {size_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, "
+                                f"budget: {budget_mb:.2f}MB, total usage: {actual_usage_mb:.0f}MB)"
                             )
                         except (BrokenPipeError, ConnectionResetError, OSError) as e:
                             self.manager_logger.error(
@@ -331,7 +380,8 @@ class WorkerManager:
 
             self.manager_logger.warning(
                 f"[Memory Pressure] Total usage {usage_mb:.0f}MB exceeds limit {max_mb:.0f}MB, "
-                f"killing opportunistic worker {largest_worker.worker_id} ({binary_name}, estimated: {estimated_mb:.0f}MB)"
+                f"killing opportunistic worker {largest_worker.worker_id} "
+                f"({binary_name}, estimated: {estimated_mb:.0f}MB)"
             )
 
             # Release memory and mark as failed
@@ -345,10 +395,15 @@ class WorkerManager:
             self._restart_worker(largest_worker.worker_id)
 
     def _handle_worker_without_task(
-        self, worker: WorkerState, worker_id: int, active_workers: set[int], allow_stop: bool
+        self,
+        worker: WorkerState,
+        worker_id: int,
+        active_workers: set[int],
+        allow_stop: bool,
+        is_initial_phase: bool = False,
     ) -> bool:
         """Handle a worker that has no current task. Returns True if worker should continue."""
-        if self._assign_binary_to_worker(worker):
+        if self._assign_binary_to_worker(worker, is_initial_phase=is_initial_phase):
             return True
 
         if not self.pending_binaries and allow_stop:
@@ -372,6 +427,7 @@ class WorkerManager:
         active_workers: set[int],
         allow_stop: bool,
         on_failure_increment_failed: bool,
+        is_initial_phase: bool = False,
     ) -> None:
         """Handle the result from monitoring a worker."""
         if monitor_result.should_restart:
@@ -407,7 +463,11 @@ class WorkerManager:
 
         # Get updated worker reference in case it was restarted elsewhere
         worker = self.workers[worker_id]
-        if not self._assign_binary_to_worker(worker) and not self.pending_binaries and allow_stop:
+        if (
+            not self._assign_binary_to_worker(worker, is_initial_phase=is_initial_phase)
+            and not self.pending_binaries
+            and allow_stop
+        ):
             log_to_worker_file(self.log_dir, worker_id, f"Worker {worker_id} stopping (no more tasks)")
             self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")
             success, error = send_worker_command(worker, "stop")
@@ -421,6 +481,7 @@ class WorkerManager:
         active_workers: set[int],
         allow_stop: bool = True,
         on_failure_increment_failed: bool = False,
+        is_initial_phase: bool = False,
     ) -> None:
         """Main worker processing loop."""
         while active_workers or self.pending_binaries:
@@ -428,7 +489,9 @@ class WorkerManager:
                 worker = self.workers[worker_id]
 
                 if worker.current_binary is None:
-                    if not self._handle_worker_without_task(worker, worker_id, active_workers, allow_stop):
+                    if not self._handle_worker_without_task(
+                        worker, worker_id, active_workers, allow_stop, is_initial_phase
+                    ):
                         continue
                 else:
 
@@ -451,6 +514,7 @@ class WorkerManager:
                             active_workers,
                             allow_stop,
                             on_failure_increment_failed,
+                            is_initial_phase,
                         )
 
             # After processing all workers, handle pending worker assignments first
@@ -458,11 +522,12 @@ class WorkerManager:
                 for worker_id in list(self.pending_worker_assignments):
                     worker = self.workers[worker_id]
                     if worker.current_binary is None:
-                        self._assign_binary_to_worker(worker)
+                        self._assign_binary_to_worker(worker, is_initial_phase=is_initial_phase)
                         self.pending_worker_assignments.discard(worker_id)
 
             # After processing all workers, try to assign to idle workers if we have pending binaries
-            if self.pending_binaries:
+            # Skip opportunistic assignment during initial phase
+            if self.pending_binaries and not is_initial_phase:
                 idle_worker_count = sum(1 for w in self.workers if w.idle and w.current_binary is None)
                 if idle_worker_count > 1:
                     self._try_assign_to_idle_workers()
@@ -486,8 +551,11 @@ class WorkerManager:
 
     def _run_initial_phase(self) -> None:
         """Run the initial processing phase."""
+        self.initial_assignment_count = 0
         active_workers = set(range(self.num_workers))
-        self._process_worker_loop(active_workers, allow_stop=False, on_failure_increment_failed=False)
+        self._process_worker_loop(
+            active_workers, allow_stop=False, on_failure_increment_failed=False, is_initial_phase=True
+        )
         self.unassigned_tasks = list(set(self.unassigned_tasks))
 
     def _run_retry_phase(self) -> None:

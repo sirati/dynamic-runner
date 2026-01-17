@@ -2,7 +2,6 @@ import socket
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 
 from .binary_info import BinaryInfo
 
@@ -43,6 +42,9 @@ class WorkerState:
     max_memory_current_task: int = 0
     idle: bool = False
     opportunistic: bool = False
+    reserved_budget: int = 0
+    has_completed_non_opportunistic: bool = False
+    has_received_initial_assignment: bool = False
 
 
 @dataclass
