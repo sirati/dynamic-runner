@@ -2,7 +2,13 @@ import os
 import re
 from pathlib import Path
 
-from .binary_info import BinaryInfo, build_binary_filename_format, build_field_regexes, parse_binary_filename
+from .binary_info import (
+    BinaryIdentifier,
+    BinaryInfo,
+    build_binary_filename_format,
+    build_field_regexes,
+    parse_binary_filename,
+)
 
 
 def find_matching_binaries(
@@ -127,11 +133,13 @@ def find_matching_binaries(
                 BinaryInfo(
                     path=filepath,
                     size=size,
-                    binary_name=binary_name,
-                    platform=platform,
-                    compiler=comp,
-                    version=version,
-                    opt_level=opt,
+                    identifier=BinaryIdentifier(
+                        binary_name=binary_name,
+                        platform=platform,
+                        compiler=comp,
+                        version=version,
+                        opt_level=opt,
+                    ),
                 )
             )
 

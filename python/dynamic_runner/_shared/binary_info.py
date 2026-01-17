@@ -3,15 +3,40 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-@dataclass
-class BinaryInfo:
-    path: Path
-    size: int
+@dataclass(frozen=True)
+class BinaryIdentifier:
     binary_name: str
     platform: str
     compiler: str
     version: str
     opt_level: str
+
+
+@dataclass
+class BinaryInfo:
+    path: Path
+    size: int
+    identifier: BinaryIdentifier
+
+    @property
+    def binary_name(self) -> str:
+        return self.identifier.binary_name
+
+    @property
+    def platform(self) -> str:
+        return self.identifier.platform
+
+    @property
+    def compiler(self) -> str:
+        return self.identifier.compiler
+
+    @property
+    def version(self) -> str:
+        return self.identifier.version
+
+    @property
+    def opt_level(self) -> str:
+        return self.identifier.opt_level
 
 
 FIELD_MAPPING = {
