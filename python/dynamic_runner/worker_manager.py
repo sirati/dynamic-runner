@@ -49,6 +49,7 @@ class WorkerManager:
         self.failed_tasks: list = []
         self.oom_tasks: list = []
         self.unassigned_tasks: list[BinaryInfo] = []
+        self.pending_worker_assignments: set[int] = set()
         self.stats = {"completed": 0, "failed": 0, "total": 0, "skipped": 0}
 
         start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -164,6 +165,7 @@ class WorkerManager:
         if result.socket_error:
             self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error during assignment, restarting worker")
             self._restart_worker(worker.worker_id)
+            self.pending_worker_assignments.add(worker.worker_id)
             return False
 
         if result.assigned:
@@ -375,6 +377,7 @@ class WorkerManager:
         if monitor_result.should_restart:
             self._worker_completed(worker, monitor_result.result)
             self._restart_worker(worker_id)
+            self.pending_worker_assignments.add(worker_id)
             return
 
         if not monitor_result.task_completed:
@@ -449,6 +452,14 @@ class WorkerManager:
                             allow_stop,
                             on_failure_increment_failed,
                         )
+
+            # After processing all workers, handle pending worker assignments first
+            if self.pending_worker_assignments and self.pending_binaries:
+                for worker_id in list(self.pending_worker_assignments):
+                    worker = self.workers[worker_id]
+                    if worker.current_binary is None:
+                        self._assign_binary_to_worker(worker)
+                        self.pending_worker_assignments.discard(worker_id)
 
             # After processing all workers, try to assign to idle workers if we have pending binaries
             if self.pending_binaries:
