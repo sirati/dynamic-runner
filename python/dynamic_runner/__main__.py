@@ -1,4 +1,5 @@
 import argparse
+import logging
 
 from shared import (
     add_selection_arguments,
@@ -15,6 +16,14 @@ from .worker_manager import WorkerManager
 
 
 def main():
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     parser = argparse.ArgumentParser(
         description="Dynamic batch processing for binary tokenization with memory-aware parallel execution"
     )
@@ -58,11 +67,11 @@ def main():
         display_opt_levels = normalized.display_values
 
     print_selection_summary(config, display_opt_levels)
-    print(f"Cores: {num_cores}")
-    print(f"Max memory: {max_memory / (1024**3):.2f}GB")
-    print()
+    logger.info(f"Cores: {num_cores}")
+    logger.info(f"Max memory: {max_memory / (1024**3):.2f}GB")
+    logger.info("")
 
-    print("Scanning for matching binaries...")
+    logger.info("Scanning for matching binaries...")
     binaries = find_matching_binaries(
         config.source_dir,
         config.platforms,
@@ -76,29 +85,29 @@ def main():
         config.exclude_subfolders,
     )
 
-    print(f"Found {len(binaries)} matching binaries")
+    logger.info(f"Found {len(binaries)} matching binaries")
 
     if not binaries:
-        print("No binaries found matching the criteria")
+        logger.info("No binaries found matching the criteria")
         return
 
     if config.list_files:
-        print("\nMatched files:")
+        logger.info("\nMatched files:")
         for binary in binaries:
-            print(format_binary_info(binary, config.source_dir))
+            logger.info(format_binary_info(binary, config.source_dir))
         return
 
-    print("Organizing and sorting binaries...")
+    logger.info("Organizing and sorting binaries...")
     sorted_binaries = organize_and_sort_binaries(binaries)
 
     if args.skip_existing:
-        print("Filtering out binaries with existing output files...")
+        logger.info("Filtering out binaries with existing output files...")
         sorted_binaries, skipped_count = filter_existing_outputs(sorted_binaries, config.source_dir, config.output_dir)
-        print(f"Skipped {skipped_count} binaries with existing outputs")
-        print(f"Remaining binaries to process: {len(sorted_binaries)}")
+        logger.info(f"Skipped {skipped_count} binaries with existing outputs")
+        logger.info(f"Remaining binaries to process: {len(sorted_binaries)}")
 
         if not sorted_binaries:
-            print("No binaries to process after filtering")
+            logger.info("No binaries to process after filtering")
             return
 
     manager = WorkerManager(

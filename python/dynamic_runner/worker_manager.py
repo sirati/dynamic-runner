@@ -3,6 +3,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from shared import setup_file_logger
+
 from .binary_info import BinaryInfo
 from .models import ErrorType, TaskResult, WorkerState
 from .processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
@@ -61,25 +63,13 @@ class WorkerManager:
     def _setup_logger(self) -> logging.Logger:
         """Setup and configure the manager logger."""
         manager_log_path = self.log_dir / "manager.log"
-        logger = logging.getLogger("manager")
-        logger.setLevel(logging.INFO)
-        logger.propagate = False
-
-        file_handler = logging.FileHandler(manager_log_path, mode="a")
-        file_handler.setLevel(logging.INFO)
-        file_formatter = logging.Formatter(
-            "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        return setup_file_logger(
+            name="manager",
+            log_file_path=manager_log_path,
+            level=logging.INFO,
+            console=True,
+            console_format="%(levelname)s %(asctime)s | %(name)s %(message)s",
         )
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
-
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_formatter = logging.Formatter("%(levelname)s %(asctime)s | %(name)s %(message)s", datefmt="%H:%M")
-        console_handler.setFormatter(console_formatter)
-        logger.addHandler(console_handler)
-
-        return logger
 
     def _log_memory_usage(self, worker: WorkerState, errored: bool) -> None:
         """Log memory usage to memuse.log file."""

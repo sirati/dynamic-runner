@@ -17,6 +17,12 @@ from .binary_info import (
     parse_binary_filename,
 )
 from .binary_selector import find_matching_binaries
+from .logging_utils import (
+    WarningCounterHandler,
+    remove_stream_handlers,
+    setup_file_logger,
+    setup_logger,
+)
 from .selection_args import (
     NormalizedOptLevels,
     SelectionConfig,
@@ -41,4 +47,8 @@ __all__ = [
     "add_selection_arguments",
     "process_selection_arguments",
     "normalize_opt_levels",
+    "WarningCounterHandler",
+    "remove_stream_handlers",
+    "setup_file_logger",
+    "setup_logger",
 ]
