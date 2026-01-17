@@ -12,6 +12,11 @@ from .worker_lifecycle import restart_worker, start_worker
 from .worker_monitoring import monitor_worker_once
 from .worker_utils import cleanup_workers, increment_stat, log_to_worker_file
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 
 class WorkerManager:
     def __init__(
@@ -199,6 +204,114 @@ class WorkerManager:
         )
         self.available_memory += released
 
+    def _get_worker_actual_memory_usage(self) -> int:
+        """Get actual memory usage of all workers combined."""
+        if psutil is None:
+            return 0
+
+        total_memory = 0
+        for worker in self.workers:
+            if worker.process and worker.process.poll() is None:
+                try:
+                    process = psutil.Process(worker.process.pid)
+                    total_memory += process.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
+        return total_memory
+
+    def _try_assign_to_idle_workers(self) -> None:
+        """Try to assign tasks to workers that were marked idle due to insufficient memory."""
+        for w in self.workers:
+            if w.idle and w.current_binary is None:
+                if self._assign_binary_to_worker(w):
+                    break
+
+    def _try_opportunistic_assignment(self) -> None:
+        """Try to assign tasks to idle workers using overreserved memory."""
+        idle_workers_list = [w for w in self.workers if w.idle and w.current_binary is None]
+        if not idle_workers_list:
+            return
+
+        # Measure actual memory usage
+        actual_usage = self._get_worker_actual_memory_usage()
+        overreserved = self.max_memory - actual_usage
+
+        if overreserved <= 0:
+            return
+
+        # Divide by 4 as safety buffer
+        available_opportunistic = overreserved // 4
+
+        if available_opportunistic <= 0:
+            return
+
+        # Distribute memory: first gets 1/2, second gets 1/4, third gets 1/8, etc.
+        # Last gets same as previous
+        memory_budgets = []
+        remaining = available_opportunistic
+        for i in range(len(idle_workers_list)):
+            if i == 0:
+                budget = remaining // 2
+            elif i == len(idle_workers_list) - 1:
+                # Last worker gets same as previous
+                budget = memory_budgets[-1] if memory_budgets else 0
+            else:
+                budget = remaining // (2 ** (i + 1))
+
+            if budget > 0:
+                memory_budgets.append(budget)
+            else:
+                break
+
+        # Try to assign binaries that fit within budgets
+        for worker, budget in zip(idle_workers_list, memory_budgets):
+            if not self.pending_binaries:
+                break
+
+            # Find a binary that fits within this worker's budget
+            with self.lock:
+                for i, binary in enumerate(self.pending_binaries):
+                    from .memory import estimate_memory
+
+                    estimated = estimate_memory(binary.size)
+
+                    if estimated <= budget:
+                        # Assign this binary
+                        self.pending_binaries.pop(i)
+                        worker.current_binary = binary
+                        worker.estimated_memory = estimated
+                        worker.idle = False
+
+                        try:
+                            relative_path = binary.path.relative_to(self.source_dir)
+                        except ValueError:
+                            relative_path = binary.path
+
+                        message = f"{relative_path}\n"
+                        try:
+                            worker.socket.sendall(message.encode("utf-8"))
+                            # Update available_memory to avoid double-reservation
+                            self.available_memory -= estimated
+                            binary_name = worker.current_binary.path.name
+                            size_mb = binary.size / (1024 * 1024)
+                            estimated_mb = estimated / (1024 * 1024)
+                            budget_mb = budget / (1024 * 1024)
+                            actual_usage_mb = actual_usage / (1024 * 1024)
+                            self.manager_logger.info(
+                                f"[Worker {worker.worker_id}] Opportunistic assignment: {binary_name} "
+                                f"(size: {size_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB, total worker usage: {actual_usage_mb:.0f}MB)"
+                            )
+                        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                            self.manager_logger.error(
+                                f"[Worker {worker.worker_id}] Socket error during opportunistic assignment: {e}"
+                            )
+                            self.pending_binaries.insert(i, binary)
+                            worker.current_binary = None
+                            worker.estimated_memory = 0
+                            worker.idle = True
+                            self._restart_worker(worker.worker_id)
+                        break
+
     def _handle_worker_without_task(
         self, worker: WorkerState, worker_id: int, active_workers: set[int], allow_stop: bool
     ) -> bool:
@@ -306,6 +419,17 @@ class WorkerManager:
                             allow_stop,
                             on_failure_increment_failed,
                         )
+
+            # After processing all workers, try to assign to idle workers if we have pending binaries
+            if self.pending_binaries:
+                idle_worker_count = sum(1 for w in self.workers if w.idle and w.current_binary is None)
+                if idle_worker_count > 1:
+                    self._try_assign_to_idle_workers()
+
+                # Try opportunistic assignment with overreserved memory
+                idle_worker_count = sum(1 for w in self.workers if w.idle and w.current_binary is None)
+                if idle_worker_count > 0:
+                    self._try_opportunistic_assignment()
 
             if active_workers:
                 threading.Event().wait(0.1)
