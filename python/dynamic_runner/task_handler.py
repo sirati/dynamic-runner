@@ -1,9 +1,17 @@
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from .binary_info import BinaryInfo
 from .memory import estimate_memory, get_actual_memory_usage
 from .models import ErrorType, FailedTask, ProcessingPhase, TaskResult, WorkerState
+
+
+@dataclass
+class AssignmentResult:
+    assigned: bool
+    new_available_memory: int
+    socket_error: bool = False
 
 
 def assign_binary_to_worker(
@@ -15,10 +23,11 @@ def assign_binary_to_worker(
     lock: threading.Lock,
     unassigned_tasks: list[BinaryInfo] | None = None,
     logger=None,
-) -> tuple[bool, int]:
-    """Try to assign a binary to the worker. Returns (assigned, new_available_memory).
+) -> AssignmentResult:
+    """Try to assign a binary to the worker.
 
     Tasks that cannot be assigned due to memory constraints are added to unassigned_tasks if provided.
+    Returns AssignmentResult with assignment status, new memory, and socket error flag.
     """
     with lock:
         actual_usage = get_actual_memory_usage()
@@ -38,7 +47,15 @@ def assign_binary_to_worker(
                     relative_path = binary.path
 
                 message = f"{relative_path}\n"
-                worker.socket.sendall(message.encode("utf-8"))
+                try:
+                    worker.socket.sendall(message.encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    if logger:
+                        logger.error(f"[Worker {worker.worker_id}] Socket error while assigning binary: {e}")
+                    pending_binaries.insert(i, binary)
+                    worker.current_binary = None
+                    worker.estimated_memory = 0
+                    return AssignmentResult(assigned=False, new_available_memory=available_memory, socket_error=True)
 
                 if logger:
                     size_mb = binary.size / (1024 * 1024)
@@ -49,14 +66,14 @@ def assign_binary_to_worker(
                         f"Available after: {new_available_memory / (1024 * 1024):.2f}MB"
                     )
 
-                return True, new_available_memory
+                return AssignmentResult(assigned=True, new_available_memory=new_available_memory)
 
         if unassigned_tasks is not None and pending_binaries:
             for binary in pending_binaries:
                 if binary not in unassigned_tasks:
                     unassigned_tasks.append(binary)
 
-        return False, available_memory
+        return AssignmentResult(assigned=False, new_available_memory=available_memory)
 
 
 def worker_completed(

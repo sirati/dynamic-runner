@@ -6,7 +6,7 @@ from pathlib import Path
 from .binary_info import BinaryInfo
 from .models import ErrorType, TaskResult, WorkerState
 from .processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
-from .task_handler import assign_binary_to_worker, worker_completed
+from .task_handler import AssignmentResult, assign_binary_to_worker, worker_completed
 from .worker_communication import send_worker_command
 from .worker_lifecycle import restart_worker, start_worker
 from .worker_monitoring import monitor_worker_once
@@ -155,7 +155,7 @@ class WorkerManager:
         idle_workers = sum(1 for w in self.workers if w.current_binary is None)
         reserved_memory = max(0, (idle_workers - 1) * self.reserved_memory_per_worker)
 
-        assigned, new_memory = assign_binary_to_worker(
+        result = assign_binary_to_worker(
             worker,
             self.pending_binaries,
             self.available_memory,
@@ -165,11 +165,17 @@ class WorkerManager:
             unassigned_list,
             self.manager_logger,
         )
-        if assigned:
-            self.available_memory = new_memory
+
+        if result.socket_error:
+            self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error during assignment, restarting worker")
+            self._restart_worker(worker.worker_id)
+            return False
+
+        if result.assigned:
+            self.available_memory = result.new_available_memory
             binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
             self.manager_logger.info(f"[Worker {worker.worker_id}] Assigned: {binary_name}")
-        return assigned
+        return result.assigned
 
     def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
         """Mark worker as completed and release memory."""
