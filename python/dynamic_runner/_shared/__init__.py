@@ -7,9 +7,13 @@ This package contains reusable code for:
 """
 
 from .binary_info import (
+    BinaryFilenameFormat,
     BinaryInfo,
     FieldRegexes,
+    build_binary_filename_format,
     build_field_regexes,
+    format_binary_info,
+    format_size,
     parse_binary_filename,
 )
 from .binary_selector import find_matching_binaries
@@ -24,8 +28,12 @@ from .selection_args import (
 
 __all__ = [
     "BinaryInfo",
+    "BinaryFilenameFormat",
     "FieldRegexes",
+    "build_binary_filename_format",
     "build_field_regexes",
+    "format_binary_info",
+    "format_size",
     "parse_binary_filename",
     "find_matching_binaries",
     "SelectionConfig",
@@ -33,5 +41,4 @@ __all__ = [
     "add_selection_arguments",
     "process_selection_arguments",
     "normalize_opt_levels",
-    "print_selection_summary",
 ]

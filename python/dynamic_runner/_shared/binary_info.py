@@ -40,6 +40,15 @@ class FieldRegexes:
     binary_name: str = r".+"
 
 
+@dataclass
+class BinaryFilenameFormat:
+    field_regexes: FieldRegexes
+    format_string: str
+    regex: re.Pattern
+    field_to_group: dict[str, int]
+    opt_transform: str | None
+
+
 def build_field_regexes(
     platforms: list[str] | None = None,
     compilers: list[str] | None = None,
@@ -212,46 +221,102 @@ def build_regex_from_format(
     return compiled_regex, field_to_group, field_regexes.opt_level_transform
 
 
-def parse_binary_filename(
-    filename: str,
+def build_binary_filename_format(
     format_string: str = "platform-compiler-version-optimisationlevel_binaryname",
     field_regexes: FieldRegexes | None = None,
-) -> tuple[str, str, str, str, str] | None:
-    """Parse binary filename using format string template.
+) -> BinaryFilenameFormat:
+    """Build a BinaryFilenameFormat from format string and field regexes.
 
     Args:
-        filename: The binary filename to parse
-        format_string: Format template with field names (e.g., 'p-c-cv-opt_name')
+        format_string: Format template with field names
         field_regexes: Custom regex patterns for fields
 
     Returns:
-        Tuple of (platform, compiler, version, opt_level, binary_name) or None if no match
+        BinaryFilenameFormat containing all necessary parsing components
     """
     if field_regexes is None:
         field_regexes = build_field_regexes()
 
-    try:
-        regex, field_to_group, opt_transform = build_regex_from_format(format_string, field_regexes)
-    except ValueError:
-        return None
+    regex, field_to_group, opt_transform = build_regex_from_format(format_string, field_regexes)
 
-    match = regex.match(filename)
+    return BinaryFilenameFormat(
+        field_regexes=field_regexes,
+        format_string=format_string,
+        regex=regex,
+        field_to_group=field_to_group,
+        opt_transform=opt_transform,
+    )
+
+
+def parse_binary_filename(
+    filename: str,
+    binary_format: BinaryFilenameFormat,
+) -> tuple[str, str, str, str, str] | None:
+    """Parse binary filename using prebuilt binary format.
+
+    Args:
+        filename: The binary filename to parse
+        binary_format: Prebuilt BinaryFilenameFormat containing regex and field mappings
+
+    Returns:
+        Tuple of (platform, compiler, version, opt_level, binary_name) or None if no match
+    """
+    match = binary_format.regex.match(filename)
     if not match:
         return None
 
     groups = match.groups()
 
-    platform = groups[field_to_group["platform"] - 1]
-    compiler = groups[field_to_group["compiler"] - 1]
-    version = groups[field_to_group["version"] - 1]
-    binary_name = groups[field_to_group["binary_name"] - 1]
+    platform = groups[binary_format.field_to_group["platform"] - 1]
+    compiler = groups[binary_format.field_to_group["compiler"] - 1]
+    version = groups[binary_format.field_to_group["version"] - 1]
+    binary_name = groups[binary_format.field_to_group["binary_name"] - 1]
 
-    opt_group_idx = field_to_group["opt_level"] - 1
-    if opt_transform == "O":
+    opt_group_idx = binary_format.field_to_group["opt_level"] - 1
+    if binary_format.opt_transform == "O":
         opt_level = "O" + groups[opt_group_idx + 1]
-    elif opt_transform == "transform":
+    elif binary_format.opt_transform == "transform":
         opt_level = groups[opt_group_idx]
     else:
         opt_level = groups[opt_group_idx]
 
     return (platform, compiler, version, opt_level, binary_name)
+
+
+def format_size(size: int) -> str:
+    """Format file size in human-readable format (B, KiB, MiB, GiB).
+
+    Args:
+        size: Size in bytes
+
+    Returns:
+        Formatted size string
+    """
+    if size < 1024:
+        return f"{size}B"
+    elif size < 1024 * 1024:
+        return f"{size / 1024:.1f}KiB"
+    elif size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f}MiB"
+    else:
+        return f"{size / (1024 * 1024 * 1024):.1f}GiB"
+
+
+def format_binary_info(binary: BinaryInfo, base_path: Path | None = None) -> str:
+    """Format BinaryInfo for display.
+
+    Args:
+        binary: BinaryInfo to format
+        base_path: Optional base path to compute relative path from
+
+    Returns:
+        Formatted string with path, fields, and size
+    """
+    if base_path:
+        path = binary.path.relative_to(base_path)
+    else:
+        path = binary.path
+
+    fields = f"[{binary.platform}, {binary.compiler}, {binary.version}, {binary.opt_level}, {binary.binary_name}]"
+    size_str = format_size(binary.size)
+    return f"  {path}  {fields}  {size_str}"

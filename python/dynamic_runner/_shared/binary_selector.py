@@ -2,7 +2,7 @@ import os
 import re
 from pathlib import Path
 
-from .binary_info import BinaryInfo, build_field_regexes, parse_binary_filename
+from .binary_info import BinaryInfo, build_binary_filename_format, build_field_regexes, parse_binary_filename
 
 
 def find_matching_binaries(
@@ -51,6 +51,8 @@ def find_matching_binaries(
         name_regex=name_regex,
     )
 
+    binary_format = build_binary_filename_format(format_string, field_regexes)
+
     normalized_opt_levels = None
     if opt_levels:
         normalized_opt_levels = []
@@ -95,7 +97,7 @@ def find_matching_binaries(
                 continue
 
             # Parse the filename according to the format string
-            parsed = parse_binary_filename(filename, format_string, field_regexes)
+            parsed = parse_binary_filename(filename, binary_format)
             if not parsed:
                 continue
 

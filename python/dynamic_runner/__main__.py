@@ -3,6 +3,7 @@ import argparse
 from shared import (
     add_selection_arguments,
     find_matching_binaries,
+    format_binary_info,
     normalize_opt_levels,
     print_selection_summary,
     process_selection_arguments,
@@ -84,11 +85,7 @@ def main():
     if config.list_files:
         print("\nMatched files:")
         for binary in binaries:
-            rel_path = binary.path.relative_to(config.source_dir)
-            fields = (
-                f"[{binary.platform}, {binary.compiler}, {binary.version}, {binary.opt_level}, {binary.binary_name}]"
-            )
-            print(f"  {rel_path}  {fields}")
+            print(format_binary_info(binary, config.source_dir))
         return
 
     print("Organizing and sorting binaries...")
