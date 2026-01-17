@@ -237,11 +237,14 @@ class WorkerManager:
         actual_usage = self._get_worker_actual_memory_usage()
         overreserved = self.max_memory - actual_usage
 
+        if self.available_memory < 0:
+            overreserved += self.available_memory
+
         if overreserved <= 0:
             return
 
         # Divide by 4 as safety buffer
-        available_opportunistic = overreserved // 2.5
+        available_opportunistic = overreserved // 2
 
         if available_opportunistic <= 0:
             return
