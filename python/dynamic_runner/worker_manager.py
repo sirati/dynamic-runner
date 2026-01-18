@@ -211,9 +211,10 @@ class WorkerManager:
             socket_path,
         )
 
-        # Preserve initial budget and opportunistic status
+        # Preserve initial budget, opportunistic status, and initial assignment flag
         new_worker.reserved_budget = old_worker.reserved_budget
         new_worker.opportunistic = old_worker.opportunistic
+        new_worker.has_received_initial_assignment = old_worker.has_received_initial_assignment
         new_worker.idle = True
         # Reset ready flag - worker needs to send ready signal again
         new_worker.ready = False
@@ -248,6 +249,10 @@ class WorkerManager:
         if not worker.ready or not worker.connection_established:
             return False
 
+        # Only assign once per worker during initial phase
+        if worker.has_received_initial_assignment:
+            return False
+
         with self.lock:
             if not self.pending_binaries:
                 return False
@@ -261,7 +266,7 @@ class WorkerManager:
                 if estimated > budget:
                     continue
 
-                # Check if assigning would exceed memory limit
+                # Check if assigning would exceed memory limit (only on first assignment)
                 would_exceed = (self.total_assigned_memory + estimated) > self.max_memory
 
                 # Assign the task
@@ -269,10 +274,12 @@ class WorkerManager:
                 worker.current_binary = binary
                 worker.estimated_memory = estimated
                 worker.idle = False
+                worker.has_received_initial_assignment = True
 
                 # Track all assigned memory
                 self.total_assigned_memory += estimated
 
+                # Only mark as opportunistic on first assignment
                 if would_exceed:
                     worker.opportunistic = True
 
@@ -396,7 +403,9 @@ class WorkerManager:
         self._log_memory_usage(worker, errored)
 
         with self.lock:
-            pass
+            # Decrement total_assigned_memory if this was an initial assignment
+            if worker.current_binary and worker.has_received_initial_assignment and not worker.opportunistic:
+                self.total_assigned_memory = max(0, self.total_assigned_memory - worker.estimated_memory)
 
         worker_completed(
             worker,
@@ -512,7 +521,14 @@ class WorkerManager:
     ) -> bool:
         """Handle a worker that has no current task. Returns True if worker should continue."""
         if is_initial_phase:
-            assigned = self._assign_binary_to_worker_initial_phase(worker)
+            # During initial phase, only assign using initial phase logic if not yet assigned
+            if not worker.has_received_initial_assignment:
+                assigned = self._assign_binary_to_worker_initial_phase(worker)
+            else:
+                # Already received initial assignment, use normal logic
+                assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
+                if not assigned:
+                    assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=True)
         else:
             assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
             if not assigned:
@@ -626,7 +642,14 @@ class WorkerManager:
         # Get updated worker reference in case it was restarted elsewhere
         worker = self.workers[worker_id]
         if is_initial_phase:
-            assigned = self._assign_binary_to_worker_initial_phase(worker)
+            # During initial phase, only assign using initial phase logic if not yet assigned
+            if not worker.has_received_initial_assignment:
+                assigned = self._assign_binary_to_worker_initial_phase(worker)
+            else:
+                # Already received initial assignment, use normal logic
+                assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
+                if not assigned:
+                    assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=True)
         else:
             assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
             if not assigned:
@@ -687,7 +710,7 @@ class WorkerManager:
         is_initial_phase: bool = False,
     ) -> None:
         """Main worker processing loop."""
-        while active_workers or self.pending_binaries:
+        while active_workers:
             # Check for manual worker connections
             if self.manual_start_worker:
                 self._check_manual_worker_connections()
@@ -750,7 +773,13 @@ class WorkerManager:
                     worker = self.workers[worker_id]
                     if worker.current_binary is None:
                         if is_initial_phase:
-                            self._assign_binary_to_worker_initial_phase(worker)
+                            # During initial phase, only assign using initial phase logic if not yet assigned
+                            if not worker.has_received_initial_assignment:
+                                self._assign_binary_to_worker_initial_phase(worker)
+                            else:
+                                assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
+                                if not assigned:
+                                    self._assign_binary_to_worker_normal(worker, retry_attempt=True)
                         else:
                             assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
                             if not assigned:
@@ -787,14 +816,33 @@ class WorkerManager:
         # Wait for all workers to be ready before proceeding
         self._wait_for_workers_ready()
 
-    def _run_initial_phase(self) -> None:
-        """Run the initial processing phase."""
-        active_workers = set(range(self.num_workers))
-        self._process_worker_loop(
-            active_workers, allow_stop=False, on_failure_increment_failed=False, is_initial_phase=True
-        )
+    def _run_initial_assignments(self) -> None:
+        """Perform initial assignment phase - assign first task to each worker."""
+        # Wait for all workers to receive their first assignment
+        while not all(w.has_received_initial_assignment for w in self.workers):
+            # Check for manual worker connections
+            if self.manual_start_worker:
+                self._check_manual_worker_connections()
 
-        # Report assigned memory totals
+            # Check for ready messages
+            for worker in self.workers:
+                if worker.connection_established and not worker.ready:
+                    from .worker_communication import receive_worker_messages
+
+                    msg = receive_worker_messages(worker)
+                    if msg.success and msg.parsed_responses:
+                        for response in msg.parsed_responses:
+                            if response == "ready":
+                                worker.ready = True
+
+            # Try to assign to workers that haven't received initial assignment
+            for worker in self.workers:
+                if not worker.has_received_initial_assignment and worker.ready and worker.connection_established:
+                    self._assign_binary_to_worker_initial_phase(worker)
+
+            threading.Event().wait(0.1)
+
+        # Report assigned memory totals after initial assignments
         opportunistic_memory = sum(
             w.estimated_memory for w in self.workers if w.opportunistic and w.current_binary is not None
         )
@@ -808,6 +856,13 @@ class WorkerManager:
             f"[Initial Phase] Total assigned: {total_mb:.2f}MB, "
             f"Non-opportunistic: {non_opp_mb:.2f}MB, "
             f"Opportunistic: {opp_mb:.2f}MB"
+        )
+
+    def _run_main_phase(self) -> None:
+        """Run the main processing phase."""
+        active_workers = set(range(self.num_workers))
+        self._process_worker_loop(
+            active_workers, allow_stop=True, on_failure_increment_failed=False, is_initial_phase=False
         )
 
     def _run_retry_phase(self) -> None:
@@ -861,7 +916,8 @@ class WorkerManager:
         self.manager_logger.info(process_msg)
 
         self._initialize_workers()
-        self._run_initial_phase()
+        self._run_initial_assignments()
+        self._run_main_phase()
         self._run_retry_phase()
         self._run_oom_phase()
         self._run_unassigned_phase()

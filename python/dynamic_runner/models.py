@@ -31,6 +31,7 @@ class WorkerState:
     idle: bool = False
     opportunistic: bool = False
     reserved_budget: int = 0
+    has_received_initial_assignment: bool = False
     connection_established: bool = True
     ready: bool = False
     connection_established_time: float | None = None
