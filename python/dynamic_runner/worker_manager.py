@@ -72,7 +72,7 @@ class WorkerManager:
         self.oom_tasks: list = []
         self.unassigned_tasks: list[BinaryInfo] = []
         self.pending_worker_assignments: set[int] = set()
-        self.stats = {"completed": 0, "failed": 0, "total": 0, "skipped": 0}
+        self.stats = {"completed": 0, "total": 0, "skipped": 0}
         self.idle_workers_logged: set[int] = set()
         self.in_oom_phase: bool = False
 
@@ -628,7 +628,7 @@ class WorkerManager:
             return
 
         if on_failure_increment_failed and not monitor_result.result.success:
-            increment_stat(self.lock, self.stats, "failed")
+            increment_stat(self.lock, self.stats, "errored")
             binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
             giveup_msg = f"[GiveUp] {binary_name}"
             self.manager_logger.warning(giveup_msg)
@@ -750,7 +750,7 @@ class WorkerManager:
                 else:
 
                     def increment_failed():
-                        increment_stat(self.lock, self.stats, "failed")
+                        increment_stat(self.lock, self.stats, "errored")
 
                     monitor_result = monitor_worker_once(
                         worker,
@@ -872,37 +872,44 @@ class WorkerManager:
         )
 
         # Report status after main phase
+        errored_count = len(self.failed_tasks)
+        oom_count = len(self.oom_tasks)
         self.manager_logger.info(
             f"[Main Phase Complete] Completed: {self.stats['completed']}/{self.stats['total']}, "
-            f"Failed: {self.stats['failed']}/{self.stats['total']}"
+            f"Errored: {errored_count}/{self.stats['total']}, "
+            f"OOM: {oom_count}/{self.stats['total']}"
         )
 
     def _run_retry_phase(self) -> None:
         """Run the retry phase for failed tasks."""
         if not self.failed_tasks:
+            self.manager_logger.info("[Retry Phase] Skipped - no errored tasks to retry")
             return
 
         self.manager_logger.info(f"[Retry Phase] Starting retry of {len(self.failed_tasks)} failed tasks")
 
         # Reactivate all workers for retry phase
-        active_workers = set(range(self.num_workers))
         process_retry_phase(
             self.failed_tasks,
             self.pending_binaries,
             self.num_workers,
-            lambda aw, **kwargs: self._process_worker_loop(aw, allow_stop=False, **kwargs),
+            lambda aw, **kwargs: self._process_worker_loop(aw, **kwargs),
             self.manager_logger,
         )
 
         # Report status after retry phase
+        errored_count = len(self.failed_tasks)
+        oom_count = len(self.oom_tasks)
         self.manager_logger.info(
             f"[Retry Phase Complete] Completed: {self.stats['completed']}/{self.stats['total']}, "
-            f"Failed: {self.stats['failed']}/{self.stats['total']}"
+            f"Errored: {errored_count}/{self.stats['total']}, "
+            f"OOM: {oom_count}/{self.stats['total']}"
         )
 
     def _run_oom_phase(self) -> None:
         """Run the OOM phase with single worker."""
         if not self.oom_tasks:
+            self.manager_logger.info("[OOM Phase] Skipped - no OOM tasks")
             return
 
         self.manager_logger.info(f"[OOM Phase] Starting processing of {len(self.oom_tasks)} OOM tasks")
@@ -919,9 +926,12 @@ class WorkerManager:
         self.in_oom_phase = False
 
         # Report status after OOM phase
+        errored_count = len(self.failed_tasks)
+        oom_count = len(self.oom_tasks)
         self.manager_logger.info(
             f"[OOM Phase Complete] Completed: {self.stats['completed']}/{self.stats['total']}, "
-            f"Failed: {self.stats['failed']}/{self.stats['total']}"
+            f"Errored: {errored_count}/{self.stats['total']}, "
+            f"OOM: {oom_count}/{self.stats['total']}"
         )
 
     def _run_unassigned_phase(self) -> None:
@@ -944,7 +954,7 @@ class WorkerManager:
         self.pending_binaries = binaries.copy()
         self.stats["total"] = len(binaries)
         self.stats["completed"] = 0
-        self.stats["failed"] = 0
+        self.stats["errored"] = 0
 
         start_msg = f"Starting {self.num_workers} workers with {self.max_memory / (1024**3):.2f}GB memory limit"
         process_msg = f"Processing {self.stats['total']} binaries"
@@ -970,9 +980,22 @@ class WorkerManager:
 
         cleanup_workers(self.workers)
 
-        final_msg = (
-            f"[*] Completed: {self.stats['completed']}/{self.stats['total']}, "
-            f"Failed: {self.stats['failed']}/{self.stats['total']}, "
-            f"Skipped: {self.stats['skipped']}/{self.stats['total']}"
-        )
+        # Count remaining failed tasks by type
+        completed = self.stats["completed"]
+        errored_twice_failed = len(self.failed_tasks)
+        oom_failed = len(self.oom_tasks)
+        skipped = self.stats["skipped"]
+        total = self.stats["total"]
+
+        final_msg = f"[*] Completed: {completed}/{total}"
+
+        if errored_twice_failed > 0:
+            final_msg += f", Errored: {errored_twice_failed}/{total}"
+
+        if oom_failed > 0:
+            final_msg += f", OOM: {oom_failed}/{total}"
+
+        if skipped > 0:
+            final_msg += f", Skipped: {skipped}/{total}"
+
         self.manager_logger.info(final_msg)

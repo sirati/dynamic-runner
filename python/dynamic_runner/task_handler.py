@@ -39,10 +39,18 @@ def worker_completed(
                     )
                 elif result.error_type == ErrorType.NON_RECOVERABLE:
                     if logger:
-                        logger.error(f"[Worker {worker.worker_id}] [Worker crashed] {worker.current_binary.path.name}")
+                        logger.warning(
+                            f"[Worker {worker.worker_id}] [Worker crashed] {worker.current_binary.path.name}"
+                        )
                         if result.error_message:
-                            logger.error(f"  Error: {result.error_message}")
-                    stats["failed"] += 1
+                            logger.warning(f"  Error: {result.error_message}")
+                    failed_tasks.append(
+                        FailedTask(
+                            binary=worker.current_binary,
+                            error_type=result.error_type,
+                            error_message=result.error_message or "",
+                        )
+                    )
                 else:
                     if logger:
                         logger.warning(f"[Worker {worker.worker_id}] [Errored] {worker.current_binary.path.name}")
