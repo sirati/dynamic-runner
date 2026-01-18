@@ -1,120 +1,6 @@
 import threading
-from dataclasses import dataclass
-from pathlib import Path
 
-from .binary_info import BinaryInfo
-from .memory import get_actual_memory_usage
 from .models import ErrorType, FailedTask, TaskResult, WorkerState
-from .task import TaskDefinition
-
-
-@dataclass
-class AssignmentResult:
-    assigned: bool
-    new_available_memory: int
-    socket_error: bool = False
-    memory_insufficient: bool = False
-
-
-def assign_binary_to_worker(
-    worker: WorkerState,
-    pending_binaries: list[BinaryInfo],
-    available_memory: int,
-    reserved_memory: int,
-    source_dir: Path,
-    task_definition: TaskDefinition,
-    lock: threading.Lock,
-    unassigned_tasks: list[BinaryInfo] | None = None,
-    logger=None,
-    initial_phase_budget: int | None = None,
-) -> AssignmentResult:
-    """Try to assign a binary to the worker.
-
-    Tasks that cannot be assigned due to memory constraints are added to unassigned_tasks if provided.
-    Returns AssignmentResult with assignment status, new memory, and socket error flag.
-
-    If initial_phase_budget is provided, tasks that exceed the budget are marked as opportunistic.
-    If the worker has a reserved_budget from completing a non-opportunistic task, it is used instead.
-    """
-    with lock:
-        actual_usage = get_actual_memory_usage()
-
-        # Use worker's reserved budget if available, otherwise use initial_phase_budget
-        effective_budget = worker.reserved_budget if worker.reserved_budget > 0 else initial_phase_budget
-
-        for i, binary in enumerate(pending_binaries):
-            estimated = task_definition.estimate_memory(binary.size)
-
-            # If we have a budget, skip tasks that exceed it
-            if effective_budget is not None and estimated > effective_budget:
-                continue
-
-            # Check if we have enough available memory
-            mark_opportunistic = False
-            if available_memory - estimated < reserved_memory:
-                # Not enough available memory, mark as opportunistic
-                mark_opportunistic = True
-                if logger:
-                    available_mb = available_memory / (1024 * 1024)
-                    estimated_mb = estimated / (1024 * 1024)
-                    reserved_mb = reserved_memory / (1024 * 1024)
-                    logger.info(
-                        f"[Worker {worker.worker_id}] Insufficient memory "
-                        f"(available: {available_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, "
-                        f"reserved: {reserved_mb:.2f}MB), marking as opportunistic"
-                    )
-
-            # Assign the task (either normally or opportunistically)
-            pending_binaries.pop(i)
-            worker.current_binary = binary
-            worker.estimated_memory = estimated
-            new_available_memory = available_memory - estimated
-
-            try:
-                relative_path = binary.path.relative_to(source_dir)
-            except ValueError:
-                relative_path = binary.path
-
-            message = f"{relative_path}\n"
-            try:
-                worker.socket.sendall(message.encode("utf-8"))
-                worker.opportunistic = mark_opportunistic
-            except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                if logger:
-                    logger.error(f"[Worker {worker.worker_id}] Socket error while assigning binary: {e}")
-                pending_binaries.insert(i, binary)
-                worker.current_binary = None
-                worker.estimated_memory = 0
-                return AssignmentResult(assigned=False, new_available_memory=available_memory, socket_error=True)
-
-            if logger:
-                size_mb = binary.size / (1024 * 1024)
-                estimated_mb = estimated / (1024 * 1024)
-                budget_str = ""
-                if effective_budget is not None:
-                    budget_mb = effective_budget / (1024 * 1024)
-                    budget_str = f", budget: {budget_mb:.2f}MB"
-                opportunistic_str = " (opportunistic)" if mark_opportunistic else ""
-                logger.info(
-                    f"[Worker {worker.worker_id}] Binary size: {size_mb:.2f}MB, "
-                    f"Estimated memory: {estimated_mb:.2f}MB{budget_str}, "
-                    f"Available after: {new_available_memory / (1024 * 1024):.2f}MB{opportunistic_str}"
-                )
-
-            return AssignmentResult(assigned=True, new_available_memory=new_available_memory)
-
-        # No binary could be assigned - check if it's due to memory constraints
-        memory_insufficient = False
-        if pending_binaries:
-            memory_insufficient = True
-            if unassigned_tasks is not None:
-                for binary in pending_binaries:
-                    if binary not in unassigned_tasks:
-                        unassigned_tasks.append(binary)
-
-        return AssignmentResult(
-            assigned=False, new_available_memory=available_memory, memory_insufficient=memory_insufficient
-        )
 
 
 def worker_completed(
@@ -150,25 +36,12 @@ def worker_completed(
                             error_message=result.error_message or "",
                         )
                     )
-                    # Reset reserved budget on OOM
-                    worker.reserved_budget = 0
-                    worker.has_completed_non_opportunistic = False
                 elif result.error_type == ErrorType.NON_RECOVERABLE:
                     if logger:
                         logger.error(f"[Worker {worker.worker_id}] [Worker crashed] {worker.current_binary.path.name}")
                         if result.error_message:
                             logger.error(f"  Error: {result.error_message}")
                     stats["failed"] += 1
-                    released_memory = worker.estimated_memory
-                    worker.current_binary = None
-                    worker.estimated_memory = 0
-                    worker.phase = None
-                    worker.phase_start_time = None
-                    worker.last_keepalive = None
-                    # Reset reserved budget on crash
-                    worker.reserved_budget = 0
-                    worker.has_completed_non_opportunistic = False
-                    return released_memory
                 else:
                     if logger:
                         logger.warning(f"[Worker {worker.worker_id}] [Errored] {worker.current_binary.path.name}")
@@ -181,16 +54,6 @@ def worker_completed(
                             error_message=result.error_message or "",
                         )
                     )
-
-            # Reserve memory for non-opportunistic successful tasks
-            if result.success and not worker.opportunistic:
-                actual_memory = worker.max_memory_current_task
-                reserved = max(actual_memory, worker.estimated_memory)
-                worker.reserved_budget = reserved
-                worker.has_completed_non_opportunistic = True
-                if logger:
-                    reserved_mb = reserved / (1024 * 1024)
-                    logger.info(f"[Worker {worker.worker_id}] Reserved budget: {reserved_mb:.2f}MB for future tasks")
 
             released_memory = worker.estimated_memory
             worker.current_binary = None

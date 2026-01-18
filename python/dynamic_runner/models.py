@@ -32,13 +32,9 @@ class WorkerState:
     phase_start_time: float | None = None
     last_keepalive: float | None = None
     last_printed_minute: int | None = None
-    last_memory_check: float | None = None
-    max_memory_current_task: int = 0
     idle: bool = False
     opportunistic: bool = False
     reserved_budget: int = 0
-    has_completed_non_opportunistic: bool = False
-    has_received_initial_assignment: bool = False
 
 
 @dataclass

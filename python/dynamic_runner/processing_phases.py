@@ -41,7 +41,7 @@ def process_oom_phase(
     process_worker_loop_callback,
     logger: logging.Logger,
 ) -> None:
-    """Process OOM tasks with single worker."""
+    """Process OOM tasks with single worker, starting with smallest."""
     if not oom_tasks:
         return
 
@@ -50,8 +50,13 @@ def process_oom_phase(
 
     stop_workers_except(workers, keep_worker_id=0, log_dir=log_dir, logger=logger, reason="OOM processing")
 
-    for oom_task in oom_tasks:
+    # Sort OOM tasks by size (smallest first)
+    sorted_oom_tasks = sorted(oom_tasks, key=lambda task: task.binary.size)
+
+    for oom_task in sorted_oom_tasks:
         pending_binaries.append(oom_task.binary)
+
+    oom_tasks.clear()
 
     active_workers = {0}
     process_worker_loop_callback(active_workers, allow_stop=False, on_failure_increment_failed=True)

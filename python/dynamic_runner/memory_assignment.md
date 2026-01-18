@@ -33,7 +33,7 @@ When a task finishes successfully, errors, or crashes, the worker will be restar
 If a task errored or crashed, the task is added the errored queue.
 
 ### 4. Assigning new tasks
-If there are idle tasks we look at the current total memory usage, ignoring the usage of the idle tasks. With that we compute the available memory = memory limit - total memory usage. 
+If there are idle tasks we look at the current total memory usage, ignoring the usage of the idle tasks. With that we compute the available memory = memory limit - total memory usage. Here we measure the actual memory usage, we do not use the estimate!
 1. we order the idle workers by their budget
 2. each worker is assigned a secondary 'temporary budget factor' 1st idle worker 1.5, 2nd is 2, 3rd is 3, etc.
 3. if the worker is not opportunistic, we assign a task only based on the initial budget, ignoring the temporary budget
@@ -41,7 +41,7 @@ If there are idle tasks we look at the current total memory usage, ignoring the 
 5. the memory used based on the estimate is substracted from available memory. (please note that for non-opportunistic workers we do not subtract)
 6. if we fail to assign bacause no estimate fits, we add it to a list to handle in the next step.
 7. after we have done step 3 to 6 for all we continue with step 8
-8. we try again only with the failed workers from step 1. once
+8. we try again only with the failed workers from step 1. once only
 9. if we fail after another iteration, we add keep it idle. the first time an idle worker stays idle after having completed (successfully or not) a task, we log this 
 
 ### 5. Finishing up
@@ -50,7 +50,7 @@ If there are no tasks left that fit into any workers, we add them to the OOM que
 ### OOM management
 The OOM manager will start killing workers if all workers currently use - 500MB or limit/cores whichever is smaller - less then the memory limit. If this is the case we kill the median opportunistic worker.
 If there are no opportunistic workers, we wait till the memory limit is exceeded, and then kill the smallest worker and mark is permanently as opportunistic.
-If worker zero (the one with the largest budget) would be killed, we do not mark it as opportunistic, and we do not requeue the task, instead we add the task to the OOM queue.
+If worker first (the one with the largest budget - worker 0) would be killed, we do not mark it as opportunistic, and we do not requeue the task, instead we add the task to the OOM queue.
 
 Killed workers are restarted, marked as idle, and the task is requeued.
 

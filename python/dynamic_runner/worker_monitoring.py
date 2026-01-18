@@ -31,20 +31,6 @@ def _get_process_memory(pid: int) -> int:
         return 0
 
 
-def _check_and_update_memory(worker: WorkerState) -> None:
-    """Check worker memory usage once per second and update max if needed."""
-    current_time = time.time()
-    last_check = worker.last_memory_check or 0
-
-    # Check memory once per second
-    if current_time - last_check >= 1.0:
-        if worker.process and worker.process.poll() is None:
-            memory_usage = _get_process_memory(worker.process.pid)
-            if memory_usage > 0:
-                worker.max_memory_current_task = max(worker.max_memory_current_task, memory_usage)
-        worker.last_memory_check = current_time
-
-
 def monitor_worker_once(
     worker: WorkerState,
     worker_id: int,
@@ -66,9 +52,6 @@ def monitor_worker_once(
     Returns:
         WorkerMonitorResult indicating what action to take
     """
-    # Check and update memory usage once per second
-    _check_and_update_memory(worker)
-
     if check_worker_timeout(worker, task_definition):
         binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
         timeout_msg = f"[Timeout] Worker {worker_id} timed out - {binary_name}"

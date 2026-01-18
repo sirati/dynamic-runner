@@ -1,3 +1,4 @@
+import logging
 import socket
 import subprocess
 import sys
@@ -42,6 +43,10 @@ def start_worker(
 
     if skip_existing:
         cmd.append("--skip_existing")
+
+    # Log the full command line at debug level
+    logger = logging.getLogger("manager")
+    logger.info(f"[Worker {worker_id}] Starting with command: {' '.join(cmd)}")
 
     process = subprocess.Popen(
         cmd,

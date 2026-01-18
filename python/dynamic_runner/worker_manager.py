@@ -9,7 +9,7 @@ from .binary_info import BinaryInfo
 from .models import ErrorType, TaskResult, WorkerState
 from .processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
 from .task import TaskDefinition
-from .task_handler import assign_binary_to_worker, worker_completed
+from .task_handler import worker_completed
 from .worker_communication import send_worker_command
 from .worker_lifecycle import restart_worker, start_worker
 from .worker_monitoring import monitor_worker_once
@@ -47,6 +47,7 @@ class WorkerManager:
 
         self.workers: list[WorkerState] = []
         self.available_memory = max_memory
+        self.total_assigned_memory = 0
         self.lock = threading.Lock()
         self.pending_binaries: list[BinaryInfo] = []
         self.failed_tasks: list = []
@@ -54,7 +55,8 @@ class WorkerManager:
         self.unassigned_tasks: list[BinaryInfo] = []
         self.pending_worker_assignments: set[int] = set()
         self.stats = {"completed": 0, "failed": 0, "total": 0, "skipped": 0}
-        self.initial_assignment_count = 0
+        self.idle_workers_logged: set[int] = set()
+        self.in_oom_phase: bool = False
 
         start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_dir = output_dir / "logs" / start_time
@@ -65,43 +67,58 @@ class WorkerManager:
         # Memory usage log file
         self.memuse_log_path = output_dir / "memuse.log"
 
+    def _calculate_initial_budget(self, worker_index: int) -> int:
+        """Calculate initial budget for worker based on specification.
+
+        1st worker (index 0): max_memory
+        2nd worker (index 1): max_memory/2 + 150MB
+        3rd worker (index 2): max_memory/4 + 150MB
+        4th worker (index 3): max_memory/5 + 150MB
+        5th worker onwards: follows pattern + 150MB
+        """
+        base_150mb = 150 * 1024 * 1024
+
+        if worker_index == 0:
+            return self.max_memory
+        elif worker_index == 1:
+            return self.max_memory // 2 + base_150mb
+        elif worker_index == 2:
+            return self.max_memory // 4 + base_150mb
+        else:
+            # For 4th worker (index 3): 1/5
+            # For 5th worker (index 4): 1/6
+            # For nth worker (index n): 1/(n+2)
+            divisor = worker_index + 2
+            return self.max_memory // divisor + base_150mb
+
     def _setup_logger(self) -> logging.Logger:
         """Setup and configure the manager logger."""
         manager_log_path = self.log_dir / "manager.log"
-        return setup_file_logger(
-            name="manager",
-            log_file_path=manager_log_path,
-            level=logging.INFO,
-            console=True,
-            console_format="%(levelname)s %(asctime)s | %(name)s %(message)s",
-        )
+        logger = setup_file_logger("manager", manager_log_path, level=logging.INFO)
+        return logger
 
-    def _log_memory_usage(self, worker: WorkerState, errored: bool) -> None:
+    def _log_memory_usage(self, worker: WorkerState, errored: bool = False) -> None:
         """Log memory usage to memuse.log file."""
-        if worker.current_binary is None:
+        if not worker.current_binary:
             return
 
-        max_memory = worker.max_memory_current_task
-
-        # Convert to MB
-        binary_size_mb = worker.current_binary.size / (1024 * 1024)
-        max_memory_mb = max_memory / (1024 * 1024)
-
-        # Format: binary_name, size_mb, max_memory_mb[+]
-        binary_name = worker.current_binary.path.name
-        suffix = "+" if errored else ""
-
-        log_line = f"{binary_name}, {binary_size_mb:.2f}, {max_memory_mb:.2f}{suffix}\n"
-
         try:
-            with open(self.memuse_log_path, "a") as f:
-                f.write(log_line)
-        except Exception as e:
-            self.manager_logger.warning(f"Failed to write to memuse.log: {e}")
+            actual_memory = 0
+            if psutil and worker.process and worker.process.poll() is None:
+                try:
+                    process = psutil.Process(worker.process.pid)
+                    actual_memory = process.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    pass
 
-        # Reset memory tracking for this worker's next task
-        worker.max_memory_current_task = 0
-        worker.last_memory_check = None
+            with open(self.memuse_log_path, "a") as f:
+                status = "ERROR" if errored else "OK"
+                f.write(
+                    f"{worker.current_binary.size},{worker.estimated_memory},{actual_memory},"
+                    f"{worker.current_binary.path.name},{status}\n"
+                )
+        except Exception as e:
+            self.manager_logger.warning(f"Failed to log memory usage: {e}")
 
     def _start_worker(self, worker_id: int) -> WorkerState:
         """Start a new worker process."""
@@ -118,7 +135,12 @@ class WorkerManager:
             self.skip_existing,
         )
 
-        self.manager_logger.info(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
+        # Set initial budget based on worker index
+        worker.reserved_budget = self._calculate_initial_budget(worker_id)
+        budget_mb = worker.reserved_budget / (1024 * 1024)
+        self.manager_logger.info(
+            f"[Worker {worker_id}] Started with PID {worker.process.pid}, budget: {budget_mb:.2f}MB"
+        )
         return worker
 
     def _restart_worker(self, worker_id: int) -> WorkerState:
@@ -139,6 +161,11 @@ class WorkerManager:
             self.skip_existing,
         )
 
+        # Preserve initial budget and opportunistic status
+        new_worker.reserved_budget = old_worker.reserved_budget
+        new_worker.opportunistic = old_worker.opportunistic
+        new_worker.idle = True
+
         self.manager_logger.info(
             f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid} (old PID: {old_worker.process.pid})"
         )
@@ -148,93 +175,149 @@ class WorkerManager:
 
         return new_worker
 
-    def _assign_binary_to_worker(
-        self, worker: WorkerState, track_unassigned: bool = False, is_initial_phase: bool = False
-    ) -> bool:
-        """Try to assign a binary to the worker."""
-        # During initial phase, don't assign if worker already received its initial assignment
-        if is_initial_phase and worker.has_received_initial_assignment:
-            return False
+    def _assign_binary_to_worker_initial_phase(self, worker: WorkerState) -> bool:
+        """Assign binary during initial phase with opportunistic marking."""
+        with self.lock:
+            if not self.pending_binaries:
+                return False
 
-        unassigned_list = self.unassigned_tasks if track_unassigned else None
+            budget = worker.reserved_budget
 
-        # Calculate reserved memory based on idle workers
-        # Reserve memory for idle workers (excluding the one we're trying to assign to)
-        idle_workers = sum(1 for w in self.workers if w.current_binary is None and not w.idle)
-        reserved_memory = max(0, (idle_workers - 1) * self.reserved_memory_per_worker)
+            # Find task that fits budget
+            for i, binary in enumerate(self.pending_binaries):
+                estimated = self.task_definition.estimate_memory(binary.size)
 
-        # Calculate initial phase budget if in initial phase
-        initial_phase_budget = None
-        if is_initial_phase and not worker.has_received_initial_assignment:
-            self.initial_assignment_count += 1
-            if self.initial_assignment_count == 1 or len(self.pending_binaries) == 1:
-                initial_phase_budget = self.max_memory
-            else:
-                initial_phase_budget = self.max_memory // self.initial_assignment_count
+                if estimated > budget:
+                    continue
 
-        result = assign_binary_to_worker(
-            worker,
-            self.pending_binaries,
-            self.available_memory,
-            reserved_memory,
-            self.source_dir,
-            self.task_definition,
-            self.lock,
-            unassigned_list,
-            self.manager_logger,
-            initial_phase_budget,
-        )
+                # Check if assigning would exceed memory limit
+                would_exceed = (self.total_assigned_memory + estimated) > self.max_memory
 
-        if result.socket_error:
-            self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error during assignment, restarting worker")
-            self._restart_worker(worker.worker_id)
-            self.pending_worker_assignments.add(worker.worker_id)
-            return False
+                # Assign the task
+                self.pending_binaries.pop(i)
+                worker.current_binary = binary
+                worker.estimated_memory = estimated
+                worker.idle = False
 
-        if result.assigned:
-            self.available_memory = result.new_available_memory
-            worker.idle = False
-            worker.opportunistic = False
-            if is_initial_phase:
-                worker.has_received_initial_assignment = True
-            binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
-            self.manager_logger.info(f"[Worker {worker.worker_id}] Assigned: {binary_name}")
-        elif result.memory_insufficient and not worker.idle:
+                # Track all assigned memory
+                self.total_assigned_memory += estimated
+
+                if would_exceed:
+                    worker.opportunistic = True
+
+                try:
+                    relative_path = binary.path.relative_to(self.source_dir)
+                except ValueError:
+                    relative_path = binary.path
+
+                message = f"{relative_path}\n"
+                try:
+                    worker.socket.sendall(message.encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error: {e}")
+                    self.pending_binaries.insert(i, binary)
+                    worker.current_binary = None
+                    worker.estimated_memory = 0
+                    self.total_assigned_memory -= estimated
+                    worker.opportunistic = False
+                    return False
+
+                size_mb = binary.size / (1024 * 1024)
+                estimated_mb = estimated / (1024 * 1024)
+                budget_mb = budget / (1024 * 1024)
+                opp_str = " (opportunistic)" if worker.opportunistic else ""
+                self.manager_logger.info(
+                    f"[Worker {worker.worker_id}] Assigned: {binary.path.name} "
+                    f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB){opp_str}"
+                )
+                return True
+
+            # No task fits
             worker.idle = True
-            if is_initial_phase:
-                worker.has_received_initial_assignment = True
+            return False
 
-            # Find smallest binary that doesn't fit the budget
-            budget_info = ""
-            if initial_phase_budget is not None:
-                budget_mb = initial_phase_budget / (1024 * 1024)
-                budget_info = f", budget: {budget_mb:.2f}MB"
+    def _assign_binary_to_worker_normal(self, worker: WorkerState, retry_attempt: bool = False) -> bool:
+        """Assign binary during normal phase with temporary budget factors."""
+        with self.lock:
+            if not self.pending_binaries:
+                return False
 
-                # Find smallest binary that exceeds budget
-                smallest_out_of_budget = None
-                for binary in self.pending_binaries:
-                    estimated = self.task_definition.estimate_memory(binary.size)
-                    if estimated > initial_phase_budget:
-                        if smallest_out_of_budget is None or estimated < self.task_definition.estimate_memory(
-                            smallest_out_of_budget.size
-                        ):
-                            smallest_out_of_budget = binary
+            # Calculate available memory using actual memory usage
+            actual_total_usage = self._get_worker_actual_memory_usage()
+            available = self.max_memory - actual_total_usage
 
-                if smallest_out_of_budget:
-                    smallest_size_mb = smallest_out_of_budget.size / (1024 * 1024)
-                    smallest_estimated_mb = self.task_definition.estimate_memory(smallest_out_of_budget.size) / (
-                        1024 * 1024
-                    )
-                    budget_info += (
-                        f", smallest out-of-budget: {smallest_out_of_budget.path.name} "
-                        f"({smallest_size_mb:.2f}MB, est: {smallest_estimated_mb:.2f}MB)"
-                    )
-
-            self.manager_logger.warning(
-                f"[Worker {worker.worker_id}] Set to idle due to insufficient memory{budget_info}"
+            # Get idle workers ordered by budget
+            idle_workers = sorted(
+                [w for w in self.workers if w.idle and w.current_binary is None], key=lambda w: w.reserved_budget
             )
 
-        return result.assigned
+            if worker not in idle_workers:
+                return False
+
+            worker_idle_index = idle_workers.index(worker)
+
+            # Assign temporary budget factor: 1st=1.5, 2nd=2, 3rd=3, etc.
+            if worker_idle_index == 0:
+                temp_factor = 1.5
+            elif worker_idle_index == 1:
+                temp_factor = 2.0
+            else:
+                temp_factor = float(worker_idle_index + 1)
+
+            # Determine budget to use
+            if worker.opportunistic:
+                temp_budget = available / temp_factor
+                effective_budget = min(worker.reserved_budget, temp_budget)
+            else:
+                effective_budget = worker.reserved_budget
+
+            # Find task that fits
+            for i, binary in enumerate(self.pending_binaries):
+                estimated = self.task_definition.estimate_memory(binary.size)
+
+                if estimated > effective_budget:
+                    continue
+
+                # Assign the task
+                self.pending_binaries.pop(i)
+                worker.current_binary = binary
+                worker.estimated_memory = estimated
+                worker.idle = False
+
+                # Subtract from available only for opportunistic workers
+                if worker.opportunistic:
+                    available -= estimated
+
+                try:
+                    relative_path = binary.path.relative_to(self.source_dir)
+                except ValueError:
+                    relative_path = binary.path
+
+                message = f"{relative_path}\n"
+                try:
+                    worker.socket.sendall(message.encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error: {e}")
+                    self.pending_binaries.insert(i, binary)
+                    worker.current_binary = None
+                    worker.estimated_memory = 0
+                    return False
+
+                size_mb = binary.size / (1024 * 1024)
+                estimated_mb = estimated / (1024 * 1024)
+                budget_mb = effective_budget / (1024 * 1024)
+                self.manager_logger.info(
+                    f"[Worker {worker.worker_id}] Assigned: {binary.path.name} "
+                    f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB)"
+                )
+                return True
+
+            # No task fits - log if first time staying idle after completion
+            if not retry_attempt and worker.worker_id not in self.idle_workers_logged:
+                self.idle_workers_logged.add(worker.worker_id)
+                self.manager_logger.info(f"[Worker {worker.worker_id}] Staying idle - no fitting task")
+
+            return False
 
     def _worker_completed(self, worker: WorkerState, result: TaskResult) -> None:
         """Mark worker as completed and release memory."""
@@ -242,7 +325,10 @@ class WorkerManager:
         errored = not result.success
         self._log_memory_usage(worker, errored)
 
-        released = worker_completed(
+        with self.lock:
+            pass
+
+        worker_completed(
             worker,
             result,
             self.oom_tasks,
@@ -251,7 +337,9 @@ class WorkerManager:
             self.lock,
             self.manager_logger,
         )
-        self.available_memory += released
+
+        # Mark worker as idle and ready for reassignment
+        worker.idle = True
 
     def _get_worker_actual_memory_usage(self) -> int:
         """Get actual memory usage of all workers combined."""
@@ -268,139 +356,80 @@ class WorkerManager:
                     pass
         return total_memory
 
-    def _try_assign_to_idle_workers(self) -> None:
-        """Try to assign tasks to workers that were marked idle due to insufficient memory."""
-        for w in self.workers:
-            if w.idle and w.current_binary is None:
-                if self._assign_binary_to_worker(w):
-                    break
-
-    def _try_opportunistic_assignment(self) -> None:
-        """Try to assign tasks to idle workers using overreserved memory."""
-        idle_workers_list = [w for w in self.workers if w.idle and w.current_binary is None]
-        if not idle_workers_list:
-            return
-
-        # Measure actual memory usage
+    def _check_memory_pressure_and_kill(self) -> None:
+        """Check memory pressure and kill workers according to specification."""
         actual_usage = self._get_worker_actual_memory_usage()
-        overreserved = self.max_memory - actual_usage
+        threshold = min(500 * 1024 * 1024, self.max_memory // self.num_workers)
 
-        if self.available_memory < 0:
-            overreserved += self.available_memory
-
-        if overreserved <= 0:
-            return
-
-        # Divide by 4 as safety buffer
-        available_opportunistic = overreserved // 2
-
-        if available_opportunistic <= 0:
-            return
-
-        # Distribute memory: first gets 1/2, second gets 1/4, third gets 1/8, etc.
-        # Last gets same as previous
-        memory_budgets = []
-        remaining = available_opportunistic
-        for i in range(len(idle_workers_list)):
-            if i == 0:
-                budget = remaining // 2
-            elif i == len(idle_workers_list) - 1:
-                # Last worker gets same as previous
-                budget = memory_budgets[-1] if memory_budgets else 0
-            else:
-                budget = remaining // (2 ** (i + 1))
-
-            if budget > 0:
-                memory_budgets.append(budget)
-            else:
-                break
-
-        # Try to assign binaries that fit within budgets
-        for worker, budget in zip(idle_workers_list, memory_budgets):
-            if not self.pending_binaries:
-                break
-
-            # Find a binary that fits within this worker's budget
-            with self.lock:
-                for i, binary in enumerate(self.pending_binaries):
-                    from .memory import estimate_memory
-
-                    estimated = estimate_memory(binary.size)
-
-                    if estimated <= budget:
-                        # Assign this binary
-                        self.pending_binaries.pop(i)
-                        worker.current_binary = binary
-                        worker.estimated_memory = estimated
-                        worker.idle = False
-                        worker.opportunistic = True
-
-                        try:
-                            relative_path = binary.path.relative_to(self.source_dir)
-                        except ValueError:
-                            relative_path = binary.path
-
-                        message = f"{relative_path}\n"
-                        try:
-                            worker.socket.sendall(message.encode("utf-8"))
-                            # Update available_memory to avoid double-reservation
-                            self.available_memory -= estimated
-                            binary_name = worker.current_binary.path.name
-                            size_mb = binary.size / (1024 * 1024)
-                            estimated_mb = estimated / (1024 * 1024)
-                            budget_mb = budget / (1024 * 1024)
-                            actual_usage_mb = actual_usage / (1024 * 1024)
-                            self.manager_logger.info(
-                                f"[Worker {worker.worker_id}] Opportunistic assignment: {binary_name} "
-                                f"(size: {size_mb:.2f}MB, estimated: {estimated_mb:.2f}MB, "
-                                f"budget: {budget_mb:.2f}MB, total usage: {actual_usage_mb:.0f}MB)"
-                            )
-                        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                            self.manager_logger.error(
-                                f"[Worker {worker.worker_id}] Socket error during opportunistic assignment: {e}"
-                            )
-                            self.pending_binaries.insert(i, binary)
-                            worker.current_binary = None
-                            worker.estimated_memory = 0
-                            worker.idle = True
-                            worker.opportunistic = False
-                            self._restart_worker(worker.worker_id)
-                        break
-
-    def _check_memory_pressure_and_kill_opportunistic(self) -> None:
-        """Check if total memory usage is too high and kill largest opportunistic worker if needed."""
-        actual_usage = self._get_worker_actual_memory_usage()
-
-        if actual_usage > self.max_memory:
-            # Find all opportunistic workers with current tasks
+        # Check if we should kill opportunistic workers
+        if actual_usage > (self.max_memory - threshold):
             opportunistic_workers = [w for w in self.workers if w.opportunistic and w.current_binary is not None]
 
-            if not opportunistic_workers:
+            if opportunistic_workers:
+                # Kill median opportunistic worker
+                sorted_opp = sorted(opportunistic_workers, key=lambda w: w.estimated_memory)
+                median_idx = len(sorted_opp) // 2
+                victim = sorted_opp[median_idx]
+
+                binary_name = victim.current_binary.path.name if victim.current_binary else "unknown"
+                usage_mb = actual_usage / (1024 * 1024)
+                self.manager_logger.warning(
+                    f"[OOM] Killing median opportunistic worker {victim.worker_id} "
+                    f"({binary_name}, usage: {usage_mb:.0f}MB)"
+                )
+
+                # Requeue task only if not in OOM phase
+                if victim.current_binary and not self.in_oom_phase:
+                    self.pending_binaries.insert(0, victim.current_binary)
+
+                victim.current_binary = None
+                victim.estimated_memory = 0
+                self._restart_worker(victim.worker_id)
                 return
 
-            # Find the one using the most memory (estimated)
-            largest_worker = max(opportunistic_workers, key=lambda w: w.estimated_memory)
+        # Check if we exceeded limit (no opportunistic workers)
+        if actual_usage > self.max_memory:
+            active_workers = [w for w in self.workers if w.current_binary is not None]
 
-            binary_name = largest_worker.current_binary.path.name if largest_worker.current_binary else "unknown"
-            usage_mb = actual_usage / (1024 * 1024)
-            max_mb = self.max_memory / (1024 * 1024)
-            estimated_mb = largest_worker.estimated_memory / (1024 * 1024)
+            if not active_workers:
+                return
 
-            self.manager_logger.warning(
-                f"[Memory Pressure] Total usage {usage_mb:.0f}MB exceeds limit {max_mb:.0f}MB, "
-                f"killing opportunistic worker {largest_worker.worker_id} "
-                f"({binary_name}, estimated: {estimated_mb:.0f}MB)"
-            )
+            # Kill smallest worker
+            smallest = min(active_workers, key=lambda w: w.estimated_memory)
 
-            # Release memory and mark as failed
-            self.available_memory += largest_worker.estimated_memory
-            largest_worker.current_binary = None
-            largest_worker.estimated_memory = 0
-            largest_worker.opportunistic = False
-            largest_worker.idle = True
+            # Special handling for worker 0
+            if smallest.worker_id == 0:
+                binary_name = smallest.current_binary.path.name if smallest.current_binary else "unknown"
+                self.manager_logger.error(f"[OOM] Worker 0 killed, adding task to OOM queue: {binary_name}")
+                if smallest.current_binary:
+                    from .models import FailedTask
 
-            # Restart the worker
-            self._restart_worker(largest_worker.worker_id)
+                    self.oom_tasks.append(
+                        FailedTask(
+                            binary=smallest.current_binary,
+                            error_type=ErrorType.OUT_OF_MEMORY,
+                            error_message="Worker 0 exceeded memory",
+                        )
+                    )
+                smallest.current_binary = None
+                smallest.estimated_memory = 0
+                self._restart_worker(smallest.worker_id)
+            else:
+                binary_name = smallest.current_binary.path.name if smallest.current_binary else "unknown"
+                usage_mb = actual_usage / (1024 * 1024)
+                self.manager_logger.warning(
+                    f"[OOM] Killing smallest worker {smallest.worker_id} "
+                    f"({binary_name}, usage: {usage_mb:.0f}MB), marking as opportunistic"
+                )
+
+                # Requeue task and mark worker as permanently opportunistic (only if not in OOM phase)
+                if smallest.current_binary and not self.in_oom_phase:
+                    self.pending_binaries.insert(0, smallest.current_binary)
+
+                smallest.current_binary = None
+                smallest.estimated_memory = 0
+                smallest.opportunistic = True
+                self._restart_worker(smallest.worker_id)
 
     def _handle_worker_without_task(
         self,
@@ -411,7 +440,15 @@ class WorkerManager:
         is_initial_phase: bool = False,
     ) -> bool:
         """Handle a worker that has no current task. Returns True if worker should continue."""
-        if self._assign_binary_to_worker(worker, is_initial_phase=is_initial_phase):
+        if is_initial_phase:
+            assigned = self._assign_binary_to_worker_initial_phase(worker)
+        else:
+            assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
+            if not assigned:
+                # Try once more with recalculated idle workers and budget factors
+                assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=True)
+
+        if assigned:
             return True
 
         if not self.pending_binaries and allow_stop:
@@ -466,16 +503,18 @@ class WorkerManager:
         if self.always_restart_worker and monitor_result.result.success and self.pending_binaries:
             self.manager_logger.info(f"[Worker {worker_id}] Restarting worker after successful completion")
             self._restart_worker(worker_id)
-            # Don't try to assign to the old worker after restart, return early
             return
 
         # Get updated worker reference in case it was restarted elsewhere
         worker = self.workers[worker_id]
-        if (
-            not self._assign_binary_to_worker(worker, is_initial_phase=is_initial_phase)
-            and not self.pending_binaries
-            and allow_stop
-        ):
+        if is_initial_phase:
+            assigned = self._assign_binary_to_worker_initial_phase(worker)
+        else:
+            assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
+            if not assigned:
+                assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=True)
+
+        if not assigned and not self.pending_binaries and allow_stop:
             log_to_worker_file(self.log_dir, worker_id, f"Worker {worker_id} stopping (no more tasks)")
             self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")
             success, error = send_worker_command(worker, "stop")
@@ -531,26 +570,34 @@ class WorkerManager:
                 for worker_id in list(self.pending_worker_assignments):
                     worker = self.workers[worker_id]
                     if worker.current_binary is None:
-                        self._assign_binary_to_worker(worker, is_initial_phase=is_initial_phase)
+                        if is_initial_phase:
+                            self._assign_binary_to_worker_initial_phase(worker)
+                        else:
+                            assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=False)
+                            if not assigned:
+                                self._assign_binary_to_worker_normal(worker, retry_attempt=True)
                         self.pending_worker_assignments.discard(worker_id)
 
-            # After processing all workers, try to assign to idle workers if we have pending binaries
-            # Skip opportunistic assignment during initial phase
-            if self.pending_binaries and not is_initial_phase:
-                idle_worker_count = sum(1 for w in self.workers if w.idle and w.current_binary is None)
-                if idle_worker_count > 1:
-                    self._try_assign_to_idle_workers()
-
-                # Try opportunistic assignment with overreserved memory
-                idle_worker_count = sum(1 for w in self.workers if w.idle and w.current_binary is None)
-                if idle_worker_count > 0:
-                    self._try_opportunistic_assignment()
-
-                # Check memory pressure and kill opportunistic workers if needed
-                self._check_memory_pressure_and_kill_opportunistic()
+            # Check memory pressure and kill workers if needed (only in normal phase)
+            if not is_initial_phase and self.pending_binaries:
+                self._check_memory_pressure_and_kill()
 
             if active_workers:
                 threading.Event().wait(0.1)
+
+        # Move unassigned tasks to OOM queue at the end
+        if not is_initial_phase and self.pending_binaries:
+            for binary in self.pending_binaries:
+                from .models import FailedTask
+
+                self.oom_tasks.append(
+                    FailedTask(
+                        binary=binary,
+                        error_type=ErrorType.OUT_OF_MEMORY,
+                        error_message="Could not fit in any worker budget",
+                    )
+                )
+            self.pending_binaries.clear()
 
     def _initialize_workers(self) -> None:
         """Initialize all worker processes."""
@@ -560,12 +607,26 @@ class WorkerManager:
 
     def _run_initial_phase(self) -> None:
         """Run the initial processing phase."""
-        self.initial_assignment_count = 0
         active_workers = set(range(self.num_workers))
         self._process_worker_loop(
             active_workers, allow_stop=False, on_failure_increment_failed=False, is_initial_phase=True
         )
-        self.unassigned_tasks = list(set(self.unassigned_tasks))
+
+        # Report assigned memory totals
+        opportunistic_memory = sum(
+            w.estimated_memory for w in self.workers if w.opportunistic and w.current_binary is not None
+        )
+        non_opportunistic_memory = sum(
+            w.estimated_memory for w in self.workers if not w.opportunistic and w.current_binary is not None
+        )
+        total_mb = self.total_assigned_memory / (1024 * 1024)
+        opp_mb = opportunistic_memory / (1024 * 1024)
+        non_opp_mb = non_opportunistic_memory / (1024 * 1024)
+        self.manager_logger.info(
+            f"[Initial Phase] Total assigned: {total_mb:.2f}MB, "
+            f"Non-opportunistic: {non_opp_mb:.2f}MB, "
+            f"Opportunistic: {opp_mb:.2f}MB"
+        )
 
     def _run_retry_phase(self) -> None:
         """Run the retry phase for failed tasks."""
@@ -576,10 +637,10 @@ class WorkerManager:
             self._process_worker_loop,
             self.manager_logger,
         )
-        self.unassigned_tasks = list(set(self.unassigned_tasks))
 
     def _run_oom_phase(self) -> None:
         """Run the OOM phase with single worker."""
+        self.in_oom_phase = True
         process_oom_phase(
             self.oom_tasks,
             self.pending_binaries,
@@ -588,7 +649,7 @@ class WorkerManager:
             self._process_worker_loop,
             self.manager_logger,
         )
-        self.unassigned_tasks = list(set(self.unassigned_tasks))
+        self.in_oom_phase = False
 
     def _run_unassigned_phase(self) -> None:
         """Run the unassigned phase with single worker and no memory limit."""
