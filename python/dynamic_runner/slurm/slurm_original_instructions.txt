@@ -1,0 +1,38 @@
+please add the following feature to [@dynamic_batch](file:///home/sirati/devel/python/asm-tokenizer/dynamic_batch) with the code living in the new subdirectories docker/ slurm/ gateway/, document all this in slurm.md at the same detail but more polished language as here (first generate slurm.md, then work on code):
+1. --gateway either ssh:// syntax or local as parameter - this defined where the slurm manager should live (where it has access to the slurm controller commands)
+2. --slurm parameter needing additional paramters like --slurm-notify-email for some inspiration take a look at [@bash_script_slurm_qcp.sh](file:///home/sirati/devel/python/asm-tokenizer/bash_script_slurm_qcp.sh) although we are not using the executed scripts there anymore!
+3. --slurm also requires a --packaging right now we only support docker --packaging docker will run nix to generate the docker image
+4. --slurm-root-folder required for --slurm, if missing suggest ~/slurm and ~/BIG/slurm
+5. --slurm-image-subfolder default image_bin
+5. --slurm-output-subfolder default out
+5. --slurm-log-subfolder default log
+
+the whole thing works as following
+1. collect list of files for processing (as usual, when just run like so far)
+2. connect to the gateway
+3. start a worker that uses nix to build the docker image, then transfers it over into slurm-image-subfolder
+4a. start the slurm task on the gateway
+4b. the slurm tasks loads the docker image, then starts the docker image by invoking dynamtic_batch with --secondary {mode of communication to primary}
+4b1. it creates a random folder in /tmp now referred to as rndtmp (outside of docker)
+4b2. it mkdirs and maps rndtmp/src to /app/src-tmp, rndtmp/out to /app/out-tmp, rndtmp/log to /app/log-tmp, slurm-image-subfolder/srcbins/ to /app/src-network, slurm-output-subfolder to app/out-network, slurm-log-subfolder/{like current log folder}/ to app/log-network
+4b3. the bash script that starts the docker keeps the dockers also allocates a unix named socket that is accessible to the docker secondary, over it the secondary can request a command to be executed outside of the docker container, which the bashscript does by creating a named socket, starting the command and via the socket relaying it to the secondary (all named sockets live in /tmp)
+4b4. the docker container must be started so that it has a port open on the host for the incomming quic connections
+4c. connects to the primary, send secondary-welcome message including ram and worker count
+4d. primary sends entropy to secondary
+4e. generates certificates for QUIC using both secondary and primaries entropy
+4f. send own public cert and local ipv6 and ipv4 to primary
+4g. primary relays that to all other secondaries
+4h. secondaries establish connection to each other over QUIC authenicated by each others public certs.
+4i. starts its workers, relays each works ready message to the primary, including budget
+5. primary waits for all secondaries workers
+6. does a preliminary initial assignment to all workers, treating each secondary seperately when it comes to the estimated allocated memory
+7. the first secondary looks at its /app/src-network opens all zip files there whose hash matches its .hash file, inside each it finds all the binaries .hash file, and sends the zipname + inside zip local path + binary info object + hash to the primary
+8. for each secondary it zips all assigned files as a stream into slurm-image-subfolder/srcbins/{unique filename including random postfix}, before zipping it checks however if it for that file has received a hash from the first secondary, if it did and hash matches the binary file, that was is marked as already send and not included in the initial-zips. after a zips upload finished, it sends the inital assignment to the corresponding secondary, including in which zipfile to find the binary, it does this for each secondary
+9. the secondary finds the files in its mapped /app/src-network and it unzips it to /app/src-tmp and then tells its workers their initial assignment with source, output, logfile set to src-tmp, out-tmp, log-tmp/worder_{secondary id}-{worker id}.{current log file increment=start at 0}.log increment is per worker independent
+10. all secondaries use their direct connection to update all others on task completion and failures, they also send a keepalive once per second, the secondary timeout is 2 minutes. once a timeout is detected it asks all other secondaries for the last keepalive they received, and if they all are more than 1 minute old it marks that secondary as dead, otherwise its updates its keepalive for that secondary to the most recent keepalive of any other secondary that got it
+11. the primary per binary zips them together till the zip is at least 20mb large, once that size is reached it sends it, if a binary is larger is just contains it in a zip with its hash on its own and sends it. importantly the zip here does not use compression, all completely transferred files as marked as sent, it does not send already sent binaries again including those that it knows were already sent from the first secondary.
+12. once all files are sent it notifies all secondaries of this, and then promotes a random secondary to slurm-primary, sends all secondaries full task list, it then prints that the primary can now be closed via ctrl+c
+13. if any worker finish before the the primary has finished sending all files, the secondary contact the primary for a new task to assign the worker
+14. if the slurm-primary is has a local timeout of 30 seconds by any other secondary, that secondary then notifies all other secondaries, who in turn rely that to all including the sender. all secondaries that receive this reply with a confirmation to all, relayed messages also generate a confirmation to all. once that has happened, any secondary that does not have any timeout with other secondaries is promoted to the new slurm-primary
+15. the slurm primary is responsible for assigning tasks for other secondaries (but not for tracking the overall task progress, that is all secondaries task). while a process 14. of selecting a new primary in underway, no new tasks are assigned and workers stay idle till a new primary was selected and the new primary has assigned tasks
+16. if a worker has finished its task, the secondary moves all files from /out-tmp to /out-network, if at least 1 minute has ellapsed its send a increment log message to the worker who then switches over to  log-tmp/worder_{secondary id}-{worker id}.{new log file increment}.log, and the old logfile is moved from /log-tmp to /log-network. if a task errored, crashed, or was OOM killed the logfile is always incremented and the old file moved
