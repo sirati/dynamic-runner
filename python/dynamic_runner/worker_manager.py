@@ -865,8 +865,19 @@ class WorkerManager:
             active_workers, allow_stop=True, on_failure_increment_failed=False, is_initial_phase=False
         )
 
+        # Report status after main phase
+        self.manager_logger.info(
+            f"[Main Phase Complete] Completed: {self.stats['completed']}/{self.stats['total']}, "
+            f"Failed: {self.stats['failed']}/{self.stats['total']}"
+        )
+
     def _run_retry_phase(self) -> None:
         """Run the retry phase for failed tasks."""
+        if not self.failed_tasks:
+            return
+
+        self.manager_logger.info(f"[Retry Phase] Starting retry of {len(self.failed_tasks)} failed tasks")
+
         process_retry_phase(
             self.failed_tasks,
             self.pending_binaries,
@@ -875,8 +886,19 @@ class WorkerManager:
             self.manager_logger,
         )
 
+        # Report status after retry phase
+        self.manager_logger.info(
+            f"[Retry Phase Complete] Completed: {self.stats['completed']}/{self.stats['total']}, "
+            f"Failed: {self.stats['failed']}/{self.stats['total']}"
+        )
+
     def _run_oom_phase(self) -> None:
         """Run the OOM phase with single worker."""
+        if not self.oom_tasks:
+            return
+
+        self.manager_logger.info(f"[OOM Phase] Starting processing of {len(self.oom_tasks)} OOM tasks")
+
         self.in_oom_phase = True
         process_oom_phase(
             self.oom_tasks,
@@ -887,6 +909,12 @@ class WorkerManager:
             self.manager_logger,
         )
         self.in_oom_phase = False
+
+        # Report status after OOM phase
+        self.manager_logger.info(
+            f"[OOM Phase Complete] Completed: {self.stats['completed']}/{self.stats['total']}, "
+            f"Failed: {self.stats['failed']}/{self.stats['total']}"
+        )
 
     def _run_unassigned_phase(self) -> None:
         """Run the unassigned phase with single worker and no memory limit."""

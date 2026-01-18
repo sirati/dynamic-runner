@@ -75,6 +75,13 @@ def main():
         help="Directory for named socket files (defaults to <output>/sockets when --manual-start-worker is used)",
     )
 
+    parser.add_argument(
+        "--simulate-crash",
+        type=float,
+        metavar="PERCENTAGE",
+        help="Simulate random worker crashes with given percentage chance (0-100)",
+    )
+
     args = parser.parse_args()
 
     # Default to named mode when manual-start-worker is used
