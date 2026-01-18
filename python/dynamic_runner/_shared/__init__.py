@@ -6,6 +6,7 @@ This package contains reusable code for:
 - Filtering binaries based on platform, compiler, version, and optimization level
 """
 
+from .binary_filter import filter_existing_outputs
 from .binary_info import (
     BinaryFilenameFormat,
     BinaryInfo,
@@ -39,6 +40,7 @@ __all__ = [
     "FieldRegexes",
     "build_binary_filename_format",
     "build_field_regexes",
+    "filter_existing_outputs",
     "format_binary_info",
     "format_size",
     "parse_binary_filename",

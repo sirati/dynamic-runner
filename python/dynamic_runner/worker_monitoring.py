@@ -1,7 +1,8 @@
 import time
 from dataclasses import dataclass
 
-from .models import ErrorType, ProcessingPhase, TaskResult, WorkerState
+from .models import ErrorType, TaskResult, WorkerState
+from .task import TaskDefinition
 from .worker_communication import log_pickled_error, receive_worker_messages
 from .worker_lifecycle import check_worker_timeout, print_phase_status
 
@@ -48,6 +49,7 @@ def monitor_worker_once(
     worker: WorkerState,
     worker_id: int,
     logger,
+    task_definition: TaskDefinition,
     on_failure_increment_failed: bool = False,
     increment_failed_callback=None,
 ) -> WorkerMonitorResult:
@@ -57,6 +59,7 @@ def monitor_worker_once(
         worker: Worker state
         worker_id: Worker ID for logging
         logger: Logger instance
+        task_definition: Task definition for timeout checking
         on_failure_increment_failed: Whether to increment failed count on error
         increment_failed_callback: Optional callback to increment failed count
 
@@ -66,7 +69,7 @@ def monitor_worker_once(
     # Check and update memory usage once per second
     _check_and_update_memory(worker)
 
-    if check_worker_timeout(worker):
+    if check_worker_timeout(worker, task_definition):
         binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
         timeout_msg = f"[Timeout] Worker {worker_id} timed out - {binary_name}"
         logger.warning(timeout_msg)
@@ -75,7 +78,7 @@ def monitor_worker_once(
         result = TaskResult(success=False, error_type=ErrorType.RECOVERABLE, error_message="Worker timeout")
         return WorkerMonitorResult(should_restart=True, task_completed=True, result=result)
 
-    print_phase_status(worker, logger)
+    print_phase_status(worker, logger, task_definition)
 
     message = receive_worker_messages(worker)
 
@@ -104,12 +107,12 @@ def monitor_worker_once(
 
     if message.parsed_responses:
         for parsed in message.parsed_responses:
-            if isinstance(parsed, ProcessingPhase):
+            if isinstance(parsed, str):
                 worker.phase = parsed
                 worker.phase_start_time = time.time()
                 worker.last_printed_minute = None
                 binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
-                logger.info(f"[Worker {worker_id}] Phase: {parsed.value} - {binary_name}")
+                logger.info(f"[Worker {worker_id}] Phase: {parsed} - {binary_name}")
             elif isinstance(parsed, TaskResult):
                 return WorkerMonitorResult(
                     should_restart=parsed.error_type == ErrorType.NON_RECOVERABLE,

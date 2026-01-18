@@ -4,16 +4,18 @@ import sys
 import time
 from pathlib import Path
 
-from .models import ProcessingPhase, WorkerState
+from .models import WorkerState
+from .task import TaskDefinition
 
 
 def start_worker(
     worker_id: int,
     source_dir: Path,
     output_dir: Path,
-    platform_arg: str,
-    skip_existing: bool,
     worker_log_path: Path,
+    task_definition: TaskDefinition,
+    task_args,
+    skip_existing: bool,
 ) -> WorkerState:
     """Start a worker process with dynamic_queue mode."""
     parent_sock, child_sock = socket.socketpair()
@@ -23,18 +25,20 @@ def start_worker(
     cmd = [
         sys.executable,
         "-m",
-        "tokenizer",
+        task_definition.get_worker_module(),
         "--dynamic_queue",
         str(child_fd),
         "--source",
         str(source_dir),
         "--output",
         str(output_dir),
-        "--platform",
-        platform_arg,
         "--log-file",
         str(worker_log_path),
     ]
+
+    # Add task-specific arguments
+    task_cmd_args = task_definition.build_worker_command_args(task_args, source_dir, output_dir, skip_existing)
+    cmd.extend(task_cmd_args)
 
     if skip_existing:
         cmd.append("--skip_existing")
@@ -62,44 +66,68 @@ def restart_worker(
     worker: WorkerState,
     source_dir: Path,
     output_dir: Path,
-    platform_arg: str,
-    skip_existing: bool,
     worker_log_path: Path,
+    task_definition: TaskDefinition,
+    task_args,
+    skip_existing: bool,
 ) -> WorkerState:
     """Restart a worker that encountered a non-recoverable error."""
     try:
         worker.process.terminate()
         worker.socket.close()
-    except:
+    except Exception:
         pass
 
     return start_worker(
         worker.worker_id,
         source_dir,
         output_dir,
-        platform_arg,
-        skip_existing,
         worker_log_path,
+        task_definition,
+        task_args,
+        skip_existing,
     )
 
 
-def check_worker_timeout(worker: WorkerState) -> bool:
-    """Check if worker has timed out based on phase."""
-    if worker.phase == ProcessingPhase.PHASE_3 and worker.last_keepalive:
-        if time.time() - worker.last_keepalive > 10:
-            return True
+def check_worker_timeout(worker: WorkerState, task_definition: TaskDefinition) -> bool:
+    """Check if worker has timed out based on phase and task definition."""
+    if worker.phase is None or worker.last_keepalive is None:
+        return False
+
+    # Find the stage definition for current phase
+    stages = task_definition.get_stages()
+    for stage in stages:
+        if stage.name == worker.phase:
+            if stage.timeout_seconds is not None:
+                if time.time() - worker.last_keepalive > stage.timeout_seconds:
+                    return True
+            break
+
     return False
 
 
-def print_phase_status(worker: WorkerState, logger) -> None:
+def print_phase_status(worker: WorkerState, logger, task_definition: TaskDefinition) -> None:
     """Log status message for long-running phases."""
-    if worker.phase in [ProcessingPhase.PHASE_1, ProcessingPhase.PHASE_2] and worker.phase_start_time:
+    if worker.phase is None or worker.phase_start_time is None:
+        return
+
+    # Check if current phase has no timeout (long-running)
+    stages = task_definition.get_stages()
+    is_long_running = False
+    for stage in stages:
+        if stage.name == worker.phase and stage.timeout_seconds is None:
+            is_long_running = True
+            break
+
+    if is_long_running and worker.phase_start_time:
         elapsed = time.time() - worker.phase_start_time
         if elapsed >= 60:
             minutes = int(elapsed / 60)
             if minutes in [1, 5, 10, 30, 60] or (minutes > 60 and minutes % 60 == 0):
                 if worker.last_printed_minute != minutes:
                     worker.last_printed_minute = minutes
+                    binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
                     logger.info(
-                        f"[Worker {worker.worker_id}] Still in {worker.phase.value}, {minutes} minute(s) elapsed - {worker.current_binary.path.name if worker.current_binary else 'unknown'}"
+                        f"[Worker {worker.worker_id}] Still in {worker.phase}, "
+                        f"{minutes} minute(s) elapsed - {binary_name}"
                     )

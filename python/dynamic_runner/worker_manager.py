@@ -8,6 +8,7 @@ from shared import setup_file_logger
 from .binary_info import BinaryInfo
 from .models import ErrorType, TaskResult, WorkerState
 from .processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
+from .task import TaskDefinition
 from .task_handler import assign_binary_to_worker, worker_completed
 from .worker_communication import send_worker_command
 from .worker_lifecycle import restart_worker, start_worker
@@ -27,17 +28,19 @@ class WorkerManager:
         max_memory: int,
         source_dir: Path,
         output_dir: Path,
-        platform_arg: str,
+        task_definition: TaskDefinition,
+        task_args,
         skip_existing: bool,
         print_pid: bool,
         always_restart_worker: bool = False,
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
-        self.reserved_memory_per_worker = 650 * 1024 * 1024
+        self.task_definition = task_definition
+        self.task_args = task_args
+        self.reserved_memory_per_worker = task_definition.get_reserved_memory_per_worker()
         self.source_dir = source_dir
         self.output_dir = output_dir
-        self.platform_arg = platform_arg
         self.skip_existing = skip_existing
         self.print_pid = print_pid
         self.always_restart_worker = always_restart_worker
@@ -109,9 +112,10 @@ class WorkerManager:
             worker_id,
             self.source_dir,
             self.output_dir,
-            self.platform_arg,
-            self.skip_existing,
             worker_log_path,
+            self.task_definition,
+            self.task_args,
+            self.skip_existing,
         )
 
         self.manager_logger.info(f"[Worker {worker_id}] Started with PID {worker.process.pid}")
@@ -129,9 +133,10 @@ class WorkerManager:
             old_worker,
             self.source_dir,
             self.output_dir,
-            self.platform_arg,
-            self.skip_existing,
             worker_log_path,
+            self.task_definition,
+            self.task_args,
+            self.skip_existing,
         )
 
         self.manager_logger.info(
@@ -173,6 +178,7 @@ class WorkerManager:
             self.available_memory,
             reserved_memory,
             self.source_dir,
+            self.task_definition,
             self.lock,
             unassigned_list,
             self.manager_logger,
@@ -205,18 +211,20 @@ class WorkerManager:
                 budget_info = f", budget: {budget_mb:.2f}MB"
 
                 # Find smallest binary that exceeds budget
-                from .memory import estimate_memory
-
                 smallest_out_of_budget = None
                 for binary in self.pending_binaries:
-                    estimated = estimate_memory(binary.size)
+                    estimated = self.task_definition.estimate_memory(binary.size)
                     if estimated > initial_phase_budget:
-                        if smallest_out_of_budget is None or estimated < estimate_memory(smallest_out_of_budget.size):
+                        if smallest_out_of_budget is None or estimated < self.task_definition.estimate_memory(
+                            smallest_out_of_budget.size
+                        ):
                             smallest_out_of_budget = binary
 
                 if smallest_out_of_budget:
                     smallest_size_mb = smallest_out_of_budget.size / (1024 * 1024)
-                    smallest_estimated_mb = estimate_memory(smallest_out_of_budget.size) / (1024 * 1024)
+                    smallest_estimated_mb = self.task_definition.estimate_memory(smallest_out_of_budget.size) / (
+                        1024 * 1024
+                    )
                     budget_info += (
                         f", smallest out-of-budget: {smallest_out_of_budget.path.name} "
                         f"({smallest_size_mb:.2f}MB, est: {smallest_estimated_mb:.2f}MB)"
@@ -502,6 +510,7 @@ class WorkerManager:
                         worker,
                         worker_id,
                         self.manager_logger,
+                        self.task_definition,
                         on_failure_increment_failed,
                         increment_failed,
                     )
@@ -590,6 +599,7 @@ class WorkerManager:
             self.log_dir,
             self.lock,
             self.stats,
+            self.task_definition,
             self._restart_worker,
             self._worker_completed,
             self.manager_logger,

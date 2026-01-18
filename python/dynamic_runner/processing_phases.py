@@ -5,6 +5,7 @@ from pathlib import Path
 from .binary_info import BinaryInfo
 from .memory import get_free_system_memory
 from .models import ErrorType, FailedTask, TaskResult, WorkerState
+from .task import TaskDefinition
 from .worker_monitoring import WorkerMonitorResult, monitor_worker_once
 from .worker_utils import increment_stat, log_to_worker_file, stop_workers_except
 
@@ -67,6 +68,7 @@ def process_unassigned_phase(
     log_dir: Path,
     lock: threading.Lock,
     stats: dict,
+    task_definition: TaskDefinition,
     restart_worker_callback,
     worker_completed_callback,
     logger: logging.Logger,
@@ -90,6 +92,7 @@ def process_unassigned_phase(
             log_dir,
             lock,
             stats,
+            task_definition,
             restart_worker_callback,
             worker_completed_callback,
             logger,
@@ -108,6 +111,7 @@ def _process_single_unassigned_binary(
     log_dir: Path,
     lock: threading.Lock,
     stats: dict,
+    task_definition: TaskDefinition,
     restart_worker_callback,
     worker_completed_callback,
     logger: logging.Logger,
@@ -125,7 +129,7 @@ def _process_single_unassigned_binary(
         return False
 
     return _monitor_unassigned_binary(
-        binary, worker, lock, stats, restart_worker_callback, worker_completed_callback, logger
+        binary, worker, lock, stats, task_definition, restart_worker_callback, worker_completed_callback, logger
     )
 
 
@@ -158,6 +162,7 @@ def _monitor_unassigned_binary(
     worker: WorkerState,
     lock: threading.Lock,
     stats: dict,
+    task_definition: TaskDefinition,
     restart_worker_callback,
     worker_completed_callback,
     logger: logging.Logger,
@@ -180,6 +185,7 @@ def _monitor_unassigned_binary(
             worker,
             worker.worker_id,
             logger,
+            task_definition,
             on_failure_increment_failed=True,
             increment_failed_callback=increment_skipped,
         )

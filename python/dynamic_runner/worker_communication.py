@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from .models import ErrorType, ProcessingPhase, TaskResult, WorkerState
+from .models import ErrorType, TaskResult, WorkerState
 from .task_handler import parse_response
 
 
@@ -19,7 +19,7 @@ class WorkerMessage:
     success: bool
     error_type: WorkerCommunicationError
     error_message: str | None = None
-    parsed_responses: list[ProcessingPhase | TaskResult] | None = None
+    parsed_responses: list[str | TaskResult] | None = None
     pickled_error_info: dict | None = None
 
 
@@ -94,7 +94,7 @@ def receive_worker_messages(worker: WorkerState) -> WorkerMessage:
                     )
             else:
                 parsed = parse_response(response)
-                if isinstance(parsed, (ProcessingPhase, TaskResult)):
+                if isinstance(parsed, (str, TaskResult)):
                     parsed_responses.append(parsed)
 
         return WorkerMessage(

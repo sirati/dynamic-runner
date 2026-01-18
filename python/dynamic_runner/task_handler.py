@@ -3,8 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .binary_info import BinaryInfo
-from .memory import estimate_memory, get_actual_memory_usage
-from .models import ErrorType, FailedTask, ProcessingPhase, TaskResult, WorkerState
+from .memory import get_actual_memory_usage
+from .models import ErrorType, FailedTask, TaskResult, WorkerState
+from .task import TaskDefinition
 
 
 @dataclass
@@ -21,6 +22,7 @@ def assign_binary_to_worker(
     available_memory: int,
     reserved_memory: int,
     source_dir: Path,
+    task_definition: TaskDefinition,
     lock: threading.Lock,
     unassigned_tasks: list[BinaryInfo] | None = None,
     logger=None,
@@ -41,7 +43,7 @@ def assign_binary_to_worker(
         effective_budget = worker.reserved_budget if worker.reserved_budget > 0 else initial_phase_budget
 
         for i, binary in enumerate(pending_binaries):
-            estimated = estimate_memory(binary.size)
+            estimated = task_definition.estimate_memory(binary.size)
 
             # If we have a budget, skip tasks that exceed it
             if effective_budget is not None and estimated > effective_budget:
@@ -200,7 +202,7 @@ def worker_completed(
         return released_memory
 
 
-def parse_response(response: str) -> TaskResult | ProcessingPhase | None:
+def parse_response(response: str) -> TaskResult | str | None:
     """Parse worker response into TaskResult or phase update."""
     # print(f"[Received response] {response}")
     if response == "done":
@@ -222,10 +224,7 @@ def parse_response(response: str) -> TaskResult | ProcessingPhase | None:
             return TaskResult(success=False, error_type=error_type, error_message=error_message)
     elif response.startswith("phase:"):
         phase_str = response.split(":", 1)[1]
-        try:
-            return ProcessingPhase(phase_str)
-        except ValueError:
-            pass
+        return phase_str
     elif response == "keepalive":
         return None
     return TaskResult(success=False, error_type=ErrorType.RECOVERABLE, error_message="Unknown response")

@@ -3,6 +3,7 @@ import logging
 
 from shared import (
     add_selection_arguments,
+    filter_existing_outputs,
     find_matching_binaries,
     format_binary_info,
     normalize_opt_levels,
@@ -10,8 +11,8 @@ from shared import (
     process_selection_arguments,
 )
 
-from .binary_discovery import filter_existing_outputs, organize_and_sort_binaries
 from .system_resources import parse_cores, parse_memory
+from .task import TokenizerTask
 from .worker_manager import WorkerManager
 
 
@@ -29,6 +30,10 @@ def main():
     )
 
     add_selection_arguments(parser)
+
+    # Create task instance to add task-specific arguments
+    task = TokenizerTask()
+    task.add_task_arguments(parser)
 
     parser.add_argument(
         "--cores",
@@ -98,11 +103,13 @@ def main():
         return
 
     logger.info("Organizing and sorting binaries...")
-    sorted_binaries = organize_and_sort_binaries(binaries)
+    sorted_binaries = task.organize_and_sort_items(binaries)
 
     if args.skip_existing:
         logger.info("Filtering out binaries with existing output files...")
-        sorted_binaries, skipped_count = filter_existing_outputs(sorted_binaries, config.source_dir, config.output_dir)
+        sorted_binaries, skipped_count = filter_existing_outputs(
+            sorted_binaries, config.source_dir, config.output_dir, task.get_output_filename_pattern
+        )
         logger.info(f"Skipped {skipped_count} binaries with existing outputs")
         logger.info(f"Remaining binaries to process: {len(sorted_binaries)}")
 
@@ -115,7 +122,8 @@ def main():
         max_memory=max_memory,
         source_dir=config.source_dir,
         output_dir=config.output_dir,
-        platform_arg="file_prefix",
+        task_definition=task,
+        task_args=args,
         skip_existing=args.skip_existing,
         print_pid=args.pid,
         always_restart_worker=args.always_restart_worker,
