@@ -1,5 +1,6 @@
-from .tokenizer_task import TokenizerTask
+from .tokenizer_task import TokenizerPhase, TokenizerTask
 
 __all__ = [
     "TokenizerTask",
+    "TokenizerPhase",
 ]

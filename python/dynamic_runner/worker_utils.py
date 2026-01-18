@@ -3,8 +3,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+from .comm import StopCommand
 from .models import WorkerState
-from .worker_communication import send_worker_command
 
 
 def log_to_worker_file(log_dir: Path, worker_id: int, message: str) -> None:
@@ -37,9 +37,10 @@ def stop_workers_except(
         try:
             log_to_worker_file(log_dir, worker_id, f"Worker {worker_id} stopping for {reason}")
             logger.info(f"[Worker {worker_id}] Stopping for {reason}")
-            send_worker_command(workers[worker_id], "stop")
+            stop_cmd = StopCommand()
+            workers[worker_id].comm.send_command(stop_cmd)
             workers[worker_id].process.wait(timeout=5)
-            workers[worker_id].socket.close()
+            workers[worker_id].comm.close()
         except Exception:
             pass
 
@@ -56,7 +57,8 @@ def stop_worker(worker: WorkerState, worker_id: int, log_dir: Path, logger: logg
     """
     log_to_worker_file(log_dir, worker_id, f"Worker {worker_id} stopping {reason}")
     logger.info(f"[Worker {worker_id}] Stopping {reason}")
-    worker.socket.sendall(b"stop\n")
+    stop_cmd = StopCommand()
+    worker.comm.send_command(stop_cmd)
 
 
 def cleanup_workers(workers: list[WorkerState]) -> None:
@@ -64,7 +66,7 @@ def cleanup_workers(workers: list[WorkerState]) -> None:
     for worker in workers:
         try:
             worker.process.wait(timeout=5)
-            worker.socket.close()
+            worker.comm.close()
         except Exception:
             pass
 

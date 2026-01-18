@@ -1,16 +1,22 @@
 import logging
-import pickle
 import time
 from dataclasses import dataclass
 from enum import Enum
 
-from .models import ErrorType, TaskResult, WorkerState
-from .task_handler import parse_response
+from .comm import (
+    DoneResponse,
+    ErrorResponse,
+    KeepaliveResponse,
+    PhaseUpdateResponse,
+    PickledErrorResponse,
+    ProcessBinaryCommand,
+)
+from .models import TaskResult, WorkerState
 
 
 class WorkerCommunicationError(Enum):
-    SOCKET_ERROR = "socket_error"
-    SOCKET_CLOSED = "socket_closed"
+    COMMUNICATION_ERROR = "communication_error"
+    CONNECTION_CLOSED = "connection_closed"
     NO_ERROR = "no_error"
 
 
@@ -23,79 +29,68 @@ class WorkerMessage:
     pickled_error_info: dict | None = None
 
 
-def send_worker_command(worker: WorkerState, command: str) -> tuple[bool, str | None]:
-    """Send a command to a worker via socket.
+def send_worker_command(worker: WorkerState, binary_relative_path: str) -> tuple[bool, str | None]:
+    """Send a command to a worker to process a binary.
 
     Returns:
         (success, error_message)
     """
-    try:
-        worker.socket.sendall(f"{command}\n".encode("utf-8"))
-        return (True, None)
-    except (BrokenPipeError, ConnectionResetError, OSError) as e:
-        return (False, str(e))
-
-
-def handle_pickled_error(response: str) -> dict | None:
-    """Extract and unpickle error information from a response.
-
-    Returns:
-        Dictionary with error info or None if unpickling fails
-    """
-    if not response.startswith("error:pickle:"):
-        return None
-
-    try:
-        pickled_data = response[13:].encode("latin-1")
-        error_info = pickle.loads(pickled_data)
-        return error_info
-    except Exception:
-        return None
+    command = ProcessBinaryCommand(relative_path=binary_relative_path)
+    return worker.comm.send_command(command)
 
 
 def receive_worker_messages(worker: WorkerState) -> WorkerMessage:
     """Receive and parse messages from a worker.
 
-    Handles socket errors and parses responses including pickled errors.
+    Handles communication errors and parses responses including pickled errors.
     """
-    try:
-        worker.socket.setblocking(False)
-    except (BrokenPipeError, ConnectionResetError, OSError) as e:
-        return WorkerMessage(
-            success=False,
-            error_type=WorkerCommunicationError.SOCKET_ERROR,
-            error_message=str(e),
-        )
+    worker.comm.set_blocking(False)
 
     try:
-        data = worker.socket.recv(1024)
+        responses = worker.comm.receive_responses()
 
-        if not data:
+        if not responses:
             return WorkerMessage(
-                success=False,
-                error_type=WorkerCommunicationError.SOCKET_CLOSED,
-                error_message="Worker socket closed",
+                success=True,
+                error_type=WorkerCommunicationError.NO_ERROR,
+                parsed_responses=[],
             )
 
-        responses = data.decode("utf-8").strip().split("\n")
         worker.last_keepalive = time.time()
 
         parsed_responses = []
         pickled_error = None
 
         for response in responses:
-            if response.startswith("error:pickle:"):
-                pickled_error = handle_pickled_error(response)
-                if pickled_error:
-                    return WorkerMessage(
-                        success=True,
-                        error_type=WorkerCommunicationError.NO_ERROR,
-                        pickled_error_info=pickled_error,
-                    )
-            else:
-                parsed = parse_response(response)
-                if isinstance(parsed, (str, TaskResult)):
-                    parsed_responses.append(parsed)
+            if isinstance(response, PickledErrorResponse):
+                pickled_error = {
+                    "type": response.exception_type,
+                    "message": response.exception_message,
+                    "traceback": response.traceback_str,
+                }
+                return WorkerMessage(
+                    success=True,
+                    error_type=WorkerCommunicationError.NO_ERROR,
+                    pickled_error_info=pickled_error,
+                )
+            elif isinstance(response, PhaseUpdateResponse):
+                parsed_responses.append(response.phase_name)
+            elif isinstance(response, DoneResponse):
+                task_result = TaskResult(
+                    success=True,
+                    warnings=response.warnings,
+                    filtered=response.filtered,
+                )
+                parsed_responses.append(task_result)
+            elif isinstance(response, ErrorResponse):
+                task_result = TaskResult(
+                    success=False,
+                    error_type=response.error_type,
+                    error_message=response.error_message,
+                )
+                parsed_responses.append(task_result)
+            elif isinstance(response, KeepaliveResponse):
+                pass
 
         return WorkerMessage(
             success=True,
@@ -103,23 +98,14 @@ def receive_worker_messages(worker: WorkerState) -> WorkerMessage:
             parsed_responses=parsed_responses,
         )
 
-    except BlockingIOError:
-        return WorkerMessage(
-            success=True,
-            error_type=WorkerCommunicationError.NO_ERROR,
-            parsed_responses=[],
-        )
-    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+    except Exception as e:
         return WorkerMessage(
             success=False,
-            error_type=WorkerCommunicationError.SOCKET_ERROR,
+            error_type=WorkerCommunicationError.COMMUNICATION_ERROR,
             error_message=str(e),
         )
     finally:
-        try:
-            worker.socket.setblocking(True)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        worker.comm.set_blocking(True)
 
 
 def log_pickled_error(worker_id: int, error_info: dict, logger: logging.Logger) -> str:

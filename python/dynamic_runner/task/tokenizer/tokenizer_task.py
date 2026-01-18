@@ -5,7 +5,13 @@ from pathlib import Path
 
 from shared import BinaryInfo
 
-from ..base import StageDefinition, TaskDefinition
+from ..base import Phase, StageDefinition, TaskDefinition
+
+
+class TokenizerPhase(Phase):
+    ANGR_1 = "angr-1"
+    ANGR_2 = "angr-2"
+    TOKENIZATION = "tokenization"
 
 
 class TokenizerTask(TaskDefinition):
@@ -18,9 +24,9 @@ class TokenizerTask(TaskDefinition):
         Stage 3: 10 second timeout (CSV writing with keepalive)
         """
         return [
-            StageDefinition(name="phase1", timeout_seconds=None),
-            StageDefinition(name="phase2", timeout_seconds=None),
-            StageDefinition(name="phase3", timeout_seconds=10.0),
+            StageDefinition(phase=TokenizerPhase.ANGR_1, timeout_seconds=None),
+            StageDefinition(phase=TokenizerPhase.ANGR_2, timeout_seconds=None),
+            StageDefinition(phase=TokenizerPhase.TOKENIZATION, timeout_seconds=10.0),
         ]
 
     def organize_and_sort_items(self, items: list[BinaryInfo]) -> list[BinaryInfo]:

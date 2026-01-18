@@ -1,7 +1,8 @@
 import time
 from dataclasses import dataclass
 
-from .models import ErrorType, TaskResult, WorkerState
+from .comm import ErrorType
+from .models import TaskResult, WorkerState
 from .task import TaskDefinition
 from .worker_communication import log_pickled_error, receive_worker_messages
 from .worker_lifecycle import check_worker_timeout, print_phase_status

@@ -1,14 +1,21 @@
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, Namespace
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from shared import BinaryInfo
 
 
+class Phase(Enum):
+    """Base class for task-specific phase enums."""
+
+    pass
+
+
 @dataclass
 class StageDefinition:
-    name: str
+    phase: Phase
     timeout_seconds: float | None = None
 
 

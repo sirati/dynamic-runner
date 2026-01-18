@@ -6,7 +6,8 @@ from pathlib import Path
 from shared import setup_file_logger
 
 from .binary_info import BinaryInfo
-from .models import ErrorType, TaskResult, WorkerState
+from .comm import ErrorType
+from .models import TaskResult, WorkerState
 from .processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
 from .task import TaskDefinition
 from .task_handler import worker_completed
@@ -33,6 +34,7 @@ class WorkerManager:
         skip_existing: bool,
         print_pid: bool,
         always_restart_worker: bool = False,
+        manual_start_worker: bool = False,
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
@@ -44,6 +46,7 @@ class WorkerManager:
         self.skip_existing = skip_existing
         self.print_pid = print_pid
         self.always_restart_worker = always_restart_worker
+        self.manual_start_worker = manual_start_worker
 
         self.workers: list[WorkerState] = []
         self.available_memory = max_memory
@@ -133,6 +136,7 @@ class WorkerManager:
             self.task_definition,
             self.task_args,
             self.skip_existing,
+            self.manual_start_worker,
         )
 
         # Set initial budget based on worker index
@@ -159,6 +163,7 @@ class WorkerManager:
             self.task_definition,
             self.task_args,
             self.skip_existing,
+            self.manual_start_worker,
         )
 
         # Preserve initial budget and opportunistic status
@@ -210,16 +215,12 @@ class WorkerManager:
                 except ValueError:
                     relative_path = binary.path
 
-                message = f"{relative_path}\n"
-                try:
-                    worker.socket.sendall(message.encode("utf-8"))
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error: {e}")
+                success, error_msg = send_worker_command(worker, str(relative_path))
+                if not success:
+                    self.manager_logger.error(f"[Worker {worker.worker_id}] Communication error: {error_msg}")
                     self.pending_binaries.insert(i, binary)
                     worker.current_binary = None
                     worker.estimated_memory = 0
-                    self.total_assigned_memory -= estimated
-                    worker.opportunistic = False
                     return False
 
                 size_mb = binary.size / (1024 * 1024)
@@ -293,14 +294,13 @@ class WorkerManager:
                 except ValueError:
                     relative_path = binary.path
 
-                message = f"{relative_path}\n"
-                try:
-                    worker.socket.sendall(message.encode("utf-8"))
-                except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                    self.manager_logger.error(f"[Worker {worker.worker_id}] Socket error: {e}")
+                success, error_msg = send_worker_command(worker, str(relative_path))
+                if not success:
+                    self.manager_logger.error(f"[Worker {worker.worker_id}] Communication error: {error_msg}")
                     self.pending_binaries.insert(i, binary)
                     worker.current_binary = None
                     worker.estimated_memory = 0
+                    worker.idle = True
                     return False
 
                 size_mb = binary.size / (1024 * 1024)

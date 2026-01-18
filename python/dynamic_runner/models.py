@@ -1,15 +1,8 @@
-import socket
 import subprocess
 from dataclasses import dataclass
-from enum import Enum
 
 from .binary_info import BinaryInfo
-
-
-class ErrorType(Enum):
-    OUT_OF_MEMORY = "oom"
-    NON_RECOVERABLE = "non_recoverable"
-    RECOVERABLE = "recoverable"
+from .comm import CommunicationInterface, ErrorType
 
 
 @dataclass
@@ -24,7 +17,7 @@ class TaskResult:
 @dataclass
 class WorkerState:
     process: subprocess.Popen
-    socket: socket.socket
+    comm: CommunicationInterface
     current_binary: BinaryInfo | None
     estimated_memory: int
     worker_id: int

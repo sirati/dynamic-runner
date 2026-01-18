@@ -1,6 +1,7 @@
 import threading
 
-from .models import ErrorType, FailedTask, TaskResult, WorkerState
+from .comm import ErrorType
+from .models import FailedTask, TaskResult, WorkerState
 
 
 def worker_completed(
@@ -63,31 +64,3 @@ def worker_completed(
             worker.last_keepalive = None
 
         return released_memory
-
-
-def parse_response(response: str) -> TaskResult | str | None:
-    """Parse worker response into TaskResult or phase update."""
-    # print(f"[Received response] {response}")
-    if response == "done":
-        return TaskResult(success=True)
-    elif response.startswith("done:"):
-        parts = response.split(":", 3)
-        warnings = int(parts[1]) if len(parts) > 1 else 0
-        filtered = int(parts[2]) if len(parts) > 2 else 0
-        return TaskResult(success=True, warnings=warnings, filtered=filtered)
-    elif response.startswith("error:"):
-        parts = response.split(":", 2)
-        if len(parts) >= 3:
-            error_type_str = parts[1]
-            error_message = parts[2]
-            try:
-                error_type = ErrorType(error_type_str)
-            except ValueError:
-                error_type = ErrorType.RECOVERABLE
-            return TaskResult(success=False, error_type=error_type, error_message=error_message)
-    elif response.startswith("phase:"):
-        phase_str = response.split(":", 1)[1]
-        return phase_str
-    elif response == "keepalive":
-        return None
-    return TaskResult(success=False, error_type=ErrorType.RECOVERABLE, error_message="Unknown response")

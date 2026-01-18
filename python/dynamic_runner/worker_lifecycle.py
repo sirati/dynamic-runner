@@ -5,8 +5,14 @@ import sys
 import time
 from pathlib import Path
 
+from .comm import UnixSocketInterface
 from .models import WorkerState
 from .task import TaskDefinition
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 def start_worker(
@@ -17,6 +23,7 @@ def start_worker(
     task_definition: TaskDefinition,
     task_args,
     skip_existing: bool,
+    manual_start: bool = False,
 ) -> WorkerState:
     """Start a worker process with dynamic_queue mode."""
     parent_sock, child_sock = socket.socketpair()
@@ -48,19 +55,79 @@ def start_worker(
     logger = logging.getLogger("manager")
     logger.info(f"[Worker {worker_id}] Starting with command: {' '.join(cmd)}")
 
-    process = subprocess.Popen(
-        cmd,
-        pass_fds=[child_fd],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    if manual_start:
+        if psutil is None:
+            raise RuntimeError("psutil is required for manual worker start mode")
 
-    child_sock.close()
+        print(f"\n[Worker {worker_id}] Please run the following command in another terminal:")
+        print(f"  {' '.join(cmd)}")
+        print(f"[Worker {worker_id}] Waiting for process with socket FD {child_fd} to start...")
+
+        # Wait for process with matching socket FD argument to appear
+        process = None
+        fd_arg = str(child_fd)
+        timeout = 300  # 5 minutes timeout
+        start_time = time.time()
+
+        while process is None:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Worker {worker_id} did not start within {timeout} seconds")
+
+            for proc in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    cmdline = proc.info.get("cmdline")
+                    if cmdline and "--dynamic_queue" in cmdline:
+                        # Find the index of --dynamic_queue and check if next arg matches our FD
+                        try:
+                            idx = cmdline.index("--dynamic_queue")
+                            if idx + 1 < len(cmdline) and cmdline[idx + 1] == fd_arg:
+                                process = proc
+                                logger.info(f"[Worker {worker_id}] Found process with PID {proc.pid}")
+                                print(f"[Worker {worker_id}] Found process with PID {proc.pid}")
+
+                                # Wrap psutil.Process to look like subprocess.Popen
+                                class ProcessWrapper:
+                                    def __init__(self, psutil_proc):
+                                        self._proc = psutil_proc
+                                        self.pid = psutil_proc.pid
+
+                                    def poll(self):
+                                        if self._proc.is_running():
+                                            return None
+                                        return self._proc.status()
+
+                                    def wait(self, timeout=None):
+                                        self._proc.wait(timeout)
+
+                                    def terminate(self):
+                                        self._proc.terminate()
+
+                                process = ProcessWrapper(proc)
+                                break
+                        except (ValueError, IndexError):
+                            continue
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            if process is None:
+                time.sleep(0.5)
+
+        child_sock.close()
+    else:
+        process = subprocess.Popen(
+            cmd,
+            pass_fds=[child_fd],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        child_sock.close()
+
+    comm_interface = UnixSocketInterface(parent_sock)
 
     return WorkerState(
         process=process,
-        socket=parent_sock,
+        comm=comm_interface,
         current_binary=None,
         estimated_memory=0,
         worker_id=worker_id,
@@ -75,11 +142,12 @@ def restart_worker(
     task_definition: TaskDefinition,
     task_args,
     skip_existing: bool,
+    manual_start: bool = False,
 ) -> WorkerState:
     """Restart a worker that encountered a non-recoverable error."""
     try:
         worker.process.terminate()
-        worker.socket.close()
+        worker.comm.close()
     except Exception:
         pass
 
@@ -91,6 +159,7 @@ def restart_worker(
         task_definition,
         task_args,
         skip_existing,
+        manual_start,
     )
 
 
@@ -102,7 +171,7 @@ def check_worker_timeout(worker: WorkerState, task_definition: TaskDefinition) -
     # Find the stage definition for current phase
     stages = task_definition.get_stages()
     for stage in stages:
-        if stage.name == worker.phase:
+        if stage.phase.value == worker.phase:
             if stage.timeout_seconds is not None:
                 if time.time() - worker.last_keepalive > stage.timeout_seconds:
                     return True
@@ -120,7 +189,7 @@ def print_phase_status(worker: WorkerState, logger, task_definition: TaskDefinit
     stages = task_definition.get_stages()
     is_long_running = False
     for stage in stages:
-        if stage.name == worker.phase and stage.timeout_seconds is None:
+        if stage.phase.value == worker.phase and stage.timeout_seconds is None:
             is_long_running = True
             break
 

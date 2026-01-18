@@ -56,6 +56,10 @@ def main():
 
     parser.add_argument("--pid", action="store_true", help="Print worker PIDs when (re)started")
 
+    parser.add_argument(
+        "--manual-start-worker", action="store_true", help="Manually start worker processes (print command and wait)"
+    )
+
     args = parser.parse_args()
 
     if hasattr(args, "debugs") and args.debugs:
@@ -127,6 +131,7 @@ def main():
         skip_existing=args.skip_existing,
         print_pid=args.pid,
         always_restart_worker=args.always_restart_worker,
+        manual_start_worker=args.manual_start_worker,
     )
 
     manager.process_binaries(sorted_binaries)

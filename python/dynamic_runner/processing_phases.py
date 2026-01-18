@@ -3,8 +3,9 @@ import threading
 from pathlib import Path
 
 from .binary_info import BinaryInfo
+from .comm import ErrorType
 from .memory import get_free_system_memory
-from .models import ErrorType, FailedTask, TaskResult, WorkerState
+from .models import FailedTask, TaskResult, WorkerState
 from .task import TaskDefinition
 from .worker_monitoring import WorkerMonitorResult, monitor_worker_once
 from .worker_utils import increment_stat, log_to_worker_file, stop_workers_except
