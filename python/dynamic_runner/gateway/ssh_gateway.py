@@ -1,12 +1,13 @@
 import logging
 import subprocess
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 class SSHGateway:
-    """Gateway implementation for SSH connection to SLURM controller"""
+    """Gateway implementation for SSH connection to SLURM controller using persistent connection"""
 
     def __init__(self, host: str, port: int, user: str | None):
         self.host = host
@@ -14,74 +15,185 @@ class SSHGateway:
         self.user = user
         self.connected = False
         self.remote_home = None
+        self.control_path = None
+        self.control_dir = None
 
     def connect(self) -> None:
-        """Establish connection to SSH gateway"""
+        """Establish persistent SSH connection using ControlMaster"""
         if self.user:
             logger.info(f"Connecting to SSH gateway: {self.user}@{self.host}:{self.port}")
         else:
             logger.info(f"Connecting to SSH gateway: {self.host}:{self.port} (using SSH config)")
 
-        # Test connection
-        returncode, stdout, stderr = self._execute_ssh_command("echo 'Connection test'")
-        if returncode != 0:
-            raise RuntimeError(f"SSH connection failed: {stderr}")
+        # Create temporary directory for control socket
+        self.control_dir = tempfile.mkdtemp(prefix="ssh-control-")
+        self.control_path = f"{self.control_dir}/control-socket"
+        logger.debug(f"SSH control socket path: {self.control_path}")
 
-        self.connected = True
+        # Build SSH command for master connection
+        ssh_cmd = self._build_ssh_base_command()
+        ssh_cmd.extend(
+            [
+                "-M",  # Master mode
+                "-N",  # No remote command (just establish connection)
+                "-f",  # Go to background
+                "-o",
+                f"ControlPath={self.control_path}",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=yes",
+            ]
+        )
 
-        # Get remote home directory
-        returncode, stdout, stderr = self._execute_ssh_command("echo $HOME")
-        if returncode == 0:
-            self.remote_home = stdout.strip()
-            logger.info(f"SSH gateway connected successfully (remote home: {self.remote_home})")
-        else:
-            logger.warning("Could not determine remote home directory")
-            logger.info("SSH gateway connected successfully")
-
-    def disconnect(self) -> None:
-        """Close connection to gateway"""
-        self.connected = False
-        logger.info("SSH gateway disconnected")
-
-    def _build_ssh_command(self, remote_command: str) -> list[str]:
-        """Build SSH command with proper escaping"""
         if self.user:
             target = f"{self.user}@{self.host}"
         else:
             target = self.host
 
-        return [
-            "ssh",
-            "-p",
-            str(self.port),
-            target,
-            remote_command,
-        ]
+        ssh_cmd.append(target)
 
-    def _execute_ssh_command(self, command: str, cwd: Path | None = None) -> tuple[int, str, str]:
-        """Execute SSH command"""
+        # Establish master connection
+        logger.info(f"Establishing persistent SSH master connection...")
+        logger.debug(f"SSH master command: {' '.join(ssh_cmd)}")
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"SSH master connection failed with exit code {result.returncode}")
+            logger.error(f"stderr: {result.stderr}")
+            if result.stdout:
+                logger.error(f"stdout: {result.stdout}")
+            raise RuntimeError(f"SSH master connection failed: {result.stderr}")
+
+        logger.info("SSH master connection established successfully")
+        self.connected = True
+
+        # Get remote home directory
+        logger.debug("Detecting remote home directory...")
+        returncode, stdout, stderr = self._execute_ssh_command("echo $HOME")
+        if returncode == 0:
+            self.remote_home = stdout.strip()
+            logger.info(f"Remote home directory detected: {self.remote_home}")
+            logger.info(f"SSH gateway connected successfully")
+        else:
+            logger.warning(f"Could not determine remote home directory (exit code {returncode})")
+            if stderr:
+                logger.warning(f"stderr: {stderr}")
+            logger.info("SSH gateway connected successfully")
+
+    def disconnect(self) -> None:
+        """Close persistent SSH connection"""
+        if not self.connected:
+            logger.debug("SSH gateway already disconnected")
+            return
+
+        logger.info("Closing SSH master connection...")
+        # Send exit command to master connection
+        ssh_cmd = self._build_ssh_base_command()
+        ssh_cmd.extend(
+            [
+                "-O",
+                "exit",
+                "-o",
+                f"ControlPath={self.control_path}",
+            ]
+        )
+
+        if self.user:
+            target = f"{self.user}@{self.host}"
+        else:
+            target = self.host
+
+        ssh_cmd.append(target)
+
+        logger.debug(f"Sending exit command to SSH master")
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.warning(f"SSH master exit command returned {result.returncode}: {result.stderr}")
+
+        # Clean up control directory
+        if self.control_dir:
+            try:
+                import shutil
+
+                logger.debug(f"Cleaning up SSH control directory: {self.control_dir}")
+                shutil.rmtree(self.control_dir)
+            except Exception as e:
+                logger.warning(f"Failed to clean up control directory {self.control_dir}: {e}")
+
+        self.connected = False
+        logger.info("SSH gateway disconnected")
+
+    def _build_ssh_base_command(self) -> list[str]:
+        """Build base SSH command with port and common options"""
+        cmd = ["ssh"]
+
+        if self.port != 22:
+            cmd.extend(["-p", str(self.port)])
+
+        # Disable host key checking warnings (optional, can be made configurable)
+        # cmd.extend(["-o", "StrictHostKeyChecking=no"])
+        # cmd.extend(["-o", "UserKnownHostsFile=/dev/null"])
+
+        return cmd
+
+    def _build_ssh_command(self, remote_command: str) -> list[str]:
+        """Build SSH command that uses the persistent connection"""
+        if not self.connected:
+            raise RuntimeError("Gateway not connected")
+
+        ssh_cmd = self._build_ssh_base_command()
+        ssh_cmd.extend(
+            [
+                "-o",
+                f"ControlPath={self.control_path}",
+                "-o",
+                "ControlMaster=no",
+            ]
+        )
+
+        if self.user:
+            target = f"{self.user}@{self.host}"
+        else:
+            target = self.host
+
+        ssh_cmd.append(target)
+        ssh_cmd.append(remote_command)
+
+        return ssh_cmd
+
+    def _execute_ssh_command(self, command: str, cwd: str | None = None) -> tuple[int, str, str]:
+        """Execute command via persistent SSH connection
+
+        Args:
+            command: Command to execute
+            cwd: Optional working directory
+
+        Returns:
+            (return_code, stdout, stderr)
+        """
+        # Wrap command with cd if cwd is provided
         if cwd:
             command = f"cd {cwd} && {command}"
 
         ssh_cmd = self._build_ssh_command(command)
 
-        try:
-            result = subprocess.run(
-                ssh_cmd,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            logger.error(f"SSH command timed out: {command}")
-            return -1, "", "Command timed out"
-        except Exception as e:
-            logger.error(f"SSH command execution failed: {e}")
-            return -1, "", str(e)
+        logger.debug(f"Executing SSH command: {command[:100]}{'...' if len(command) > 100 else ''}")
+        result = subprocess.run(ssh_cmd, capture_output=True, text=True)
 
-    def execute_command(self, command: str, cwd: Path | None = None) -> tuple[int, str, str]:
+        if result.returncode != 0:
+            logger.debug(f"Command failed with exit code {result.returncode}")
+            if result.stderr:
+                logger.debug(f"stderr: {result.stderr[:200]}{'...' if len(result.stderr) > 200 else ''}")
+
+        return result.returncode, result.stdout, result.stderr
+
+    def execute_command(self, command: str, cwd: str | None = None) -> tuple[int, str, str]:
         """Execute command on gateway
+
+        Args:
+            command: Shell command to execute
+            cwd: Optional working directory
 
         Returns:
             (return_code, stdout, stderr)
@@ -89,82 +201,92 @@ class SSHGateway:
         if not self.connected:
             raise RuntimeError("Gateway not connected")
 
-        logger.debug(f"Executing via SSH: {command}")
         return self._execute_ssh_command(command, cwd)
 
-    def transfer_file(self, local_path: Path, remote_path: Path) -> None:
-        """Transfer file from local to gateway using scp"""
+    def transfer_file(self, local_path: Path, remote_path: str) -> None:
+        """Transfer file from local to gateway using scp over persistent connection"""
         if not self.connected:
             raise RuntimeError("Gateway not connected")
 
-        logger.debug(f"Transferring {local_path} to {self.host}:{remote_path}")
+        # Get file size for logging
+        try:
+            file_size_mb = local_path.stat().st_size / (1024 * 1024)
+            logger.info(f"Transferring file: {local_path.name} ({file_size_mb:.1f} MB) -> {remote_path}")
+        except Exception:
+            logger.info(f"Transferring file: {local_path} -> {remote_path}")
 
-        # Expand ~ using remote home directory
-        path_str = str(remote_path)
-        if path_str.startswith("~") and self.remote_home:
-            path_str = path_str.replace("~", self.remote_home, 1)
-            remote_path = path_str
+        # Build scp command using the same control socket
+        scp_cmd = ["scp"]
 
-        # Ensure remote directory exists
-        self.create_directory(Path(remote_path).parent)
+        if self.port != 22:
+            scp_cmd.extend(["-P", str(self.port)])
+
+        # Use the same control socket
+        scp_cmd.extend(
+            [
+                "-o",
+                f"ControlPath={self.control_path}",
+            ]
+        )
+
+        # Source and destination
+        local_path_str = str(local_path)
 
         if self.user:
-            target = f"{self.user}@{self.host}:{remote_path}"
+            remote_target = f"{self.user}@{self.host}:{remote_path}"
         else:
-            target = f"{self.host}:{remote_path}"
+            remote_target = f"{self.host}:{remote_path}"
 
-        scp_cmd = [
-            "scp",
-            "-P",
-            str(self.port),
-            str(local_path),
-            target,
-        ]
+        scp_cmd.extend([local_path_str, remote_target])
 
-        try:
-            result = subprocess.run(
-                scp_cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"SCP failed: {result.stderr}")
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("File transfer timed out")
-        except Exception as e:
-            logger.error(f"File transfer failed: {e}")
-            raise
+        logger.debug(f"SCP command: {' '.join(scp_cmd[:5])}...")
+        result = subprocess.run(scp_cmd, capture_output=True, text=True)
 
-    def create_directory(self, remote_path: Path) -> None:
-        """Create directory on gateway"""
+        if result.returncode != 0:
+            logger.error(f"SCP failed with exit code {result.returncode}")
+            logger.error(f"stderr: {result.stderr}")
+            if result.stdout:
+                logger.error(f"stdout: {result.stdout}")
+            raise RuntimeError(f"SCP failed: {result.stderr}")
+
+        logger.info(f"File transferred successfully")
+        logger.debug(f"Remote path: {remote_path}")
+
+    def create_directory(self, remote_path: str) -> None:
+        """Create directory on gateway (including parents)"""
         if not self.connected:
             raise RuntimeError("Gateway not connected")
 
-        # Expand ~ using remote home directory
-        path_str = str(remote_path)
-        if path_str.startswith("~") and self.remote_home:
-            path_str = path_str.replace("~", self.remote_home, 1)
+        logger.info(f"Creating directory: {remote_path}")
 
-        command = f"mkdir -p {path_str}"
-        returncode, stdout, stderr = self._execute_ssh_command(command)
+        # Expand ~ if present
+        if remote_path.startswith("~") and self.remote_home:
+            expanded_path = remote_path.replace("~", self.remote_home, 1)
+        else:
+            expanded_path = remote_path
+
+        returncode, stdout, stderr = self._execute_ssh_command(f"mkdir -p {expanded_path}")
 
         if returncode != 0:
-            raise RuntimeError(f"Directory creation failed: {stderr}")
+            logger.error(f"Failed to create directory {remote_path}")
+            logger.error(f"exit code: {returncode}, stderr: {stderr}")
+            raise RuntimeError(f"Failed to create directory {remote_path}: {stderr}")
 
-        logger.debug(f"Created directory: {remote_path}")
+        logger.info(f"Directory created successfully")
 
-    def file_exists(self, remote_path: Path) -> bool:
+    def file_exists(self, remote_path: str) -> bool:
         """Check if file exists on gateway"""
         if not self.connected:
             raise RuntimeError("Gateway not connected")
 
-        # Expand ~ using remote home directory
-        path_str = str(remote_path)
-        if path_str.startswith("~") and self.remote_home:
-            path_str = path_str.replace("~", self.remote_home, 1)
+        logger.debug(f"Checking if file exists: {remote_path}")
+        # Expand ~ if present
+        if remote_path.startswith("~") and self.remote_home:
+            expanded_path = remote_path.replace("~", self.remote_home, 1)
+        else:
+            expanded_path = remote_path
 
-        command = f"test -e {path_str} && echo exists || echo notfound"
-        returncode, stdout, stderr = self._execute_ssh_command(command)
-
-        return stdout.strip() == "exists"
+        returncode, _, _ = self._execute_ssh_command(f"test -e {expanded_path}")
+        exists = returncode == 0
+        logger.debug(f"File exists check result: {exists}")
+        return exists

@@ -182,19 +182,56 @@ This document tracks the implementation status of the SLURM distributed processi
 - Mock SLURM environment for testing
 - End-to-end workflow tests
 
+## 📊 Recent Progress (2026-01-18)
+
+### ✅ Latest Achievement: Persistent SSH Connection
+**Successfully implemented SSH ControlMaster for connection reuse**:
+- Single SSH master connection established at start
+- All subsequent commands (execute, scp, etc.) reuse the same connection via ControlPath
+- Properly closes connection and cleans up control socket on exit
+- Eliminates connection overhead for repeated operations
+- Ensures all operations go to the same gateway node (critical for SLURM clusters)
+- Debug logging shows connection lifecycle clearly
+
+### ✅ Completed Today
+1. **Persistent SSH Connection** - Implemented ControlMaster for single reusable connection across all operations
+2. **Docker Image Build & Transfer** - Successfully builds locally with Nix and transfers to gateway via SCP
+3. **Gateway Integration** - SSH gateway connects, creates directories, transfers 367MB image in ~26 seconds
+4. **Path Expansion** - Properly expands `~` paths for remote execution using detected remote home
+5. **SLURM Job Submission** - Successfully submits test jobs with proper wrapper scripts
+6. **Test Mode** - Added `--slurm-test-job` flag to validate Docker image loading on compute nodes
+7. **Debug Logging** - Added `--debug` flag for comprehensive logging throughout the pipeline
+
+### 🚧 Current Blocker
+**Container Runtime on Compute Nodes**: SLURM compute nodes have Podman in rootless mode, but:
+- `/run/user/{uid}/containers` is not available/writable
+- Default OCI runtime "crun" not found
+- Error code 125 from Podman
+
+**Possible Solutions**:
+1. Use Singularity/Apptainer instead of Docker (common on HPC clusters)
+2. Configure Podman with alternative storage/runtime directories
+3. Pre-configure compute node environment via SLURM prolog scripts
+4. Use system-wide container runtime if available
+
+**Test Results**:
+- Job 71732: Image copied to /tmp successfully (367MB)
+- Docker load command fails with runtime error
+- Need to investigate cluster's container capabilities
+
 ## 📋 Implementation Priority
 
 ### High Priority (Core Functionality)
-1. **QUIC Communication** - Required for all distributed operations
-2. **File Distribution** - Core data transfer mechanism
-3. **Worker Integration** - Actual task execution
-4. **Message Handling** - Enable coordinator-secondary communication
+1. **Container Runtime Setup** - BLOCKER: Fix Podman/Docker runtime on compute nodes or switch to Singularity
+2. **QUIC Communication** - Required for all distributed operations
+3. **File Distribution** - Core data transfer mechanism
+4. **Worker Integration** - Actual task execution
+5. **Message Handling** - Enable coordinator-secondary communication
 
 ### Medium Priority (Robustness)
-5. **Failover Protocol** - Ensure reliability
-6. **Log Management** - Proper debugging and monitoring
-7. **Unix Socket Commands** - Container-host interaction
-8. **Project Sync** - Automatic deployment
+6. **Failover Protocol** - Ensure reliability
+7. **Log Management** - Proper debugging and monitoring
+8. **Unix Socket Commands** - Container-host interaction
 
 ### Low Priority (Polish)
 9. **Testing Infrastructure** - Quality assurance
@@ -225,24 +262,34 @@ This document tracks the implementation status of the SLURM distributed processi
 
 - **Documentation & Architecture**: 100% ✅
 - **Infrastructure & CLI**: 100% ✅
+- **Build & Transfer Pipeline**: 90% ✅ (works locally, blocked on compute nodes)
 - **Core Components**: 40% 🚧
 - **QUIC & Networking**: 0% ⏸️
 - **File Operations**: 10% 🚧
 - **Failover & Robustness**: 0% ⏸️
-- **Testing**: 0% ⏸️
+- **Testing**: 5% 🚧 (test job submission works, runtime blocked)
 
-**Overall Progress**: ~35% complete
+**Overall Progress**: ~40% complete
 
 ## 🚀 Next Steps
 
-1. Implement QUIC communication layer (use `aioquic` or similar)
-2. Complete message handling in coordinator and secondary
-3. Implement file distribution with deduplication
-4. Integrate with existing worker manager
-5. Add comprehensive error handling
-6. Develop testing infrastructure
-7. Performance profiling and optimization
-8. Production deployment testing
+### Immediate (Unblock Progress)
+1. **Investigate container runtime on LMU cluster**:
+   - Check if Singularity/Apptainer is available
+   - Test if system-wide Docker/Podman works
+   - Check cluster documentation for container best practices
+2. **Alternative: Implement Singularity packaging** alongside Docker
+3. **Test container execution** on actual compute node with working runtime
+
+### After Unblocking
+4. Implement QUIC communication layer (use `aioquic` or similar)
+5. Complete message handling in coordinator and secondary
+6. Implement file distribution with deduplication
+7. Integrate with existing worker manager
+8. Add comprehensive error handling
+9. Develop testing infrastructure
+10. Performance profiling and optimization
+11. Production deployment testing
 
 ## 📝 Notes
 
@@ -251,3 +298,19 @@ This document tracks the implementation status of the SLURM distributed processi
 - Packaging interface supports future container runtimes (Podman, Singularity)
 - Protocol designed for extensibility (easy to add new message types)
 - Clean separation between coordinator, gateway, and secondary concerns
+- Persistent SSH connection ensures reliability and consistency
+
+### Working Components (Tested)
+- Persistent SSH ControlMaster connection: ✅ (single connection reused for all operations)
+- Nix builds Docker image locally: ✅ (367MB, ~30 seconds)
+- SSH gateway connection: ✅ (auto-detects remote home)
+- Directory creation on gateway: ✅ (all operations via same connection)
+- SCP file transfer: ✅ (367MB in ~26 seconds, via persistent connection)
+- SLURM job submission: ✅ (via persistent connection)
+- Path expansion (~/ → /home/k/kruppb): ✅
+- Image copy to /tmp on compute node: ✅
+- Debug logging throughout: ✅ (use --debug flag)
+
+### Known Issues
+- Podman rootless mode on compute nodes requires runtime directories that don't exist
+- Need to investigate cluster-specific container configuration

@@ -15,6 +15,20 @@ class SlurmJobManager:
         self.packaging = packaging_method
         self.job_ids: list[str] = []
 
+    def _expand_path(self, path: str | Path) -> str:
+        """Expand tilde paths for remote execution
+
+        Args:
+            path: Path that may contain ~
+
+        Returns:
+            Path with ~ expanded to remote home directory
+        """
+        path_str = str(path)
+        if path_str.startswith("~") and hasattr(self.gateway, "remote_home") and self.gateway.remote_home:
+            return path_str.replace("~", self.gateway.remote_home, 1)
+        return path_str
+
     def prepare_directories(self) -> None:
         """Create necessary directories on gateway"""
         logger.info("Creating SLURM directories on gateway...")
@@ -26,11 +40,11 @@ class SlurmJobManager:
 
         logger.info("Directories created successfully")
 
-    def build_and_transfer_image(self, project_root: Path) -> Path:
-        """Build Docker image and transfer to gateway
+    def build_and_transfer_image(self, local_project_root: Path) -> Path:
+        """Build Docker image locally and transfer to gateway
 
         Args:
-            project_root: Root directory of project on gateway
+            local_project_root: Root directory of project locally
 
         Returns:
             Path to image on gateway
@@ -39,11 +53,12 @@ class SlurmJobManager:
 
         image_path = f"{self.slurm_config.get_image_dir()}/asm-tokenizer-docker.tar"
 
-        # Build image on gateway
-        built_image = self.packaging.build_image(self.gateway, project_root, image_path)
+        # Build image locally using Nix, then transfer to gateway
+        built_image = self.packaging.build_image(self.gateway, local_project_root, image_path)
 
         logger.info(f"Image available at: {built_image}")
-        return built_image
+        # Return expanded path for use in scripts
+        return self._expand_path(built_image)
 
     def generate_wrapper_script(
         self,
@@ -63,18 +78,25 @@ class SlurmJobManager:
         Returns:
             Bash script content
         """
-        rnd_suffix = secrets.token_hex(8)
-        rndtmp = f"/tmp/asm-tokenizer-{rnd_suffix}"
+        rnd_suffix = secrets.token_hex(4)
+        rndtmp = f"/tmp/asm-{rnd_suffix}"
 
         # Directory paths
         src_tmp = f"{rndtmp}/src"
         out_tmp = f"{rndtmp}/out"
         log_tmp = f"{rndtmp}/log"
 
-        # Network paths
-        srcbins_network = self.slurm_config.get_srcbins_dir()
-        output_network = self.slurm_config.get_output_dir()
-        log_network = self.slurm_config.get_log_dir()
+        # Podman storage paths for SLURM environment (keep short - runroot limit is 50 chars)
+        podman_storage = f"{rndtmp}/storage"
+        podman_run = f"{rndtmp}/run"
+
+        # Network paths (expand ~ for remote execution)
+        srcbins_network = self._expand_path(self.slurm_config.get_srcbins_dir())
+        output_network = self._expand_path(self.slurm_config.get_output_dir())
+        log_network = self._expand_path(self.slurm_config.get_log_dir())
+
+        # Expand image path
+        image_path_expanded = self._expand_path(image_path)
 
         # Socket paths
         socket_dir = f"{rndtmp}/sockets"
@@ -86,8 +108,16 @@ class SlurmJobManager:
         script = f"""#!/bin/bash
 set -e
 
+echo "=================================================="
+echo "SLURM Secondary Job Starting"
+echo "Node: $(hostname)"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Time: $(date)"
+echo "=================================================="
+
 # Create temporary directories
 RNDTMP="{rndtmp}"
+echo "Creating temporary directory: $RNDTMP"
 mkdir -p "$RNDTMP"
 mkdir -p "{src_tmp}"
 mkdir -p "{out_tmp}"
@@ -97,13 +127,32 @@ mkdir -p "{socket_dir}"
 # Cleanup on exit
 cleanup() {{
     echo "Cleaning up temporary directory: $RNDTMP"
-    rm -rf "$RNDTMP"
+    # Force remove with sudo for podman overlay permission issues
+    rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
 }}
 trap cleanup EXIT
 
-# Load Docker image
-echo "Loading Docker image..."
-{self.packaging.get_load_command(image_path)}
+# Setup Podman environment for SLURM
+PODMAN_STORAGE="{podman_storage}"
+PODMAN_RUN="{podman_run}"
+mkdir -p "$PODMAN_STORAGE" "$PODMAN_RUN"
+chmod 700 "$PODMAN_STORAGE" "$PODMAN_RUN"
+export XDG_RUNTIME_DIR="$PODMAN_RUN"
+echo "Podman storage: $PODMAN_STORAGE"
+echo "Podman run root: $PODMAN_RUN"
+echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+echo ""
+
+# Copy Docker image to local /tmp for faster loading
+echo "Copying Docker image to local temp directory..."
+LOCAL_IMAGE="$RNDTMP/asm-tokenizer-docker.tar"
+cp "{image_path_expanded}" "$LOCAL_IMAGE"
+echo "Docker image copied to: $LOCAL_IMAGE"
+
+# Load Docker image with Podman
+echo "Loading Docker image into container runtime..."
+{self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
+echo "Docker image loaded successfully"
 
 # Start command relay service in background
 echo "Starting command relay service..."
@@ -125,22 +174,136 @@ CMD_RELAY_PID=$!
 
 # Run Docker container
 echo "Starting Docker container..."
-docker run --rm \\
-    -v "{src_tmp}:/app/src-tmp" \\
-    -v "{out_tmp}:/app/out-tmp" \\
-    -v "{log_tmp}:/app/log-tmp" \\
-    -v "{srcbins_network}:/app/src-network:ro" \\
-    -v "{output_network}:/app/out-network" \\
-    -v "{log_network}:/app/log-network" \\
-    -v "{socket_dir}:/app/sockets" \\
-    -p {secondary_port}:{secondary_port} \\
-    {image_name}:{image_tag} \\
+echo "  Volumes:"
+echo "    {src_tmp} -> /app/src-tmp"
+echo "    {out_tmp} -> /app/out-tmp"
+echo "    {log_tmp} -> /app/log-tmp"
+echo "    {srcbins_network} -> /app/src-network (ro)"
+echo "    {output_network} -> /app/out-network"
+echo "    {log_network} -> /app/log-network"
+echo "    {socket_dir} -> /app/sockets"
+echo "  Port: {secondary_port}:{secondary_port}"
+echo "  Primary: {primary_host}:{primary_port}"
+echo ""
+
+# Run container with Podman
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    -v "{src_tmp}:/app/src-tmp" \
+    -v "{out_tmp}:/app/out-tmp" \
+    -v "{log_tmp}:/app/log-tmp" \
+    -v "{srcbins_network}:/app/src-network:ro" \
+    -v "{output_network}:/app/out-network" \
+    -v "{log_network}:/app/log-network" \
+    -v "{socket_dir}:/app/sockets" \
+    -p {secondary_port}:{secondary_port} \
+    {image_name}:{image_tag} \
     dynamic_batch --secondary quic://{primary_host}:{primary_port}
+
+CONTAINER_EXIT_CODE=$?
+echo "Container exited with code: $CONTAINER_EXIT_CODE"
 
 # Kill command relay service
 kill $CMD_RELAY_PID 2>/dev/null || true
 
-echo "Job completed successfully"
+echo "=================================================="
+echo "Job completed"
+echo "Time: $(date)"
+echo "=================================================="
+
+exit $CONTAINER_EXIT_CODE
+"""
+        return script
+
+    def generate_test_wrapper_script(self, image_path: Path) -> str:
+        """Generate test bash wrapper script that validates Docker image loading
+
+        Args:
+            image_path: Path to Docker image on compute node
+
+        Returns:
+            Bash script content for test job
+        """
+        rnd_suffix = secrets.token_hex(4)
+        rndtmp = f"/tmp/asm-test-{rnd_suffix}"
+
+        image_name = self.packaging.get_image_name()
+        image_tag = self.packaging.get_image_tag()
+
+        # Expand image path for remote execution
+        image_path_expanded = self._expand_path(image_path)
+
+        # Podman storage paths (keep short - runroot limit is 50 chars)
+        podman_storage = f"{rndtmp}/storage"
+        podman_run = f"{rndtmp}/run"
+
+        script = f"""#!/bin/bash
+set -e
+
+echo "=================================================="
+echo "SLURM Test Job - Docker Image Validation"
+echo "Node: $(hostname)"
+echo "Job ID: $SLURM_JOB_ID"
+echo "Time: $(date)"
+echo "=================================================="
+echo ""
+
+# Create temporary directory
+RNDTMP="{rndtmp}"
+echo "Creating temporary directory: $RNDTMP"
+mkdir -p "$RNDTMP"
+
+# Cleanup on exit
+cleanup() {{
+    echo ""
+    echo "Cleaning up temporary directory: $RNDTMP"
+    rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
+}}
+trap cleanup EXIT
+
+# Setup Podman environment for SLURM
+PODMAN_STORAGE="{podman_storage}"
+PODMAN_RUN="{podman_run}"
+mkdir -p "$PODMAN_STORAGE" "$PODMAN_RUN"
+chmod 700 "$PODMAN_STORAGE" "$PODMAN_RUN"
+export XDG_RUNTIME_DIR="$PODMAN_RUN"
+echo "Podman storage: $PODMAN_STORAGE"
+echo "Podman run root: $PODMAN_RUN"
+echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+echo ""
+
+# Copy Docker image to local /tmp
+echo "Copying Docker image to local temp directory..."
+LOCAL_IMAGE="$RNDTMP/asm-tokenizer-docker.tar"
+echo "  Source: {image_path_expanded}"
+echo "  Destination: $LOCAL_IMAGE"
+cp "{image_path_expanded}" "$LOCAL_IMAGE"
+echo "  Size: $(du -h "$LOCAL_IMAGE" | cut -f1)"
+echo "Docker image copied successfully"
+echo ""
+
+# Load Docker image with Podman
+echo "Loading Docker image into container runtime..."
+{self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
+echo ""
+
+# List loaded images
+echo "Verifying image is loaded..."
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" images | grep {image_name} || echo "WARNING: Image not found in listing"
+echo ""
+
+# Test run container with simple command
+echo "Testing container execution..."
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm {image_name}:{image_tag} python --version
+echo ""
+
+echo "Testing dynamic_batch module..."
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm {image_name}:{image_tag} dynamic_batch --help | head -5
+echo ""
+
+echo "=================================================="
+echo "Test Job Completed Successfully"
+echo "Time: $(date)"
+echo "=================================================="
 """
         return script
 
@@ -185,8 +348,8 @@ echo "Job completed successfully"
             f"--cpus-per-task={self.slurm_config.cpus_per_task}",
             f"--partition={self.slurm_config.partition}",
             f"--time={self.slurm_config.time_limit}",
-            f"--output={self.slurm_config.get_log_dir()}/slurm_%j.out",
-            f"--error={self.slurm_config.get_log_dir()}/slurm_%j.err",
+            f"--output={self._expand_path(self.slurm_config.get_log_dir())}/slurm_%j.out",
+            f"--error={self._expand_path(self.slurm_config.get_log_dir())}/slurm_%j.err",
         ]
 
         if self.slurm_config.notify_email:
