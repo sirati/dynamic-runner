@@ -675,7 +675,7 @@ class WorkerManager:
                         for response in msg.parsed_responses:
                             if response == "ready":
                                 worker.ready = True
-                                self.manager_logger.info(f"[Worker {worker.worker_id}] Ready signal received")
+                                self.manager_logger.debug(f"[Worker {worker.worker_id}] Ready signal received")
 
             time.sleep(0.1)
 
@@ -702,7 +702,7 @@ class WorkerManager:
                         for response in msg.parsed_responses:
                             if response == "ready":
                                 worker.ready = True
-                                self.manager_logger.info(f"[Worker {worker.worker_id}] Ready signal received")
+                                self.manager_logger.debug(f"[Worker {worker.worker_id}] Ready signal received")
 
             for worker_id in list(active_workers):
                 worker = self.workers[worker_id]

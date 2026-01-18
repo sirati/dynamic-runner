@@ -75,7 +75,7 @@ def start_worker(
 
     # Log the full command line at debug level
     logger = logging.getLogger("manager")
-    logger.info(f"[Worker {worker_id}] Starting with command: {' '.join(cmd)}")
+    logger.debug(f"[Worker {worker_id}] Starting with command: {' '.join(cmd)}")
 
     if connection_mode == "named":
         # Create named socket interface (server side)
