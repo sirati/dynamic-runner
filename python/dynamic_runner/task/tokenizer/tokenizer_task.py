@@ -112,7 +112,13 @@ class TokenizerTask(TaskDefinition):
         """
         # Tokenizer requires --platform argument
         # The value "auto" tells tokenizer to extract platform from filename
-        return ["--platform", "auto"]
+        cmd_args = ["--platform", "auto"]
+
+        # Add simulate-crash if provided
+        if hasattr(args, "simulate_crash") and args.simulate_crash is not None:
+            cmd_args.extend(["--simulate-crash", str(args.simulate_crash)])
+
+        return cmd_args
 
     def get_output_filename_pattern(self, input_filename: str) -> str:
         """Generate output filename for tokenizer.
