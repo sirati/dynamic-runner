@@ -538,13 +538,16 @@ class WorkerManager:
         if assigned:
             return True
 
-        if not self.pending_binaries and allow_stop:
-            success, error = send_worker_command(worker, "stop")
-            if not success:
-                crash_msg = f"[Worker {worker_id}] Socket error while sending stop, worker likely crashed: {error}"
-                self.manager_logger.error(crash_msg)
-                self._restart_worker(worker_id)
-                return True
+        if not self.pending_binaries:
+            if allow_stop:
+                success, error = send_worker_command(worker, "stop")
+                if not success:
+                    crash_msg = f"[Worker {worker_id}] Socket error while sending stop, worker likely crashed: {error}"
+                    self.manager_logger.error(crash_msg)
+                    self._restart_worker(worker_id)
+                    return True
+                self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")
+            # Remove from active workers (but don't stop if allow_stop=False)
             active_workers.discard(worker_id)
             return False
 
@@ -655,13 +658,15 @@ class WorkerManager:
             if not assigned:
                 assigned = self._assign_binary_to_worker_normal(worker, retry_attempt=True)
 
-        if not assigned and not self.pending_binaries and allow_stop:
-            log_to_worker_file(self.log_dir, worker_id, f"Worker {worker_id} stopping (no more tasks)")
-            self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")
-            success, error = send_worker_command(worker, "stop")
-            if not success:
-                socket_error_msg = f"[Worker {worker_id}] Socket error while sending stop: {error}"
-                self.manager_logger.warning(socket_error_msg)
+        if not assigned and not self.pending_binaries:
+            if allow_stop:
+                log_to_worker_file(self.log_dir, worker_id, f"Worker {worker_id} stopping (no more tasks)")
+                self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")
+                success, error = send_worker_command(worker, "stop")
+                if not success:
+                    socket_error_msg = f"[Worker {worker_id}] Socket error while sending stop: {error}"
+                    self.manager_logger.warning(socket_error_msg)
+            # Remove from active workers regardless of allow_stop
             active_workers.discard(worker_id)
 
     def _wait_for_workers_ready(self) -> None:
@@ -861,8 +866,9 @@ class WorkerManager:
     def _run_main_phase(self) -> None:
         """Run the main processing phase."""
         active_workers = set(range(self.num_workers))
+        # Don't stop workers - keep them alive for subsequent phases
         self._process_worker_loop(
-            active_workers, allow_stop=True, on_failure_increment_failed=False, is_initial_phase=False
+            active_workers, allow_stop=False, on_failure_increment_failed=False, is_initial_phase=False
         )
 
         # Report status after main phase
@@ -878,11 +884,13 @@ class WorkerManager:
 
         self.manager_logger.info(f"[Retry Phase] Starting retry of {len(self.failed_tasks)} failed tasks")
 
+        # Reactivate all workers for retry phase
+        active_workers = set(range(self.num_workers))
         process_retry_phase(
             self.failed_tasks,
             self.pending_binaries,
             self.num_workers,
-            self._process_worker_loop,
+            lambda aw, **kwargs: self._process_worker_loop(aw, allow_stop=False, **kwargs),
             self.manager_logger,
         )
 
@@ -905,7 +913,7 @@ class WorkerManager:
             self.pending_binaries,
             self.workers,
             self.log_dir,
-            self._process_worker_loop,
+            lambda aw, **kwargs: self._process_worker_loop(aw, allow_stop=False, **kwargs),
             self.manager_logger,
         )
         self.in_oom_phase = False
@@ -949,6 +957,16 @@ class WorkerManager:
         self._run_retry_phase()
         self._run_oom_phase()
         self._run_unassigned_phase()
+
+        # Stop all workers after all phases complete
+        for worker in self.workers:
+            if worker.process and worker.process.poll() is None:
+                try:
+                    success, error = send_worker_command(worker, "stop")
+                    if success:
+                        self.manager_logger.info(f"[Worker {worker.worker_id}] Stopping (all phases complete)")
+                except Exception:
+                    pass
 
         cleanup_workers(self.workers)
 
