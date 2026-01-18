@@ -1,4 +1,6 @@
 import logging
+import random
+import string
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +37,8 @@ class WorkerManager:
         print_pid: bool,
         always_restart_worker: bool = False,
         manual_start_worker: bool = False,
+        connection_mode: str = "socketpair",
+        socket_dir: Path | None = None,
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
@@ -47,6 +51,17 @@ class WorkerManager:
         self.print_pid = print_pid
         self.always_restart_worker = always_restart_worker
         self.manual_start_worker = manual_start_worker
+        self.connection_mode = connection_mode
+        self.socket_dir = socket_dir
+
+        # Validate socket_dir for named mode
+        if self.connection_mode == "named":
+            if self.socket_dir is None:
+                raise ValueError("socket_dir is required when connection_mode is 'named'")
+            self.socket_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate random session ID for socket names
+        self.session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
 
         self.workers: list[WorkerState] = []
         self.available_memory = max_memory
@@ -123,10 +138,18 @@ class WorkerManager:
         except Exception as e:
             self.manager_logger.warning(f"Failed to log memory usage: {e}")
 
+    def _get_socket_path(self, worker_id: int) -> Path | None:
+        """Get socket path for a worker in named mode."""
+        if self.connection_mode != "named":
+            return None
+        return self.socket_dir / f"worker_{worker_id}_{self.session_id}.sock"
+
     def _start_worker(self, worker_id: int) -> WorkerState:
         """Start a new worker process."""
         worker_log_path = self.log_dir / f"worker_{worker_id}.log"
         log_to_worker_file(self.log_dir, worker_id, f"Manager: Worker {worker_id} starting")
+
+        socket_path = self._get_socket_path(worker_id)
 
         worker = start_worker(
             worker_id,
@@ -137,23 +160,43 @@ class WorkerManager:
             self.task_args,
             self.skip_existing,
             self.manual_start_worker,
+            self.connection_mode,
+            socket_path,
         )
 
         # Set initial budget based on worker index
         worker.reserved_budget = self._calculate_initial_budget(worker_id)
         budget_mb = worker.reserved_budget / (1024 * 1024)
-        self.manager_logger.info(
-            f"[Worker {worker_id}] Started with PID {worker.process.pid}, budget: {budget_mb:.2f}MB"
-        )
+
+        if worker.process:
+            self.manager_logger.info(
+                f"[Worker {worker_id}] Started with PID {worker.process.pid}, budget: {budget_mb:.2f}MB"
+            )
+        else:
+            self.manager_logger.info(f"[Worker {worker_id}] Waiting for manual start, budget: {budget_mb:.2f}MB")
         return worker
 
     def _restart_worker(self, worker_id: int) -> WorkerState:
         """Restart a worker process."""
         old_worker = self.workers[worker_id]
         worker_log_path = self.log_dir / f"worker_{worker_id}.log"
-        log_to_worker_file(
-            self.log_dir, worker_id, f"Manager: Worker {worker_id} restarting (old PID: {old_worker.process.pid})"
-        )
+        old_pid_str = f"old PID: {old_worker.process.pid}" if old_worker.process else "waiting for manual start"
+        log_to_worker_file(self.log_dir, worker_id, f"Manager: Worker {worker_id} restarting ({old_pid_str})")
+
+        # Close old communication interface
+        try:
+            old_worker.comm.close()
+        except Exception:
+            pass
+
+        # Generate new socket path with new random suffix for named mode
+        if self.connection_mode == "named":
+            # Generate new random suffix for this restart
+            new_suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+            socket_path = self.socket_dir / f"worker_{worker_id}_{new_suffix}.sock"
+            self.manager_logger.info(f"[Worker {worker_id}] New socket path: {socket_path}")
+        else:
+            socket_path = None
 
         new_worker = restart_worker(
             old_worker,
@@ -164,16 +207,35 @@ class WorkerManager:
             self.task_args,
             self.skip_existing,
             self.manual_start_worker,
+            self.connection_mode,
+            socket_path,
         )
 
         # Preserve initial budget and opportunistic status
         new_worker.reserved_budget = old_worker.reserved_budget
         new_worker.opportunistic = old_worker.opportunistic
         new_worker.idle = True
+        # Reset ready flag - worker needs to send ready signal again
+        new_worker.ready = False
+        # In socketpair mode with automatic start, connection is established immediately
+        if self.connection_mode == "socketpair" and not self.manual_start_worker:
+            new_worker.connection_established = True
+        else:
+            new_worker.connection_established = False
 
-        self.manager_logger.info(
-            f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid} (old PID: {old_worker.process.pid})"
-        )
+        # Handle logging for manual mode where process might be None
+        if new_worker.process and old_worker.process:
+            self.manager_logger.info(
+                f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid} (old PID: {old_worker.process.pid})"
+            )
+        elif new_worker.process:
+            self.manager_logger.info(f"[Worker {worker_id}] Restarted with PID {new_worker.process.pid}")
+        elif old_worker.process:
+            self.manager_logger.info(
+                f"[Worker {worker_id}] Restarted (waiting for manual start, old PID: {old_worker.process.pid})"
+            )
+        else:
+            self.manager_logger.info(f"[Worker {worker_id}] Restarted (waiting for manual start)")
 
         with self.lock:
             self.workers[worker_id] = new_worker
@@ -182,6 +244,10 @@ class WorkerManager:
 
     def _assign_binary_to_worker_initial_phase(self, worker: WorkerState) -> bool:
         """Assign binary during initial phase with opportunistic marking."""
+        # Don't assign to workers that aren't ready
+        if not worker.ready or not worker.connection_established:
+            return False
+
         with self.lock:
             if not self.pending_binaries:
                 return False
@@ -238,7 +304,11 @@ class WorkerManager:
             return False
 
     def _assign_binary_to_worker_normal(self, worker: WorkerState, retry_attempt: bool = False) -> bool:
-        """Assign binary during normal phase with temporary budget factors."""
+        """Assign a binary to a worker during normal phase."""
+        # Don't assign to workers that aren't ready
+        if not worker.ready or not worker.connection_established:
+            return False
+
         with self.lock:
             if not self.pending_binaries:
                 return False
@@ -349,11 +419,12 @@ class WorkerManager:
         total_memory = 0
         for worker in self.workers:
             if worker.process and worker.process.poll() is None:
-                try:
-                    process = psutil.Process(worker.process.pid)
-                    total_memory += process.memory_info().rss
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    pass
+                if psutil and worker.process:
+                    try:
+                        process = psutil.Process(worker.process.pid)
+                        total_memory += process.memory_info().rss
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        pass
         return total_memory
 
     def _check_memory_pressure_and_kill(self) -> None:
@@ -464,6 +535,53 @@ class WorkerManager:
         # Worker is idle but binaries remain - keep it in the loop
         return True
 
+    def _check_manual_worker_connections(self) -> None:
+        """Check for manually started workers that haven't connected yet."""
+        if not self.manual_start_worker:
+            return
+
+        import time
+
+        from .worker_lifecycle import check_manual_worker_connection
+
+        for worker in self.workers:
+            if not worker.connection_established:
+                # Try to find the process
+                if worker.socket_path is None:
+                    continue
+
+                process, found = check_manual_worker_connection(worker, worker.socket_path)
+
+                if found and process:
+                    if worker.process is None:
+                        # First time we found this process
+                        worker.process = process
+                        worker.connection_established_time = time.time()
+                        self.manager_logger.info(
+                            f"[Worker {worker.worker_id}] Process detected with PID {process.pid} "
+                            f"(socket: {worker.socket_path})"
+                        )
+                    elif worker.connection_established_time:
+                        # Process was already found, check if it's been stable for 5 seconds (manual mode only)
+                        if self.manual_start_worker:
+                            elapsed = time.time() - worker.connection_established_time
+                            if elapsed >= 5.0:
+                                worker.connection_established = True
+                                self.manager_logger.info(
+                                    f"[Worker {worker.worker_id}] Connection established (stable for 5s)"
+                                )
+                        else:
+                            # In non-manual mode, mark as connected immediately
+                            worker.connection_established = True
+                            self.manager_logger.info(f"[Worker {worker.worker_id}] Connection established")
+                elif not found and worker.process:
+                    # Process died before becoming stable
+                    self.manager_logger.warning(
+                        f"[Worker {worker.worker_id}] Process died before connection established, still waiting..."
+                    )
+                    worker.process = None
+                    worker.connection_established_time = None
+
     def _handle_monitor_result(
         self,
         monitor_result,
@@ -523,6 +641,44 @@ class WorkerManager:
                 self.manager_logger.warning(socket_error_msg)
             active_workers.discard(worker_id)
 
+    def _wait_for_workers_ready(self) -> None:
+        """Wait for all workers to be connection_established and ready."""
+        import time
+
+        self.manager_logger.info("Waiting for all workers to be ready...")
+
+        timeout = 300  # 5 minutes
+        start_time = time.time()
+
+        while True:
+            if time.time() - start_time > timeout:
+                raise TimeoutError("Workers did not become ready within timeout")
+
+            # Check manual worker connections
+            self._check_manual_worker_connections()
+
+            # Check if all workers are connected and ready
+            all_connected = all(w.connection_established for w in self.workers)
+            all_ready = all(w.ready for w in self.workers)
+
+            if all_connected and all_ready:
+                self.manager_logger.info("All workers ready!")
+                break
+
+            # Monitor workers to receive ready messages
+            for worker in self.workers:
+                if worker.connection_established and not worker.ready:
+                    from .worker_communication import receive_worker_messages
+
+                    msg = receive_worker_messages(worker)
+                    if msg.success and msg.parsed_responses:
+                        for response in msg.parsed_responses:
+                            if response == "ready":
+                                worker.ready = True
+                                self.manager_logger.info(f"[Worker {worker.worker_id}] Ready signal received")
+
+            time.sleep(0.1)
+
     def _process_worker_loop(
         self,
         active_workers: set[int],
@@ -532,8 +688,31 @@ class WorkerManager:
     ) -> None:
         """Main worker processing loop."""
         while active_workers or self.pending_binaries:
+            # Check for manual worker connections
+            if self.manual_start_worker:
+                self._check_manual_worker_connections()
+
+            # Check for ready messages from connected workers (all modes)
+            for worker in self.workers:
+                if worker.connection_established and not worker.ready:
+                    from .worker_communication import receive_worker_messages
+
+                    msg = receive_worker_messages(worker)
+                    if msg.success and msg.parsed_responses:
+                        for response in msg.parsed_responses:
+                            if response == "ready":
+                                worker.ready = True
+                                self.manager_logger.info(f"[Worker {worker.worker_id}] Ready signal received")
+
             for worker_id in list(active_workers):
                 worker = self.workers[worker_id]
+
+                # Skip workers that aren't ready
+                if not worker.ready or not worker.connection_established:
+                    # If no tasks remain, remove from active workers
+                    if not self.pending_binaries and allow_stop:
+                        active_workers.discard(worker_id)
+                    continue
 
                 if worker.current_binary is None:
                     if not self._handle_worker_without_task(
@@ -601,9 +780,12 @@ class WorkerManager:
 
     def _initialize_workers(self) -> None:
         """Initialize all worker processes."""
-        for i in range(self.num_workers):
-            worker = self._start_worker(i)
+        for worker_id in range(self.num_workers):
+            worker = self._start_worker(worker_id)
             self.workers.append(worker)
+
+        # Wait for all workers to be ready before proceeding
+        self._wait_for_workers_ready()
 
     def _run_initial_phase(self) -> None:
         """Run the initial processing phase."""

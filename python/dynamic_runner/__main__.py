@@ -1,5 +1,6 @@
 import argparse
 import logging
+from pathlib import Path
 
 from shared import (
     add_selection_arguments,
@@ -60,12 +61,39 @@ def main():
         "--manual-start-worker", action="store_true", help="Manually start worker processes (print command and wait)"
     )
 
+    parser.add_argument(
+        "--connection-mode",
+        type=str,
+        choices=["socketpair", "named"],
+        default=None,
+        help="Connection mode: 'socketpair' uses socketpair() (default), 'named' uses named Unix domain sockets",
+    )
+
+    parser.add_argument(
+        "--socket-dir",
+        type=str,
+        help="Directory for named socket files (defaults to <output>/sockets when --manual-start-worker is used)",
+    )
+
     args = parser.parse_args()
+
+    # Default to named mode when manual-start-worker is used
+    if args.connection_mode is None:
+        args.connection_mode = "named" if args.manual_start_worker else "socketpair"
 
     if hasattr(args, "debugs") and args.debugs:
         args.pid = True
 
     config = process_selection_arguments(args)
+
+    # Default socket-dir to output/sockets when manual-start-worker is used
+    if args.manual_start_worker and not args.socket_dir:
+        args.socket_dir = str(config.output_dir / "sockets")
+
+    # Validate socket-dir is provided when using named mode
+    if args.connection_mode == "named" and not args.socket_dir:
+        logger.error("--socket-dir is required when --connection-mode=named")
+        return
 
     num_cores = parse_cores(args.cores)
     max_memory = parse_memory(args.max_memory)
@@ -132,6 +160,8 @@ def main():
         print_pid=args.pid,
         always_restart_worker=args.always_restart_worker,
         manual_start_worker=args.manual_start_worker,
+        connection_mode=args.connection_mode,
+        socket_dir=Path(args.socket_dir) if args.socket_dir else None,
     )
 
     manager.process_binaries(sorted_binaries)

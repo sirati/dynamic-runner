@@ -103,6 +103,14 @@ class KeepaliveResponse(Response):
         return b"keepalive\n"
 
 
+@dataclass
+class ReadyResponse(Response):
+    """Response indicating worker is ready to receive commands."""
+
+    def serialize(self) -> bytes:
+        return b"ready\n"
+
+
 def parse_command(data: str) -> Command | None:
     """Parse a command string into a Command object."""
     data = data.strip()
@@ -125,6 +133,9 @@ def parse_response(data: str) -> Response | None:
 
     if data == "keepalive":
         return KeepaliveResponse()
+
+    if data == "ready":
+        return ReadyResponse()
 
     if data == "done":
         return DoneResponse()

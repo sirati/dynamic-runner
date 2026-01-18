@@ -4,8 +4,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-from .comm import UnixSocketInterface
+from .comm import NamedSocketInterface, UnixSocketInterface
 from .models import WorkerState
 from .task import TaskDefinition
 
@@ -24,25 +25,46 @@ def start_worker(
     task_args,
     skip_existing: bool,
     manual_start: bool = False,
+    connection_mode: str = "socketpair",
+    socket_path: Path | None = None,
 ) -> WorkerState:
     """Start a worker process with dynamic_queue mode."""
-    parent_sock, child_sock = socket.socketpair()
+    if connection_mode == "named":
+        # Use named socket for named mode
+        if socket_path is None:
+            raise ValueError("socket_path is required for named connection mode")
 
-    child_fd = child_sock.fileno()
+        cmd = [
+            sys.executable,
+            "-m",
+            task_definition.get_worker_module(),
+            "--socket-path",
+            str(socket_path),
+            "--source",
+            str(source_dir),
+            "--output",
+            str(output_dir),
+            "--log-file",
+            str(worker_log_path),
+        ]
+    elif connection_mode == "socketpair":
+        # Use socketpair() for socketpair mode
+        parent_sock, child_sock = socket.socketpair()
+        child_fd = child_sock.fileno()
 
-    cmd = [
-        sys.executable,
-        "-m",
-        task_definition.get_worker_module(),
-        "--dynamic_queue",
-        str(child_fd),
-        "--source",
-        str(source_dir),
-        "--output",
-        str(output_dir),
-        "--log-file",
-        str(worker_log_path),
-    ]
+        cmd = [
+            sys.executable,
+            "-m",
+            task_definition.get_worker_module(),
+            "--dynamic_queue",
+            str(child_fd),
+            "--source",
+            str(source_dir),
+            "--output",
+            str(output_dir),
+            "--log-file",
+            str(worker_log_path),
+        ]
 
     # Add task-specific arguments
     task_cmd_args = task_definition.build_worker_command_args(task_args, source_dir, output_dir, skip_existing)
@@ -55,75 +77,54 @@ def start_worker(
     logger = logging.getLogger("manager")
     logger.info(f"[Worker {worker_id}] Starting with command: {' '.join(cmd)}")
 
-    if manual_start:
-        if psutil is None:
-            raise RuntimeError("psutil is required for manual worker start mode")
+    if connection_mode == "named":
+        # Create named socket interface (server side)
+        comm_interface = NamedSocketInterface(socket_path, is_server=True)
+        child_fd = None
 
-        print(f"\n[Worker {worker_id}] Please run the following command in another terminal:")
-        print(f"  {' '.join(cmd)}")
-        print(f"[Worker {worker_id}] Waiting for process with socket FD {child_fd} to start...")
+        if manual_start:
+            if psutil is None:
+                raise RuntimeError("psutil is required for manual worker start mode")
 
-        # Wait for process with matching socket FD argument to appear
-        process = None
-        fd_arg = str(child_fd)
-        timeout = 300  # 5 minutes timeout
-        start_time = time.time()
+            print(f"\n[Worker {worker_id}] Please run the following command in another terminal:")
+            print(f"  {' '.join(cmd)}")
+            print(f"[Worker {worker_id}] Manager will detect when worker connects via socket: {socket_path}")
 
-        while process is None:
-            if time.time() - start_time > timeout:
-                raise TimeoutError(f"Worker {worker_id} did not start within {timeout} seconds")
+            # Don't wait for process - let it be detected later
+            process = None
+            connection_established = False
+        else:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            connection_established = True
+    else:  # anonymous mode
+        comm_interface = UnixSocketInterface(parent_sock)
 
-            for proc in psutil.process_iter(["pid", "cmdline"]):
-                try:
-                    cmdline = proc.info.get("cmdline")
-                    if cmdline and "--dynamic_queue" in cmdline:
-                        # Find the index of --dynamic_queue and check if next arg matches our FD
-                        try:
-                            idx = cmdline.index("--dynamic_queue")
-                            if idx + 1 < len(cmdline) and cmdline[idx + 1] == fd_arg:
-                                process = proc
-                                logger.info(f"[Worker {worker_id}] Found process with PID {proc.pid}")
-                                print(f"[Worker {worker_id}] Found process with PID {proc.pid}")
+        if manual_start:
+            if psutil is None:
+                raise RuntimeError("psutil is required for manual worker start mode")
 
-                                # Wrap psutil.Process to look like subprocess.Popen
-                                class ProcessWrapper:
-                                    def __init__(self, psutil_proc):
-                                        self._proc = psutil_proc
-                                        self.pid = psutil_proc.pid
+            print(f"\n[Worker {worker_id}] Please run the following command in another terminal:")
+            print(f"  {' '.join(cmd)}")
+            print(f"[Worker {worker_id}] Manager will detect when worker connects")
 
-                                    def poll(self):
-                                        if self._proc.is_running():
-                                            return None
-                                        return self._proc.status()
-
-                                    def wait(self, timeout=None):
-                                        self._proc.wait(timeout)
-
-                                    def terminate(self):
-                                        self._proc.terminate()
-
-                                process = ProcessWrapper(proc)
-                                break
-                        except (ValueError, IndexError):
-                            continue
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-
-            if process is None:
-                time.sleep(0.5)
-
-        child_sock.close()
-    else:
-        process = subprocess.Popen(
-            cmd,
-            pass_fds=[child_fd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        child_sock.close()
-
-    comm_interface = UnixSocketInterface(parent_sock)
+            # Don't wait for process - let it be detected later
+            process = None
+            connection_established = False
+        else:
+            process = subprocess.Popen(
+                cmd,
+                pass_fds=[child_fd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            child_sock.close()
+            connection_established = True
 
     return WorkerState(
         process=process,
@@ -131,6 +132,11 @@ def start_worker(
         current_binary=None,
         estimated_memory=0,
         worker_id=worker_id,
+        child_fd=child_fd,
+        socket_path=socket_path if connection_mode == "named" else None,
+        connection_established=connection_established,
+        ready=False,
+        connection_established_time=None if not connection_established else time.time(),
     )
 
 
@@ -143,6 +149,8 @@ def restart_worker(
     task_args,
     skip_existing: bool,
     manual_start: bool = False,
+    connection_mode: str = "socketpair",
+    socket_path: Path | None = None,
 ) -> WorkerState:
     """Restart a worker that encountered a non-recoverable error."""
     try:
@@ -151,7 +159,7 @@ def restart_worker(
     except Exception:
         pass
 
-    return start_worker(
+    new_worker = start_worker(
         worker.worker_id,
         source_dir,
         output_dir,
@@ -160,7 +168,10 @@ def restart_worker(
         task_args,
         skip_existing,
         manual_start,
+        connection_mode,
+        socket_path,
     )
+    return new_worker
 
 
 def check_worker_timeout(worker: WorkerState, task_definition: TaskDefinition) -> bool:
@@ -205,3 +216,48 @@ def print_phase_status(worker: WorkerState, logger, task_definition: TaskDefinit
                         f"[Worker {worker.worker_id}] Still in {worker.phase}, "
                         f"{minutes} minute(s) elapsed - {binary_name}"
                     )
+
+
+def check_manual_worker_connection(worker: WorkerState, socket_path: Path) -> tuple[Any, bool]:
+    """Check if a manually started worker process has connected.
+
+    Returns:
+        (process, found) - process object if found and stable, or None; found=True if process detected
+    """
+    if psutil is None:
+        return (None, False)
+
+    socket_path_str = str(socket_path)
+
+    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmdline = proc.info.get("cmdline")
+            if cmdline and "--socket-path" in cmdline:
+                try:
+                    idx = cmdline.index("--socket-path")
+                    if idx + 1 < len(cmdline) and cmdline[idx + 1] == socket_path_str:
+                        # Found a matching process
+                        # Wrap psutil.Process to look like subprocess.Popen
+                        class ProcessWrapper:
+                            def __init__(self, psutil_proc):
+                                self._proc = psutil_proc
+                                self.pid = psutil_proc.pid
+
+                            def poll(self):
+                                if self._proc.is_running():
+                                    return None
+                                return self._proc.status()
+
+                            def wait(self, timeout=None):
+                                self._proc.wait(timeout)
+
+                            def terminate(self):
+                                self._proc.terminate()
+
+                        return (ProcessWrapper(proc), True)
+                except (ValueError, IndexError):
+                    continue
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    return (None, False)

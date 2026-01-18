@@ -1,5 +1,6 @@
 import subprocess
 from dataclasses import dataclass
+from typing import Any
 
 from .binary_info import BinaryInfo
 from .comm import CommunicationInterface, ErrorType
@@ -16,11 +17,13 @@ class TaskResult:
 
 @dataclass
 class WorkerState:
-    process: subprocess.Popen
+    process: Any  # subprocess.Popen or ProcessWrapper or None
     comm: CommunicationInterface
     current_binary: BinaryInfo | None
     estimated_memory: int
     worker_id: int
+    child_fd: int | None = None
+    socket_path: Any = None  # Path for named socket mode
     phase: str | None = None
     phase_start_time: float | None = None
     last_keepalive: float | None = None
@@ -28,6 +31,9 @@ class WorkerState:
     idle: bool = False
     opportunistic: bool = False
     reserved_budget: int = 0
+    connection_established: bool = True
+    ready: bool = False
+    connection_established_time: float | None = None
 
 
 @dataclass

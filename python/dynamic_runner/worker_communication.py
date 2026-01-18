@@ -10,6 +10,7 @@ from .comm import (
     PhaseUpdateResponse,
     PickledErrorResponse,
     ProcessBinaryCommand,
+    ReadyResponse,
 )
 from .models import TaskResult, WorkerState
 
@@ -91,6 +92,8 @@ def receive_worker_messages(worker: WorkerState) -> WorkerMessage:
                 parsed_responses.append(task_result)
             elif isinstance(response, KeepaliveResponse):
                 pass
+            elif isinstance(response, ReadyResponse):
+                parsed_responses.append("ready")
 
         return WorkerMessage(
             success=True,

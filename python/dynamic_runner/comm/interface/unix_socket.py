@@ -28,23 +28,35 @@ class UnixSocketInterface(CommunicationInterface):
             return (False, str(e))
 
     def receive_command(self, blocking: bool = True) -> Command | None:
-        """Receive a command from the socket (always non-blocking in practice)."""
+        """Receive a command from the socket."""
         try:
-            self.socket.setblocking(False)
-            data = self.socket.recv(1024)
-            if not data:
-                return None
-            line = data.decode("utf-8").strip()
-            return parse_command(line)
+            if blocking:
+                # Use buffered file object for blocking reads (worker side)
+                if self.socket_file is None:
+                    self.socket_file = self.socket.makefile("r")
+
+                line = self.socket_file.readline()
+                if not line:
+                    return None
+                return parse_command(line)
+            else:
+                # Non-blocking for manager side
+                self.socket.setblocking(False)
+                data = self.socket.recv(1024)
+                if not data:
+                    return None
+                line = data.decode("utf-8").strip()
+                return parse_command(line)
         except BlockingIOError:
             return None
         except (BrokenPipeError, ConnectionResetError, OSError):
             return None
         finally:
-            try:
-                self.socket.setblocking(True)
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                pass
+            if not blocking:
+                try:
+                    self.socket.setblocking(True)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
 
     def receive_responses(self) -> list[Response]:
         """Receive and parse all available responses from the socket."""

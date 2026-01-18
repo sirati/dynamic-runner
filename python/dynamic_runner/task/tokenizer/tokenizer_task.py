@@ -111,8 +111,8 @@ class TokenizerTask(TaskDefinition):
             List of command-line arguments for the worker
         """
         # Tokenizer requires --platform argument
-        # The value "file_prefix" tells tokenizer to extract platform from filename
-        return ["--platform", "file_prefix"]
+        # The value "auto" tells tokenizer to extract platform from filename
+        return ["--platform", "auto"]
 
     def get_output_filename_pattern(self, input_filename: str) -> str:
         """Generate output filename for tokenizer.

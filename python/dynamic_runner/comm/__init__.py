@@ -1,4 +1,4 @@
-from .interface import CommunicationInterface, NoopInterface, UnixSocketInterface
+from .interface import CommunicationInterface, NamedSocketInterface, NoopInterface, UnixSocketInterface
 from .proto import (
     Command,
     DoneResponse,
@@ -8,6 +8,7 @@ from .proto import (
     PhaseUpdateResponse,
     PickledErrorResponse,
     ProcessBinaryCommand,
+    ReadyResponse,
     Response,
     StopCommand,
     parse_command,
@@ -16,6 +17,7 @@ from .proto import (
 
 __all__ = [
     "CommunicationInterface",
+    "NamedSocketInterface",
     "NoopInterface",
     "UnixSocketInterface",
     "Command",
@@ -27,6 +29,7 @@ __all__ = [
     "PickledErrorResponse",
     "PhaseUpdateResponse",
     "KeepaliveResponse",
+    "ReadyResponse",
     "ErrorType",
     "parse_command",
     "parse_response",
