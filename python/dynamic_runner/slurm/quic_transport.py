@@ -108,9 +108,9 @@ class QuicTransport:
         self.server = None
         self.running = False
 
-        # Install custom exception handler to suppress QUIC ConnectionErrors
+        # Exception handler will be installed when event loop is available
         self._original_exception_handler = None
-        self._install_exception_handler()
+        self._exception_handler_installed = False
 
     async def generate_certificates(self) -> tuple[str, str]:
         """Generate self-signed certificates for QUIC
@@ -367,6 +367,10 @@ class QuicTransport:
 
         logger.info(f"QUIC server listening on {self.bind_address}:{self.listen_port} (UDP)")
 
+        # Install exception handler now that event loop is running
+        if not self._exception_handler_installed:
+            self._install_exception_handler()
+
         # Start WSS server (TCP) on same port
         await self._start_wss_server()
 
@@ -376,7 +380,7 @@ class QuicTransport:
 
     def _install_exception_handler(self) -> None:
         """Install custom exception handler to suppress QUIC ConnectionErrors"""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._original_exception_handler = loop.get_exception_handler()
 
         def custom_exception_handler(loop, context):
@@ -395,6 +399,7 @@ class QuicTransport:
                 loop.default_exception_handler(context)
 
         loop.set_exception_handler(custom_exception_handler)
+        self._exception_handler_installed = True
 
     async def _start_wss_server(self) -> None:
         """Start WebSocket Secure server for TCP fallback"""
