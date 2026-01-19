@@ -29,7 +29,7 @@ class WorkerManagerBase(ABC):
         self,
         num_workers: int,
         max_memory: int,
-        output_dir: Path,
+        log_dir: Path,
         task_definition: TaskDefinition,
         always_restart_worker: bool = False,
     ):
@@ -37,7 +37,6 @@ class WorkerManagerBase(ABC):
         self.max_memory = max_memory
         self.task_definition = task_definition
         self.reserved_memory_per_worker = task_definition.get_reserved_memory_per_worker()
-        self.output_dir = output_dir
         self.always_restart_worker = always_restart_worker
 
         # Generate random session ID
@@ -57,13 +56,13 @@ class WorkerManagerBase(ABC):
         self.in_oom_phase: bool = False
 
         start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_dir = output_dir / "logs" / start_time
+        self.log_dir = log_dir / start_time
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.manager_logger = self._setup_logger()
 
         # Memory usage log file
-        self.memuse_log_path = output_dir / "memuse.log"
+        self.memuse_log_path = log_dir.parent / "memuse.log"
 
     def _calculate_initial_budget(self, worker_index: int) -> int:
         """Calculate initial budget for worker based on specification.

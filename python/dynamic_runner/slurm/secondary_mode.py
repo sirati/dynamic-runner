@@ -1,11 +1,13 @@
 import asyncio
 import hashlib
 import logging
+import os
 import socket
 import subprocess
 import sys
 import time
 import zipfile
+from asyncio import DatagramProtocol, DatagramTransport
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -76,9 +78,10 @@ class SecondaryMode:
         out_network: Path,
         log_network: Path,
         socket_dir: Path,
-        task_definition: TaskDefinition,
+        task_definition: Any,
         task_args: Any,
         skip_existing: bool = False,
+        quic_port: int = 0,
     ):
         self.primary_url = primary_url
         self.secondary_id = secondary_id
@@ -103,6 +106,7 @@ class SecondaryMode:
         self.src_tmp.mkdir(parents=True, exist_ok=True)
         self.out_tmp.mkdir(parents=True, exist_ok=True)
         self.log_tmp.mkdir(parents=True, exist_ok=True)
+        self.socket_dir.mkdir(parents=True, exist_ok=True)
 
         self.peers: dict[str, Any] = {}
         self.primary_connection: Any = None
@@ -131,7 +135,7 @@ class SecondaryMode:
         self.message_router = MessageRouter(secondary_id, "secondary")
 
         # QUIC transport for peer-to-peer communication
-        self.quic_transport = QuicTransport(secondary_id, listen_port=0)  # Let OS pick port
+        self.quic_transport = QuicTransport(secondary_id, listen_port=quic_port)
 
         # Parse primary URL
         parsed = urlparse(primary_url)
@@ -363,7 +367,12 @@ class SecondaryMode:
         # Connect to all peers (primary controls the peer list, so we know this is complete)
         await self.quic_transport.connect_to_peers()
 
-        logger.info(f"Peer connections established: {len(self.quic_transport.connections)} peers connected")
+        # Count both QUIC and WSS connections
+        total_connections = len(self.quic_transport.connections) + len(self.quic_transport.wss_connections)
+        logger.info(
+            f"Peer connections established: {total_connections} peers connected "
+            f"({len(self.quic_transport.connections)} QUIC, {len(self.quic_transport.wss_connections)} WSS)"
+        )
 
         # Signal that peer list has been processed
         self.peer_list_received.set()
@@ -535,11 +544,143 @@ class SecondaryMode:
         self.message_router.stop()
         # TODO: Save state
 
-    def _execute_host_command(self, command: str) -> tuple[int, str, str]:
-        """Execute command on host via socket"""
-        # TODO: Send command through Unix socket to host wrapper
-        # TODO: Wait for result
-        return 0, "", ""
+    async def _execute_host_command(self, command: str, timeout: float = 30.0) -> tuple[int, str, str]:
+        """Execute command on host via socket (async)
+
+        Args:
+            command: Shell command to execute on host
+            timeout: Maximum time to wait for command completion in seconds
+
+        Returns:
+            Tuple of (return_code, stdout, stderr)
+        """
+        cmd_socket = self.socket_dir / "cmd.sock"
+        response_socket = self.socket_dir / "cmd.sock.response"
+
+        try:
+            # Send command to relay service via command socket
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._write_to_socket, cmd_socket, f"{command}\n")
+
+            # Read response with socket filenames and PID from response socket
+            response = await loop.run_in_executor(None, self._read_from_socket, response_socket)
+
+            if not response:
+                logger.error("No response from command relay service")
+                return 1, "", "No response from command relay service"
+
+            # Parse response: output_socket,exit_socket,signal_socket,pid
+            parts = response.strip().split(",")
+            if len(parts) != 4:
+                logger.error(f"Invalid response format: {response}")
+                return 1, "", f"Invalid response format: {response}"
+
+            output_sock_filename, exit_sock_filename, signal_sock_filename, pid_str = parts
+            pid = int(pid_str)
+
+            # Convert filenames to full container paths
+            output_sock_path = self.socket_dir / output_sock_filename
+            exit_sock_path = self.socket_dir / exit_sock_filename
+            signal_sock_path = self.socket_dir / signal_sock_filename
+
+            logger.debug(
+                f"Command spawned with PID {pid}, sockets: "
+                f"{output_sock_filename}, {exit_sock_filename}, {signal_sock_filename}"
+            )
+
+            # Read output and exit code concurrently
+            try:
+                loop = asyncio.get_event_loop()
+                output_task = loop.run_in_executor(None, self._read_output_socket, output_sock_path)
+                exit_task = loop.run_in_executor(None, self._read_exit_code, exit_sock_path)
+
+                # Wait for both with timeout
+                done, pending = await asyncio.wait(
+                    [output_task, exit_task], timeout=timeout, return_when=asyncio.ALL_COMPLETED
+                )
+
+                if pending:
+                    # Timeout - send SIGTERM to the process
+                    logger.warning(f"Command timed out after {timeout}s, sending SIGTERM")
+                    await loop.run_in_executor(None, self._send_signal, signal_sock_path, 15)
+
+                    # Wait a bit more for graceful shutdown
+                    done, pending = await asyncio.wait(pending, timeout=5.0)
+
+                    if pending:
+                        # Still not done, send SIGKILL
+                        logger.warning("Command still running, sending SIGKILL")
+                        await loop.run_in_executor(None, self._send_signal, signal_sock_path, 9)
+
+                        # Cancel pending tasks
+                        for task in pending:
+                            task.cancel()
+
+                        return 1, "", f"Command timed out after {timeout}s"
+
+                # Get results
+                stdout_data = await output_task
+                exit_code = await exit_task
+
+                stderr = ""
+                return exit_code, stdout_data, stderr
+
+            except Exception as e:
+                logger.error(f"Error reading from command sockets: {e}")
+                # Try to kill the process
+                try:
+                    await loop.run_in_executor(None, self._send_signal, signal_sock_path, 9)
+                except Exception:
+                    pass
+                return 1, "", str(e)
+
+        except Exception as e:
+            logger.error(f"Error executing host command: {e}")
+            return 1, "", str(e)
+
+    def _write_to_socket(self, socket_path: Path, data: str) -> None:
+        """Write data to a FIFO socket"""
+        with open(socket_path, "w") as f:
+            f.write(data)
+            f.flush()
+
+    def _read_from_socket(self, socket_path: Path) -> str:
+        """Read a line from a FIFO socket"""
+        with open(socket_path, "r") as f:
+            return f.readline()
+
+    def _read_output_socket(self, socket_path: Path) -> str:
+        """Read all output from output socket until EOF"""
+        chunks = []
+        try:
+            with open(socket_path, "r") as f:
+                while True:
+                    chunk = f.read(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+        except Exception as e:
+            logger.error(f"Error reading output socket: {e}")
+        return "".join(chunks)
+
+    def _read_exit_code(self, socket_path: Path) -> int:
+        """Read exit code from exit socket (blocks until process completes)"""
+        try:
+            with open(socket_path, "r") as f:
+                exit_code_str = f.read().strip()
+                return int(exit_code_str) if exit_code_str else 1
+        except Exception as e:
+            logger.error(f"Error reading exit code: {e}")
+            return 1
+
+    def _send_signal(self, socket_path: Path, signal_num: int) -> None:
+        """Send signal to host process via signal socket"""
+        try:
+            with open(socket_path, "w") as f:
+                f.write(str(signal_num))
+                f.flush()
+        except Exception as e:
+            logger.error(f"Error sending signal: {e}")
 
     def _move_completed_files(self, worker_id: int, task_hash: str) -> None:
         """Move completed files from tmp to network storage"""

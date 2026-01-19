@@ -11,6 +11,7 @@ from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
 from ..worker.remote_worker import RemoteWorker
 from ..worker_manager import WorkerManager
+from ..worker_manager.authoritive import AuthoritiveManager
 from .message_router import MessageRouter
 from .quic_transport import QuicTransport
 
@@ -441,16 +442,18 @@ class PrimaryCoordinator:
 
                         if success:
                             connected.add(secondary_id)
-                            logger.info(f"Connected to {secondary_id} ({len(connected)}/{expected_count})")
+                            logger.info(
+                                f"Tunnel establishes to {secondary_id} - ready for connection ({len(connected)}/{expected_count})"
+                            )
                         else:
-                            logger.warning(f"Failed to connect to {secondary_id}, will retry")
+                            logger.warning(f"Failed to establish tunnel to {secondary_id}, will retry")
 
                     except Exception as e:
                         logger.warning(f"Error processing connection info {file_path}: {e}")
 
             await asyncio.sleep(2)
 
-        logger.info(f"All {expected_count} secondaries connected via reverse mode")
+        logger.info(f"All {expected_count} secondaries have an established tunnel")
 
     async def _connect_to_secondary_ssh(self, secondary_id: str, hostname: str, port: int) -> bool:
         """Connect to a secondary via SSH ProxyJump through the gateway"""
@@ -758,10 +761,10 @@ class PrimaryCoordinator:
         pending_binaries = self.binaries.copy()
 
         for idx, (secondary_id, secondary_info) in enumerate(self.secondaries.items()):
-            # Get workers for this secondary
-            workers = secondary_info.get("workers", {})
+            # Get RemoteWorker instances for this secondary
+            remote_workers = self.remote_workers.get(secondary_id, [])
 
-            if not workers:
+            if not remote_workers:
                 logger.warning(f"No workers registered for {secondary_id}, skipping")
                 continue
 
@@ -770,79 +773,39 @@ class PrimaryCoordinator:
             end_idx = start_idx + binaries_per_secondary if idx < len(self.secondaries) - 1 else len(self.binaries)
             secondary_binaries = pending_binaries[start_idx:end_idx]
 
-            # Track memory for this secondary
+            # Create AuthoritiveManager for this secondary
             secondary_memory_limit = secondary_info.get("ram_bytes", 0)
-            total_assigned_memory = 0
+            manager = AuthoritiveManager(
+                num_workers=len(remote_workers),
+                max_memory=secondary_memory_limit,
+                log_dir=Path.cwd() / "run" / self.run_id / "logs",
+                task_definition=self.task_definition,
+                workers=sorted(remote_workers, key=lambda w: w.worker_id),
+            )
 
-            # Assign one task per worker with OOM checking
-            # Use same logic as local: iterate workers and find first fitting binary
+            # Set reserved_budget from the budget sent by secondary (don't recalculate)
+            for worker in manager.workers:
+                worker.reserved_budget = worker.memory_budget
+
+            # Set pending binaries and run initial assignment
+            manager.pending_binaries = secondary_binaries
+            manager._run_initial_assignments()
+
+            # Collect assignments for sending to secondary
             assignments = []
-
-            for worker_id, worker_info in workers.items():
-                if not secondary_binaries:
-                    break
-
-                worker_budget = worker_info.get("memory_budget", 0)
-
-                # Find first task that fits worker budget (same as local assignment)
-                assigned = False
-                for i, binary in enumerate(secondary_binaries):
-                    estimated = self.task_definition.estimate_memory(binary.size)
-
-                    if estimated > worker_budget:
-                        continue
-
-                    # Check if assigning would exceed memory limit
-                    would_exceed = (total_assigned_memory + estimated) > secondary_memory_limit
-                    is_opportunistic = would_exceed
-
-                    # Assign the task
-                    task_binary = secondary_binaries.pop(i)
-                    task_hash = self._compute_task_hash(task_binary)
+            for worker in manager.workers:
+                if worker.current_binary:
+                    task_hash = self._compute_task_hash(worker.current_binary)
                     self.task_assignments[task_hash] = secondary_id
-
-                    # Track assignment
-                    total_assigned_memory += estimated
-
-                    size_mb = task_binary.size / (1024 * 1024)
-                    estimated_mb = estimated / (1024 * 1024)
-                    budget_mb = worker_budget / (1024 * 1024)
-                    opp_str = " (opportunistic)" if is_opportunistic else ""
-
-                    logger.info(
-                        f"[{secondary_id} Worker {worker_id}] Assigned: {task_binary.path.name} "
-                        f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB){opp_str}"
-                    )
 
                     assignments.append(
                         {
-                            "worker_id": worker_id,
-                            "binary": task_binary,
-                            "estimated_memory": estimated,
-                            "opportunistic": is_opportunistic,
+                            "worker_id": worker.worker_id,
+                            "binary": worker.current_binary,
+                            "estimated_memory": worker.estimated_memory,
+                            "opportunistic": worker.opportunistic,
                         }
                     )
-
-                    assigned = True
-                    break
-
-                if not assigned:
-                    logger.warning(
-                        f"[{secondary_id} Worker {worker_id}] No task fits budget {worker_budget / (1024**3):.2f}GB"
-                    )
-
-            # Report assignment summary for this secondary
-            opportunistic_memory = sum(a["estimated_memory"] for a in assignments if a["opportunistic"])
-            non_opportunistic_memory = sum(a["estimated_memory"] for a in assignments if not a["opportunistic"])
-            total_mb = total_assigned_memory / (1024 * 1024)
-            opp_mb = opportunistic_memory / (1024 * 1024)
-            non_opp_mb = non_opportunistic_memory / (1024 * 1024)
-
-            logger.info(
-                f"[{secondary_id} Initial Phase] Total assigned: {total_mb:.2f}MB, "
-                f"Non-opportunistic: {non_opp_mb:.2f}MB, "
-                f"Opportunistic: {opp_mb:.2f}MB"
-            )
 
             # Store assignments for sending after transfer complete
             secondary_info["initial_assignments"] = assignments

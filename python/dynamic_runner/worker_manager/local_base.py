@@ -41,12 +41,13 @@ class LocalWorkerManagerBase(WorkerManagerBase):
         super().__init__(
             num_workers=num_workers,
             max_memory=max_memory,
-            output_dir=output_dir,
+            log_dir=output_dir / "logs",
             task_definition=task_definition,
             always_restart_worker=always_restart_worker,
         )
 
         self.source_dir = source_dir
+        self.output_dir = output_dir
         self.task_args = task_args
         self.skip_existing = skip_existing
         self.manual_start_worker = manual_start_worker

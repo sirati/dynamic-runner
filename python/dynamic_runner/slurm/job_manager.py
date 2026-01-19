@@ -151,6 +151,90 @@ echo "Podman storage: $PODMAN_STORAGE"
 echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
+"""
+
+        # Add connection mode specific parts - port allocation and connection info
+        if reverse_connection:
+            if run_log_dir:
+                connection_info_dir = self._expand_path(f"{run_log_dir}/connection_info")
+            else:
+                connection_info_dir = self._expand_path(f"{self.slurm_config.get_log_dir()}/connection_info")
+
+            script += f"""
+# Find two free ports: one for SSH tunnel, one for QUIC server
+echo "Finding free ports on compute node..."
+TUNNEL_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+QUIC_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+echo "Using tunnel port: $TUNNEL_PORT"
+echo "Using QUIC port: $QUIC_PORT"
+
+# Write connection info for primary to find and create tunnel
+HOSTNAME=$(hostname -f)
+mkdir -p "{connection_info_dir}"
+echo "{secondary_id},$HOSTNAME,$TUNNEL_PORT" > "{connection_info_dir}/{secondary_id}.info"
+echo "Connection info written to: {connection_info_dir}/{secondary_id}.info"
+echo "  Hostname: $HOSTNAME"
+echo "  Tunnel Port: $TUNNEL_PORT"
+echo "  QUIC Port: $QUIC_PORT"
+"""
+        else:
+            script += f"""
+# Find a free port for QUIC server
+echo "Finding free port for QUIC server..."
+QUIC_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+echo "Using QUIC port: $QUIC_PORT"
+"""
+
+        script += f"""
+# Start command relay service in background
+echo "Starting command relay service..."
+SOCKET_COUNTER=0
+{{
+    rm -f "{cmd_socket}" "{cmd_socket}.response"
+    mkfifo "{cmd_socket}"
+    mkfifo "{cmd_socket}.response"
+
+    while true; do
+        # Wait for command on the command socket
+        if read -r CMD < "{cmd_socket}"; then
+            if [ -n "$CMD" ]; then
+                # Create unique sockets for this command
+                SOCKET_COUNTER=$((SOCKET_COUNTER + 1))
+                OUTPUT_SOCK="{socket_dir}/output_${{SOCKET_COUNTER}}.sock"
+                EXIT_SOCK="{socket_dir}/exit_${{SOCKET_COUNTER}}.sock"
+                SIGNAL_SOCK="{socket_dir}/signal_${{SOCKET_COUNTER}}.sock"
+                mkfifo "$OUTPUT_SOCK"
+                mkfifo "$EXIT_SOCK"
+                mkfifo "$SIGNAL_SOCK"
+
+                # Execute command in background with stdout/stderr redirected to output socket
+                {{
+                    eval "$CMD" > "$OUTPUT_SOCK" 2>&1
+                    EXIT_CODE=$?
+                    rm -f "$OUTPUT_SOCK"
+                    # Write exit code to exit socket (blocks until reader opens it)
+                    echo "$EXIT_CODE" > "$EXIT_SOCK"
+                    rm -f "$EXIT_SOCK"
+                }} &
+                CMD_PID=$!
+
+                # Monitor signal socket in background to allow killing the process
+                {{
+                    if read -r SIGNAL < "$SIGNAL_SOCK"; then
+                        if [ -n "$SIGNAL" ]; then
+                            kill -$SIGNAL $CMD_PID 2>/dev/null || true
+                        fi
+                    fi
+                    rm -f "$SIGNAL_SOCK"
+                }} &
+
+                # Send back socket filenames and PID to response socket
+                echo "output_${{SOCKET_COUNTER}}.sock,exit_${{SOCKET_COUNTER}}.sock,signal_${{SOCKET_COUNTER}}.sock,$CMD_PID" > "{cmd_socket}.response"
+            fi
+        fi
+    done
+}} &
+CMD_RELAY_PID=$!
 
 # Copy Docker image to local /tmp for faster loading
 echo "Copying Docker image to local temp directory..."
@@ -162,24 +246,6 @@ echo "Docker image copied to: $LOCAL_IMAGE"
 echo "Loading Docker image into container runtime..."
 {self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
 echo "Docker image loaded successfully"
-
-# Start command relay service in background
-echo "Starting command relay service..."
-{{
-    rm -f "{cmd_socket}"
-    while true; do
-        if [ -e "{cmd_socket}" ]; then
-            # Read command from socket
-            CMD=$(cat "{cmd_socket}")
-            if [ -n "$CMD" ]; then
-                # Execute command and write result back
-                eval "$CMD" > "{cmd_socket}.out" 2>&1
-            fi
-        fi
-        sleep 0.1
-    done
-}} &
-CMD_RELAY_PID=$!
 
 # Run Docker container
 echo "Starting Docker container..."
@@ -197,27 +263,10 @@ echo "  Secondary ID: {secondary_id}"
         # Add connection mode specific parts
         if reverse_connection:
             # SSH ProxyJump mode: write connection info, then connect to localhost
-            if run_log_dir:
-                connection_info_dir = self._expand_path(f"{run_log_dir}/connection_info")
-            else:
-                connection_info_dir = self._expand_path(f"{self.slurm_config.get_log_dir()}/connection_info")
             script += f"""echo "  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)"
 echo ""
 
-# Find a free port on this compute node
-echo "Finding free port on compute node..."
-FREE_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
-echo "Using port: $FREE_PORT"
-
-# Write connection info for primary to find and create tunnel
-HOSTNAME=$(hostname -f)
-mkdir -p "{connection_info_dir}"
-echo "{secondary_id},$HOSTNAME,$FREE_PORT" > "{connection_info_dir}/{secondary_id}.info"
-echo "Connection info written to: {connection_info_dir}/{secondary_id}.info"
-echo "  Hostname: $HOSTNAME"
-echo "  Port: $FREE_PORT"
-
-# Run container with Podman using host networking - secondary connects to localhost:FREE_PORT (primary will tunnel to it)
+# Run container with Podman using host networking - secondary connects to localhost:TUNNEL_PORT (primary will tunnel to it)
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --network host \
     -v "{src_tmp}:/app/src-tmp" \
@@ -228,15 +277,16 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
     {image_name}:{image_tag} \
-    dynamic_batch --secondary tcp://localhost:$FREE_PORT --secondary-id {secondary_id}"""
+    dynamic_batch --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
         else:
             # Standard mode: secondary connects to primary via gateway
             script += f"""echo "  Gateway: {gateway_host}:{gateway_port}"
 echo "  Mode: Standard (secondary connects to primary via gateway)"
 echo ""
 
-# Run container with Podman
+# Run container with Podman using host networking for secondary-to-secondary connectivity
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    --network host \
     -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
@@ -245,7 +295,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
     {image_name}:{image_tag} \
-    dynamic_batch --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id}"""
+    dynamic_batch --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
 
         # Continue with common cleanup
         script += f"""

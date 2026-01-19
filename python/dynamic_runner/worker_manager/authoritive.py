@@ -24,14 +24,14 @@ class AuthoritiveManager(WorkerManagerBase):
         self,
         num_workers: int,
         max_memory: int,
-        output_dir: Path,
+        log_dir: Path,
         task_definition: TaskDefinition,
         workers: list[BaseWorker] | None = None,
     ):
         super().__init__(
             num_workers=num_workers,
             max_memory=max_memory,
-            output_dir=output_dir,
+            log_dir=log_dir,
             task_definition=task_definition,
             always_restart_worker=False,
         )

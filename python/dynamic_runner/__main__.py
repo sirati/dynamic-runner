@@ -117,6 +117,13 @@ def main():
     )
 
     parser.add_argument(
+        "--secondary-quic-port",
+        type=int,
+        default=0,
+        help="Port for QUIC server to listen on (0 = let OS pick, default: 0)",
+    )
+
+    parser.add_argument(
         "--gateway",
         type=str,
         help="Gateway for SLURM controller. Use 'local' or 'ssh://user@host[:port]'",
@@ -175,7 +182,7 @@ def main():
     )
 
     parser.add_argument(
-        "--num-secondaries",
+        "--jobs",
         type=int,
         default=1,
         help="Number of SLURM secondary nodes to spawn (default: 1)",
@@ -206,6 +213,7 @@ def main():
         logger.info("=" * 60)
         logger.info(f"Secondary ID: {args.secondary_id}")
         logger.info(f"Primary URL: {args.secondary}")
+        logger.info(f"QUIC Port: {args.secondary_quic_port if args.secondary_quic_port else 'auto'}")
 
         # Get system resources
         ram_bytes = psutil.virtual_memory().total
@@ -235,6 +243,7 @@ def main():
             task_definition=task,
             task_args=args,
             skip_existing=args.skip_existing,
+            quic_port=args.secondary_quic_port,
         )
 
         secondary.run()
@@ -404,7 +413,7 @@ def main():
                 if len(binaries_info) == 0:
                     logger.warning("No binaries found to process. Coordinator will run in test mode.")
 
-                num_secondaries = args.num_secondaries
+                num_secondaries = args.jobs
                 logger.info(f"Starting coordinator with {num_secondaries} secondaries")
 
                 # Create unique run directory with timestamp
