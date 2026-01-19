@@ -117,7 +117,10 @@ class SecondaryMode:
         self.all_tasks: list[Any] = []
 
         self.is_slurm_primary = False
+        self.slurm_primary_id: str | None = None
+        self.transfer_complete = False
         self.last_keepalives: dict[str, float] = {}
+        self.pending_worker_assignments: list[dict[str, Any]] = []  # Assignments waiting for transfer_complete
 
         self.running = True
         self.setup_complete = False  # Track if initialization is complete
@@ -168,6 +171,9 @@ class SecondaryMode:
             self.message_router.register_handler("initial_assignment", self._handle_initial_assignment)
             self.message_router.register_handler("task_assignment", self._handle_task_assignment)
             self.message_router.register_handler("discover_sources", self._handle_discover_sources)
+            self.message_router.register_handler("transfer_complete", self._handle_transfer_complete)
+            self.message_router.register_handler("promote_primary", self._handle_promote_primary)
+            self.message_router.register_handler("full_task_list", self._handle_full_task_list)
 
             # Phase 5: Connect to peers (wait for peer_list from primary)
             await self._connect_to_peers()
@@ -372,6 +378,26 @@ class SecondaryMode:
 
         logger.info("Peer list received and connections established, continuing...")
 
+        # Notify primary that peer connections are ready
+        await self._send_peer_connections_ready()
+
+    async def _send_peer_connections_ready(self) -> None:
+        """Notify primary that peer connections are established"""
+        if self.connection_closing or not self.message_router.primary_connection:
+            logger.warning("Cannot send peer_connections_ready: not connected to primary")
+            return
+
+        msg = {
+            "type": "peer_connections_ready",
+            "secondary_id": self.secondary_id,
+        }
+
+        try:
+            await self.message_router.send_to_primary(msg)
+            logger.info("Notified primary that peer connections are ready")
+        except Exception as e:
+            logger.warning(f"Failed to send peer_connections_ready: {e}")
+
     async def _start_workers(self) -> None:
         """Start worker processes using SubmissiveManager"""
         logger.info(f"Starting {self.num_workers} workers via SubmissiveManager")
@@ -397,7 +423,7 @@ class SecondaryMode:
         # Send worker ready messages to primary for each worker
         for worker in self.worker_manager.workers:
             worker_id = worker.worker_id
-            memory_budget = worker.memory_budget
+            memory_budget = worker.reserved_budget
             await self._send_worker_ready(worker_id, memory_budget)
 
         logger.info(f"All {len(self.worker_manager.workers)} workers initialized and reported to primary")
@@ -625,15 +651,39 @@ class SecondaryMode:
         logger.info("Received initial assignment from primary")
 
         zip_files = message.get("zip_files", [])
+        worker_assignments = message.get("worker_assignments", [])
+
+        # Validate that we received data
+        if not zip_files:
+            logger.error("Initial assignment contains no ZIP files!")
+            return
+
+        if not worker_assignments:
+            logger.error("Initial assignment contains no worker assignments!")
+            return
+
+        logger.info(
+            f"Initial assignment contains {len(zip_files)} ZIP files and {len(worker_assignments)} worker assignments"
+        )
 
         # Extract all binaries from ZIPs
         for zip_info in zip_files:
             zip_name = zip_info.get("zip_name")
             binaries = zip_info.get("binaries", [])
 
+            if not zip_name:
+                logger.error(f"ZIP info missing zip_name: {zip_info}")
+                continue
+
+            logger.info(f"Processing ZIP: {zip_name} with {len(binaries)} binaries")
+
             for binary_entry in binaries:
                 local_path = binary_entry.get("local_path")
                 file_hash = binary_entry.get("hash")
+
+                if not local_path or not file_hash:
+                    logger.error(f"Binary entry missing required fields: {binary_entry}")
+                    continue
 
                 # Extract the binary
                 extracted_path = self._extract_binary_from_zip(zip_name, local_path, file_hash)
@@ -641,11 +691,14 @@ class SecondaryMode:
                     logger.error(f"Failed to extract {local_path} from {zip_name}")
                     continue
 
-                # Store task info (will assign to workers later)
-                # For now, just log that we have it ready
-                logger.debug(f"Ready to assign: {extracted_path.name}")
+                logger.debug(f"Extracted: {extracted_path.name}")
 
         logger.info(f"Extracted {len(self.extracted_binaries)} binaries from {len(zip_files)} ZIP files")
+
+        # Store worker assignments to process after transfer_complete
+        self.pending_worker_assignments = worker_assignments
+
+        logger.info(f"Waiting for transfer_complete before assigning {len(worker_assignments)} tasks to workers")
 
     async def _handle_task_assignment(self, message: dict[str, Any], sender_id: str | None) -> None:
         """Handle task assignment message from primary"""
@@ -811,3 +864,82 @@ class SecondaryMode:
 
         except Exception as e:
             logger.error(f"Source discovery failed: {e}")
+
+    async def _handle_transfer_complete(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle transfer complete notification from primary"""
+        logger.info("Received transfer complete notification from primary")
+        self.transfer_complete = True
+
+        # Now process pending worker assignments
+        if self.pending_worker_assignments:
+            logger.info(f"Processing {len(self.pending_worker_assignments)} pending worker assignments")
+            await self._process_initial_worker_assignments()
+        else:
+            logger.warning("No pending worker assignments to process")
+
+    async def _process_initial_worker_assignments(self) -> None:
+        """Process initial worker assignments after transfer is complete"""
+        for assignment in self.pending_worker_assignments:
+            worker_id = assignment.get("worker_id")
+            file_hash = assignment.get("file_hash")
+            estimated_memory = assignment.get("estimated_memory", 0)
+            opportunistic = assignment.get("opportunistic", False)
+            binary_info_dict = assignment.get("binary_info", {})
+
+            if worker_id is None or not file_hash:
+                logger.error(f"Invalid worker assignment: {assignment}")
+                continue
+
+            # Get extracted binary path
+            extracted_path = self.extracted_binaries.get(file_hash)
+            if not extracted_path:
+                logger.error(f"Binary not found for hash {file_hash}")
+                continue
+
+            # Create BinaryInfo from dict
+            try:
+                identifier = BinaryIdentifier(
+                    binary_name=binary_info_dict.get("binary_name", ""),
+                    platform=binary_info_dict.get("platform", ""),
+                    compiler=binary_info_dict.get("compiler", ""),
+                    version=binary_info_dict.get("version", ""),
+                    opt_level=binary_info_dict.get("opt_level", ""),
+                )
+                binary_info = BinaryInfo(
+                    path=extracted_path,
+                    size=binary_info_dict.get("size", extracted_path.stat().st_size),
+                    identifier=identifier,
+                )
+            except Exception as e:
+                logger.error(f"Failed to create BinaryInfo: {e}")
+                continue
+
+            # Assign to worker via SubmissiveManager
+            success = self.worker_manager.assign_task_from_primary(worker_id, binary_info, estimated_memory)
+
+            opp_str = " (opportunistic)" if opportunistic else ""
+            if success:
+                logger.info(f"[Worker {worker_id}] Assigned initial task: {extracted_path.name}{opp_str}")
+            else:
+                logger.error(f"[Worker {worker_id}] Failed to assign initial task: {extracted_path.name}")
+
+        logger.info("Initial worker assignments complete")
+
+    async def _handle_promote_primary(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle primary promotion notification"""
+        slurm_primary_id = message.get("slurm_primary_id")
+        logger.info(f"Received primary promotion notification: {slurm_primary_id} is now SLURM-primary")
+        self.slurm_primary_id = slurm_primary_id
+        self.is_slurm_primary = slurm_primary_id == self.secondary_id
+        if self.is_slurm_primary:
+            logger.info("This secondary has been promoted to SLURM-primary")
+
+    async def _handle_full_task_list(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle full task list from primary"""
+        all_tasks = message.get("all_tasks", [])
+        completed_tasks = message.get("completed_tasks", [])
+
+        logger.info(f"Received full task list: {len(all_tasks)} total tasks, {len(completed_tasks)} completed")
+
+        self.all_tasks = all_tasks
+        self.completed_tasks = set(completed_tasks)

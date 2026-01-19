@@ -50,9 +50,6 @@ class RemoteWorker(BaseWorker):
         if not self.message_router:
             return False, "No message router available"
 
-        # Mark worker as busy
-        self.mark_busy(binary, estimated_memory)
-
         # Task assignment is handled asynchronously via coordinator
         # The actual message sending happens in the coordinator's _send_initial_assignment
         # or when responding to task_request messages

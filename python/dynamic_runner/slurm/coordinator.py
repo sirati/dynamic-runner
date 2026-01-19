@@ -57,6 +57,7 @@ class PrimaryCoordinator:
         self.completed_tasks: set[str] = set()
         self.failed_tasks: set[str] = set()
         self.discovered_binaries: dict[str, dict[str, Any]] = {}  # hash -> {zip_name, local_path, binary_info}
+        self.peer_connections_ready: set[str] = set()  # Track which secondaries have completed peer connections
 
         self.primary_entropy = secrets.token_bytes(32)
         self.peer_info: list[dict[str, Any]] = []
@@ -106,6 +107,9 @@ class PrimaryCoordinator:
 
             # Phase 3: Certificate exchange
             await self._exchange_certificates()
+
+            # Phase 3.5: Wait for peer connections
+            await self._wait_for_peer_connections()
 
             # Phase 4: Wait for workers ready
             await self._wait_for_workers()
@@ -190,6 +194,7 @@ class PrimaryCoordinator:
         self.message_router.register_handler("secondary_log", self._handle_secondary_log)
         self.message_router.register_handler("worker_ready", self._handle_worker_ready)
         self.message_router.register_handler("source_discovered", self._handle_source_discovered)
+        self.message_router.register_handler("peer_connections_ready", self._handle_peer_connections_ready)
 
         self.quic_transport.register_handler("secondary_welcome", self._handle_secondary_welcome)
         self.quic_transport.register_handler("cert_exchange", self._handle_cert_exchange)
@@ -621,6 +626,37 @@ class PrimaryCoordinator:
 
         logger.info("Certificate exchange complete")
 
+    async def _wait_for_peer_connections(self) -> None:
+        """Wait for all secondaries to establish peer-to-peer connections"""
+        logger.info("Waiting for secondaries to build peer-to-peer network...")
+
+        expected_secondaries = len(self.secondaries)
+        timeout = 300  # 5 minutes for peer connections
+        start_time = time.time()
+
+        while len(self.peer_connections_ready) < expected_secondaries:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(
+                    f"Timeout waiting for peer connections. Got {len(self.peer_connections_ready)}/{expected_secondaries}"
+                )
+            await asyncio.sleep(0.5)
+
+        logger.info(f"All {expected_secondaries} secondaries have established peer connections")
+
+    async def _handle_peer_connections_ready(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle peer connections ready notification from secondary"""
+        secondary_id = message.get("secondary_id")
+
+        if not secondary_id:
+            logger.warning("Received peer_connections_ready without secondary_id")
+            return
+
+        if secondary_id not in self.peer_connections_ready:
+            self.peer_connections_ready.add(secondary_id)
+            logger.info(
+                f"[{secondary_id}] Peer connections ready ({len(self.peer_connections_ready)}/{len(self.secondaries)})"
+            )
+
     async def _wait_for_workers(self) -> None:
         """Wait for all workers to report ready"""
         logger.info("Waiting for workers to report ready...")
@@ -690,11 +726,21 @@ class PrimaryCoordinator:
             # This allows WorkerManager to use its logic with remote workers
             self.worker_managers[secondary_id].workers = []
 
+        # Track worker info in secondaries dict
+        if secondary_id in self.secondaries:
+            if "workers" not in self.secondaries[secondary_id]:
+                self.secondaries[secondary_id]["workers"] = {}
+
+            self.secondaries[secondary_id]["workers"][worker_id] = {
+                "memory_budget": memory_budget,
+                "ready": True,
+            }
+
         budget_gb = memory_budget / (1024**3) if memory_budget else 0
         logger.debug(f"Worker ready: {secondary_id} worker {worker_id} (budget: {budget_gb:.2f}GB)")
 
     async def _preliminary_assignment(self) -> None:
-        """Assign initial tasks to secondaries - one per worker initially"""
+        """Assign initial tasks to secondaries - one per worker with OOM checking"""
         logger.info("Performing preliminary task assignment...")
 
         if len(self.secondaries) == 0:
@@ -705,29 +751,101 @@ class PrimaryCoordinator:
             logger.warning("No binaries to assign")
             return
 
-        # Use WorkerManager per secondary to handle assignments
+        # Distribute binaries evenly across secondaries
         binaries_per_secondary = len(self.binaries) // len(self.secondaries)
 
-        for idx, secondary_id in enumerate(self.secondaries.keys()):
-            if secondary_id not in self.worker_managers:
-                logger.warning(f"No WorkerManager for {secondary_id}, skipping assignment")
+        # Track binaries for assignment
+        pending_binaries = self.binaries.copy()
+
+        for idx, (secondary_id, secondary_info) in enumerate(self.secondaries.items()):
+            # Get workers for this secondary
+            workers = secondary_info.get("workers", {})
+
+            if not workers:
+                logger.warning(f"No workers registered for {secondary_id}, skipping")
                 continue
 
-            # Assign slice of binaries to this secondary's WorkerManager
+            # Get slice of binaries for this secondary
             start_idx = idx * binaries_per_secondary
             end_idx = start_idx + binaries_per_secondary if idx < len(self.secondaries) - 1 else len(self.binaries)
-            secondary_binaries = self.binaries[start_idx:end_idx]
+            secondary_binaries = pending_binaries[start_idx:end_idx]
 
-            # Set pending binaries for this WorkerManager
-            worker_manager = self.worker_managers[secondary_id]
-            worker_manager.pending_binaries = secondary_binaries.copy()
+            # Track memory for this secondary
+            secondary_memory_limit = secondary_info.get("ram_bytes", 0)
+            total_assigned_memory = 0
 
-            # Track assignments
-            for binary in secondary_binaries:
-                task_hash = self._compute_task_hash(binary)
-                self.task_assignments[task_hash] = secondary_id
+            # Assign one task per worker with OOM checking
+            # Use same logic as local: iterate workers and find first fitting binary
+            assignments = []
 
-            logger.info(f"Assigned {len(secondary_binaries)} tasks to {secondary_id}")
+            for worker_id, worker_info in workers.items():
+                if not secondary_binaries:
+                    break
+
+                worker_budget = worker_info.get("memory_budget", 0)
+
+                # Find first task that fits worker budget (same as local assignment)
+                assigned = False
+                for i, binary in enumerate(secondary_binaries):
+                    estimated = self.task_definition.estimate_memory(binary.size)
+
+                    if estimated > worker_budget:
+                        continue
+
+                    # Check if assigning would exceed memory limit
+                    would_exceed = (total_assigned_memory + estimated) > secondary_memory_limit
+                    is_opportunistic = would_exceed
+
+                    # Assign the task
+                    task_binary = secondary_binaries.pop(i)
+                    task_hash = self._compute_task_hash(task_binary)
+                    self.task_assignments[task_hash] = secondary_id
+
+                    # Track assignment
+                    total_assigned_memory += estimated
+
+                    size_mb = task_binary.size / (1024 * 1024)
+                    estimated_mb = estimated / (1024 * 1024)
+                    budget_mb = worker_budget / (1024 * 1024)
+                    opp_str = " (opportunistic)" if is_opportunistic else ""
+
+                    logger.info(
+                        f"[{secondary_id} Worker {worker_id}] Assigned: {task_binary.path.name} "
+                        f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB){opp_str}"
+                    )
+
+                    assignments.append(
+                        {
+                            "worker_id": worker_id,
+                            "binary": task_binary,
+                            "estimated_memory": estimated,
+                            "opportunistic": is_opportunistic,
+                        }
+                    )
+
+                    assigned = True
+                    break
+
+                if not assigned:
+                    logger.warning(
+                        f"[{secondary_id} Worker {worker_id}] No task fits budget {worker_budget / (1024**3):.2f}GB"
+                    )
+
+            # Report assignment summary for this secondary
+            opportunistic_memory = sum(a["estimated_memory"] for a in assignments if a["opportunistic"])
+            non_opportunistic_memory = sum(a["estimated_memory"] for a in assignments if not a["opportunistic"])
+            total_mb = total_assigned_memory / (1024 * 1024)
+            opp_mb = opportunistic_memory / (1024 * 1024)
+            non_opp_mb = non_opportunistic_memory / (1024 * 1024)
+
+            logger.info(
+                f"[{secondary_id} Initial Phase] Total assigned: {total_mb:.2f}MB, "
+                f"Non-opportunistic: {non_opp_mb:.2f}MB, "
+                f"Opportunistic: {opp_mb:.2f}MB"
+            )
+
+            # Store assignments for sending after transfer complete
+            secondary_info["initial_assignments"] = assignments
 
         logger.info("Preliminary assignment complete")
 
@@ -793,7 +911,7 @@ class PrimaryCoordinator:
         srcbins_dir = self.slurm_config.get_srcbins_dir()
 
         # Ensure srcbins directory exists
-        self.gateway.create_directory(srcbins_dir)
+        self.gateway.create_directory(str(srcbins_dir))
 
         for secondary_id in self.secondaries:
             # Get assigned tasks for this secondary
@@ -820,7 +938,8 @@ class PrimaryCoordinator:
 
                 random_suffix = secrets.token_hex(8)
                 zip_name = f"{secondary_id}_batch_{batch_idx}_{random_suffix}.zip"
-                zip_path = Path(srcbins_dir) / zip_name
+                # Use string path joining for remote paths
+                zip_path = f"{srcbins_dir}/{zip_name}" if not srcbins_dir.endswith("/") else f"{srcbins_dir}{zip_name}"
 
                 # Create ZIP with batch binaries
                 zip_info = await self._create_and_upload_zip(zip_path, batch)
@@ -864,9 +983,16 @@ class PrimaryCoordinator:
 
         return batches
 
-    async def _create_and_upload_zip(self, zip_path: Path, binaries: list[BinaryInfo]) -> dict[str, Any] | None:
+    async def _create_and_upload_zip(self, zip_path: str | Path, binaries: list[BinaryInfo]) -> dict[str, Any] | None:
         """Create ZIP file with binaries and upload to gateway"""
         try:
+            # Convert to Path for local operations
+            if isinstance(zip_path, str):
+                zip_path = Path(zip_path).expanduser()
+
+            # Ensure parent directory exists
+            zip_path.parent.mkdir(parents=True, exist_ok=True)
+
             # Create ZIP without compression (store only)
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
                 binaries_info = []
@@ -915,15 +1041,70 @@ class PrimaryCoordinator:
 
     async def _send_initial_assignment(self, secondary_id: str, zip_files_info: list[dict[str, Any]]) -> None:
         """Send initial assignment with ZIP locations to secondary"""
+
+        # Get the initial assignments prepared during preliminary_assignment
+        secondary_info = self.secondaries.get(secondary_id, {})
+        initial_assignments = secondary_info.get("initial_assignments", [])
+
+        # Build worker assignments with full details
+        worker_assignments = []
+        for assignment in initial_assignments:
+            worker_id = assignment["worker_id"]
+            binary = assignment["binary"]
+            estimated_memory = assignment["estimated_memory"]
+            opportunistic = assignment["opportunistic"]
+
+            # Compute hash to find which ZIP contains this binary
+            task_hash = self._compute_task_hash(binary)
+
+            # Find ZIP containing this binary
+            zip_name = None
+            local_path = None
+
+            for zip_info in zip_files_info:
+                for binary_entry in zip_info.get("binaries", []):
+                    if binary_entry.get("hash") == task_hash:
+                        zip_name = zip_info.get("zip_name")
+                        local_path = binary_entry.get("local_path")
+                        break
+                if zip_name:
+                    break
+
+            if not zip_name:
+                logger.warning(f"Could not find ZIP for binary {binary.path.name}, skipping assignment")
+                continue
+
+            worker_assignments.append(
+                {
+                    "worker_id": worker_id,
+                    "zip_file": zip_name,
+                    "local_path": local_path,
+                    "file_hash": task_hash,
+                    "estimated_memory": estimated_memory,
+                    "opportunistic": opportunistic,
+                    "binary_info": {
+                        "path": str(binary.path.relative_to(self.source_dir)) if self.source_dir else str(binary.path),
+                        "size": binary.size,
+                        "binary_name": binary.binary_name,
+                        "platform": binary.platform,
+                        "compiler": binary.compiler,
+                        "version": binary.version,
+                        "opt_level": binary.opt_level,
+                    },
+                }
+            )
+
         msg = {
             "type": "initial_assignment",
             "secondary_id": secondary_id,
             "zip_files": zip_files_info,
-            "workers_ready": [],  # Will be populated when workers report ready
+            "worker_assignments": worker_assignments,
         }
 
         await self.message_router.send_to_secondary(secondary_id, msg)
-        logger.info(f"Sent initial assignment to {secondary_id}: {len(zip_files_info)} ZIP files")
+        logger.info(
+            f"Sent initial assignment to {secondary_id}: {len(zip_files_info)} ZIP files, {len(worker_assignments)} worker assignments"
+        )
 
     async def _handle_source_discovered(self, message: dict[str, Any], sender_id: str | None) -> None:
         """Handle discovered source binary report from first secondary"""

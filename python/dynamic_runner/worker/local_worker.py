@@ -86,8 +86,6 @@ class LocalWorker(BaseWorker):
             relative_path = binary.path
 
         success, error_msg = send_worker_command(self.worker_state, str(relative_path))
-        if success:
-            self.mark_busy(binary, estimated_memory)
         return success, error_msg
 
     def check_status(self) -> tuple[bool, TaskResult | None]:
