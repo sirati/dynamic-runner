@@ -300,7 +300,22 @@ class PrimaryCoordinator:
         logger.error("=" * 80)
         logger.error(f"SECONDARY ERROR from {secondary_id}")
         logger.error("=" * 80)
-        logger.error(f"Error Type: {error_type}")
+        logger.error(f"Error Type: {error_type}")multi-computer slurm instead")
+        
+            # Validate multi-computer arguments
+            if args.multi_computer:
+                if args.multi_computer == "slurm":
+                    if not args.gateway:
+                        logger.error("--gateway is required when --multi-computer slurm is enabled")
+                        return
+                    if not args.packaging:
+                        logger.error("--packaging is required when --multi-computer slurm is enabled")
+                        return
+                    if not args.slurm_root_folder:
+                        home = Path.home()
+                        suggestions = [home / "slurm", home / "BIG" / "slurm"]
+                        logger.error(f"--slurm-root-folder is required when --multi-computer slurm is enabled")
+                        logger.error(f"Suggested locations: {'
         logger.error(f"Error Message: {error_message}")
         logger.error("")
         logger.error("Traceback:")

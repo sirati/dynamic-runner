@@ -16,10 +16,10 @@ from shared.binary_info import BinaryIdentifier
 
 from ..binary_info import BinaryInfo
 from ..models import WorkerState
+from ..multi_computer.message_router import MessageRouter
+from ..multi_computer.quic_transport import QuicPeerInfo, QuicTransport
 from ..task import TaskDefinition
 from ..worker_manager.submissive import SubmissiveManager
-from .message_router import MessageRouter
-from .quic_transport import QuicPeerInfo, QuicTransport
 
 logger = logging.getLogger(__name__)
 

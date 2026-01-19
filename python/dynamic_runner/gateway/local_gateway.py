@@ -130,48 +130,11 @@ class LocalGateway:
         return remote_path.exists()
 
     def sync_project(self, local_project_root: Path, remote_project_root: Path) -> None:
-        """Synchronize project files to gateway (local copy with exclusions)"""
-        if not self.connected:
-            raise RuntimeError("Gateway not connected")
+        """Synchronize project files to gateway using rsync over SSH
 
-        # Expand ~ using home directory
-        path_str = str(remote_project_root)
-        if path_str.startswith("~"):
-            path_str = path_str.replace("~", str(self.remote_home), 1)
-            remote_project_root = Path(path_str)
-
-        logger.info(f"Syncing project {local_project_root} to {remote_project_root}")
-
-        # Remove existing directory if present
-        if remote_project_root.exists():
-            import shutil
-
-            shutil.rmtree(remote_project_root)
-
-        # Copy with exclusions
-        copytree(
-            local_project_root,
-            remote_project_root,
-            ignore=ignore_patterns(
-                ".git",
-                "__pycache__",
-                "*.pyc",
-                "*.pyo",
-                "*.egg-info",
-                ".pytest_cache",
-                ".mypy_cache",
-                ".ruff_cache",
-                "result",
-                "result-*",
-                ".direnv",
-                ".venv",
-                "venv",
-                "node_modules",
-                ".DS_Store",
-            ),
-        )
-
-        logger.info(f"Project synchronized to {remote_project_root}")
+        TODO REMOVE THIS, WE NEVER WANT TO DO THIS AS WE SENT A DOCKER IMAGE INSTEAD!!!
+        """
+        raise RuntimeError("TODO REMOVE THIS, WE NEVER WANT TO DO THIS AS WE SENT A DOCKER IMAGE INSTEAD!!!")
 
     def setup_port_forwarding(self, local_port: int, remote_port: int) -> None:
         """Setup port forwarding (no-op for local gateway)

@@ -17,16 +17,19 @@ from shared import (
 )
 
 from .gateway import GatewayConfig, create_gateway, parse_gateway_url
+from .local_test.primary import LocalTestPrimaryCoordinator
+from .multi_computer import ExecutionMode
 from .runtime_env import PackagingConfig, create_packaging_method
 from .slurm import SlurmConfig, validate_slurm_config
 from .slurm.job_manager import SlurmJobManager
+from .slurm.primary import SlurmPrimaryCoordinator
 from .system_resources import parse_cores, parse_memory
 from .task import TokenizerTask
 from .worker_manager import WorkerManager
 
 
 def main():
-    # Parse args early to check for debug flag
+    # Parse args early to check for debug flag and mode
     parser = argparse.ArgumentParser(
         description="Dynamic batch processing for binary tokenization with memory-aware parallel execution"
     )
@@ -37,19 +40,60 @@ def main():
         help="Enable debug logging for detailed output",
     )
 
-    # Parse known args first to get debug flag
-    early_args, _ = parser.parse_known_args()
-
-    # Set up logging based on debug flag
-    log_level = logging.DEBUG if early_args.debug else logging.INFO
-    logger = logging.getLogger()
-    logger.setLevel(log_level)
-
-    logging.basicConfig(
-        level=log_level,
-        format="%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+    parser.add_argument(
+        "--raw-logs",
+        action="store_true",
+        help="Use raw log formatting (no level, timestamp - only prefix and message)",
     )
+
+    # Check if help is requested - if so, we need to add all arguments first
+    import sys
+
+    help_requested = "-h" in sys.argv or "--help" in sys.argv
+
+    if not help_requested:
+        # Parse known args first to determine mode and logging flags
+        early_args, _ = parser.parse_known_args()
+
+        # Determine mode and prefix
+        if "--secondary" in sys.argv:
+            prefix = "S|"
+        else:
+            # Check if we're in primary multi-computer mode or normal mode
+            if "--multi-computer" in sys.argv or "--slurm" in sys.argv:
+                prefix = "P|"
+            else:
+                prefix = ""  # Normal local mode, no prefix
+
+        # Set up logging based on flags
+        log_level = logging.DEBUG if early_args.debug else logging.INFO
+        logger = logging.getLogger()
+        logger.setLevel(log_level)
+
+        if early_args.raw_logs:
+            log_format = f"{prefix}%(message)s"
+            logging.basicConfig(
+                level=log_level,
+                format=log_format,
+            )
+        else:
+            if prefix:
+                log_format = f"%(levelname)s | %(asctime)s |{prefix}| %(message)s"
+            else:
+                log_format = "%(levelname)s | %(asctime)s | %(message)s"
+            logging.basicConfig(
+                level=log_level,
+                format=log_format,
+                datefmt="%H:%M:%S",
+            )
+    else:
+        # Set up default logging for help display
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s | %(asctime)s | %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        logger = logging.getLogger()
 
     add_selection_arguments(parser)
 
@@ -130,22 +174,29 @@ def main():
     )
 
     parser.add_argument(
+        "--multi-computer",
+        type=str,
+        choices=["slurm", "local"],
+        help="Enable multi-computer distributed mode (slurm or local)",
+    )
+
+    parser.add_argument(
         "--slurm",
         action="store_true",
-        help="Enable SLURM distributed mode",
+        help="(Deprecated) Enable SLURM distributed mode. Use --multi-computer slurm instead.",
     )
 
     parser.add_argument(
         "--packaging",
         type=str,
         choices=["docker", "podman"],
-        help="Packaging method for SLURM deployment (required with --slurm). Use 'podman' for SLURM clusters.",
+        help="Packaging method for SLURM deployment (required with --multi-computer slurm). Use 'podman' for SLURM clusters.",
     )
 
     parser.add_argument(
         "--slurm-root-folder",
         type=str,
-        help="Root folder for SLURM operations on gateway (required with --slurm)",
+        help="Root folder for SLURM operations on gateway (required with --multi-computer slurm)",
     )
 
     parser.add_argument(
@@ -178,7 +229,7 @@ def main():
     parser.add_argument(
         "--slurm-test-job",
         action="store_true",
-        help="Submit a test SLURM job to validate Docker image loading (requires --slurm)",
+        help="Submit a test SLURM job to validate Docker image loading (requires --multi-computer slurm)",
     )
 
     parser.add_argument(
@@ -196,21 +247,48 @@ def main():
 
     args = parser.parse_args()
 
-    # Handle secondary mode early - this is for SLURM compute nodes
+    # Handle secondary mode early - this is for SLURM compute nodes or local test
     if args.secondary:
         import socket
+        import tempfile
 
         import psutil
 
-        from .slurm.secondary_mode import SecondaryMode
+        from .multi_computer.secondary import SecondaryCoordinator
 
         if not args.secondary_id:
             logger.error("--secondary-id is required when running in secondary mode")
             return
 
-        logger.info("=" * 60)
-        logger.info("SECONDARY MODE (SLURM Compute Node)")
-        logger.info("=" * 60)
+        # Detect if running in Docker container or locally
+        in_docker = Path("/app").exists() and Path("/.dockerenv").exists()
+
+        if in_docker:
+            logger.info("=" * 60)
+            logger.info("SECONDARY MODE (SLURM Compute Node)")
+            logger.info("=" * 60)
+            # Paths inside container
+            src_tmp = Path("/app/src-tmp")
+            out_tmp = Path("/app/out-tmp")
+            log_tmp = Path("/app/log-tmp")
+            src_network = Path("/app/src-network")
+            out_network = Path("/app/out-network")
+            log_network = Path("/app/log-network")
+            socket_dir = Path("/app/sockets")
+        else:
+            logger.info("=" * 60)
+            logger.info("SECONDARY MODE (Local Test)")
+            logger.info("=" * 60)
+            # Use temporary directory for local testing
+            temp_dir = Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-"))
+            src_tmp = temp_dir / "src-tmp"
+            out_tmp = temp_dir / "out-tmp"
+            log_tmp = temp_dir / "log-tmp"
+            src_network = temp_dir / "src-network"
+            out_network = temp_dir / "out-network"
+            log_network = temp_dir / "log-network"
+            socket_dir = temp_dir / "sockets"
+
         logger.info(f"Secondary ID: {args.secondary_id}")
         logger.info(f"Primary URL: {args.secondary}")
         logger.info(f"QUIC Port: {args.secondary_quic_port if args.secondary_quic_port else 'auto'}")
@@ -219,16 +297,7 @@ def main():
         ram_bytes = psutil.virtual_memory().total
         num_workers = psutil.cpu_count(logical=False) or 4
 
-        # Paths inside container
-        src_tmp = Path("/app/src-tmp")
-        out_tmp = Path("/app/out-tmp")
-        log_tmp = Path("/app/log-tmp")
-        src_network = Path("/app/src-network")
-        out_network = Path("/app/out-network")
-        log_network = Path("/app/log-network")
-        socket_dir = Path("/app/sockets")
-
-        secondary = SecondaryMode(
+        secondary = SecondaryCoordinator(
             primary_url=args.secondary,
             secondary_id=args.secondary_id,
             num_workers=num_workers,
@@ -249,20 +318,29 @@ def main():
         secondary.run()
         return
 
-    # Validate SLURM arguments
-    if args.slurm:
-        if not args.gateway:
-            logger.error("--gateway is required when --slurm is enabled")
-            return
-        if not args.packaging:
-            logger.error("--packaging is required when --slurm is enabled")
-            return
-        if not args.slurm_root_folder:
-            home = Path.home()
-            suggestions = [home / "slurm", home / "BIG" / "slurm"]
-            logger.error(f"--slurm-root-folder is required when --slurm is enabled")
-            logger.error(f"Suggested locations: {', '.join(str(s) for s in suggestions)}")
-            return
+    # Handle backward compatibility: --slurm maps to --multi-computer slurm
+    if args.slurm and not args.multi_computer:
+        args.multi_computer = "slurm"
+        logger.warning("--slurm is deprecated, use --multi-computer slurm instead")
+
+    # Validate multi-computer arguments
+    if args.multi_computer:
+        if args.multi_computer == "slurm":
+            if not args.gateway:
+                logger.error("--gateway is required when --multi-computer slurm is enabled")
+                return
+            if not args.packaging:
+                logger.error("--packaging is required when --multi-computer slurm is enabled")
+                return
+            if not args.slurm_root_folder:
+                home = Path.home()
+                suggestions = [home / "slurm", home / "BIG" / "slurm"]
+                logger.error(f"--slurm-root-folder is required when --multi-computer slurm is enabled")
+                logger.error(f"Suggested locations: {', '.join(str(s) for s in suggestions)}")
+                return
+        elif args.multi_computer == "local":
+            # Local mode validation
+            pass
 
     # Default to named mode when manual-start-worker is used
     if args.connection_mode is None:
@@ -282,168 +360,116 @@ def main():
         logger.error("--socket-dir is required when --connection-mode=named")
         return
 
-    # Handle SLURM mode early - before scanning binaries
-    if args.slurm:
+    # Handle multi-computer mode early - before scanning binaries
+    if args.multi_computer == "slurm":
         logger.info("=" * 60)
         logger.info("SLURM DISTRIBUTED MODE")
         logger.info("=" * 60)
 
-        # Parse gateway configuration
-        gateway_config = parse_gateway_url(args.gateway)
-        gateway = create_gateway(gateway_config)
-
-        # Setup port forwarding BEFORE connecting (for SSH gateway)
-        gateway.setup_port_forwarding(local_port=5000, remote_port=6000)
-
-        # Create SLURM configuration
-        # Keep as string if starts with ~ for remote expansion
-        root_folder = args.slurm_root_folder
-        if not root_folder.startswith("~"):
-            root_folder = Path(root_folder)
-
-        slurm_config = SlurmConfig(
-            root_folder=root_folder,
-            image_subfolder=args.slurm_image_subfolder,
-            output_subfolder=args.slurm_output_subfolder,
-            log_subfolder=args.slurm_log_subfolder,
-            notify_email=args.slurm_notify_email,
+        # Collect binaries to process
+        logger.info("Collecting binaries from source directory...")
+        sel_result = process_selection_arguments(args)
+        binaries_info = find_matching_binaries(
+            sel_result.source_dir,
+            sel_result.platforms,
+            sel_result.compiler,
+            sel_result.compiler_versions,
+            sel_result.opt_levels,
         )
 
-        # Create packaging method
-        packaging_config = PackagingConfig(method=args.packaging)
-        packaging = create_packaging_method(packaging_config)
+        if args.skip_existing:
+            binaries_info = filter_existing_outputs(binaries_info, sel_result.output_dir)
 
-        # Connect to gateway
-        gateway.connect()
+        logger.info(f"Found {len(binaries_info)} binaries to process")
 
-        # Check if GatewayPorts is properly configured for SLURM
-        use_ssh_jump = False
-        if hasattr(gateway, "gateway_ports_enabled") and gateway.gateway_ports_enabled is False:
-            logger.info("=" * 60)
-            logger.info("USING SSH PROXYJUMP MODE")
-            logger.info("=" * 60)
-            logger.info("The SSH gateway does not allow public port forwarding (GatewayPorts is disabled).")
-            logger.info("Using SSH ProxyJump tunnels: primary will tunnel to each secondary via gateway.")
-            logger.info("Secondaries will connect to localhost:{free port} (tunneled to primary).")
-            logger.info("")
-            use_ssh_jump = True
+        if len(binaries_info) == 0:
+            logger.warning("No binaries found to process. Coordinator will run in test mode.")
 
-        # Validate configuration (after gateway connection to check remote folder)
+        num_secondaries = args.jobs
+        logger.info(f"Starting coordinator with {num_secondaries} secondaries")
+
+        # Create unique run directory with timestamp
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"run_{run_timestamp}"
+        logger.info(f"Run ID: {run_id}")
+
+        # Create coordinator - it will handle all gateway setup, validation, etc.
+        coordinator = SlurmPrimaryCoordinator(
+            binaries=binaries_info,
+            gateway_url=args.gateway,
+            slurm_root_folder=args.slurm_root_folder,
+            packaging_method=args.packaging,
+            task_definition=task,
+            task_args=args,
+            run_id=run_id,
+            source_dir=sel_result.source_dir,
+            skip_image_build=args.skip_image_build,
+            slurm_config_kwargs={
+                "image_subfolder": args.slurm_image_subfolder,
+                "output_subfolder": args.slurm_output_subfolder,
+                "log_subfolder": args.slurm_log_subfolder,
+                "notify_email": args.slurm_notify_email,
+            },
+        )
+
         try:
-            validate_slurm_config(slurm_config, gateway)
-        except ValueError:
-            # Create directory if it doesn't exist
-            logger.info(f"Creating SLURM root directory: {slurm_config.root_folder}")
-            gateway.create_directory(slurm_config.root_folder)
-
-        try:
-            # Create job manager
-            job_manager = SlurmJobManager(gateway, slurm_config, packaging)
-
-            # Prepare directories on gateway
-            job_manager.prepare_directories()
-
-            # Build and transfer Docker image (unless skipped)
-            if args.skip_image_build:
-                logger.info("Skipping image build and transfer (--skip-image-build)")
-                image_path = f"{slurm_config.get_image_dir()}/asm-tokenizer-docker.tar"
-                logger.info(f"Assuming Docker image exists at: {image_path}")
-            else:
-                project_root = Path.cwd()
-                image_path = job_manager.build_and_transfer_image(project_root)
-                logger.info(f"Docker image ready at: {image_path}")
-
-            logger.info("")
-
-            if args.slurm_test_job:
-                logger.info("Submitting test SLURM job...")
-
-                # Generate test wrapper script
-                test_script = job_manager.generate_test_wrapper_script(image_path)
-
-                # Submit test job
-                test_job_id = job_manager.submit_job(
-                    wrapper_script=test_script,
-                    job_name="asm-tokenizer-test",
-                    nodes=1,
-                )
-
-                logger.info(f"Test job submitted: {test_job_id}")
-                logger.info("")
-                logger.info("Monitor job status with:")
-                logger.info(f"  ssh {gateway_config.ssh_host} 'squeue -j {test_job_id}'")
-                logger.info("")
-                logger.info("Check job output at:")
-                logger.info(f"  {slurm_config.get_log_dir()}/slurm_{test_job_id}.out")
-                logger.info("")
-                logger.info("To view logs:")
-                logger.info(
-                    f"  ssh {gateway_config.ssh_host} 'tail -f {slurm_config.get_log_dir()}/slurm_{test_job_id}.out'"
-                )
-            else:
-                logger.info("Next steps:")
-                logger.info("1. Use --slurm-test-job to validate Docker image loading")
-                logger.info("2. Primary will coordinate initial distribution")
-                logger.info("3. Secondaries will be submitted as SLURM jobs")
-                logger.info("4. After all files transferred, primary can disconnect")
-                logger.info("")
-                logger.info("SLURM mode setup complete!")
-                logger.info("")
-                logger.info("Starting primary coordinator...")
-
-                # Run primary coordinator
-                from .slurm.coordinator import PrimaryCoordinator
-
-                # Collect binaries to process
-                logger.info("Collecting binaries from source directory...")
-                sel_result = process_selection_arguments(args)
-                binaries_info = find_matching_binaries(
-                    sel_result.source_dir,
-                    sel_result.platforms,
-                    sel_result.compiler,
-                    sel_result.compiler_versions,
-                    sel_result.opt_levels,
-                )
-
-                if args.skip_existing:
-                    binaries_info = filter_existing_outputs(binaries_info, sel_result.output_dir)
-
-                logger.info(f"Found {len(binaries_info)} binaries to process")
-
-                if len(binaries_info) == 0:
-                    logger.warning("No binaries found to process. Coordinator will run in test mode.")
-
-                num_secondaries = args.jobs
-                logger.info(f"Starting coordinator with {num_secondaries} secondaries")
-
-                # Create unique run directory with timestamp
-                run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                run_id = f"run_{run_timestamp}"
-                logger.info(f"Run ID: {run_id}")
-
-                # Clean up any existing SSH tunnels from previous runs
-                logger.info("Cleaning up any existing SSH tunnels...")
-                subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "ssh.*-L.*localhost"], stderr=subprocess.DEVNULL)
-                logger.debug("SSH tunnel cleanup complete")
-
-                coordinator = PrimaryCoordinator(
-                    binaries_info,
-                    slurm_config,
-                    job_manager,
-                    gateway,
-                    task_definition=task,
-                    task_args=args,
-                    use_reverse_connection=use_ssh_jump,
-                    run_id=run_id,
-                    source_dir=sel_result.source_dir,
-                )
-                coordinator.run(num_secondaries=num_secondaries)
-
+            # Run coordinator
+            coordinator.run(num_secondaries=num_secondaries)
         finally:
-            # Clean up SSH tunnels
-            logger.info("Cleaning up SSH tunnels...")
-            subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "ssh.*-L.*localhost"], stderr=subprocess.DEVNULL)
-            gateway.disconnect()
+            # Coordinator handles its own cleanup
+            pass
+
+        return
+
+    elif args.multi_computer == "local":
+        logger.info("=" * 60)
+        logger.info("LOCAL MULTI-COMPUTER MODE (Testing)")
+        logger.info("=" * 60)
+
+        # Collect binaries to process
+        logger.info("Collecting binaries from source directory...")
+        sel_result = process_selection_arguments(args)
+        binaries_info = find_matching_binaries(
+            sel_result.source_dir,
+            sel_result.platforms,
+            sel_result.compiler,
+            sel_result.compiler_versions,
+            sel_result.opt_levels,
+        )
+
+        if args.skip_existing:
+            binaries_info = filter_existing_outputs(binaries_info, sel_result.output_dir)
+
+        logger.info(f"Found {len(binaries_info)} binaries to process")
+
+        if len(binaries_info) == 0:
+            logger.warning("No binaries found to process.")
+            return
+
+        num_secondaries = args.jobs
+        logger.info(f"Starting coordinator with {num_secondaries} local secondaries")
+
+        # Create unique run directory with timestamp
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"run_{run_timestamp}"
+        logger.info(f"Run ID: {run_id}")
+
+        # Create local test coordinator - no gateway, no Docker, no SSH
+        coordinator = LocalTestPrimaryCoordinator(
+            binaries=binaries_info,
+            task_definition=task,
+            task_args=args,
+            run_id=run_id,
+            source_dir=sel_result.source_dir,
+            raw_logs=args.raw_logs,
+        )
+
+        try:
+            # Run coordinator
+            coordinator.run(num_secondaries=num_secondaries)
+        finally:
+            # Coordinator handles its own cleanup
+            pass
 
         return
 

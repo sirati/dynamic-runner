@@ -70,7 +70,7 @@ def setup_file_logger(
         log_file_path: Path to log file
         level: Logging level (default: INFO)
         console: Whether to add console handler (default: True)
-        console_format: Custom format for console handler. If None, uses standard format.
+        console_format: Custom format for console handler. If None, inherits from root logger.
 
     Returns:
         Configured logger
@@ -90,9 +90,29 @@ def setup_file_logger(
     if console:
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
+
+        # If no custom format specified, inherit from root logger's handlers
         if console_format is None:
-            console_format = "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s"
-        console_formatter = logging.Formatter(console_format, datefmt="%Y-%m-%d %H:%M:%S")
+            root_logger = logging.getLogger()
+            root_format = None
+            root_datefmt = None
+
+            # Find the first StreamHandler in root logger to inherit its format
+            for handler in root_logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and handler.formatter:
+                    root_format = handler.formatter._fmt
+                    root_datefmt = handler.formatter.datefmt
+                    break
+
+            # Fall back to standard format if root has no stream handlers
+            if root_format is None:
+                root_format = "%(levelname)s | %(asctime)s,%(msecs)03d | %(message)s"
+                root_datefmt = "%Y-%m-%d %H:%M:%S"
+
+            console_formatter = logging.Formatter(root_format, datefmt=root_datefmt)
+        else:
+            console_formatter = logging.Formatter(console_format, datefmt="%Y-%m-%d %H:%M:%S")
+
         console_handler.setFormatter(console_formatter)
         logger.addHandler(console_handler)
 
