@@ -1,12 +1,16 @@
 import asyncio
+import hashlib
 import logging
 import secrets
-import socket
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
 from ..binary_info import BinaryInfo
+from ..task import TaskDefinition
+from ..worker.remote_worker import RemoteWorker
+from ..worker_manager import WorkerManager
 from .message_router import MessageRouter
 from .quic_transport import QuicTransport
 
@@ -22,6 +26,8 @@ class PrimaryCoordinator:
         slurm_config: Any,
         job_manager: Any,
         gateway: Any,
+        task_definition: TaskDefinition,
+        task_args: Any,
         use_reverse_connection: bool = False,
         run_id: str = "default",
     ):
@@ -29,6 +35,8 @@ class PrimaryCoordinator:
         self.slurm_config = slurm_config
         self.job_manager = job_manager
         self.gateway = gateway
+        self.task_definition = task_definition
+        self.task_args = task_args
         self.use_reverse_connection = use_reverse_connection
         self.run_id = run_id
 
@@ -41,10 +49,12 @@ class PrimaryCoordinator:
 
         self.secondaries: dict[str, dict[str, Any]] = {}
         self.secondary_port_map: dict[str, int] = {}  # Map secondary_id to allocated port
-        self.workers: dict[str, list[dict[str, Any]]] = {}
+        self.worker_managers: dict[str, WorkerManager] = {}  # One WorkerManager per secondary
+        self.remote_workers: dict[str, list[RemoteWorker]] = {}  # Remote workers per secondary
         self.task_assignments: dict[str, str] = {}  # task_hash -> secondary_id
         self.completed_tasks: set[str] = set()
         self.failed_tasks: set[str] = set()
+        self.discovered_binaries: dict[str, dict[str, Any]] = {}  # hash -> {zip_name, local_path, binary_info}
 
         self.primary_entropy = secrets.token_bytes(32)
         self.peer_info: list[dict[str, Any]] = []
@@ -176,11 +186,14 @@ class PrimaryCoordinator:
         self.message_router.register_handler("cert_exchange", self._handle_cert_exchange)
         self.message_router.register_handler("secondary_error", self._handle_secondary_error)
         self.message_router.register_handler("secondary_log", self._handle_secondary_log)
+        self.message_router.register_handler("worker_ready", self._handle_worker_ready)
+        self.message_router.register_handler("source_discovered", self._handle_source_discovered)
 
         self.quic_transport.register_handler("secondary_welcome", self._handle_secondary_welcome)
         self.quic_transport.register_handler("cert_exchange", self._handle_cert_exchange)
         self.quic_transport.register_handler("secondary_error", self._handle_secondary_error)
         self.quic_transport.register_handler("secondary_log", self._handle_secondary_log)
+        self.quic_transport.register_handler("worker_ready", self._handle_worker_ready)
 
     # Old TCP connection handler - no longer used with QUIC
     # async def _handle_secondary_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -216,6 +229,8 @@ class PrimaryCoordinator:
             if temp_id.startswith("temp_"):
                 self.active_connections[secondary_id] = writer
                 del self.active_connections[temp_id]
+                # Add to message router for sending messages
+                self.message_router.add_secondary_connection(secondary_id, writer)
                 break
 
         logger.info(f"Secondary {secondary_id} registered and ready (total: {len(self.secondaries)} secondaries)")
@@ -360,7 +375,6 @@ class PrimaryCoordinator:
     async def _connect_to_secondaries_reverse(self, expected_count: int) -> None:
         """Connect to secondaries in reverse mode (they listen, we connect via ProxyJump)"""
         import asyncio
-        import subprocess
 
         logger.info("Reverse connection mode: polling for secondary connection info files...")
 
@@ -501,7 +515,8 @@ class PrimaryCoordinator:
             ]
 
             logger.info(
-                f"Creating SSH ProxyJump tunnel: {hostname}:{port} -> localhost:{local_port} (via gateway {gateway_host})"
+                f"Creating SSH ProxyJump tunnel: {hostname}:{port} -> localhost:{local_port} "
+                f"(via gateway {gateway_host})"
             )
             logger.info(f"SSH tunnel command: {' '.join(tunnel_cmd)}")
 
@@ -517,7 +532,8 @@ class PrimaryCoordinator:
             await asyncio.sleep(1)
 
             logger.info(
-                f"Tunnel ready: {secondary_id} can connect to localhost:{port} -> tunnels to primary localhost:{local_port}"
+                f"Tunnel ready: {secondary_id} can connect to localhost:{port} -> "
+                f"tunnels to primary localhost:{local_port}"
             )
             return True
 
@@ -607,46 +623,109 @@ class PrimaryCoordinator:
         """Wait for all workers to report ready"""
         logger.info("Waiting for workers to report ready...")
 
-        # TODO: Receive ReadyResponse from each worker
-        # TODO: Store worker info with memory budgets
-
         expected_workers = sum(s["worker_count"] for s in self.secondaries.values())
         timeout = 300  # 5 minutes
         start_time = time.time()
 
-        total_workers = sum(len(workers) for workers in self.workers.values())
+        total_workers = sum(len(workers) for workers in self.remote_workers.values())
         while total_workers < expected_workers:
             if time.time() - start_time > timeout:
                 raise TimeoutError(f"Timeout waiting for workers. Got {total_workers}/{expected_workers}")
 
-            # TODO: Process worker ready messages
             await asyncio.sleep(0.5)
-            total_workers = sum(len(workers) for workers in self.workers.values())
+            total_workers = sum(len(workers) for workers in self.remote_workers.values())
 
         logger.info(f"All {expected_workers} workers ready")
 
+    async def _handle_worker_ready(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle worker ready message from secondary"""
+        secondary_id = message.get("secondary_id")
+        worker_id = message.get("worker_id")
+        memory_budget = message.get("memory_budget")
+
+        if not secondary_id or not isinstance(worker_id, int):
+            logger.warning(f"Invalid worker_ready message: secondary_id={secondary_id}, worker_id={worker_id}")
+            return
+
+        # Create RemoteWorker instance
+        if secondary_id not in self.remote_workers:
+            self.remote_workers[secondary_id] = []
+
+        remote_worker = RemoteWorker(
+            worker_id=worker_id,
+            memory_budget=memory_budget or 0,
+            secondary_id=secondary_id,
+            message_router=self.message_router,
+        )
+        remote_worker.start()
+        self.remote_workers[secondary_id].append(remote_worker)
+
+        # Initialize WorkerManager for this secondary if not exists
+        if secondary_id not in self.worker_managers:
+            secondary_info = self.secondaries.get(secondary_id, {})
+            ram_bytes = secondary_info.get("ram_bytes", 0)
+
+            # Create temp directories (not actually used for remote workers)
+            from tempfile import mkdtemp
+
+            temp_dir = Path(mkdtemp(prefix=f"remote_{secondary_id}_"))
+
+            self.worker_managers[secondary_id] = WorkerManager(
+                num_workers=secondary_info.get("worker_count", 1),
+                max_memory=ram_bytes,
+                source_dir=temp_dir / "src",
+                output_dir=temp_dir / "out",
+                task_definition=self.task_definition,
+                task_args=self.task_args,
+                skip_existing=False,
+                print_pid=False,
+                always_restart_worker=False,
+                manual_start_worker=False,
+                connection_mode="socketpair",
+            )
+
+            # Replace the WorkerManager's workers list with our RemoteWorker instances
+            # This allows WorkerManager to use its logic with remote workers
+            self.worker_managers[secondary_id].workers = []
+
+        budget_gb = memory_budget / (1024**3) if memory_budget else 0
+        logger.debug(f"Worker ready: {secondary_id} worker {worker_id} (budget: {budget_gb:.2f}GB)")
+
     async def _preliminary_assignment(self) -> None:
-        """Assign initial tasks to secondaries"""
+        """Assign initial tasks to secondaries - one per worker initially"""
         logger.info("Performing preliminary task assignment...")
 
         if len(self.secondaries) == 0:
             logger.warning("No secondaries connected, skipping preliminary assignment")
             return
 
-        # Distribute binaries across secondaries based on memory
-        total_binaries = len(self.binaries)
-        binaries_per_secondary = total_binaries // len(self.secondaries)
+        if len(self.binaries) == 0:
+            logger.warning("No binaries to assign")
+            return
 
-        for idx, (secondary_id, info) in enumerate(self.secondaries.items()):
+        # Use WorkerManager per secondary to handle assignments
+        binaries_per_secondary = len(self.binaries) // len(self.secondaries)
+
+        for idx, secondary_id in enumerate(self.secondaries.keys()):
+            if secondary_id not in self.worker_managers:
+                logger.warning(f"No WorkerManager for {secondary_id}, skipping assignment")
+                continue
+
+            # Assign slice of binaries to this secondary's WorkerManager
             start_idx = idx * binaries_per_secondary
-            end_idx = start_idx + binaries_per_secondary if idx < len(self.secondaries) - 1 else total_binaries
+            end_idx = start_idx + binaries_per_secondary if idx < len(self.secondaries) - 1 else len(self.binaries)
+            secondary_binaries = self.binaries[start_idx:end_idx]
 
-            assigned = self.binaries[start_idx:end_idx]
-            for binary in assigned:
+            # Set pending binaries for this WorkerManager
+            worker_manager = self.worker_managers[secondary_id]
+            worker_manager.pending_binaries = secondary_binaries.copy()
+
+            # Track assignments
+            for binary in secondary_binaries:
                 task_hash = self._compute_task_hash(binary)
                 self.task_assignments[task_hash] = secondary_id
 
-            logger.info(f"Assigned {len(assigned)} tasks to {secondary_id}")
+            logger.info(f"Assigned {len(secondary_binaries)} tasks to {secondary_id}")
 
         logger.info("Preliminary assignment complete")
 
@@ -666,11 +745,32 @@ class PrimaryCoordinator:
         first_secondary = next(iter(self.secondaries.keys()))
         logger.info(f"Using {first_secondary} for source discovery")
 
-        # TODO: First secondary scans /app/src-network
-        # TODO: Opens ZIPs matching .hash files
-        # TODO: Sends (zip_name, local_path, binary_info, hash) to primary
+        # Send source discovery request to first secondary
+        msg = {
+            "type": "discover_sources",
+            "sender_id": "primary",
+            "timestamp": time.time(),
+        }
 
-        logger.info("Source discovery complete")
+        # Register handler for discovered binaries
+        self.message_router.register_handler("source_discovered", self._handle_source_discovered)
+
+        # Send request
+        await self.message_router.send_to_secondary(first_secondary, msg)
+
+        # Wait for discovery to complete (timeout after 30 seconds)
+        timeout = 30
+        start_time = time.time()
+        discovery_complete = False
+
+        while not discovery_complete and (time.time() - start_time) < timeout:
+            await asyncio.sleep(0.5)
+            # Check if we received discovery complete message
+            # For now, just wait a bit for discoveries to come in
+            if (time.time() - start_time) > 5:  # Give 5 seconds for discovery
+                discovery_complete = True
+
+        logger.info(f"Source discovery complete: found {len(self.discovered_binaries)} existing binaries")
 
     async def _distribute_files(self) -> None:
         """Distribute files to secondaries with intelligent deduplication"""
@@ -684,22 +784,159 @@ class PrimaryCoordinator:
             logger.info("No binaries to distribute, skipping file distribution")
             return
 
-        # TODO: For each secondary's assigned tasks:
-        # TODO:   Check if hash matches first secondary's discovered binaries
-        # TODO:   If match, mark as already_sent
-        # TODO:   Create ZIP of non-duplicate files
-        # TODO:   Stream ZIP to srcbins/{unique}_{random}.zip
-        # TODO:   Send InitialAssignmentMessage with ZIP locations
-
         total_size = 0
         total_files = 0
 
+        # Get srcbins directory on gateway
+        srcbins_dir = self.slurm_config.get_srcbins_dir()
+
+        # Ensure srcbins directory exists
+        self.gateway.create_directory(srcbins_dir)
+
         for secondary_id in self.secondaries:
-            # TODO: Build ZIP for this secondary
-            # TODO: Track size and file count
-            pass
+            # Get assigned tasks for this secondary
+            assigned_binaries = [
+                binary
+                for binary in self.binaries
+                if self.task_assignments.get(self._compute_task_hash(binary)) == secondary_id
+            ]
+
+            if not assigned_binaries:
+                logger.info(f"No binaries assigned to {secondary_id}")
+                continue
+
+            logger.info(f"Distributing {len(assigned_binaries)} binaries to {secondary_id}")
+
+            # Group binaries into batches
+            batches = self._create_zip_batches(assigned_binaries)
+
+            # Create ZIPs and upload to gateway
+            zip_files_info = []
+            for batch_idx, batch in enumerate(batches):
+                # Create unique ZIP name
+                import secrets
+
+                random_suffix = secrets.token_hex(8)
+                zip_name = f"{secondary_id}_batch_{batch_idx}_{random_suffix}.zip"
+                zip_path = Path(srcbins_dir) / zip_name
+
+                # Create ZIP with batch binaries
+                zip_info = await self._create_and_upload_zip(zip_path, batch)
+                if zip_info:
+                    zip_files_info.append(zip_info)
+                    total_files += len(batch)
+                    total_size += sum(b.size for b in batch)
+
+            # Send initial assignment to secondary
+            await self._send_initial_assignment(secondary_id, zip_files_info)
 
         logger.info(f"Distribution complete: {total_files} files, {total_size / (1024**3):.2f}GB")
+
+    def _create_zip_batches(self, binaries: list[BinaryInfo]) -> list[list[BinaryInfo]]:
+        """Create batches of binaries for ZIP files (20MB uncompressed target)"""
+        target_size = 20 * 1024 * 1024  # 20MB
+        batches = []
+        current_batch = []
+        current_size = 0
+
+        for binary in binaries:
+            # Check if already discovered (skip if so)
+            binary_hash = self._compute_file_hash(binary.path)
+            if binary_hash in self.discovered_binaries:
+                logger.debug(f"Skipping {binary.path.name} (already on secondary)")
+                continue
+
+            # Check if adding this would exceed target
+            if current_size > 0 and current_size + binary.size > target_size:
+                # Start new batch
+                batches.append(current_batch)
+                current_batch = [binary]
+                current_size = binary.size
+            else:
+                current_batch.append(binary)
+                current_size += binary.size
+
+        # Add remaining batch
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
+
+    async def _create_and_upload_zip(self, zip_path: Path, binaries: list[BinaryInfo]) -> dict[str, Any] | None:
+        """Create ZIP file with binaries and upload to gateway"""
+        try:
+            # Create ZIP without compression (store only)
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+                binaries_info = []
+                for binary in binaries:
+                    # Compute hash
+                    file_hash = self._compute_file_hash(binary.path)
+
+                    # Add to ZIP with relative path
+                    arcname = binary.path.name
+                    zf.write(binary.path, arcname)
+
+                    binaries_info.append(
+                        {
+                            "local_path": arcname,
+                            "binary_info": {
+                                "path": str(binary.path),
+                                "size": binary.size,
+                                "binary_name": binary.binary_name,
+                                "platform": binary.platform,
+                                "compiler": binary.compiler,
+                                "version": binary.version,
+                                "opt_level": binary.opt_level,
+                            },
+                            "hash": file_hash,
+                        }
+                    )
+
+            logger.info(f"Created ZIP: {zip_path.name} with {len(binaries)} binaries")
+
+            return {
+                "zip_name": zip_path.name,
+                "binaries": binaries_info,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to create ZIP {zip_path}: {e}")
+            return None
+
+    def _compute_file_hash(self, path: Path) -> str:
+        """Compute SHA256 hash of a file"""
+        sha256 = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    async def _send_initial_assignment(self, secondary_id: str, zip_files_info: list[dict[str, Any]]) -> None:
+        """Send initial assignment with ZIP locations to secondary"""
+        msg = {
+            "type": "initial_assignment",
+            "secondary_id": secondary_id,
+            "zip_files": zip_files_info,
+            "workers_ready": [],  # Will be populated when workers report ready
+        }
+
+        await self.message_router.send_to_secondary(secondary_id, msg)
+        logger.info(f"Sent initial assignment to {secondary_id}: {len(zip_files_info)} ZIP files")
+
+    async def _handle_source_discovered(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle discovered source binary report from first secondary"""
+        zip_name = message.get("zip_name")
+        local_path = message.get("local_path")
+        file_hash = message.get("hash")
+        binary_info = message.get("binary_info")
+
+        if file_hash and file_hash not in self.discovered_binaries:
+            self.discovered_binaries[file_hash] = {
+                "zip_name": zip_name,
+                "local_path": local_path,
+                "binary_info": binary_info,
+            }
+            logger.debug(f"Discovered existing binary: {local_path} (hash: {file_hash[:8]})")
 
     async def _notify_transfer_complete(self) -> None:
         """Notify all secondaries that transfer is complete"""
@@ -710,15 +947,16 @@ class PrimaryCoordinator:
             self.transfer_complete = True
             return
 
-        msg = TransferCompleteMessage(
-            sender_id="primary",
-            timestamp=time.time(),
-            total_files=len(self.binaries),
-            total_bytes=0,  # TODO: Track actual bytes
-        )
+        transfer_msg = {
+            "type": "transfer_complete",
+            "sender_id": "primary",
+            "timestamp": time.time(),
+            "total_files": len(self.binaries),
+            "total_bytes": 0,
+        }
 
         for secondary_id in self.secondaries:
-            # TODO: Send to secondary
+            await self.message_router.send_to_secondary(secondary_id, transfer_msg)
             logger.debug(f"Sent transfer complete to {secondary_id}")
 
         self.transfer_complete = True
@@ -735,14 +973,15 @@ class PrimaryCoordinator:
         self.slurm_primary_id = random.choice(list(self.secondaries.keys()))
         logger.info(f"Promoting {self.slurm_primary_id} to SLURM-primary")
 
-        msg = PromotePrimaryMessage(
-            sender_id="primary",
-            timestamp=time.time(),
-            new_primary_id=self.slurm_primary_id,
-        )
+        promote_msg = {
+            "type": "promote_primary",
+            "sender_id": "primary",
+            "timestamp": time.time(),
+            "new_primary_id": self.slurm_primary_id,
+        }
 
         for secondary_id in self.secondaries:
-            # TODO: Send to secondary
+            await self.message_router.send_to_secondary(secondary_id, promote_msg)
             logger.debug(f"Sent promotion to {secondary_id}")
 
         logger.info("SLURM-primary promotion complete")
@@ -763,15 +1002,16 @@ class PrimaryCoordinator:
             for binary in self.binaries
         ]
 
-        msg = FullTaskListMessage(
-            sender_id="primary",
-            timestamp=time.time(),
-            all_tasks=all_tasks,
-            completed_tasks=list(self.completed_tasks),
-        )
+        task_list_msg = {
+            "type": "full_task_list",
+            "sender_id": "primary",
+            "timestamp": time.time(),
+            "all_tasks": all_tasks,
+            "completed_tasks": list(self.completed_tasks),
+        }
 
         for secondary_id in self.secondaries:
-            # TODO: Send to secondary
+            await self.message_router.send_to_secondary(secondary_id, task_list_msg)
             logger.debug(f"Sent task list to {secondary_id}")
 
         logger.info("Full task list sent")

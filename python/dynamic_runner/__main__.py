@@ -232,6 +232,9 @@ def main():
             out_network=out_network,
             log_network=log_network,
             socket_dir=socket_dir,
+            task_definition=task,
+            task_args=args,
+            skip_existing=args.skip_existing,
         )
 
         secondary.run()
@@ -419,6 +422,8 @@ def main():
                     slurm_config,
                     job_manager,
                     gateway,
+                    task_definition=task,
+                    task_args=args,
                     use_reverse_connection=use_ssh_jump,
                     run_id=run_id,
                 )

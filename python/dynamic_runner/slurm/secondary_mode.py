@@ -1,22 +1,19 @@
 import asyncio
+import hashlib
 import logging
-import secrets
 import socket
+import subprocess
+import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ..binary_info import BinaryInfo
+from ..models import WorkerState
+from ..task import TaskDefinition
+from ..worker_manager import WorkerManager
 from .message_router import MessageRouter
-from .protocol import (
-    CertExchangeMessage,
-    KeepaliveMessage,
-    SecondaryWelcomeMessage,
-    TaskCompleteMessage,
-    TaskFailedMessage,
-    TaskRequestMessage,
-)
 from .quic_transport import QuicPeerInfo, QuicTransport
 
 logger = logging.getLogger(__name__)
@@ -29,11 +26,21 @@ class PrimaryLogHandler(logging.Handler):
         super().__init__()
         self.secondary_mode = secondary_mode
         self.setLevel(logging.WARNING)
+        self._in_emit = False  # Prevent recursive logging
 
     def emit(self, record: logging.LogRecord) -> None:
         """Send log record to primary if it's a warning or error"""
+        # Prevent recursive calls if sending to primary fails and generates another log
+        if self._in_emit:
+            return
+
         try:
+            self._in_emit = True
             if record.levelno >= logging.WARNING and self.secondary_mode.message_router.primary_connection:
+                # Don't send logs about message router failures to avoid infinite recursion
+                if record.module == "message_router" or "send_to_primary" in record.message:
+                    return
+
                 msg = {
                     "type": "secondary_log",
                     "secondary_id": self.secondary_mode.secondary_id,
@@ -46,6 +53,8 @@ class PrimaryLogHandler(logging.Handler):
                 asyncio.create_task(self.secondary_mode.message_router.send_to_primary(msg))
         except Exception:
             pass  # Don't let logging errors crash the application
+        finally:
+            self._in_emit = False
 
 
 class SecondaryMode:
@@ -64,6 +73,9 @@ class SecondaryMode:
         out_network: Path,
         log_network: Path,
         socket_dir: Path,
+        task_definition: TaskDefinition,
+        task_args: Any,
+        skip_existing: bool = False,
     ):
         self.primary_url = primary_url
         self.secondary_id = secondary_id
@@ -77,12 +89,26 @@ class SecondaryMode:
         self.out_network = out_network
         self.log_network = log_network
         self.socket_dir = socket_dir
+        self.task_definition = task_definition
+        self.task_args = task_args
+        self.skip_existing = skip_existing
+        self.task_definition = task_definition
+        self.task_args = task_args
+        self.skip_existing = skip_existing
+
+        # Create directories
+        self.src_tmp.mkdir(parents=True, exist_ok=True)
+        self.out_tmp.mkdir(parents=True, exist_ok=True)
+        self.log_tmp.mkdir(parents=True, exist_ok=True)
 
         self.peers: dict[str, Any] = {}
         self.primary_connection: Any = None
         self.peer_connections: dict[str, Any] = {}
 
-        self.workers: list[Any] = []
+        # WorkerManager handles all worker lifecycle and task assignment
+        self.worker_manager: WorkerManager | None = None
+        self.extracted_binaries: dict[str, Path] = {}  # hash -> extracted path
+
         self.completed_tasks: set[str] = set()
         self.failed_tasks: set[str] = set()
         self.all_tasks: list[Any] = []
@@ -93,6 +119,7 @@ class SecondaryMode:
         self.running = True
         self.setup_complete = False  # Track if initialization is complete
         self.peer_list_received = asyncio.Event()  # Event to signal peer list processing is complete
+        self.connection_closing = False  # Prevent sending messages during shutdown
 
         # Message router for communication
         self.message_router = MessageRouter(secondary_id, "secondary")
@@ -133,14 +160,17 @@ class SecondaryMode:
             # Phase 3: Certificate exchange
             await self._setup_certificates()
 
-            # Phase 4: Register peer_list handler
+            # Phase 4: Register handlers
             self.message_router.register_handler("peer_list", self._handle_peer_list)
+            self.message_router.register_handler("initial_assignment", self._handle_initial_assignment)
+            self.message_router.register_handler("task_assignment", self._handle_task_assignment)
+            self.message_router.register_handler("discover_sources", self._handle_discover_sources)
 
             # Phase 5: Connect to peers (wait for peer_list from primary)
             await self._connect_to_peers()
 
             # Phase 5: Start workers
-            self._start_workers()
+            await self._start_workers()
 
             # Mark setup as complete
             self.setup_complete = True
@@ -196,7 +226,8 @@ class SecondaryMode:
                 remaining = timeout - elapsed
                 if remaining > 0:
                     logger.info(
-                        f"Connection failed (attempt {attempt}): {error_type}: {error_msg}. Retrying in {retry_delay}s..."
+                        f"Connection failed (attempt {attempt}): {error_type}: {error_msg}. "
+                        f"Retrying in {retry_delay}s..."
                     )
                     await asyncio.sleep(retry_delay)
                 else:
@@ -229,6 +260,9 @@ class SecondaryMode:
         """Send error message with traceback to primary"""
         import traceback
 
+        if self.connection_closing:
+            return
+
         try:
             error_msg = {
                 "type": "secondary_error",
@@ -247,23 +281,15 @@ class SecondaryMode:
         try:
             await self.message_router.receive_loop(reader, "primary")
         finally:
+            # Mark that connection is closing to prevent sending more messages
+            self.connection_closing = True
+
             # Connection closed
             if not self.setup_complete:
                 logger.error("Primary connection closed before setup was complete!")
                 logger.error("Aborting secondary - setup incomplete")
                 self.running = False
-                # Send error to primary if possible (connection might still work briefly)
-                try:
-                    error_msg = {
-                        "type": "secondary_error",
-                        "secondary_id": self.secondary_id,
-                        "error_type": "PrimaryDisconnectedError",
-                        "error_message": "Primary connection closed before setup was complete",
-                        "traceback": "Connection closed during initialization phase",
-                    }
-                    await self.message_router.send_to_primary(error_msg)
-                except Exception:
-                    pass
+                # Don't try to send error to primary - connection is already closed
                 # Exit the process
                 import sys
 
@@ -343,22 +369,76 @@ class SecondaryMode:
 
         logger.info("Peer list received and connections established, continuing...")
 
-    def _start_workers(self) -> None:
-        """Start worker processes"""
-        logger.info(f"Starting {self.num_workers} workers")
-        # TODO: Create worker processes
-        # For now, just create placeholder worker structures
-        for i in range(self.num_workers):
-            self.workers.append(
-                {
-                    "id": i,
-                    "status": "ready",
-                    "active": False,
-                }
-            )
-        logger.info(f"Created {len(self.workers)} worker placeholders")
-        # TODO: Send ready messages to primary
-        pass
+    async def _start_workers(self) -> None:
+        """Start worker processes using WorkerManager"""
+        logger.info(f"Starting {self.num_workers} workers via WorkerManager")
+
+        # Create WorkerManager to handle all worker lifecycle
+        self.worker_manager = WorkerManager(
+            num_workers=self.num_workers,
+            max_memory=self.ram_bytes,
+            source_dir=self.src_tmp,
+            output_dir=self.out_tmp,
+            task_definition=self.task_definition,
+            task_args=self.task_args,
+            skip_existing=self.skip_existing,
+            print_pid=False,
+            always_restart_worker=False,
+            manual_start_worker=False,
+            connection_mode="named",
+            socket_dir=self.socket_dir,
+        )
+
+        # Initialize workers (this starts the processes and waits for ready)
+        self.worker_manager._initialize_workers()
+
+
+async def _start_workers(self) -> None:
+    """Start workers using WorkerManager with LocalWorker"""
+    logger.info(f"Starting WorkerManager with {self.num_workers} workers")
+
+    # Create WorkerManager that will handle all worker lifecycle
+    self.worker_manager = WorkerManager(
+        num_workers=self.num_workers,
+        max_memory=self.ram_bytes,
+        source_dir=self.src_tmp,
+        output_dir=self.out_tmp,
+        task_definition=self.task_definition,
+        task_args=self.task_args,
+        skip_existing=self.skip_existing,
+        print_pid=False,
+        always_restart_worker=False,
+        manual_start_worker=False,
+        connection_mode="named",
+        socket_dir=self.socket_dir,
+    )
+
+    # Initialize workers (this creates LocalWorker instances)
+    self.worker_manager._initialize_workers()
+
+    # Send worker ready messages to primary for each worker
+    for worker in self.worker_manager.workers:
+        if isinstance(worker, LocalWorker):
+            await self._send_worker_ready(worker.worker_id, worker.memory_budget)
+
+    logger.info(f"All {len(self.worker_manager.workers)} workers initialized")
+
+    async def _send_worker_ready(self, worker_id: int, memory_budget: int) -> None:
+        """Send worker ready message to primary"""
+        if self.connection_closing or not self.message_router.primary_connection:
+            logger.warning(f"Cannot send worker_ready for worker {worker_id}: not connected to primary")
+            return
+
+        msg = {
+            "type": "worker_ready",
+            "secondary_id": self.secondary_id,
+            "worker_id": worker_id,
+            "memory_budget": memory_budget,
+        }
+        try:
+            await self.message_router.send_to_primary(msg)
+        except Exception as e:
+            logger.warning(f"Failed to send worker_ready for worker {worker_id}: {e}")
 
     async def _main_loop(self) -> None:
         """Main processing loop with keepalive"""
@@ -416,11 +496,13 @@ class SecondaryMode:
         pass
 
     def _process_worker_updates(self) -> None:
-        """Process worker completion and status updates"""
-        # TODO: Check worker status
-        # TODO: Move completed files from tmp to network storage
-        # TODO: Rotate logs if needed
-        # TODO: Request new tasks from SLURM-primary
+        """Process worker completion and status updates using WorkerManager"""
+        if not self.worker_manager:
+            return
+
+        # WorkerManager handles worker polling internally
+        # We just need to check for completed tasks and request new ones from primary
+        # Note: In SLURM mode, we don't auto-reassign - we ask primary for tasks
         pass
 
     def _process_messages(self) -> None:
@@ -443,15 +525,297 @@ class SecondaryMode:
         # TODO: Wait for result
         return 0, "", ""
 
-    def _move_completed_files(self, worker_id: int) -> None:
+    def _move_completed_files(self, worker_id: int, task_hash: str) -> None:
         """Move completed files from tmp to network storage"""
-        # TODO: Move files from out_tmp to out_network
-        pass
+        task_info = self.worker_tasks.get(worker_id)
+        if not task_info:
+            logger.warning(f"No task info for worker {worker_id}")
+            return
 
-    def _rotate_worker_log(self, worker_id: int, increment: int) -> None:
-        """Rotate worker log file"""
-        old_log = self.log_tmp / f"worker_{self.secondary_id}_{worker_id}.{increment}.log"
+        binary_info = task_info.get("binary_info")
+        if not binary_info:
+            return
+
+        # Move output files from out_tmp to out_network
+        # Output files are named based on the binary
+        output_pattern = f"{binary_info.path.stem}*"
+        for output_file in self.out_tmp.glob(output_pattern):
+            target = self.out_network / output_file.name
+            try:
+                output_file.rename(target)
+                logger.debug(f"Moved output: {output_file.name} -> {target}")
+            except Exception as e:
+                logger.error(f"Failed to move output file {output_file}: {e}")
+
+    def _rotate_worker_log(self, worker_id: int, force: bool = False) -> None:
+        """Rotate worker log file if needed (at least 1 minute elapsed or forced)"""
+        current_time = time.time()
+        last_move = self.worker_last_log_move.get(worker_id, 0)
+
+        if not force and (current_time - last_move) < 60:
+            # Less than 1 minute elapsed, don't rotate
+            return
+
+        current_increment = self.worker_log_increments.get(worker_id, 0)
+        old_log = self._get_worker_log_path(worker_id, current_increment)
+
         if old_log.exists():
-            new_log = self.log_network / old_log.name
-            old_log.rename(new_log)
-            logger.debug(f"Rotated log: {old_log.name}")
+            # Move to network storage
+            target = self.log_network / old_log.name
+            try:
+                old_log.rename(target)
+                logger.debug(f"Rotated log: {old_log.name} -> {target}")
+            except Exception as e:
+                logger.error(f"Failed to rotate log {old_log}: {e}")
+                return
+
+        # Increment and update worker with new log path
+        new_increment = current_increment + 1
+        self.worker_log_increments[worker_id] = new_increment
+        self.worker_last_log_move[worker_id] = current_time
+
+        new_log = self._get_worker_log_path(worker_id, new_increment)
+
+        # Send command to worker to switch log file
+        if worker_id < len(self.workers):
+            try:
+                # TODO: Implement log switching via comm interface
+                # For now, just log the intention
+                logger.debug(f"Would switch worker {worker_id} to new log file: {new_log}")
+            except Exception as e:
+                logger.warning(f"Failed to send log switch command to worker {worker_id}: {e}")
+
+    def _extract_binary_from_zip(self, zip_name: str, local_path: str, file_hash: str) -> Path | None:
+        """Extract a binary from a ZIP file in src_network to src_tmp"""
+        # Check if already extracted
+        if file_hash in self.extracted_binaries:
+            return self.extracted_binaries[file_hash]
+
+        zip_path = self.src_network / zip_name
+        if not zip_path.exists():
+            logger.error(f"ZIP file not found: {zip_path}")
+            return None
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # Extract specific file
+                extracted_path = self.src_tmp / Path(local_path).name
+
+                # Read from ZIP and write to target
+                with zf.open(local_path) as source:
+                    with open(extracted_path, "wb") as target:
+                        target.write(source.read())
+
+                # Verify hash
+                computed_hash = self._compute_file_hash(extracted_path)
+                if computed_hash != file_hash:
+                    logger.error(f"Hash mismatch for {local_path}: expected {file_hash}, got {computed_hash}")
+                    extracted_path.unlink()
+                    return None
+
+                # Cache the extraction
+                self.extracted_binaries[file_hash] = extracted_path
+                logger.debug(f"Extracted {local_path} from {zip_name} to {extracted_path}")
+                return extracted_path
+
+        except Exception as e:
+            logger.error(f"Failed to extract {local_path} from {zip_name}: {e}")
+            return None
+
+    def _compute_file_hash(self, path: Path) -> str:
+        """Compute SHA256 hash of a file"""
+        sha256 = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    async def _handle_initial_assignment(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle initial assignment message from primary"""
+        logger.info("Received initial assignment from primary")
+
+        zip_files = message.get("zip_files", [])
+
+        # Extract all binaries from ZIPs
+        for zip_info in zip_files:
+            zip_name = zip_info.get("zip_name")
+            binaries = zip_info.get("binaries", [])
+
+            for binary_entry in binaries:
+                local_path = binary_entry.get("local_path")
+                file_hash = binary_entry.get("hash")
+
+                # Extract the binary
+                extracted_path = self._extract_binary_from_zip(zip_name, local_path, file_hash)
+                if not extracted_path:
+                    logger.error(f"Failed to extract {local_path} from {zip_name}")
+                    continue
+
+                # Store task info (will assign to workers later)
+                # For now, just log that we have it ready
+                logger.debug(f"Ready to assign: {extracted_path.name}")
+
+        logger.info(f"Extracted {len(self.extracted_binaries)} binaries from {len(zip_files)} ZIP files")
+
+    async def _handle_task_assignment(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle task assignment message"""
+        worker_id = message.get("worker_id")
+        zip_file = message.get("zip_file")
+        local_path = message.get("local_path")
+        file_hash = message.get("file_hash")
+        binary_info_dict = message.get("binary_info")
+
+        if not isinstance(worker_id, int) or worker_id >= len(self.workers):
+            logger.error(f"Invalid worker_id {worker_id}")
+            return
+
+        # Extract binary if from ZIP
+        if zip_file and local_path and file_hash:
+            extracted_path = self._extract_binary_from_zip(zip_file, local_path, file_hash)
+            if not extracted_path:
+                logger.error(f"Failed to extract binary for worker {worker_id}")
+                return
+        elif file_hash:
+            # Already extracted
+            extracted_path = self.extracted_binaries.get(file_hash)
+            if not extracted_path:
+                logger.error(f"Binary not found for hash {file_hash}")
+                return
+        else:
+            logger.error(f"Missing file information for worker {worker_id}")
+            return
+
+        # Assign to worker
+        worker = self.workers[worker_id]
+
+        # Store task info
+        task_hash = file_hash  # Use file hash as task hash
+        self.worker_tasks[worker_id] = {
+            "task_hash": task_hash,
+            "binary_path": extracted_path,
+            "binary_info": binary_info_dict,
+        }
+
+        # Send assignment to worker
+        try:
+            # Use the comm interface to send the binary path
+            command = ProcessBinaryCommand(relative_path=str(extracted_path.relative_to(self.src_tmp)))
+            success, error = worker.comm.send_command(command)
+            if not success:
+                logger.error(f"Failed to assign task to worker {worker_id}: {error}")
+                del self.worker_tasks[worker_id]
+                return
+
+            worker.ready = False
+            worker.current_binary = None  # Will be set when worker processes it
+            logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
+        except Exception as e:
+            logger.error(f"Failed to assign task to worker {worker_id}: {e}")
+            del self.worker_tasks[worker_id]
+
+    async def _notify_task_complete(self, worker_id: int, task_hash: str) -> None:
+        """Notify all peers that a task completed"""
+        msg = {
+            "type": "task_complete",
+            "secondary_id": self.secondary_id,
+            "worker_id": worker_id,
+            "task_hash": task_hash,
+            "warnings": 0,
+            "filtered": 0,
+        }
+
+        # Broadcast to all peers
+        try:
+            if len(self.message_router.secondary_connections) > 0:
+                await self.message_router.broadcast_to_secondaries(msg)
+        except Exception as e:
+            logger.warning(f"Failed to notify task complete: {e}")
+
+        logger.info(f"Task completed: worker {worker_id}, hash {task_hash}")
+
+    async def _request_new_task(self, worker_id: int) -> None:
+        """Request a new task from primary or SLURM-primary"""
+        if self.connection_closing or not self.message_router.primary_connection:
+            logger.debug(f"Cannot request task for worker {worker_id}: not connected to primary")
+            return
+
+        worker = self.workers[worker_id]
+
+        msg = {
+            "type": "task_request",
+            "secondary_id": self.secondary_id,
+            "worker_id": worker_id,
+            "available_memory": worker.reserved_budget,
+        }
+
+        # Send to primary (or SLURM-primary if promoted)
+        try:
+            await self.message_router.send_to_primary(msg)
+            logger.debug(f"Requested new task for worker {worker_id}")
+        except Exception as e:
+            logger.warning(f"Failed to request new task for worker {worker_id}: {e}")
+
+    async def _handle_discover_sources(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle source discovery request from primary"""
+        logger.info("Starting source discovery in /app/src-network")
+
+        discovered_count = 0
+
+        try:
+            # Scan src_network directory for ZIP files
+            for zip_path in self.src_network.glob("*.zip"):
+                # Check for corresponding .hash file
+                hash_file = zip_path.with_suffix(".zip.hash")
+                if not hash_file.exists():
+                    logger.debug(f"Skipping {zip_path.name} (no .hash file)")
+                    continue
+
+                # Read expected hash
+                try:
+                    with open(hash_file, "r") as f:
+                        expected_hash = f.read().strip()
+                except Exception as e:
+                    logger.warning(f"Failed to read hash file {hash_file}: {e}")
+                    continue
+
+                # Verify ZIP hash
+                actual_hash = self._compute_file_hash(zip_path)
+                if actual_hash != expected_hash:
+                    logger.warning(f"Hash mismatch for {zip_path.name}: expected {expected_hash}, got {actual_hash}")
+                    continue
+
+                # Open ZIP and report contents
+                try:
+                    with zipfile.ZipFile(zip_path, "r") as zf:
+                        for info in zf.infolist():
+                            if info.is_dir():
+                                continue
+
+                            # Extract file content to compute hash
+                            with zf.open(info.filename) as f:
+                                file_data = f.read()
+                                file_hash = hashlib.sha256(file_data).hexdigest()
+
+                            # Report to primary
+                            msg = {
+                                "type": "source_discovered",
+                                "zip_name": zip_path.name,
+                                "local_path": info.filename,
+                                "hash": file_hash,
+                                "binary_info": {
+                                    "size": info.file_size,
+                                    "path": info.filename,
+                                },
+                            }
+
+                            await self.message_router.send_to_primary(msg)
+                            discovered_count += 1
+                            logger.debug(f"Discovered: {info.filename} in {zip_path.name}")
+
+                except Exception as e:
+                    logger.error(f"Failed to process ZIP {zip_path.name}: {e}")
+
+            logger.info(f"Source discovery complete: reported {discovered_count} binaries")
+
+        except Exception as e:
+            logger.error(f"Source discovery failed: {e}")

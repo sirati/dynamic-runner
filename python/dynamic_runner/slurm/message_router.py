@@ -93,12 +93,24 @@ class MessageRouter:
         if not self.primary_connection:
             raise RuntimeError("Not connected to primary")
 
+        # Check if connection is closing
+        if hasattr(self.primary_connection, "is_closing") and self.primary_connection.is_closing():
+            # Connection is closing, don't try to send
+            return
+
         # Add sender info
         message["sender_id"] = self.node_id
         message["timestamp"] = time.time()
 
-        await self._send_message(self.primary_connection, message)
-        logger.debug(f"Sent to primary: {message.get('type')}")
+        try:
+            await self._send_message(self.primary_connection, message)
+            logger.debug(f"Sent to primary: {message.get('type')}")
+        except Exception as e:
+            # Don't log errors here - it can cause infinite recursion if PrimaryLogHandler is active
+            # Just silently fail if connection is broken
+            if message.get("type") not in ["secondary_log", "secondary_error"]:
+                # Only log non-logging messages to avoid recursion
+                logger.debug(f"Failed to send {message.get('type')} to primary: {e}")
 
     async def send_to_secondary(self, secondary_id: str, message: dict[str, Any]) -> None:
         """Send message to specific secondary
@@ -215,6 +227,10 @@ class MessageRouter:
             connection: Connection object (writer or socket)
             message: Message dictionary
         """
+        # Check if connection is closing
+        if hasattr(connection, "is_closing") and connection.is_closing():
+            raise ConnectionError("Connection is closing")
+
         # Serialize message
         message_str = json.dumps(message)
         message_bytes = message_str.encode("utf-8")
