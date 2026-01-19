@@ -36,12 +36,38 @@ class Gateway(Protocol):
         """Transfer file from local to gateway"""
         ...
 
-    def create_directory(self, remote_path: Path) -> None:
+    def upload_file(self, local_path: str | Path, remote_path: str | Path) -> None:
+        """Upload file from local to gateway"""
+        ...
+
+    def download_file(self, remote_path: str | Path, local_path: str | Path) -> None:
+        """Download file from gateway to local"""
+        ...
+
+    def create_directory(self, remote_path: Path | str) -> None:
         """Create directory on gateway"""
         ...
 
     def file_exists(self, remote_path: Path) -> bool:
         """Check if file exists on gateway"""
+        ...
+
+    def sync_project(self, local_project_root: Path, remote_project_root: Path) -> None:
+        """Synchronize project files to gateway (excluding .git, __pycache__, etc.)
+        TODO REMOVE THIS, WE NEVER WANT TO DO THIS AS WE SENT A DOCKER IMAGE INSTEAD!!!
+        """
+        ...
+
+    def setup_port_forwarding(self, local_port: int, remote_port: int) -> None:
+        """Setup SSH remote port forwarding: gateway:remote_port -> localhost:local_port
+
+        This allows compute nodes to connect to the gateway port, which forwards to
+        the primary coordinator running locally.
+
+        Args:
+            local_port: Port on local machine where primary listens
+            remote_port: Port on gateway that secondaries will connect to
+        """
         ...
 
 

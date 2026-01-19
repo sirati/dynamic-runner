@@ -1,6 +1,9 @@
 import argparse
 import logging
+import os
 import secrets
+import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from shared import (
@@ -104,7 +107,13 @@ def main():
     parser.add_argument(
         "--secondary",
         type=str,
-        help="Run in secondary mode, connecting to primary at specified URL (e.g., quic://host:port)",
+        help="Run in secondary mode, connecting to primary at specified URL (e.g., tcp://host:port)",
+    )
+
+    parser.add_argument(
+        "--secondary-id",
+        type=str,
+        help="Unique identifier for this secondary (required with --secondary)",
     )
 
     parser.add_argument(
@@ -165,6 +174,19 @@ def main():
         help="Submit a test SLURM job to validate Docker image loading (requires --slurm)",
     )
 
+    parser.add_argument(
+        "--num-secondaries",
+        type=int,
+        default=1,
+        help="Number of SLURM secondary nodes to spawn (default: 1)",
+    )
+
+    parser.add_argument(
+        "--skip-image-build",
+        action="store_true",
+        help="Skip building and transferring Docker image (assumes image already exists on gateway)",
+    )
+
     args = parser.parse_args()
 
     # Handle secondary mode early - this is for SLURM compute nodes
@@ -175,9 +197,15 @@ def main():
 
         from .slurm.secondary_mode import SecondaryMode
 
+        if not args.secondary_id:
+            logger.error("--secondary-id is required when running in secondary mode")
+            return
+
         logger.info("=" * 60)
         logger.info("SECONDARY MODE (SLURM Compute Node)")
         logger.info("=" * 60)
+        logger.info(f"Secondary ID: {args.secondary_id}")
+        logger.info(f"Primary URL: {args.secondary}")
 
         # Get system resources
         ram_bytes = psutil.virtual_memory().total
@@ -192,12 +220,9 @@ def main():
         log_network = Path("/app/log-network")
         socket_dir = Path("/app/sockets")
 
-        # Generate secondary ID
-        secondary_id = f"secondary_{socket.gethostname()}_{secrets.token_hex(4)}"
-
         secondary = SecondaryMode(
             primary_url=args.secondary,
-            secondary_id=secondary_id,
+            secondary_id=args.secondary_id,
             num_workers=num_workers,
             ram_bytes=ram_bytes,
             src_tmp=src_tmp,
@@ -255,6 +280,9 @@ def main():
         gateway_config = parse_gateway_url(args.gateway)
         gateway = create_gateway(gateway_config)
 
+        # Setup port forwarding BEFORE connecting (for SSH gateway)
+        gateway.setup_port_forwarding(local_port=5000, remote_port=6000)
+
         # Create SLURM configuration
         # Keep as string if starts with ~ for remote expansion
         root_folder = args.slurm_root_folder
@@ -276,6 +304,18 @@ def main():
         # Connect to gateway
         gateway.connect()
 
+        # Check if GatewayPorts is properly configured for SLURM
+        use_ssh_jump = False
+        if hasattr(gateway, "gateway_ports_enabled") and gateway.gateway_ports_enabled is False:
+            logger.info("=" * 60)
+            logger.info("USING SSH PROXYJUMP MODE")
+            logger.info("=" * 60)
+            logger.info("The SSH gateway does not allow public port forwarding (GatewayPorts is disabled).")
+            logger.info("Using SSH ProxyJump tunnels: primary will tunnel to each secondary via gateway.")
+            logger.info("Secondaries will connect to localhost:{free port} (tunneled to primary).")
+            logger.info("")
+            use_ssh_jump = True
+
         # Validate configuration (after gateway connection to check remote folder)
         try:
             validate_slurm_config(slurm_config, gateway)
@@ -291,14 +331,18 @@ def main():
             # Prepare directories on gateway
             job_manager.prepare_directories()
 
-            # Build and transfer Docker image
-            project_root = Path.cwd()
-            image_path = job_manager.build_and_transfer_image(project_root)
+            # Build and transfer Docker image (unless skipped)
+            if args.skip_image_build:
+                logger.info("Skipping image build and transfer (--skip-image-build)")
+                image_path = f"{slurm_config.get_image_dir()}/asm-tokenizer-docker.tar"
+                logger.info(f"Assuming Docker image exists at: {image_path}")
+            else:
+                project_root = Path.cwd()
+                image_path = job_manager.build_and_transfer_image(project_root)
+                logger.info(f"Docker image ready at: {image_path}")
 
-            logger.info(f"Docker image ready at: {image_path}")
             logger.info("")
 
-            # If test mode, submit a simple test job
             if args.slurm_test_job:
                 logger.info("Submitting test SLURM job...")
 
@@ -332,9 +376,58 @@ def main():
                 logger.info("4. After all files transferred, primary can disconnect")
                 logger.info("")
                 logger.info("SLURM mode setup complete!")
-                logger.info("Note: Full SLURM orchestration not yet implemented")
+                logger.info("")
+                logger.info("Starting primary coordinator...")
+
+                # Run primary coordinator
+                from .slurm.coordinator import PrimaryCoordinator
+
+                # Collect binaries to process
+                logger.info("Collecting binaries from source directory...")
+                sel_result = process_selection_arguments(args)
+                binaries_info = find_matching_binaries(
+                    sel_result.source_dir,
+                    sel_result.platforms,
+                    sel_result.compiler,
+                    sel_result.compiler_versions,
+                    sel_result.opt_levels,
+                )
+
+                if args.skip_existing:
+                    binaries_info = filter_existing_outputs(binaries_info, sel_result.output_dir)
+
+                logger.info(f"Found {len(binaries_info)} binaries to process")
+
+                if len(binaries_info) == 0:
+                    logger.warning("No binaries found to process. Coordinator will run in test mode.")
+
+                num_secondaries = args.num_secondaries
+                logger.info(f"Starting coordinator with {num_secondaries} secondaries")
+
+                # Create unique run directory with timestamp
+                run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                run_id = f"run_{run_timestamp}"
+                logger.info(f"Run ID: {run_id}")
+
+                # Clean up any existing SSH tunnels from previous runs
+                logger.info("Cleaning up any existing SSH tunnels...")
+                subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "ssh.*-L.*localhost"], stderr=subprocess.DEVNULL)
+                logger.debug("SSH tunnel cleanup complete")
+
+                coordinator = PrimaryCoordinator(
+                    binaries_info,
+                    slurm_config,
+                    job_manager,
+                    gateway,
+                    use_reverse_connection=use_ssh_jump,
+                    run_id=run_id,
+                )
+                coordinator.run(num_secondaries=num_secondaries)
 
         finally:
+            # Clean up SSH tunnels
+            logger.info("Cleaning up SSH tunnels...")
+            subprocess.run(["pkill", "-u", str(os.getuid()), "-f", "ssh.*-L.*localhost"], stderr=subprocess.DEVNULL)
             gateway.disconnect()
 
         return

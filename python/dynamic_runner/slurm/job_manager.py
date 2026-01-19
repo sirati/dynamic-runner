@@ -63,17 +63,21 @@ class SlurmJobManager:
     def generate_wrapper_script(
         self,
         image_path: Path,
-        secondary_port: int,
-        primary_host: str,
-        primary_port: int,
+        secondary_id: str,
+        gateway_host: str | None,
+        gateway_port: int | None,
+        reverse_connection: bool = False,
+        run_log_dir: str | None = None,
     ) -> str:
         """Generate bash wrapper script for SLURM job
 
         Args:
             image_path: Path to Docker image on compute node
-            secondary_port: Port for secondary QUIC connections
-            primary_host: Primary host address
-            primary_port: Primary port
+            secondary_id: Unique identifier for this secondary
+            gateway_host: Gateway hostname to connect to (None for reverse mode)
+            gateway_port: Gateway port (forwarded to primary) (None for reverse mode)
+            reverse_connection: If True, secondary listens and writes connection info
+            run_log_dir: Run-specific log directory (if None, uses base log dir)
 
         Returns:
             Bash script content
@@ -93,7 +97,12 @@ class SlurmJobManager:
         # Network paths (expand ~ for remote execution)
         srcbins_network = self._expand_path(self.slurm_config.get_srcbins_dir())
         output_network = self._expand_path(self.slurm_config.get_output_dir())
-        log_network = self._expand_path(self.slurm_config.get_log_dir())
+
+        # Use run-specific log directory if provided, otherwise use base log dir
+        if run_log_dir:
+            log_network = self._expand_path(run_log_dir)
+        else:
+            log_network = self._expand_path(self.slurm_config.get_log_dir())
 
         # Expand image path
         image_path_expanded = self._expand_path(image_path)
@@ -182,8 +191,48 @@ echo "    {srcbins_network} -> /app/src-network (ro)"
 echo "    {output_network} -> /app/out-network"
 echo "    {log_network} -> /app/log-network"
 echo "    {socket_dir} -> /app/sockets"
-echo "  Port: {secondary_port}:{secondary_port}"
-echo "  Primary: {primary_host}:{primary_port}"
+echo "  Secondary ID: {secondary_id}"
+"""
+
+        # Add connection mode specific parts
+        if reverse_connection:
+            # SSH ProxyJump mode: write connection info, then connect to localhost
+            if run_log_dir:
+                connection_info_dir = self._expand_path(f"{run_log_dir}/connection_info")
+            else:
+                connection_info_dir = self._expand_path(f"{self.slurm_config.get_log_dir()}/connection_info")
+            script += f"""echo "  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)"
+echo ""
+
+# Find a free port on this compute node
+echo "Finding free port on compute node..."
+FREE_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('', 0)); print(s.getsockname()[1]); s.close()")
+echo "Using port: $FREE_PORT"
+
+# Write connection info for primary to find and create tunnel
+HOSTNAME=$(hostname -f)
+mkdir -p "{connection_info_dir}"
+echo "{secondary_id},$HOSTNAME,$FREE_PORT" > "{connection_info_dir}/{secondary_id}.info"
+echo "Connection info written to: {connection_info_dir}/{secondary_id}.info"
+echo "  Hostname: $HOSTNAME"
+echo "  Port: $FREE_PORT"
+
+# Run container with Podman using host networking - secondary connects to localhost:FREE_PORT (primary will tunnel to it)
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    --network host \
+    -v "{src_tmp}:/app/src-tmp" \
+    -v "{out_tmp}:/app/out-tmp" \
+    -v "{log_tmp}:/app/log-tmp" \
+    -v "{srcbins_network}:/app/src-network:ro" \
+    -v "{output_network}:/app/out-network" \
+    -v "{log_network}:/app/log-network" \
+    -v "{socket_dir}:/app/sockets" \
+    {image_name}:{image_tag} \
+    dynamic_batch --secondary tcp://localhost:$FREE_PORT --secondary-id {secondary_id}"""
+        else:
+            # Standard mode: secondary connects to primary via gateway
+            script += f"""echo "  Gateway: {gateway_host}:{gateway_port}"
+echo "  Mode: Standard (secondary connects to primary via gateway)"
 echo ""
 
 # Run container with Podman
@@ -195,9 +244,11 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{output_network}:/app/out-network" \
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
-    -p {secondary_port}:{secondary_port} \
     {image_name}:{image_tag} \
-    dynamic_batch --secondary quic://{primary_host}:{primary_port}
+    dynamic_batch --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id}"""
+
+        # Continue with common cleanup
+        script += f"""
 
 CONTAINER_EXIT_CODE=$?
 echo "Container exited with code: $CONTAINER_EXIT_CODE"
@@ -312,6 +363,7 @@ echo "=================================================="
         wrapper_script: str,
         job_name: str,
         nodes: int = 1,
+        run_log_dir: str | None = None,
     ) -> str:
         """Submit SLURM job
 
@@ -319,6 +371,7 @@ echo "=================================================="
             wrapper_script: Bash script content
             job_name: Name for SLURM job
             nodes: Number of nodes to request
+            run_log_dir: Run-specific log directory (if None, uses base log dir)
 
         Returns:
             Job ID
@@ -338,6 +391,12 @@ echo "=================================================="
         # Make executable
         self.gateway.execute_command(f"chmod +x {script_path}")
 
+        # Determine log directory
+        if run_log_dir:
+            log_dir = self._expand_path(run_log_dir)
+        else:
+            log_dir = self._expand_path(self.slurm_config.get_log_dir())
+
         # Build sbatch command
         sbatch_cmd_parts = [
             "sbatch",
@@ -348,8 +407,8 @@ echo "=================================================="
             f"--cpus-per-task={self.slurm_config.cpus_per_task}",
             f"--partition={self.slurm_config.partition}",
             f"--time={self.slurm_config.time_limit}",
-            f"--output={self._expand_path(self.slurm_config.get_log_dir())}/slurm_%j.out",
-            f"--error={self._expand_path(self.slurm_config.get_log_dir())}/slurm_%j.err",
+            f"--output={log_dir}/slurm_%j.out",
+            f"--error={log_dir}/slurm_%j.err",
         ]
 
         if self.slurm_config.notify_email:

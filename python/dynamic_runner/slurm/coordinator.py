@@ -1,19 +1,14 @@
+import asyncio
 import logging
 import secrets
+import socket
 import time
 from pathlib import Path
 from typing import Any
 
 from ..binary_info import BinaryInfo
-from .protocol import (
-    EntropyMessage,
-    FullTaskListMessage,
-    InitialAssignmentMessage,
-    PeerInfoMessage,
-    PromotePrimaryMessage,
-    TaskAssignmentMessage,
-    TransferCompleteMessage,
-)
+from .message_router import MessageRouter
+from .quic_transport import QuicTransport
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +16,31 @@ logger = logging.getLogger(__name__)
 class PrimaryCoordinator:
     """Coordinates primary orchestration in SLURM distributed mode"""
 
-    def __init__(self, binaries: list[BinaryInfo], slurm_config: Any, job_manager: Any):
+    def __init__(
+        self,
+        binaries: list[BinaryInfo],
+        slurm_config: Any,
+        job_manager: Any,
+        gateway: Any,
+        use_reverse_connection: bool = False,
+        run_id: str = "default",
+    ):
         self.binaries = binaries
         self.slurm_config = slurm_config
         self.job_manager = job_manager
+        self.gateway = gateway
+        self.use_reverse_connection = use_reverse_connection
+        self.run_id = run_id
+
+        # Create run-specific log directory
+        base_log_dir = self.slurm_config.get_log_dir()
+        self.run_log_dir = f"{base_log_dir}/{run_id}"
+
+        # Certificate persistence directory (local, in run-specific directory)
+        self.cert_dir = Path.cwd() / "run" / run_id / "certificates"
 
         self.secondaries: dict[str, dict[str, Any]] = {}
+        self.secondary_port_map: dict[str, int] = {}  # Map secondary_id to allocated port
         self.workers: dict[str, list[dict[str, Any]]] = {}
         self.task_assignments: dict[str, str] = {}  # task_hash -> secondary_id
         self.completed_tasks: set[str] = set()
@@ -38,6 +52,16 @@ class PrimaryCoordinator:
         self.running = True
         self.transfer_complete = False
         self.slurm_primary_id: str | None = None
+
+        # Message router for communication
+        self.message_router = MessageRouter("primary", "primary")
+
+        # QUIC transport for all connections (primary-secondary and secondary-secondary)
+        self.quic_transport: QuicTransport | None = None
+        self.primary_quic_port = 5000
+
+        # Track active connections (stores StreamWriter, Server, and control paths)
+        self.active_connections: dict[str, Any] = {}
 
     def run(self, num_secondaries: int, quic_port: int = 5000) -> None:
         """Main execution loop for primary coordinator
@@ -53,125 +77,533 @@ class PrimaryCoordinator:
         logger.info(f"Spawning {num_secondaries} SLURM secondaries")
         logger.info("")
 
+        # Run async coordinator
+        asyncio.run(self._run_async(num_secondaries, quic_port))
+
+    async def _run_async(self, num_secondaries: int, quic_port: int) -> None:
+        """Async main execution loop"""
         try:
+            # Phase 0: Setup QUIC transport and generate certificates
+            await self._setup_quic_transport()
+
             # Phase 1: Submit SLURM jobs
             self._submit_slurm_jobs(num_secondaries, quic_port)
 
             # Phase 2: Wait for secondaries to connect
-            self._wait_for_secondaries(num_secondaries)
+            await self._wait_for_secondaries(num_secondaries)
 
             # Phase 3: Certificate exchange
-            self._exchange_certificates()
+            await self._exchange_certificates()
 
             # Phase 4: Wait for workers ready
-            self._wait_for_workers()
+            await self._wait_for_workers()
 
             # Phase 5: Preliminary assignment
-            self._preliminary_assignment()
+            await self._preliminary_assignment()
 
             # Phase 6: Source discovery from first secondary
-            self._source_discovery()
+            await self._source_discovery()
 
             # Phase 7: Intelligent file distribution
-            self._distribute_files()
+            await self._distribute_files()
 
             # Phase 8: Notify transfer complete
-            self._notify_transfer_complete()
+            await self._notify_transfer_complete()
 
             # Phase 9: Promote SLURM-primary
-            self._promote_slurm_primary()
+            await self._promote_slurm_primary()
 
             # Phase 10: Send full task list
-            self._send_full_task_list()
+            await self._send_full_task_list()
 
             # Phase 11: Monitor until user disconnects
-            self._monitor_mode()
+            await self._monitor_mode()
 
         except KeyboardInterrupt:
             logger.info("Received interrupt signal")
         except Exception as e:
             logger.error(f"Primary coordinator error: {e}", exc_info=True)
         finally:
-            self._cleanup()
+            await self._cleanup()
+
+    async def _setup_quic_transport(self) -> None:
+        """Setup QUIC transport, generate/load certificates, and start server"""
+        logger.info("Setting up QUIC transport for all connections...")
+
+        # Create certificate directory locally if it doesn't exist
+        self.cert_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize QUIC transport - listen only on localhost
+        self.quic_transport = QuicTransport("primary", listen_port=self.primary_quic_port, bind_address="127.0.0.1")
+
+        # Try to load existing certificates from local disk
+        primary_cert_path = self.cert_dir / "primary_cert.pem"
+        primary_key_path = self.cert_dir / "primary_key.pem"
+
+        # Check if certificates exist locally
+        if primary_cert_path.exists() and primary_key_path.exists():
+            logger.info("Loading existing primary certificates from local disk...")
+
+            self.quic_transport.cert_path = primary_cert_path
+            self.quic_transport.key_path = primary_key_path
+            self.quic_transport.cert_fingerprint = self.quic_transport._compute_cert_fingerprint(primary_cert_path)
+
+            logger.info(f"Loaded certificates with fingerprint: {self.quic_transport.cert_fingerprint}")
+        else:
+            logger.info("Generating new primary certificates...")
+            await self.quic_transport.generate_certificates()
+
+            # Save certificates to local disk for persistence
+            if not self.quic_transport.cert_path or not self.quic_transport.key_path:
+                raise RuntimeError("Certificates not generated properly")
+
+            cert_content = self.quic_transport.cert_path.read_text()
+            key_content = self.quic_transport.key_path.read_text()
+
+            primary_cert_path.write_text(cert_content)
+            primary_key_path.write_text(key_content)
+            primary_key_path.chmod(0o600)
+
+            logger.info(f"Saved certificates to {self.cert_dir}")
+
+        # Start QUIC server listening only on localhost
+        # The SSH reverse tunnel will forward from compute nodes to this local port
+        await self.quic_transport.start_server()
+        logger.info(f"Primary QUIC server listening on 127.0.0.1:{self.quic_transport.listen_port}")
+
+        # Register message handlers with both message_router (for current TCP) and QUIC transport (for future)
+        self.message_router.register_handler("secondary_welcome", self._handle_secondary_welcome)
+        self.message_router.register_handler("cert_exchange", self._handle_cert_exchange)
+        self.message_router.register_handler("secondary_error", self._handle_secondary_error)
+        self.message_router.register_handler("secondary_log", self._handle_secondary_log)
+
+        self.quic_transport.register_handler("secondary_welcome", self._handle_secondary_welcome)
+        self.quic_transport.register_handler("cert_exchange", self._handle_cert_exchange)
+        self.quic_transport.register_handler("secondary_error", self._handle_secondary_error)
+        self.quic_transport.register_handler("secondary_log", self._handle_secondary_log)
+
+    # Old TCP connection handler - no longer used with QUIC
+    # async def _handle_secondary_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    #     """Handle incoming connection from secondary"""
+    #     # Now handled by QUIC protocol callbacks
+
+    async def _handle_secondary_welcome(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle secondary welcome message"""
+        logger.debug(f"Received secondary_welcome message: {message}")
+        secondary_id = message.get("secondary_id")
+        ram_bytes = message.get("ram_bytes") or 0
+        worker_count = message.get("worker_count") or 0
+        hostname = message.get("hostname") or "unknown"
+
+        if not secondary_id:
+            logger.error("Received welcome message without secondary_id")
+            return
+
+        logger.info(
+            f"Secondary {secondary_id} connected: {hostname}, {ram_bytes / (1024**3):.1f}GB, {worker_count} workers"
+        )
+
+        self.secondaries[secondary_id] = {
+            "id": secondary_id,
+            "ram_bytes": ram_bytes,
+            "worker_count": worker_count,
+            "hostname": hostname,
+        }
+
+        # Move writer from temp storage to permanent secondary connections
+        # Find the temp connection and move it
+        for temp_id, writer in list(self.active_connections.items()):
+            if temp_id.startswith("temp_"):
+                self.active_connections[secondary_id] = writer
+                del self.active_connections[temp_id]
+                break
+
+        logger.info(f"Secondary {secondary_id} registered and ready (total: {len(self.secondaries)} secondaries)")
+
+    async def _handle_cert_exchange(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle certificate exchange from secondary"""
+        secondary_id = message.get("secondary_id")
+        public_cert_pem = message.get("public_cert_pem")
+        ipv4_address = message.get("ipv4_address")
+        ipv6_address = message.get("ipv6_address")
+        quic_port = message.get("quic_port")
+
+        if not secondary_id:
+            logger.error("Received cert_exchange without secondary_id")
+            return
+
+        logger.info(f"Received certificate from {secondary_id}: {ipv4_address}:{quic_port}")
+
+        # Store peer info
+        self.peer_info.append(
+            {
+                "peer_id": secondary_id,
+                "ipv4": ipv4_address,
+                "ipv6": ipv6_address,
+                "port": quic_port,
+                "cert_pem": public_cert_pem,
+            }
+        )
+
+        # Save secondary certificate to local disk for persistence
+        secondary_cert_path = self.cert_dir / f"{secondary_id}_cert.pem"
+        secondary_info_path = self.cert_dir / f"{secondary_id}_info.json"
+
+        # Save certificate
+        if public_cert_pem:
+            secondary_cert_path.write_text(public_cert_pem)
+
+        # Save connection info as JSON
+        import json
+
+        info = {
+            "secondary_id": secondary_id,
+            "ipv4": ipv4_address,
+            "ipv6": ipv6_address,
+            "port": quic_port,
+        }
+        secondary_info_path.write_text(json.dumps(info, indent=2))
+
+        logger.debug(f"Stored peer info for {secondary_id} ({len(self.peer_info)}/{len(self.secondaries)} peers)")
+        logger.debug(f"Saved certificate to {secondary_cert_path}")
+
+    async def _handle_secondary_error(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle error message from secondary"""
+        secondary_id = message.get("secondary_id")
+        error_type = message.get("error_type")
+        error_message = message.get("error_message")
+        traceback_str = message.get("traceback")
+
+        logger.error("=" * 80)
+        logger.error(f"SECONDARY ERROR from {secondary_id}")
+        logger.error("=" * 80)
+        logger.error(f"Error Type: {error_type}")
+        logger.error(f"Error Message: {error_message}")
+        logger.error("")
+        logger.error("Traceback:")
+        logger.error(traceback_str)
+        logger.error("=" * 80)
+
+    async def _handle_secondary_log(self, message: dict[str, Any], sender_id: str | None) -> None:
+        """Handle log message from secondary"""
+        secondary_id = message.get("secondary_id")
+        level = message.get("level")
+        log_message = message.get("message")
+        module = message.get("module")
+        func_name = message.get("funcName")
+        lineno = message.get("lineno")
+
+        # Format log message with secondary ID prefix
+        formatted = f"[{secondary_id}] {module}.{func_name}:{lineno} - {log_message}"
+
+        # Log at appropriate level
+        if level == "CRITICAL":
+            logger.critical(formatted)
+        elif level == "ERROR":
+            logger.error(formatted)
+        elif level == "WARNING":
+            logger.warning(formatted)
+        else:
+            logger.info(formatted)
 
     def _submit_slurm_jobs(self, num_secondaries: int, base_port: int) -> None:
         """Submit SLURM jobs for secondaries"""
         logger.info("Submitting SLURM jobs...")
 
-        # Get primary host and port
-        import socket
+        # Gateway hostname for secondaries to connect to
+        # For SSH gateway, detect the actual hostname that compute nodes can reach
+        if hasattr(self.gateway, "host") and self.gateway.host:
+            # SSH gateway - get the actual FQDN from the gateway
+            logger.info("Detecting gateway hostname for compute nodes...")
+            returncode, stdout, stderr = self.gateway.execute_command("hostname -f")
+            if returncode == 0 and stdout.strip():
+                gateway_host = stdout.strip()
+                logger.info(f"Using gateway FQDN: {gateway_host}")
+            else:
+                # Fallback to SSH host
+                gateway_host = self.gateway.host
+                logger.warning(f"Could not detect gateway FQDN, using SSH host: {gateway_host}")
+        else:
+            # Local gateway - use localhost
+            gateway_host = "localhost"
+            logger.info(f"Using local gateway host: {gateway_host}")
 
-        primary_host = socket.gethostname()
-        primary_port = base_port
+        # Gateway port is no longer used - using QUIC instead
+        # gateway_port = self.gateway_port
 
         for i in range(num_secondaries):
-            secondary_port = base_port + i + 1
-            job_name = f"asm-tokenizer-secondary-{i}"
+            secondary_id = f"secondary-{i}"
+            job_name = f"asm-tokenizer-{secondary_id}"
 
             # Generate wrapper script
+            image_dir = self.slurm_config.get_image_dir()
+            if isinstance(image_dir, str):
+                image_path = f"{image_dir}/asm-tokenizer-docker.tar"
+            else:
+                image_path = image_dir / "asm-tokenizer-docker.tar"
+
             wrapper = self.job_manager.generate_wrapper_script(
-                image_path=self.slurm_config.get_image_dir() / "asm-tokenizer-docker.tar",
-                secondary_port=secondary_port,
-                primary_host=primary_host,
-                primary_port=primary_port,
+                image_path=image_path,
+                secondary_id=secondary_id,
+                gateway_host=gateway_host,
+                gateway_port=self.primary_quic_port,
+                reverse_connection=self.use_reverse_connection,
+                run_log_dir=self.run_log_dir,
             )
 
             # Submit job
-            job_id = self.job_manager.submit_job(wrapper, job_name)
-            logger.info(f"Submitted job {job_id} for secondary {i}")
+            job_id = self.job_manager.submit_job(wrapper, job_name, run_log_dir=self.run_log_dir)
+            logger.info(f"Submitted job {job_id} for {secondary_id}")
 
         logger.info(f"All {num_secondaries} jobs submitted")
 
-    def _wait_for_secondaries(self, expected_count: int) -> None:
-        """Wait for secondaries to connect and send welcome"""
-        logger.info(f"Waiting for {expected_count} secondaries to connect...")
+    async def _connect_to_secondaries_reverse(self, expected_count: int) -> None:
+        """Connect to secondaries in reverse mode (they listen, we connect via ProxyJump)"""
+        import asyncio
+        import subprocess
 
-        # TODO: Listen for SecondaryWelcomeMessage from each secondary
-        # TODO: Store secondary info (id, ram, worker_count, hostname)
+        logger.info("Reverse connection mode: polling for secondary connection info files...")
+
+        # Create run-specific log directory
+        self.gateway.create_directory(self.run_log_dir)
+
+        connection_info_dir = f"{self.run_log_dir}/connection_info"
+        self.gateway.create_directory(connection_info_dir)
+
+        connected = set()
+        timeout = 600  # 10 minutes
+        start_time = time.time()
+
+        while len(connected) < expected_count:
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Timeout waiting for secondaries. Got {len(connected)}/{expected_count}")
+
+            # List connection info files
+            returncode, stdout, stderr = self.gateway.execute_command(
+                f"ls {connection_info_dir}/*.info 2>/dev/null || true"
+            )
+
+            if returncode == 0 and stdout.strip():
+                files = stdout.strip().split("\n")
+
+                for file_path in files:
+                    if not file_path or file_path in connected:
+                        continue
+
+                    # Read connection info
+                    returncode, content, stderr = self.gateway.execute_command(f"cat {file_path}")
+                    if returncode != 0 or not content.strip():
+                        continue
+
+                    # Parse: secondary_id,hostname,port
+                    try:
+                        parts = content.strip().split(",")
+                        if len(parts) != 3:
+                            continue
+
+                        secondary_id, hostname, port_str = parts
+                        port = int(port_str)
+
+                        if secondary_id in connected:
+                            continue
+
+                        # Only try to connect if we haven't already tried this secondary
+                        # (avoid creating duplicate tunnels on retry)
+                        if secondary_id in self.secondary_port_map:
+                            logger.debug(f"Secondary {secondary_id} already has tunnel, skipping tunnel creation")
+                            continue
+
+                        logger.info(f"Found secondary {secondary_id} at {hostname}:{port}, connecting...")
+
+                        # Connect via SSH ProxyJump
+                        success = await self._connect_to_secondary_ssh(secondary_id, hostname, port)
+
+                        if success:
+                            connected.add(secondary_id)
+                            logger.info(f"Connected to {secondary_id} ({len(connected)}/{expected_count})")
+                        else:
+                            logger.warning(f"Failed to connect to {secondary_id}, will retry")
+
+                    except Exception as e:
+                        logger.warning(f"Error processing connection info {file_path}: {e}")
+
+            await asyncio.sleep(2)
+
+        logger.info(f"All {expected_count} secondaries connected via reverse mode")
+
+    async def _connect_to_secondary_ssh(self, secondary_id: str, hostname: str, port: int) -> bool:
+        """Connect to a secondary via SSH ProxyJump through the gateway"""
+        import subprocess
+        import tempfile
+
+        try:
+            # Use SSH with ProxyJump to create a local port forward tunnel
+            gateway_host = self.gateway.host if hasattr(self.gateway, "host") else "localhost"
+
+            # Get gateway username - use gateway.user if set, otherwise query the gateway
+            if hasattr(self.gateway, "user") and self.gateway.user:
+                gateway_user = self.gateway.user
+            else:
+                # Query the gateway to get the username
+                returncode, stdout, stderr = self.gateway.execute_command("whoami")
+                if returncode == 0 and stdout.strip():
+                    gateway_user = stdout.strip()
+                    logger.debug(f"Detected gateway username: {gateway_user}")
+                else:
+                    logger.warning("Could not determine gateway username, using 'unknown'")
+                    gateway_user = "unknown"
+
+            # Start listening on an automatically allocated free port for the secondary to connect via the tunnel
+            logger.info(f"Allocating free port on primary for {secondary_id}...")
+            server = await asyncio.start_server(
+                lambda r, w: self._handle_proxyjump_connection(r, w, secondary_id), "localhost", 0
+            )
+
+            # Get the allocated port
+            local_port = server.sockets[0].getsockname()[1]
+            logger.info(f"Allocated port {local_port} for {secondary_id}")
+
+            # Store the port allocation for this secondary
+            self.secondary_port_map[secondary_id] = local_port
+
+            # Store server so we can close it later
+            self.active_connections[f"{secondary_id}_server"] = server
+
+            # Create control socket for this tunnel
+            control_dir = tempfile.mkdtemp(prefix=f"ssh-tunnel-{secondary_id}-")
+            control_path = f"{control_dir}/control-socket"
+
+            # Start SSH tunnel with ControlMaster using -R (remote forward)
+            # This creates port 6000 on the secondary node that forwards to localhost:local_port on primary
+            # Secondary connects to localhost:6000, which gets forwarded back to primary's local_port
+            tunnel_cmd = [
+                "ssh",
+                "-M",  # ControlMaster
+                "-N",  # Don't execute remote command
+                "-f",  # Go to background
+                "-R",
+                f"{port}:localhost:{local_port}",
+                "-J",
+                gateway_host,
+                "-o",
+                f"ControlPath={control_path}",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=yes",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                f"{gateway_user}@{hostname}" if gateway_user else hostname,
+            ]
+
+            logger.info(
+                f"Creating SSH ProxyJump tunnel: {hostname}:{port} -> localhost:{local_port} (via gateway {gateway_host})"
+            )
+            logger.info(f"SSH tunnel command: {' '.join(tunnel_cmd)}")
+
+            result = subprocess.run(tunnel_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Failed to start SSH tunnel: {result.stderr}")
+                return False
+
+            # Store control path for cleanup
+            self.active_connections[f"{secondary_id}_tunnel_control"] = control_path
+
+            # Wait for tunnel to establish
+            await asyncio.sleep(1)
+
+            logger.info(
+                f"Tunnel ready: {secondary_id} can connect to localhost:{port} -> tunnels to primary localhost:{local_port}"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Error connecting to {secondary_id} at {hostname}:{port}: {e}")
+            import traceback
+
+            logger.debug(traceback.format_exc())
+            return False
+
+    async def _handle_proxyjump_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, secondary_id: str
+    ) -> None:
+        """Handle incoming connection from secondary through SSH ProxyJump tunnel"""
+        addr = writer.get_extra_info("peername")
+        logger.info(f"Secondary {secondary_id} connected through ProxyJump tunnel from {addr}")
+
+        # Store writer with temp ID first (will be moved to secondary_id after welcome message)
+        temp_id = f"temp_{secondary_id}"
+        self.active_connections[temp_id] = writer
+
+        # Start receive loop with secondary_id so handlers can identify the sender
+        asyncio.create_task(self.message_router.receive_loop(reader, secondary_id))
+
+    async def _wait_for_secondaries(self, expected_count: int) -> None:
+        """Wait for secondaries to connect and send welcome"""
+        if self.use_reverse_connection:
+            logger.info(f"Waiting for {expected_count} secondaries to start and write connection info...")
+            await self._connect_to_secondaries_reverse(expected_count)
+        else:
+            logger.info(f"Waiting for {expected_count} secondaries to connect...")
 
         timeout = 600  # 10 minutes
         start_time = time.time()
+        last_count = 0
 
         while len(self.secondaries) < expected_count:
             if time.time() - start_time > timeout:
                 raise TimeoutError(f"Timeout waiting for secondaries. Got {len(self.secondaries)}/{expected_count}")
 
-            # TODO: Process incoming connections
-            time.sleep(1)
+            # Log progress
+            current_count = len(self.secondaries)
+            if current_count != last_count:
+                logger.info(f"Progress: {current_count}/{expected_count} secondaries connected")
+                last_count = current_count
+
+            # Wait a bit for connections
+            await asyncio.sleep(1)
 
         logger.info(f"All {expected_count} secondaries connected")
 
-    def _exchange_certificates(self) -> None:
+    async def _exchange_certificates(self) -> None:
         """Exchange certificates with secondaries"""
         logger.info("Performing certificate exchange...")
 
-        # Send entropy to all secondaries
-        for secondary_id in self.secondaries:
-            msg = EntropyMessage(
-                sender_id="primary",
-                timestamp=time.time(),
-                entropy_hex=self.primary_entropy.hex(),
-            )
-            # TODO: Send to secondary
-            logger.debug(f"Sent entropy to {secondary_id}")
+        # Wait for all secondaries to send their certificates
+        timeout = 60.0
+        start_time = time.time()
 
-        # Wait for certificate exchange responses
-        # TODO: Receive CertExchangeMessage from each secondary
-        # TODO: Build peer_info list
+        while len(self.peer_info) < len(self.secondaries):
+            if time.time() - start_time > timeout:
+                raise TimeoutError(
+                    f"Timeout waiting for certificates. Got {len(self.peer_info)}/{len(self.secondaries)}"
+                )
+            await asyncio.sleep(0.5)
+
+        logger.info(f"Received all {len(self.peer_info)} certificates")
 
         # Broadcast peer info to all secondaries
         for secondary_id in self.secondaries:
-            msg = PeerInfoMessage(
-                sender_id="primary",
-                timestamp=time.time(),
-                peers=self.peer_info,
-            )
-            # TODO: Send to secondary
+            if secondary_id not in self.active_connections:
+                logger.warning(f"No connection to {secondary_id}, skipping peer info")
+                continue
+
+            msg = {
+                "type": "peer_list",
+                "peers": self.peer_info,
+            }
+
+            writer = self.active_connections[secondary_id]
+            await self.message_router._send_message(writer, msg)
             logger.debug(f"Sent peer info to {secondary_id}")
 
         logger.info("Certificate exchange complete")
 
-    def _wait_for_workers(self) -> None:
+    async def _wait_for_workers(self) -> None:
         """Wait for all workers to report ready"""
         logger.info("Waiting for workers to report ready...")
 
@@ -188,14 +620,18 @@ class PrimaryCoordinator:
                 raise TimeoutError(f"Timeout waiting for workers. Got {total_workers}/{expected_workers}")
 
             # TODO: Process worker ready messages
-            time.sleep(0.5)
+            await asyncio.sleep(0.5)
             total_workers = sum(len(workers) for workers in self.workers.values())
 
         logger.info(f"All {expected_workers} workers ready")
 
-    def _preliminary_assignment(self) -> None:
+    async def _preliminary_assignment(self) -> None:
         """Assign initial tasks to secondaries"""
         logger.info("Performing preliminary task assignment...")
+
+        if len(self.secondaries) == 0:
+            logger.warning("No secondaries connected, skipping preliminary assignment")
+            return
 
         # Distribute binaries across secondaries based on memory
         total_binaries = len(self.binaries)
@@ -214,9 +650,17 @@ class PrimaryCoordinator:
 
         logger.info("Preliminary assignment complete")
 
-    def _source_discovery(self) -> None:
+    async def _source_discovery(self) -> None:
         """First secondary discovers and reports source binaries"""
         logger.info("Starting source discovery phase...")
+
+        if len(self.secondaries) == 0:
+            logger.warning("No secondaries connected, skipping source discovery")
+            return
+
+        if len(self.binaries) == 0:
+            logger.warning("No binaries to process, skipping source discovery")
+            return
 
         # Get first secondary
         first_secondary = next(iter(self.secondaries.keys()))
@@ -228,9 +672,17 @@ class PrimaryCoordinator:
 
         logger.info("Source discovery complete")
 
-    def _distribute_files(self) -> None:
+    async def _distribute_files(self) -> None:
         """Distribute files to secondaries with intelligent deduplication"""
         logger.info("Starting file distribution...")
+
+        if len(self.secondaries) == 0:
+            logger.warning("No secondaries connected, skipping file distribution")
+            return
+
+        if len(self.binaries) == 0:
+            logger.info("No binaries to distribute, skipping file distribution")
+            return
 
         # TODO: For each secondary's assigned tasks:
         # TODO:   Check if hash matches first secondary's discovered binaries
@@ -249,9 +701,14 @@ class PrimaryCoordinator:
 
         logger.info(f"Distribution complete: {total_files} files, {total_size / (1024**3):.2f}GB")
 
-    def _notify_transfer_complete(self) -> None:
+    async def _notify_transfer_complete(self) -> None:
         """Notify all secondaries that transfer is complete"""
         logger.info("Notifying secondaries: transfer complete")
+
+        if len(self.secondaries) == 0:
+            logger.info("No secondaries to notify, skipping transfer complete notification")
+            self.transfer_complete = True
+            return
 
         msg = TransferCompleteMessage(
             sender_id="primary",
@@ -267,9 +724,13 @@ class PrimaryCoordinator:
         self.transfer_complete = True
         logger.info("Transfer complete notification sent")
 
-    def _promote_slurm_primary(self) -> None:
+    async def _promote_slurm_primary(self) -> None:
         """Promote a random secondary to SLURM-primary role"""
         import random
+
+        if len(self.secondaries) == 0:
+            logger.info("No secondaries to promote, skipping SLURM-primary promotion")
+            return
 
         self.slurm_primary_id = random.choice(list(self.secondaries.keys()))
         logger.info(f"Promoting {self.slurm_primary_id} to SLURM-primary")
@@ -286,9 +747,13 @@ class PrimaryCoordinator:
 
         logger.info("SLURM-primary promotion complete")
 
-    def _send_full_task_list(self) -> None:
+    async def _send_full_task_list(self) -> None:
         """Send complete task list to all secondaries"""
         logger.info("Sending full task list to all secondaries...")
+
+        if len(self.secondaries) == 0:
+            logger.info("No secondaries to send task list to, skipping")
+            return
 
         all_tasks = [
             {
@@ -311,7 +776,7 @@ class PrimaryCoordinator:
 
         logger.info("Full task list sent")
 
-    def _monitor_mode(self) -> None:
+    async def _monitor_mode(self) -> None:
         """Monitor mode - primary can be safely disconnected"""
         logger.info("")
         logger.info("=" * 60)
@@ -325,14 +790,56 @@ class PrimaryCoordinator:
         while self.running:
             # TODO: Process status updates from secondaries
             # TODO: Display progress
-            time.sleep(5)
+            await asyncio.sleep(5)
 
-    def _cleanup(self) -> None:
+    async def _cleanup(self) -> None:
         """Clean up resources"""
         logger.info("Cleaning up primary coordinator resources")
-        # TODO: Close connections
-        # TODO: Flush pending data
-        pass
+
+        # Clean up SSH tunnels
+        import shutil
+        import subprocess
+
+        for key in list(self.active_connections.keys()):
+            if key.endswith("_tunnel_control"):
+                control_path = self.active_connections[key]
+                try:
+                    # Close SSH tunnel via ControlMaster
+                    control_dir = str(Path(control_path).parent)
+                    logger.debug(f"Closing SSH tunnel with control path: {control_path}")
+                    subprocess.run(
+                        ["ssh", "-O", "exit", "-o", f"ControlPath={control_path}", "lmu"],
+                        capture_output=True,
+                    )
+                    # Clean up control directory
+                    shutil.rmtree(control_dir, ignore_errors=True)
+                except Exception as e:
+                    logger.debug(f"Error cleaning up SSH tunnel {key}: {e}")
+
+        # Close all secondary connections
+        for secondary_id, writer in self.active_connections.items():
+            if not secondary_id.endswith("_tunnel_control") and not secondary_id.endswith("_server"):
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception as e:
+                    logger.debug(f"Error closing connection to {secondary_id}: {e}")
+
+        # Close servers
+        for key, server in self.active_connections.items():
+            if key.endswith("_server"):
+                try:
+                    server.close()
+                    await server.wait_closed()
+                except Exception as e:
+                    logger.debug(f"Error closing server {key}: {e}")
+
+        # Stop QUIC transport
+        if self.quic_transport:
+            await self.quic_transport.stop()
+
+        # Stop message router
+        self.message_router.stop()
 
     def _compute_task_hash(self, binary: BinaryInfo) -> str:
         """Compute unique hash for task"""
@@ -346,12 +853,12 @@ class PrimaryCoordinator:
         self.completed_tasks.add(task_hash)
         logger.info(f"Task complete: {task_hash} (by {secondary_id})")
 
-    def _handle_task_failed(self, secondary_id: str, task_hash: str, error: str) -> None:
+    async def _handle_task_failed(self, secondary_id: str, task_hash: str, error: str) -> None:
         """Handle task failure notification"""
         self.failed_tasks.add(task_hash)
         logger.warning(f"Task failed: {task_hash} (by {secondary_id}): {error}")
 
-    def _handle_task_request(self, secondary_id: str, worker_id: int, available_memory: int) -> None:
+    async def _handle_task_request(self, secondary_id: str, worker_id: int, available_memory: int) -> None:
         """Handle request for new task from secondary"""
         # TODO: Find unassigned task that fits memory budget
         # TODO: Send TaskAssignmentMessage
