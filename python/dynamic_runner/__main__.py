@@ -426,6 +426,7 @@ def main():
                     task_args=args,
                     use_reverse_connection=use_ssh_jump,
                     run_id=run_id,
+                    source_dir=sel_result.source_dir,
                 )
                 coordinator.run(num_secondaries=num_secondaries)
 

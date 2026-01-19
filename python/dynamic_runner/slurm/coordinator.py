@@ -30,6 +30,7 @@ class PrimaryCoordinator:
         task_args: Any,
         use_reverse_connection: bool = False,
         run_id: str = "default",
+        source_dir: Path | None = None,
     ):
         self.binaries = binaries
         self.slurm_config = slurm_config
@@ -39,6 +40,7 @@ class PrimaryCoordinator:
         self.task_args = task_args
         self.use_reverse_connection = use_reverse_connection
         self.run_id = run_id
+        self.source_dir = source_dir
 
         # Create run-specific log directory
         base_log_dir = self.slurm_config.get_log_dir()
@@ -997,7 +999,15 @@ class PrimaryCoordinator:
         all_tasks = [
             {
                 "hash": self._compute_task_hash(binary),
-                "binary_info": binary.__dict__,
+                "binary_info": {
+                    "path": str(binary.path.relative_to(self.source_dir)) if self.source_dir else str(binary.path),
+                    "size": binary.size,
+                    "binary_name": binary.binary_name,
+                    "platform": binary.platform,
+                    "compiler": binary.compiler,
+                    "version": binary.version,
+                    "opt_level": binary.opt_level,
+                },
             }
             for binary in self.binaries
         ]

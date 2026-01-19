@@ -10,9 +10,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from shared.binary_info import BinaryIdentifier
+
+from ..binary_info import BinaryInfo
 from ..models import WorkerState
 from ..task import TaskDefinition
-from ..worker_manager import WorkerManager
+from ..worker_manager.submissive import SubmissiveManager
 from .message_router import MessageRouter
 from .quic_transport import QuicPeerInfo, QuicTransport
 
@@ -105,8 +108,8 @@ class SecondaryMode:
         self.primary_connection: Any = None
         self.peer_connections: dict[str, Any] = {}
 
-        # WorkerManager handles all worker lifecycle and task assignment
-        self.worker_manager: WorkerManager | None = None
+        # SubmissiveManager handles all worker lifecycle and task assignment
+        self.worker_manager: SubmissiveManager | None = None
         self.extracted_binaries: dict[str, Path] = {}  # hash -> extracted path
 
         self.completed_tasks: set[str] = set()
@@ -370,11 +373,11 @@ class SecondaryMode:
         logger.info("Peer list received and connections established, continuing...")
 
     async def _start_workers(self) -> None:
-        """Start worker processes using WorkerManager"""
-        logger.info(f"Starting {self.num_workers} workers via WorkerManager")
+        """Start worker processes using SubmissiveManager"""
+        logger.info(f"Starting {self.num_workers} workers via SubmissiveManager")
 
-        # Create WorkerManager to handle all worker lifecycle
-        self.worker_manager = WorkerManager(
+        # Create SubmissiveManager to handle all worker lifecycle
+        self.worker_manager = SubmissiveManager(
             num_workers=self.num_workers,
             max_memory=self.ram_bytes,
             source_dir=self.src_tmp,
@@ -382,8 +385,7 @@ class SecondaryMode:
             task_definition=self.task_definition,
             task_args=self.task_args,
             skip_existing=self.skip_existing,
-            print_pid=False,
-            always_restart_worker=False,
+            request_task_callback=self._request_task_callback,
             manual_start_worker=False,
             connection_mode="named",
             socket_dir=self.socket_dir,
@@ -392,36 +394,20 @@ class SecondaryMode:
         # Initialize workers (this starts the processes and waits for ready)
         self.worker_manager._initialize_workers()
 
+        # Send worker ready messages to primary for each worker
+        for worker in self.worker_manager.workers:
+            worker_id = worker.worker_id
+            memory_budget = worker.memory_budget
+            await self._send_worker_ready(worker_id, memory_budget)
 
-async def _start_workers(self) -> None:
-    """Start workers using WorkerManager with LocalWorker"""
-    logger.info(f"Starting WorkerManager with {self.num_workers} workers")
+        logger.info(f"All {len(self.worker_manager.workers)} workers initialized and reported to primary")
 
-    # Create WorkerManager that will handle all worker lifecycle
-    self.worker_manager = WorkerManager(
-        num_workers=self.num_workers,
-        max_memory=self.ram_bytes,
-        source_dir=self.src_tmp,
-        output_dir=self.out_tmp,
-        task_definition=self.task_definition,
-        task_args=self.task_args,
-        skip_existing=self.skip_existing,
-        print_pid=False,
-        always_restart_worker=False,
-        manual_start_worker=False,
-        connection_mode="named",
-        socket_dir=self.socket_dir,
-    )
+    def _request_task_callback(self, worker_id: int) -> None:
+        """Callback for SubmissiveManager to request tasks from primary.
 
-    # Initialize workers (this creates LocalWorker instances)
-    self.worker_manager._initialize_workers()
-
-    # Send worker ready messages to primary for each worker
-    for worker in self.worker_manager.workers:
-        if isinstance(worker, LocalWorker):
-            await self._send_worker_ready(worker.worker_id, worker.memory_budget)
-
-    logger.info(f"All {len(self.worker_manager.workers)} workers initialized")
+        This is called synchronously, so we need to schedule the async work.
+        """
+        asyncio.create_task(self._request_new_task(worker_id))
 
     async def _send_worker_ready(self, worker_id: int, memory_budget: int) -> None:
         """Send worker ready message to primary"""
@@ -466,10 +452,14 @@ async def _start_workers(self) -> None:
 
     async def _send_keepalive(self) -> None:
         """Send keepalive to all peers"""
+        active_count = 0
+        if self.worker_manager:
+            active_count = len([w for w in self.worker_manager.workers if w.current_binary is not None])
+
         msg = {
             "type": "keepalive",
             "secondary_id": self.secondary_id,
-            "active_workers": len([w for w in self.workers if isinstance(w, dict) and w.get("active", False)]),
+            "active_workers": active_count,
         }
 
         # TODO: Broadcast to all peers (secondaries)
@@ -658,14 +648,15 @@ async def _start_workers(self) -> None:
         logger.info(f"Extracted {len(self.extracted_binaries)} binaries from {len(zip_files)} ZIP files")
 
     async def _handle_task_assignment(self, message: dict[str, Any], sender_id: str | None) -> None:
-        """Handle task assignment message"""
+        """Handle task assignment message from primary"""
         worker_id = message.get("worker_id")
         zip_file = message.get("zip_file")
         local_path = message.get("local_path")
         file_hash = message.get("file_hash")
         binary_info_dict = message.get("binary_info")
+        estimated_memory = message.get("estimated_memory", 0)
 
-        if not isinstance(worker_id, int) or worker_id >= len(self.workers):
+        if not isinstance(worker_id, int) or worker_id >= len(self.worker_manager.workers):
             logger.error(f"Invalid worker_id {worker_id}")
             return
 
@@ -685,33 +676,30 @@ async def _start_workers(self) -> None:
             logger.error(f"Missing file information for worker {worker_id}")
             return
 
-        # Assign to worker
-        worker = self.workers[worker_id]
-
-        # Store task info
-        task_hash = file_hash  # Use file hash as task hash
-        self.worker_tasks[worker_id] = {
-            "task_hash": task_hash,
-            "binary_path": extracted_path,
-            "binary_info": binary_info_dict,
-        }
-
-        # Send assignment to worker
+        # Create BinaryInfo from dict
         try:
-            # Use the comm interface to send the binary path
-            command = ProcessBinaryCommand(relative_path=str(extracted_path.relative_to(self.src_tmp)))
-            success, error = worker.comm.send_command(command)
-            if not success:
-                logger.error(f"Failed to assign task to worker {worker_id}: {error}")
-                del self.worker_tasks[worker_id]
-                return
-
-            worker.ready = False
-            worker.current_binary = None  # Will be set when worker processes it
-            logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
+            identifier = BinaryIdentifier(
+                binary_name=binary_info_dict.get("binary_name", ""),
+                platform=binary_info_dict.get("platform", ""),
+                compiler=binary_info_dict.get("compiler", ""),
+                version=binary_info_dict.get("version", ""),
+                opt_level=binary_info_dict.get("opt_level", ""),
+            )
+            binary_info = BinaryInfo(
+                path=extracted_path,
+                size=binary_info_dict.get("size", extracted_path.stat().st_size),
+                identifier=identifier,
+            )
         except Exception as e:
-            logger.error(f"Failed to assign task to worker {worker_id}: {e}")
-            del self.worker_tasks[worker_id]
+            logger.error(f"Failed to create BinaryInfo: {e}")
+            return
+
+        # Assign to worker via SubmissiveManager
+        success = self.worker_manager.assign_task_from_primary(worker_id, binary_info, estimated_memory)
+        if success:
+            logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
+        else:
+            logger.error(f"Failed to assign task to worker {worker_id}")
 
     async def _notify_task_complete(self, worker_id: int, task_hash: str) -> None:
         """Notify all peers that a task completed"""
@@ -739,13 +727,17 @@ async def _start_workers(self) -> None:
             logger.debug(f"Cannot request task for worker {worker_id}: not connected to primary")
             return
 
-        worker = self.workers[worker_id]
+        if worker_id >= len(self.worker_manager.workers):
+            logger.error(f"Invalid worker_id {worker_id}")
+            return
+
+        worker = self.worker_manager.workers[worker_id]
 
         msg = {
             "type": "task_request",
             "secondary_id": self.secondary_id,
             "worker_id": worker_id,
-            "available_memory": worker.reserved_budget,
+            "available_memory": worker.memory_budget,
         }
 
         # Send to primary (or SLURM-primary if promoted)
