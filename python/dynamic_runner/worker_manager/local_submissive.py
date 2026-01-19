@@ -1,24 +1,24 @@
-"""Submissive worker manager for secondary nodes.
+"""Local submissive worker manager for local testing of master/slave architecture.
 
-This manager performs OOM checking but does NOT do task assignment.
-Instead, it requests tasks from the primary coordinator over network.
+This manager works with a LocalAuthoritiveManager to test the distributed
+assignment algorithm locally without networking.
 """
 
 from pathlib import Path
 from typing import Any, Callable
 
+from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
 from .submissive_base import SubmissiveManagerBase
 
 
-class SubmissiveManager(SubmissiveManagerBase):
-    """Submissive worker manager for secondary nodes (remote over network).
+class LocalSubmissiveManager(SubmissiveManagerBase):
+    """Local submissive worker manager for testing master/slave locally.
 
     This manager:
     - Creates and manages LocalWorker instances (subprocess-based)
     - Performs OOM checking and worker killing
-    - Does NOT autonomously assign tasks beyond initial phase
-    - Requests tasks from primary coordinator via callback (over network)
+    - Requests tasks from a local authoritive manager (no network)
     """
 
     def __init__(
@@ -51,5 +51,5 @@ class SubmissiveManager(SubmissiveManagerBase):
         self.request_task_callback = request_task_callback
 
     def _request_task_from_authoritive(self, worker_id: int) -> None:
-        """Request a task from the primary coordinator via network callback."""
+        """Request a task from the local authoritive manager via callback."""
         self.request_task_callback(worker_id)

@@ -251,14 +251,14 @@ class TaskHandler:
             return
 
         # Assign to worker via SubmissiveManager
-        success = self.coordinator.worker_manager.assign_task_from_primary(worker_id, binary_info, estimated_memory)
+        success = self.coordinator.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
         if success:
             logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
         else:
             logger.error(f"Failed to assign task to worker {worker_id}")
 
     async def notify_task_complete(self, worker_id: int, task_hash: str) -> None:
-        """Notify all peers that a task completed"""
+        """Notify primary and all peers that a task completed"""
         msg = {
             "type": "task_complete",
             "secondary_id": self.coordinator.secondary_id,
@@ -268,12 +268,18 @@ class TaskHandler:
             "filtered": 0,
         }
 
+        # Send to primary
+        try:
+            await self.coordinator.send_to_primary_ws(msg)
+        except Exception as e:
+            logger.warning(f"Failed to notify primary of task complete: {e}")
+
         # Broadcast to all peers
         try:
             if len(self.coordinator.message_router.secondary_connections) > 0:
                 await self.coordinator.message_router.broadcast_to_secondaries(msg)
         except Exception as e:
-            logger.warning(f"Failed to notify task complete: {e}")
+            logger.warning(f"Failed to notify peers of task complete: {e}")
 
         logger.info(f"Task completed: worker {worker_id}, hash {task_hash}")
 
@@ -396,7 +402,9 @@ class TaskHandler:
                 continue
 
             # Assign to worker via SubmissiveManager
-            success = self.coordinator.worker_manager.assign_task_from_primary(worker_id, binary_info, estimated_memory)
+            success = self.coordinator.worker_manager.assign_task_from_authoritive(
+                worker_id, binary_info, estimated_memory
+            )
 
             opp_str = " (opportunistic)" if opportunistic else ""
             if success:

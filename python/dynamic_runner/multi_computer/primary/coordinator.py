@@ -195,6 +195,8 @@ class BaseCoordinator:
         self.quic_transport.register_handler("secondary_log", self._handle_secondary_log)
         self.quic_transport.register_handler("peer_connections_ready", self._handle_peer_connections_ready)
         self.quic_transport.register_handler("worker_ready", self._handle_worker_ready)
+        self.quic_transport.register_handler("task_complete", self._handle_task_complete)
+        self.quic_transport.register_handler("task_failed", self._handle_task_failed)
 
         logger.info("QUIC transport ready")
 
@@ -440,18 +442,36 @@ class BaseCoordinator:
             message_router=self.message_router,
         )
 
+        # Start the remote worker (marks it as ready)
+        remote_worker.start()
+
         if secondary_id not in self.remote_workers:
             self.remote_workers[secondary_id] = []
 
         self.remote_workers[secondary_id].append(remote_worker)
 
     async def _preliminary_assignment(self) -> None:
-        """Phase 5: Preliminary task assignment"""
+        """Phase 5: Preliminary task assignment
+
+        This phase assigns initial tasks to workers on each secondary.
+        Assignment is done using the AuthoritiveManager for memory-aware scheduling.
+        """
         logger.info("Phase 5: Preliminary assignment")
 
-        # Create WorkerManager for each secondary
+        if len(self.secondaries) == 0:
+            logger.warning("No secondaries connected")
+            return
+
+        if len(self.binaries) == 0:
+            logger.warning("No binaries to assign")
+            return
+
+        # Create WorkerManager for each secondary and perform initial assignment
         for secondary_id, info in self.secondaries.items():
             workers = self.remote_workers.get(secondary_id, [])
+            logger.debug(f"Creating manager for {secondary_id} with {len(workers)} workers")
+            for w in workers:
+                logger.debug(f"  Worker {w.worker_id}: ready={w.ready}")
 
             # Create log directory for this secondary
             log_dir = Path.cwd() / "run" / self.run_id / "logs" / secondary_id
@@ -467,6 +487,41 @@ class BaseCoordinator:
 
             self.worker_managers[secondary_id] = manager
 
+            # Initialize workers (this calls _create_workers() and sets up budgets)
+            manager._initialize_workers()
+
+            # Manually perform initial assignment by setting up pending binaries
+            # and running initial assignment phase
+            logger.info(f"Performing initial assignment for {secondary_id} ({info['num_workers']} workers)")
+            logger.debug(f"  Manager has {len(manager.workers)} workers in its list")
+            logger.debug(f"  Available binaries: {len(self.binaries)}")
+
+            # Copy binaries to manager's pending list
+            manager.pending_binaries = list(self.binaries)
+
+            # Sort by size descending for better packing
+            manager.pending_binaries.sort(key=lambda b: b.size, reverse=True)
+
+            # Perform initial assignment to all workers
+            assigned_count = 0
+            for worker in manager.workers:
+                logger.debug(
+                    f"  Worker {worker.worker_id}: ready={worker.ready}, has_initial={worker.has_received_initial_assignment}"
+                )
+                if worker.ready:
+                    success = manager._assign_binary_to_worker_initial_phase(worker)
+                    logger.debug(
+                        f"    Assignment success={success}, current_binary={worker.current_binary is not None}"
+                    )
+                    if success and worker.current_binary:
+                        task_hash = self._compute_task_hash(worker.current_binary)
+                        self.task_assignments[task_hash] = secondary_id
+                        assigned_count += 1
+
+            logger.info(f"  {secondary_id}: {assigned_count} initial tasks assigned to {info['num_workers']} workers")
+
+        total_assigned = len(self.task_assignments)
+        logger.info(f"Total initial assignments: {total_assigned}/{len(self.binaries)} tasks")
         logger.info(f"Created {len(self.worker_managers)} worker managers")
 
     async def _source_discovery(self) -> None:
@@ -544,7 +599,11 @@ class BaseCoordinator:
             task_hash = self._compute_task_hash(binary)
             tasks.append({"hash": task_hash, "binary_info": binary.to_dict()})
 
-        task_list_msg = {"type": "full_task_list", "tasks": tasks}
+        task_list_msg = {
+            "type": "full_task_list",
+            "all_tasks": tasks,
+            "completed_tasks": list(self.completed_tasks),
+        }
         await self._send_to_secondary(self.slurm_primary_id, task_list_msg)
 
         logger.info(f"Sent {len(tasks)} tasks to {self.slurm_primary_id}")
@@ -612,7 +671,16 @@ class BaseCoordinator:
     def _handle_task_complete(self, message: dict[str, Any], connection: Any) -> None:
         """Handle task complete message"""
         task_hash = message.get("task_hash")
-        self.completed_tasks.add(task_hash)
+        secondary_id = message.get("secondary_id")
+        worker_id = message.get("worker_id")
+
+        logger.debug(f"Task complete: hash={task_hash}, secondary={secondary_id}, worker={worker_id}")
+
+        if task_hash:
+            self.completed_tasks.add(task_hash)
+            logger.info(f"Task {task_hash} completed by {secondary_id} worker {worker_id}")
+        else:
+            logger.warning(f"Task complete message missing task_hash: {message}")
 
     async def _handle_task_failed(self, message: dict[str, Any], connection: Any) -> None:
         """Handle task failed message"""

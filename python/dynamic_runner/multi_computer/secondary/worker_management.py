@@ -93,10 +93,53 @@ class WorkerManager:
         if not self.coordinator.worker_manager:
             return
 
-        # WorkerManager handles worker polling internally
-        # We just need to check for completed tasks and request new ones from primary
-        # Note: In multi-computer mode, we don't auto-reassign - we ask primary for tasks
-        pass
+        manager = self.coordinator.worker_manager
+
+        # Check for ready messages from workers
+        for worker in manager.workers:
+            if not worker.ready:
+                has_result, _ = worker.check_status()
+
+        # Process each worker
+        for worker_id, worker in enumerate(manager.workers):
+            # Skip workers that aren't ready
+            if not worker.ready:
+                continue
+
+            # Check if worker has a current task
+            if worker.current_binary is not None:
+                # Save the binary info before completion clears it
+                current_binary = worker.current_binary
+
+                # Check worker status
+                has_result, result = worker.check_status()
+
+                if has_result:
+                    # Handle the result using base class logic
+                    manager._worker_completed(worker, result)
+
+                    # Notify primary of task completion
+                    if result.success and current_binary:
+                        # Compute task hash
+                        import hashlib
+
+                        hash_input = f"{current_binary.path}:{current_binary.binary_name}:{current_binary.platform}:{current_binary.compiler}:{current_binary.version}:{current_binary.opt_level}"
+                        task_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+
+                        # Schedule async notification
+                        import asyncio
+
+                        task_handler = self.coordinator.task_handler
+                        asyncio.create_task(task_handler.notify_task_complete(worker_id, task_hash))
+
+                    # After completion, worker is ready for new task
+                    # In submissive mode, request task from primary
+                    if worker.ready and not worker.current_binary:
+                        logger.debug(f"[Worker {worker_id}] Completed task, requesting new task from primary")
+                        self.request_task_from_primary(worker_id)
+
+        # Check memory pressure and kill workers if needed
+        manager._check_memory_pressure_and_kill()
 
     async def send_keepalive(self) -> None:
         """Send keepalive to all peers"""

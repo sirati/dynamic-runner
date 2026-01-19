@@ -11,15 +11,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ...binary_info import BinaryInfo
-from ...multi_computer import ConnectionResult, FileTransferMode, PreparationResult
-from ...multi_computer.primary.coordinator import BaseCoordinator
-from ...multi_computer.primary.file_utils import (
+from ....binary_info import BinaryInfo
+from ....multi_computer import ConnectionResult, FileTransferMode, PreparationResult
+from ....multi_computer.primary.coordinator import BaseCoordinator
+from ....multi_computer.primary.file_utils import (
     compute_file_hash,
     compute_task_hash,
     send_initial_assignment_file_ready,
 )
-from ...task import TaskDefinition
+from ....task import TaskDefinition
 
 logger = logging.getLogger(__name__)
 
@@ -133,24 +133,24 @@ class LocalTestPrimaryCoordinator(BaseCoordinator):
             logger.info("No binaries to process")
             return
 
-        # For each secondary, send initial_assignment with file_ready list
+        # For each secondary, send initial_assignment with file_ready list and worker assignments
         for secondary_id, info in self.secondaries.items():
-            # Get assigned tasks for this secondary
-            assigned_binaries = [
-                binary
-                for binary in self.binaries
-                if self.task_assignments.get(compute_task_hash(binary)) == secondary_id
-            ]
-
-            if not assigned_binaries:
-                logger.info(f"No binaries assigned to {secondary_id}")
+            manager = self.worker_managers.get(secondary_id)
+            if not manager:
+                logger.warning(f"No worker manager for {secondary_id}")
                 continue
 
-            logger.info(f"Sending file_ready assignment to {secondary_id}: {len(assigned_binaries)} binaries")
-
-            # Build file_ready list with local paths and hashes
+            # Build file_ready list and worker_assignments from WorkerManager state
             file_ready_list = []
-            for binary in assigned_binaries:
+            worker_assignments = []
+
+            # Get all assigned binaries from the manager's workers
+            for worker in manager.workers:
+                if not hasattr(worker, "current_binary") or worker.current_binary is None:
+                    continue
+
+                binary = worker.current_binary
+
                 if self.source_dir is None:
                     logger.error("source_dir is not set")
                     continue
@@ -164,34 +164,43 @@ class LocalTestPrimaryCoordinator(BaseCoordinator):
                 # Compute hash for verification
                 file_hash = compute_file_hash(binary_path)
 
-                # Manually create binary_info dict
-                binary_info_dict = {
-                    "path": str(binary.path),
-                    "size": binary.size,
-                    "binary_name": binary.identifier.binary_name,
-                    "platform": binary.identifier.platform,
-                    "compiler": binary.identifier.compiler,
-                    "version": binary.identifier.version,
-                    "opt_level": binary.identifier.opt_level,
-                }
+                # Add to file_ready list (only once per unique file)
+                if not any(f["hash"] == file_hash for f in file_ready_list):
+                    file_ready_list.append(
+                        {
+                            "hash": file_hash,
+                            "path": str(binary_path),  # Send absolute path for local mode
+                            "binary_info": binary.to_dict(),
+                        }
+                    )
 
-                file_ready_list.append(
+                # Add worker assignment
+                estimated_memory = self.task_definition.estimate_memory(binary.size)
+                opportunistic = estimated_memory > worker.memory_budget if hasattr(worker, "memory_budget") else False
+
+                worker_assignments.append(
                     {
-                        "hash": file_hash,
-                        "path": str(binary_path),  # Send absolute path for local mode
-                        "binary_info": binary_info_dict,
+                        "worker_id": worker.worker_id,
+                        "file_hash": file_hash,
+                        "estimated_memory": estimated_memory,
+                        "opportunistic": opportunistic,
+                        "binary_info": binary.to_dict(),
                     }
                 )
 
             if not file_ready_list:
-                logger.warning(f"No valid binaries for {secondary_id}")
+                logger.info(f"No initial assignments for {secondary_id}")
                 continue
 
-            # Send initial_assignment with file_ready mode
+            logger.info(
+                f"Sending file_ready assignment to {secondary_id}: {len(file_ready_list)} files, {len(worker_assignments)} worker assignments"
+            )
+
+            # Send initial_assignment with file_ready mode and worker assignments
             await send_initial_assignment_file_ready(
                 secondary_id=secondary_id,
                 file_ready_list=file_ready_list,
-                worker_assignments=[],  # Will be populated later
+                worker_assignments=worker_assignments,
                 secondary_info=info,
                 message_router=self.message_router,
                 quic_transport=self.quic_transport,

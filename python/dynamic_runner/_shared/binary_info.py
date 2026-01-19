@@ -38,6 +38,18 @@ class BinaryInfo:
     def opt_level(self) -> str:
         return self.identifier.opt_level
 
+    def to_dict(self) -> dict:
+        """Convert BinaryInfo to dictionary representation."""
+        return {
+            "path": str(self.path),
+            "size": self.size,
+            "binary_name": self.identifier.binary_name,
+            "platform": self.identifier.platform,
+            "compiler": self.identifier.compiler,
+            "version": self.identifier.version,
+            "opt_level": self.identifier.opt_level,
+        }
+
 
 FIELD_MAPPING = {
     "p": "platform",

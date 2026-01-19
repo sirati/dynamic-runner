@@ -1,23 +1,24 @@
 """Authoritive worker manager for primary coordinator.
 
 This manager performs task assignments but does NOT do OOM checking.
-It's used by the primary to manage workers across multiple secondaries.
+It's used by the primary to manage workers across multiple secondaries over network.
 """
 
 from pathlib import Path
 
+from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
 from ..worker.base_worker import BaseWorker
-from .base import WorkerManagerBase
+from .authoritive_base import AuthoritiveManagerBase
 
 
-class AuthoritiveManager(WorkerManagerBase):
-    """Authoritive worker manager for primary coordinator.
+class AuthoritiveManager(AuthoritiveManagerBase):
+    """Authoritive worker manager for primary coordinator (remote over network).
 
     This manager:
     - Performs task assignments
     - Does NOT perform OOM checking (delegated to secondaries)
-    - Used by primary to manage RemoteWorker instances
+    - Used by primary to manage RemoteWorker instances over network
     """
 
     def __init__(
@@ -33,18 +34,13 @@ class AuthoritiveManager(WorkerManagerBase):
             max_memory=max_memory,
             log_dir=log_dir,
             task_definition=task_definition,
-            always_restart_worker=False,
+            workers=workers,
         )
 
-        # Workers can be provided externally (RemoteWorker instances)
-        self._external_workers = workers or []
+    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None:
+        """Handle OOM killed task by requeueing for retry.
 
-    def _create_workers(self) -> list[BaseWorker]:
-        """Return externally provided workers (RemoteWorker instances)."""
-        return self._external_workers
-
-    def _check_memory_pressure_and_kill(self) -> None:
-        """No OOM checking in authoritive manager - delegated to secondaries."""
-        # Authoritive manager does not perform OOM checking
-        # This is handled by SubmissiveManager on each secondary
-        pass
+        In distributed mode, OOM notifications come from secondaries.
+        We requeue the task at the front of pending_binaries.
+        """
+        self.pending_binaries.insert(0, binary)

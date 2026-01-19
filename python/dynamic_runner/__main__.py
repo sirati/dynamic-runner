@@ -17,8 +17,8 @@ from shared import (
 )
 
 from .gateway import GatewayConfig, create_gateway, parse_gateway_url
-from .local_test.primary import LocalTestPrimaryCoordinator
 from .multi_computer import ExecutionMode
+from .multi_computer.test_network.primary import LocalTestPrimaryCoordinator
 from .runtime_env import PackagingConfig, create_packaging_method
 from .slurm import SlurmConfig, validate_slurm_config
 from .slurm.job_manager import SlurmJobManager
@@ -245,6 +245,12 @@ def main():
         help="Skip building and transferring Docker image (assumes image already exists on gateway)",
     )
 
+    parser.add_argument(
+        "--test-master-slave",
+        action="store_true",
+        help="Test master/slave architecture locally without networking (uses local_submissive and local_authoritive)",
+    )
+
     args = parser.parse_args()
 
     # Handle secondary mode early - this is for SLURM compute nodes or local test
@@ -378,7 +384,9 @@ def main():
         )
 
         if args.skip_existing:
-            binaries_info = filter_existing_outputs(binaries_info, sel_result.output_dir)
+            binaries_info, _ = filter_existing_outputs(
+                binaries_info, sel_result.source_dir, sel_result.output_dir, task.get_output_filename_pattern
+            )
 
         logger.info(f"Found {len(binaries_info)} binaries to process")
 
@@ -435,10 +443,17 @@ def main():
             sel_result.compiler,
             sel_result.compiler_versions,
             sel_result.opt_levels,
+            sel_result.file_format,
+            sel_result.version_regex,
+            sel_result.opt_regex,
+            sel_result.name_regex,
+            sel_result.exclude_subfolders,
         )
 
         if args.skip_existing:
-            binaries_info = filter_existing_outputs(binaries_info, sel_result.output_dir)
+            binaries_info, _ = filter_existing_outputs(
+                binaries_info, sel_result.source_dir, sel_result.output_dir, task.get_output_filename_pattern
+            )
 
         logger.info(f"Found {len(binaries_info)} binaries to process")
 
@@ -528,22 +543,67 @@ def main():
             logger.info("No binaries to process after filtering")
             return
 
-    manager = WorkerManager(
-        num_workers=num_cores,
-        max_memory=max_memory,
-        source_dir=config.source_dir,
-        output_dir=config.output_dir,
-        task_definition=task,
-        task_args=args,
-        skip_existing=args.skip_existing,
-        print_pid=args.pid,
-        always_restart_worker=args.always_restart_worker,
-        manual_start_worker=args.manual_start_worker,
-        connection_mode=args.connection_mode,
-        socket_dir=Path(args.socket_dir) if args.socket_dir else None,
-    )
+    # Check if test-master-slave mode is enabled
+    if args.test_master_slave:
+        from .worker_manager import LocalAuthoritiveManager, LocalSubmissiveManager
 
-    manager.process_binaries(sorted_binaries)
+        logger.info("=" * 60)
+        logger.info("TEST MASTER-SLAVE MODE (Local)")
+        logger.info("=" * 60)
+        logger.info("Using local_submissive + local_authoritive architecture")
+        logger.info("")
+
+        # Create submissive manager
+        def request_task_callback(worker_id: int) -> None:
+            """Callback for submissive to request tasks from authoritive."""
+            result = authoritive_manager.handle_task_request(worker_id)
+            if result:
+                binary, estimated_memory = result
+                submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+
+        submissive_manager = LocalSubmissiveManager(
+            num_workers=num_cores,
+            max_memory=max_memory,
+            source_dir=config.source_dir,
+            output_dir=config.output_dir,
+            task_definition=task,
+            task_args=args,
+            skip_existing=args.skip_existing,
+            request_task_callback=request_task_callback,
+            manual_start_worker=args.manual_start_worker,
+            connection_mode=args.connection_mode,
+            socket_dir=Path(args.socket_dir) if args.socket_dir else None,
+        )
+
+        # Create authoritive manager with the submissive's workers
+        authoritive_manager = LocalAuthoritiveManager(
+            num_workers=num_cores,
+            max_memory=max_memory,
+            log_dir=config.output_dir,
+            task_definition=task,
+            submissive_managers=[submissive_manager],
+        )
+
+        # Process binaries through the submissive (which will coordinate with authoritive)
+        submissive_manager.process_binaries(sorted_binaries)
+    else:
+        # Use standard local manager
+        manager = WorkerManager(
+            num_workers=num_cores,
+            max_memory=max_memory,
+            source_dir=config.source_dir,
+            output_dir=config.output_dir,
+            task_definition=task,
+            task_args=args,
+            skip_existing=args.skip_existing,
+            print_pid=args.pid,
+            always_restart_worker=args.always_restart_worker,
+            manual_start_worker=args.manual_start_worker,
+            connection_mode=args.connection_mode,
+            socket_dir=Path(args.socket_dir) if args.socket_dir else None,
+        )
+
+        manager.process_binaries(sorted_binaries)
 
 
 if __name__ == "__main__":
