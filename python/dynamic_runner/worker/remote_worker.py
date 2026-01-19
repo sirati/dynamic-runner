@@ -139,15 +139,19 @@ class RemoteWorker(BaseWorker):
             TaskResult for this failed task
         """
         # Map error type string to ErrorType
+        # Valid ErrorType values: OUT_OF_MEMORY, NON_RECOVERABLE, RECOVERABLE
         error_type_map = {
-            "worker_crashed": ErrorType.WORKER_CRASHED,
-            "worker_timeout": ErrorType.WORKER_TIMEOUT,
-            "oom_killed": ErrorType.OOM_KILLED,
-            "communication_error": ErrorType.COMMUNICATION_ERROR,
-            "task_error": ErrorType.TASK_ERROR,
+            "worker_crashed": ErrorType.NON_RECOVERABLE,
+            "worker_timeout": ErrorType.RECOVERABLE,
+            "oom_killed": ErrorType.OUT_OF_MEMORY,
+            "communication_error": ErrorType.NON_RECOVERABLE,
+            "task_error": ErrorType.RECOVERABLE,
+            "non_recoverable": ErrorType.NON_RECOVERABLE,
+            "recoverable": ErrorType.RECOVERABLE,
+            "oom": ErrorType.OUT_OF_MEMORY,
         }
 
-        error_type = error_type_map.get(error_type_str.lower(), ErrorType.TASK_ERROR)
+        error_type = error_type_map.get(error_type_str.lower(), ErrorType.RECOVERABLE)
 
         result = TaskResult(
             success=False,

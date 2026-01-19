@@ -102,7 +102,7 @@ class LocalWorker(BaseWorker):
             if msg.error_type.value == "connection_closed":
                 return True, TaskResult(
                     success=False,
-                    error_type=ErrorType.WORKER_CRASHED,
+                    error_type=ErrorType.NON_RECOVERABLE,
                     error_message="Worker connection closed",
                 )
             return False, None
