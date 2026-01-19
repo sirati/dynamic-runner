@@ -176,8 +176,8 @@ def main():
     parser.add_argument(
         "--multi-computer",
         type=str,
-        choices=["slurm", "local"],
-        help="Enable multi-computer distributed mode (slurm or local)",
+        choices=["slurm", "local", "single-process"],
+        help="Enable multi-computer distributed mode (slurm, local, or single-process)",
     )
 
     parser.add_argument(
@@ -347,6 +347,9 @@ def main():
         elif args.multi_computer == "local":
             # Local mode validation
             pass
+        elif args.multi_computer == "single-process":
+            # Single-process mode validation
+            pass
 
     # Default to named mode when manual-start-worker is used
     if args.connection_mode is None:
@@ -477,6 +480,69 @@ def main():
             run_id=run_id,
             source_dir=sel_result.source_dir,
             raw_logs=args.raw_logs,
+        )
+
+        try:
+            # Run coordinator
+            coordinator.run(num_secondaries=num_secondaries)
+        finally:
+            # Coordinator handles its own cleanup
+            pass
+
+        return
+
+    elif args.multi_computer == "single-process":
+        logger.info("=" * 60)
+        logger.info("SINGLE-PROCESS MULTI-COMPUTER MODE (Testing)")
+        logger.info("=" * 60)
+
+        # Collect binaries to process
+        logger.info("Collecting binaries from source directory...")
+        sel_result = process_selection_arguments(args)
+        binaries_info = find_matching_binaries(
+            sel_result.source_dir,
+            sel_result.platforms,
+            sel_result.compiler,
+            sel_result.compiler_versions,
+            sel_result.opt_levels,
+            sel_result.file_format,
+            sel_result.version_regex,
+            sel_result.opt_regex,
+            sel_result.name_regex,
+            sel_result.exclude_subfolders,
+        )
+
+        if args.skip_existing:
+            binaries_info, _ = filter_existing_outputs(
+                binaries_info, sel_result.source_dir, sel_result.output_dir, task.get_output_filename_pattern
+            )
+
+        logger.info(f"Found {len(binaries_info)} binaries to process")
+
+        if len(binaries_info) == 0:
+            logger.warning("No binaries found to process.")
+            return
+
+        num_secondaries = args.jobs
+        logger.info(f"Starting coordinator with {num_secondaries} in-process secondaries")
+
+        # Create unique run directory with timestamp
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_id = f"run_{run_timestamp}"
+        logger.info(f"Run ID: {run_id}")
+
+        # Import here to avoid circular dependency
+        from .multi_computer.test_single_process import SingleProcessPrimaryCoordinator
+
+        # Create single-process coordinator
+        coordinator = SingleProcessPrimaryCoordinator(
+            binaries=binaries_info,
+            task_definition=task,
+            task_args=args,
+            run_id=run_id,
+            source_dir=sel_result.source_dir,
+            output_dir=sel_result.output_dir,
+            num_workers_per_secondary=parse_cores(args.cores) // num_secondaries if num_secondaries > 0 else 1,
         )
 
         try:
