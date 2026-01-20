@@ -25,7 +25,7 @@ from .slurm.job_manager import SlurmJobManager
 from .slurm.primary import SlurmPrimaryCoordinator
 from .system_resources import parse_cores, parse_memory
 from .task import TokenizerTask
-from .worker_manager import WorkerManager
+from .worker_manager import LocalWorkerManager
 
 
 def main():
@@ -638,7 +638,7 @@ def main():
 
     # Check if test-master-slave mode is enabled
     elif args.test_master_slave:
-        from .worker_manager import LocalAuthoritiveManager, LocalSubmissiveManager
+        from .worker_manager import ActualAuthoritativeWorkerManager, ActualSubmissiveWorkerManager
 
         logger.info("=" * 60)
         logger.info("TEST MASTER-SLAVE MODE (Local)")
@@ -654,7 +654,7 @@ def main():
                 binary, estimated_memory = result
                 submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
 
-        submissive_manager = LocalSubmissiveManager(
+        submissive_manager = ActualSubmissiveWorkerManager(
             num_workers=num_cores,
             max_memory=max_memory,
             source_dir=config.source_dir,
@@ -672,7 +672,7 @@ def main():
         submissive_manager.initialize_workers_only()
 
         # Create authoritive manager with the submissive's workers
-        authoritive_manager = LocalAuthoritiveManager(
+        authoritive_manager = ActualAuthoritativeWorkerManager(
             num_workers=num_cores,
             max_memory=max_memory,
             log_dir=config.output_dir,
@@ -680,14 +680,37 @@ def main():
             submissive_managers=[submissive_manager],
         )
 
-        # Set pending binaries on authoritative manager (it needs the task queue)
-        authoritive_manager.set_pending_binaries(sorted_binaries)
+        # Set pending binaries and run processing through authoritative manager
+        authoritive_manager.pending_binaries = sorted_binaries.copy()
+        authoritive_manager.stats["total"] = len(sorted_binaries)
+        authoritive_manager.stats["completed"] = 0
+        authoritive_manager.stats["errored"] = 0
 
-        # Process binaries through the submissive (which will coordinate with authoritive)
-        submissive_manager.process_binaries(sorted_binaries)
+        # Log start
+        start_msg = f"Starting {num_cores} workers with {max_memory / (1024**3):.2f}GB memory limit"
+        process_msg = f"Processing {len(sorted_binaries)} binaries"
+        logger.info(start_msg)
+        logger.info(process_msg)
+
+        # Run the processing phases through authoritative (which coordinates with submissive)
+        authoritive_manager._initialize_workers()
+        authoritive_manager._run_initial_assignments()
+        authoritive_manager._run_main_phase()
+        authoritive_manager._run_retry_phase()
+        authoritive_manager._run_oom_phase()
+        authoritive_manager._run_unassigned_phase()
+
+        # Stop workers
+        for worker in authoritive_manager.workers:
+            if worker.is_alive():
+                try:
+                    worker.terminate()
+                    logger.info(f"[Worker {worker.worker_id}] Stopping (all phases complete)")
+                except Exception:
+                    pass
     else:
         # Use standard local manager
-        manager = WorkerManager(
+        manager = LocalWorkerManager(
             num_workers=num_cores,
             max_memory=max_memory,
             source_dir=config.source_dir,

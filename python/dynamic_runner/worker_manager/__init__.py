@@ -11,13 +11,6 @@ This package provides worker manager abstractions:
 - RemoteAuthoritativeWorkerManager: Authoritative relay (network)
 - ActualSubmissiveWorkerManager: Submissive with execution logic
 - RemoteSubmissiveWorkerManager: Submissive relay (network)
-
-Legacy names for backward compatibility:
-- LocalManager -> LocalWorkerManager
-- AuthoritiveManager -> ActualAuthoritativeWorkerManager
-- SubmissiveManager -> ActualSubmissiveWorkerManager
-- LocalAuthoritiveManager -> ActualAuthoritativeWorkerManager
-- LocalSubmissiveManager -> ActualSubmissiveWorkerManager
 """
 
 from .actual_authoritative import ActualAuthoritativeWorkerManager
@@ -31,18 +24,6 @@ from .remote_authoritative import RemoteAuthoritativeWorkerManager
 from .remote_submissive import RemoteSubmissiveWorkerManager
 from .submissive_base import SubmissiveBase
 
-# Legacy aliases for backward compatibility
-LocalManager = LocalWorkerManager
-WorkerManager = LocalWorkerManager
-AuthoritiveManager = ActualAuthoritativeWorkerManager
-SubmissiveManager = ActualSubmissiveWorkerManager
-LocalAuthoritiveManager = ActualAuthoritativeWorkerManager
-LocalSubmissiveManager = ActualSubmissiveWorkerManager
-
-# Legacy base class names
-AuthoritiveManagerBase = AuthoritativeBase
-SubmissiveManagerBase = SubmissiveBase
-
 __all__ = [
     # Core base classes
     "WorkerManagerBase",
@@ -50,19 +31,10 @@ __all__ = [
     "ExecutionWorkerManBaseImpl",
     "AuthoritativeBase",
     "SubmissiveBase",
-    # New concrete implementations
+    # Concrete implementations
     "LocalWorkerManager",
     "ActualAuthoritativeWorkerManager",
     "ActualSubmissiveWorkerManager",
     "RemoteAuthoritativeWorkerManager",
     "RemoteSubmissiveWorkerManager",
-    # Legacy aliases
-    "WorkerManager",
-    "LocalManager",
-    "AuthoritiveManager",
-    "SubmissiveManager",
-    "LocalAuthoritiveManager",
-    "LocalSubmissiveManager",
-    "AuthoritiveManagerBase",
-    "SubmissiveManagerBase",
 ]

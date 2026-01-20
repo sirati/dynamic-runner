@@ -19,7 +19,7 @@ from ..models import WorkerState
 from ..multi_computer.message_router import MessageRouter
 from ..multi_computer.quic_transport import QuicPeerInfo, QuicTransport
 from ..task import TaskDefinition
-from ..worker_manager import SubmissiveManager
+from ..worker_manager import ActualSubmissiveWorkerManager
 
 logger = logging.getLogger(__name__)
 
@@ -112,8 +112,8 @@ class SecondaryMode:
         self.primary_connection: Any = None
         self.peer_connections: dict[str, Any] = {}
 
-        # SubmissiveManager handles all worker lifecycle and task assignment
-        self.worker_manager: SubmissiveManager | None = None
+        # ActualSubmissiveWorkerManager handles all worker lifecycle and task assignment
+        self.worker_manager: ActualSubmissiveWorkerManager | None = None
         self.extracted_binaries: dict[str, Path] = {}  # hash -> extracted path
 
         self.completed_tasks: set[str] = set()
@@ -408,11 +408,11 @@ class SecondaryMode:
             logger.warning(f"Failed to send peer_connections_ready: {e}")
 
     async def _start_workers(self) -> None:
-        """Start worker processes using SubmissiveManager"""
-        logger.info(f"Starting {self.num_workers} workers via SubmissiveManager")
+        """Start worker processes using ActualSubmissiveWorkerManager"""
+        logger.info(f"Starting {self.num_workers} workers via ActualSubmissiveWorkerManager")
 
-        # Create SubmissiveManager to handle all worker lifecycle
-        self.worker_manager = SubmissiveManager(
+        # Create ActualSubmissiveWorkerManager to handle all worker lifecycle
+        self.worker_manager = ActualSubmissiveWorkerManager(
             num_workers=self.num_workers,
             max_memory=self.ram_bytes,
             source_dir=self.src_tmp,
@@ -438,7 +438,7 @@ class SecondaryMode:
         logger.info(f"All {len(self.worker_manager.workers)} workers initialized and reported to primary")
 
     def _request_task_callback(self, worker_id: int) -> None:
-        """Callback for SubmissiveManager to request tasks from primary.
+        """Callback for ActualSubmissiveWorkerManager to request tasks from primary.
 
         This is called synchronously, so we need to schedule the async work.
         """
@@ -521,11 +521,11 @@ class SecondaryMode:
         pass
 
     def _process_worker_updates(self) -> None:
-        """Process worker completion and status updates using WorkerManager"""
+        """Process worker completion and status updates using ActualSubmissiveWorkerManager"""
         if not self.worker_manager:
             return
 
-        # WorkerManager handles worker polling internally
+        # ActualSubmissiveWorkerManager handles worker polling internally
         # We just need to check for completed tasks and request new ones from primary
         # Note: In SLURM mode, we don't auto-reassign - we ask primary for tasks
         pass
@@ -888,7 +888,7 @@ class SecondaryMode:
             logger.error(f"Failed to create BinaryInfo: {e}")
             return
 
-        # Assign to worker via SubmissiveManager
+        # Assign to worker via ActualSubmissiveWorkerManager
         success = self.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
         if success:
             logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
@@ -1055,7 +1055,7 @@ class SecondaryMode:
                 logger.error(f"Failed to create BinaryInfo: {e}")
                 continue
 
-            # Assign to worker via SubmissiveManager
+            # Assign to worker via ActualSubmissiveWorkerManager
             success = self.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
 
             opp_str = " (opportunistic)" if opportunistic else ""

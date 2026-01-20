@@ -21,8 +21,8 @@ from typing import Any
 from ..binary_info import BinaryInfo
 from ..multi_computer.protocol import MessageType, TaskAssignmentMessage, TaskRequestMessage
 from ..task import TaskDefinition
-from .local_authoritive import LocalAuthoritiveManager
-from .local_submissive import LocalSubmissiveManager
+from .actual_authoritative import ActualAuthoritativeWorkerManager
+from .actual_submissive import ActualSubmissiveWorkerManager
 
 logger = logging.getLogger(__name__)
 
@@ -108,10 +108,10 @@ class NetworkSimulator:
         )
 
 
-class NetworkSimulatedSubmissiveManager(LocalSubmissiveManager):
+class NetworkSimulatedSubmissiveManager(ActualSubmissiveWorkerManager):
     """Submissive manager that communicates via network simulator.
 
-    This wraps LocalSubmissiveManager and intercepts task requests,
+    This wraps ActualSubmissiveWorkerManager and intercepts task requests,
     sending them through the network simulator instead of direct callbacks.
 
     Note: This is a relay manager that only handles network communication.
@@ -176,10 +176,10 @@ class NetworkSimulatedSubmissiveManager(LocalSubmissiveManager):
             logger.info(f"[NetSim-Sub] Processed {processed} assignment messages")
 
 
-class NetworkSimulatedAuthoritiveManager(LocalAuthoritiveManager):
+class NetworkSimulatedAuthoritiveManager(ActualAuthoritativeWorkerManager):
     """Authoritive manager that communicates via network simulator.
 
-    This wraps LocalAuthoritiveManager and intercepts task assignments,
+    This wraps ActualAuthoritativeWorkerManager and intercepts task assignments,
     sending them through the network simulator instead of direct callbacks.
 
     Note: This is a relay manager that only handles network communication.
@@ -194,7 +194,7 @@ class NetworkSimulatedAuthoritiveManager(LocalAuthoritiveManager):
         log_dir: Path,
         task_definition: TaskDefinition,
         network_sim: NetworkSimulator,
-        submissive_managers: list[LocalSubmissiveManager],
+        submissive_managers: list[ActualSubmissiveWorkerManager],
     ):
         self.network_sim = network_sim
         self.network_submissive_manager: NetworkSimulatedSubmissiveManager | None = None
@@ -260,7 +260,7 @@ def run_baseline_test(
             binary, estimated_memory = result
             submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
 
-    submissive_manager = LocalSubmissiveManager(
+    submissive_manager = ActualSubmissiveWorkerManager(
         num_workers=num_cores,
         max_memory=max_memory,
         source_dir=source_dir,
@@ -272,7 +272,7 @@ def run_baseline_test(
     )
 
     # Create authoritive manager
-    authoritive_manager = LocalAuthoritiveManager(
+    authoritive_manager = ActualAuthoritativeWorkerManager(
         num_workers=num_cores,
         max_memory=max_memory,
         log_dir=output_dir,

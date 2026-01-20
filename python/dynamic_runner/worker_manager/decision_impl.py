@@ -312,7 +312,7 @@ class DecisionWorkerManMixin:
                 # Don't discard from pending here - let assignment success or worker stop handle it
                 if worker_id in self.pending_worker_assignments:
                     if worker.current_binary is None:
-                        if not self._handle_worker_without_task(worker, worker_id, active_workers, True, False):
+                        if not self._handle_worker_without_task(worker, worker_id, active_workers, False, False):
                             continue
 
                 # Check worker status if it has a current task
@@ -330,14 +330,14 @@ class DecisionWorkerManMixin:
                             should_restart,
                             worker_id,
                             active_workers,
-                            allow_stop=True,
+                            allow_stop=False,
                             on_failure_increment_failed=True,
                             is_initial_phase=False,
                         )
                         continue
                 else:
                     # Worker has no task, try to assign one
-                    if not self._handle_worker_without_task(worker, worker_id, active_workers, True, False):
+                    if not self._handle_worker_without_task(worker, worker_id, active_workers, False, False):
                         continue
 
             import threading

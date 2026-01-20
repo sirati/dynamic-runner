@@ -24,7 +24,7 @@ from ....binary_info import BinaryInfo
 from ....multi_computer import ConnectionResult, FileTransferMode, PreparationResult
 from ....multi_computer.primary.coordinator import BaseCoordinator
 from ....task import TaskDefinition
-from ....worker_manager import LocalAuthoritiveManager, LocalSubmissiveManager
+from ....worker_manager import ActualAuthoritativeWorkerManager, ActualSubmissiveWorkerManager
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,8 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
         self.from_secondary_queues: dict[str, asyncio.Queue] = {}
 
         # Worker managers
-        self.submissive_managers: list[LocalSubmissiveManager] = []
-        self.authoritive_manager: LocalAuthoritiveManager | None = None
+        self.submissive_managers: list[ActualSubmissiveWorkerManager] = []
+        self.authoritive_manager: ActualAuthoritativeWorkerManager | None = None
 
         # Track which secondary is promoted to authoritive
         self.promoted_secondary_id: str | None = None
@@ -85,7 +85,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
             secondary_id = f"secondary-{i}"
 
             # Create submissive manager with placeholder callback
-            submissive = LocalSubmissiveManager(
+            submissive = ActualSubmissiveWorkerManager(
                 num_workers=self.num_workers_per_secondary,
                 max_memory=16 * 1024 * 1024 * 1024,  # 16GB default per secondary
                 source_dir=self.source_dir or Path.cwd(),
@@ -102,7 +102,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
             logger.info(f"Created submissive manager for {secondary_id} with {self.num_workers_per_secondary} workers")
 
         # Create authoritive manager that manages all submissive managers
-        self.authoritive_manager = LocalAuthoritiveManager(
+        self.authoritive_manager = ActualAuthoritativeWorkerManager(
             num_workers=total_workers,
             max_memory=16 * 1024 * 1024 * 1024 * num_secondaries,
             log_dir=self.output_dir,
@@ -233,7 +233,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
         """Perform preliminary assignment using existing authoritive manager.
 
         Override base implementation to use the authoritive manager we already created
-        in prepare() instead of creating new AuthoritiveManager instances.
+        in prepare() instead of creating new ActualAuthoritativeWorkerManager instances.
         """
         logger.info("Phase 5: Preliminary assignment (single-process)")
 
@@ -361,7 +361,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
 
         logger.info("Single-process cleanup complete")
 
-    def _get_submissive_for_secondary(self, secondary_id: str) -> LocalSubmissiveManager | None:
+    def _get_submissive_for_secondary(self, secondary_id: str) -> ActualSubmissiveWorkerManager | None:
         """Get submissive manager for a given secondary ID."""
         secondary_index = int(secondary_id.split("-")[1])
         if 0 <= secondary_index < len(self.submissive_managers):

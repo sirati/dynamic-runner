@@ -6,7 +6,7 @@ from typing import Any
 
 from ...models import WorkerState
 from ...task import TaskDefinition
-from ...worker_manager import SubmissiveManager
+from ...worker_manager import ActualSubmissiveWorkerManager
 from ..message_router import MessageRouter
 from ..quic_transport import QuicTransport
 from .connection import ConnectionManager
@@ -61,7 +61,7 @@ class SecondaryCoordinator:
         self.socket_dir.mkdir(parents=True, exist_ok=True)
 
         # Worker management
-        self.worker_manager: SubmissiveManager | None = None
+        self.worker_manager: ActualSubmissiveWorkerManager | None = None
         self.extracted_binaries: dict[str, Path] = {}  # hash -> extracted path
 
         # Task tracking

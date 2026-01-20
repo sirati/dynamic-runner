@@ -10,7 +10,7 @@ from typing import Any
 from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
 from ..worker.remote_worker import RemoteWorker
-from ..worker_manager import AuthoritiveManager, WorkerManager
+from ..worker_manager import ActualAuthoritativeWorkerManager
 from .message_router import MessageRouter
 from .quic_transport import QuicTransport
 
@@ -51,7 +51,7 @@ class PrimaryCoordinator:
 
         self.secondaries: dict[str, dict[str, Any]] = {}
         self.secondary_port_map: dict[str, int] = {}  # Map secondary_id to allocated port
-        self.worker_managers: dict[str, WorkerManager] = {}  # One WorkerManager per secondary
+        self.worker_managers: dict[str, ActualAuthoritativeWorkerManager] = {}  # One manager per secondary
         self.remote_workers: dict[str, list[RemoteWorker]] = {}  # Remote workers per secondary
         self.task_assignments: dict[str, str] = {}  # task_hash -> secondary_id
         self.completed_tasks: set[str] = set()
@@ -715,7 +715,7 @@ class PrimaryCoordinator:
         remote_worker.start()
         self.remote_workers[secondary_id].append(remote_worker)
 
-        # Initialize WorkerManager for this secondary if not exists
+        # Initialize ActualAuthoritativeWorkerManager for this secondary if not exists
         if secondary_id not in self.worker_managers:
             secondary_info = self.secondaries.get(secondary_id, {})
             ram_bytes = secondary_info.get("ram_bytes", 0)
@@ -725,7 +725,7 @@ class PrimaryCoordinator:
 
             temp_dir = Path(mkdtemp(prefix=f"remote_{secondary_id}_"))
 
-            self.worker_managers[secondary_id] = WorkerManager(
+            self.worker_managers[secondary_id] = ActualAuthoritativeWorkerManager(
                 num_workers=secondary_info.get("worker_count", 1),
                 max_memory=ram_bytes,
                 source_dir=temp_dir / "src",
@@ -739,8 +739,8 @@ class PrimaryCoordinator:
                 connection_mode="socketpair",
             )
 
-            # Replace the WorkerManager's workers list with our RemoteWorker instances
-            # This allows WorkerManager to use its logic with remote workers
+            # Replace the manager's workers list with our RemoteWorker instances
+            # This allows the manager to use its logic with remote workers
             self.worker_managers[secondary_id].workers = []
 
         # Track worker info in secondaries dict
@@ -787,9 +787,9 @@ class PrimaryCoordinator:
             end_idx = start_idx + binaries_per_secondary if idx < len(self.secondaries) - 1 else len(self.binaries)
             secondary_binaries = pending_binaries[start_idx:end_idx]
 
-            # Create AuthoritiveManager for this secondary
+            # Create ActualAuthoritativeWorkerManager for this secondary
             secondary_memory_limit = secondary_info.get("ram_bytes", 0)
-            manager = AuthoritiveManager(
+            manager = ActualAuthoritativeWorkerManager(
                 num_workers=len(remote_workers),
                 max_memory=secondary_memory_limit,
                 log_dir=Path.cwd() / "run" / self.run_id / "logs",

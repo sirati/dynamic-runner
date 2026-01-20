@@ -16,7 +16,7 @@ from typing import Any
 from ...binary_info import BinaryInfo
 from ...task import TaskDefinition
 from ...worker.remote_worker import RemoteWorker
-from ...worker_manager import AuthoritiveManager, WorkerManager
+from ...worker_manager import ActualAuthoritativeWorkerManager
 from .. import ConnectionResult, CoordinationPhase, FileTransferMode, PreparationResult
 from ..message_router import MessageRouter
 from ..quic_transport import QuicTransport
@@ -50,7 +50,7 @@ class BaseCoordinator:
         self.cert_dir = Path.cwd() / "run" / run_id / "certificates"
 
         self.secondaries: dict[str, dict[str, Any]] = {}
-        self.worker_managers: dict[str, WorkerManager] = {}  # One WorkerManager per secondary
+        self.worker_managers: dict[str, ActualAuthoritativeWorkerManager] = {}  # One manager per secondary
         self.remote_workers: dict[str, list[RemoteWorker]] = {}  # Remote workers per secondary
         self.task_assignments: dict[str, str] = {}  # task_hash -> secondary_id
         self.completed_tasks: set[str] = set()
@@ -453,7 +453,7 @@ class BaseCoordinator:
         """Phase 5: Preliminary task assignment
 
         This phase assigns initial tasks to workers on each secondary.
-        Assignment is done using the AuthoritiveManager for memory-aware scheduling.
+        Assignment is done using the ActualAuthoritativeWorkerManager for memory-aware scheduling.
         """
         logger.info("Phase 5: Preliminary assignment")
 
@@ -476,7 +476,7 @@ class BaseCoordinator:
             log_dir = Path.cwd() / "run" / self.run_id / "logs" / secondary_id
             log_dir.mkdir(parents=True, exist_ok=True)
 
-            manager = AuthoritiveManager(
+            manager = ActualAuthoritativeWorkerManager(
                 num_workers=info["num_workers"],
                 max_memory=info["ram_bytes"],
                 log_dir=log_dir,

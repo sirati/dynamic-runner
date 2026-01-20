@@ -191,9 +191,9 @@ class WorkerManagerBase(ABC):
         """Handle a task that was killed due to OOM.
 
         Override in subclasses to customize behavior:
-        - LocalManager: requeue to pending_binaries for local retry
-        - SubmissiveManager: add to oom_tasks to report to primary
-        - AuthoritiveManager: N/A (no OOM checking)
+        - LocalWorkerManager: requeue to pending_binaries for local retry
+        - ActualSubmissiveWorkerManager: add to oom_tasks to report to primary
+        - ActualAuthoritativeWorkerManager: N/A (no OOM checking)
         """
         pass
 
@@ -201,7 +201,7 @@ class WorkerManagerBase(ABC):
         """Check memory pressure and kill workers according to specification.
 
         Base implementation that can be overridden. By default does nothing.
-        LocalManager and SubmissiveManager override to enable OOM checking.
+        LocalWorkerManager and ActualSubmissiveWorkerManager override to enable OOM checking.
         """
         pass
 

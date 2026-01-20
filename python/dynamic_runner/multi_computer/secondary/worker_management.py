@@ -3,7 +3,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from ...worker_manager import SubmissiveManager
+from ...worker_manager import ActualSubmissiveWorkerManager
 
 if TYPE_CHECKING:
     from .coordinator import SecondaryCoordinator
@@ -18,11 +18,11 @@ class WorkerManager:
         self.coordinator = coordinator
 
     async def start_workers(self) -> None:
-        """Start worker processes using SubmissiveManager"""
-        logger.info(f"Starting {self.coordinator.num_workers} workers via SubmissiveManager")
+        """Start worker processes using ActualSubmissiveWorkerManager"""
+        logger.info(f"Starting {self.coordinator.num_workers} workers via ActualSubmissiveWorkerManager")
 
-        # Create SubmissiveManager to handle all worker lifecycle
-        self.coordinator.worker_manager = SubmissiveManager(
+        # Create ActualSubmissiveWorkerManager to handle all worker lifecycle
+        self.coordinator.worker_manager = ActualSubmissiveWorkerManager(
             num_workers=self.coordinator.num_workers,
             max_memory=self.coordinator.ram_bytes,
             source_dir=self.coordinator.src_tmp,
@@ -48,7 +48,7 @@ class WorkerManager:
         logger.info(f"All {len(self.coordinator.worker_manager.workers)} workers initialized and reported to primary")
 
     def _request_task_callback(self, worker_id: int) -> None:
-        """Callback for SubmissiveManager to request tasks from primary.
+        """Callback for ActualSubmissiveWorkerManager to request tasks from primary.
 
         This is called synchronously, so we need to schedule the async work.
         """

@@ -55,7 +55,7 @@ class AuthoritativeBase(WorkerManagerBase, ABC):
     def _check_memory_pressure_and_kill(self) -> None:
         """No OOM checking in authoritative manager - delegated to submissive managers."""
         # Authoritative manager does not perform OOM checking
-        # This is handled by SubmissiveManager on each worker node
+        # This is handled by ActualSubmissiveWorkerManager on each worker node
         pass
 
     @abstractmethod

@@ -250,7 +250,7 @@ class TaskHandler:
             logger.error(f"Failed to create BinaryInfo: {e}")
             return
 
-        # Assign to worker via SubmissiveManager
+        # Assign to worker via ActualSubmissiveWorkerManager
         success = self.coordinator.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
         if success:
             logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
@@ -401,7 +401,7 @@ class TaskHandler:
                 logger.error(f"Failed to create BinaryInfo: {e}")
                 continue
 
-            # Assign to worker via SubmissiveManager
+            # Assign to worker via ActualSubmissiveWorkerManager
             success = self.coordinator.worker_manager.assign_task_from_authoritive(
                 worker_id, binary_info, estimated_memory
             )

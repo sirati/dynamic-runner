@@ -1,17 +1,13 @@
 from .worker_manager import (
-    ActualAuthoritativeWorkerManager as AuthoritiveManager,
+    ActualAuthoritativeWorkerManager,
+    ActualSubmissiveWorkerManager,
+    LocalWorkerManager,
+    WorkerManagerBase,
 )
-from .worker_manager import (
-    ActualSubmissiveWorkerManager as SubmissiveManager,
-)
-from .worker_manager import LocalWorkerManager as LocalManager
-from .worker_manager import LocalWorkerManager as WorkerManager
-from .worker_manager import WorkerManagerBase
 
 __all__ = [
-    "WorkerManager",
+    "LocalWorkerManager",
     "WorkerManagerBase",
-    "LocalManager",
-    "AuthoritiveManager",
-    "SubmissiveManager",
+    "ActualAuthoritativeWorkerManager",
+    "ActualSubmissiveWorkerManager",
 ]
