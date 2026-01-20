@@ -10,8 +10,7 @@ from typing import Any
 from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
 from ..worker.remote_worker import RemoteWorker
-from ..worker_manager import WorkerManager
-from ..worker_manager.authoritive import AuthoritiveManager
+from ..worker_manager import AuthoritiveManager, WorkerManager
 from .message_router import MessageRouter
 from .quic_transport import QuicTransport
 
@@ -301,7 +300,7 @@ class PrimaryCoordinator:
         logger.error(f"SECONDARY ERROR from {secondary_id}")
         logger.error("=" * 80)
         logger.error(f"Error Type: {error_type}")multi-computer slurm instead")
-        
+
             # Validate multi-computer arguments
             if args.multi_computer:
                 if args.multi_computer == "slurm":

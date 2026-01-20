@@ -1,52 +1,62 @@
 """Base class for submissive worker managers.
 
 Submissive managers perform OOM checking but delegate task assignment decisions
-to an authoritative manager. They can work locally or over network.
+to an authoritive manager. They can work locally or over network.
 """
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from pathlib import Path
+from typing import Any
 
 from ..binary_info import BinaryInfo
 from ..comm import ErrorType
 from ..models import FailedTask
 from ..task import TaskDefinition
 from ..worker.base_worker import BaseWorker
-from .base import WorkerManagerBase
+from .local_base import LocalWorkerManagerBase
 
 
-class SubmissiveBase(WorkerManagerBase, ABC):
+class SubmissiveManagerBase(LocalWorkerManagerBase):
     """Base class for submissive worker managers.
 
     Submissive managers:
-    - Perform OOM checking and worker killing (via ExecutionWorkerManBaseImpl)
+    - Create and manage LocalWorker instances (subprocess-based)
+    - Perform OOM checking and worker killing
     - Do NOT autonomously assign tasks beyond initial phase
-    - Request tasks from authoritative manager (local or remote)
-    - Report OOM events to authoritative manager
+    - Request tasks from authoritive manager (local or remote)
     """
 
     def __init__(
         self,
         num_workers: int,
         max_memory: int,
-        log_dir: Path,
+        source_dir: Path,
+        output_dir: Path,
         task_definition: TaskDefinition,
-        always_restart_worker: bool = False,
+        task_args: Any,
+        skip_existing: bool,
+        manual_start_worker: bool = False,
+        connection_mode: str = "socketpair",
+        socket_dir: Path | None = None,
         enable_logging: bool = True,
-        **kwargs,
     ):
         super().__init__(
             num_workers=num_workers,
             max_memory=max_memory,
-            log_dir=log_dir,
+            source_dir=source_dir,
+            output_dir=output_dir,
             task_definition=task_definition,
-            always_restart_worker=always_restart_worker,
+            task_args=task_args,
+            skip_existing=skip_existing,
+            always_restart_worker=False,
+            manual_start_worker=manual_start_worker,
+            connection_mode=connection_mode,
+            socket_dir=socket_dir,
             enable_logging=enable_logging,
-            **kwargs,
         )
 
     def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None:
-        """Handle OOM killed task by reporting to authoritative manager (add to oom_tasks)."""
+        """Handle OOM killed task by reporting to authoritive manager (add to oom_tasks)."""
         self.oom_tasks.append(
             FailedTask(
                 binary=binary,
@@ -55,25 +65,9 @@ class SubmissiveBase(WorkerManagerBase, ABC):
             )
         )
 
-    def _assign_binary_to_worker_initial_phase(self, worker: BaseWorker) -> bool:
-        """Stub implementation for submissive base.
-
-        Submissive managers that have decision logic (via ExecutionWorkerManBaseImpl)
-        should override this. Pure submissive bases provide stub implementation.
-        """
-        return False
-
-    def _assign_binary_to_worker_normal(self, worker: BaseWorker, retry_attempt: bool = False) -> bool:
-        """Stub implementation for submissive base.
-
-        Submissive managers that have decision logic (via ExecutionWorkerManBaseImpl)
-        should override this. Pure submissive bases provide stub implementation.
-        """
-        return False
-
     @abstractmethod
-    def _request_task_from_authoritative(self, worker_id: int) -> None:
-        """Request a task from the authoritative manager for the given worker.
+    def _request_task_from_authoritive(self, worker_id: int) -> None:
+        """Request a task from the authoritive manager for the given worker.
 
         Must be implemented by subclasses (local or remote).
         """
@@ -89,18 +83,18 @@ class SubmissiveBase(WorkerManagerBase, ABC):
     ) -> bool:
         """Handle a worker that has no current task.
 
-        For submissive manager, after initial phase, request tasks from authoritative
+        For submissive manager, after initial phase, request tasks from authoritive
         instead of autonomously assigning from local pending queue.
         """
         if is_initial_phase:
-            # During initial phase, use base behavior (DecisionWorkerManMixin if present)
+            # During initial phase, use base behavior
             return super()._handle_worker_without_task(worker, worker_id, active_workers, allow_stop, is_initial_phase)
         else:
-            # After initial phase, request task from authoritative
+            # After initial phase, request task from authoritive
             if worker.ready and not worker.current_binary:
-                self.manager_logger.debug(f"[Worker {worker_id}] Requesting task from authoritative")
-                self._request_task_from_authoritative(worker_id)
-                # Keep worker active, waiting for authoritative assignment
+                self.manager_logger.debug(f"[Worker {worker_id}] Requesting task from authoritive")
+                self._request_task_from_authoritive(worker_id)
+                # Keep worker active, waiting for authoritive assignment
                 return True
 
             if not self.pending_binaries:
@@ -113,8 +107,8 @@ class SubmissiveBase(WorkerManagerBase, ABC):
             # Worker is idle but binaries remain - keep it in the loop
             return True
 
-    def assign_task_from_authoritative(self, worker_id: int, binary: BinaryInfo, estimated_memory: int) -> bool:
-        """Assign a task to a worker from authoritative manager.
+    def assign_task_from_authoritive(self, worker_id: int, binary: BinaryInfo, estimated_memory: int) -> bool:
+        """Assign a task to a worker from authoritive manager.
 
         Args:
             worker_id: Worker ID to assign to
@@ -140,7 +134,7 @@ class SubmissiveBase(WorkerManagerBase, ABC):
             size_mb = binary.size / (1024 * 1024)
             estimated_mb = estimated_memory / (1024 * 1024)
             self.manager_logger.info(
-                f"[Worker {worker_id}] Assigned from authoritative: {binary.path.name} "
+                f"[Worker {worker_id}] Assigned from authoritive: {binary.path.name} "
                 f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB)"
             )
         else:

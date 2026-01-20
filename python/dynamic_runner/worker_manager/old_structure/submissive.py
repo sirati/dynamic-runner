@@ -19,6 +19,9 @@ class SubmissiveManager(SubmissiveManagerBase):
     - Performs OOM checking and worker killing
     - Does NOT autonomously assign tasks beyond initial phase
     - Requests tasks from primary coordinator via callback (over network)
+
+    Note: This is a network relay manager. Logging is disabled by default
+    since it only forwards messages and doesn't perform the actual work.
     """
 
     def __init__(
@@ -46,6 +49,7 @@ class SubmissiveManager(SubmissiveManagerBase):
             manual_start_worker=manual_start_worker,
             connection_mode=connection_mode,
             socket_dir=socket_dir,
+            enable_logging=False,
         )
 
         self.request_task_callback = request_task_callback

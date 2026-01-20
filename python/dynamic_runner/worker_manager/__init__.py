@@ -2,35 +2,67 @@
 
 This package provides worker manager abstractions:
 - WorkerManagerBase: Base class with common worker management logic
-- LocalManager: Complete local worker management (current behavior)
-- AuthoritiveManagerBase: Base for task assignment managers
-- AuthoritiveManager: Task assignment without OOM checking (for primary, over network)
-- LocalAuthoritiveManager: Local task assignment (for testing master/slave locally)
-- SubmissiveManagerBase: Base for OOM checking managers
-- SubmissiveManager: OOM checking without task assignment (for secondary, over network)
-- LocalSubmissiveManager: Local OOM checking (for testing master/slave locally)
+- DecisionWorkerManMixin: Mixin for decision-making responsibilities
+- ExecutionWorkerManBaseImpl: Base for execution responsibilities (worker lifecycle, OOM)
+- AuthoritativeBase: Base for authoritative managers (no OOM checking)
+- SubmissiveBase: Base for submissive managers (request tasks from authoritative)
+- LocalWorkerManager: Complete local worker management (decision + execution)
+- ActualAuthoritativeWorkerManager: Authoritative with decision logic
+- RemoteAuthoritativeWorkerManager: Authoritative relay (network)
+- ActualSubmissiveWorkerManager: Submissive with execution logic
+- RemoteSubmissiveWorkerManager: Submissive relay (network)
+
+Legacy names for backward compatibility:
+- LocalManager -> LocalWorkerManager
+- AuthoritiveManager -> ActualAuthoritativeWorkerManager
+- SubmissiveManager -> ActualSubmissiveWorkerManager
+- LocalAuthoritiveManager -> ActualAuthoritativeWorkerManager
+- LocalSubmissiveManager -> ActualSubmissiveWorkerManager
 """
 
-from .authoritive import AuthoritiveManager
-from .authoritive_base import AuthoritiveManagerBase
+from .actual_authoritative import ActualAuthoritativeWorkerManager
+from .actual_submissive import ActualSubmissiveWorkerManager
+from .authoritative_base import AuthoritativeBase
 from .base import WorkerManagerBase
-from .local import LocalManager
-from .local_authoritive import LocalAuthoritiveManager
-from .local_submissive import LocalSubmissiveManager
-from .submissive import SubmissiveManager
-from .submissive_base import SubmissiveManagerBase
+from .decision_impl import DecisionWorkerManMixin
+from .execution_impl import ExecutionWorkerManBaseImpl
+from .local import LocalWorkerManager
+from .remote_authoritative import RemoteAuthoritativeWorkerManager
+from .remote_submissive import RemoteSubmissiveWorkerManager
+from .submissive_base import SubmissiveBase
 
-# WorkerManager is an alias for LocalManager for backward compatibility
-WorkerManager = LocalManager
+# Legacy aliases for backward compatibility
+LocalManager = LocalWorkerManager
+WorkerManager = LocalWorkerManager
+AuthoritiveManager = ActualAuthoritativeWorkerManager
+SubmissiveManager = ActualSubmissiveWorkerManager
+LocalAuthoritiveManager = ActualAuthoritativeWorkerManager
+LocalSubmissiveManager = ActualSubmissiveWorkerManager
+
+# Legacy base class names
+AuthoritiveManagerBase = AuthoritativeBase
+SubmissiveManagerBase = SubmissiveBase
 
 __all__ = [
+    # Core base classes
     "WorkerManagerBase",
-    "LocalManager",
-    "AuthoritiveManagerBase",
-    "AuthoritiveManager",
-    "LocalAuthoritiveManager",
-    "SubmissiveManagerBase",
-    "SubmissiveManager",
-    "LocalSubmissiveManager",
+    "DecisionWorkerManMixin",
+    "ExecutionWorkerManBaseImpl",
+    "AuthoritativeBase",
+    "SubmissiveBase",
+    # New concrete implementations
+    "LocalWorkerManager",
+    "ActualAuthoritativeWorkerManager",
+    "ActualSubmissiveWorkerManager",
+    "RemoteAuthoritativeWorkerManager",
+    "RemoteSubmissiveWorkerManager",
+    # Legacy aliases
     "WorkerManager",
+    "LocalManager",
+    "AuthoritiveManager",
+    "SubmissiveManager",
+    "LocalAuthoritiveManager",
+    "LocalSubmissiveManager",
+    "AuthoritiveManagerBase",
+    "SubmissiveManagerBase",
 ]

@@ -32,12 +32,15 @@ class WorkerManagerBase(ABC):
         log_dir: Path,
         task_definition: TaskDefinition,
         always_restart_worker: bool = False,
+        enable_logging: bool = True,
+        **kwargs,
     ):
         self.num_workers = num_workers
         self.max_memory = max_memory
         self.task_definition = task_definition
         self.reserved_memory_per_worker = task_definition.get_reserved_memory_per_worker()
         self.always_restart_worker = always_restart_worker
+        self.enable_logging = enable_logging
 
         # Generate random session ID
         self.session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
@@ -54,12 +57,15 @@ class WorkerManagerBase(ABC):
         self.stats = {"completed": 0, "total": 0, "skipped": 0, "errored": 0}
         self.idle_workers_logged: set[int] = set()
         self.in_oom_phase: bool = False
+        self.worker_assignment_failures: dict[int, int] = {}  # Track assignment failures per worker
 
         start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_dir = log_dir / start_time
         self.log_dir.mkdir(parents=True, exist_ok=True)
 
         self.manager_logger = self._setup_logger()
+        if not self.enable_logging:
+            self.manager_logger.disabled = True
 
         # Memory usage log file
         self.memuse_log_path = log_dir.parent / "memuse.log"
@@ -116,148 +122,21 @@ class WorkerManagerBase(ABC):
         """Create worker instances. Must be implemented by subclasses."""
         pass
 
+    @abstractmethod
     def _assign_binary_to_worker_initial_phase(self, worker: BaseWorker) -> bool:
-        """Assign binary during initial phase with opportunistic marking."""
-        # Don't assign to workers that aren't ready
-        if not worker.ready:
-            return False
+        """Assign binary during initial phase with opportunistic marking.
 
-        # Only assign once per worker during initial phase
-        if worker.has_received_initial_assignment:
-            return False
+        Must be implemented by subclasses (typically via DecisionWorkerManMixin).
+        """
+        pass
 
-        with self.lock:
-            if not self.pending_binaries:
-                return False
-
-            budget = worker.reserved_budget
-
-            # Find task that fits budget
-            for i, binary in enumerate(self.pending_binaries):
-                estimated = self.task_definition.estimate_memory(binary.size)
-
-                if estimated > budget:
-                    continue
-
-                # Check if assigning would exceed memory limit (only on first assignment)
-                would_exceed = (self.total_assigned_memory + estimated) > self.max_memory
-
-                # Assign the task
-                self.pending_binaries.pop(i)
-
-                # Track all assigned memory
-                self.total_assigned_memory += estimated
-
-                # Only mark as opportunistic on first assignment
-                if would_exceed:
-                    worker.opportunistic = True
-
-                success, error_msg = worker.assign_task(binary, estimated)
-                if not success:
-                    self.manager_logger.error(f"[Worker {worker.worker_id}] Assignment error: {error_msg}")
-                    self.pending_binaries.insert(i, binary)
-                    self.total_assigned_memory = max(0, self.total_assigned_memory - estimated)
-                    return False
-
-                worker.mark_busy(binary, estimated, worker.opportunistic)
-
-                size_mb = binary.size / (1024 * 1024)
-                estimated_mb = estimated / (1024 * 1024)
-                budget_mb = budget / (1024 * 1024)
-                opp_str = " (opportunistic)" if worker.opportunistic else ""
-                self.manager_logger.info(
-                    f"[Worker {worker.worker_id}] Assigned: {binary.path.name} "
-                    f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB){opp_str}"
-                )
-                return True
-
-            # No task fits
-            worker.idle = True
-            return False
-
+    @abstractmethod
     def _assign_binary_to_worker_normal(self, worker: BaseWorker, retry_attempt: bool = False) -> bool:
-        """Assign a binary to a worker during normal phase."""
-        # Don't assign to workers that aren't ready
-        if not worker.ready:
-            self.manager_logger.debug(f"[Worker {worker.worker_id}] Not ready, cannot assign")
-            return False
+        """Assign a binary to a worker during normal phase.
 
-        with self.lock:
-            if not self.pending_binaries:
-                return False
-
-            # Calculate available memory using actual memory usage
-            actual_total_usage = self._get_worker_actual_memory_usage()
-            available = self.max_memory - actual_total_usage
-
-            # Get idle workers ordered by budget
-            idle_workers = sorted(
-                [w for w in self.workers if w.idle and w.current_binary is None], key=lambda w: w.reserved_budget
-            )
-
-            if worker not in idle_workers:
-                self.manager_logger.debug(
-                    f"[Worker {worker.worker_id}] Not in idle_workers list "
-                    f"(idle={worker.idle}, current_binary={worker.current_binary})"
-                )
-                return False
-
-            worker_idle_index = idle_workers.index(worker)
-
-            # Assign temporary budget factor: 1st=1.5, 2nd=2, 3rd=3, etc.
-            if worker_idle_index == 0:
-                temp_factor = 1.5
-            elif worker_idle_index == 1:
-                temp_factor = 2.0
-            else:
-                temp_factor = float(worker_idle_index + 1)
-
-            # Determine budget to use
-            if worker.opportunistic:
-                temp_budget = available / temp_factor
-                effective_budget = min(worker.reserved_budget, temp_budget)
-            else:
-                effective_budget = worker.reserved_budget
-
-            # Find task that fits
-            for i, binary in enumerate(self.pending_binaries):
-                estimated = self.task_definition.estimate_memory(binary.size)
-
-                if estimated > effective_budget:
-                    continue
-
-                # Assign the task
-                self.pending_binaries.pop(i)
-
-                # Subtract from available only for opportunistic workers
-                if worker.opportunistic:
-                    available -= estimated
-
-                success, error_msg = worker.assign_task(binary, estimated)
-                if not success:
-                    self.manager_logger.error(f"[Worker {worker.worker_id}] Assignment error: {error_msg}")
-                    self.pending_binaries.insert(i, binary)
-                    worker.idle = True
-                    return False
-
-                worker.mark_busy(binary, estimated)
-                worker.idle = False
-
-                size_mb = binary.size / (1024 * 1024)
-                estimated_mb = estimated / (1024 * 1024)
-                budget_mb = effective_budget / (1024 * 1024)
-                self.manager_logger.info(
-                    f"[Worker {worker.worker_id}] Assigned: {binary.path.name} "
-                    f"(size: {size_mb:.2f}MB, est: {estimated_mb:.2f}MB, budget: {budget_mb:.2f}MB)"
-                )
-                return True
-
-            # No task fits - log if first time staying idle after completion
-            if not retry_attempt and worker.worker_id not in self.idle_workers_logged:
-                self.idle_workers_logged.add(worker.worker_id)
-                self.manager_logger.info(f"[Worker {worker.worker_id}] Staying idle - no fitting task")
-
-            return False
+        Must be implemented by subclasses (typically via DecisionWorkerManMixin).
+        """
+        pass
 
     def _worker_completed(self, worker: BaseWorker, result: TaskResult) -> None:
         """Mark worker as completed and release memory."""
@@ -277,18 +156,25 @@ class WorkerManagerBase(ABC):
                 binary_name = binary.path.name if binary else "unknown"
                 self.manager_logger.info(f"[Worker {worker.worker_id}] Completed: {binary_name}")
             else:
+                binary_name = binary.path.name if binary else "unknown"
+                error_type_str = result.error_type.value if result.error_type else "UNKNOWN"
+                error_msg = result.error_message or "No error message"
+
                 if result.error_type == ErrorType.OUT_OF_MEMORY:
                     self.oom_tasks.append(
                         FailedTask(binary=binary, error_type=result.error_type, error_message=result.error_message)
                     )
-                    binary_name = binary.path.name if binary else "unknown"
-                    self.manager_logger.warning(f"[Worker {worker.worker_id}] OOM: {binary_name}")
-                elif result.error_type != ErrorType.NON_RECOVERABLE:
+                    self.manager_logger.warning(
+                        f"[Worker {worker.worker_id}] OOM: {binary_name} - {error_type_str}: {error_msg}"
+                    )
+                else:
+                    # All non-OOM errors (including NON_RECOVERABLE) go to failed_tasks
                     self.failed_tasks.append(
                         FailedTask(binary=binary, error_type=result.error_type, error_message=result.error_message)
                     )
-                    binary_name = binary.path.name if binary else "unknown"
-                    self.manager_logger.warning(f"[Worker {worker.worker_id}] Failed: {binary_name}")
+                    self.manager_logger.warning(
+                        f"[Worker {worker.worker_id}] Failed: {binary_name} - {error_type_str}: {error_msg}"
+                    )
 
         # Mark worker as idle and ready for reassignment
         worker.clear_task()
@@ -318,6 +204,50 @@ class WorkerManagerBase(ABC):
         LocalManager and SubmissiveManager override to enable OOM checking.
         """
         pass
+
+    def handle_assignment_failure(self, worker: BaseWorker, error_msg: str) -> bool:
+        """Handle assignment failure by restarting worker with retry logic.
+
+        Args:
+            worker: Worker that failed to receive assignment
+            error_msg: Error message from assignment failure
+
+        Returns:
+            True if worker was restarted successfully, False if max retries exceeded
+
+        Raises:
+            RuntimeError: If worker fails to restart after 3 attempts
+        """
+        worker_id = worker.worker_id
+
+        # Track failures
+        if worker_id not in self.worker_assignment_failures:
+            self.worker_assignment_failures[worker_id] = 0
+
+        self.worker_assignment_failures[worker_id] += 1
+        failure_count = self.worker_assignment_failures[worker_id]
+
+        self.manager_logger.warning(f"[Worker {worker_id}] Assignment failure #{failure_count}: {error_msg}")
+
+        if failure_count >= 3:
+            self.manager_logger.error(
+                f"[Worker {worker_id}] Failed to assign task after {failure_count} attempts. "
+                "Worker communication is broken. Manager will crash."
+            )
+            raise RuntimeError(
+                f"Worker {worker_id} failed to receive assignments after {failure_count} attempts. "
+                "Communication channel is broken."
+            )
+
+        # Try to restart the worker
+        self.manager_logger.info(f"[Worker {worker_id}] Attempting restart (attempt {failure_count}/3)")
+        if worker.restart():
+            self.pending_worker_assignments.add(worker_id)
+            self.manager_logger.info(f"[Worker {worker_id}] Restart successful, added to pending assignments")
+            return True
+        else:
+            self.manager_logger.error(f"[Worker {worker_id}] Restart failed")
+            return False
 
     def _handle_worker_without_task(
         self,
@@ -350,6 +280,8 @@ class WorkerManagerBase(ABC):
             if allow_stop:
                 worker.terminate()
                 self.manager_logger.info(f"[Worker {worker_id}] Stopping (no more tasks)")
+                # Remove from pending_worker_assignments when stopping
+                self.pending_worker_assignments.discard(worker_id)
             # Remove from active workers (but don't stop if allow_stop=False)
             active_workers.discard(worker_id)
             return False
@@ -378,16 +310,27 @@ class WorkerManagerBase(ABC):
         if should_restart:
             self._worker_completed(worker, result)
             if worker.restart():
+                self.manager_logger.info(f"[Worker {worker_id}] Restarted successfully after error")
                 self.pending_worker_assignments.add(worker_id)
+            else:
+                self.manager_logger.error(f"[Worker {worker_id}] Failed to restart after error")
             return
 
         if not task_completed:
             return
 
         if result.error_type == ErrorType.NON_RECOVERABLE:
-            self.manager_logger.error(f"[Worker {worker_id}] Non-recoverable error, restarting")
+            binary_name = worker.current_binary.path.name if worker.current_binary else "unknown"
+            error_msg = result.error_message or "No error message"
+            self.manager_logger.error(
+                f"[Worker {worker_id}] Non-recoverable error: {binary_name} - {error_msg}, restarting worker"
+            )
             self._worker_completed(worker, result)
-            worker.restart()
+            if worker.restart():
+                self.manager_logger.info(f"[Worker {worker_id}] Restarted successfully after non-recoverable error")
+                self.pending_worker_assignments.add(worker_id)
+            else:
+                self.manager_logger.error(f"[Worker {worker_id}] Failed to restart after non-recoverable error")
             return
 
         if on_failure_increment_failed and not result.success:
@@ -560,6 +503,10 @@ class WorkerManagerBase(ABC):
 
     def _initialize_workers(self) -> None:
         """Initialize all worker processes."""
+        # Skip if workers already initialized
+        if self.workers:
+            return
+
         self.workers = self._create_workers()
 
         # Set initial budgets
@@ -575,6 +522,15 @@ class WorkerManagerBase(ABC):
 
         # Wait for all workers to be ready before proceeding
         self._wait_for_workers_ready()
+
+    def initialize_workers_only(self) -> None:
+        """Initialize workers without starting full processing.
+
+        This is used in test-master-slave mode where workers need to be created
+        before the authoritative manager can reference them.
+        """
+        if not self.workers:
+            self._initialize_workers()
 
     def _run_initial_assignments(self) -> None:
         """Perform initial assignment phase - assign first task to each worker."""
@@ -632,6 +588,17 @@ class WorkerManagerBase(ABC):
             return
 
         self.manager_logger.info(f"[Retry Phase] Starting retry of {len(self.failed_tasks)} failed tasks")
+
+        # Restart workers that are not alive or not ready before retry phase
+        for worker in self.workers:
+            if not worker.is_alive() or not worker.ready:
+                self.manager_logger.info(
+                    f"[Worker {worker.worker_id}] Restarting for retry phase (alive={worker.is_alive()}, ready={worker.ready})"
+                )
+                if worker.restart():
+                    self.pending_worker_assignments.add(worker.worker_id)
+                else:
+                    self.manager_logger.error(f"[Worker {worker.worker_id}] Failed to restart for retry phase")
 
         # Reactivate all workers for retry phase
         process_retry_phase(

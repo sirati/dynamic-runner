@@ -3,7 +3,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from ...worker_manager.submissive import SubmissiveManager
+from ...worker_manager import SubmissiveManager
 
 if TYPE_CHECKING:
     from .coordinator import SecondaryCoordinator

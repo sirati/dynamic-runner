@@ -29,6 +29,7 @@ class AuthoritiveManagerBase(WorkerManagerBase, ABC):
         log_dir: Path,
         task_definition: TaskDefinition,
         workers: list[BaseWorker] | None = None,
+        enable_logging: bool = True,
     ):
         # Workers can be provided externally (RemoteWorker or LocalWorker instances)
         # Set this BEFORE calling super().__init__() so _create_workers() can access it
@@ -40,6 +41,7 @@ class AuthoritiveManagerBase(WorkerManagerBase, ABC):
             log_dir=log_dir,
             task_definition=task_definition,
             always_restart_worker=False,
+            enable_logging=enable_logging,
         )
 
     def _create_workers(self) -> list[BaseWorker]:

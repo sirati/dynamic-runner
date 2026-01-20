@@ -114,9 +114,9 @@ class TokenizerTask(TaskDefinition):
         # The value "auto" tells tokenizer to extract platform from filename
         cmd_args = ["--platform", "auto"]
 
-        # Add simulate-crash if provided
-        if hasattr(args, "simulate_crash") and args.simulate_crash is not None:
-            cmd_args.extend(["--simulate-crash", str(args.simulate_crash)])
+        # Add simulate-errors if provided
+        if hasattr(args, "simulate_errors") and args.simulate_errors is not None:
+            cmd_args.extend(["--simulate-errors", str(args.simulate_errors)])
 
         return cmd_args
 

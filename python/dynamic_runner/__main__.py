@@ -141,10 +141,10 @@ def main():
     )
 
     parser.add_argument(
-        "--simulate-crash",
+        "--simulate-errors",
         type=float,
         metavar="PERCENTAGE",
-        help="Simulate random worker crashes with given percentage chance (0-100)",
+        help="Simulate random worker error on a task with given percentage chance (0-100)",
     )
 
     # SLURM distributed processing arguments
@@ -249,6 +249,12 @@ def main():
         "--test-master-slave",
         action="store_true",
         help="Test master/slave architecture locally without networking (uses local_submissive and local_authoritive)",
+    )
+
+    parser.add_argument(
+        "--test-master-slave-netsim",
+        action="store_true",
+        help="Test master/slave with network simulation (uses message queues to verify network protocol compatibility)",
     )
 
     args = parser.parse_args()
@@ -609,8 +615,29 @@ def main():
             logger.info("No binaries to process after filtering")
             return
 
+    # Check if test-master-slave-netsim mode is enabled (network simulation)
+    if args.test_master_slave_netsim:
+        from .worker_manager.test_network_sim import run_network_sim_test
+
+        logger.info("=" * 60)
+        logger.info("TEST MASTER-SLAVE NETWORK SIMULATION")
+        logger.info("=" * 60)
+        logger.info("Testing submissive/authoritive coordination via network message queues")
+        logger.info("")
+
+        # Run network simulation test (message queues)
+        run_network_sim_test(
+            binaries=sorted_binaries,
+            task_definition=task,
+            task_args=args,
+            source_dir=config.source_dir,
+            output_dir=config.output_dir,
+            num_cores=num_cores,
+            max_memory=max_memory,
+        )
+
     # Check if test-master-slave mode is enabled
-    if args.test_master_slave:
+    elif args.test_master_slave:
         from .worker_manager import LocalAuthoritiveManager, LocalSubmissiveManager
 
         logger.info("=" * 60)
@@ -641,6 +668,9 @@ def main():
             socket_dir=Path(args.socket_dir) if args.socket_dir else None,
         )
 
+        # Initialize workers in submissive manager before creating authoritive
+        submissive_manager.initialize_workers_only()
+
         # Create authoritive manager with the submissive's workers
         authoritive_manager = LocalAuthoritiveManager(
             num_workers=num_cores,
@@ -649,6 +679,9 @@ def main():
             task_definition=task,
             submissive_managers=[submissive_manager],
         )
+
+        # Set pending binaries on authoritative manager (it needs the task queue)
+        authoritive_manager.set_pending_binaries(sorted_binaries)
 
         # Process binaries through the submissive (which will coordinate with authoritive)
         submissive_manager.process_binaries(sorted_binaries)

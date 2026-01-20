@@ -19,7 +19,7 @@ from ..models import WorkerState
 from ..multi_computer.message_router import MessageRouter
 from ..multi_computer.quic_transport import QuicPeerInfo, QuicTransport
 from ..task import TaskDefinition
-from ..worker_manager.submissive import SubmissiveManager
+from ..worker_manager import SubmissiveManager
 
 logger = logging.getLogger(__name__)
 

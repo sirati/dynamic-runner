@@ -10,17 +10,16 @@ from typing import Any
 from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
 from ..worker.base_worker import BaseWorker
-from .decision_impl import DecisionWorkerManMixin
-from .execution_impl import ExecutionWorkerManBaseImpl
+from .local_base import LocalWorkerManagerBase
 
 
-class LocalWorkerManager(DecisionWorkerManMixin, ExecutionWorkerManBaseImpl):
+class LocalManager(LocalWorkerManagerBase):
     """Local worker manager with full local subprocess management.
 
     This manager:
     - Creates and manages LocalWorker instances (subprocess-based)
-    - Performs task assignments (decision responsibility via mixin)
-    - Performs OOM checking and worker killing (execution responsibility)
+    - Performs task assignments
+    - Performs OOM checking and worker killing
     - Maintains exact behavior of original WorkerManager
     """
 
@@ -38,22 +37,19 @@ class LocalWorkerManager(DecisionWorkerManMixin, ExecutionWorkerManBaseImpl):
         manual_start_worker: bool = False,
         connection_mode: str = "socketpair",
         socket_dir: Path | None = None,
-        enable_logging: bool = True,
     ):
         super().__init__(
             num_workers=num_workers,
             max_memory=max_memory,
-            log_dir=output_dir / "logs",
-            task_definition=task_definition,
             source_dir=source_dir,
             output_dir=output_dir,
+            task_definition=task_definition,
             task_args=task_args,
             skip_existing=skip_existing,
             always_restart_worker=always_restart_worker,
             manual_start_worker=manual_start_worker,
             connection_mode=connection_mode,
             socket_dir=socket_dir,
-            enable_logging=enable_logging,
         )
 
         self.print_pid = print_pid

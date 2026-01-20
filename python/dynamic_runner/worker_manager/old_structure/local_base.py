@@ -37,6 +37,7 @@ class LocalWorkerManagerBase(WorkerManagerBase):
         manual_start_worker: bool = False,
         connection_mode: str = "socketpair",
         socket_dir: Path | None = None,
+        enable_logging: bool = True,
     ):
         super().__init__(
             num_workers=num_workers,
@@ -44,6 +45,7 @@ class LocalWorkerManagerBase(WorkerManagerBase):
             log_dir=output_dir / "logs",
             task_definition=task_definition,
             always_restart_worker=always_restart_worker,
+            enable_logging=enable_logging,
         )
 
         self.source_dir = source_dir

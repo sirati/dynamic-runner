@@ -6,7 +6,7 @@ from typing import Any
 
 from ...models import WorkerState
 from ...task import TaskDefinition
-from ...worker_manager.submissive import SubmissiveManager
+from ...worker_manager import SubmissiveManager
 from ..message_router import MessageRouter
 from ..quic_transport import QuicTransport
 from .connection import ConnectionManager

@@ -1,27 +1,26 @@
-"""Local worker manager implementation for subprocess-based workers.
+"""Actual submissive worker manager implementation.
 
-This manager maintains the exact behavior of the original WorkerManager,
-managing local subprocess workers with full OOM checking and task assignment.
+This manager performs execution responsibilities (worker lifecycle, OOM checking)
+and provides submissive API, but does NOT perform assignment decisions
+(requests tasks from authoritative manager).
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from ..binary_info import BinaryInfo
 from ..task import TaskDefinition
-from ..worker.base_worker import BaseWorker
-from .decision_impl import DecisionWorkerManMixin
 from .execution_impl import ExecutionWorkerManBaseImpl
+from .submissive_base import SubmissiveBase
 
 
-class LocalWorkerManager(DecisionWorkerManMixin, ExecutionWorkerManBaseImpl):
-    """Local worker manager with full local subprocess management.
+class ActualSubmissiveWorkerManager(ExecutionWorkerManBaseImpl, SubmissiveBase):
+    """Actual submissive worker manager for secondary nodes.
 
     This manager:
     - Creates and manages LocalWorker instances (subprocess-based)
-    - Performs task assignments (decision responsibility via mixin)
     - Performs OOM checking and worker killing (execution responsibility)
-    - Maintains exact behavior of original WorkerManager
+    - Does NOT autonomously assign tasks beyond initial phase
+    - Requests tasks from authoritative manager via callback
     """
 
     def __init__(
@@ -33,13 +32,17 @@ class LocalWorkerManager(DecisionWorkerManMixin, ExecutionWorkerManBaseImpl):
         task_definition: TaskDefinition,
         task_args: Any,
         skip_existing: bool,
-        print_pid: bool,
-        always_restart_worker: bool = False,
+        request_task_callback: Callable[[int], None],
         manual_start_worker: bool = False,
         connection_mode: str = "socketpair",
         socket_dir: Path | None = None,
         enable_logging: bool = True,
     ):
+        # Store callback before calling super().__init__
+        self.request_task_callback = request_task_callback
+
+        # Call super().__init__ which will follow MRO:
+        # ActualSubmissiveWorkerManager -> ExecutionWorkerManBaseImpl -> SubmissiveBase -> WorkerManagerBase
         super().__init__(
             num_workers=num_workers,
             max_memory=max_memory,
@@ -49,15 +52,13 @@ class LocalWorkerManager(DecisionWorkerManMixin, ExecutionWorkerManBaseImpl):
             output_dir=output_dir,
             task_args=task_args,
             skip_existing=skip_existing,
-            always_restart_worker=always_restart_worker,
+            always_restart_worker=False,
             manual_start_worker=manual_start_worker,
             connection_mode=connection_mode,
             socket_dir=socket_dir,
             enable_logging=enable_logging,
         )
 
-        self.print_pid = print_pid
-
-    def _handle_oom_killed_task(self, worker: BaseWorker, binary: BinaryInfo, reason: str) -> None:
-        """Handle OOM killed task by requeueing locally for retry."""
-        self.pending_binaries.insert(0, binary)
+    def _request_task_from_authoritative(self, worker_id: int) -> None:
+        """Request a task from the authoritative manager via callback."""
+        self.request_task_callback(worker_id)

@@ -16,8 +16,7 @@ from typing import Any
 from ...binary_info import BinaryInfo
 from ...task import TaskDefinition
 from ...worker.remote_worker import RemoteWorker
-from ...worker_manager import WorkerManager
-from ...worker_manager.authoritive import AuthoritiveManager
+from ...worker_manager import AuthoritiveManager, WorkerManager
 from .. import ConnectionResult, CoordinationPhase, FileTransferMode, PreparationResult
 from ..message_router import MessageRouter
 from ..quic_transport import QuicTransport
