@@ -815,6 +815,9 @@ def main():
             skip_existing=args.skip_existing,
             always_restart_worker=args.always_restart_worker,
             print_pid=args.pid,
+            connection_mode=args.connection_mode,
+            socket_dir=args.socket_dir,
+            manual_start_worker=args.manual_start_worker,
         )
 
         rust_manager.process_binaries(sorted_binaries)
