@@ -361,7 +361,14 @@ impl PyLocalManager {
 
     /// Process a list of PyBinaryInfo objects.
     fn process_binaries(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
-        let rust_binaries = extract_binaries(binaries)?;
+        let mut rust_binaries = extract_binaries(binaries)?;
+
+        // Convert absolute paths to relative (matching Python's relative_to(source_dir))
+        for binary in &mut rust_binaries {
+            if let Ok(rel) = binary.path.strip_prefix(&self.source_dir) {
+                binary.path = rel.to_path_buf();
+            }
+        }
 
         let estimator = PyMemoryEstimatorBridge {
             slope: self.estimator_slope,
