@@ -903,7 +903,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
     /// it is killed and restarted with a Recoverable error.
     async fn check_timeouts(
         &mut self,
-        active_workers: &mut HashSet<WorkerId>,
+        _active_workers: &mut HashSet<WorkerId>,
         on_failure_increment_failed: bool,
         factory: &mut impl WorkerFactory<M>,
     ) {
