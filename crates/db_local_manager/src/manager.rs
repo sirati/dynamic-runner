@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use db_comm_api_base::{
     BinaryInfo, ErrorType, FailedTask, Identifier, ManagerEndpoint, MemoryBytes, TaskResult, WorkerId,
@@ -18,6 +19,9 @@ pub struct LocalManagerConfig {
     pub always_restart_worker: bool,
     pub print_pid: bool,
     pub memuse_log_path: Option<std::path::PathBuf>,
+    /// Phase name → timeout duration. If a worker is in a phase with a timeout
+    /// and hasn't sent a keepalive within that duration, it is killed and restarted.
+    pub stage_timeouts: HashMap<String, Duration>,
 }
 
 /// Callback trait for spawning/restarting worker transports.
@@ -469,6 +473,9 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 self.check_oom();
             }
 
+            // Check for worker timeouts
+            self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
+
             if !active_workers.is_empty() {
                 tokio::task::yield_now().await;
             }
@@ -749,9 +756,13 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 phase_name,
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
+                let worker = &mut self.workers[worker_id as usize];
+                worker.phase = Some(phase_name);
+                worker.last_keepalive = Some(Instant::now());
             }
             WorkerEvent::Keepalive { worker_id } => {
                 tracing::trace!(worker_id, "keepalive");
+                self.workers[worker_id as usize].last_keepalive = Some(Instant::now());
             }
         }
     }
@@ -884,6 +895,74 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                     }
                 }
             }
+        }
+    }
+
+    /// Check all workers for phase-based timeouts. If a worker has been in a
+    /// timed phase longer than the configured timeout without a keepalive,
+    /// it is killed and restarted with a Recoverable error.
+    async fn check_timeouts(
+        &mut self,
+        active_workers: &mut HashSet<WorkerId>,
+        on_failure_increment_failed: bool,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
+        if self.config.stage_timeouts.is_empty() {
+            return;
+        }
+
+        let mut timed_out = Vec::new();
+        for worker in &self.workers {
+            if let (Some(phase), Some(last_keepalive)) = (&worker.phase, worker.last_keepalive) {
+                if let Some(timeout) = self.config.stage_timeouts.get(phase) {
+                    if last_keepalive.elapsed() > *timeout {
+                        timed_out.push((worker.worker_id, phase.clone()));
+                    }
+                }
+            }
+        }
+
+        for (worker_id, phase) in timed_out {
+            let binary_name = self.workers[worker_id as usize]
+                .current_binary
+                .as_ref()
+                .and_then(|b| b.path.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into());
+
+            tracing::warn!(
+                worker_id,
+                phase = %phase,
+                binary = %binary_name,
+                "worker timed out"
+            );
+
+            // Record as recoverable error
+            let binary = self.workers[worker_id as usize].current_binary.clone();
+            let actual_mem = self.workers[worker_id as usize].actual_memory_usage;
+            let estimated = self.workers[worker_id as usize].estimated_memory;
+
+            self.log_memory_usage(binary.as_ref(), estimated, actual_mem, true);
+
+            let result = TaskResult::error(
+                ErrorType::Recoverable,
+                format!("Worker timeout in phase {phase}"),
+            );
+            self.record_result(&result, binary.as_ref());
+
+            if on_failure_increment_failed {
+                self.stats.errored += 1;
+            }
+
+            // Release estimated memory
+            let worker = &self.workers[worker_id as usize];
+            if worker.has_initial_assignment && !worker.opportunistic {
+                self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated);
+            }
+
+            // Restart the worker
+            self.restart_worker(worker_id, factory).await;
+            self.pending_worker_assignments.insert(worker_id);
         }
     }
 
@@ -1060,6 +1139,7 @@ mod tests {
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
+            stage_timeouts: HashMap::new(),
         }
     }
 
@@ -1234,6 +1314,7 @@ mod tests {
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: Some(memuse_path.clone()),
+            stage_timeouts: HashMap::new(),
         };
 
         let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));

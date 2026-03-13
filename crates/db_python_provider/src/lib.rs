@@ -282,6 +282,7 @@ struct PyLocalManager {
     skip_existing: bool,
     estimator_slope: f64,
     estimator_intercept: f64,
+    stage_timeouts: std::collections::HashMap<String, std::time::Duration>,
     stats: Option<ProcessingStats>,
     failed_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
     oom_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
@@ -316,6 +317,22 @@ impl PyLocalManager {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
+
+        // Extract stage timeouts from task_definition.get_stages()
+        let mut stage_timeouts = std::collections::HashMap::new();
+        let stages: Vec<Bound<'_, PyAny>> = task_definition.call_method0("get_stages")?.extract()?;
+        for stage in &stages {
+            let phase = stage.getattr("phase")?;
+            let phase_name: String = phase.getattr("value")?.extract()?;
+            let timeout_obj = stage.getattr("timeout_seconds")?;
+            if !timeout_obj.is_none() {
+                let timeout_secs: f64 = timeout_obj.extract()?;
+                stage_timeouts.insert(
+                    phase_name,
+                    std::time::Duration::from_secs_f64(timeout_secs),
+                );
+            }
+        }
 
         // Extract worker module
         let worker_module: String = task_definition
@@ -353,6 +370,7 @@ impl PyLocalManager {
             skip_existing,
             estimator_slope: bridge.slope,
             estimator_intercept: bridge.intercept,
+            stage_timeouts,
             stats: None,
             failed_tasks: Vec::new(),
             oom_tasks: Vec::new(),
@@ -383,6 +401,7 @@ impl PyLocalManager {
             always_restart_worker: self.always_restart_worker,
             print_pid: self.print_pid,
             memuse_log_path,
+            stage_timeouts: self.stage_timeouts.clone(),
         };
 
         let mut factory = SubprocessWorkerFactory {

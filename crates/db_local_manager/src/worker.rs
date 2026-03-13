@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use db_comm_api_base::{
     BinaryInfo, ErrorType, Identifier, ManagerEndpoint, MemoryBytes, TaskResult, WorkerId,
 };
@@ -47,6 +49,10 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub actual_memory_usage: MemoryBytes,
     pub assignment_failure_count: u32,
     pub pid: Option<u32>,
+    /// Current processing phase name (set by PhaseUpdate messages).
+    pub phase: Option<String>,
+    /// Timestamp of the last keepalive or phase update.
+    pub last_keepalive: Option<Instant>,
     protocol: RunnerProtocolState<M>,
 }
 
@@ -64,6 +70,8 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
             actual_memory_usage: 0,
             assignment_failure_count: 0,
             pid: None,
+            phase: None,
+            last_keepalive: None,
             protocol: RunnerProtocolState::WaitingForReady(waiting),
         }
     }
@@ -230,6 +238,8 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
         self.current_binary = None;
         self.estimated_memory = 0;
         self.idle = true;
+        self.phase = None;
+        self.last_keepalive = None;
     }
 
     /// Mark this worker as OOM-killed: clear task, mark opportunistic.

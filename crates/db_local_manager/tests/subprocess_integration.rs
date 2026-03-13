@@ -117,6 +117,7 @@ async fn single_worker_subprocess_processes_all() {
         always_restart_worker: false,
         print_pid: false,
         memuse_log_path: None,
+        stage_timeouts: std::collections::HashMap::new(),
     };
 
     let mut factory = PythonWorkerFactory {
@@ -162,6 +163,7 @@ async fn multi_worker_subprocess_processes_all() {
         always_restart_worker: false,
         print_pid: false,
         memuse_log_path: None,
+        stage_timeouts: std::collections::HashMap::new(),
     };
 
     let mut factory = PythonWorkerFactory {
