@@ -368,8 +368,35 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             "starting unassigned phase"
         );
 
-        let tasks: Vec<BinaryInfo<I>> = self.unassigned_tasks.drain(..).collect();
-        for task in tasks {
+        // Sort by size (smallest first) matching Python behavior
+        self.unassigned_tasks.sort_by_key(|b| b.size);
+
+        // Filter out binaries if free system memory is critically low (< 300MB)
+        const LOW_MEMORY_THRESHOLD: u64 = 300 * 1024 * 1024;
+        let mut kept = Vec::new();
+        for task in self.unassigned_tasks.drain(..) {
+            let free_mem = Self::get_free_system_memory();
+            if free_mem > 0 && free_mem < LOW_MEMORY_THRESHOLD {
+                let name = task.path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                tracing::warn!(
+                    binary = %name,
+                    free_mb = free_mem / (1024 * 1024),
+                    "skipping unassigned binary due to low system memory"
+                );
+                // Don't process, just skip
+                continue;
+            }
+            kept.push(task);
+        }
+
+        if kept.is_empty() {
+            tracing::info!("all unassigned tasks skipped due to low memory");
+            return;
+        }
+
+        for task in kept {
             self.pending_binaries.push(task);
         }
 
@@ -1007,6 +1034,31 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 worker.mark_oom_killed();
             }
             OomDecision::NoAction => {}
+        }
+    }
+
+    /// Read free system memory from /proc/meminfo (Linux only).
+    /// Returns 0 on non-Linux or if the file can't be read.
+    fn get_free_system_memory() -> MemoryBytes {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+                for line in contents.lines() {
+                    if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                        let rest = rest.trim();
+                        if let Some(kb_str) = rest.strip_suffix("kB").or_else(|| rest.strip_suffix(" kB")) {
+                            if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                                return kb * 1024;
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
         }
     }
 
