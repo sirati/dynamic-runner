@@ -710,8 +710,27 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                     error = ?result.error_message,
                     "worker disconnected"
                 );
+                // Log memory usage before recording result
+                self.log_memory_usage(binary.as_ref(), 0, true);
+
+                // Release estimated memory (matching handle_task_completed logic)
+                let worker = &self.workers[worker_id as usize];
+                if worker.has_initial_assignment && !worker.opportunistic {
+                    let est = worker.estimated_memory;
+                    self.total_assigned_memory = self.total_assigned_memory.saturating_sub(est);
+                }
+
                 self.record_result(&result, binary.as_ref());
-                active_workers.remove(&worker_id);
+
+                if on_failure_increment_failed {
+                    self.stats.errored += 1;
+                }
+
+                // Restart worker and keep it in the active set (matching Python's
+                // _handle_monitor_result which restarts on NonRecoverable errors)
+                tracing::info!(worker_id, "restarting worker after disconnect/non-recoverable error");
+                self.restart_worker(worker_id, factory).await;
+                self.pending_worker_assignments.insert(worker_id);
             }
             WorkerEvent::Ready { worker_id } => {
                 tracing::info!(worker_id, "worker became ready");
