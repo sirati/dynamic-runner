@@ -402,6 +402,12 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             for worker_id in worker_ids {
                 let idx = worker_id as usize;
 
+                // In main phase, check OOM per-worker (matching Python's decision_impl.py
+                // which calls _check_memory_pressure_and_kill inside the per-worker loop)
+                if phase == ProcessingPhase::MainPhase && !self.pending_binaries.is_empty() {
+                    self.check_oom();
+                }
+
                 // Poll not-yet-ready workers
                 if !self.workers[idx].is_ready() {
                     self.workers[idx].poll_ready().await;
@@ -449,8 +455,11 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 }
             }
 
-            // OOM checking (only in main/retry phases, not during OOM phase itself)
-            if !self.in_oom_phase && !self.pending_binaries.is_empty() {
+            // OOM checking for non-main phases (main phase checks per-worker above).
+            // This runs during retry, OOM, and unassigned phases.
+            // During OOM phase, the check still runs (matching Python) but check_oom
+            // will not requeue killed tasks to pending_binaries.
+            if phase != ProcessingPhase::MainPhase && !self.pending_binaries.is_empty() {
                 self.check_oom();
             }
 
@@ -858,22 +867,27 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
         match decision {
             OomDecision::Kill { worker_id, reason } => {
-                tracing::warn!(worker_id, reason = %reason, "OOM killing worker");
+                tracing::warn!(worker_id, reason = %reason, in_oom_phase = self.in_oom_phase, "OOM killing worker");
                 let worker = &mut self.workers[worker_id as usize];
                 if let Some(binary) = worker.current_binary.take() {
                     if worker_id == 0 {
                         // Worker 0 is the last resort — if it can't fit, the task
                         // is truly OOM and goes to the oom_tasks queue.
+                        // This happens even during OOM phase (matching Python).
                         self.oom_tasks.push(FailedTask {
                             binary,
                             error_type: ErrorType::OutOfMemory,
                             error_message: reason.clone(),
                             retry_count: 0,
                         });
-                    } else {
-                        // Other workers: requeue for local retry
+                    } else if !self.in_oom_phase {
+                        // Other workers: requeue for local retry.
+                        // During OOM phase, Python skips _handle_oom_killed_task
+                        // (which does the requeue), so we also skip requeuing.
                         self.pending_binaries.insert(0, binary);
                     }
+                    // During OOM phase for non-worker-0: task is dropped (not requeued)
+                    // matching Python's behavior where _handle_oom_killed_task is skipped.
                 }
                 worker.mark_oom_killed();
             }

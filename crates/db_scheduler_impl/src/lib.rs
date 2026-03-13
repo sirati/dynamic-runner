@@ -139,12 +139,8 @@ impl<I: Identifier> Scheduler<I> for MemoryStealingScheduler {
         &self,
         workers: &[WorkerBudgetInfo<I>],
         max_memory: MemoryBytes,
-        in_oom_phase: bool,
+        _in_oom_phase: bool,
     ) -> OomDecision {
-        if in_oom_phase {
-            return OomDecision::NoAction;
-        }
-
         let actual_usage: u64 = workers.iter().map(|w| w.actual_memory_usage).sum();
         let num_workers = workers.len() as u64;
         if num_workers == 0 {
@@ -515,7 +511,10 @@ mod tests {
     }
 
     #[test]
-    fn check_oom_skips_during_oom_phase() {
+    fn check_oom_still_runs_during_oom_phase() {
+        // The scheduler no longer short-circuits during OOM phase.
+        // The manager is responsible for deciding what to do with killed tasks
+        // during OOM phase (e.g. not requeuing to pending_binaries).
         let s = MemoryStealingScheduler;
         let workers = vec![WorkerBudgetInfo {
             worker_id: 0,
@@ -528,7 +527,8 @@ mod tests {
             estimated_memory: 99999,
         }];
         let decision = Scheduler::<TestId>::check_oom(&s, &workers, 100, true);
-        assert!(matches!(decision, OomDecision::NoAction));
+        // Should still detect OOM and return Kill, even during OOM phase
+        assert!(matches!(decision, OomDecision::Kill { .. }));
     }
 
     #[test]
