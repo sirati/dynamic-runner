@@ -128,6 +128,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 }
             }
             let mut handle = WorkerHandle::new(i, transport);
+            handle.pid = pid;
             handle.reserved_budget =
                 self.scheduler
                     .initial_budget(i, self.config.max_memory);
@@ -397,6 +398,11 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         factory: &mut impl WorkerFactory<M>,
     ) {
         while !active_workers.is_empty() {
+            // Update actual memory usage for all workers at the start of each
+            // outer loop iteration, so OOM checks and assignment decisions use
+            // current data.
+            self.update_all_memory_usage();
+
             let worker_ids: Vec<WorkerId> = active_workers.iter().copied().collect();
 
             for worker_id in worker_ids {
@@ -655,6 +661,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
 
         let mut handle = WorkerHandle::new(worker_id, transport);
+        handle.pid = pid;
         handle.reserved_budget = self.workers[worker_id as usize].reserved_budget;
         handle.assignment_failure_count = self.workers[worker_id as usize].assignment_failure_count;
         self.workers[worker_id as usize] = handle;
@@ -711,7 +718,8 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                     "worker disconnected"
                 );
                 // Log memory usage before recording result
-                self.log_memory_usage(binary.as_ref(), 0, true);
+                let actual_mem = self.workers[worker_id as usize].actual_memory_usage;
+                self.log_memory_usage(binary.as_ref(), 0, actual_mem, true);
 
                 // Release estimated memory (matching handle_task_completed logic)
                 let worker = &self.workers[worker_id as usize];
@@ -760,8 +768,9 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         _phase: ProcessingPhase,
         factory: &mut impl WorkerFactory<M>,
     ) {
-        // Log memory usage before recording result
-        self.log_memory_usage(binary.as_ref(), estimated_memory, !result.success);
+        // Log memory usage before recording result (capture actual before clearing)
+        let actual_mem = self.workers[worker_id as usize].actual_memory_usage;
+        self.log_memory_usage(binary.as_ref(), estimated_memory, actual_mem, !result.success);
 
         // Release estimated memory from total (only for non-opportunistic workers
         // that received an initial assignment, matching Python behavior)
@@ -801,11 +810,12 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
     }
 
-    /// Log memory usage to memuse.log in CSV format: size,estimated,0,filename,status
+    /// Log memory usage to memuse.log in CSV format: size,estimated,actual,filename,status
     fn log_memory_usage(
         &self,
         binary: Option<&BinaryInfo<I>>,
         estimated_memory: MemoryBytes,
+        actual_memory: MemoryBytes,
         errored: bool,
     ) {
         let log_path = match &self.config.memuse_log_path {
@@ -832,8 +842,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         {
             Ok(mut f) => {
                 // Format: size,estimated,actual,filename,status
-                // actual=0 since we don't have psutil in Rust
-                let _ = writeln!(f, "{},{},0,{},{}", binary.size, estimated_memory, filename, status);
+                let _ = writeln!(f, "{},{},{},{},{}", binary.size, estimated_memory, actual_memory, filename, status);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "failed to write memuse log");
@@ -878,7 +887,15 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
     }
 
+    /// Update actual memory usage for all workers from /proc/[pid]/statm.
+    fn update_all_memory_usage(&mut self) {
+        for worker in &mut self.workers {
+            worker.update_memory_usage();
+        }
+    }
+
     fn check_oom(&mut self) {
+        self.update_all_memory_usage();
         let infos = self.worker_budget_infos();
         let decision =
             self.scheduler

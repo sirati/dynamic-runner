@@ -46,6 +46,7 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub idle: bool,
     pub actual_memory_usage: MemoryBytes,
     pub assignment_failure_count: u32,
+    pub pid: Option<u32>,
     protocol: RunnerProtocolState<M>,
 }
 
@@ -62,6 +63,7 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
             idle: false,
             actual_memory_usage: 0,
             assignment_failure_count: 0,
+            pid: None,
             protocol: RunnerProtocolState::WaitingForReady(waiting),
         }
     }
@@ -235,5 +237,46 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
         self.current_binary = None;
         self.estimated_memory = 0;
         self.opportunistic = true;
+    }
+
+    /// Update actual memory usage by reading /proc/[pid]/statm (Linux only).
+    ///
+    /// The second field of statm is the RSS in pages. We multiply by the page
+    /// size (typically 4096) to get bytes. Returns 0 on non-Linux or if the
+    /// process is gone.
+    pub fn update_memory_usage(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = match self.pid {
+                Some(p) => p,
+                None => {
+                    self.actual_memory_usage = 0;
+                    return;
+                }
+            };
+            let path = format!("/proc/{pid}/statm");
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => {
+                    // statm format: size resident shared text lib data dt
+                    // We want the second field (resident) in pages
+                    if let Some(rss_pages_str) = contents.split_whitespace().nth(1) {
+                        if let Ok(rss_pages) = rss_pages_str.parse::<u64>() {
+                            let page_size = 4096u64; // standard Linux page size
+                            self.actual_memory_usage = rss_pages * page_size;
+                            return;
+                        }
+                    }
+                    self.actual_memory_usage = 0;
+                }
+                Err(_) => {
+                    // Process may have exited
+                    self.actual_memory_usage = 0;
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.actual_memory_usage = 0;
+        }
     }
 }
