@@ -101,7 +101,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         );
 
         self.initialize_workers(factory).await;
-        self.run_initial_assignments().await;
+        self.run_initial_assignments(factory).await;
         self.run_main_phase(factory).await;
         self.run_retry_phase(factory).await;
         self.run_oom_phase(factory).await;
@@ -161,7 +161,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     // ── Phase 1: Initial Assignments ──
 
-    async fn run_initial_assignments(&mut self) {
+    async fn run_initial_assignments(&mut self, factory: &mut impl WorkerFactory<M>) {
         tracing::info!("starting initial assignment phase");
 
         loop {
@@ -177,7 +177,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 if self.workers[i].has_initial_assignment || !self.workers[i].is_ready() {
                     continue;
                 }
-                self.try_assign_initial(i as WorkerId).await;
+                self.try_assign_initial(i as WorkerId, factory).await;
             }
             tokio::task::yield_now().await;
         }
@@ -202,7 +202,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         );
     }
 
-    async fn try_assign_initial(&mut self, worker_id: WorkerId) {
+    async fn try_assign_initial(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
         let worker_info = self.workers[worker_id as usize].budget_info();
         let decision = self.scheduler.assign_initial(
             &worker_info,
@@ -224,7 +224,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
                 let worker = &mut self.workers[worker_id as usize];
-                match worker.assign_task(binary, estimated_memory, opportunistic).await {
+                match worker.assign_task(binary.clone(), estimated_memory, opportunistic).await {
                     Ok(()) => {
                         tracing::info!(
                             worker_id,
@@ -233,11 +233,13 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                             opportunistic,
                             "initial assignment"
                         );
+                        self.workers[worker_id as usize].assignment_failure_count = 0;
                     }
                     Err(e) => {
-                        tracing::error!(worker_id, error = %e, "initial assignment send failed");
-                        // The binary was already removed from pending, re-insert
-                        // Worker is now Stopped, we can't easily recover here
+                        // Put binary back and undo memory increment
+                        self.pending_binaries.insert(0, binary);
+                        self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated_memory);
+                        self.handle_assignment_failure(worker_id, &e, factory).await;
                     }
                 }
             }
