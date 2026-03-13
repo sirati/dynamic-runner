@@ -813,6 +813,8 @@ def main():
             task_definition=task,
             task_args=args,
             skip_existing=args.skip_existing,
+            always_restart_worker=args.always_restart_worker,
+            print_pid=args.pid,
         )
 
         rust_manager.process_binaries(sorted_binaries)
