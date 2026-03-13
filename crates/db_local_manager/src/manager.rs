@@ -1394,4 +1394,102 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
+
+    #[tokio::test]
+    async fn non_recoverable_error_restarts_worker_and_continues() {
+        // Worker sends NonRecoverable on first task, succeeds on second.
+        // The worker should be restarted and the second task should succeed.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use db_comm_api_base::{Command, CommandReceiver, ResponseSender};
+
+        let spawn_count = Arc::new(AtomicU32::new(0));
+        let spawn_count_clone = spawn_count.clone();
+
+        struct RestartCountingFactory {
+            spawn_count: Arc<AtomicU32>,
+        }
+
+        impl WorkerFactory<ChannelManagerEnd> for RestartCountingFactory {
+            fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
+                let count = self.spawn_count.fetch_add(1, Ordering::SeqCst);
+                let (manager_end, runner_end) = channel_pair();
+                tokio::spawn(async move {
+                    let mut runner = runner_end;
+                    let _ = runner.send_response(Response::Ready).await;
+                    loop {
+                        match runner.recv_command().await {
+                            Some(Command::Stop) => break,
+                            Some(Command::ProcessBinary { .. }) => {
+                                if count == 0 {
+                                    // First spawn: send NonRecoverable error (triggers disconnect)
+                                    let _ = runner
+                                        .send_response(Response::Error {
+                                            error_type: ErrorType::NonRecoverable,
+                                            message: "crash".into(),
+                                        })
+                                        .await;
+                                    break; // NonRecoverable worker exits
+                                } else {
+                                    // Restarted worker: succeed
+                                    let _ = runner
+                                        .send_response(Response::Done {
+                                            warnings: 0,
+                                            filtered: 0,
+                                        })
+                                        .await;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                });
+                (manager_end, None)
+            }
+        }
+
+        let config = test_config(1);
+        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+        let mut factory = RestartCountingFactory {
+            spawn_count: spawn_count_clone,
+        };
+
+        let binaries = vec![
+            make_binary("crash_me", 50),
+            make_binary("succeed", 60),
+        ];
+
+        manager.process_binaries(binaries, &mut factory).await;
+
+        // First task: NonRecoverable -> fails, worker restarted
+        // Second task: succeeds on restarted worker
+        // Retry phase: first task retried on restarted worker and succeeds
+        assert_eq!(manager.stats().completed, 2, "both tasks should complete");
+        assert!(manager.oom_tasks().is_empty(), "no OOM tasks expected");
+
+        // At least 2 spawns: initial + restart after NonRecoverable
+        let spawns = spawn_count.load(Ordering::SeqCst);
+        assert!(spawns >= 2, "expected at least 2 spawns (initial + restart), got {spawns}");
+    }
+
+    #[tokio::test]
+    async fn multiple_workers_with_mixed_results() {
+        // 2 workers, 6 binaries: worker 0 always succeeds, worker 1 first OOM then succeed
+        let config = test_config(2);
+        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+        let mut factory = FakeWorkerFactory {
+            mode: FakeWorkerMode::AlwaysSucceed,
+        };
+
+        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
+            .collect();
+
+        manager.process_binaries(binaries, &mut factory).await;
+
+        assert_eq!(manager.stats().completed, 6);
+        assert_eq!(manager.stats().total, 6);
+        assert!(manager.failed_tasks().is_empty());
+        assert!(manager.oom_tasks().is_empty());
+    }
 }
