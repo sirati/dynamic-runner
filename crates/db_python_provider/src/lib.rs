@@ -349,7 +349,11 @@ impl PyLocalManager {
             )?
             .extract()?;
 
-        let log_dir = output_path.join("logs");
+        // Create timestamped log subdirectory (matching Python's logs/<timestamp>/)
+        let datetime_mod = py.import("datetime")?;
+        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
+        let timestamp: String = now.call_method1("strftime", ("%Y%m%d_%H%M%S",))?.extract()?;
+        let log_dir = output_path.join("logs").join(&timestamp);
         std::fs::create_dir_all(&log_dir).ok();
 
         // Detect the current Python interpreter so workers use the same one.
@@ -618,7 +622,11 @@ impl PyDistributedManager {
             )?
             .extract()?;
 
-        let log_dir = output_path.join("logs");
+        // Create timestamped log subdirectory (matching Python's logs/<timestamp>/)
+        let datetime_mod = py.import("datetime")?;
+        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
+        let timestamp: String = now.call_method1("strftime", ("%Y%m%d_%H%M%S",))?.extract()?;
+        let log_dir = output_path.join("logs").join(&timestamp);
         std::fs::create_dir_all(&log_dir).ok();
 
         // Detect the current Python interpreter so workers use the same one.
