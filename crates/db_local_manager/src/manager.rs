@@ -292,6 +292,15 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             self.pending_binaries.push(task.binary);
         }
 
+        // Restart any stopped/dead workers before retry (matching Python behavior)
+        for i in 0..self.config.num_workers {
+            if self.workers[i as usize].is_stopped() || !self.workers[i as usize].is_ready() {
+                tracing::info!(worker_id = i, "restarting worker for retry phase");
+                self.restart_worker(i, factory).await;
+                self.pending_worker_assignments.insert(i);
+            }
+        }
+
         let mut active_workers: HashSet<WorkerId> =
             (0..self.config.num_workers).collect();
 
@@ -327,7 +336,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         let mut active_workers: HashSet<WorkerId> = HashSet::new();
         active_workers.insert(0);
 
-        self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::OomPhase, factory)
+        self.process_worker_loop(&mut active_workers, false, false, ProcessingPhase::OomPhase, factory)
             .await;
 
         self.in_oom_phase = false;
@@ -363,7 +372,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         self.process_worker_loop(
             &mut active_workers,
             false,
-            true,
+            false,
             ProcessingPhase::UnassignedPhase,
             factory,
         )
@@ -448,8 +457,9 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             }
         }
 
-        // Move remaining pending to OOM queue at end of normal phases
-        if phase == ProcessingPhase::MainPhase || phase == ProcessingPhase::RetryPhase {
+        // Move remaining pending to OOM queue at end of retry phase
+        // (Main phase leftovers go to unassigned_tasks in run_main_phase)
+        if phase == ProcessingPhase::RetryPhase {
             if !self.pending_binaries.is_empty() {
                 let remaining: Vec<BinaryInfo<I>> = self.pending_binaries.drain(..).collect();
                 for binary in remaining {
@@ -723,8 +733,12 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         // Log memory usage before recording result
         self.log_memory_usage(binary.as_ref(), estimated_memory, !result.success);
 
-        // Release estimated memory from total
-        self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated_memory);
+        // Release estimated memory from total (only for non-opportunistic workers
+        // that received an initial assignment, matching Python behavior)
+        let worker = &self.workers[worker_id as usize];
+        if worker.has_initial_assignment && !worker.opportunistic {
+            self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated_memory);
+        }
 
         self.record_result(&result, binary.as_ref());
 
