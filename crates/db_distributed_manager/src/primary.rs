@@ -489,15 +489,46 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
             }
 
             let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            if self.pending_binaries.is_empty() && active_workers == 0
-                && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
-            {
+            if self.pending_binaries.is_empty() && active_workers == 0 {
+                tracing::info!("no pending binaries and no active workers");
                 break;
             }
 
-            match self.transport.recv().await {
-                Some(msg) => self.dispatch_message(msg).await?,
-                None => break,
+            // Use a timeout on recv to avoid stalling indefinitely if a
+            // secondary disconnects while processing a task. The timeout
+            // is generous — if no message arrives in 5 minutes and there
+            // are in-flight tasks, something is wrong.
+            tokio::select! {
+                msg = self.transport.recv() => {
+                    match msg {
+                        Some(m) => self.dispatch_message(m).await?,
+                        None => {
+                            tracing::info!("transport closed");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                    let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+                    if active > 0 {
+                        tracing::warn!(
+                            active_workers = active,
+                            completed = self.completed_tasks.len(),
+                            failed = self.failed_tasks.len(),
+                            total = self.total_tasks,
+                            "operational loop timeout with active workers, marking in-flight tasks as failed"
+                        );
+                        // Mark all in-flight tasks as failed
+                        for worker in &mut self.workers {
+                            if let Some(binary) = worker.current_task.take() {
+                                let hash = compute_task_hash(&binary);
+                                self.failed_tasks.insert(hash);
+                                worker.estimated_memory = 0;
+                                worker.is_idle = true;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -593,13 +624,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
         {
             self.completed_tasks.insert(task_hash);
 
-            // Mark worker idle
-            if let Some(worker) = self.workers.iter_mut().find(|w| {
-                w.secondary_id == secondary_id && !w.is_idle
-            }) {
-                worker.current_task = None;
-                worker.estimated_memory = 0;
-                worker.is_idle = true;
+            // Mark the specific worker idle using secondary_id + local worker_id
+            let mut local_idx: u32 = 0;
+            for w in &mut self.workers {
+                if w.secondary_id == secondary_id {
+                    if local_idx == worker_id {
+                        w.current_task = None;
+                        w.estimated_memory = 0;
+                        w.is_idle = true;
+                        break;
+                    }
+                    local_idx += 1;
+                }
             }
 
             tracing::debug!(
@@ -621,14 +657,39 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
             ..
         } = msg
         {
-            self.failed_tasks.insert(task_hash);
+            // Find the specific worker and recover the binary if it's a
+            // recoverable error so it can be re-assigned to another worker.
+            let mut recovered_binary: Option<BinaryInfo<I>> = None;
+            let mut local_idx: u32 = 0;
+            for w in &mut self.workers {
+                if w.secondary_id == secondary_id {
+                    if local_idx == worker_id {
+                        recovered_binary = w.current_task.take();
+                        w.estimated_memory = 0;
+                        w.is_idle = true;
+                        break;
+                    }
+                    local_idx += 1;
+                }
+            }
 
-            if let Some(worker) = self.workers.iter_mut().find(|w| {
-                w.secondary_id == secondary_id && !w.is_idle
-            }) {
-                worker.current_task = None;
-                worker.estimated_memory = 0;
-                worker.is_idle = true;
+            if error_type == "Recoverable" {
+                // Re-enqueue recoverable failures for assignment to another worker
+                if let Some(binary) = recovered_binary {
+                    tracing::info!(
+                        secondary = %secondary_id,
+                        worker_id,
+                        error = %error_message,
+                        "recoverable failure, re-enqueuing task"
+                    );
+                    self.pending_binaries.push(binary);
+                } else {
+                    // Can't recover — no binary info available
+                    self.failed_tasks.insert(task_hash);
+                }
+            } else {
+                // Non-recoverable: permanently mark as failed
+                self.failed_tasks.insert(task_hash);
             }
 
             tracing::warn!(
