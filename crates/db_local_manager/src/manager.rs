@@ -16,6 +16,8 @@ pub struct LocalManagerConfig {
     pub num_workers: u32,
     pub max_memory: MemoryBytes,
     pub always_restart_worker: bool,
+    pub print_pid: bool,
+    pub memuse_log_path: Option<std::path::PathBuf>,
 }
 
 /// Callback trait for spawning/restarting worker transports.
@@ -25,7 +27,8 @@ pub struct LocalManagerConfig {
 pub trait WorkerFactory<M: ManagerEndpoint> {
     /// Create a new transport connection for the given worker.
     /// Called at initial startup and on restart.
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> M;
+    /// Returns (transport, optional_pid).
+    fn spawn_worker(&mut self, worker_id: WorkerId) -> (M, Option<u32>);
 }
 
 /// The local manager: owns workers, scheduler, and the 5-phase pipeline.
@@ -99,10 +102,10 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
         self.initialize_workers(factory).await;
         self.run_initial_assignments().await;
-        self.run_main_phase().await;
-        self.run_retry_phase().await;
-        self.run_oom_phase().await;
-        self.run_unassigned_phase().await;
+        self.run_main_phase(factory).await;
+        self.run_retry_phase(factory).await;
+        self.run_oom_phase(factory).await;
+        self.run_unassigned_phase(factory).await;
         self.stop_all_workers().await;
 
         tracing::info!(
@@ -118,7 +121,12 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
         for i in 0..self.config.num_workers {
-            let transport = factory.spawn_worker(i);
+            let (transport, pid) = factory.spawn_worker(i);
+            if self.config.print_pid {
+                if let Some(pid) = pid {
+                    tracing::info!(worker_id = i, pid, "worker PID");
+                }
+            }
             let mut handle = WorkerHandle::new(i, transport);
             handle.reserved_budget =
                 self.scheduler
@@ -246,13 +254,13 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     // ── Phase 2: Main Phase ──
 
-    async fn run_main_phase(&mut self) {
+    async fn run_main_phase(&mut self, factory: &mut impl WorkerFactory<M>) {
         tracing::info!("starting main phase");
 
         let mut active_workers: HashSet<WorkerId> =
             (0..self.config.num_workers).collect();
 
-        self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::MainPhase)
+        self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::MainPhase, factory)
             .await;
 
         // Move remaining pending to unassigned
@@ -271,7 +279,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     // ── Phase 3: Retry Phase ──
 
-    async fn run_retry_phase(&mut self) {
+    async fn run_retry_phase(&mut self, factory: &mut impl WorkerFactory<M>) {
         if self.failed_tasks.is_empty() {
             tracing::info!("retry phase skipped - no failed tasks");
             return;
@@ -287,7 +295,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         let mut active_workers: HashSet<WorkerId> =
             (0..self.config.num_workers).collect();
 
-        self.process_worker_loop(&mut active_workers, true, true, ProcessingPhase::RetryPhase)
+        self.process_worker_loop(&mut active_workers, true, true, ProcessingPhase::RetryPhase, factory)
             .await;
 
         tracing::info!(
@@ -300,7 +308,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     // ── Phase 4: OOM Phase ──
 
-    async fn run_oom_phase(&mut self) {
+    async fn run_oom_phase(&mut self, factory: &mut impl WorkerFactory<M>) {
         if self.oom_tasks.is_empty() {
             tracing::info!("OOM phase skipped - no OOM tasks");
             return;
@@ -319,7 +327,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         let mut active_workers: HashSet<WorkerId> = HashSet::new();
         active_workers.insert(0);
 
-        self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::OomPhase)
+        self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::OomPhase, factory)
             .await;
 
         self.in_oom_phase = false;
@@ -334,7 +342,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     // ── Phase 5: Unassigned Phase ──
 
-    async fn run_unassigned_phase(&mut self) {
+    async fn run_unassigned_phase(&mut self, factory: &mut impl WorkerFactory<M>) {
         if self.unassigned_tasks.is_empty() {
             return;
         }
@@ -357,6 +365,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             false,
             true,
             ProcessingPhase::UnassignedPhase,
+            factory,
         )
         .await;
     }
@@ -374,6 +383,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         allow_stop: bool,
         on_failure_increment_failed: bool,
         phase: ProcessingPhase,
+        factory: &mut impl WorkerFactory<M>,
     ) {
         while !active_workers.is_empty() {
             let worker_ids: Vec<WorkerId> = active_workers.iter().copied().collect();
@@ -408,6 +418,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                             allow_stop,
                             on_failure_increment_failed,
                             phase,
+                            factory,
                         )
                         .await;
                     }
@@ -420,8 +431,8 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                     self.pending_worker_assignments.iter().copied().collect();
                 for worker_id in pending {
                     let idx = worker_id as usize;
-                    if self.workers[idx].current_binary.is_none() {
-                        self.try_assign_normal(worker_id).await;
+                    if self.workers[idx].current_binary.is_none() && self.workers[idx].is_ready() {
+                        self.try_assign_normal(worker_id, factory).await;
                         self.pending_worker_assignments.remove(&worker_id);
                     }
                 }
@@ -520,7 +531,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
     }
 
-    async fn try_assign_normal(&mut self, worker_id: WorkerId) {
+    async fn try_assign_normal(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
         let worker_info = self.workers[worker_id as usize].budget_info();
         let all_infos = self.worker_budget_infos();
         let decision = self.scheduler.assign_normal(
@@ -543,24 +554,100 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let worker = &mut self.workers[worker_id as usize];
                 match worker
-                    .assign_task(binary, estimated_memory, opportunistic)
+                    .assign_task(binary.clone(), estimated_memory, opportunistic)
                     .await
                 {
                     Ok(()) => {
+                        self.total_assigned_memory += estimated_memory;
                         tracing::info!(
                             worker_id,
                             binary = %name,
                             estimated_mb = estimated_memory / (1024 * 1024),
                             "assigned task"
                         );
+                        // Reset failure count on success
+                        self.workers[worker_id as usize].assignment_failure_count = 0;
                     }
                     Err(e) => {
-                        tracing::error!(worker_id, error = %e, "assignment send failed");
+                        // Put binary back
+                        self.pending_binaries.insert(0, binary);
+                        self.handle_assignment_failure(worker_id, &e, factory).await;
                     }
                 }
             }
             AssignmentDecision::NoFit | AssignmentDecision::NoPendingTasks => {}
         }
+    }
+
+    /// Handle assignment failure with restart and 3-attempt limit.
+    async fn handle_assignment_failure(
+        &mut self,
+        worker_id: WorkerId,
+        error_msg: &str,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
+        let worker = &mut self.workers[worker_id as usize];
+        worker.assignment_failure_count += 1;
+        let count = worker.assignment_failure_count;
+
+        tracing::warn!(
+            worker_id,
+            failure_count = count,
+            error = %error_msg,
+            "assignment failure"
+        );
+
+        if count >= 3 {
+            tracing::error!(
+                worker_id,
+                attempts = count,
+                "worker failed to receive assignments after 3 attempts, communication broken"
+            );
+            // In Python this raises RuntimeError, crashing the manager.
+            // Here we panic to match that behavior.
+            panic!(
+                "Worker {worker_id} failed to receive assignments after {count} attempts. \
+                 Communication channel is broken."
+            );
+        }
+
+        // Restart the worker
+        tracing::info!(worker_id, attempt = count, "restarting worker after assignment failure");
+        self.restart_worker(worker_id, factory).await;
+        self.pending_worker_assignments.insert(worker_id);
+    }
+
+    /// Restart a worker: stop the old one, spawn a new transport via factory.
+    async fn restart_worker(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
+        // Stop old worker
+        let old = &mut self.workers[worker_id as usize];
+        if !old.is_stopped() {
+            old.stop().await;
+        }
+
+        // Spawn new transport
+        let (transport, pid) = factory.spawn_worker(worker_id);
+        if self.config.print_pid {
+            if let Some(pid) = pid {
+                tracing::info!(worker_id, pid, "worker PID (restart)");
+            }
+        }
+
+        let mut handle = WorkerHandle::new(worker_id, transport);
+        handle.reserved_budget = self.workers[worker_id as usize].reserved_budget;
+        handle.assignment_failure_count = self.workers[worker_id as usize].assignment_failure_count;
+        self.workers[worker_id as usize] = handle;
+
+        // Wait for ready
+        loop {
+            if self.workers[worker_id as usize].is_ready() {
+                break;
+            }
+            self.workers[worker_id as usize].poll_ready().await;
+            tokio::task::yield_now().await;
+        }
+
+        tracing::info!(worker_id, "worker restarted and ready");
     }
 
     async fn handle_event(
@@ -570,22 +657,25 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         allow_stop: bool,
         on_failure_increment_failed: bool,
         phase: ProcessingPhase,
+        factory: &mut impl WorkerFactory<M>,
     ) {
         match event {
             WorkerEvent::TaskCompleted {
                 worker_id,
                 result,
                 binary,
-                ..
+                estimated_memory,
             } => {
                 self.handle_task_completed(
                     worker_id,
                     result,
                     binary,
+                    estimated_memory,
                     active_workers,
                     allow_stop,
                     on_failure_increment_failed,
                     phase,
+                    factory,
                 )
                 .await;
             }
@@ -623,20 +713,37 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         worker_id: WorkerId,
         result: TaskResult,
         binary: Option<BinaryInfo<I>>,
+        estimated_memory: MemoryBytes,
         active_workers: &mut HashSet<WorkerId>,
         allow_stop: bool,
         on_failure_increment_failed: bool,
         _phase: ProcessingPhase,
+        factory: &mut impl WorkerFactory<M>,
     ) {
+        // Log memory usage before recording result
+        self.log_memory_usage(binary.as_ref(), estimated_memory, !result.success);
+
+        // Release estimated memory from total
+        self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated_memory);
+
         self.record_result(&result, binary.as_ref());
 
         if on_failure_increment_failed && !result.success {
             self.stats.errored += 1;
         }
 
+        // Restart worker after successful completion if always_restart_worker
+        // is enabled and there are still binaries to process
+        if self.config.always_restart_worker && result.success && !self.pending_binaries.is_empty() {
+            tracing::info!(worker_id, "restarting worker after successful completion (always_restart_worker)");
+            self.restart_worker(worker_id, factory).await;
+            self.pending_worker_assignments.insert(worker_id);
+            return;
+        }
+
         // Try to assign next task
         if !self.pending_binaries.is_empty() {
-            self.try_assign_normal(worker_id).await;
+            self.try_assign_normal(worker_id, factory).await;
         }
 
         // If still no task and no pending, remove from active
@@ -647,6 +754,46 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 tracing::info!(worker_id, "stopping (no more tasks after completion)");
             }
             active_workers.remove(&worker_id);
+        }
+    }
+
+    /// Log memory usage to memuse.log in CSV format: size,estimated,0,filename,status
+    fn log_memory_usage(
+        &self,
+        binary: Option<&BinaryInfo<I>>,
+        estimated_memory: MemoryBytes,
+        errored: bool,
+    ) {
+        let log_path = match &self.config.memuse_log_path {
+            Some(p) => p,
+            None => return,
+        };
+        let binary = match binary {
+            Some(b) => b,
+            None => return,
+        };
+
+        let status = if errored { "ERROR" } else { "OK" };
+        let filename = binary
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
+            Ok(mut f) => {
+                // Format: size,estimated,actual,filename,status
+                // actual=0 since we don't have psutil in Rust
+                let _ = writeln!(f, "{},{},0,{},{}", binary.size, estimated_memory, filename, status);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to write memuse log");
+            }
         }
     }
 
@@ -776,11 +923,11 @@ mod tests {
     }
 
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-        fn spawn_worker(&mut self, _worker_id: WorkerId) -> ChannelManagerEnd {
+        fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
             let (manager_end, runner_end) = channel_pair();
             let mode = self.mode.clone();
             tokio::spawn(fake_worker_loop(runner_end, mode));
-            manager_end
+            (manager_end, None)
         }
     }
 
@@ -840,13 +987,19 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn single_worker_processes_all_binaries() {
-        let config = LocalManagerConfig {
-            num_workers: 1,
+    fn test_config(num_workers: u32) -> LocalManagerConfig {
+        LocalManagerConfig {
+            num_workers,
             max_memory: 1024 * 1024 * 1024, // 1GB
             always_restart_worker: false,
-        };
+            print_pid: false,
+            memuse_log_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn single_worker_processes_all_binaries() {
+        let config = test_config(1);
         let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
         let mut factory = FakeWorkerFactory {
             mode: FakeWorkerMode::AlwaysSucceed,
@@ -868,11 +1021,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_workers_process_binaries() {
-        let config = LocalManagerConfig {
-            num_workers: 3,
-            max_memory: 1024 * 1024 * 1024,
-            always_restart_worker: false,
-        };
+        let config = test_config(3);
         let mut manager =
             LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
         let mut factory = FakeWorkerFactory {
@@ -891,11 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn retry_phase_retries_failed_tasks() {
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_memory: 1024 * 1024 * 1024,
-            always_restart_worker: false,
-        };
+        let config = test_config(1);
         let mut manager =
             LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
         let mut factory = FakeWorkerFactory {
@@ -912,11 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn oom_tasks_collected() {
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_memory: 1024 * 1024 * 1024,
-            always_restart_worker: false,
-        };
+        let config = test_config(1);
         let mut manager =
             LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
         let mut factory = FakeWorkerFactory {
@@ -933,11 +1074,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_binaries_completes_immediately() {
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_memory: 1024 * 1024 * 1024,
-            always_restart_worker: false,
-        };
+        let config = test_config(1);
         let mut manager =
             LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
         let mut factory = FakeWorkerFactory {
@@ -950,5 +1087,112 @@ mod tests {
 
         assert_eq!(manager.stats().completed, 0);
         assert_eq!(manager.stats().total, 0);
+    }
+
+    #[tokio::test]
+    async fn always_restart_worker_respawns_after_success() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        use db_comm_api_base::{Command, CommandReceiver, ResponseSender};
+
+        let spawn_count = Arc::new(AtomicU32::new(0));
+        let spawn_count_clone = spawn_count.clone();
+
+        struct CountingFactory {
+            spawn_count: Arc<AtomicU32>,
+        }
+
+        impl WorkerFactory<ChannelManagerEnd> for CountingFactory {
+            fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
+                self.spawn_count.fetch_add(1, Ordering::SeqCst);
+                let (manager_end, runner_end) = channel_pair();
+                tokio::spawn(async move {
+                    let mut runner = runner_end;
+                    let _ = runner.send_response(Response::Ready).await;
+                    loop {
+                        match runner.recv_command().await {
+                            Some(Command::Stop) => break,
+                            Some(Command::ProcessBinary { .. }) => {
+                                let _ = runner
+                                    .send_response(Response::Done {
+                                        warnings: 0,
+                                        filtered: 0,
+                                    })
+                                    .await;
+                            }
+                            None => break,
+                        }
+                    }
+                });
+                (manager_end, Some(42))
+            }
+        }
+
+        let mut config = test_config(1);
+        config.always_restart_worker = true;
+
+        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+        let mut factory = CountingFactory {
+            spawn_count: spawn_count_clone,
+        };
+
+        let binaries = vec![
+            make_binary("a", 50),
+            make_binary("b", 60),
+            make_binary("c", 70),
+        ];
+
+        manager.process_binaries(binaries, &mut factory).await;
+
+        assert_eq!(manager.stats().completed, 3);
+        assert_eq!(manager.stats().total, 3);
+        assert!(manager.failed_tasks().is_empty());
+
+        // With always_restart_worker=true and 3 binaries with 1 worker:
+        // 1 initial spawn + 2 restarts (after "a" and "b" complete, "c" is the last so no restart)
+        let spawns = spawn_count.load(Ordering::SeqCst);
+        assert_eq!(spawns, 3, "expected 3 spawns (1 initial + 2 restarts), got {spawns}");
+    }
+
+    #[tokio::test]
+    async fn memuse_log_written() {
+        let tmp_dir = std::env::temp_dir().join("rust_memuse_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let memuse_path = tmp_dir.join("memuse.log");
+        // Clean up any previous run
+        let _ = std::fs::remove_file(&memuse_path);
+
+        let config = LocalManagerConfig {
+            num_workers: 1,
+            max_memory: 1024 * 1024 * 1024,
+            always_restart_worker: false,
+            print_pid: false,
+            memuse_log_path: Some(memuse_path.clone()),
+        };
+
+        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+        let mut factory = FakeWorkerFactory {
+            mode: FakeWorkerMode::AlwaysSucceed,
+        };
+
+        let binaries = vec![
+            make_binary("a", 50),
+            make_binary("b", 60),
+        ];
+
+        manager.process_binaries(binaries, &mut factory).await;
+
+        assert_eq!(manager.stats().completed, 2);
+
+        // Verify memuse.log was written
+        let contents = std::fs::read_to_string(&memuse_path).expect("memuse.log should exist");
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 lines in memuse.log, got {}", lines.len());
+
+        // Each line: size,estimated,0,filename,status
+        assert!(lines[0].contains(",OK"), "first line should contain OK: {}", lines[0]);
+        assert!(lines[1].contains(",OK"), "second line should contain OK: {}", lines[1]);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -207,7 +207,7 @@ struct SubprocessWorkerFactory {
 }
 
 impl WorkerFactory<SocketpairManagerEnd> for SubprocessWorkerFactory {
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> SocketpairManagerEnd {
+    fn spawn_worker(&mut self, worker_id: WorkerId) -> (SocketpairManagerEnd, Option<u32>) {
         let (manager_end, child_fd) = create_socketpair()
             .unwrap_or_else(|e| panic!("failed to create socketpair for worker {worker_id}: {e}"));
 
@@ -255,13 +255,14 @@ impl WorkerFactory<SocketpairManagerEnd> for SubprocessWorkerFactory {
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
 
         // Store child handle
+        let pid = child.id();
         let idx = worker_id as usize;
         if self.child_processes.len() <= idx {
             self.child_processes.resize_with(idx + 1, || None);
         }
         self.child_processes[idx] = Some(child);
 
-        manager_end
+        (manager_end, Some(pid))
     }
 }
 
@@ -271,6 +272,8 @@ struct PyLocalManager {
     python_executable: PathBuf,
     num_workers: u32,
     max_memory: u64,
+    always_restart_worker: bool,
+    print_pid: bool,
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_dir: PathBuf,
@@ -295,6 +298,8 @@ impl PyLocalManager {
         task_definition,
         task_args,
         skip_existing = false,
+        always_restart_worker = false,
+        print_pid = false,
     ))]
     fn new(
         py: Python<'_>,
@@ -305,6 +310,8 @@ impl PyLocalManager {
         task_definition: &Bound<'_, PyAny>,
         task_args: &Bound<'_, PyAny>,
         skip_existing: bool,
+        always_restart_worker: bool,
+        print_pid: bool,
     ) -> PyResult<Self> {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
@@ -336,6 +343,8 @@ impl PyLocalManager {
             python_executable: PathBuf::from(python_executable),
             num_workers,
             max_memory,
+            always_restart_worker,
+            print_pid,
             source_dir: source_path,
             output_dir: output_path,
             log_dir,
@@ -359,10 +368,14 @@ impl PyLocalManager {
             intercept: self.estimator_intercept,
         };
 
+        let memuse_log_path = Some(self.output_dir.join("memuse.log"));
+
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
             max_memory: self.max_memory,
-            always_restart_worker: false,
+            always_restart_worker: self.always_restart_worker,
+            print_pid: self.print_pid,
+            memuse_log_path,
         };
 
         let mut factory = SubprocessWorkerFactory {

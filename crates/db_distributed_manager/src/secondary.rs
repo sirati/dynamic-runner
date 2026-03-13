@@ -120,7 +120,7 @@ where
 
     async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
         for i in 0..self.config.num_workers {
-            let transport = factory.spawn_worker(i);
+            let (transport, _pid) = factory.spawn_worker(i);
             let mut handle = WorkerHandle::new(i, transport);
             handle.reserved_budget = self.scheduler.initial_budget(i, self.config.ram_bytes);
             tracing::info!(
@@ -624,7 +624,7 @@ mod tests {
     /// Factory that spawns fake workers via channel transport.
     struct FakeWorkerFactory;
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-        fn spawn_worker(&mut self, _worker_id: WorkerId) -> ChannelManagerEnd {
+        fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
             let (manager_end, runner_end) = channel_pair();
             tokio::spawn(async move {
                 let mut runner = runner_end;
@@ -644,7 +644,7 @@ mod tests {
                     }
                 }
             });
-            manager_end
+            (manager_end, None)
         }
     }
 

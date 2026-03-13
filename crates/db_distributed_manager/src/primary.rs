@@ -944,7 +944,7 @@ mod tests {
     /// Factory that spawns fake workers via channel transport.
     struct FakeWorkerFactory;
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-        fn spawn_worker(&mut self, _worker_id: u32) -> ChannelManagerEnd {
+        fn spawn_worker(&mut self, _worker_id: u32) -> (ChannelManagerEnd, Option<u32>) {
             let (manager_end, runner_end) = channel_pair();
             tokio::spawn(async move {
                 let mut runner = runner_end;
@@ -964,7 +964,7 @@ mod tests {
                     }
                 }
             });
-            manager_end
+            (manager_end, None)
         }
     }
 

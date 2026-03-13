@@ -35,7 +35,7 @@ struct PythonWorkerFactory {
 }
 
 impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> SocketpairManagerEnd {
+    fn spawn_worker(&mut self, worker_id: WorkerId) -> (SocketpairManagerEnd, Option<u32>) {
         let (manager_end, child_fd) = create_socketpair()
             .expect("failed to create socketpair");
 
@@ -71,9 +71,10 @@ impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
         if self.children.len() <= idx {
             self.children.resize_with(idx + 1, || None);
         }
+        let pid = child.id();
         self.children[idx] = Some(child);
 
-        manager_end
+        (manager_end, Some(pid))
     }
 }
 
@@ -114,6 +115,8 @@ async fn single_worker_subprocess_processes_all() {
         num_workers: 1,
         max_memory: 1024 * 1024 * 1024,
         always_restart_worker: false,
+        print_pid: false,
+        memuse_log_path: None,
     };
 
     let mut factory = PythonWorkerFactory {
@@ -157,6 +160,8 @@ async fn multi_worker_subprocess_processes_all() {
         num_workers: 3,
         max_memory: 2 * 1024 * 1024 * 1024,
         always_restart_worker: false,
+        print_pid: false,
+        memuse_log_path: None,
     };
 
     let mut factory = PythonWorkerFactory {
