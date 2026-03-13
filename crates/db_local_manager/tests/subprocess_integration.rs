@@ -8,11 +8,14 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use db_comm_api_base::{BinaryInfo, MemoryBytes, WorkerId};
+use db_comm_api_base::{
+    BinaryInfo, Command, CommandSender, MemoryBytes, Response, ResponseReceiver, WorkerId,
+};
 use serde::{Deserialize, Serialize};
 use db_local_manager::{LocalManager, LocalManagerConfig, WorkerFactory};
 use db_scheduler_api::MemoryEstimator;
 use db_scheduler_impl::MemoryStealingScheduler;
+use db_transport_socket::named_socket::NamedSocketManagerEnd;
 use db_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
 
 /// Minimal test identifier.
@@ -143,6 +146,207 @@ async fn single_worker_subprocess_processes_all() {
 
     assert_eq!(manager.stats().completed, 3);
     assert_eq!(manager.stats().total, 3);
+    assert!(manager.failed_tasks().is_empty());
+    assert!(manager.oom_tasks().is_empty());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ── Named socket integration tests ──
+
+/// Transport enum for named socket integration tests.
+#[allow(dead_code)]
+enum EitherManagerEnd {
+    Socketpair(SocketpairManagerEnd),
+    Named {
+        inner: NamedSocketManagerEnd,
+        accepted: bool,
+    },
+}
+
+impl CommandSender for EitherManagerEnd {
+    async fn send_command(&mut self, command: Command) -> Result<(), String> {
+        match self {
+            EitherManagerEnd::Socketpair(s) => s.send_command(command).await,
+            EitherManagerEnd::Named { inner, accepted } => {
+                if !*accepted {
+                    return Err("Named socket: not yet accepted".into());
+                }
+                inner.send_command(command).await
+            }
+        }
+    }
+}
+
+impl ResponseReceiver for EitherManagerEnd {
+    async fn recv_responses(&mut self) -> Vec<Response> {
+        match self {
+            EitherManagerEnd::Socketpair(s) => s.recv_responses().await,
+            EitherManagerEnd::Named { inner, accepted } => {
+                if !*accepted {
+                    match inner.accept().await {
+                        Ok(()) => *accepted = true,
+                        Err(e) => {
+                            eprintln!("named socket accept failed: {e}");
+                            return Vec::new();
+                        }
+                    }
+                }
+                inner.recv_responses().await
+            }
+        }
+    }
+}
+
+/// Factory that spawns real Python workers via named Unix domain sockets.
+struct NamedSocketWorkerFactory {
+    worker_module_dir: PathBuf,
+    source_dir: PathBuf,
+    output_dir: PathBuf,
+    socket_dir: PathBuf,
+    children: Vec<Option<process::Child>>,
+}
+
+impl WorkerFactory<EitherManagerEnd> for NamedSocketWorkerFactory {
+    fn spawn_worker(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
+        let socket_path = self.socket_dir.join(format!("worker_{worker_id}.sock"));
+        let manager_end = NamedSocketManagerEnd::bind(&socket_path)
+            .unwrap_or_else(|e| panic!("failed to bind named socket for worker {worker_id}: {e}"));
+
+        let mut cmd = process::Command::new("python3");
+        cmd.arg("-m")
+            .arg("test_worker_mod")
+            .arg("--socket-path")
+            .arg(&socket_path)
+            .arg("--source")
+            .arg(&self.source_dir)
+            .arg("--output")
+            .arg(&self.output_dir);
+
+        cmd.env("PYTHONPATH", &self.worker_module_dir);
+
+        cmd.stdin(process::Stdio::null())
+            .stdout(process::Stdio::null())
+            .stderr(process::Stdio::null());
+
+        let child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn Python worker {worker_id}: {e}"));
+
+        let pid = child.id();
+        let idx = worker_id as usize;
+        if self.children.len() <= idx {
+            self.children.resize_with(idx + 1, || None);
+        }
+        self.children[idx] = Some(child);
+
+        let endpoint = EitherManagerEnd::Named {
+            inner: manager_end,
+            accepted: false,
+        };
+        (endpoint, Some(pid))
+    }
+}
+
+impl Drop for NamedSocketWorkerFactory {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            if let Some(mut c) = child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_worker_named_socket_processes_all() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let worker_dir = worker_module_dir();
+    let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_{}", process::id()));
+    let socket_dir = tmp_dir.join("sockets");
+    let _ = std::fs::create_dir_all(&socket_dir);
+
+    let config = LocalManagerConfig {
+        num_workers: 1,
+        max_memory: 1024 * 1024 * 1024,
+        always_restart_worker: false,
+        print_pid: false,
+        memuse_log_path: None,
+        stage_timeouts: std::collections::HashMap::new(),
+    };
+
+    let mut factory = NamedSocketWorkerFactory {
+        worker_module_dir: worker_dir,
+        source_dir: tmp_dir.clone(),
+        output_dir: tmp_dir.clone(),
+        socket_dir,
+        children: Vec::new(),
+    };
+
+    let binaries = vec![
+        make_binary("a.bin", 100),
+        make_binary("b.bin", 200),
+        make_binary("c.bin", 300),
+    ];
+
+    let mut manager = LocalManager::new(
+        config,
+        MemoryStealingScheduler,
+        FixedEstimator(50 * 1024 * 1024),
+    );
+
+    manager.process_binaries(binaries, &mut factory).await;
+
+    assert_eq!(manager.stats().completed, 3);
+    assert_eq!(manager.stats().total, 3);
+    assert!(manager.failed_tasks().is_empty());
+    assert!(manager.oom_tasks().is_empty());
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn multi_worker_named_socket_processes_all() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let worker_dir = worker_module_dir();
+    let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_multi_{}", process::id()));
+    let socket_dir = tmp_dir.join("sockets");
+    let _ = std::fs::create_dir_all(&socket_dir);
+
+    let config = LocalManagerConfig {
+        num_workers: 3,
+        max_memory: 2 * 1024 * 1024 * 1024,
+        always_restart_worker: false,
+        print_pid: false,
+        memuse_log_path: None,
+        stage_timeouts: std::collections::HashMap::new(),
+    };
+
+    let mut factory = NamedSocketWorkerFactory {
+        worker_module_dir: worker_dir,
+        source_dir: tmp_dir.clone(),
+        output_dir: tmp_dir.clone(),
+        socket_dir,
+        children: Vec::new(),
+    };
+
+    let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+        .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
+        .collect();
+
+    let mut manager = LocalManager::new(
+        config,
+        MemoryStealingScheduler,
+        FixedEstimator(50 * 1024 * 1024),
+    );
+
+    manager.process_binaries(binaries, &mut factory).await;
+
+    assert_eq!(manager.stats().completed, 8);
+    assert_eq!(manager.stats().total, 8);
     assert!(manager.failed_tasks().is_empty());
     assert!(manager.oom_tasks().is_empty());
 
