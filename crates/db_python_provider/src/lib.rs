@@ -1,12 +1,14 @@
 use std::os::fd::FromRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use serde::{Deserialize, Serialize};
 
-use db_comm_api_base::{BinaryInfo, MemoryBytes, WorkerId};
+use db_comm_api_base::{
+    BinaryInfo, Command, CommandSender, MemoryBytes, Response, ResponseReceiver, WorkerId,
+};
 
 /// The concrete identifier type for the tokenizer task.
 ///
@@ -25,7 +27,60 @@ pub struct TokenizerIdentifier {
 use db_local_manager::{LocalManager, LocalManagerConfig, ProcessingStats, WorkerFactory};
 use db_scheduler_api::MemoryEstimator;
 use db_scheduler_impl::MemoryStealingScheduler;
+use db_transport_socket::named_socket::NamedSocketManagerEnd;
 use db_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
+
+// ── EitherManagerEnd: unified transport for socketpair + named socket ──
+
+/// A manager-side transport endpoint that works with either socketpair or named
+/// socket connections. Named sockets require an async `accept()` before
+/// communication, which is performed lazily on the first `recv_responses` call.
+enum EitherManagerEnd {
+    Socketpair(SocketpairManagerEnd),
+    /// Named socket — `Option` holds it until accept is called; after accept
+    /// it stays `Some` (the accept mutates the inner state to have a connection).
+    Named {
+        inner: NamedSocketManagerEnd,
+        accepted: bool,
+    },
+}
+
+impl CommandSender for EitherManagerEnd {
+    async fn send_command(&mut self, command: Command) -> Result<(), String> {
+        match self {
+            EitherManagerEnd::Socketpair(s) => s.send_command(command).await,
+            EitherManagerEnd::Named { inner, accepted } => {
+                if !*accepted {
+                    return Err("Named socket: connection not yet accepted".into());
+                }
+                inner.send_command(command).await
+            }
+        }
+    }
+}
+
+impl ResponseReceiver for EitherManagerEnd {
+    async fn recv_responses(&mut self) -> Vec<Response> {
+        match self {
+            EitherManagerEnd::Socketpair(s) => s.recv_responses().await,
+            EitherManagerEnd::Named { inner, accepted } => {
+                // Lazy accept: on first recv, wait for the worker to connect
+                if !*accepted {
+                    match inner.accept().await {
+                        Ok(()) => {
+                            *accepted = true;
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "named socket accept failed");
+                            return Vec::new();
+                        }
+                    }
+                }
+                inner.recv_responses().await
+            }
+        }
+    }
+}
 
 /// Python-visible wrapper for BinaryIdentifier.
 #[pyclass(name = "BinaryIdentifier", from_py_object)]
@@ -194,7 +249,18 @@ impl MemoryEstimator for PyMemoryEstimatorBridge {
     }
 }
 
-/// Subprocess worker factory: spawns Python workers via socketpair.
+/// Connection mode for worker communication.
+#[derive(Clone, Debug)]
+enum ConnectionMode {
+    /// Anonymous Unix socketpair — FD is passed to child process.
+    Socketpair,
+    /// Named Unix domain socket — socket path is passed to child process.
+    Named {
+        socket_dir: PathBuf,
+    },
+}
+
+/// Subprocess worker factory: spawns Python workers via socketpair or named socket.
 struct SubprocessWorkerFactory {
     python_executable: PathBuf,
     source_dir: PathBuf,
@@ -203,16 +269,23 @@ struct SubprocessWorkerFactory {
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
+    connection_mode: ConnectionMode,
+    manual_start_worker: bool,
     child_processes: Vec<Option<std::process::Child>>,
 }
 
-impl WorkerFactory<SocketpairManagerEnd> for SubprocessWorkerFactory {
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> (SocketpairManagerEnd, Option<u32>) {
+impl SubprocessWorkerFactory {
+    /// Get the socket path for a worker in named socket mode.
+    fn socket_path_for_worker(socket_dir: &Path, worker_id: WorkerId) -> PathBuf {
+        socket_dir.join(format!("worker_{worker_id}.sock"))
+    }
+
+    /// Spawn using socketpair mode: create a socketpair, pass child FD.
+    fn spawn_socketpair(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
         let (manager_end, child_fd) = create_socketpair()
             .unwrap_or_else(|e| panic!("failed to create socketpair for worker {worker_id}: {e}"));
 
         let worker_log = self.log_dir.join(format!("worker_{worker_id}.log"));
-
         let mut cmd = std::process::Command::new(&self.python_executable);
         cmd.arg("-m")
             .arg(&self.worker_module)
@@ -228,7 +301,6 @@ impl WorkerFactory<SocketpairManagerEnd> for SubprocessWorkerFactory {
         if self.skip_existing {
             cmd.arg("--skip_existing");
         }
-
         for arg in &self.worker_cmd_args {
             cmd.arg(arg);
         }
@@ -250,11 +322,9 @@ impl WorkerFactory<SocketpairManagerEnd> for SubprocessWorkerFactory {
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn worker {worker_id}: {e}"));
 
-        // Close child fd on parent side (it was duped into child).
-        // Wrapping in OwnedFd will close it on drop.
+        // Close child fd on parent side (duped into child).
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
 
-        // Store child handle
         let pid = child.id();
         let idx = worker_id as usize;
         if self.child_processes.len() <= idx {
@@ -262,7 +332,110 @@ impl WorkerFactory<SocketpairManagerEnd> for SubprocessWorkerFactory {
         }
         self.child_processes[idx] = Some(child);
 
-        (manager_end, Some(pid))
+        (EitherManagerEnd::Socketpair(manager_end), Some(pid))
+    }
+
+    /// Spawn using named socket mode: bind socket, then optionally spawn subprocess.
+    fn spawn_named(
+        &mut self,
+        worker_id: WorkerId,
+        socket_dir: &PathBuf,
+    ) -> (EitherManagerEnd, Option<u32>) {
+        let socket_path = Self::socket_path_for_worker(socket_dir, worker_id);
+        let manager_end = NamedSocketManagerEnd::bind(&socket_path)
+            .unwrap_or_else(|e| panic!("failed to bind named socket for worker {worker_id}: {e}"));
+
+        if self.manual_start_worker {
+            // Print command for manual execution
+            let worker_log = self.log_dir.join(format!("worker_{worker_id}.log"));
+            let mut parts = vec![
+                self.python_executable.to_string_lossy().into_owned(),
+                "-m".into(),
+                self.worker_module.clone(),
+                "--socket-path".into(),
+                socket_path.to_string_lossy().into_owned(),
+                "--source".into(),
+                self.source_dir.to_string_lossy().into_owned(),
+                "--output".into(),
+                self.output_dir.to_string_lossy().into_owned(),
+                "--log-file".into(),
+                worker_log.to_string_lossy().into_owned(),
+            ];
+            if self.skip_existing {
+                parts.push("--skip_existing".into());
+            }
+            for arg in &self.worker_cmd_args {
+                parts.push(arg.clone());
+            }
+
+            tracing::info!(
+                worker_id,
+                "\n[Worker {worker_id}] Please run the following command in another terminal:\n  {}\n[Worker {worker_id}] Manager will detect when worker connects via socket: {}",
+                parts.join(" "),
+                socket_path.display()
+            );
+
+            let endpoint = EitherManagerEnd::Named {
+                inner: manager_end,
+                accepted: false,
+            };
+            // No child process — worker started manually
+            return (endpoint, None);
+        }
+
+        // Auto-spawn subprocess with --socket-path
+        let worker_log = self.log_dir.join(format!("worker_{worker_id}.log"));
+        let mut cmd = std::process::Command::new(&self.python_executable);
+        cmd.arg("-m")
+            .arg(&self.worker_module)
+            .arg("--socket-path")
+            .arg(&socket_path)
+            .arg("--source")
+            .arg(&self.source_dir)
+            .arg("--output")
+            .arg(&self.output_dir)
+            .arg("--log-file")
+            .arg(&worker_log);
+
+        if self.skip_existing {
+            cmd.arg("--skip_existing");
+        }
+        for arg in &self.worker_cmd_args {
+            cmd.arg(arg);
+        }
+
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let child = cmd
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn worker {worker_id}: {e}"));
+
+        let pid = child.id();
+        let idx = worker_id as usize;
+        if self.child_processes.len() <= idx {
+            self.child_processes.resize_with(idx + 1, || None);
+        }
+        self.child_processes[idx] = Some(child);
+
+        let endpoint = EitherManagerEnd::Named {
+            inner: manager_end,
+            accepted: false,
+        };
+        (endpoint, Some(pid))
+    }
+}
+
+impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
+    fn spawn_worker(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
+        match &self.connection_mode {
+            ConnectionMode::Socketpair => self.spawn_socketpair(worker_id),
+            ConnectionMode::Named { socket_dir } => {
+                let socket_dir = socket_dir.clone();
+                self.spawn_named(worker_id, &socket_dir)
+            }
+        }
     }
 }
 
@@ -283,6 +456,8 @@ struct PyLocalManager {
     estimator_slope: f64,
     estimator_intercept: f64,
     stage_timeouts: std::collections::HashMap<String, std::time::Duration>,
+    connection_mode: ConnectionMode,
+    manual_start_worker: bool,
     stats: Option<ProcessingStats>,
     failed_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
     oom_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
@@ -301,6 +476,9 @@ impl PyLocalManager {
         skip_existing = false,
         always_restart_worker = false,
         print_pid = false,
+        connection_mode = "socketpair",
+        socket_dir = None,
+        manual_start_worker = false,
     ))]
     fn new(
         py: Python<'_>,
@@ -313,6 +491,9 @@ impl PyLocalManager {
         skip_existing: bool,
         always_restart_worker: bool,
         print_pid: bool,
+        connection_mode: &str,
+        socket_dir: Option<String>,
+        manual_start_worker: bool,
     ) -> PyResult<Self> {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
@@ -360,6 +541,27 @@ impl PyLocalManager {
         let sys = py.import("sys")?;
         let python_executable: String = sys.getattr("executable")?.extract()?;
 
+        // Parse connection mode
+        let conn_mode = match connection_mode {
+            "socketpair" => ConnectionMode::Socketpair,
+            "named" => {
+                let dir = socket_dir
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "socket_dir is required when connection_mode is 'named'",
+                        )
+                    })?;
+                std::fs::create_dir_all(&dir).ok();
+                ConnectionMode::Named { socket_dir: dir }
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown connection_mode: {other:?}, expected 'socketpair' or 'named'"
+                )));
+            }
+        };
+
         Ok(Self {
             python_executable: PathBuf::from(python_executable),
             num_workers,
@@ -375,6 +577,8 @@ impl PyLocalManager {
             estimator_slope: bridge.slope,
             estimator_intercept: bridge.intercept,
             stage_timeouts,
+            connection_mode: conn_mode,
+            manual_start_worker,
             stats: None,
             failed_tasks: Vec::new(),
             oom_tasks: Vec::new(),
@@ -416,6 +620,8 @@ impl PyLocalManager {
             worker_module: self.worker_module.clone(),
             worker_cmd_args: self.worker_cmd_args.clone(),
             skip_existing: self.skip_existing,
+            connection_mode: self.connection_mode.clone(),
+            manual_start_worker: self.manual_start_worker,
             child_processes: Vec::new(),
         };
 
@@ -428,7 +634,7 @@ impl PyLocalManager {
                 .expect("failed to create tokio runtime");
 
             rt.block_on(async {
-                let mut manager =
+                let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, MemoryStealingScheduler, estimator);
                 manager.process_binaries(rust_binaries, &mut factory).await;
 
@@ -736,6 +942,8 @@ impl PyDistributedManager {
                             worker_module: sec_worker_module,
                             worker_cmd_args: sec_worker_args,
                             skip_existing,
+                            connection_mode: ConnectionMode::Socketpair,
+                            manual_start_worker: false,
                             child_processes: Vec::new(),
                         };
 
