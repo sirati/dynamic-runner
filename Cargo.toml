@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/db_comm_api_base",
+    "crates/db_manager_runner_comm",
+    "crates/db_primary_secondary_comm",
+    "crates/db_scheduler_api",
+    "crates/db_scheduler_impl",
+    "crates/db_transport_socket",
+    "crates/db_transport_channel",
+    "crates/db_transport_quic",
+    "crates/db_runner_impl",
+    "crates/db_local_manager",
+    "crates/db_distributed_manager",
+    "crates/db_python_provider",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "process", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "2"
+pyo3 = { version = "0.28", features = ["extension-module"] }
+quinn = "0.11"
+rustls = "0.23"
+rcgen = "0.13"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+nix = { version = "0.29", features = ["socket", "process"] }
+
+# Internal crates
+db_comm_api_base = { path = "crates/db_comm_api_base" }
+db_manager_runner_comm = { path = "crates/db_manager_runner_comm" }
+db_primary_secondary_comm = { path = "crates/db_primary_secondary_comm" }
+db_scheduler_api = { path = "crates/db_scheduler_api" }
+db_scheduler_impl = { path = "crates/db_scheduler_impl" }
+db_transport_socket = { path = "crates/db_transport_socket" }
+db_transport_channel = { path = "crates/db_transport_channel" }
+db_transport_quic = { path = "crates/db_transport_quic" }
+db_runner_impl = { path = "crates/db_runner_impl" }
+db_local_manager = { path = "crates/db_local_manager" }
+db_distributed_manager = { path = "crates/db_distributed_manager" }
+db_python_provider = { path = "crates/db_python_provider" }

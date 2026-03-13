@@ -1,0 +1,12 @@
+[package]
+name = "db_runner_impl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+db_comm_api_base = { workspace = true }
+db_manager_runner_comm = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+db_transport_channel = { workspace = true }

@@ -1,0 +1,25 @@
+[package]
+name = "db_python_provider"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "dynamic_batch_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+db_comm_api_base = { workspace = true }
+db_scheduler_api = { workspace = true }
+db_scheduler_impl = { workspace = true }
+db_local_manager = { workspace = true }
+db_distributed_manager = { workspace = true }
+db_primary_secondary_comm = { workspace = true }
+db_transport_quic = { workspace = true }
+db_manager_runner_comm = { workspace = true }
+db_transport_socket = { workspace = true }
+db_transport_channel = { workspace = true }
+serde = { workspace = true }
+pyo3 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -257,6 +257,18 @@ def main():
         help="Test master/slave with network simulation (uses message queues to verify network protocol compatibility)",
     )
 
+    parser.add_argument(
+        "--use-rust-backend",
+        action="store_true",
+        help="Use the Rust-based local manager (requires dynamic_batch_rs to be installed via maturin)",
+    )
+
+    parser.add_argument(
+        "--use-rust-distributed-backend",
+        action="store_true",
+        help="Use the Rust-based distributed manager (single-process mode, requires dynamic_batch_rs)",
+    )
+
     args = parser.parse_args()
 
     # Handle secondary mode early - this is for SLURM compute nodes or local test
@@ -560,6 +572,74 @@ def main():
 
         return
 
+    elif args.use_rust_distributed_backend:
+        # Rust-based in-process distributed manager
+        try:
+            from dynamic_batch_rs import RustDistributedManager
+        except ImportError:
+            logger.error(
+                "Rust distributed backend not available. Install it with: "
+                "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+            )
+            return
+
+        logger.info("=" * 60)
+        logger.info("RUST DISTRIBUTED BACKEND MODE")
+        logger.info("=" * 60)
+
+        sel_result = process_selection_arguments(args)
+        binaries_info = find_matching_binaries(
+            sel_result.source_dir,
+            sel_result.platforms,
+            sel_result.compiler,
+            sel_result.compiler_versions,
+            sel_result.opt_levels,
+            sel_result.file_format,
+            sel_result.version_regex,
+            sel_result.opt_regex,
+            sel_result.name_regex,
+            sel_result.exclude_subfolders,
+        )
+
+        if args.skip_existing:
+            binaries_info, _ = filter_existing_outputs(
+                binaries_info, sel_result.source_dir, sel_result.output_dir, task.get_output_filename_pattern
+            )
+
+        logger.info(f"Found {len(binaries_info)} binaries to process")
+
+        if len(binaries_info) == 0:
+            logger.warning("No binaries found to process.")
+            return
+
+        num_secondaries = args.jobs if args.jobs else 1
+        num_cores = parse_cores(args.cores)
+        max_memory = parse_memory(args.max_memory)
+        workers_per_secondary = num_cores // num_secondaries if num_secondaries > 0 else num_cores
+        ram_per_secondary = max_memory // num_secondaries if num_secondaries > 0 else max_memory
+
+        logger.info(f"Secondaries: {num_secondaries}")
+        logger.info(f"Workers per secondary: {workers_per_secondary}")
+        logger.info(f"RAM per secondary: {ram_per_secondary / (1024**3):.2f}GB")
+
+        rust_dm = RustDistributedManager(
+            num_secondaries=num_secondaries,
+            num_workers_per_secondary=workers_per_secondary,
+            ram_per_secondary=ram_per_secondary,
+            source_dir=str(sel_result.source_dir),
+            output_dir=str(sel_result.output_dir),
+            task_definition=task,
+            task_args=args,
+            skip_existing=args.skip_existing,
+        )
+
+        rust_dm.run(binaries_info)
+
+        logger.info(f"Completed: {rust_dm.completed}")
+        logger.info(f"Failed: {rust_dm.failed}")
+
+        return
+
     # Standard local processing mode
     num_cores = parse_cores(args.cores)
     max_memory = parse_memory(args.max_memory)
@@ -572,6 +652,8 @@ def main():
     print_selection_summary(config, display_opt_levels)
     logger.info(f"Cores: {num_cores}")
     logger.info(f"Max memory: {max_memory / (1024**3):.2f}GB")
+    if args.use_rust_backend:
+        logger.info("Backend: Rust (dynamic_batch_rs)")
     logger.info("")
 
     logger.info("Scanning for matching binaries...")
@@ -708,6 +790,44 @@ def main():
                     logger.info(f"[Worker {worker.worker_id}] Stopping (all phases complete)")
                 except Exception:
                     pass
+    elif args.use_rust_backend:
+        # Use Rust-based local manager
+        try:
+            from dynamic_batch_rs import RustLocalManager
+        except ImportError:
+            logger.error(
+                "Rust backend not available. Install it with: "
+                "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+            )
+            return
+
+        logger.info("=" * 60)
+        logger.info("RUST BACKEND MODE")
+        logger.info("=" * 60)
+
+        rust_manager = RustLocalManager(
+            num_workers=num_cores,
+            max_memory=max_memory,
+            source_dir=str(config.source_dir),
+            output_dir=str(config.output_dir),
+            task_definition=task,
+            task_args=args,
+            skip_existing=args.skip_existing,
+        )
+
+        rust_manager.process_binaries(sorted_binaries)
+
+        stats = rust_manager.stats
+        logger.info(f"Completed: {stats.completed}/{stats.total}")
+        logger.info(f"Errored: {stats.errored}")
+        if rust_manager.failed_tasks:
+            logger.warning(f"Failed tasks: {len(rust_manager.failed_tasks)}")
+            for ft in rust_manager.failed_tasks:
+                logger.warning(f"  {ft.binary.path}: {ft.error_type}: {ft.error_message}")
+        if rust_manager.oom_tasks:
+            logger.warning(f"OOM tasks: {len(rust_manager.oom_tasks)}")
+            for ot in rust_manager.oom_tasks:
+                logger.warning(f"  {ot.binary.path}: {ot.error_message}")
     else:
         # Use standard local manager
         manager = LocalWorkerManager(
