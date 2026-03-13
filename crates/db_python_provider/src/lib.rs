@@ -798,6 +798,14 @@ impl PyDistributedManager {
 /// Python module definition.
 #[pymodule]
 fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize tracing subscriber (only once, ignore if already set)
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyBinaryInfo>()?;
     m.add_class::<PyProcessingStats>()?;

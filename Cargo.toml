@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "pr
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 pyo3 = { version = "0.28", features = ["extension-module"] }
 quinn = "0.11"
