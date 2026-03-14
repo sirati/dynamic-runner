@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 db_comm_api_base = { workspace = true }
+db_manager_runner_comm = { workspace = true }
 db_primary_secondary_comm = { workspace = true }
 db_scheduler_api = { workspace = true }
 db_scheduler_impl = { workspace = true }
@@ -13,6 +14,8 @@ db_transport_quic = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+zip = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 db_transport_channel = { workspace = true }

@@ -7,8 +7,9 @@ use pyo3::types::PyList;
 use serde::{Deserialize, Serialize};
 
 use db_comm_api_base::{
-    BinaryInfo, Command, CommandSender, MemoryBytes, Response, ResponseReceiver, WorkerId,
+    BinaryInfo, MemoryBytes, MessageReceiver, MessageSender, WorkerId,
 };
+use db_manager_runner_comm::{Command, Response};
 
 /// The concrete identifier type for the tokenizer task.
 ///
@@ -45,24 +46,24 @@ enum EitherManagerEnd {
     },
 }
 
-impl CommandSender for EitherManagerEnd {
-    async fn send_command(&mut self, command: Command) -> Result<(), String> {
+impl MessageSender<Command> for EitherManagerEnd {
+    async fn send(&mut self, msg: Command) -> Result<(), String> {
         match self {
-            EitherManagerEnd::Socketpair(s) => s.send_command(command).await,
+            EitherManagerEnd::Socketpair(s) => s.send(msg).await,
             EitherManagerEnd::Named { inner, accepted } => {
                 if !*accepted {
                     return Err("Named socket: connection not yet accepted".into());
                 }
-                inner.send_command(command).await
+                inner.send(msg).await
             }
         }
     }
 }
 
-impl ResponseReceiver for EitherManagerEnd {
-    async fn recv_responses(&mut self) -> Vec<Response> {
+impl MessageReceiver<Response> for EitherManagerEnd {
+    async fn recv(&mut self) -> Option<Response> {
         match self {
-            EitherManagerEnd::Socketpair(s) => s.recv_responses().await,
+            EitherManagerEnd::Socketpair(s) => s.recv().await,
             EitherManagerEnd::Named { inner, accepted } => {
                 // Lazy accept: on first recv, wait for the worker to connect
                 if !*accepted {
@@ -72,11 +73,11 @@ impl ResponseReceiver for EitherManagerEnd {
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "named socket accept failed");
-                            return Vec::new();
+                            return None;
                         }
                     }
                 }
-                inner.recv_responses().await
+                inner.recv().await
             }
         }
     }
@@ -633,7 +634,8 @@ impl PyLocalManager {
                 .build()
                 .expect("failed to create tokio runtime");
 
-            rt.block_on(async {
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, MemoryStealingScheduler, estimator);
                 manager.process_binaries(rust_binaries, &mut factory).await;
@@ -641,7 +643,7 @@ impl PyLocalManager {
                 self.stats = Some(manager.stats().clone());
                 self.failed_tasks = manager.failed_tasks().to_vec();
                 self.oom_tasks = manager.oom_tasks().to_vec();
-            });
+            }));
 
             // Clean up child processes
             for child in &mut factory.child_processes {
@@ -727,46 +729,11 @@ fn extract_binaries(binaries: &Bound<'_, PyList>) -> PyResult<Vec<BinaryInfo<Tok
 
 use std::collections::HashMap;
 use db_distributed_manager::{
-    PrimaryCoordinator, PrimaryConfig, SecondaryTransport,
-    SecondaryCoordinator, SecondaryConfig, PrimaryTransport,
+    PrimaryCoordinator, PrimaryConfig,
+    SecondaryCoordinator, SecondaryConfig,
 };
-use db_primary_secondary_comm::DistributedMessage;
+use db_transport_channel::{ChannelSecondaryTransportEnd, ChannelPrimaryTransportEnd};
 use std::time::Duration;
-
-/// Channel-based SecondaryTransport for in-process primary.
-struct ChannelSecondaryTransport {
-    outgoing: HashMap<String, tokio::sync::mpsc::UnboundedSender<DistributedMessage<TokenizerIdentifier>>>,
-    incoming_rx: tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TokenizerIdentifier>>,
-}
-
-impl SecondaryTransport<TokenizerIdentifier> for ChannelSecondaryTransport {
-    async fn send_to(&mut self, secondary_id: &str, msg: DistributedMessage<TokenizerIdentifier>) -> Result<(), String> {
-        if let Some(tx) = self.outgoing.get(secondary_id) {
-            tx.send(msg).map_err(|e| e.to_string())?;
-        }
-        Ok(())
-    }
-
-    async fn recv(&mut self) -> Option<DistributedMessage<TokenizerIdentifier>> {
-        self.incoming_rx.recv().await
-    }
-}
-
-/// Channel-based PrimaryTransport for in-process secondary.
-struct ChannelPrimaryTransport {
-    tx: tokio::sync::mpsc::UnboundedSender<DistributedMessage<TokenizerIdentifier>>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TokenizerIdentifier>>,
-}
-
-impl PrimaryTransport<TokenizerIdentifier> for ChannelPrimaryTransport {
-    async fn send(&mut self, msg: DistributedMessage<TokenizerIdentifier>) -> Result<(), String> {
-        self.tx.send(msg).map_err(|e| e.to_string())
-    }
-
-    async fn recv(&mut self) -> Option<DistributedMessage<TokenizerIdentifier>> {
-        self.rx.recv().await
-    }
-}
 
 /// In-process distributed manager: runs primary + N secondaries in the same
 /// process using channel transport. Suitable for `--multi-computer single-process`.
@@ -883,7 +850,8 @@ impl PyDistributedManager {
                 .build()
                 .expect("failed to create tokio runtime");
 
-            rt.block_on(async {
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async {
                 use tokio::sync::mpsc as tokio_mpsc;
 
                 let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
@@ -903,7 +871,7 @@ impl PyDistributedManager {
 
                     // Forward secondary→primary messages
                     let fwd_tx = incoming_tx.clone();
-                    tokio::spawn(async move {
+                    tokio::task::spawn_local(async move {
                         let mut rx = sec_to_pri_rx;
                         while let Some(msg) = rx.recv().await {
                             if fwd_tx.send(msg).is_err() {
@@ -919,8 +887,8 @@ impl PyDistributedManager {
                     let sec_worker_module = worker_module.clone();
                     let sec_worker_args = worker_cmd_args.clone();
 
-                    let handle = tokio::spawn(async move {
-                        let transport = ChannelPrimaryTransport {
+                    let handle = tokio::task::spawn_local(async move {
+                        let transport = ChannelPrimaryTransportEnd {
                             tx: sec_to_pri_tx,
                             rx: pri_to_sec_rx,
                         };
@@ -930,6 +898,9 @@ impl PyDistributedManager {
                             ram_bytes: ram,
                             hostname: "localhost".into(),
                             keepalive_interval: Duration::from_secs(60),
+                            src_network: None,
+                            src_tmp: None,
+                            peer_timeout: Duration::from_secs(120),
                         };
 
                         let estimator = PyMemoryEstimatorBridge { slope, intercept };
@@ -950,6 +921,7 @@ impl PyDistributedManager {
                         let mut secondary = SecondaryCoordinator::new(
                             config,
                             transport,
+                            db_transport_quic::NoPeerTransport,
                             MemoryStealingScheduler,
                             estimator,
                         );
@@ -969,7 +941,7 @@ impl PyDistributedManager {
                 }
                 drop(incoming_tx); // Only forwarding tasks hold senders now
 
-                let transport = ChannelSecondaryTransport { outgoing, incoming_rx };
+                let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
                 let config = PrimaryConfig {
                     node_id: "primary".into(),
                     num_secondaries,
@@ -1010,7 +982,7 @@ impl PyDistributedManager {
                         let _ = c.wait();
                     }
                 }
-            });
+            }));
         });
 
         self.completed = completed;
@@ -1030,6 +1002,478 @@ impl PyDistributedManager {
     }
 }
 
+// ── Network-based primary coordinator (spawns real secondary processes) ──
+
+use db_transport_quic::{NetworkClient, NetworkServer};
+
+/// Python-facing primary coordinator that listens for real network connections
+/// from secondary processes. For `--multi-computer local` mode.
+///
+/// Spawns secondary subprocesses that connect back via WSS, then runs the
+/// Rust `PrimaryCoordinator` with `NetworkServer` as the transport.
+#[pyclass(name = "RustPrimaryCoordinator")]
+struct PyPrimaryCoordinator {
+    python_executable: PathBuf,
+    num_secondaries: u32,
+    estimator_slope: f64,
+    estimator_intercept: f64,
+    raw_logs: bool,
+    completed: u32,
+    failed: u32,
+}
+
+#[pymethods]
+impl PyPrimaryCoordinator {
+    #[new]
+    #[pyo3(signature = (
+        num_secondaries,
+        task_definition,
+        raw_logs = false,
+    ))]
+    fn new(
+        py: Python<'_>,
+        num_secondaries: u32,
+        task_definition: &Bound<'_, PyAny>,
+        raw_logs: bool,
+    ) -> PyResult<Self> {
+        let estimate_fn = task_definition.getattr("estimate_memory")?;
+        let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
+
+        let sys = py.import("sys")?;
+        let python_executable: String = sys.getattr("executable")?.extract()?;
+
+        // Validate arguments that the secondaries will need (fail early).
+        let _: String = task_definition
+            .call_method0("get_worker_module")?
+            .extract()?;
+
+        Ok(Self {
+            python_executable: PathBuf::from(python_executable),
+            num_secondaries,
+            estimator_slope: bridge.slope,
+            estimator_intercept: bridge.intercept,
+            raw_logs,
+            completed: 0,
+            failed: 0,
+        })
+    }
+
+    /// Run the primary coordination pipeline over real network connections.
+    fn run(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
+        let rust_binaries = extract_binaries(binaries)?;
+
+        let num_secondaries = self.num_secondaries;
+        let slope = self.estimator_slope;
+        let intercept = self.estimator_intercept;
+        let python_executable = self.python_executable.clone();
+        let raw_logs = self.raw_logs;
+
+        let mut completed = 0u32;
+        let mut failed = 0u32;
+
+        py.detach(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime");
+
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async {
+                // Start the network server on a random port.
+                let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+                let server: NetworkServer<TokenizerIdentifier> =
+                    match NetworkServer::bind(bind_addr).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to start network server");
+                            return;
+                        }
+                    };
+                let port = server.port();
+                tracing::info!(port, "primary network server listening");
+
+                // Spawn secondary subprocesses pointing at this port.
+                let primary_url = format!("tcp://127.0.0.1:{}", port);
+                let mut child_processes: Vec<std::process::Child> = Vec::new();
+
+                for i in 0..num_secondaries {
+                    let secondary_id = format!("secondary-{i}");
+
+                    let mut cmd = std::process::Command::new(python_executable.as_os_str());
+                    cmd.args(["-m", "dynamic_batch"]);
+                    cmd.args(["--secondary", &primary_url]);
+                    cmd.args(["--secondary-id", &secondary_id]);
+                    cmd.args(["--secondary-quic-port", "0"]);
+                    if raw_logs {
+                        cmd.arg("--raw-logs");
+                    }
+
+                    match cmd.spawn() {
+                        Ok(child) => {
+                            tracing::info!(
+                                secondary_id = %secondary_id,
+                                pid = child.id(),
+                                "spawned secondary process"
+                            );
+                            child_processes.push(child);
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                secondary_id = %secondary_id,
+                                error = %e,
+                                "failed to spawn secondary"
+                            );
+                        }
+                    }
+                }
+
+                // Give secondaries a moment to start up.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Run the primary coordinator with the network server transport.
+                let config = PrimaryConfig {
+                    node_id: "primary".into(),
+                    num_secondaries,
+                    connect_timeout: Duration::from_secs(600),
+                    peer_timeout: Duration::from_secs(300),
+                };
+
+                let estimator = PyMemoryEstimatorBridge { slope, intercept };
+                let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =
+                    PrimaryCoordinator::new(
+                        config,
+                        server,
+                        MemoryStealingScheduler,
+                        estimator,
+                    );
+
+                let result = primary.run(rust_binaries).await;
+                if let Err(e) = &result {
+                    tracing::error!(error = %e, "primary coordinator failed");
+                }
+
+                completed = primary.completed_count() as u32;
+                failed = primary.failed_count() as u32;
+
+                drop(primary);
+
+                // Terminate secondary processes.
+                for mut child in child_processes {
+                    let pid = child.id();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::debug!(pid, "secondary process terminated");
+                }
+            }));
+        });
+
+        self.completed = completed;
+        self.failed = failed;
+
+        Ok(())
+    }
+
+    #[getter]
+    fn completed(&self) -> u32 {
+        self.completed
+    }
+
+    #[getter]
+    fn failed(&self) -> u32 {
+        self.failed
+    }
+}
+
+// ── Network-based secondary coordinator ──
+
+/// Python-facing secondary coordinator that connects to a remote primary
+/// over the network (WSS) and runs local workers. For `--secondary` mode.
+#[pyclass(name = "RustSecondaryCoordinator")]
+struct PySecondaryCoordinator {
+    python_executable: PathBuf,
+    primary_url: String,
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    source_dir: PathBuf,
+    output_dir: PathBuf,
+    log_dir: PathBuf,
+    worker_module: String,
+    worker_cmd_args: Vec<String>,
+    skip_existing: bool,
+    estimator_slope: f64,
+    estimator_intercept: f64,
+    completed: u32,
+}
+
+#[pymethods]
+impl PySecondaryCoordinator {
+    #[new]
+    #[pyo3(signature = (
+        primary_url,
+        secondary_id,
+        num_workers,
+        ram_bytes,
+        source_dir,
+        output_dir,
+        task_definition,
+        task_args,
+        skip_existing = false,
+    ))]
+    fn new(
+        py: Python<'_>,
+        primary_url: String,
+        secondary_id: String,
+        num_workers: u32,
+        ram_bytes: u64,
+        source_dir: String,
+        output_dir: String,
+        task_definition: &Bound<'_, PyAny>,
+        task_args: &Bound<'_, PyAny>,
+        skip_existing: bool,
+    ) -> PyResult<Self> {
+        let estimate_fn = task_definition.getattr("estimate_memory")?;
+        let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
+
+        let worker_module: String = task_definition
+            .call_method0("get_worker_module")?
+            .extract()?;
+
+        let source_path = PathBuf::from(&source_dir);
+        let output_path = PathBuf::from(&output_dir);
+        let args_list: Vec<String> = task_definition
+            .call_method1(
+                "build_worker_command_args",
+                (task_args, source_path.to_str().unwrap(), output_path.to_str().unwrap(), skip_existing),
+            )?
+            .extract()?;
+
+        let datetime_mod = py.import("datetime")?;
+        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
+        let timestamp: String = now.call_method1("strftime", ("%Y%m%d_%H%M%S",))?.extract()?;
+        let log_dir = output_path.join("logs").join(&timestamp);
+        std::fs::create_dir_all(&log_dir).ok();
+
+        let sys = py.import("sys")?;
+        let python_executable: String = sys.getattr("executable")?.extract()?;
+
+        Ok(Self {
+            python_executable: PathBuf::from(python_executable),
+            primary_url,
+            secondary_id,
+            num_workers,
+            ram_bytes,
+            source_dir: source_path,
+            output_dir: output_path,
+            log_dir,
+            worker_module,
+            worker_cmd_args: args_list,
+            skip_existing,
+            estimator_slope: bridge.slope,
+            estimator_intercept: bridge.intercept,
+            completed: 0,
+        })
+    }
+
+    /// Connect to the primary and run the secondary coordination loop.
+    fn run(&mut self, py: Python<'_>) -> PyResult<()> {
+        let primary_url = self.primary_url.clone();
+        let secondary_id = self.secondary_id.clone();
+        let num_workers = self.num_workers;
+        let ram_bytes = self.ram_bytes;
+        let slope = self.estimator_slope;
+        let intercept = self.estimator_intercept;
+        let python_executable = self.python_executable.clone();
+        let source_dir = self.source_dir.clone();
+        let output_dir = self.output_dir.clone();
+        let log_dir = self.log_dir.clone();
+        let worker_module = self.worker_module.clone();
+        let worker_cmd_args = self.worker_cmd_args.clone();
+        let skip_existing = self.skip_existing;
+
+        let mut completed = 0u32;
+
+        py.detach(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime");
+
+            let local = tokio::task::LocalSet::new();
+            rt.block_on(local.run_until(async {
+                // Parse the primary URL to get the address.
+                // Supports formats like "tcp://host:port", "ws://host:port", or "host:port"
+                let addr_str = primary_url
+                    .strip_prefix("tcp://")
+                    .or_else(|| primary_url.strip_prefix("ws://"))
+                    .or_else(|| primary_url.strip_prefix("wss://"))
+                    .unwrap_or(&primary_url);
+
+                let addr: std::net::SocketAddr = match addr_str.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(url = %primary_url, error = %e, "failed to parse primary URL");
+                        return;
+                    }
+                };
+
+                // Connect to primary via WSS with retry logic (up to 60 seconds)
+                let connect_timeout = Duration::from_secs(60);
+                let retry_delay = Duration::from_secs(1);
+                let start = std::time::Instant::now();
+                let mut attempt = 0u32;
+                let client = loop {
+                    attempt += 1;
+                    let elapsed = start.elapsed();
+                    if elapsed > connect_timeout {
+                        tracing::error!(
+                            addr = %addr,
+                            attempts = attempt,
+                            "failed to connect to primary after {:.0}s",
+                            connect_timeout.as_secs_f64()
+                        );
+                        return;
+                    }
+                    match NetworkClient::connect_wss_only(addr).await {
+                        Ok(c) => {
+                            tracing::info!(
+                                addr = %addr,
+                                elapsed_s = elapsed.as_secs_f64(),
+                                attempts = attempt,
+                                "connected to primary"
+                            );
+                            break c;
+                        }
+                        Err(e) => {
+                            let remaining = connect_timeout.saturating_sub(elapsed);
+                            if remaining > retry_delay {
+                                tracing::info!(
+                                    attempt,
+                                    error = %e,
+                                    "connection failed, retrying in {:.0}s...",
+                                    retry_delay.as_secs_f64()
+                                );
+                                tokio::time::sleep(retry_delay).await;
+                            } else {
+                                tracing::error!(addr = %addr, error = %e, "failed to connect to primary");
+                                return;
+                            }
+                        }
+                    }
+                };
+
+                // Start peer network for peer-to-peer communication
+                let peer_network: db_transport_quic::PeerNetwork<TokenizerIdentifier> =
+                    db_transport_quic::PeerNetwork::start(&format!("sec-{}", num_workers))
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::error!(error = %e, "failed to start peer network, using no-op");
+                            // This won't happen in practice since PeerNetwork::start only fails
+                            // on cert generation or bind errors, but we handle it gracefully.
+                            panic!("peer network start failed: {e}");
+                        });
+
+                let peer_cert_pem = peer_network.cert_pem().to_string();
+                let peer_port = peer_network.port();
+
+                let config = SecondaryConfig {
+                    secondary_id: secondary_id.clone(),
+                    num_workers,
+                    ram_bytes,
+                    hostname: gethostname(),
+                    keepalive_interval: Duration::from_secs(1),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                };
+
+                let estimator = PyMemoryEstimatorBridge { slope, intercept };
+
+                let mut factory = SubprocessWorkerFactory {
+                    python_executable,
+                    source_dir,
+                    output_dir,
+                    log_dir,
+                    worker_module,
+                    worker_cmd_args,
+                    skip_existing,
+                    connection_mode: ConnectionMode::Socketpair,
+                    manual_start_worker: false,
+                    child_processes: Vec::new(),
+                };
+
+                let mut secondary: SecondaryCoordinator<_, _, _, _, _, TokenizerIdentifier> = SecondaryCoordinator::new(
+                    config,
+                    client,
+                    peer_network,
+                    MemoryStealingScheduler,
+                    estimator,
+                );
+
+                // Set peer cert info so the CertExchange message includes our QUIC details
+                secondary.set_peer_cert_info(
+                    db_distributed_manager::PeerCertInfo {
+                        public_cert_pem: peer_cert_pem,
+                        ipv4_address: Some(detect_ipv4()),
+                        ipv6_address: None,
+                        quic_port: peer_port,
+                    },
+                );
+
+                match secondary.run(&mut factory).await {
+                    Ok(()) => {
+                        tracing::info!("secondary finished successfully");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "secondary failed");
+                    }
+                }
+
+                completed = secondary.completed_count() as u32;
+
+                // Clean up child processes
+                for child in &mut factory.child_processes {
+                    if let Some(mut c) = child.take() {
+                        let _ = c.kill();
+                        let _ = c.wait();
+                    }
+                }
+            }));
+        });
+
+        self.completed = completed;
+        Ok(())
+    }
+
+    #[getter]
+    fn completed(&self) -> u32 {
+        self.completed
+    }
+}
+
+/// Get the hostname, falling back to "unknown" on error.
+fn gethostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Detect the local IPv4 address by connecting a UDP socket to 8.8.8.8.
+/// Returns "127.0.0.1" if detection fails.
+fn detect_ipv4() -> String {
+    use std::net::UdpSocket;
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|sock| {
+            sock.connect("8.8.8.8:80")?;
+            sock.local_addr()
+        })
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".into())
+}
+
 /// Python module definition.
 #[pymodule]
 fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1047,5 +1491,7 @@ fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyFailedTask>()?;
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
+    m.add_class::<PyPrimaryCoordinator>()?;
+    m.add_class::<PySecondaryCoordinator>()?;
     Ok(())
 }

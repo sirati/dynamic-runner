@@ -27,7 +27,11 @@ quinn = "0.11"
 rustls = "0.23"
 rcgen = "0.13"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
 nix = { version = "0.29", features = ["socket", "process"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 # Internal crates
 db_comm_api_base = { path = "crates/db_comm_api_base" }

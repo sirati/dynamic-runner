@@ -1,0 +1,200 @@
+use db_comm_api_base::{Identifier, MemoryBytes, WorkerId};
+use db_manager_runner_comm::ManagerEndpoint;
+use db_scheduler_api::{OomDecision, Scheduler, WorkerBudgetInfo};
+use tokio::sync::mpsc;
+
+use crate::manager::WorkerFactory;
+use crate::worker::{WorkerEvent, WorkerHandle};
+
+/// Result of an OOM check — tells the caller what happened so it can
+/// take manager-specific action (requeue task, report to primary, etc.).
+pub enum OomKillResult<I: Identifier> {
+    /// A worker was killed. The caller should handle the displaced binary
+    /// (e.g. requeue locally or report failure to primary).
+    Killed {
+        worker_id: WorkerId,
+        binary: Option<db_comm_api_base::BinaryInfo<I>>,
+        reason: String,
+    },
+    /// No action needed — memory is within limits.
+    NoAction,
+}
+
+/// Shared worker pool used by both `LocalManager` and `SecondaryCoordinator`.
+///
+/// Owns the workers, the event channel, and provides lifecycle operations
+/// (initialize, restart, OOM check, stop). Does NOT own scheduling decisions
+/// or task queues — those remain with the specific manager.
+pub struct WorkerPool<M: ManagerEndpoint, I: Identifier> {
+    pub workers: Vec<WorkerHandle<M, I>>,
+    event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
+    event_rx: mpsc::UnboundedReceiver<WorkerEvent<I>>,
+}
+
+impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
+    pub fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        Self {
+            workers: Vec::new(),
+            event_tx,
+            event_rx,
+        }
+    }
+
+    /// Shared event sender — needed when constructing WorkerHandles externally.
+    pub fn event_tx(&self) -> &mpsc::UnboundedSender<WorkerEvent<I>> {
+        &self.event_tx
+    }
+
+    /// Receive the next worker event (async, blocks until one arrives).
+    pub async fn recv_event(&mut self) -> Option<WorkerEvent<I>> {
+        self.event_rx.recv().await
+    }
+
+    /// Initialize N workers using the factory, assigning budgets via the scheduler.
+    pub async fn initialize<S: Scheduler<I>>(
+        &mut self,
+        num_workers: u32,
+        max_memory: MemoryBytes,
+        scheduler: &S,
+        factory: &mut impl WorkerFactory<M>,
+        print_pid: bool,
+    ) {
+        for i in 0..num_workers {
+            let (transport, pid) = factory.spawn_worker(i);
+            if print_pid {
+                if let Some(pid) = pid {
+                    tracing::info!(worker_id = i, pid, "worker PID");
+                }
+            }
+            let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
+            handle.pid = pid;
+            handle.reserved_budget = scheduler.initial_budget(i, max_memory);
+            tracing::info!(
+                worker_id = i,
+                budget_mb = handle.reserved_budget / (1024 * 1024),
+                "worker created"
+            );
+            self.workers.push(handle);
+        }
+
+        self.wait_for_all_ready().await;
+    }
+
+    /// Block until every worker has reported Ready.
+    pub async fn wait_for_all_ready(&mut self) {
+        loop {
+            let all_ready = self.workers.iter().all(|w| w.is_ready());
+            if all_ready {
+                tracing::info!("all workers ready");
+                break;
+            }
+            for worker in &mut self.workers {
+                if !worker.is_ready() {
+                    worker.poll_ready().await;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Restart a single worker: stop the old one, spawn a fresh transport,
+    /// preserve budget and assignment_failure_count, wait for Ready.
+    pub async fn restart_worker(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+        print_pid: bool,
+    ) {
+        let old = &mut self.workers[worker_id as usize];
+        if !old.is_stopped() {
+            old.stop().await;
+        }
+
+        let (transport, pid) = factory.spawn_worker(worker_id);
+        if print_pid {
+            if let Some(pid) = pid {
+                tracing::info!(worker_id, pid, "worker PID (restart)");
+            }
+        }
+
+        let reserved_budget = self.workers[worker_id as usize].reserved_budget;
+        let failure_count = self.workers[worker_id as usize].assignment_failure_count;
+
+        let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
+        handle.pid = pid;
+        handle.reserved_budget = reserved_budget;
+        handle.assignment_failure_count = failure_count;
+        self.workers[worker_id as usize] = handle;
+
+        // Wait for ready
+        loop {
+            if self.workers[worker_id as usize].is_ready() {
+                break;
+            }
+            self.workers[worker_id as usize].poll_ready().await;
+            tokio::task::yield_now().await;
+        }
+
+        tracing::info!(worker_id, "worker restarted and ready");
+    }
+
+    /// Update actual memory usage for all workers from /proc/[pid]/statm.
+    pub fn update_all_memory_usage(&mut self) {
+        for worker in &mut self.workers {
+            worker.update_memory_usage();
+        }
+    }
+
+    /// Check OOM via the scheduler, kill if needed.
+    ///
+    /// Returns `OomKillResult::Killed` with the displaced binary so the
+    /// caller can decide what to do (requeue locally, report to primary, etc.).
+    /// The worker is marked as OOM-killed but NOT restarted — the caller
+    /// must call `restart_worker` if it wants the worker back.
+    pub fn check_oom<S: Scheduler<I>>(
+        &mut self,
+        scheduler: &S,
+        max_memory: MemoryBytes,
+        in_oom_phase: bool,
+    ) -> OomKillResult<I> {
+        self.update_all_memory_usage();
+        let infos = self.budget_infos();
+        let decision = scheduler.check_oom(&infos, max_memory, in_oom_phase);
+
+        match decision {
+            OomDecision::Kill { worker_id, reason } => {
+                tracing::warn!(
+                    worker_id,
+                    reason = %reason,
+                    in_oom_phase,
+                    "OOM killing worker"
+                );
+                let worker = &mut self.workers[worker_id as usize];
+                let binary = worker.current_binary.take();
+                worker.mark_oom_killed();
+                OomKillResult::Killed {
+                    worker_id,
+                    binary,
+                    reason,
+                }
+            }
+            OomDecision::NoAction => OomKillResult::NoAction,
+        }
+    }
+
+    /// Build budget info snapshots for all workers.
+    pub fn budget_infos(&self) -> Vec<WorkerBudgetInfo<I>> {
+        self.workers.iter().map(|w| w.budget_info()).collect()
+    }
+
+    /// Stop all workers that aren't already stopped.
+    pub async fn stop_all(&mut self) {
+        for worker in &mut self.workers {
+            if !worker.is_stopped() {
+                worker.stop().await;
+                tracing::info!(worker_id = worker.worker_id, "worker stopped");
+            }
+        }
+    }
+}

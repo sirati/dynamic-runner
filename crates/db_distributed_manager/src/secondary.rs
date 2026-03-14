@@ -1,11 +1,18 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use db_comm_api_base::{BinaryInfo, Identifier, ManagerEndpoint, WorkerId};
-use db_local_manager::worker::{WorkerEvent, WorkerHandle};
+use db_comm_api_base::{BinaryInfo, Identifier, WorkerId};
+use db_manager_runner_comm::ManagerEndpoint;
+use db_local_manager::pool::{OomKillResult, WorkerPool};
+use db_local_manager::worker::WorkerEvent;
 use db_local_manager::WorkerFactory;
-use db_primary_secondary_comm::{DistributedBinaryInfo, DistributedMessage, MessageType};
+use db_primary_secondary_comm::{
+    DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, PrimaryTransport,
+};
 use db_scheduler_api::{MemoryEstimator, Scheduler};
+
+use crate::zip_extract::ExtractionCache;
 
 /// Configuration for the secondary coordinator.
 pub struct SecondaryConfig {
@@ -14,18 +21,36 @@ pub struct SecondaryConfig {
     pub ram_bytes: u64,
     pub hostname: String,
     pub keepalive_interval: Duration,
+    /// Directory containing ZIP files (for SLURM mode). `None` for local/channel mode.
+    pub src_network: Option<PathBuf>,
+    /// Temporary directory for extracted binaries. Defaults to a temp dir if `None`.
+    pub src_tmp: Option<PathBuf>,
+    /// Peer timeout threshold (default: 120s). A peer is considered dead if no
+    /// keepalive is received within this duration.
+    pub peer_timeout: Duration,
 }
 
-/// Trait for the secondary's transport to the primary.
-pub trait PrimaryTransport<I: Identifier> {
-    /// Send a message to the primary.
-    fn send(
-        &mut self,
-        msg: DistributedMessage<I>,
-    ) -> impl std::future::Future<Output = Result<(), String>>;
+impl Default for SecondaryConfig {
+    fn default() -> Self {
+        Self {
+            secondary_id: String::new(),
+            num_workers: 1,
+            ram_bytes: 1024 * 1024 * 1024,
+            hostname: String::new(),
+            keepalive_interval: Duration::from_secs(1),
+            src_network: None,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+        }
+    }
+}
 
-    /// Receive the next message from the primary.
-    fn recv(&mut self) -> impl std::future::Future<Output = Option<DistributedMessage<I>>>;
+/// Certificate info for peer connections, set before `run()`.
+pub struct PeerCertInfo {
+    pub public_cert_pem: String,
+    pub ipv4_address: Option<String>,
+    pub ipv6_address: Option<String>,
+    pub quic_port: u16,
 }
 
 /// The secondary coordinator: connects to primary, manages local workers.
@@ -33,15 +58,34 @@ pub trait PrimaryTransport<I: Identifier> {
 /// Unlike `LocalManager` which runs a 5-phase pipeline, the secondary receives
 /// individual task assignments from the primary and dispatches them to local
 /// workers. It reports completions back and requests more work.
-pub struct SecondaryCoordinator<PT: PrimaryTransport<I>, M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier>
+///
+/// Generic over:
+/// - `PT`: primary transport (e.g. WSS connection or channel)
+/// - `P`: peer transport (e.g. `PeerNetwork` or `NoPeerTransport`)
+/// - `M`: manager endpoint for worker communication
+/// - `S`: scheduler
+/// - `E`: memory estimator
+/// - `I`: identifier type
+pub struct SecondaryCoordinator<PT, P, M, S, E, I>
+where
+    PT: PrimaryTransport<I>,
+    P: PeerTransport<I>,
+    M: ManagerEndpoint,
+    S: Scheduler<I>,
+    E: MemoryEstimator,
+    I: Identifier,
 {
     config: SecondaryConfig,
     primary_transport: PT,
+    peer_transport: P,
     scheduler: S,
     estimator: E,
 
+    // Certificate info for peer connections (set before run)
+    peer_cert_info: Option<PeerCertInfo>,
+
     // Workers
-    workers: Vec<WorkerHandle<M, I>>,
+    pool: WorkerPool<M, I>,
 
     // Task tracking: file_hash -> worker_id
     active_tasks: HashMap<String, WorkerId>,
@@ -50,28 +94,59 @@ pub struct SecondaryCoordinator<PT: PrimaryTransport<I>, M: ManagerEndpoint, S: 
     // State
     transfer_complete: bool,
     is_slurm_primary: bool,
+
+    // ZIP extraction cache
+    extraction_cache: ExtractionCache,
+
+    // Peer keepalive tracking: peer_id -> last_seen timestamp
+    peer_keepalives: HashMap<String, f64>,
+
+    // Deferred peer messages to send (queued from sync handlers)
+    pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
 }
 
-impl<PT, M, S, E, I> SecondaryCoordinator<PT, M, S, E, I>
+impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
     PT: PrimaryTransport<I>,
-    M: ManagerEndpoint,
+    P: PeerTransport<I>,
+    M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: MemoryEstimator + Clone,
     I: Identifier,
 {
-    pub fn new(config: SecondaryConfig, primary_transport: PT, scheduler: S, estimator: E) -> Self {
+    pub fn new(
+        config: SecondaryConfig,
+        primary_transport: PT,
+        peer_transport: P,
+        scheduler: S,
+        estimator: E,
+    ) -> Self {
+        let tmp_dir = config.src_tmp.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
+        });
+        let extraction_cache = ExtractionCache::new(tmp_dir, config.src_network.clone());
         Self {
             config,
             primary_transport,
+            peer_transport,
             scheduler,
             estimator,
-            workers: Vec::new(),
+            peer_cert_info: None,
+            pool: WorkerPool::new(),
             active_tasks: HashMap::new(),
             completed_tasks: HashSet::new(),
             transfer_complete: false,
             is_slurm_primary: false,
+            extraction_cache,
+            peer_keepalives: HashMap::new(),
+            pending_peer_messages: Vec::new(),
         }
+    }
+
+    /// Set certificate info for peer connections. Must be called before `run()`
+    /// if peer-to-peer QUIC is enabled.
+    pub fn set_peer_cert_info(&mut self, info: PeerCertInfo) {
+        self.peer_cert_info = Some(info);
     }
 
     pub fn completed_count(&self) -> usize {
@@ -104,7 +179,7 @@ where
         self.wait_for_setup().await?;
 
         // Phase 5: Process tasks
-        self.process_tasks().await?;
+        self.process_tasks(factory).await?;
 
         // Stop workers
         self.stop_all_workers().await;
@@ -119,32 +194,15 @@ where
     }
 
     async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
-        for i in 0..self.config.num_workers {
-            let (transport, _pid) = factory.spawn_worker(i);
-            let mut handle = WorkerHandle::new(i, transport);
-            handle.reserved_budget = self.scheduler.initial_budget(i, self.config.ram_bytes);
-            tracing::info!(
-                worker_id = i,
-                budget_mb = handle.reserved_budget / (1024 * 1024),
-                "worker created"
-            );
-            self.workers.push(handle);
-        }
-
-        // Wait for all workers to become ready
-        loop {
-            let all_ready = self.workers.iter().all(|w| w.is_ready());
-            if all_ready {
-                tracing::info!("all workers ready");
-                break;
-            }
-            for worker in &mut self.workers {
-                if !worker.is_ready() {
-                    worker.poll_ready().await;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
+        self.pool
+            .initialize(
+                self.config.num_workers,
+                self.config.ram_bytes,
+                &self.scheduler,
+                factory,
+                false,
+            )
+            .await;
     }
 
     async fn send_welcome(&mut self) -> Result<(), String> {
@@ -160,14 +218,24 @@ where
     }
 
     async fn send_cert_exchange(&mut self) -> Result<(), String> {
+        let (cert_pem, ipv4, ipv6, port) = match &self.peer_cert_info {
+            Some(info) => (
+                info.public_cert_pem.clone(),
+                info.ipv4_address.clone(),
+                info.ipv6_address.clone(),
+                info.quic_port,
+            ),
+            None => (String::new(), Some("127.0.0.1".into()), None, 0),
+        };
+
         let msg = DistributedMessage::CertExchange {
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
-            public_cert_pem: String::new(),
-            ipv4_address: Some("127.0.0.1".into()),
-            ipv6_address: None,
-            quic_port: 0,
+            public_cert_pem: cert_pem,
+            ipv4_address: ipv4,
+            ipv6_address: ipv6,
+            quic_port: port,
         };
         self.primary_transport.send(msg).await
     }
@@ -186,61 +254,28 @@ where
                 Some(msg) => match msg.msg_type() {
                     MessageType::PeerInfo => {
                         got_peer_info = true;
-                        tracing::debug!("received peer list");
+                        if let DistributedMessage::PeerInfo { peers, .. } = &msg {
+                            let peer_count = peers
+                                .iter()
+                                .filter(|p| p.secondary_id != self.config.secondary_id)
+                                .count();
+                            tracing::info!(peers = peer_count, "received peer list, connecting to peers");
+                            self.peer_transport.connect_to_peers(peers).await;
+                            tracing::info!(
+                                connected = self.peer_transport.peer_count(),
+                                "peer connections established"
+                            );
+                        }
                     }
                     MessageType::InitialAssignment => {
                         got_assignment = true;
-                        // Extract tasks from zip_files and assign to workers
                         if let DistributedMessage::InitialAssignment {
                             zip_files,
                             workers_ready,
                             ..
                         } = msg
                         {
-                            // Collect (worker_id, binary, hash) tuples from zip entries
-                            let mut tasks: Vec<(DistributedBinaryInfo<I>, String)> = Vec::new();
-                            for zip_file in &zip_files {
-                                for entry in &zip_file.binaries {
-                                    tasks.push((entry.binary_info.clone(), entry.hash.clone()));
-                                }
-                            }
-
-                            // Match tasks to workers using workers_ready info
-                            for (i, (binary_info, hash)) in tasks.into_iter().enumerate() {
-                                let worker_id = workers_ready
-                                    .get(i)
-                                    .map(|w| w.worker_id)
-                                    .unwrap_or(i as u32);
-                                let wid = worker_id.min(self.workers.len() as u32 - 1);
-
-                                let binary = distributed_to_binary(&binary_info);
-                                let estimated = self.estimator.estimate_memory(binary.size);
-
-                                if (wid as usize) < self.workers.len()
-                                    && self.workers[wid as usize].is_idle_state()
-                                {
-                                    match self.workers[wid as usize]
-                                        .assign_task(binary, estimated, false)
-                                        .await
-                                    {
-                                        Ok(()) => {
-                                            self.active_tasks.insert(hash, wid);
-                                            tracing::info!(
-                                                worker_id = wid,
-                                                binary = ?binary_info.identifier,
-                                                "initial task assigned"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                worker_id = wid,
-                                                error = %e,
-                                                "failed to assign initial task"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
+                            self.handle_initial_assignment(zip_files, workers_ready).await;
                         }
                         tracing::debug!("received initial assignment");
                     }
@@ -260,35 +295,110 @@ where
         Ok(())
     }
 
+    /// Handle initial assignment from primary.
+    async fn handle_initial_assignment(
+        &mut self,
+        zip_files: Vec<db_primary_secondary_comm::ZipFileAssignment<I>>,
+        workers_ready: Vec<db_primary_secondary_comm::WorkerReadyInfo>,
+    ) {
+        let mut tasks: Vec<(String, String, DistributedBinaryInfo<I>, String)> = Vec::new();
+        for zip_file in &zip_files {
+            for entry in &zip_file.binaries {
+                tasks.push((
+                    zip_file.zip_name.clone(),
+                    entry.local_path.clone(),
+                    entry.binary_info.clone(),
+                    entry.hash.clone(),
+                ));
+            }
+        }
+
+        for (i, (zip_name, local_path, binary_info, hash)) in tasks.into_iter().enumerate() {
+            let worker_id = workers_ready
+                .get(i)
+                .map(|w| w.worker_id)
+                .unwrap_or(i as u32);
+            let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+
+            let zip_ref = if zip_name.is_empty() {
+                None
+            } else {
+                Some(zip_name.as_str())
+            };
+            let resolved_path = self
+                .extraction_cache
+                .resolve_binary(zip_ref, &local_path, &hash);
+
+            let binary = match resolved_path {
+                Some(path) => BinaryInfo {
+                    path,
+                    size: binary_info.size,
+                    identifier: binary_info.identifier.clone(),
+                },
+                None => distributed_to_binary(&binary_info),
+            };
+
+            let estimated = self.estimator.estimate_memory(binary.size);
+
+            if (wid as usize) < self.pool.workers.len() && self.pool.workers[wid as usize].is_idle_state() {
+                match self.pool.workers[wid as usize]
+                    .assign_task(binary, estimated, false)
+                    .await
+                {
+                    Ok(()) => {
+                        self.active_tasks.insert(hash, wid);
+                        tracing::info!(
+                            worker_id = wid,
+                            binary = ?binary_info.identifier,
+                            "initial task assigned"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            worker_id = wid,
+                            error = %e,
+                            "failed to assign initial task"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Main task processing loop.
     ///
     /// Uses `tokio::select!` to multiplex between:
+    /// - Worker events from the shared channel (spawned poll tasks)
     /// - Messages from primary (task assignments, promotions)
-    /// - Worker completion events (poll workers)
+    /// - Messages from peers (keepalives, timeout detection)
     /// - Keepalive timer
-    async fn process_tasks(&mut self) -> Result<(), String> {
+    /// - OOM check timer (100ms)
+    async fn process_tasks(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
         tracing::info!("entering task processing loop");
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
+        let mut oom_interval = tokio::time::interval(Duration::from_millis(100));
 
         // Request tasks only for workers that didn't get initial assignments
-        for i in 0..self.workers.len() {
-            if self.workers[i].is_idle_state() {
+        for i in 0..self.pool.workers.len() {
+            if self.pool.workers[i].is_idle_state() {
                 self.request_task_for_worker(i as WorkerId).await?;
             }
         }
 
         loop {
-            // Check if any workers are processing — poll them
-            let worker_event = self.poll_any_worker().await;
+            // Workers that need restart after disconnect
+            let mut workers_to_restart: Vec<WorkerId> = Vec::new();
 
-            if let Some(event) = worker_event {
-                self.handle_worker_event(event).await?;
-                continue; // Check for more events immediately
-            }
-
-            // No worker events — wait for primary message or keepalive
             tokio::select! {
+                event = self.pool.recv_event() => {
+                    if let Some(event) = event {
+                        let restart = self.handle_worker_event(event).await?;
+                        if let Some(wid) = restart {
+                            workers_to_restart.push(wid);
+                        }
+                    }
+                }
                 msg = self.primary_transport.recv() => {
                     match msg {
                         Some(m) => {
@@ -300,39 +410,204 @@ where
                         }
                     }
                 }
-                _ = keepalive_interval.tick() => {
-                    let active_count = self.workers.iter()
-                        .filter(|w| w.current_binary.is_some())
-                        .count() as u32;
-                    let msg = DistributedMessage::Keepalive {
-                        sender_id: self.config.secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        secondary_id: self.config.secondary_id.clone(),
-                        active_workers: active_count,
-                    };
-                    let _ = self.primary_transport.send(msg).await;
+                peer_msg = self.peer_transport.recv_peer() => {
+                    if let Some(m) = peer_msg {
+                        self.handle_peer_message(m);
+                    }
                 }
+                _ = keepalive_interval.tick() => {
+                    self.send_keepalive().await;
+                    self.check_peer_timeouts();
+                }
+                _ = oom_interval.tick() => {
+                    self.check_oom(factory).await;
+                }
+            }
+
+            // Flush any deferred peer messages
+            for (peer_id, msg) in std::mem::take(&mut self.pending_peer_messages) {
+                let _ = self.peer_transport.send_to_peer(&peer_id, msg).await;
+            }
+
+            // Restart any workers that disconnected
+            for wid in workers_to_restart {
+                self.pool.restart_worker(wid, factory, false).await;
+                let _ = self.request_task_for_worker(wid).await;
             }
         }
 
         Ok(())
     }
 
-    /// Poll all workers that are currently processing for completion.
-    /// Returns the first event found, or None if all are still running.
-    async fn poll_any_worker(&mut self) -> Option<WorkerEvent<I>> {
-        for worker in &mut self.workers {
-            if worker.current_binary.is_some() {
-                if let Some(event) = worker.poll_status().await {
-                    return Some(event);
-                }
+    /// Send keepalive to both primary and all peers.
+    async fn send_keepalive(&mut self) {
+        let active_count = self
+            .pool.workers
+            .iter()
+            .filter(|w| w.current_binary.is_some())
+            .count() as u32;
+        let msg = DistributedMessage::Keepalive {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            active_workers: active_count,
+        };
+        // Send to primary
+        let _ = self.primary_transport.send(msg.clone()).await;
+        // Broadcast to peers
+        let _ = self.peer_transport.broadcast(msg).await;
+    }
+
+    /// Handle a message from a peer secondary.
+    fn handle_peer_message(&mut self, msg: DistributedMessage<I>) {
+        match msg {
+            DistributedMessage::Keepalive {
+                secondary_id,
+                timestamp,
+                active_workers,
+                ..
+            } => {
+                self.peer_keepalives.insert(secondary_id.clone(), timestamp);
+                tracing::trace!(
+                    peer = %secondary_id,
+                    active_workers,
+                    "peer keepalive received"
+                );
+            }
+            DistributedMessage::TaskComplete {
+                secondary_id,
+                task_hash,
+                ..
+            } => {
+                // Track peer's completed task to avoid duplicate processing
+                self.completed_tasks.insert(task_hash.clone());
+                tracing::debug!(
+                    peer = %secondary_id,
+                    task_hash,
+                    "peer task complete"
+                );
+            }
+            DistributedMessage::TaskFailed {
+                secondary_id,
+                task_hash,
+                error_type,
+                ..
+            } => {
+                tracing::debug!(
+                    peer = %secondary_id,
+                    task_hash,
+                    error_type,
+                    "peer task failed"
+                );
+            }
+            DistributedMessage::TimeoutDetected {
+                timed_out_secondary_id,
+                last_seen,
+                ..
+            } => {
+                tracing::warn!(
+                    timed_out = %timed_out_secondary_id,
+                    last_seen,
+                    "peer timeout detected by another secondary"
+                );
+            }
+            DistributedMessage::TimeoutQuery {
+                query_secondary_id,
+                sender_id,
+                ..
+            } => {
+                // Respond with our last known keepalive for the queried secondary
+                let last_keepalive = self.peer_keepalives.get(&query_secondary_id).copied();
+                let response: DistributedMessage<I> = DistributedMessage::TimeoutResponse {
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    query_secondary_id,
+                    last_keepalive,
+                };
+                tracing::debug!(peer = %sender_id, "timeout query received, queueing response");
+                // Queue for async send — will be flushed in the main loop
+                self.pending_peer_messages.push((sender_id, response));
+            }
+            _ => {
+                tracing::debug!(msg_type = ?msg.msg_type(), "unhandled peer message");
             }
         }
-        None
+    }
+
+    /// Check for peer timeouts based on keepalive tracking.
+    fn check_peer_timeouts(&mut self) {
+        let now = timestamp_now();
+        let timeout_secs = self.config.peer_timeout.as_secs_f64();
+        let mut timed_out = Vec::new();
+
+        for (peer_id, last_seen) in &self.peer_keepalives {
+            if now - last_seen > timeout_secs {
+                timed_out.push(peer_id.clone());
+            }
+        }
+
+        for peer_id in timed_out {
+            let last_seen = self.peer_keepalives.remove(&peer_id).unwrap_or(0.0);
+            tracing::warn!(
+                peer = %peer_id,
+                last_seen,
+                elapsed = now - last_seen,
+                "peer timeout detected"
+            );
+        }
+    }
+
+    /// Check memory pressure and kill workers if needed.
+    ///
+    /// Delegates to `WorkerPool::check_oom`, then reports the killed task
+    /// to primary, restarts the worker, and requests a new task.
+    async fn check_oom(&mut self, factory: &mut impl WorkerFactory<M>) {
+        match self.pool.check_oom(&self.scheduler, self.config.ram_bytes, false) {
+            OomKillResult::Killed {
+                worker_id,
+                reason,
+                ..
+            } => {
+                // Find and report the task as failed
+                let file_hash = self
+                    .active_tasks
+                    .iter()
+                    .find(|&(_, &wid)| wid == worker_id)
+                    .map(|(hash, _)| hash.clone());
+
+                if let Some(hash) = file_hash {
+                    self.active_tasks.remove(&hash);
+
+                    let msg = DistributedMessage::TaskFailed {
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        secondary_id: self.config.secondary_id.clone(),
+                        worker_id,
+                        task_hash: hash,
+                        error_type: "OutOfMemory".into(),
+                        error_message: reason,
+                    };
+                    let _ = self.primary_transport.send(msg.clone()).await;
+                    let _ = self.peer_transport.broadcast(msg).await;
+                }
+
+                // Restart the worker and request a new task
+                self.pool.restart_worker(worker_id, factory, false).await;
+                let _ = self.request_task_for_worker(worker_id).await;
+            }
+            OomKillResult::NoAction => {}
+        }
     }
 
     /// Handle a worker event (completion, disconnection, etc.)
-    async fn handle_worker_event(&mut self, event: WorkerEvent<I>) -> Result<(), String> {
+    ///
+    /// Returns `Some(worker_id)` if the worker needs to be restarted (e.g.
+    /// after disconnect). The caller is responsible for calling
+    /// `restart_worker` since it requires `&mut factory`.
+    async fn handle_worker_event(
+        &mut self,
+        event: WorkerEvent<I>,
+    ) -> Result<Option<WorkerId>, String> {
         match event {
             WorkerEvent::TaskCompleted {
                 worker_id,
@@ -340,6 +615,10 @@ where
                 binary,
                 ..
             } => {
+                // Reclaim protocol state from the spawned poll task
+                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize].clear_task();
+
                 // Find the file hash for this worker's task
                 let file_hash = self
                     .active_tasks
@@ -358,11 +637,13 @@ where
                             timestamp: timestamp_now(),
                             secondary_id: self.config.secondary_id.clone(),
                             worker_id,
-                            task_hash: hash,
+                            task_hash: hash.clone(),
                             warnings: result.warnings,
                             filtered: result.filtered,
                         };
-                        self.primary_transport.send(msg).await?;
+                        self.primary_transport.send(msg.clone()).await?;
+                        // Broadcast to peers
+                        let _ = self.peer_transport.broadcast(msg).await;
                     } else {
                         // Report error to primary
                         let msg = DistributedMessage::TaskFailed {
@@ -370,7 +651,7 @@ where
                             timestamp: timestamp_now(),
                             secondary_id: self.config.secondary_id.clone(),
                             worker_id,
-                            task_hash: hash,
+                            task_hash: hash.clone(),
                             error_type: result
                                 .error_type
                                 .map(|e| format!("{:?}", e))
@@ -379,7 +660,9 @@ where
                                 .error_message
                                 .unwrap_or_else(|| "Unknown error".into()),
                         };
-                        self.primary_transport.send(msg).await?;
+                        self.primary_transport.send(msg.clone()).await?;
+                        // Broadcast to peers
+                        let _ = self.peer_transport.broadcast(msg).await;
                     }
 
                     // Request next task for this worker
@@ -392,12 +675,18 @@ where
                     success = result.success,
                     "task completed"
                 );
+
+                Ok(None)
             }
             WorkerEvent::Disconnected {
                 worker_id,
                 result,
                 binary,
             } => {
+                // Reclaim protocol state from the spawned poll task
+                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize].clear_task();
+
                 tracing::warn!(
                     worker_id,
                     error = ?result.error_message,
@@ -425,31 +714,38 @@ where
                             .error_message
                             .unwrap_or_else(|| "Worker disconnected".into()),
                     };
-                    let _ = self.primary_transport.send(msg).await;
+                    let _ = self.primary_transport.send(msg.clone()).await;
+                    // Broadcast failure to peers
+                    let _ = self.peer_transport.broadcast(msg).await;
                 }
 
                 let _ = binary; // binary info already reported
+
+                // Signal that this worker needs restart
+                Ok(Some(worker_id))
             }
             WorkerEvent::PhaseUpdate {
                 worker_id,
                 phase_name,
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
+                Ok(None)
             }
             WorkerEvent::Keepalive { worker_id } => {
                 tracing::trace!(worker_id, "worker keepalive");
+                Ok(None)
             }
             WorkerEvent::Ready { worker_id } => {
                 tracing::debug!(worker_id, "worker ready");
+                Ok(None)
             }
         }
-        Ok(())
     }
 
     /// Request a task from the primary for the given worker.
     async fn request_task_for_worker(&mut self, worker_id: WorkerId) -> Result<(), String> {
-        let available_memory = if (worker_id as usize) < self.workers.len() {
-            self.workers[worker_id as usize].reserved_budget
+        let available_memory = if (worker_id as usize) < self.pool.workers.len() {
+            self.pool.workers[worker_id as usize].reserved_budget
         } else {
             self.config.ram_bytes / self.config.num_workers as u64
         };
@@ -471,25 +767,39 @@ where
                 worker_id,
                 file_hash,
                 binary_info,
+                zip_file,
+                local_path,
                 ..
             } => {
-                let binary = distributed_to_binary(&binary_info);
+                // Resolve binary path: file-ready or ZIP extraction
+                let zip_ref = zip_file.as_deref().filter(|z| !z.is_empty());
+                let resolved_path = self
+                    .extraction_cache
+                    .resolve_binary(zip_ref, &local_path, &file_hash);
+
+                let binary = match resolved_path {
+                    Some(path) => BinaryInfo {
+                        path,
+                        size: binary_info.size,
+                        identifier: binary_info.identifier.clone(),
+                    },
+                    None => distributed_to_binary(&binary_info),
+                };
                 let estimated = self.estimator.estimate_memory(binary.size);
-                let wid = worker_id.min(self.workers.len() as u32 - 1);
+                let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
 
                 // Find the target worker — prefer the requested one, fall back to any idle
-                let target_wid = if self.workers[wid as usize].is_idle_state() {
+                let target_wid = if self.pool.workers[wid as usize].is_idle_state() {
                     wid
                 } else {
-                    // Find any idle worker
-                    self.workers
+                    self.pool.workers
                         .iter()
                         .position(|w| w.is_idle_state())
                         .map(|i| i as u32)
-                        .unwrap_or(wid) // Fall back to requested worker
+                        .unwrap_or(wid)
                 };
 
-                let worker = &mut self.workers[target_wid as usize];
+                let worker = &mut self.pool.workers[target_wid as usize];
                 if worker.is_idle_state() {
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
@@ -507,7 +817,6 @@ where
                                 error = %e,
                                 "failed to assign task"
                             );
-                            // Report error back
                             let msg = DistributedMessage::TaskFailed {
                                 sender_id: self.config.secondary_id.clone(),
                                 timestamp: timestamp_now(),
@@ -525,7 +834,6 @@ where
                         worker_id = target_wid,
                         "no idle worker available for task assignment"
                     );
-                    // Report error: no idle worker
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -560,12 +868,7 @@ where
     }
 
     async fn stop_all_workers(&mut self) {
-        for worker in &mut self.workers {
-            if !worker.is_stopped() {
-                worker.stop().await;
-                tracing::info!(worker_id = worker.worker_id, "worker stopped");
-            }
-        }
+        self.pool.stop_all().await;
     }
 }
 
@@ -587,10 +890,11 @@ fn distributed_to_binary<I: Identifier>(info: &DistributedBinaryInfo<I>) -> Bina
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
-    use db_comm_api_base::{Command, CommandReceiver, Response, ResponseSender};
+    use db_comm_api_base::{MessageReceiver, MessageSender};
+    use db_manager_runner_comm::{Command, Response};
     use db_scheduler_impl::MemoryStealingScheduler;
-    use db_transport_channel::{channel_pair, ChannelManagerEnd};
+    use db_transport_channel::{channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd};
+    use serde::{Deserialize, Serialize};
     use tokio::sync::mpsc as tokio_mpsc;
 
     /// Minimal test identifier.
@@ -605,19 +909,32 @@ mod tests {
         }
     }
 
-    /// Channel-based transport to fake primary.
-    struct ChannelPrimaryTransport {
-        tx: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
-        rx: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
-    }
-
-    impl PrimaryTransport<TestId> for ChannelPrimaryTransport {
-        async fn send(&mut self, msg: DistributedMessage<TestId>) -> Result<(), String> {
-            self.tx.send(msg).map_err(|e| e.to_string())
+    /// No-op peer transport for tests that don't need peers.
+    struct NoPeers;
+    impl<I: Identifier> PeerTransport<I> for NoPeers {
+        async fn broadcast(&mut self, _msg: DistributedMessage<I>) -> Result<(), String> {
+            Ok(())
         }
-
-        async fn recv(&mut self) -> Option<DistributedMessage<TestId>> {
-            self.rx.recv().await
+        async fn send_to_peer(
+            &mut self,
+            _peer_id: &str,
+            _msg: DistributedMessage<I>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+            std::future::pending().await
+        }
+        fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+            None
+        }
+        fn peer_count(&self) -> usize {
+            0
+        }
+        async fn connect_to_peers(
+            &mut self,
+            _peers: &[db_primary_secondary_comm::PeerConnectionInfo],
+        ) {
         }
     }
 
@@ -626,15 +943,15 @@ mod tests {
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
         fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
             let (manager_end, runner_end) = channel_pair();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 let mut runner = runner_end;
-                let _ = runner.send_response(Response::Ready).await;
+                let _ = runner.send(Response::Ready).await;
                 loop {
-                    match runner.recv_command().await {
+                    match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
                         Some(Command::ProcessBinary { .. }) => {
                             let _ = runner
-                                .send_response(Response::Done {
+                                .send(Response::Done {
                                     warnings: 0,
                                     filtered: 0,
                                 })
@@ -672,7 +989,7 @@ mod tests {
             }
         }
 
-        // Send peer list
+        // Send peer list (empty — no peers in test)
         to_secondary
             .send(DistributedMessage::PeerInfo {
                 sender_id: "primary".into(),
@@ -710,13 +1027,11 @@ mod tests {
                         completed += 1;
                     }
                     MessageType::TaskRequest => {
-                        // Assign next pending binary
                         if let Some(binary) = pending.pop() {
                             send_task_assignment(
                                 &to_secondary,
                                 &secondary_id,
                                 &binary,
-                                // Use the worker_id from the request
                                 extract_worker_id(&msg),
                             );
                         }
@@ -770,99 +1085,115 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn secondary_with_real_workers_processes_tasks() {
         let _ = tracing_subscriber::fmt::try_init();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+                let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
 
-        let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-        let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+                let transport = ChannelPrimaryTransportEnd {
+                    tx: sec_to_pri_tx,
+                    rx: pri_to_sec_rx,
+                };
 
-        let transport = ChannelPrimaryTransport {
-            tx: sec_to_pri_tx,
-            rx: pri_to_sec_rx,
-        };
+                let config = SecondaryConfig {
+                    secondary_id: "sec-0".into(),
+                    num_workers: 1,
+                    ram_bytes: 1024 * 1024 * 1024,
+                    hostname: "test-host".into(),
+                    keepalive_interval: Duration::from_secs(60),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                };
 
-        let config = SecondaryConfig {
-            secondary_id: "sec-0".into(),
-            num_workers: 1,
-            ram_bytes: 1024 * 1024 * 1024,
-            hostname: "test-host".into(),
-            keepalive_interval: Duration::from_secs(60),
-        };
+                let binaries = vec![
+                    make_binary("a", 50),
+                    make_binary("b", 60),
+                    make_binary("c", 70),
+                ];
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+                let secondary_id = config.secondary_id.clone();
+                let primary_handle = tokio::task::spawn_local(fake_primary(
+                    binaries,
+                    secondary_id,
+                    sec_to_pri_rx,
+                    pri_to_sec_tx,
+                ));
 
-        let secondary_id = config.secondary_id.clone();
-        let primary_handle = tokio::spawn(fake_primary(
-            binaries,
-            secondary_id,
-            sec_to_pri_rx,
-            pri_to_sec_tx,
-        ));
+                let mut secondary = SecondaryCoordinator::new(
+                    config,
+                    transport,
+                    NoPeers,
+                    MemoryStealingScheduler,
+                    FixedEstimator(100),
+                );
 
-        let mut secondary = SecondaryCoordinator::new(
-            config,
-            transport,
-            MemoryStealingScheduler,
-            FixedEstimator(100),
-        );
+                let mut factory = FakeWorkerFactory;
+                secondary.run(&mut factory).await.unwrap();
 
-        let mut factory = FakeWorkerFactory;
-        secondary.run(&mut factory).await.unwrap();
+                assert_eq!(secondary.completed_count(), 3);
 
-        assert_eq!(secondary.completed_count(), 3);
-
-        primary_handle.await.unwrap();
+                primary_handle.await.unwrap();
+            })
+            .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn secondary_multi_worker_processes_tasks() {
         let _ = tracing_subscriber::fmt::try_init();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+                let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
 
-        let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
-        let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+                let transport = ChannelPrimaryTransportEnd {
+                    tx: sec_to_pri_tx,
+                    rx: pri_to_sec_rx,
+                };
 
-        let transport = ChannelPrimaryTransport {
-            tx: sec_to_pri_tx,
-            rx: pri_to_sec_rx,
-        };
+                let config = SecondaryConfig {
+                    secondary_id: "sec-0".into(),
+                    num_workers: 2,
+                    ram_bytes: 2 * 1024 * 1024 * 1024,
+                    hostname: "test-host".into(),
+                    keepalive_interval: Duration::from_secs(60),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                };
 
-        let config = SecondaryConfig {
-            secondary_id: "sec-0".into(),
-            num_workers: 2,
-            ram_bytes: 2 * 1024 * 1024 * 1024,
-            hostname: "test-host".into(),
-            keepalive_interval: Duration::from_secs(60),
-        };
+                let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+                    .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                    .collect();
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
+                let secondary_id = config.secondary_id.clone();
+                let primary_handle = tokio::task::spawn_local(fake_primary(
+                    binaries,
+                    secondary_id,
+                    sec_to_pri_rx,
+                    pri_to_sec_tx,
+                ));
 
-        let secondary_id = config.secondary_id.clone();
-        let primary_handle = tokio::spawn(fake_primary(
-            binaries,
-            secondary_id,
-            sec_to_pri_rx,
-            pri_to_sec_tx,
-        ));
+                let mut secondary = SecondaryCoordinator::new(
+                    config,
+                    transport,
+                    NoPeers,
+                    MemoryStealingScheduler,
+                    FixedEstimator(100),
+                );
 
-        let mut secondary = SecondaryCoordinator::new(
-            config,
-            transport,
-            MemoryStealingScheduler,
-            FixedEstimator(100),
-        );
+                let mut factory = FakeWorkerFactory;
+                secondary.run(&mut factory).await.unwrap();
 
-        let mut factory = FakeWorkerFactory;
-        secondary.run(&mut factory).await.unwrap();
+                assert_eq!(secondary.completed_count(), 6);
 
-        assert_eq!(secondary.completed_count(), 6);
-
-        primary_handle.await.unwrap();
+                primary_handle.await.unwrap();
+            })
+            .await;
     }
 }

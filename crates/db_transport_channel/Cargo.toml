@@ -5,4 +5,6 @@ edition = "2024"
 
 [dependencies]
 db_comm_api_base = { workspace = true }
+db_manager_runner_comm = { workspace = true }
+db_primary_secondary_comm = { workspace = true }
 tokio = { workspace = true }

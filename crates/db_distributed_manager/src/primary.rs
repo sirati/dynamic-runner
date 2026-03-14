@@ -4,7 +4,7 @@ use std::time::Duration;
 use db_comm_api_base::{BinaryInfo, Identifier, MemoryBytes};
 use db_primary_secondary_comm::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerConnectionInfo,
-    WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
+    SecondaryTransport, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
 };
 use db_scheduler_api::{
     AssignmentDecision, MemoryEstimator, Scheduler, WorkerBudgetInfo,
@@ -29,19 +29,6 @@ impl Default for PrimaryConfig {
             peer_timeout: Duration::from_secs(300),
         }
     }
-}
-
-/// Trait for sending messages to secondaries. Abstracts QUIC vs channel transport.
-pub trait SecondaryTransport<I: Identifier> {
-    /// Send a message to a specific secondary.
-    fn send_to(
-        &mut self,
-        secondary_id: &str,
-        msg: DistributedMessage<I>,
-    ) -> impl std::future::Future<Output = Result<(), String>>;
-
-    /// Receive the next message from any connected secondary.
-    fn recv(&mut self) -> impl std::future::Future<Output = Option<DistributedMessage<I>>>;
 }
 
 /// Virtual worker tracked by the authoritative primary for each remote worker.
@@ -756,28 +743,7 @@ mod tests {
         }
     }
 
-    /// A channel-based transport for testing the primary coordinator.
-    struct ChannelTransport {
-        outgoing: HashMap<String, tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>>,
-        incoming_rx: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
-    }
-
-    impl SecondaryTransport<TestId> for ChannelTransport {
-        async fn send_to(
-            &mut self,
-            secondary_id: &str,
-            msg: DistributedMessage<TestId>,
-        ) -> Result<(), String> {
-            if let Some(tx) = self.outgoing.get(secondary_id) {
-                tx.send(msg).map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        }
-
-        async fn recv(&mut self) -> Option<DistributedMessage<TestId>> {
-            self.incoming_rx.recv().await
-        }
-    }
+    use db_transport_channel::ChannelSecondaryTransportEnd;
 
     /// Simulate a secondary that sends welcome + cert, then echoes assignments as completions.
     async fn fake_secondary(
@@ -881,7 +847,7 @@ mod tests {
     fn setup_test(
         num_secondaries: u32,
     ) -> (
-        ChannelTransport,
+        ChannelSecondaryTransportEnd<TestId>,
         Vec<(
             String,
             tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -899,107 +865,111 @@ mod tests {
             secondary_ends.push((id, to_sec_rx, incoming_tx.clone()));
         }
 
-        (ChannelTransport { outgoing, incoming_rx }, secondary_ends)
+        (ChannelSecondaryTransportEnd { outgoing, incoming_rx }, secondary_ends)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn single_secondary_processes_all_tasks() {
-        let (transport, secondary_ends) = setup_test(1);
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let (transport, secondary_ends) = setup_test(1);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            MemoryStealingScheduler,
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                MemoryStealingScheduler,
+                FixedEstimator(100),
+            );
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
 
-        for (id, rx, tx) in secondary_ends {
-            tokio::spawn(fake_secondary(
-                id,
-                2,
-                1024 * 1024 * 1024,
-                rx,
-                tx,
-            ));
-        }
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(
+                    id,
+                    2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
 
-        primary.run(binaries).await.unwrap();
+            primary.run(binaries).await.unwrap();
 
-        assert_eq!(primary.completed_count(), 3);
-        assert_eq!(primary.failed_count(), 0);
+            assert_eq!(primary.completed_count(), 3);
+            assert_eq!(primary.failed_count(), 0);
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn two_secondaries_distribute_work() {
-        let (transport, secondary_ends) = setup_test(2);
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let (transport, secondary_ends) = setup_test(2);
 
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 2,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-        };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            MemoryStealingScheduler,
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                MemoryStealingScheduler,
+                FixedEstimator(100),
+            );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
-            .map(|i| make_binary(&format!("bin_{i}"), 100))
-            .collect();
+            let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 100))
+                .collect();
 
-        for (id, rx, tx) in secondary_ends {
-            tokio::spawn(fake_secondary(
-                id,
-                2,
-                1024 * 1024 * 1024,
-                rx,
-                tx,
-            ));
-        }
+            for (id, rx, tx) in secondary_ends {
+                tokio::task::spawn_local(fake_secondary(
+                    id,
+                    2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                ));
+            }
 
-        primary.run(binaries).await.unwrap();
+            primary.run(binaries).await.unwrap();
 
-        assert_eq!(primary.completed_count(), 6);
-        assert_eq!(primary.failed_count(), 0);
+            assert_eq!(primary.completed_count(), 6);
+            assert_eq!(primary.failed_count(), 0);
+        }).await;
     }
 
     // ── End-to-end tests: real Primary + real Secondary with workers ──
 
-    use db_comm_api_base::{Command, CommandReceiver, Response, ResponseSender};
-    use db_transport_channel::{channel_pair, ChannelManagerEnd};
-    use crate::secondary::{PrimaryTransport, SecondaryConfig, SecondaryCoordinator};
+    use db_comm_api_base::{MessageReceiver, MessageSender};
+    use db_manager_runner_comm::{Command, Response};
+    use db_transport_channel::{channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd};
+    use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
     use db_local_manager::WorkerFactory;
+    use db_primary_secondary_comm::PeerTransport;
 
-    /// Channel-based PrimaryTransport for the secondary side.
-    struct ChannelPrimaryTransport {
-        tx: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
-        rx: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
-    }
-
-    impl PrimaryTransport<TestId> for ChannelPrimaryTransport {
-        async fn send(&mut self, msg: DistributedMessage<TestId>) -> Result<(), String> {
-            self.tx.send(msg).map_err(|e| e.to_string())
-        }
-        async fn recv(&mut self) -> Option<DistributedMessage<TestId>> {
-            self.rx.recv().await
-        }
+    /// No-op peer transport for tests.
+    struct NoPeers;
+    impl<I: Identifier> PeerTransport<I> for NoPeers {
+        async fn broadcast(&mut self, _msg: DistributedMessage<I>) -> Result<(), String> { Ok(()) }
+        async fn send_to_peer(&mut self, _peer_id: &str, _msg: DistributedMessage<I>) -> Result<(), String> { Ok(()) }
+        async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> { std::future::pending().await }
+        fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> { None }
+        fn peer_count(&self) -> usize { 0 }
+        async fn connect_to_peers(&mut self, _peers: &[db_primary_secondary_comm::PeerConnectionInfo]) {}
     }
 
     /// Factory that spawns fake workers via channel transport.
@@ -1007,15 +977,15 @@ mod tests {
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
         fn spawn_worker(&mut self, _worker_id: u32) -> (ChannelManagerEnd, Option<u32>) {
             let (manager_end, runner_end) = channel_pair();
-            tokio::spawn(async move {
+            tokio::task::spawn_local(async move {
                 let mut runner = runner_end;
-                let _ = runner.send_response(Response::Ready).await;
+                let _ = runner.send(Response::Ready).await;
                 loop {
-                    match runner.recv_command().await {
+                    match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
                         Some(Command::ProcessBinary { .. }) => {
                             let _ = runner
-                                .send_response(Response::Done {
+                                .send(Response::Done {
                                     warnings: 0,
                                     filtered: 0,
                                 })
@@ -1046,8 +1016,8 @@ mod tests {
         // secondary→primary channel
         let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
 
-        let handle = tokio::spawn(async move {
-            let transport = ChannelPrimaryTransport {
+        let handle = tokio::task::spawn_local(async move {
+            let transport = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
             };
@@ -1057,10 +1027,14 @@ mod tests {
                 ram_bytes,
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
             };
             let mut secondary = SecondaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 MemoryStealingScheduler,
                 FixedEstimator(100),
             );
@@ -1073,130 +1047,134 @@ mod tests {
     }
 
     /// End-to-end: 1 real primary + 1 real secondary (2 workers), 5 tasks.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn e2e_primary_and_secondary_single_node() {
         let _ = tracing_subscriber::fmt::try_init();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let secondary_id = "sec-0".to_string();
+            let ram = 1024 * 1024 * 1024u64;
 
-        let secondary_id = "sec-0".to_string();
-        let ram = 1024 * 1024 * 1024u64;
-
-        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
-            spawn_real_secondary(secondary_id.clone(), 2, ram);
-
-        // Build primary transport wired to the real secondary
-        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-        let mut outgoing = HashMap::new();
-        outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
-
-        // Forward secondary→primary messages into the primary's incoming channel
-        tokio::spawn(async move {
-            let mut rx = sec_to_pri_rx;
-            while let Some(msg) = rx.recv().await {
-                if incoming_tx.send(msg).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let transport = ChannelTransport { outgoing, incoming_rx };
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 1,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-        };
-
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            MemoryStealingScheduler,
-            FixedEstimator(100),
-        );
-
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
-
-        primary.run(binaries).await.unwrap();
-
-        let completed = primary.completed_count();
-        let failed = primary.failed_count();
-
-        // Drop primary to close transport channels, allowing secondaries to exit
-        drop(primary);
-
-        let sec_completed = sec_handle.await.unwrap();
-
-        assert_eq!(completed, 5);
-        assert_eq!(failed, 0);
-        assert_eq!(sec_completed, 5);
-    }
-
-    /// End-to-end: 1 real primary + 2 real secondaries (2 workers each), 10 tasks.
-    #[tokio::test]
-    async fn e2e_primary_and_two_secondaries() {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        let ram = 2 * 1024 * 1024 * 1024u64;
-        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
-        let mut outgoing = HashMap::new();
-        let mut sec_handles = Vec::new();
-
-        for i in 0..2u32 {
-            let secondary_id = format!("sec-{i}");
-            let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
                 spawn_real_secondary(secondary_id.clone(), 2, ram);
 
-            outgoing.insert(secondary_id, pri_to_sec_tx);
-            sec_handles.push(handle);
+            // Build primary transport wired to the real secondary
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
 
-            // Forward secondary→primary
-            let tx = incoming_tx.clone();
-            tokio::spawn(async move {
+            // Forward secondary→primary messages into the primary's incoming channel
+            tokio::task::spawn_local(async move {
                 let mut rx = sec_to_pri_rx;
                 while let Some(msg) = rx.recv().await {
-                    if tx.send(msg).is_err() {
+                    if incoming_tx.send(msg).is_err() {
                         break;
                     }
                 }
             });
-        }
-        drop(incoming_tx); // Only forwarding tasks hold senders now
 
-        let transport = ChannelTransport { outgoing, incoming_rx };
-        let config = PrimaryConfig {
-            node_id: "primary".into(),
-            num_secondaries: 2,
-            connect_timeout: Duration::from_secs(10),
-            peer_timeout: Duration::from_secs(10),
-        };
+            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+            };
 
-        let mut primary = PrimaryCoordinator::new(
-            config,
-            transport,
-            MemoryStealingScheduler,
-            FixedEstimator(100),
-        );
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                MemoryStealingScheduler,
+                FixedEstimator(100),
+            );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..10)
-            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
-            .collect();
+            let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
 
-        primary.run(binaries).await.unwrap();
+            primary.run(binaries).await.unwrap();
 
-        let completed = primary.completed_count();
-        let failed = primary.failed_count();
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
 
-        // Drop primary to close transport channels, allowing secondaries to exit
-        drop(primary);
+            // Drop primary to close transport channels, allowing secondaries to exit
+            drop(primary);
 
-        let mut total_sec_completed = 0;
-        for handle in sec_handles {
-            total_sec_completed += handle.await.unwrap();
-        }
+            let sec_completed = sec_handle.await.unwrap();
 
-        assert_eq!(completed, 10);
-        assert_eq!(failed, 0);
-        assert_eq!(total_sec_completed, 10);
+            assert_eq!(completed, 5);
+            assert_eq!(failed, 0);
+            assert_eq!(sec_completed, 5);
+        }).await;
+    }
+
+    /// End-to-end: 1 real primary + 2 real secondaries (2 workers each), 10 tasks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn e2e_primary_and_two_secondaries() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let ram = 2 * 1024 * 1024 * 1024u64;
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            let mut sec_handles = Vec::new();
+
+            for i in 0..2u32 {
+                let secondary_id = format!("sec-{i}");
+                let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+                    spawn_real_secondary(secondary_id.clone(), 2, ram);
+
+                outgoing.insert(secondary_id, pri_to_sec_tx);
+                sec_handles.push(handle);
+
+                // Forward secondary→primary
+                let tx = incoming_tx.clone();
+                tokio::task::spawn_local(async move {
+                    let mut rx = sec_to_pri_rx;
+                    while let Some(msg) = rx.recv().await {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(incoming_tx); // Only forwarding tasks hold senders now
+
+            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 2,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+            };
+
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                MemoryStealingScheduler,
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<BinaryInfo<TestId>> = (0..10)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+
+            primary.run(binaries).await.unwrap();
+
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+
+            // Drop primary to close transport channels, allowing secondaries to exit
+            drop(primary);
+
+            let mut total_sec_completed = 0;
+            for handle in sec_handles {
+                total_sec_completed += handle.await.unwrap();
+            }
+
+            assert_eq!(completed, 10);
+            assert_eq!(failed, 0);
+            assert_eq!(total_sec_completed, 10);
+        }).await;
     }
 }

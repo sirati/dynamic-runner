@@ -1,8 +1,5 @@
 import argparse
 import logging
-import os
-import secrets
-import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -16,12 +13,7 @@ from shared import (
     process_selection_arguments,
 )
 
-from .gateway import GatewayConfig, create_gateway, parse_gateway_url
-from .multi_computer import ExecutionMode
 from .multi_computer.test_network.primary import LocalTestPrimaryCoordinator
-from .runtime_env import PackagingConfig, create_packaging_method
-from .slurm import SlurmConfig, validate_slurm_config
-from .slurm.job_manager import SlurmJobManager
 from .slurm.primary import SlurmPrimaryCoordinator
 from .system_resources import parse_cores, parse_memory
 from .task import TokenizerTask
@@ -260,13 +252,19 @@ def main():
     parser.add_argument(
         "--use-rust-backend",
         action="store_true",
-        help="Use the Rust-based local manager (requires dynamic_batch_rs to be installed via maturin)",
+        help="Use the Rust-based local manager (default when dynamic_batch_rs is installed; kept for compatibility)",
+    )
+
+    parser.add_argument(
+        "--use-python-backend",
+        action="store_true",
+        help="Force the Python-based local manager instead of the Rust backend",
     )
 
     parser.add_argument(
         "--use-rust-distributed-backend",
         action="store_true",
-        help="Use the Rust-based distributed manager (single-process mode, requires dynamic_batch_rs)",
+        help="(Deprecated) Use --multi-computer single-process --use-rust-backend instead",
     )
 
     args = parser.parse_args()
@@ -321,23 +319,56 @@ def main():
         ram_bytes = psutil.virtual_memory().total
         num_workers = psutil.cpu_count(logical=False) or 4
 
-        secondary = SecondaryCoordinator(
-            primary_url=args.secondary,
-            secondary_id=args.secondary_id,
-            num_workers=num_workers,
-            ram_bytes=ram_bytes,
-            src_tmp=src_tmp,
-            out_tmp=out_tmp,
-            log_tmp=log_tmp,
-            src_network=src_network,
-            out_network=out_network,
-            log_network=log_network,
-            socket_dir=socket_dir,
-            task_definition=task,
-            task_args=args,
-            skip_existing=args.skip_existing,
-            quic_port=args.secondary_quic_port,
-        )
+        # Backend selection: prefer Rust unless --use-python-backend
+        use_rust = not args.use_python_backend
+        if use_rust:
+            try:
+                from dynamic_batch_rs import RustSecondaryCoordinator
+
+                rust_available = True
+            except ImportError:
+                rust_available = False
+                if args.use_rust_backend:
+                    logger.error(
+                        "Rust backend not available. Install it with: "
+                        "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+                    )
+                    return
+        else:
+            rust_available = False
+
+        if rust_available:
+            logger.info("Using Rust secondary coordinator backend")
+            secondary = RustSecondaryCoordinator(
+                primary_url=args.secondary,
+                secondary_id=args.secondary_id,
+                num_workers=num_workers,
+                ram_bytes=ram_bytes,
+                source_dir=str(src_tmp),
+                output_dir=str(out_tmp),
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+            )
+        else:
+            logger.info("Using Python secondary coordinator backend")
+            secondary = SecondaryCoordinator(
+                primary_url=args.secondary,
+                secondary_id=args.secondary_id,
+                num_workers=num_workers,
+                ram_bytes=ram_bytes,
+                src_tmp=src_tmp,
+                out_tmp=out_tmp,
+                log_tmp=log_tmp,
+                src_network=src_network,
+                out_network=out_network,
+                log_network=log_network,
+                socket_dir=socket_dir,
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+                quic_port=args.secondary_quic_port,
+            )
 
         secondary.run()
         return
@@ -485,35 +516,64 @@ def main():
         num_secondaries = args.jobs
         logger.info(f"Starting coordinator with {num_secondaries} local secondaries")
 
-        # Create unique run directory with timestamp
-        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_id = f"run_{run_timestamp}"
-        logger.info(f"Run ID: {run_id}")
+        # Backend selection: prefer Rust unless --use-python-backend
+        use_rust = not args.use_python_backend
+        if use_rust:
+            try:
+                from dynamic_batch_rs import RustPrimaryCoordinator
 
-        # Create local test coordinator - no gateway, no Docker, no SSH
-        coordinator = LocalTestPrimaryCoordinator(
-            binaries=binaries_info,
-            task_definition=task,
-            task_args=args,
-            run_id=run_id,
-            source_dir=sel_result.source_dir,
-            raw_logs=args.raw_logs,
-        )
+                rust_available = True
+            except ImportError:
+                rust_available = False
+                if args.use_rust_backend:
+                    logger.error(
+                        "Rust backend not available. Install it with: "
+                        "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+                    )
+                    return
+        else:
+            rust_available = False
 
-        try:
-            # Run coordinator
-            coordinator.run(num_secondaries=num_secondaries)
-        finally:
-            # Coordinator handles its own cleanup
-            pass
+        if rust_available:
+            logger.info("Using Rust primary coordinator backend")
+            coordinator = RustPrimaryCoordinator(
+                num_secondaries=num_secondaries,
+                task_definition=task,
+                raw_logs=args.raw_logs,
+            )
+
+            coordinator.run(binaries_info)
+
+            logger.info(f"Completed: {coordinator.completed}")
+            logger.info(f"Failed: {coordinator.failed}")
+        else:
+            logger.info("Using Python primary coordinator backend")
+
+            # Create unique run directory with timestamp
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_id = f"run_{run_timestamp}"
+            logger.info(f"Run ID: {run_id}")
+
+            # Create local test coordinator - no gateway, no Docker, no SSH
+            coordinator = LocalTestPrimaryCoordinator(
+                binaries=binaries_info,
+                task_definition=task,
+                task_args=args,
+                run_id=run_id,
+                source_dir=sel_result.source_dir,
+                raw_logs=args.raw_logs,
+            )
+
+            try:
+                # Run coordinator
+                coordinator.run(num_secondaries=num_secondaries)
+            finally:
+                # Coordinator handles its own cleanup
+                pass
 
         return
 
     elif args.multi_computer == "single-process":
-        logger.info("=" * 60)
-        logger.info("SINGLE-PROCESS MULTI-COMPUTER MODE (Testing)")
-        logger.info("=" * 60)
-
         # Collect binaries to process
         logger.info("Collecting binaries from source directory...")
         sel_result = process_selection_arguments(args)
@@ -541,39 +601,99 @@ def main():
             logger.warning("No binaries found to process.")
             return
 
-        num_secondaries = args.jobs
-        logger.info(f"Starting coordinator with {num_secondaries} in-process secondaries")
+        num_secondaries = args.jobs if args.jobs else 1
+        num_cores_sp = parse_cores(args.cores)
+        max_memory_sp = parse_memory(args.max_memory)
+        workers_per_secondary = num_cores_sp // num_secondaries if num_secondaries > 0 else num_cores_sp
+        ram_per_secondary = max_memory_sp // num_secondaries if num_secondaries > 0 else max_memory_sp
 
-        # Create unique run directory with timestamp
-        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_id = f"run_{run_timestamp}"
-        logger.info(f"Run ID: {run_id}")
+        use_rust = not args.use_python_backend
+        if use_rust:
+            try:
+                from dynamic_batch_rs import RustDistributedManager
 
-        # Import here to avoid circular dependency
-        from .multi_computer.test_single_process import SingleProcessPrimaryCoordinator
+                rust_available = True
+            except ImportError:
+                rust_available = False
+                if args.use_rust_backend:
+                    logger.error(
+                        "Rust backend not available. Install it with: "
+                        "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+                    )
+                    return
+        else:
+            rust_available = False
 
-        # Create single-process coordinator
-        coordinator = SingleProcessPrimaryCoordinator(
-            binaries=binaries_info,
-            task_definition=task,
-            task_args=args,
-            run_id=run_id,
-            source_dir=sel_result.source_dir,
-            output_dir=sel_result.output_dir,
-            num_workers_per_secondary=parse_cores(args.cores) // num_secondaries if num_secondaries > 0 else 1,
-        )
+        if rust_available:
+            logger.info("=" * 60)
+            logger.info("SINGLE-PROCESS MULTI-COMPUTER MODE (Rust)")
+            logger.info("=" * 60)
 
-        try:
-            # Run coordinator
-            coordinator.run(num_secondaries=num_secondaries)
-        finally:
-            # Coordinator handles its own cleanup
-            pass
+            logger.info(f"Secondaries: {num_secondaries}")
+            logger.info(f"Workers per secondary: {workers_per_secondary}")
+            logger.info(f"RAM per secondary: {ram_per_secondary / (1024**3):.2f}GB")
+
+            rust_dm = RustDistributedManager(
+                num_secondaries=num_secondaries,
+                num_workers_per_secondary=workers_per_secondary,
+                ram_per_secondary=ram_per_secondary,
+                source_dir=str(sel_result.source_dir),
+                output_dir=str(sel_result.output_dir),
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+            )
+
+            rust_dm.run(binaries_info)
+
+            logger.info(f"Completed: {rust_dm.completed}")
+            logger.info(f"Failed: {rust_dm.failed}")
+        else:
+            if not args.use_python_backend:
+                logger.info("Backend: Python (Rust not available, falling back)")
+            else:
+                logger.info("Backend: Python (explicitly selected)")
+
+            logger.info("=" * 60)
+            logger.info("SINGLE-PROCESS MULTI-COMPUTER MODE (Testing)")
+            logger.info("=" * 60)
+
+            logger.info(f"Starting coordinator with {num_secondaries} in-process secondaries")
+
+            # Create unique run directory with timestamp
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_id = f"run_{run_timestamp}"
+            logger.info(f"Run ID: {run_id}")
+
+            # Import here to avoid circular dependency
+            from .multi_computer.test_single_process import SingleProcessPrimaryCoordinator
+
+            # Create single-process coordinator
+            coordinator = SingleProcessPrimaryCoordinator(
+                binaries=binaries_info,
+                task_definition=task,
+                task_args=args,
+                run_id=run_id,
+                source_dir=sel_result.source_dir,
+                output_dir=sel_result.output_dir,
+                num_workers_per_secondary=workers_per_secondary,
+            )
+
+            try:
+                # Run coordinator
+                coordinator.run(num_secondaries=num_secondaries)
+            finally:
+                # Coordinator handles its own cleanup
+                pass
 
         return
 
     elif args.use_rust_distributed_backend:
-        # Rust-based in-process distributed manager
+        # Deprecated: use --multi-computer single-process --use-rust-backend instead
+        logger.warning(
+            "--use-rust-distributed-backend is deprecated. "
+            "Use --multi-computer single-process --use-rust-backend instead."
+        )
         try:
             from dynamic_batch_rs import RustDistributedManager
         except ImportError:
@@ -652,8 +772,6 @@ def main():
     print_selection_summary(config, display_opt_levels)
     logger.info(f"Cores: {num_cores}")
     logger.info(f"Max memory: {max_memory / (1024**3):.2f}GB")
-    if args.use_rust_backend:
-        logger.info("Backend: Rust (dynamic_batch_rs)")
     logger.info("")
 
     logger.info("Scanning for matching binaries...")
@@ -699,158 +817,262 @@ def main():
 
     # Check if test-master-slave-netsim mode is enabled (network simulation)
     if args.test_master_slave_netsim:
-        from .worker_manager.test_network_sim import run_network_sim_test
+        use_rust = not args.use_python_backend
+        if use_rust:
+            try:
+                from dynamic_batch_rs import RustDistributedManager
 
-        logger.info("=" * 60)
-        logger.info("TEST MASTER-SLAVE NETWORK SIMULATION")
-        logger.info("=" * 60)
-        logger.info("Testing submissive/authoritive coordination via network message queues")
-        logger.info("")
+                rust_available = True
+            except ImportError:
+                rust_available = False
+                if args.use_rust_backend:
+                    logger.error(
+                        "Rust backend not available. Install it with: "
+                        "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+                    )
+                    return
+        else:
+            rust_available = False
 
-        # Run network simulation test (message queues)
-        run_network_sim_test(
-            binaries=sorted_binaries,
-            task_definition=task,
-            task_args=args,
-            source_dir=config.source_dir,
-            output_dir=config.output_dir,
-            num_cores=num_cores,
-            max_memory=max_memory,
-        )
+        if rust_available:
+            logger.info("=" * 60)
+            logger.info("TEST MASTER-SLAVE NETWORK SIMULATION (Rust)")
+            logger.info("=" * 60)
+
+            num_secondaries = args.jobs if args.jobs else 1
+            workers_per_secondary = num_cores // num_secondaries if num_secondaries > 0 else num_cores
+            ram_per_secondary = max_memory // num_secondaries if num_secondaries > 0 else max_memory
+
+            logger.info(f"Secondaries: {num_secondaries}")
+            logger.info(f"Workers per secondary: {workers_per_secondary}")
+            logger.info(f"RAM per secondary: {ram_per_secondary / (1024**3):.2f}GB")
+
+            rust_dm = RustDistributedManager(
+                num_secondaries=num_secondaries,
+                num_workers_per_secondary=workers_per_secondary,
+                ram_per_secondary=ram_per_secondary,
+                source_dir=str(config.source_dir),
+                output_dir=str(config.output_dir),
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+            )
+
+            rust_dm.run(sorted_binaries)
+
+            logger.info(f"Completed: {rust_dm.completed}")
+            logger.info(f"Failed: {rust_dm.failed}")
+        else:
+            from .worker_manager.test_network_sim import run_network_sim_test
+
+            logger.info("=" * 60)
+            logger.info("TEST MASTER-SLAVE NETWORK SIMULATION")
+            logger.info("=" * 60)
+            logger.info("Testing submissive/authoritive coordination via network message queues")
+            logger.info("")
+
+            # Run network simulation test (message queues)
+            run_network_sim_test(
+                binaries=sorted_binaries,
+                task_definition=task,
+                task_args=args,
+                source_dir=config.source_dir,
+                output_dir=config.output_dir,
+                num_cores=num_cores,
+                max_memory=max_memory,
+            )
 
     # Check if test-master-slave mode is enabled
     elif args.test_master_slave:
-        from .worker_manager import ActualAuthoritativeWorkerManager, ActualSubmissiveWorkerManager
+        use_rust = not args.use_python_backend
+        if use_rust:
+            try:
+                from dynamic_batch_rs import RustDistributedManager
 
-        logger.info("=" * 60)
-        logger.info("TEST MASTER-SLAVE MODE (Local)")
-        logger.info("=" * 60)
-        logger.info("Using local_submissive + local_authoritive architecture")
-        logger.info("")
+                rust_available = True
+            except ImportError:
+                rust_available = False
+                if args.use_rust_backend:
+                    logger.error(
+                        "Rust backend not available. Install it with: "
+                        "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+                    )
+                    return
+        else:
+            rust_available = False
 
-        # Create submissive manager
-        def request_task_callback(worker_id: int) -> None:
-            """Callback for submissive to request tasks from authoritive."""
-            result = authoritive_manager.handle_task_request(worker_id)
-            if result:
-                binary, estimated_memory = result
-                submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+        if rust_available:
+            logger.info("=" * 60)
+            logger.info("TEST MASTER-SLAVE MODE (Rust)")
+            logger.info("=" * 60)
 
-        submissive_manager = ActualSubmissiveWorkerManager(
-            num_workers=num_cores,
-            max_memory=max_memory,
-            source_dir=config.source_dir,
-            output_dir=config.output_dir,
-            task_definition=task,
-            task_args=args,
-            skip_existing=args.skip_existing,
-            request_task_callback=request_task_callback,
-            manual_start_worker=args.manual_start_worker,
-            connection_mode=args.connection_mode,
-            socket_dir=Path(args.socket_dir) if args.socket_dir else None,
-        )
+            num_secondaries = args.jobs if args.jobs else 1
+            workers_per_secondary = num_cores // num_secondaries if num_secondaries > 0 else num_cores
+            ram_per_secondary = max_memory // num_secondaries if num_secondaries > 0 else max_memory
 
-        # Initialize workers in submissive manager before creating authoritive
-        submissive_manager.initialize_workers_only()
+            logger.info(f"Secondaries: {num_secondaries}")
+            logger.info(f"Workers per secondary: {workers_per_secondary}")
+            logger.info(f"RAM per secondary: {ram_per_secondary / (1024**3):.2f}GB")
 
-        # Create authoritive manager with the submissive's workers
-        authoritive_manager = ActualAuthoritativeWorkerManager(
-            num_workers=num_cores,
-            max_memory=max_memory,
-            log_dir=config.output_dir,
-            task_definition=task,
-            submissive_managers=[submissive_manager],
-        )
-
-        # Set pending binaries and run processing through authoritative manager
-        authoritive_manager.pending_binaries = sorted_binaries.copy()
-        authoritive_manager.stats["total"] = len(sorted_binaries)
-        authoritive_manager.stats["completed"] = 0
-        authoritive_manager.stats["errored"] = 0
-
-        # Log start
-        start_msg = f"Starting {num_cores} workers with {max_memory / (1024**3):.2f}GB memory limit"
-        process_msg = f"Processing {len(sorted_binaries)} binaries"
-        logger.info(start_msg)
-        logger.info(process_msg)
-
-        # Run the processing phases through authoritative (which coordinates with submissive)
-        authoritive_manager._initialize_workers()
-        authoritive_manager._run_initial_assignments()
-        authoritive_manager._run_main_phase()
-        authoritive_manager._run_retry_phase()
-        authoritive_manager._run_oom_phase()
-        authoritive_manager._run_unassigned_phase()
-
-        # Stop workers
-        for worker in authoritive_manager.workers:
-            if worker.is_alive():
-                try:
-                    worker.terminate()
-                    logger.info(f"[Worker {worker.worker_id}] Stopping (all phases complete)")
-                except Exception:
-                    pass
-    elif args.use_rust_backend:
-        # Use Rust-based local manager
-        try:
-            from dynamic_batch_rs import RustLocalManager
-        except ImportError:
-            logger.error(
-                "Rust backend not available. Install it with: "
-                "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+            rust_dm = RustDistributedManager(
+                num_secondaries=num_secondaries,
+                num_workers_per_secondary=workers_per_secondary,
+                ram_per_secondary=ram_per_secondary,
+                source_dir=str(config.source_dir),
+                output_dir=str(config.output_dir),
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
             )
-            return
 
-        logger.info("=" * 60)
-        logger.info("RUST BACKEND MODE")
-        logger.info("=" * 60)
+            rust_dm.run(sorted_binaries)
 
-        rust_manager = RustLocalManager(
-            num_workers=num_cores,
-            max_memory=max_memory,
-            source_dir=str(config.source_dir),
-            output_dir=str(config.output_dir),
-            task_definition=task,
-            task_args=args,
-            skip_existing=args.skip_existing,
-            always_restart_worker=args.always_restart_worker,
-            print_pid=args.pid,
-            connection_mode=args.connection_mode,
-            socket_dir=args.socket_dir,
-            manual_start_worker=args.manual_start_worker,
-        )
+            logger.info(f"Completed: {rust_dm.completed}")
+            logger.info(f"Failed: {rust_dm.failed}")
+        else:
+            from .worker_manager import ActualAuthoritativeWorkerManager, ActualSubmissiveWorkerManager
 
-        rust_manager.process_binaries(sorted_binaries)
+            logger.info("=" * 60)
+            logger.info("TEST MASTER-SLAVE MODE (Local)")
+            logger.info("=" * 60)
+            logger.info("Using local_submissive + local_authoritive architecture")
+            logger.info("")
 
-        stats = rust_manager.stats
-        logger.info(f"Completed: {stats.completed}/{stats.total}")
-        logger.info(f"Errored: {stats.errored}")
-        if rust_manager.failed_tasks:
-            logger.warning(f"Failed tasks: {len(rust_manager.failed_tasks)}")
-            for ft in rust_manager.failed_tasks:
-                logger.warning(f"  {ft.binary.path}: {ft.error_type}: {ft.error_message}")
-        if rust_manager.oom_tasks:
-            logger.warning(f"OOM tasks: {len(rust_manager.oom_tasks)}")
-            for ot in rust_manager.oom_tasks:
-                logger.warning(f"  {ot.binary.path}: {ot.error_message}")
+            # Create submissive manager
+            def request_task_callback(worker_id: int) -> None:
+                """Callback for submissive to request tasks from authoritive."""
+                result = authoritive_manager.handle_task_request(worker_id)
+                if result:
+                    binary, estimated_memory = result
+                    submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+
+            submissive_manager = ActualSubmissiveWorkerManager(
+                num_workers=num_cores,
+                max_memory=max_memory,
+                source_dir=config.source_dir,
+                output_dir=config.output_dir,
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+                request_task_callback=request_task_callback,
+                manual_start_worker=args.manual_start_worker,
+                connection_mode=args.connection_mode,
+                socket_dir=Path(args.socket_dir) if args.socket_dir else None,
+            )
+
+            # Initialize workers in submissive manager before creating authoritive
+            submissive_manager.initialize_workers_only()
+
+            # Create authoritive manager with the submissive's workers
+            authoritive_manager = ActualAuthoritativeWorkerManager(
+                num_workers=num_cores,
+                max_memory=max_memory,
+                log_dir=config.output_dir,
+                task_definition=task,
+                submissive_managers=[submissive_manager],
+            )
+
+            # Set pending binaries and run processing through authoritative manager
+            authoritive_manager.pending_binaries = sorted_binaries.copy()
+            authoritive_manager.stats["total"] = len(sorted_binaries)
+            authoritive_manager.stats["completed"] = 0
+            authoritive_manager.stats["errored"] = 0
+
+            # Log start
+            start_msg = f"Starting {num_cores} workers with {max_memory / (1024**3):.2f}GB memory limit"
+            process_msg = f"Processing {len(sorted_binaries)} binaries"
+            logger.info(start_msg)
+            logger.info(process_msg)
+
+            # Run the processing phases through authoritative (which coordinates with submissive)
+            authoritive_manager._initialize_workers()
+            authoritive_manager._run_initial_assignments()
+            authoritive_manager._run_main_phase()
+            authoritive_manager._run_retry_phase()
+            authoritive_manager._run_oom_phase()
+            authoritive_manager._run_unassigned_phase()
+
+            # Stop workers
+            for worker in authoritive_manager.workers:
+                if worker.is_alive():
+                    try:
+                        worker.terminate()
+                        logger.info(f"[Worker {worker.worker_id}] Stopping (all phases complete)")
+                    except Exception:
+                        pass
     else:
-        # Use standard local manager
-        manager = LocalWorkerManager(
-            num_workers=num_cores,
-            max_memory=max_memory,
-            source_dir=config.source_dir,
-            output_dir=config.output_dir,
-            task_definition=task,
-            task_args=args,
-            skip_existing=args.skip_existing,
-            print_pid=args.pid,
-            always_restart_worker=args.always_restart_worker,
-            manual_start_worker=args.manual_start_worker,
-            connection_mode=args.connection_mode,
-            socket_dir=Path(args.socket_dir) if args.socket_dir else None,
-        )
+        # Local processing mode: try Rust backend by default, fall back to Python
+        use_rust = not args.use_python_backend
+        if use_rust:
+            try:
+                from dynamic_batch_rs import RustLocalManager
 
-        manager.process_binaries(sorted_binaries)
+                rust_available = True
+            except ImportError:
+                rust_available = False
+                if args.use_rust_backend:
+                    # Explicitly requested but not available
+                    logger.error(
+                        "Rust backend not available. Install it with: "
+                        "cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
+                    )
+                    return
+        else:
+            rust_available = False
+
+        if rust_available:
+            logger.info("Backend: Rust (dynamic_batch_rs)")
+
+            rust_manager = RustLocalManager(
+                num_workers=num_cores,
+                max_memory=max_memory,
+                source_dir=str(config.source_dir),
+                output_dir=str(config.output_dir),
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+                always_restart_worker=args.always_restart_worker,
+                print_pid=args.pid,
+                connection_mode=args.connection_mode,
+                socket_dir=args.socket_dir,
+                manual_start_worker=args.manual_start_worker,
+            )
+
+            rust_manager.process_binaries(sorted_binaries)
+
+            stats = rust_manager.stats
+            logger.info(f"Completed: {stats.completed}/{stats.total}")
+            logger.info(f"Errored: {stats.errored}")
+            if rust_manager.failed_tasks:
+                logger.warning(f"Failed tasks: {len(rust_manager.failed_tasks)}")
+                for ft in rust_manager.failed_tasks:
+                    logger.warning(f"  {ft.binary.path}: {ft.error_type}: {ft.error_message}")
+            if rust_manager.oom_tasks:
+                logger.warning(f"OOM tasks: {len(rust_manager.oom_tasks)}")
+                for ot in rust_manager.oom_tasks:
+                    logger.warning(f"  {ot.binary.path}: {ot.error_message}")
+        else:
+            if not args.use_python_backend:
+                logger.info("Backend: Python (Rust not available, falling back)")
+            else:
+                logger.info("Backend: Python (explicitly selected)")
+
+            manager = LocalWorkerManager(
+                num_workers=num_cores,
+                max_memory=max_memory,
+                source_dir=config.source_dir,
+                output_dir=config.output_dir,
+                task_definition=task,
+                task_args=args,
+                skip_existing=args.skip_existing,
+                print_pid=args.pid,
+                always_restart_worker=args.always_restart_worker,
+                manual_start_worker=args.manual_start_worker,
+                connection_mode=args.connection_mode,
+                socket_dir=Path(args.socket_dir) if args.socket_dir else None,
+            )
+
+            manager.process_binaries(sorted_binaries)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use db_comm_api_base::Identifier;
+use db_comm_api_base::{Identifier, MessageReceiver, MessageSender};
 use db_primary_secondary_comm::{DistributedMessage, codec};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
@@ -23,14 +23,10 @@ impl QuicConnection {
         }
     }
 
-    /// Send a distributed message (length-prefixed JSON).
-    pub async fn send_message<I: Identifier>(&mut self, msg: &DistributedMessage<I>) -> Result<(), String> {
-        let frame = codec::serialize_message(msg)?;
-        self.send
-            .write_all(&frame)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(())
+    /// Consume the connection and return the underlying QUIC streams
+    /// along with any buffered data that was read but not yet consumed.
+    pub fn into_parts(self) -> (SendStream, RecvStream, Vec<u8>) {
+        (self.send, self.recv, self.recv_buf)
     }
 
     /// Gracefully close the send side.
@@ -40,25 +36,38 @@ impl QuicConnection {
         self.send.stopped().await.ok();
         Ok(())
     }
+}
 
-    /// Receive the next distributed message. Returns None on connection close.
-    pub async fn recv_message<I: Identifier>(&mut self) -> Result<Option<DistributedMessage<I>>, String> {
+impl<I: Identifier> MessageSender<DistributedMessage<I>> for QuicConnection {
+    async fn send(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        let frame = codec::serialize_message(&msg)?;
+        self.send
+            .write_all(&frame)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for QuicConnection {
+    async fn recv(&mut self) -> Option<DistributedMessage<I>> {
         loop {
-            match codec::decode_frame(&self.recv_buf)? {
-                Some((msg, consumed)) => {
+            match codec::decode_frame(&self.recv_buf) {
+                Ok(Some((msg, consumed))) => {
                     self.recv_buf.drain(..consumed);
-                    return Ok(Some(msg));
+                    return Some(msg);
                 }
-                None => {
+                Ok(None) => {
                     let mut tmp = [0u8; 8192];
                     match self.recv.read(&mut tmp).await {
                         Ok(Some(n)) => {
                             self.recv_buf.extend_from_slice(&tmp[..n]);
                         }
-                        Ok(None) => return Ok(None),
-                        Err(e) => return Err(e.to_string()),
+                        Ok(None) => return None,
+                        Err(_) => return None,
                     }
                 }
+                Err(_) => return None,
             }
         }
     }
@@ -169,8 +178,8 @@ mod tests {
 
         let server_task = async {
             let mut conn = listener.accept().await.expect("accept failed");
-            let msg: DistributedMessage<TestId> = conn.recv_message().await.expect("recv failed").expect("no message");
-            conn.send_message(&msg).await.expect("send failed");
+            let msg: DistributedMessage<TestId> = MessageReceiver::recv(&mut conn).await.expect("no message");
+            MessageSender::send(&mut conn, msg.clone()).await.expect("send failed");
             // Keep connection alive until client is done reading.
             done_rx.await.ok();
             msg
@@ -181,8 +190,8 @@ mod tests {
             let mut client = connect(addr, "localhost", &cert_der)
                 .await
                 .expect("connect failed");
-            client.send_message(&outgoing).await.expect("client send failed");
-            let echoed: DistributedMessage<TestId> = client.recv_message().await.expect("client recv failed").expect("no echo");
+            MessageSender::send(&mut client, outgoing).await.expect("client send failed");
+            let echoed: DistributedMessage<TestId> = MessageReceiver::recv(&mut client).await.expect("no echo");
             done_tx.send(()).ok();
             echoed
         };

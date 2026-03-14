@@ -1,4 +1,5 @@
-use db_comm_api_base::{ErrorType, Response, ResponseSender, RunnerEndpoint};
+use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender};
+use db_manager_runner_comm::{Command, Response, RunnerEndpoint};
 
 /// Output from a successful task execution.
 pub struct TaskOutput {
@@ -18,9 +19,9 @@ pub struct TaskError {
 /// The executor receives the relative path to process and a handle to send
 /// phase updates and keepalives during execution.
 ///
-/// Generic over `S` (the ResponseSender) to avoid dyn-compatibility issues
+/// Generic over `S` (a `MessageSender<Response>`) to avoid dyn-compatibility issues
 /// with async traits.
-pub trait TaskExecutor<S: ResponseSender> {
+pub trait TaskExecutor<S: MessageSender<Response>> {
     fn execute(
         &self,
         relative_path: &str,
@@ -39,18 +40,18 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
     executor: &impl TaskExecutor<E>,
 ) {
     // Send Ready
-    if endpoint.send_response(Response::Ready).await.is_err() {
+    if endpoint.send(Response::Ready).await.is_err() {
         return;
     }
 
     loop {
-        match endpoint.recv_command().await {
-            Some(db_comm_api_base::Command::Stop) => break,
-            Some(db_comm_api_base::Command::ProcessBinary { relative_path }) => {
+        match MessageReceiver::<Command>::recv(endpoint).await {
+            Some(Command::Stop) => break,
+            Some(Command::ProcessBinary { relative_path }) => {
                 match executor.execute(&relative_path, endpoint).await {
                     Ok(output) => {
                         let _ = endpoint
-                            .send_response(Response::Done {
+                            .send(Response::Done {
                                 warnings: output.warnings,
                                 filtered: output.filtered,
                             })
@@ -58,7 +59,7 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
                     }
                     Err(e) => {
                         let _ = endpoint
-                            .send_response(Response::Error {
+                            .send(Response::Error {
                                 error_type: e.error_type,
                                 message: e.message,
                             })
@@ -74,7 +75,6 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db_comm_api_base::{Command, CommandSender, ResponseReceiver};
     use db_transport_channel::{ChannelRunnerEnd, channel_pair};
 
     struct EchoExecutor;
@@ -87,7 +87,7 @@ mod tests {
         ) -> Result<TaskOutput, TaskError> {
             // Send a phase update
             let _ = status_sender
-                .send_response(Response::PhaseUpdate {
+                .send(Response::PhaseUpdate {
                     phase_name: "PROCESSING".into(),
                 })
                 .await;
@@ -106,38 +106,41 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn runner_processes_task_and_stops() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
         let (mut manager, mut runner) = channel_pair();
         let executor = EchoExecutor;
 
-        let runner_handle = tokio::spawn(async move {
+        let runner_handle = tokio::task::spawn_local(async move {
             runner_main_loop(&mut runner, &executor).await;
         });
 
         // Should receive Ready
-        let responses = manager.recv_responses().await;
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], Response::Ready));
+        let resp = manager.recv().await.unwrap();
+        assert!(matches!(resp, Response::Ready));
 
         // Send a task
         manager
-            .send_command(Command::ProcessBinary {
+            .send(Command::ProcessBinary {
                 relative_path: "test/bin".into(),
             })
             .await
             .unwrap();
 
-        // Collect all responses until we see Done
+        // Collect responses until we see Done
         let mut all = Vec::new();
         loop {
-            let responses = manager.recv_responses().await;
-            if responses.is_empty() {
-                break;
-            }
-            all.extend(responses);
-            if all.iter().any(|r| matches!(r, Response::Done { .. })) {
-                break;
+            match manager.recv().await {
+                Some(r) => {
+                    let is_done = matches!(r, Response::Done { .. });
+                    all.push(r);
+                    if is_done {
+                        break;
+                    }
+                }
+                None => break,
             }
         }
 
@@ -149,25 +152,28 @@ mod tests {
         assert!(has_done, "expected Done");
 
         // Send stop
-        manager.send_command(Command::Stop).await.unwrap();
+        manager.send(Command::Stop).await.unwrap();
         runner_handle.await.unwrap();
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn runner_handles_failure() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
         let (mut manager, mut runner) = channel_pair();
         let executor = EchoExecutor;
 
-        let runner_handle = tokio::spawn(async move {
+        let runner_handle = tokio::task::spawn_local(async move {
             runner_main_loop(&mut runner, &executor).await;
         });
 
         // Ready
-        let _ = manager.recv_responses().await;
+        let _ = manager.recv().await;
 
         // Send failing task
         manager
-            .send_command(Command::ProcessBinary {
+            .send(Command::ProcessBinary {
                 relative_path: "fail".into(),
             })
             .await
@@ -176,13 +182,15 @@ mod tests {
         // Collect responses until we get Error
         let mut all = Vec::new();
         loop {
-            let responses = manager.recv_responses().await;
-            if responses.is_empty() {
-                break;
-            }
-            all.extend(responses);
-            if all.iter().any(|r| matches!(r, Response::Error { .. })) {
-                break;
+            match manager.recv().await {
+                Some(r) => {
+                    let is_error = matches!(r, Response::Error { .. });
+                    all.push(r);
+                    if is_error {
+                        break;
+                    }
+                }
+                None => break,
             }
         }
 
@@ -201,16 +209,19 @@ mod tests {
             _ => unreachable!(),
         }
 
-        manager.send_command(Command::Stop).await.unwrap();
+        manager.send(Command::Stop).await.unwrap();
         runner_handle.await.unwrap();
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn runner_exits_on_connection_close() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
         let (manager, mut runner) = channel_pair();
         let executor = EchoExecutor;
 
-        let runner_handle = tokio::spawn(async move {
+        let runner_handle = tokio::task::spawn_local(async move {
             runner_main_loop(&mut runner, &executor).await;
         });
 
@@ -219,5 +230,6 @@ mod tests {
 
         // Runner should exit cleanly
         runner_handle.await.unwrap();
+        }).await;
     }
 }

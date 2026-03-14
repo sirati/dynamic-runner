@@ -1,6 +1,15 @@
 use std::marker::PhantomData;
 
-use db_comm_api_base::{Command, ErrorType, ManagerEndpoint, Response, TaskResult};
+use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender, TaskResult};
+use crate::command::{Command, Response};
+
+/// Composite trait: a manager endpoint can send commands and receive responses.
+pub trait ManagerEndpoint: MessageSender<Command> + MessageReceiver<Response> {}
+impl<T: MessageSender<Command> + MessageReceiver<Response>> ManagerEndpoint for T {}
+
+/// Composite trait: a runner endpoint can receive commands and send responses.
+pub trait RunnerEndpoint: MessageReceiver<Command> + MessageSender<Response> {}
+impl<T: MessageReceiver<Command> + MessageSender<Response>> RunnerEndpoint for T {}
 
 // --- ZST state tags ---
 pub struct Unconnected;
@@ -11,7 +20,7 @@ pub struct Stopped;
 
 /// The manager's view of one runner's protocol state.
 ///
-/// Generic over `M: ManagerEndpoint` (which is `CommandSender + ResponseReceiver`).
+/// Generic over `M: ManagerEndpoint` (which is `MessageSender<Command> + MessageReceiver<Response>`).
 /// State transitions consume `self` and return the next state, enforcing
 /// valid transitions at compile time.
 pub struct RunnerProtocol<State, M: ManagerEndpoint> {
@@ -33,22 +42,25 @@ impl<M: ManagerEndpoint> RunnerProtocol<WaitingForReady, M> {
     /// Poll for the Ready response.
     /// Returns Idle on success, NotYet if still waiting, or Disconnected.
     pub async fn wait_ready(mut self) -> WaitReadyResult<M> {
-        let responses = self.transport.recv_responses().await;
-        for response in &responses {
-            if matches!(response, Response::Ready) {
-                return WaitReadyResult::Ready(RunnerProtocol {
+        match self.transport.recv().await {
+            Some(Response::Ready) => {
+                WaitReadyResult::Ready(RunnerProtocol {
                     _state: PhantomData,
                     transport: self.transport,
-                });
+                })
+            }
+            Some(_) => {
+                // Got a non-Ready response, keep waiting
+                WaitReadyResult::NotYet(self)
+            }
+            None => {
+                // Connection closed
+                WaitReadyResult::Disconnected(RunnerProtocol {
+                    _state: PhantomData,
+                    transport: self.transport,
+                })
             }
         }
-        if responses.is_empty() {
-            return WaitReadyResult::Disconnected(RunnerProtocol {
-                _state: PhantomData,
-                transport: self.transport,
-            });
-        }
-        WaitReadyResult::NotYet(self)
     }
 }
 
@@ -62,7 +74,7 @@ impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
     /// Transition: Idle -> Processing (send ProcessBinary command)
     pub async fn assign_task(mut self, relative_path: String) -> AssignResult<M> {
         let cmd = Command::ProcessBinary { relative_path };
-        match self.transport.send_command(cmd).await {
+        match self.transport.send(cmd).await {
             Ok(()) => AssignResult::Assigned(RunnerProtocol {
                 _state: PhantomData,
                 transport: self.transport,
@@ -79,7 +91,7 @@ impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
 
     /// Transition: Idle -> Stopped (send Stop command)
     pub async fn stop(mut self) -> RunnerProtocol<Stopped, M> {
-        let _ = self.transport.send_command(Command::Stop).await;
+        let _ = self.transport.send(Command::Stop).await;
         RunnerProtocol {
             _state: PhantomData,
             transport: self.transport,
@@ -96,40 +108,33 @@ pub enum AssignResult<M: ManagerEndpoint> {
 }
 
 impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
-    /// Poll for task completion.
+    /// Poll for the next response from the runner.
     ///
-    /// Returns Completed on done/error, StillRunning if only phase/keepalive
-    /// updates were received, or Disconnected if the connection closed.
+    /// Returns Completed on done/error, StillRunning on phase/keepalive
+    /// updates, or Disconnected if the connection closed.
     pub async fn poll_status(mut self) -> PollResult<M> {
-        let responses = self.transport.recv_responses().await;
-
-        if responses.is_empty() {
-            return PollResult::Disconnected {
-                result: TaskResult::error(
-                    ErrorType::NonRecoverable,
-                    "Worker connection closed".into(),
-                ),
-                protocol: RunnerProtocol {
-                    _state: PhantomData,
-                    transport: self.transport,
-                },
-            };
-        }
-
-        let mut phase_updates = Vec::new();
-        let mut got_keepalive = false;
-
-        for response in responses {
-            match response {
+        match self.transport.recv().await {
+            None => {
+                PollResult::Disconnected {
+                    result: TaskResult::error(
+                        ErrorType::NonRecoverable,
+                        "Worker connection closed".into(),
+                    ),
+                    protocol: RunnerProtocol {
+                        _state: PhantomData,
+                        transport: self.transport,
+                    },
+                }
+            }
+            Some(response) => match response {
                 Response::Done { warnings, filtered } => {
-                    return PollResult::Completed {
+                    PollResult::Completed {
                         result: TaskResult::ok(warnings, filtered),
                         protocol: RunnerProtocol {
                             _state: PhantomData,
                             transport: self.transport,
                         },
-                        phase_updates,
-                    };
+                    }
                 }
                 Response::Error {
                     error_type,
@@ -138,29 +143,29 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                     let needs_restart = error_type == ErrorType::NonRecoverable;
                     let result = TaskResult::error(error_type, message);
                     if needs_restart {
-                        return PollResult::Disconnected {
+                        PollResult::Disconnected {
                             result,
                             protocol: RunnerProtocol {
                                 _state: PhantomData,
                                 transport: self.transport,
                             },
-                        };
+                        }
+                    } else {
+                        PollResult::Completed {
+                            result,
+                            protocol: RunnerProtocol {
+                                _state: PhantomData,
+                                transport: self.transport,
+                            },
+                        }
                     }
-                    return PollResult::Completed {
-                        result,
-                        protocol: RunnerProtocol {
-                            _state: PhantomData,
-                            transport: self.transport,
-                        },
-                        phase_updates,
-                    };
                 }
                 Response::PickledError {
                     exception_type,
                     message,
                     traceback,
                 } => {
-                    return PollResult::Disconnected {
+                    PollResult::Disconnected {
                         result: TaskResult::error(
                             ErrorType::NonRecoverable,
                             format!("{exception_type}: {message}\n{traceback}"),
@@ -169,22 +174,31 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                             _state: PhantomData,
                             transport: self.transport,
                         },
-                    };
+                    }
                 }
                 Response::PhaseUpdate { phase_name } => {
-                    phase_updates.push(phase_name);
+                    PollResult::StillRunning {
+                        protocol: self,
+                        phase_update: Some(phase_name),
+                        got_keepalive: false,
+                    }
                 }
                 Response::Keepalive => {
-                    got_keepalive = true;
+                    PollResult::StillRunning {
+                        protocol: self,
+                        phase_update: None,
+                        got_keepalive: true,
+                    }
                 }
-                Response::Ready => {}
-            }
-        }
-
-        PollResult::StillRunning {
-            protocol: self,
-            phase_updates,
-            got_keepalive,
+                Response::Ready => {
+                    // Spurious ready during processing — ignore
+                    PollResult::StillRunning {
+                        protocol: self,
+                        phase_update: None,
+                        got_keepalive: false,
+                    }
+                }
+            },
         }
     }
 }
@@ -193,11 +207,10 @@ pub enum PollResult<M: ManagerEndpoint> {
     Completed {
         result: TaskResult,
         protocol: RunnerProtocol<Idle, M>,
-        phase_updates: Vec<String>,
     },
     StillRunning {
         protocol: RunnerProtocol<Processing, M>,
-        phase_updates: Vec<String>,
+        phase_update: Option<String>,
         got_keepalive: bool,
     },
     Disconnected {

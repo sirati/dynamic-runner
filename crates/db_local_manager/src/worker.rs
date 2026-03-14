@@ -1,12 +1,15 @@
 use std::time::Instant;
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, Identifier, ManagerEndpoint, MemoryBytes, TaskResult, WorkerId,
+    BinaryInfo, ErrorType, Identifier, MemoryBytes, TaskResult, WorkerId,
 };
+use db_manager_runner_comm::ManagerEndpoint;
 use db_manager_runner_comm::state::{
-    AssignResult, PollResult, RunnerProtocol, RunnerProtocolState, WaitReadyResult,
+    AssignResult, PollResult, Processing, RunnerProtocol, RunnerProtocolState, WaitReadyResult,
 };
 use db_scheduler_api::WorkerBudgetInfo;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 /// Events produced by a worker that the manager reacts to.
 #[derive(Debug)]
@@ -38,6 +41,10 @@ pub enum WorkerEvent<I: Identifier> {
 ///
 /// Wraps the ZST protocol state machine plus per-worker metadata used by the
 /// scheduler (budget, current task, opportunistic flag, etc.).
+///
+/// When a task is assigned, the protocol is moved into a spawned background
+/// task that reads from the transport and sends `WorkerEvent`s to a shared
+/// channel. This avoids head-of-line blocking when polling multiple workers.
 pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub worker_id: WorkerId,
     pub reserved_budget: MemoryBytes,
@@ -54,10 +61,18 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     /// Timestamp of the last keepalive or phase update.
     pub last_keepalive: Option<Instant>,
     protocol: RunnerProtocolState<M>,
+    /// Shared channel for sending worker events to the manager.
+    event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
+    /// Handle to the background poll task (set while Processing).
+    poll_task: Option<JoinHandle<RunnerProtocolState<M>>>,
 }
 
-impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
-    pub fn new(worker_id: WorkerId, transport: M) -> Self {
+impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
+    pub fn new(
+        worker_id: WorkerId,
+        transport: M,
+        event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
+    ) -> Self {
         let waiting = RunnerProtocol::connect(transport);
         Self {
             worker_id,
@@ -73,6 +88,8 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
             phase: None,
             last_keepalive: None,
             protocol: RunnerProtocolState::WaitingForReady(waiting),
+            event_tx,
+            poll_task: None,
         }
     }
 
@@ -85,7 +102,8 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
     }
 
     pub fn is_processing(&self) -> bool {
-        self.protocol.is_processing()
+        // Transitioning means the protocol is in a spawned poll task
+        self.protocol.is_processing() || self.poll_task.is_some()
     }
 
     pub fn is_stopped(&self) -> bool {
@@ -136,6 +154,10 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
     }
 
     /// Assign a task to this worker. Transitions Idle → Processing.
+    ///
+    /// Spawns a background task that reads from the transport and sends
+    /// `WorkerEvent`s to the shared event channel. The manager receives
+    /// events for all workers from a single channel without blocking.
     pub async fn assign_task(
         &mut self,
         binary: BinaryInfo<I>,
@@ -150,7 +172,18 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
         let relative_path = binary.path.to_string_lossy().into_owned();
         match idle.assign_task(relative_path).await {
             AssignResult::Assigned(processing) => {
-                self.protocol = RunnerProtocolState::Processing(processing);
+                // Spawn a background task that polls the worker protocol.
+                let worker_id = self.worker_id;
+                let binary_clone = binary.clone();
+                let tx = self.event_tx.clone();
+
+                let handle = tokio::task::spawn_local(async move {
+                    Self::poll_loop(processing, worker_id, binary_clone, estimated_memory, tx).await
+                });
+
+                self.poll_task = Some(handle);
+                // Protocol is now owned by the spawned task; mark as Transitioning
+                self.protocol = RunnerProtocolState::Transitioning;
                 self.current_binary = Some(binary);
                 self.estimated_memory = estimated_memory;
                 self.opportunistic = opportunistic;
@@ -166,61 +199,74 @@ impl<M: ManagerEndpoint, I: Identifier> WorkerHandle<M, I> {
         }
     }
 
-    /// Poll for task completion. Returns events if any.
-    pub async fn poll_status(&mut self) -> Option<WorkerEvent<I>> {
-        let processing = self.protocol.take_processing()?;
-        match processing.poll_status().await {
-            PollResult::Completed {
-                result,
-                protocol,
-                phase_updates,
-            } => {
-                self.protocol = RunnerProtocolState::Idle(protocol);
-                for phase in &phase_updates {
-                    tracing::debug!(
+    /// Background poll loop: reads responses from the transport, sends events
+    /// to the shared channel, returns the final protocol state.
+    async fn poll_loop(
+        mut processing: RunnerProtocol<Processing, M>,
+        worker_id: WorkerId,
+        binary: BinaryInfo<I>,
+        estimated_memory: MemoryBytes,
+        tx: mpsc::UnboundedSender<WorkerEvent<I>>,
+    ) -> RunnerProtocolState<M> {
+        loop {
+            match processing.poll_status().await {
+                PollResult::Completed { result, protocol } => {
+                    let _ = tx.send(WorkerEvent::TaskCompleted {
+                        worker_id,
+                        result,
+                        binary: Some(binary),
+                        estimated_memory,
+                    });
+                    return RunnerProtocolState::Idle(protocol);
+                }
+                PollResult::StillRunning {
+                    protocol,
+                    phase_update,
+                    got_keepalive,
+                } => {
+                    processing = protocol;
+                    if let Some(phase) = phase_update {
+                        let _ = tx.send(WorkerEvent::PhaseUpdate {
+                            worker_id,
+                            phase_name: phase,
+                        });
+                    } else if got_keepalive {
+                        let _ = tx.send(WorkerEvent::Keepalive { worker_id });
+                    }
+                    // Loop to read the next response
+                }
+                PollResult::Disconnected { result, protocol } => {
+                    let _ = tx.send(WorkerEvent::Disconnected {
+                        worker_id,
+                        result,
+                        binary: Some(binary),
+                    });
+                    return RunnerProtocolState::Stopped(protocol);
+                }
+            }
+        }
+    }
+
+    /// Reclaim the protocol state from the background poll task after a
+    /// terminal event (TaskCompleted or Disconnected) has been received.
+    ///
+    /// Must be called after receiving a terminal WorkerEvent for this worker.
+    pub async fn reclaim_protocol(&mut self) {
+        if let Some(handle) = self.poll_task.take() {
+            match handle.await {
+                Ok(state) => {
+                    self.protocol = state;
+                }
+                Err(e) => {
+                    tracing::error!(
                         worker_id = self.worker_id,
-                        phase = %phase,
-                        "phase update"
+                        error = %e,
+                        "poll task panicked"
                     );
+                    // Can't recover the transport — mark as stopped with a
+                    // placeholder. The manager should restart this worker.
+                    self.protocol = RunnerProtocolState::Unconnected;
                 }
-                let binary = self.current_binary.clone();
-                let estimated_memory = self.estimated_memory;
-                self.clear_task();
-                Some(WorkerEvent::TaskCompleted {
-                    worker_id: self.worker_id,
-                    result,
-                    binary,
-                    estimated_memory,
-                })
-            }
-            PollResult::StillRunning {
-                protocol,
-                phase_updates,
-                got_keepalive,
-            } => {
-                self.protocol = RunnerProtocolState::Processing(protocol);
-                if let Some(phase) = phase_updates.into_iter().last() {
-                    return Some(WorkerEvent::PhaseUpdate {
-                        worker_id: self.worker_id,
-                        phase_name: phase,
-                    });
-                }
-                if got_keepalive {
-                    return Some(WorkerEvent::Keepalive {
-                        worker_id: self.worker_id,
-                    });
-                }
-                None
-            }
-            PollResult::Disconnected { result, protocol } => {
-                self.protocol = RunnerProtocolState::Stopped(protocol);
-                let binary = self.current_binary.clone();
-                self.clear_task();
-                Some(WorkerEvent::Disconnected {
-                    worker_id: self.worker_id,
-                    result,
-                    binary,
-                })
             }
         }
     }

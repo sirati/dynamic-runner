@@ -1,4 +1,5 @@
-use db_comm_api_base::{Command, ErrorType, Response};
+use db_comm_api_base::ErrorType;
+use crate::command::{Command, Response};
 
 /// Serialize a command to bytes (line-delimited text, backward-compatible with Python).
 ///

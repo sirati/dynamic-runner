@@ -1,9 +1,7 @@
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
-use db_comm_api_base::{
-    Command, CommandReceiver, CommandSender, Response, ResponseReceiver, ResponseSender,
-};
-use db_manager_runner_comm::codec;
+use db_comm_api_base::{MessageReceiver, MessageSender};
+use db_manager_runner_comm::{Command, Response, codec};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -52,9 +50,9 @@ pub struct SocketpairManagerEnd {
     writer: tokio::io::WriteHalf<UnixStream>,
 }
 
-impl CommandSender for SocketpairManagerEnd {
-    async fn send_command(&mut self, command: Command) -> Result<(), String> {
-        let bytes = codec::serialize_command(&command);
+impl MessageSender<Command> for SocketpairManagerEnd {
+    async fn send(&mut self, msg: Command) -> Result<(), String> {
+        let bytes = codec::serialize_command(&msg);
         self.writer
             .write_all(&bytes)
             .await
@@ -63,43 +61,16 @@ impl CommandSender for SocketpairManagerEnd {
     }
 }
 
-impl ResponseReceiver for SocketpairManagerEnd {
-    async fn recv_responses(&mut self) -> Vec<Response> {
-        let mut responses = Vec::new();
+impl MessageReceiver<Response> for SocketpairManagerEnd {
+    async fn recv(&mut self) -> Option<Response> {
         let mut line = String::new();
-
-        // Read one line (blocking-async). If nothing available, this awaits.
         match self.reader.read_line(&mut line).await {
-            Ok(0) => return responses, // EOF
-            Ok(_) => {
-                if let Some(resp) = codec::parse_response(&line) {
-                    responses.push(resp);
-                }
-            }
-            Err(_) => return responses,
+            Ok(0) => None, // EOF
+            Ok(_) => codec::parse_response(&line),
+            Err(_) => None,
         }
-
-        // Drain any additional buffered lines without blocking
-        loop {
-            line.clear();
-            // Check if there's more data buffered
-            let buf = self.reader.buffer();
-            if buf.is_empty() || !buf.contains(&b'\n') {
-                break;
-            }
-            match self.reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if let Some(resp) = codec::parse_response(&line) {
-                        responses.push(resp);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        responses
     }
+
 }
 
 /// Runner-side transport over a Unix socketpair.
@@ -131,8 +102,8 @@ impl SocketpairRunnerEnd {
     }
 }
 
-impl CommandReceiver for SocketpairRunnerEnd {
-    async fn recv_command(&mut self) -> Option<Command> {
+impl MessageReceiver<Command> for SocketpairRunnerEnd {
+    async fn recv(&mut self) -> Option<Command> {
         let mut line = String::new();
         match self.reader.read_line(&mut line).await {
             Ok(0) => None, // EOF
@@ -142,9 +113,9 @@ impl CommandReceiver for SocketpairRunnerEnd {
     }
 }
 
-impl ResponseSender for SocketpairRunnerEnd {
-    async fn send_response(&mut self, response: Response) -> Result<(), String> {
-        let bytes = codec::serialize_response(&response);
+impl MessageSender<Response> for SocketpairRunnerEnd {
+    async fn send(&mut self, msg: Response) -> Result<(), String> {
+        let bytes = codec::serialize_response(&msg);
         self.writer
             .write_all(&bytes)
             .await
@@ -156,19 +127,20 @@ impl ResponseSender for SocketpairRunnerEnd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[tokio::test]
     async fn socketpair_command_roundtrip() {
         let (mut manager, child_fd) = create_socketpair().unwrap();
         let mut runner = unsafe { SocketpairRunnerEnd::from_raw_fd(child_fd).unwrap() };
 
         manager
-            .send_command(Command::ProcessBinary {
+            .send(Command::ProcessBinary {
                 relative_path: "test/bin".into(),
             })
             .await
             .unwrap();
 
-        let cmd = runner.recv_command().await.unwrap();
+        let cmd = runner.recv().await.unwrap();
         match cmd {
             Command::ProcessBinary { relative_path } => {
                 assert_eq!(relative_path, "test/bin");
@@ -183,19 +155,18 @@ mod tests {
         let mut runner = unsafe { SocketpairRunnerEnd::from_raw_fd(child_fd).unwrap() };
 
         runner
-            .send_response(Response::Done {
+            .send(Response::Done {
                 warnings: 1,
                 filtered: 2,
             })
             .await
             .unwrap();
 
-        let responses = manager.recv_responses().await;
-        assert_eq!(responses.len(), 1);
-        match &responses[0] {
+        let resp = manager.recv().await.unwrap();
+        match resp {
             Response::Done { warnings, filtered } => {
-                assert_eq!(*warnings, 1);
-                assert_eq!(*filtered, 2);
+                assert_eq!(warnings, 1);
+                assert_eq!(filtered, 2);
             }
             _ => panic!("expected Done"),
         }
@@ -206,9 +177,9 @@ mod tests {
         let (mut manager, child_fd) = create_socketpair().unwrap();
         let mut runner = unsafe { SocketpairRunnerEnd::from_raw_fd(child_fd).unwrap() };
 
-        manager.send_command(Command::Stop).await.unwrap();
+        manager.send(Command::Stop).await.unwrap();
 
-        let cmd = runner.recv_command().await.unwrap();
+        let cmd = runner.recv().await.unwrap();
         assert!(matches!(cmd, Command::Stop));
     }
 
@@ -218,31 +189,30 @@ mod tests {
         let mut runner = unsafe { SocketpairRunnerEnd::from_raw_fd(child_fd).unwrap() };
 
         // Runner sends Ready
-        runner.send_response(Response::Ready).await.unwrap();
-        let responses = manager.recv_responses().await;
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], Response::Ready));
+        runner.send(Response::Ready).await.unwrap();
+        let resp = manager.recv().await.unwrap();
+        assert!(matches!(resp, Response::Ready));
 
         // Manager sends task
         manager
-            .send_command(Command::ProcessBinary {
+            .send(Command::ProcessBinary {
                 relative_path: "a/b".into(),
             })
             .await
             .unwrap();
 
-        let cmd = runner.recv_command().await.unwrap();
+        let cmd = runner.recv().await.unwrap();
         assert!(matches!(cmd, Command::ProcessBinary { .. }));
 
         // Runner sends Done
         runner
-            .send_response(Response::Done {
+            .send(Response::Done {
                 warnings: 0,
                 filtered: 0,
             })
             .await
             .unwrap();
-        let responses = manager.recv_responses().await;
-        assert!(matches!(responses[0], Response::Done { .. }));
+        let resp = manager.recv().await.unwrap();
+        assert!(matches!(resp, Response::Done { .. }));
     }
 }

@@ -1,4 +1,4 @@
-use crate::types::ErrorType;
+use db_comm_api_base::ErrorType;
 
 #[derive(Debug, Clone)]
 pub enum Command {

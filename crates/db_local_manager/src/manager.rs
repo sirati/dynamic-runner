@@ -2,15 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, FailedTask, Identifier, ManagerEndpoint, MemoryBytes, TaskResult, WorkerId,
+    BinaryInfo, ErrorType, FailedTask, Identifier, MemoryBytes, TaskResult, WorkerId,
 };
+use db_manager_runner_comm::ManagerEndpoint;
 use db_scheduler_api::{
-    AssignmentDecision, MemoryEstimator, OomDecision, ProcessingPhase, Scheduler,
-    WorkerBudgetInfo,
+    AssignmentDecision, MemoryEstimator, ProcessingPhase, Scheduler,
 };
-
+use crate::pool::{OomKillResult, WorkerPool};
 use crate::stats::ProcessingStats;
-use crate::worker::{WorkerEvent, WorkerHandle};
+use crate::worker::WorkerEvent;
 
 /// Configuration for the local manager.
 pub struct LocalManagerConfig {
@@ -45,7 +45,7 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator,
     config: LocalManagerConfig,
     scheduler: S,
     estimator: E,
-    workers: Vec<WorkerHandle<M, I>>,
+    pool: WorkerPool<M, I>,
     pending_binaries: Vec<BinaryInfo<I>>,
     failed_tasks: Vec<FailedTask<I>>,
     oom_tasks: Vec<FailedTask<I>>,
@@ -56,13 +56,13 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator,
     stats: ProcessingStats,
 }
 
-impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> LocalManager<M, S, E, I> {
     pub fn new(config: LocalManagerConfig, scheduler: S, estimator: E) -> Self {
         Self {
             config,
             scheduler,
             estimator,
-            workers: Vec::new(),
+            pool: WorkerPool::new(),
             pending_binaries: Vec::new(),
             failed_tasks: Vec::new(),
             oom_tasks: Vec::new(),
@@ -124,44 +124,15 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
     // ── Initialization ──
 
     async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
-        for i in 0..self.config.num_workers {
-            let (transport, pid) = factory.spawn_worker(i);
-            if self.config.print_pid {
-                if let Some(pid) = pid {
-                    tracing::info!(worker_id = i, pid, "worker PID");
-                }
-            }
-            let mut handle = WorkerHandle::new(i, transport);
-            handle.pid = pid;
-            handle.reserved_budget =
-                self.scheduler
-                    .initial_budget(i, self.config.max_memory);
-            tracing::info!(
-                worker_id = i,
-                budget_mb = handle.reserved_budget / (1024 * 1024),
-                "worker created"
-            );
-            self.workers.push(handle);
-        }
-
-        // Wait for all workers to become ready
-        self.wait_for_all_ready().await;
-    }
-
-    async fn wait_for_all_ready(&mut self) {
-        loop {
-            let all_ready = self.workers.iter().all(|w| w.is_ready());
-            if all_ready {
-                tracing::info!("all workers ready");
-                break;
-            }
-            for worker in &mut self.workers {
-                if !worker.is_ready() {
-                    worker.poll_ready().await;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
+        self.pool
+            .initialize(
+                self.config.num_workers,
+                self.config.max_memory,
+                &self.scheduler,
+                factory,
+                self.config.print_pid,
+            )
+            .await;
     }
 
     // ── Phase 1: Initial Assignments ──
@@ -171,15 +142,15 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
         loop {
             let all_assigned = self
-                .workers
+                .pool.workers
                 .iter()
                 .all(|w| w.has_initial_assignment);
             if all_assigned {
                 break;
             }
 
-            for i in 0..self.workers.len() {
-                if self.workers[i].has_initial_assignment || !self.workers[i].is_ready() {
+            for i in 0..self.pool.workers.len() {
+                if self.pool.workers[i].has_initial_assignment || !self.pool.workers[i].is_ready() {
                     continue;
                 }
                 self.try_assign_initial(i as WorkerId, factory).await;
@@ -188,13 +159,13 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
 
         let opp_mem: u64 = self
-            .workers
+            .pool.workers
             .iter()
             .filter(|w| w.opportunistic && w.current_binary.is_some())
             .map(|w| w.estimated_memory)
             .sum();
         let non_opp_mem: u64 = self
-            .workers
+            .pool.workers
             .iter()
             .filter(|w| !w.opportunistic && w.current_binary.is_some())
             .map(|w| w.estimated_memory)
@@ -208,7 +179,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
     }
 
     async fn try_assign_initial(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
-        let worker_info = self.workers[worker_id as usize].budget_info();
+        let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let decision = self.scheduler.assign_initial(
             &worker_info,
             &self.pending_binaries,
@@ -228,7 +199,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 self.total_assigned_memory += estimated_memory;
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
-                let worker = &mut self.workers[worker_id as usize];
+                let worker = &mut self.pool.workers[worker_id as usize];
                 match worker.assign_task(binary.clone(), estimated_memory, opportunistic).await {
                     Ok(()) => {
                         tracing::info!(
@@ -238,7 +209,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                             opportunistic,
                             "initial assignment"
                         );
-                        self.workers[worker_id as usize].assignment_failure_count = 0;
+                        self.pool.workers[worker_id as usize].assignment_failure_count = 0;
                     }
                     Err(e) => {
                         // Put binary back and undo memory increment
@@ -249,12 +220,12 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 }
             }
             AssignmentDecision::NoFit => {
-                self.workers[worker_id as usize].idle = true;
-                self.workers[worker_id as usize].has_initial_assignment = true;
+                self.pool.workers[worker_id as usize].idle = true;
+                self.pool.workers[worker_id as usize].has_initial_assignment = true;
             }
             AssignmentDecision::NoPendingTasks => {
-                self.workers[worker_id as usize].idle = true;
-                self.workers[worker_id as usize].has_initial_assignment = true;
+                self.pool.workers[worker_id as usize].idle = true;
+                self.pool.workers[worker_id as usize].has_initial_assignment = true;
             }
         }
     }
@@ -301,7 +272,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
         // Restart any stopped/dead workers before retry (matching Python behavior)
         for i in 0..self.config.num_workers {
-            if self.workers[i as usize].is_stopped() || !self.workers[i as usize].is_ready() {
+            if self.pool.workers[i as usize].is_stopped() || !self.pool.workers[i as usize].is_ready() {
                 tracing::info!(worker_id = i, "restarting worker for retry phase");
                 self.restart_worker(i, factory).await;
                 self.pending_worker_assignments.insert(i);
@@ -385,7 +356,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                     free_mb = free_mem / (1024 * 1024),
                     "skipping unassigned binary due to low system memory"
                 );
-                // Don't process, just skip
+                self.stats.skipped += 1;
                 continue;
             }
             kept.push(task);
@@ -417,9 +388,10 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     /// The main event-driven worker processing loop.
     ///
-    /// Replaces Python's `_process_worker_loop` + `threading.Event().wait(0.1)`.
-    /// Uses `tokio::task::yield_now()` instead of sleep(0.1) — actual event-driven
-    /// behavior comes from the transport's recv_responses blocking.
+    /// Uses `tokio::select!` to multiplex between worker events (from the
+    /// shared channel) and a periodic timer for OOM checks and timeouts.
+    /// Workers send events via the channel from their spawned poll tasks,
+    /// eliminating head-of-line blocking.
     async fn process_worker_loop(
         &mut self,
         active_workers: &mut HashSet<WorkerId>,
@@ -428,43 +400,24 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         phase: ProcessingPhase,
         factory: &mut impl WorkerFactory<M>,
     ) {
+        let mut oom_interval = tokio::time::interval(Duration::from_millis(100));
+
         while !active_workers.is_empty() {
-            // Update actual memory usage for all workers at the start of each
-            // outer loop iteration, so OOM checks and assignment decisions use
-            // current data.
-            self.update_all_memory_usage();
+            // Try to assign tasks to any idle workers
+            self.assign_idle_workers(active_workers, allow_stop, phase, factory).await;
 
-            let worker_ids: Vec<WorkerId> = active_workers.iter().copied().collect();
+            // If no workers are processing and no pending assignments, we're done
+            let any_processing = active_workers.iter().any(|&wid| {
+                let idx = wid as usize;
+                self.pool.workers[idx].is_processing()
+            });
+            if !any_processing && self.pending_worker_assignments.is_empty() {
+                break;
+            }
 
-            for worker_id in worker_ids {
-                let idx = worker_id as usize;
-
-                // In main phase, check OOM per-worker (matching Python's decision_impl.py
-                // which calls _check_memory_pressure_and_kill inside the per-worker loop)
-                if phase == ProcessingPhase::MainPhase && !self.pending_binaries.is_empty() {
-                    self.check_oom();
-                }
-
-                // Poll not-yet-ready workers
-                if !self.workers[idx].is_ready() {
-                    self.workers[idx].poll_ready().await;
-                    if !self.workers[idx].is_ready() && !self.pending_binaries.is_empty() {
-                        continue;
-                    }
-                    if !self.workers[idx].is_ready() && self.pending_binaries.is_empty() && allow_stop {
-                        active_workers.remove(&worker_id);
-                        continue;
-                    }
-                }
-
-                if self.workers[idx].current_binary.is_none() {
-                    // Worker has no task — try to assign
-                    if !self.handle_worker_without_task(worker_id, active_workers, allow_stop, phase) {
-                        continue;
-                    }
-                } else {
-                    // Worker is processing — poll for result
-                    let event = self.workers[idx].poll_status().await;
+            // Wait for either a worker event or the OOM check timer
+            tokio::select! {
+                event = self.pool.recv_event() => {
                     if let Some(event) = event {
                         self.handle_event(
                             event,
@@ -477,34 +430,27 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                         .await;
                     }
                 }
+                _ = oom_interval.tick() => {
+                    // Periodic maintenance: OOM checks, memory updates, timeouts
+                    self.pool.update_all_memory_usage();
+                    if !self.pending_binaries.is_empty() {
+                        self.check_oom();
+                    }
+                    self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
+                }
             }
 
-            // Handle pending worker reassignments
-            if !self.pending_worker_assignments.is_empty() && !self.pending_binaries.is_empty() {
+            // Handle pending worker reassignments after events
+            if !self.pending_worker_assignments.is_empty() {
                 let pending: Vec<WorkerId> =
                     self.pending_worker_assignments.iter().copied().collect();
                 for worker_id in pending {
                     let idx = worker_id as usize;
-                    if self.workers[idx].current_binary.is_none() && self.workers[idx].is_ready() {
+                    if self.pool.workers[idx].current_binary.is_none() && self.pool.workers[idx].is_ready() {
                         self.try_assign_normal(worker_id, factory).await;
                         self.pending_worker_assignments.remove(&worker_id);
                     }
                 }
-            }
-
-            // OOM checking for non-main phases (main phase checks per-worker above).
-            // This runs during retry, OOM, and unassigned phases.
-            // During OOM phase, the check still runs (matching Python) but check_oom
-            // will not requeue killed tasks to pending_binaries.
-            if phase != ProcessingPhase::MainPhase && !self.pending_binaries.is_empty() {
-                self.check_oom();
-            }
-
-            // Check for worker timeouts
-            self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
-
-            if !active_workers.is_empty() {
-                tokio::task::yield_now().await;
             }
         }
 
@@ -525,6 +471,48 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
     }
 
+    /// Try to assign tasks to all idle active workers.
+    async fn assign_idle_workers(
+        &mut self,
+        active_workers: &mut HashSet<WorkerId>,
+        allow_stop: bool,
+        phase: ProcessingPhase,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
+        let worker_ids: Vec<WorkerId> = active_workers.iter().copied().collect();
+        for worker_id in worker_ids {
+            let idx = worker_id as usize;
+
+            // Poll not-yet-ready workers (still in WaitingForReady state)
+            if !self.pool.workers[idx].is_ready() {
+                self.pool.workers[idx].poll_ready().await;
+                if !self.pool.workers[idx].is_ready() {
+                    if self.pending_binaries.is_empty() && allow_stop {
+                        active_workers.remove(&worker_id);
+                    }
+                    continue;
+                }
+            }
+
+            // Skip workers that are already processing
+            if self.pool.workers[idx].is_processing() {
+                continue;
+            }
+
+            if self.pool.workers[idx].current_binary.is_none() {
+                // Worker has no task — try to assign
+                if !self.handle_worker_without_task(worker_id, active_workers, allow_stop, phase) {
+                    continue;
+                }
+                // If marked for assignment, do it now
+                if self.pending_worker_assignments.contains(&worker_id) {
+                    self.try_assign_normal(worker_id, factory).await;
+                    self.pending_worker_assignments.remove(&worker_id);
+                }
+            }
+        }
+    }
+
     fn handle_worker_without_task(
         &mut self,
         worker_id: WorkerId,
@@ -533,8 +521,8 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         _phase: ProcessingPhase,
     ) -> bool {
         // Synchronous decision, async assign handled via pending_worker_assignments
-        let worker_info = self.workers[worker_id as usize].budget_info();
-        let all_infos = self.worker_budget_infos();
+        let worker_info = self.pool.workers[worker_id as usize].budget_info();
+        let all_infos = self.pool.budget_infos();
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
@@ -593,8 +581,8 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
     }
 
     async fn try_assign_normal(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
-        let worker_info = self.workers[worker_id as usize].budget_info();
-        let all_infos = self.worker_budget_infos();
+        let worker_info = self.pool.workers[worker_id as usize].budget_info();
+        let all_infos = self.pool.budget_infos();
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
@@ -613,7 +601,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             } => {
                 let binary = self.pending_binaries.remove(binary_index);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let worker = &mut self.workers[worker_id as usize];
+                let worker = &mut self.pool.workers[worker_id as usize];
                 match worker
                     .assign_task(binary.clone(), estimated_memory, opportunistic)
                     .await
@@ -627,7 +615,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                             "assigned task"
                         );
                         // Reset failure count on success
-                        self.workers[worker_id as usize].assignment_failure_count = 0;
+                        self.pool.workers[worker_id as usize].assignment_failure_count = 0;
                     }
                     Err(e) => {
                         // Put binary back
@@ -647,7 +635,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         error_msg: &str,
         factory: &mut impl WorkerFactory<M>,
     ) {
-        let worker = &mut self.workers[worker_id as usize];
+        let worker = &mut self.pool.workers[worker_id as usize];
         worker.assignment_failure_count += 1;
         let count = worker.assignment_failure_count;
 
@@ -680,36 +668,9 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
 
     /// Restart a worker: stop the old one, spawn a new transport via factory.
     async fn restart_worker(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
-        // Stop old worker
-        let old = &mut self.workers[worker_id as usize];
-        if !old.is_stopped() {
-            old.stop().await;
-        }
-
-        // Spawn new transport
-        let (transport, pid) = factory.spawn_worker(worker_id);
-        if self.config.print_pid {
-            if let Some(pid) = pid {
-                tracing::info!(worker_id, pid, "worker PID (restart)");
-            }
-        }
-
-        let mut handle = WorkerHandle::new(worker_id, transport);
-        handle.pid = pid;
-        handle.reserved_budget = self.workers[worker_id as usize].reserved_budget;
-        handle.assignment_failure_count = self.workers[worker_id as usize].assignment_failure_count;
-        self.workers[worker_id as usize] = handle;
-
-        // Wait for ready
-        loop {
-            if self.workers[worker_id as usize].is_ready() {
-                break;
-            }
-            self.workers[worker_id as usize].poll_ready().await;
-            tokio::task::yield_now().await;
-        }
-
-        tracing::info!(worker_id, "worker restarted and ready");
+        self.pool
+            .restart_worker(worker_id, factory, self.config.print_pid)
+            .await;
     }
 
     async fn handle_event(
@@ -728,6 +689,10 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 binary,
                 estimated_memory,
             } => {
+                // Reclaim protocol state from the spawned poll task
+                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize].clear_task();
+
                 self.handle_task_completed(
                     worker_id,
                     result,
@@ -746,17 +711,21 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 result,
                 binary,
             } => {
+                // Reclaim protocol state from the spawned poll task
+                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                self.pool.workers[worker_id as usize].clear_task();
+
                 tracing::warn!(
                     worker_id,
                     error = ?result.error_message,
                     "worker disconnected"
                 );
                 // Log memory usage before recording result
-                let actual_mem = self.workers[worker_id as usize].actual_memory_usage;
+                let actual_mem = self.pool.workers[worker_id as usize].actual_memory_usage;
                 self.log_memory_usage(binary.as_ref(), 0, actual_mem, true);
 
                 // Release estimated memory (matching handle_task_completed logic)
-                let worker = &self.workers[worker_id as usize];
+                let worker = &self.pool.workers[worker_id as usize];
                 if worker.has_initial_assignment && !worker.opportunistic {
                     let est = worker.estimated_memory;
                     self.total_assigned_memory = self.total_assigned_memory.saturating_sub(est);
@@ -783,13 +752,13 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                 phase_name,
             } => {
                 tracing::debug!(worker_id, phase = %phase_name, "phase update");
-                let worker = &mut self.workers[worker_id as usize];
+                let worker = &mut self.pool.workers[worker_id as usize];
                 worker.phase = Some(phase_name);
                 worker.last_keepalive = Some(Instant::now());
             }
             WorkerEvent::Keepalive { worker_id } => {
                 tracing::trace!(worker_id, "keepalive");
-                self.workers[worker_id as usize].last_keepalive = Some(Instant::now());
+                self.pool.workers[worker_id as usize].last_keepalive = Some(Instant::now());
             }
         }
     }
@@ -807,12 +776,12 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         factory: &mut impl WorkerFactory<M>,
     ) {
         // Log memory usage before recording result (capture actual before clearing)
-        let actual_mem = self.workers[worker_id as usize].actual_memory_usage;
+        let actual_mem = self.pool.workers[worker_id as usize].actual_memory_usage;
         self.log_memory_usage(binary.as_ref(), estimated_memory, actual_mem, !result.success);
 
         // Release estimated memory from total (only for non-opportunistic workers
         // that received an initial assignment, matching Python behavior)
-        let worker = &self.workers[worker_id as usize];
+        let worker = &self.pool.workers[worker_id as usize];
         if worker.has_initial_assignment && !worker.opportunistic {
             self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated_memory);
         }
@@ -838,7 +807,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
 
         // If still no task and no pending, remove from active
-        if self.workers[worker_id as usize].current_binary.is_none()
+        if self.pool.workers[worker_id as usize].current_binary.is_none()
             && self.pending_binaries.is_empty()
         {
             if allow_stop {
@@ -939,7 +908,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
 
         let mut timed_out = Vec::new();
-        for worker in &self.workers {
+        for worker in &self.pool.workers {
             if let (Some(phase), Some(last_keepalive)) = (&worker.phase, worker.last_keepalive) {
                 if let Some(timeout) = self.config.stage_timeouts.get(phase) {
                     if last_keepalive.elapsed() > *timeout {
@@ -950,7 +919,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
 
         for (worker_id, phase) in timed_out {
-            let binary_name = self.workers[worker_id as usize]
+            let binary_name = self.pool.workers[worker_id as usize]
                 .current_binary
                 .as_ref()
                 .and_then(|b| b.path.file_name())
@@ -965,9 +934,9 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             );
 
             // Record as recoverable error
-            let binary = self.workers[worker_id as usize].current_binary.clone();
-            let actual_mem = self.workers[worker_id as usize].actual_memory_usage;
-            let estimated = self.workers[worker_id as usize].estimated_memory;
+            let binary = self.pool.workers[worker_id as usize].current_binary.clone();
+            let actual_mem = self.pool.workers[worker_id as usize].actual_memory_usage;
+            let estimated = self.pool.workers[worker_id as usize].estimated_memory;
 
             self.log_memory_usage(binary.as_ref(), estimated, actual_mem, true);
 
@@ -982,7 +951,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
             }
 
             // Release estimated memory
-            let worker = &self.workers[worker_id as usize];
+            let worker = &self.pool.workers[worker_id as usize];
             if worker.has_initial_assignment && !worker.opportunistic {
                 self.total_assigned_memory = self.total_assigned_memory.saturating_sub(estimated);
             }
@@ -993,25 +962,14 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
     }
 
-    /// Update actual memory usage for all workers from /proc/[pid]/statm.
-    fn update_all_memory_usage(&mut self) {
-        for worker in &mut self.workers {
-            worker.update_memory_usage();
-        }
-    }
-
     fn check_oom(&mut self) {
-        self.update_all_memory_usage();
-        let infos = self.worker_budget_infos();
-        let decision =
-            self.scheduler
-                .check_oom(&infos, self.config.max_memory, self.in_oom_phase);
-
-        match decision {
-            OomDecision::Kill { worker_id, reason } => {
-                tracing::warn!(worker_id, reason = %reason, in_oom_phase = self.in_oom_phase, "OOM killing worker");
-                let worker = &mut self.workers[worker_id as usize];
-                if let Some(binary) = worker.current_binary.take() {
+        match self.pool.check_oom(&self.scheduler, self.config.max_memory, self.in_oom_phase) {
+            OomKillResult::Killed {
+                worker_id,
+                binary,
+                reason,
+            } => {
+                if let Some(binary) = binary {
                     if worker_id == 0 {
                         // Worker 0 is the last resort — if it can't fit, the task
                         // is truly OOM and goes to the oom_tasks queue.
@@ -1019,7 +977,7 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                         self.oom_tasks.push(FailedTask {
                             binary,
                             error_type: ErrorType::OutOfMemory,
-                            error_message: reason.clone(),
+                            error_message: reason,
                             retry_count: 0,
                         });
                     } else if !self.in_oom_phase {
@@ -1031,9 +989,8 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
                     // During OOM phase for non-worker-0: task is dropped (not requeued)
                     // matching Python's behavior where _handle_oom_killed_task is skipped.
                 }
-                worker.mark_oom_killed();
             }
-            OomDecision::NoAction => {}
+            OomKillResult::NoAction => {}
         }
     }
 
@@ -1062,24 +1019,16 @@ impl<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> Loc
         }
     }
 
-    fn worker_budget_infos(&self) -> Vec<WorkerBudgetInfo<I>> {
-        self.workers.iter().map(|w| w.budget_info()).collect()
-    }
-
     async fn stop_all_workers(&mut self) {
-        for worker in &mut self.workers {
-            if !worker.is_stopped() {
-                worker.stop().await;
-                tracing::info!(worker_id = worker.worker_id, "worker stopped");
-            }
-        }
+        self.pool.stop_all().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db_comm_api_base::{CommandReceiver, Response, ResponseSender};
+    use db_comm_api_base::{MessageReceiver, MessageSender};
+    use db_manager_runner_comm::{Command, Response};
     use db_scheduler_impl::MemoryStealingScheduler;
     use db_transport_channel::{ChannelManagerEnd, channel_pair};
     use serde::{Deserialize, Serialize};
@@ -1123,7 +1072,7 @@ mod tests {
         fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
             let (manager_end, runner_end) = channel_pair();
             let mode = self.mode.clone();
-            tokio::spawn(fake_worker_loop(runner_end, mode));
+            tokio::task::spawn_local(fake_worker_loop(runner_end, mode));
             (manager_end, None)
         }
     }
@@ -1132,21 +1081,19 @@ mod tests {
         mut runner: db_transport_channel::ChannelRunnerEnd,
         mode: FakeWorkerMode,
     ) {
-        use db_comm_api_base::Command;
-
         // Send Ready
-        let _ = runner.send_response(Response::Ready).await;
+        let _ = runner.send(Response::Ready).await;
 
         let mut task_count = 0u32;
         loop {
-            match runner.recv_command().await {
+            match MessageReceiver::<Command>::recv(&mut runner).await {
                 Some(Command::Stop) => break,
                 Some(Command::ProcessBinary { .. }) => {
                     task_count += 1;
                     match &mode {
                         FakeWorkerMode::AlwaysSucceed => {
                             let _ = runner
-                                .send_response(Response::Done {
+                                .send(Response::Done {
                                     warnings: 0,
                                     filtered: 0,
                                 })
@@ -1154,7 +1101,7 @@ mod tests {
                         }
                         FakeWorkerMode::AlwaysOom => {
                             let _ = runner
-                                .send_response(Response::Error {
+                                .send(Response::Error {
                                     error_type: ErrorType::OutOfMemory,
                                     message: "out of memory".into(),
                                 })
@@ -1163,14 +1110,14 @@ mod tests {
                         FakeWorkerMode::FailThenSucceed => {
                             if task_count == 1 {
                                 let _ = runner
-                                    .send_response(Response::Error {
+                                    .send(Response::Error {
                                         error_type: ErrorType::Recoverable,
                                         message: "transient failure".into(),
                                     })
                                     .await;
                             } else {
                                 let _ = runner
-                                    .send_response(Response::Done {
+                                    .send(Response::Done {
                                         warnings: 0,
                                         filtered: 0,
                                     })
@@ -1195,106 +1142,117 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn single_worker_processes_all_binaries() {
-        let config = test_config(1);
-        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let config = test_config(1);
+            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
 
-        manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await;
 
-        assert_eq!(manager.stats().completed, 3);
-        assert_eq!(manager.stats().total, 3);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.oom_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.oom_tasks().is_empty());
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn multiple_workers_process_binaries() {
-        let config = test_config(3);
-        let mut manager =
-            LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let config = test_config(3);
+            let mut manager =
+                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..10)
-            .map(|i| make_binary(&format!("bin_{i}"), 100))
-            .collect();
+            let binaries: Vec<BinaryInfo<TestId>> = (0..10)
+                .map(|i| make_binary(&format!("bin_{i}"), 100))
+                .collect();
 
-        manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await;
 
-        assert_eq!(manager.stats().completed, 10);
-        assert!(manager.failed_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 10);
+            assert!(manager.failed_tasks().is_empty());
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn retry_phase_retries_failed_tasks() {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::FailThenSucceed,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let config = test_config(1);
+            let mut manager =
+                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::FailThenSucceed,
+            };
 
-        let binaries = vec![make_binary("retry_me", 50)];
-        manager.process_binaries(binaries, &mut factory).await;
+            let binaries = vec![make_binary("retry_me", 50)];
+            manager.process_binaries(binaries, &mut factory).await;
 
-        // First attempt fails, retry succeeds
-        assert_eq!(manager.stats().completed, 1);
-        assert!(manager.failed_tasks().is_empty());
+            // First attempt fails, retry succeeds
+            assert_eq!(manager.stats().completed, 1);
+            assert!(manager.failed_tasks().is_empty());
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn oom_tasks_collected() {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysOom,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let config = test_config(1);
+            let mut manager =
+                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysOom,
+            };
 
-        let binaries = vec![make_binary("oom_bin", 50)];
-        manager.process_binaries(binaries, &mut factory).await;
+            let binaries = vec![make_binary("oom_bin", 50)];
+            manager.process_binaries(binaries, &mut factory).await;
 
-        // OOM in main → retry → OOM again → OOM phase → OOM again
-        // Eventually ends up in oom_tasks or failed_tasks
-        assert_eq!(manager.stats().completed, 0);
+            // OOM in main → retry → OOM again → OOM phase → OOM again
+            // Eventually ends up in oom_tasks or failed_tasks
+            assert_eq!(manager.stats().completed, 0);
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn no_binaries_completes_immediately() {
-        let config = test_config(1);
-        let mut manager =
-            LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let config = test_config(1);
+            let mut manager =
+                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        manager
-            .process_binaries(Vec::<BinaryInfo<TestId>>::new(), &mut factory)
-            .await;
+            manager
+                .process_binaries(Vec::<BinaryInfo<TestId>>::new(), &mut factory)
+                .await;
 
-        assert_eq!(manager.stats().completed, 0);
-        assert_eq!(manager.stats().total, 0);
+            assert_eq!(manager.stats().completed, 0);
+            assert_eq!(manager.stats().total, 0);
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn always_restart_worker_respawns_after_success() {
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
-        use db_comm_api_base::{Command, CommandReceiver, ResponseSender};
-
-        let spawn_count = Arc::new(AtomicU32::new(0));
-        let spawn_count_clone = spawn_count.clone();
 
         struct CountingFactory {
             spawn_count: Arc<AtomicU32>,
@@ -1304,15 +1262,15 @@ mod tests {
             fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
                 self.spawn_count.fetch_add(1, Ordering::SeqCst);
                 let (manager_end, runner_end) = channel_pair();
-                tokio::spawn(async move {
+                tokio::task::spawn_local(async move {
                     let mut runner = runner_end;
-                    let _ = runner.send_response(Response::Ready).await;
+                    let _ = runner.send(Response::Ready).await;
                     loop {
-                        match runner.recv_command().await {
+                        match MessageReceiver::<Command>::recv(&mut runner).await {
                             Some(Command::Stop) => break,
                             Some(Command::ProcessBinary { .. }) => {
                                 let _ = runner
-                                    .send_response(Response::Done {
+                                    .send(Response::Done {
                                         warnings: 0,
                                         filtered: 0,
                                     })
@@ -1326,85 +1284,88 @@ mod tests {
             }
         }
 
-        let mut config = test_config(1);
-        config.always_restart_worker = true;
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let spawn_count_clone = spawn_count.clone();
 
-        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = CountingFactory {
-            spawn_count: spawn_count_clone,
-        };
+            let mut config = test_config(1);
+            config.always_restart_worker = true;
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-            make_binary("c", 70),
-        ];
+            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = CountingFactory {
+                spawn_count: spawn_count_clone,
+            };
 
-        manager.process_binaries(binaries, &mut factory).await;
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
 
-        assert_eq!(manager.stats().completed, 3);
-        assert_eq!(manager.stats().total, 3);
-        assert!(manager.failed_tasks().is_empty());
+            manager.process_binaries(binaries, &mut factory).await;
 
-        // With always_restart_worker=true and 3 binaries with 1 worker:
-        // 1 initial spawn + 2 restarts (after "a" and "b" complete, "c" is the last so no restart)
-        let spawns = spawn_count.load(Ordering::SeqCst);
-        assert_eq!(spawns, 3, "expected 3 spawns (1 initial + 2 restarts), got {spawns}");
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
+
+            // With always_restart_worker=true and 3 binaries with 1 worker:
+            // 1 initial spawn + 2 restarts (after "a" and "b" complete, "c" is the last so no restart)
+            let spawns = spawn_count.load(Ordering::SeqCst);
+            assert_eq!(spawns, 3, "expected 3 spawns (1 initial + 2 restarts), got {spawns}");
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn memuse_log_written() {
-        let tmp_dir = std::env::temp_dir().join("rust_memuse_test");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-        let memuse_path = tmp_dir.join("memuse.log");
-        // Clean up any previous run
-        let _ = std::fs::remove_file(&memuse_path);
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let tmp_dir = std::env::temp_dir().join("rust_memuse_test");
+            let _ = std::fs::create_dir_all(&tmp_dir);
+            let memuse_path = tmp_dir.join("memuse.log");
+            // Clean up any previous run
+            let _ = std::fs::remove_file(&memuse_path);
 
-        let config = LocalManagerConfig {
-            num_workers: 1,
-            max_memory: 1024 * 1024 * 1024,
-            always_restart_worker: false,
-            print_pid: false,
-            memuse_log_path: Some(memuse_path.clone()),
-            stage_timeouts: HashMap::new(),
-        };
+            let config = LocalManagerConfig {
+                num_workers: 1,
+                max_memory: 1024 * 1024 * 1024,
+                always_restart_worker: false,
+                print_pid: false,
+                memuse_log_path: Some(memuse_path.clone()),
+                stage_timeouts: HashMap::new(),
+            };
 
-        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries = vec![
-            make_binary("a", 50),
-            make_binary("b", 60),
-        ];
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+            ];
 
-        manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await;
 
-        assert_eq!(manager.stats().completed, 2);
+            assert_eq!(manager.stats().completed, 2);
 
-        // Verify memuse.log was written
-        let contents = std::fs::read_to_string(&memuse_path).expect("memuse.log should exist");
-        let lines: Vec<&str> = contents.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 lines in memuse.log, got {}", lines.len());
+            // Verify memuse.log was written
+            let contents = std::fs::read_to_string(&memuse_path).expect("memuse.log should exist");
+            let lines: Vec<&str> = contents.lines().collect();
+            assert_eq!(lines.len(), 2, "expected 2 lines in memuse.log, got {}", lines.len());
 
-        // Each line: size,estimated,0,filename,status
-        assert!(lines[0].contains(",OK"), "first line should contain OK: {}", lines[0]);
-        assert!(lines[1].contains(",OK"), "second line should contain OK: {}", lines[1]);
+            // Each line: size,estimated,0,filename,status
+            assert!(lines[0].contains(",OK"), "first line should contain OK: {}", lines[0]);
+            assert!(lines[1].contains(",OK"), "second line should contain OK: {}", lines[1]);
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn non_recoverable_error_restarts_worker_and_continues() {
-        // Worker sends NonRecoverable on first task, succeeds on second.
-        // The worker should be restarted and the second task should succeed.
         use std::sync::atomic::{AtomicU32, Ordering};
         use std::sync::Arc;
-        use db_comm_api_base::{Command, CommandReceiver, ResponseSender};
-
-        let spawn_count = Arc::new(AtomicU32::new(0));
-        let spawn_count_clone = spawn_count.clone();
 
         struct RestartCountingFactory {
             spawn_count: Arc<AtomicU32>,
@@ -1414,17 +1375,17 @@ mod tests {
             fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
                 let count = self.spawn_count.fetch_add(1, Ordering::SeqCst);
                 let (manager_end, runner_end) = channel_pair();
-                tokio::spawn(async move {
+                tokio::task::spawn_local(async move {
                     let mut runner = runner_end;
-                    let _ = runner.send_response(Response::Ready).await;
+                    let _ = runner.send(Response::Ready).await;
                     loop {
-                        match runner.recv_command().await {
+                        match MessageReceiver::<Command>::recv(&mut runner).await {
                             Some(Command::Stop) => break,
                             Some(Command::ProcessBinary { .. }) => {
                                 if count == 0 {
                                     // First spawn: send NonRecoverable error (triggers disconnect)
                                     let _ = runner
-                                        .send_response(Response::Error {
+                                        .send(Response::Error {
                                             error_type: ErrorType::NonRecoverable,
                                             message: "crash".into(),
                                         })
@@ -1433,7 +1394,7 @@ mod tests {
                                 } else {
                                     // Restarted worker: succeed
                                     let _ = runner
-                                        .send_response(Response::Done {
+                                        .send(Response::Done {
                                             warnings: 0,
                                             filtered: 0,
                                         })
@@ -1448,48 +1409,57 @@ mod tests {
             }
         }
 
-        let config = test_config(1);
-        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = RestartCountingFactory {
-            spawn_count: spawn_count_clone,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let spawn_count_clone = spawn_count.clone();
 
-        let binaries = vec![
-            make_binary("crash_me", 50),
-            make_binary("succeed", 60),
-        ];
+            let config = test_config(1);
+            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = RestartCountingFactory {
+                spawn_count: spawn_count_clone,
+            };
 
-        manager.process_binaries(binaries, &mut factory).await;
+            let binaries = vec![
+                make_binary("crash_me", 50),
+                make_binary("succeed", 60),
+            ];
 
-        // First task: NonRecoverable -> fails, worker restarted
-        // Second task: succeeds on restarted worker
-        // Retry phase: first task retried on restarted worker and succeeds
-        assert_eq!(manager.stats().completed, 2, "both tasks should complete");
-        assert!(manager.oom_tasks().is_empty(), "no OOM tasks expected");
+            manager.process_binaries(binaries, &mut factory).await;
 
-        // At least 2 spawns: initial + restart after NonRecoverable
-        let spawns = spawn_count.load(Ordering::SeqCst);
-        assert!(spawns >= 2, "expected at least 2 spawns (initial + restart), got {spawns}");
+            // First task: NonRecoverable -> fails, worker restarted
+            // Second task: succeeds on restarted worker
+            // Retry phase: first task retried on restarted worker and succeeds
+            assert_eq!(manager.stats().completed, 2, "both tasks should complete");
+            assert!(manager.oom_tasks().is_empty(), "no OOM tasks expected");
+
+            // At least 2 spawns: initial + restart after NonRecoverable
+            let spawns = spawn_count.load(Ordering::SeqCst);
+            assert!(spawns >= 2, "expected at least 2 spawns (initial + restart), got {spawns}");
+        }).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn multiple_workers_with_mixed_results() {
-        // 2 workers, 6 binaries: worker 0 always succeeds, worker 1 first OOM then succeed
-        let config = test_config(2);
-        let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
-        let mut factory = FakeWorkerFactory {
-            mode: FakeWorkerMode::AlwaysSucceed,
-        };
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            // 2 workers, 6 binaries: worker 0 always succeeds, worker 1 first OOM then succeed
+            let config = test_config(2);
+            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
-            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
-            .collect();
+            let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
+                .collect();
 
-        manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await;
 
-        assert_eq!(manager.stats().completed, 6);
-        assert_eq!(manager.stats().total, 6);
-        assert!(manager.failed_tasks().is_empty());
-        assert!(manager.oom_tasks().is_empty());
+            assert_eq!(manager.stats().completed, 6);
+            assert_eq!(manager.stats().total, 6);
+            assert!(manager.failed_tasks().is_empty());
+            assert!(manager.oom_tasks().is_empty());
+        }).await;
     }
 }

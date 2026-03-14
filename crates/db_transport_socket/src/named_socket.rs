@@ -1,9 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use db_comm_api_base::{
-    Command, CommandReceiver, CommandSender, Response, ResponseReceiver, ResponseSender,
-};
-use db_manager_runner_comm::codec;
+use db_comm_api_base::{MessageReceiver, MessageSender};
+use db_manager_runner_comm::{Command, Response, codec};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -68,13 +66,13 @@ impl Drop for NamedSocketManagerEnd {
     }
 }
 
-impl CommandSender for NamedSocketManagerEnd {
-    async fn send_command(&mut self, command: Command) -> Result<(), String> {
+impl MessageSender<Command> for NamedSocketManagerEnd {
+    async fn send(&mut self, msg: Command) -> Result<(), String> {
         let conn = self
             .connection
             .as_mut()
             .ok_or_else(|| "No connection established".to_owned())?;
-        let bytes = codec::serialize_command(&command);
+        let bytes = codec::serialize_command(&msg);
         conn.writer
             .write_all(&bytes)
             .await
@@ -83,46 +81,17 @@ impl CommandSender for NamedSocketManagerEnd {
     }
 }
 
-impl ResponseReceiver for NamedSocketManagerEnd {
-    async fn recv_responses(&mut self) -> Vec<Response> {
-        let conn = match self.connection.as_mut() {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-
-        let mut responses = Vec::new();
+impl MessageReceiver<Response> for NamedSocketManagerEnd {
+    async fn recv(&mut self) -> Option<Response> {
+        let conn = self.connection.as_mut()?;
         let mut line = String::new();
-
         match conn.reader.read_line(&mut line).await {
-            Ok(0) => return responses,
-            Ok(_) => {
-                if let Some(resp) = codec::parse_response(&line) {
-                    responses.push(resp);
-                }
-            }
-            Err(_) => return responses,
+            Ok(0) => None,
+            Ok(_) => codec::parse_response(&line),
+            Err(_) => None,
         }
-
-        // Drain buffered
-        loop {
-            line.clear();
-            let buf = conn.reader.buffer();
-            if buf.is_empty() || !buf.contains(&b'\n') {
-                break;
-            }
-            match conn.reader.read_line(&mut line).await {
-                Ok(0) => break,
-                Ok(_) => {
-                    if let Some(resp) = codec::parse_response(&line) {
-                        responses.push(resp);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        responses
     }
+
 }
 
 /// Runner-side transport that connects to a named Unix domain socket.
@@ -143,8 +112,8 @@ impl NamedSocketRunnerEnd {
     }
 }
 
-impl CommandReceiver for NamedSocketRunnerEnd {
-    async fn recv_command(&mut self) -> Option<Command> {
+impl MessageReceiver<Command> for NamedSocketRunnerEnd {
+    async fn recv(&mut self) -> Option<Command> {
         let mut line = String::new();
         match self.reader.read_line(&mut line).await {
             Ok(0) => None,
@@ -154,9 +123,9 @@ impl CommandReceiver for NamedSocketRunnerEnd {
     }
 }
 
-impl ResponseSender for NamedSocketRunnerEnd {
-    async fn send_response(&mut self, response: Response) -> Result<(), String> {
-        let bytes = codec::serialize_response(&response);
+impl MessageSender<Response> for NamedSocketRunnerEnd {
+    async fn send(&mut self, msg: Response) -> Result<(), String> {
+        let bytes = codec::serialize_response(&msg);
         self.writer
             .write_all(&bytes)
             .await
@@ -169,8 +138,10 @@ impl ResponseSender for NamedSocketRunnerEnd {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn named_socket_roundtrip() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
         let dir = std::env::temp_dir().join(format!("db_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock_path = dir.join("test.sock");
@@ -179,19 +150,19 @@ mod tests {
 
         // Spawn a runner that connects
         let sock_path_clone = sock_path.clone();
-        let runner_handle = tokio::spawn(async move {
+        let runner_handle = tokio::task::spawn_local(async move {
             let mut runner = NamedSocketRunnerEnd::connect(&sock_path_clone).await.unwrap();
 
             // Send Ready
-            runner.send_response(Response::Ready).await.unwrap();
+            runner.send(Response::Ready).await.unwrap();
 
             // Receive command
-            let cmd = runner.recv_command().await.unwrap();
+            let cmd = runner.recv().await.unwrap();
             assert!(matches!(cmd, Command::ProcessBinary { .. }));
 
             // Send Done
             runner
-                .send_response(Response::Done {
+                .send(Response::Done {
                     warnings: 5,
                     filtered: 3,
                 })
@@ -203,25 +174,23 @@ mod tests {
         manager.accept().await.unwrap();
 
         // Receive Ready
-        let responses = manager.recv_responses().await;
-        assert_eq!(responses.len(), 1);
-        assert!(matches!(responses[0], Response::Ready));
+        let resp = manager.recv().await.unwrap();
+        assert!(matches!(resp, Response::Ready));
 
         // Send command
         manager
-            .send_command(Command::ProcessBinary {
+            .send(Command::ProcessBinary {
                 relative_path: "x/y".into(),
             })
             .await
             .unwrap();
 
         // Receive Done
-        let responses = manager.recv_responses().await;
-        assert_eq!(responses.len(), 1);
-        match &responses[0] {
+        let resp = manager.recv().await.unwrap();
+        match resp {
             Response::Done { warnings, filtered } => {
-                assert_eq!(*warnings, 5);
-                assert_eq!(*filtered, 3);
+                assert_eq!(warnings, 5);
+                assert_eq!(filtered, 3);
             }
             _ => panic!("expected Done"),
         }
@@ -230,5 +199,6 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
+        }).await;
     }
 }

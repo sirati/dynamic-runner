@@ -17,7 +17,7 @@ from shared import setup_file_logger
 from ..binary_info import BinaryInfo
 from ..comm import ErrorType
 from ..models import FailedTask, TaskResult
-from ..processing_phases import process_oom_phase, process_retry_phase, process_unassigned_phase
+from ..processing_phases import process_retry_phase
 from ..task import TaskDefinition
 from ..worker.base_worker import BaseWorker
 

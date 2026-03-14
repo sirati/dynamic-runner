@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::process;
 
 use db_comm_api_base::{
-    BinaryInfo, Command, CommandSender, MemoryBytes, Response, ResponseReceiver, WorkerId,
+    BinaryInfo, MemoryBytes, MessageReceiver, MessageSender, WorkerId,
 };
+use db_manager_runner_comm::{Command, Response};
 use serde::{Deserialize, Serialize};
 use db_local_manager::{LocalManager, LocalManagerConfig, WorkerFactory};
 use db_scheduler_api::MemoryEstimator;
@@ -106,50 +107,52 @@ fn worker_module_dir() -> PathBuf {
     manifest_dir.join("tests")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn single_worker_subprocess_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let worker_dir = worker_module_dir();
+        let tmp_dir = std::env::temp_dir().join("rust_integ_test_single");
+        let _ = std::fs::create_dir_all(&tmp_dir);
 
-    let worker_dir = worker_module_dir();
-    let tmp_dir = std::env::temp_dir().join("rust_integ_test_single");
-    let _ = std::fs::create_dir_all(&tmp_dir);
+        let config = LocalManagerConfig {
+            num_workers: 1,
+            max_memory: 1024 * 1024 * 1024,
+            always_restart_worker: false,
+            print_pid: false,
+            memuse_log_path: None,
+            stage_timeouts: std::collections::HashMap::new(),
+        };
 
-    let config = LocalManagerConfig {
-        num_workers: 1,
-        max_memory: 1024 * 1024 * 1024,
-        always_restart_worker: false,
-        print_pid: false,
-        memuse_log_path: None,
-        stage_timeouts: std::collections::HashMap::new(),
-    };
+        let mut factory = PythonWorkerFactory {
+            worker_module_dir: worker_dir,
+            source_dir: tmp_dir.clone(),
+            output_dir: tmp_dir.clone(),
+            children: Vec::new(),
+        };
 
-    let mut factory = PythonWorkerFactory {
-        worker_module_dir: worker_dir,
-        source_dir: tmp_dir.clone(),
-        output_dir: tmp_dir.clone(),
-        children: Vec::new(),
-    };
+        let binaries = vec![
+            make_binary("a.bin", 100),
+            make_binary("b.bin", 200),
+            make_binary("c.bin", 300),
+        ];
 
-    let binaries = vec![
-        make_binary("a.bin", 100),
-        make_binary("b.bin", 200),
-        make_binary("c.bin", 300),
-    ];
+        let mut manager = LocalManager::new(
+            config,
+            MemoryStealingScheduler,
+            FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
+        );
 
-    let mut manager = LocalManager::new(
-        config,
-        MemoryStealingScheduler,
-        FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
-    );
+        manager.process_binaries(binaries, &mut factory).await;
 
-    manager.process_binaries(binaries, &mut factory).await;
+        assert_eq!(manager.stats().completed, 3);
+        assert_eq!(manager.stats().total, 3);
+        assert!(manager.failed_tasks().is_empty());
+        assert!(manager.oom_tasks().is_empty());
 
-    assert_eq!(manager.stats().completed, 3);
-    assert_eq!(manager.stats().total, 3);
-    assert!(manager.failed_tasks().is_empty());
-    assert!(manager.oom_tasks().is_empty());
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }).await;
 }
 
 // ── Named socket integration tests ──
@@ -164,35 +167,35 @@ enum EitherManagerEnd {
     },
 }
 
-impl CommandSender for EitherManagerEnd {
-    async fn send_command(&mut self, command: Command) -> Result<(), String> {
+impl MessageSender<Command> for EitherManagerEnd {
+    async fn send(&mut self, msg: Command) -> Result<(), String> {
         match self {
-            EitherManagerEnd::Socketpair(s) => s.send_command(command).await,
+            EitherManagerEnd::Socketpair(s) => s.send(msg).await,
             EitherManagerEnd::Named { inner, accepted } => {
                 if !*accepted {
                     return Err("Named socket: not yet accepted".into());
                 }
-                inner.send_command(command).await
+                inner.send(msg).await
             }
         }
     }
 }
 
-impl ResponseReceiver for EitherManagerEnd {
-    async fn recv_responses(&mut self) -> Vec<Response> {
+impl MessageReceiver<Response> for EitherManagerEnd {
+    async fn recv(&mut self) -> Option<Response> {
         match self {
-            EitherManagerEnd::Socketpair(s) => s.recv_responses().await,
+            EitherManagerEnd::Socketpair(s) => s.recv().await,
             EitherManagerEnd::Named { inner, accepted } => {
                 if !*accepted {
                     match inner.accept().await {
                         Ok(()) => *accepted = true,
                         Err(e) => {
                             eprintln!("named socket accept failed: {e}");
-                            return Vec::new();
+                            return None;
                         }
                     }
                 }
-                inner.recv_responses().await
+                inner.recv().await
             }
         }
     }
@@ -259,140 +262,146 @@ impl Drop for NamedSocketWorkerFactory {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn single_worker_named_socket_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let worker_dir = worker_module_dir();
+        let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_{}", process::id()));
+        let socket_dir = tmp_dir.join("sockets");
+        let _ = std::fs::create_dir_all(&socket_dir);
 
-    let worker_dir = worker_module_dir();
-    let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_{}", process::id()));
-    let socket_dir = tmp_dir.join("sockets");
-    let _ = std::fs::create_dir_all(&socket_dir);
+        let config = LocalManagerConfig {
+            num_workers: 1,
+            max_memory: 1024 * 1024 * 1024,
+            always_restart_worker: false,
+            print_pid: false,
+            memuse_log_path: None,
+            stage_timeouts: std::collections::HashMap::new(),
+        };
 
-    let config = LocalManagerConfig {
-        num_workers: 1,
-        max_memory: 1024 * 1024 * 1024,
-        always_restart_worker: false,
-        print_pid: false,
-        memuse_log_path: None,
-        stage_timeouts: std::collections::HashMap::new(),
-    };
+        let mut factory = NamedSocketWorkerFactory {
+            worker_module_dir: worker_dir,
+            source_dir: tmp_dir.clone(),
+            output_dir: tmp_dir.clone(),
+            socket_dir,
+            children: Vec::new(),
+        };
 
-    let mut factory = NamedSocketWorkerFactory {
-        worker_module_dir: worker_dir,
-        source_dir: tmp_dir.clone(),
-        output_dir: tmp_dir.clone(),
-        socket_dir,
-        children: Vec::new(),
-    };
+        let binaries = vec![
+            make_binary("a.bin", 100),
+            make_binary("b.bin", 200),
+            make_binary("c.bin", 300),
+        ];
 
-    let binaries = vec![
-        make_binary("a.bin", 100),
-        make_binary("b.bin", 200),
-        make_binary("c.bin", 300),
-    ];
+        let mut manager = LocalManager::new(
+            config,
+            MemoryStealingScheduler,
+            FixedEstimator(50 * 1024 * 1024),
+        );
 
-    let mut manager = LocalManager::new(
-        config,
-        MemoryStealingScheduler,
-        FixedEstimator(50 * 1024 * 1024),
-    );
+        manager.process_binaries(binaries, &mut factory).await;
 
-    manager.process_binaries(binaries, &mut factory).await;
+        assert_eq!(manager.stats().completed, 3);
+        assert_eq!(manager.stats().total, 3);
+        assert!(manager.failed_tasks().is_empty());
+        assert!(manager.oom_tasks().is_empty());
 
-    assert_eq!(manager.stats().completed, 3);
-    assert_eq!(manager.stats().total, 3);
-    assert!(manager.failed_tasks().is_empty());
-    assert!(manager.oom_tasks().is_empty());
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn multi_worker_named_socket_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let worker_dir = worker_module_dir();
+        let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_multi_{}", process::id()));
+        let socket_dir = tmp_dir.join("sockets");
+        let _ = std::fs::create_dir_all(&socket_dir);
 
-    let worker_dir = worker_module_dir();
-    let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_multi_{}", process::id()));
-    let socket_dir = tmp_dir.join("sockets");
-    let _ = std::fs::create_dir_all(&socket_dir);
+        let config = LocalManagerConfig {
+            num_workers: 3,
+            max_memory: 2 * 1024 * 1024 * 1024,
+            always_restart_worker: false,
+            print_pid: false,
+            memuse_log_path: None,
+            stage_timeouts: std::collections::HashMap::new(),
+        };
 
-    let config = LocalManagerConfig {
-        num_workers: 3,
-        max_memory: 2 * 1024 * 1024 * 1024,
-        always_restart_worker: false,
-        print_pid: false,
-        memuse_log_path: None,
-        stage_timeouts: std::collections::HashMap::new(),
-    };
+        let mut factory = NamedSocketWorkerFactory {
+            worker_module_dir: worker_dir,
+            source_dir: tmp_dir.clone(),
+            output_dir: tmp_dir.clone(),
+            socket_dir,
+            children: Vec::new(),
+        };
 
-    let mut factory = NamedSocketWorkerFactory {
-        worker_module_dir: worker_dir,
-        source_dir: tmp_dir.clone(),
-        output_dir: tmp_dir.clone(),
-        socket_dir,
-        children: Vec::new(),
-    };
+        let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
+            .collect();
 
-    let binaries: Vec<BinaryInfo<TestId>> = (0..8)
-        .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
-        .collect();
+        let mut manager = LocalManager::new(
+            config,
+            MemoryStealingScheduler,
+            FixedEstimator(50 * 1024 * 1024),
+        );
 
-    let mut manager = LocalManager::new(
-        config,
-        MemoryStealingScheduler,
-        FixedEstimator(50 * 1024 * 1024),
-    );
+        manager.process_binaries(binaries, &mut factory).await;
 
-    manager.process_binaries(binaries, &mut factory).await;
+        assert_eq!(manager.stats().completed, 8);
+        assert_eq!(manager.stats().total, 8);
+        assert!(manager.failed_tasks().is_empty());
+        assert!(manager.oom_tasks().is_empty());
 
-    assert_eq!(manager.stats().completed, 8);
-    assert_eq!(manager.stats().total, 8);
-    assert!(manager.failed_tasks().is_empty());
-    assert!(manager.oom_tasks().is_empty());
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn multi_worker_subprocess_processes_all() {
     let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let worker_dir = worker_module_dir();
+        let tmp_dir = std::env::temp_dir().join("rust_integ_test_multi");
+        let _ = std::fs::create_dir_all(&tmp_dir);
 
-    let worker_dir = worker_module_dir();
-    let tmp_dir = std::env::temp_dir().join("rust_integ_test_multi");
-    let _ = std::fs::create_dir_all(&tmp_dir);
+        let config = LocalManagerConfig {
+            num_workers: 3,
+            max_memory: 2 * 1024 * 1024 * 1024,
+            always_restart_worker: false,
+            print_pid: false,
+            memuse_log_path: None,
+            stage_timeouts: std::collections::HashMap::new(),
+        };
 
-    let config = LocalManagerConfig {
-        num_workers: 3,
-        max_memory: 2 * 1024 * 1024 * 1024,
-        always_restart_worker: false,
-        print_pid: false,
-        memuse_log_path: None,
-        stage_timeouts: std::collections::HashMap::new(),
-    };
+        let mut factory = PythonWorkerFactory {
+            worker_module_dir: worker_dir,
+            source_dir: tmp_dir.clone(),
+            output_dir: tmp_dir.clone(),
+            children: Vec::new(),
+        };
 
-    let mut factory = PythonWorkerFactory {
-        worker_module_dir: worker_dir,
-        source_dir: tmp_dir.clone(),
-        output_dir: tmp_dir.clone(),
-        children: Vec::new(),
-    };
+        let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+            .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
+            .collect();
 
-    let binaries: Vec<BinaryInfo<TestId>> = (0..8)
-        .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
-        .collect();
+        let mut manager = LocalManager::new(
+            config,
+            MemoryStealingScheduler,
+            FixedEstimator(50 * 1024 * 1024),
+        );
 
-    let mut manager = LocalManager::new(
-        config,
-        MemoryStealingScheduler,
-        FixedEstimator(50 * 1024 * 1024),
-    );
+        manager.process_binaries(binaries, &mut factory).await;
 
-    manager.process_binaries(binaries, &mut factory).await;
+        assert_eq!(manager.stats().completed, 8);
+        assert_eq!(manager.stats().total, 8);
+        assert!(manager.failed_tasks().is_empty());
+        assert!(manager.oom_tasks().is_empty());
 
-    assert_eq!(manager.stats().completed, 8);
-    assert_eq!(manager.stats().total, 8);
-    assert!(manager.failed_tasks().is_empty());
-    assert!(manager.oom_tasks().is_empty());
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }).await;
 }
