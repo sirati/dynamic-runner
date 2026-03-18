@@ -889,7 +889,7 @@ class SecondaryMode:
             return
 
         # Assign to worker via ActualSubmissiveWorkerManager
-        success = self.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
+        success = self.worker_manager.assign_task_from_authoritative(worker_id, binary_info, estimated_memory)
         if success:
             logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
         else:
@@ -1056,7 +1056,7 @@ class SecondaryMode:
                 continue
 
             # Assign to worker via ActualSubmissiveWorkerManager
-            success = self.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
+            success = self.worker_manager.assign_task_from_authoritative(worker_id, binary_info, estimated_memory)
 
             opp_str = " (opportunistic)" if opportunistic else ""
             if success:

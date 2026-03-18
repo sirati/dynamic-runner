@@ -240,7 +240,7 @@ def main():
     parser.add_argument(
         "--test-master-slave",
         action="store_true",
-        help="Test master/slave architecture locally without networking (uses local_submissive and local_authoritive)",
+        help="Test master/slave architecture locally without networking (uses local_submissive and local_authoritative)",
     )
 
     parser.add_argument(
@@ -868,7 +868,7 @@ def main():
             logger.info("=" * 60)
             logger.info("TEST MASTER-SLAVE NETWORK SIMULATION")
             logger.info("=" * 60)
-            logger.info("Testing submissive/authoritive coordination via network message queues")
+            logger.info("Testing submissive/authoritative coordination via network message queues")
             logger.info("")
 
             # Run network simulation test (message queues)
@@ -935,16 +935,16 @@ def main():
             logger.info("=" * 60)
             logger.info("TEST MASTER-SLAVE MODE (Local)")
             logger.info("=" * 60)
-            logger.info("Using local_submissive + local_authoritive architecture")
+            logger.info("Using local_submissive + local_authoritative architecture")
             logger.info("")
 
             # Create submissive manager
             def request_task_callback(worker_id: int) -> None:
-                """Callback for submissive to request tasks from authoritive."""
-                result = authoritive_manager.handle_task_request(worker_id)
+                """Callback for submissive to request tasks from authoritative."""
+                result = authoritative_manager.handle_task_request(worker_id)
                 if result:
                     binary, estimated_memory = result
-                    submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+                    submissive_manager.assign_task_from_authoritative(worker_id, binary, estimated_memory)
 
             submissive_manager = ActualSubmissiveWorkerManager(
                 num_workers=num_cores,
@@ -960,11 +960,11 @@ def main():
                 socket_dir=Path(args.socket_dir) if args.socket_dir else None,
             )
 
-            # Initialize workers in submissive manager before creating authoritive
+            # Initialize workers in submissive manager before creating authoritative
             submissive_manager.initialize_workers_only()
 
-            # Create authoritive manager with the submissive's workers
-            authoritive_manager = ActualAuthoritativeWorkerManager(
+            # Create authoritative manager with the submissive's workers
+            authoritative_manager = ActualAuthoritativeWorkerManager(
                 num_workers=num_cores,
                 max_memory=max_memory,
                 log_dir=config.output_dir,
@@ -973,10 +973,10 @@ def main():
             )
 
             # Set pending binaries and run processing through authoritative manager
-            authoritive_manager.pending_binaries = sorted_binaries.copy()
-            authoritive_manager.stats["total"] = len(sorted_binaries)
-            authoritive_manager.stats["completed"] = 0
-            authoritive_manager.stats["errored"] = 0
+            authoritative_manager.pending_binaries = sorted_binaries.copy()
+            authoritative_manager.stats["total"] = len(sorted_binaries)
+            authoritative_manager.stats["completed"] = 0
+            authoritative_manager.stats["errored"] = 0
 
             # Log start
             start_msg = f"Starting {num_cores} workers with {max_memory / (1024**3):.2f}GB memory limit"
@@ -985,15 +985,15 @@ def main():
             logger.info(process_msg)
 
             # Run the processing phases through authoritative (which coordinates with submissive)
-            authoritive_manager._initialize_workers()
-            authoritive_manager._run_initial_assignments()
-            authoritive_manager._run_main_phase()
-            authoritive_manager._run_retry_phase()
-            authoritive_manager._run_oom_phase()
-            authoritive_manager._run_unassigned_phase()
+            authoritative_manager._initialize_workers()
+            authoritative_manager._run_initial_assignments()
+            authoritative_manager._run_main_phase()
+            authoritative_manager._run_retry_phase()
+            authoritative_manager._run_oom_phase()
+            authoritative_manager._run_unassigned_phase()
 
             # Stop workers
-            for worker in authoritive_manager.workers:
+            for worker in authoritative_manager.workers:
                 if worker.is_alive():
                     try:
                         worker.terminate()

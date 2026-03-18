@@ -251,7 +251,7 @@ class TaskHandler:
             return
 
         # Assign to worker via ActualSubmissiveWorkerManager
-        success = self.coordinator.worker_manager.assign_task_from_authoritive(worker_id, binary_info, estimated_memory)
+        success = self.coordinator.worker_manager.assign_task_from_authoritative(worker_id, binary_info, estimated_memory)
         if success:
             logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
         else:
@@ -402,7 +402,7 @@ class TaskHandler:
                 continue
 
             # Assign to worker via ActualSubmissiveWorkerManager
-            success = self.coordinator.worker_manager.assign_task_from_authoritive(
+            success = self.coordinator.worker_manager.assign_task_from_authoritative(
                 worker_id, binary_info, estimated_memory
             )
 

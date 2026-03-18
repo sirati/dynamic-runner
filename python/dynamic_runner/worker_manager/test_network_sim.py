@@ -1,12 +1,12 @@
-"""Network simulation test for submissive/authoritive coordination.
+"""Network simulation test for submissive/authoritative coordination.
 
-This test verifies that remote submissive/authoritive managers behave identically
+This test verifies that remote submissive/authoritative managers behave identically
 to local ones by simulating network communication using the existing multi-computer
 protocol messages (TaskRequestMessage, TaskAssignmentMessage).
 
 The test creates:
-1. Local submissive + local authoritive (--test-master-slave baseline)
-2. Simulated network with message queues between submissive and authoritive
+1. Local submissive + local authoritative (--test-master-slave baseline)
+2. Simulated network with message queues between submissive and authoritative
 
 Both should produce identical results.
 """
@@ -30,14 +30,14 @@ logger = logging.getLogger(__name__)
 class NetworkSimulator:
     """Simulates network communication using queues and protocol messages.
 
-    This simulator routes messages between submissive and authoritive managers
+    This simulator routes messages between submissive and authoritative managers
     using the existing multi-computer protocol (TaskRequestMessage, TaskAssignmentMessage).
     """
 
     def __init__(self):
         # Message queues (thread-safe for blocking operations)
-        self.submissive_to_authoritive: Queue = Queue()
-        self.authoritive_to_submissive: Queue = Queue()
+        self.submissive_to_authoritative: Queue = Queue()
+        self.authoritative_to_submissive: Queue = Queue()
 
         # Statistics
         self.messages_sent = 0
@@ -45,7 +45,7 @@ class NetworkSimulator:
         self.task_assignments = 0
 
     def send_task_request(self, worker_id: int) -> None:
-        """Submissive sends task request to authoritive."""
+        """Submissive sends task request to authoritative."""
         msg = TaskRequestMessage(
             sender_id="submissive-0",
             timestamp=time.time(),
@@ -53,15 +53,15 @@ class NetworkSimulator:
             worker_id=worker_id,
             available_memory=0,  # Not used in local case
         )
-        self.submissive_to_authoritive.put(msg)
+        self.submissive_to_authoritative.put(msg)
         self.messages_sent += 1
         self.task_requests += 1
         logger.info(f"[NetSim] Task request: worker {worker_id}")
 
     def send_task_assignment(self, worker_id: int, binary: BinaryInfo, estimated_memory: int) -> None:
-        """Authoritive sends task assignment to submissive."""
+        """Authoritative sends task assignment to submissive."""
         msg = TaskAssignmentMessage(
-            sender_id="authoritive-0",
+            sender_id="authoritative-0",
             timestamp=time.time(),
             secondary_id="submissive-0",
             worker_id=worker_id,
@@ -83,22 +83,22 @@ class NetworkSimulator:
         msg._binary_obj = binary
         msg._estimated_memory = estimated_memory
 
-        self.authoritive_to_submissive.put(msg)
+        self.authoritative_to_submissive.put(msg)
         self.messages_sent += 1
         self.task_assignments += 1
         logger.info(f"[NetSim] Task assignment: worker {worker_id} -> {binary.path.name}")
 
     def get_task_request(self) -> TaskRequestMessage | None:
-        """Authoritive receives task request from submissive (non-blocking)."""
-        if self.submissive_to_authoritive.empty():
+        """Authoritative receives task request from submissive (non-blocking)."""
+        if self.submissive_to_authoritative.empty():
             return None
-        return self.submissive_to_authoritive.get_nowait()
+        return self.submissive_to_authoritative.get_nowait()
 
     def get_task_assignment(self) -> TaskAssignmentMessage | None:
-        """Submissive receives task assignment from authoritive (non-blocking)."""
-        if self.authoritive_to_submissive.empty():
+        """Submissive receives task assignment from authoritative (non-blocking)."""
+        if self.authoritative_to_submissive.empty():
             return None
-        return self.authoritive_to_submissive.get_nowait()
+        return self.authoritative_to_submissive.get_nowait()
 
     def print_stats(self) -> None:
         """Print simulation statistics."""
@@ -170,14 +170,14 @@ class NetworkSimulatedSubmissiveManager(ActualSubmissiveWorkerManager):
 
             # Apply the assignment locally
             logger.info(f"[NetSim-Sub] Processing assignment for worker {worker_id}: {binary.path.name}")
-            self.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+            self.assign_task_from_authoritative(worker_id, binary, estimated_memory)
 
         if processed > 0:
             logger.info(f"[NetSim-Sub] Processed {processed} assignment messages")
 
 
-class NetworkSimulatedAuthoritiveManager(ActualAuthoritativeWorkerManager):
-    """Authoritive manager that communicates via network simulator.
+class NetworkSimulatedAuthoritativeManager(ActualAuthoritativeWorkerManager):
+    """Authoritative manager that communicates via network simulator.
 
     This wraps ActualAuthoritativeWorkerManager and intercepts task assignments,
     sending them through the network simulator instead of direct callbacks.
@@ -245,20 +245,20 @@ def run_baseline_test(
     num_cores: int,
     max_memory: int,
 ) -> dict[str, Any]:
-    """Run baseline test with direct local submissive + authoritive.
+    """Run baseline test with direct local submissive + authoritative.
 
     This is the --test-master-slave mode.
     """
     logger.info("=" * 60)
-    logger.info("BASELINE: Direct Local Submissive + Authoritive")
+    logger.info("BASELINE: Direct Local Submissive + Authoritative")
     logger.info("=" * 60)
 
     # Create submissive manager
     def request_task_callback(worker_id: int) -> None:
-        result = authoritive_manager.handle_task_request(worker_id)
+        result = authoritative_manager.handle_task_request(worker_id)
         if result:
             binary, estimated_memory = result
-            submissive_manager.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+            submissive_manager.assign_task_from_authoritative(worker_id, binary, estimated_memory)
 
     submissive_manager = ActualSubmissiveWorkerManager(
         num_workers=num_cores,
@@ -271,8 +271,8 @@ def run_baseline_test(
         request_task_callback=request_task_callback,
     )
 
-    # Create authoritive manager
-    authoritive_manager = ActualAuthoritativeWorkerManager(
+    # Create authoritative manager
+    authoritative_manager = ActualAuthoritativeWorkerManager(
         num_workers=num_cores,
         max_memory=max_memory,
         log_dir=output_dir,
@@ -304,7 +304,7 @@ def run_network_sim_test(
     This is the --test-master-slave-netsim mode.
     """
     logger.info("=" * 60)
-    logger.info("NETWORK SIM: Submissive + Authoritive via Message Queues")
+    logger.info("NETWORK SIM: Submissive + Authoritative via Message Queues")
     logger.info("=" * 60)
 
     # Create network simulator
@@ -322,8 +322,8 @@ def run_network_sim_test(
         network_sim=network_sim,
     )
 
-    # Create network-simulated authoritive manager
-    authoritive_manager = NetworkSimulatedAuthoritiveManager(
+    # Create network-simulated authoritative manager
+    authoritative_manager = NetworkSimulatedAuthoritativeManager(
         num_workers=num_cores,
         max_memory=max_memory,
         log_dir=output_dir,
@@ -333,7 +333,7 @@ def run_network_sim_test(
     )
 
     # Link them together
-    authoritive_manager.network_submissive_manager = submissive_manager
+    authoritative_manager.network_submissive_manager = submissive_manager
 
     # Override the worker loop to process network messages
     original_process_loop = submissive_manager._process_worker_loop
@@ -346,14 +346,14 @@ def run_network_sim_test(
     ) -> None:
         # Process any pending network messages before the worker loop iteration
         submissive_manager.process_network_messages()
-        authoritive_manager.process_network_messages()
+        authoritative_manager.process_network_messages()
 
         # Call original worker loop
         original_process_loop(active_workers, allow_stop, on_failure_increment_failed, is_initial_phase)
 
         # Process network messages after the worker loop iteration
         submissive_manager.process_network_messages()
-        authoritive_manager.process_network_messages()
+        authoritative_manager.process_network_messages()
 
     # Monkey-patch the process loop
     submissive_manager._process_worker_loop = network_aware_process_loop

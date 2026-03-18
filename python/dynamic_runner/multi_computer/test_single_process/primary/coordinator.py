@@ -2,7 +2,7 @@
 
 This coordinator runs primary and secondary in the same async context, using
 Python message passing (asyncio queues) instead of network communication.
-Worker managers use direct local_submissive to local_authoritive connection.
+Worker managers use direct local_submissive to local_authoritative connection.
 
 IMPORTANT: This coordinator follows the proper multi-computer protocol:
 1. Prepare (create secondaries)
@@ -10,7 +10,7 @@ IMPORTANT: This coordinator follows the proper multi-computer protocol:
 3. Initial assignment (via _initial_assignment_phase)
 4. File transfer (paths only, no actual transfer)
 5. Notify transfer complete
-6. Promote primary (one secondary becomes authoritive)
+6. Promote primary (one secondary becomes authoritative)
 7. Send full task list
 8. Monitor mode (workers process, request tasks dynamically)
 """
@@ -33,7 +33,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
     """Single-process primary coordinator.
 
     Runs primary and secondary in same async context with message passing.
-    Uses local_submissive + local_authoritive for worker management.
+    Uses local_submissive + local_authoritative for worker management.
     Follows the proper multi-computer protocol for testing.
     """
 
@@ -61,9 +61,9 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
 
         # Worker managers
         self.submissive_managers: list[ActualSubmissiveWorkerManager] = []
-        self.authoritive_manager: ActualAuthoritativeWorkerManager | None = None
+        self.authoritative_manager: ActualAuthoritativeWorkerManager | None = None
 
-        # Track which secondary is promoted to authoritive
+        # Track which secondary is promoted to authoritative
         self.promoted_secondary_id: str | None = None
 
     async def prepare(self, num_secondaries: int, quic_port: int) -> PreparationResult:
@@ -101,8 +101,8 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
 
             logger.info(f"Created submissive manager for {secondary_id} with {self.num_workers_per_secondary} workers")
 
-        # Create authoritive manager that manages all submissive managers
-        self.authoritive_manager = ActualAuthoritativeWorkerManager(
+        # Create authoritative manager that manages all submissive managers
+        self.authoritative_manager = ActualAuthoritativeWorkerManager(
             num_workers=total_workers,
             max_memory=16 * 1024 * 1024 * 1024 * num_secondaries,
             log_dir=self.output_dir,
@@ -110,22 +110,22 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
             submissive_managers=self.submissive_managers,
         )
 
-        logger.info(f"Created authoritive manager for {total_workers} total workers")
+        logger.info(f"Created authoritative manager for {total_workers} total workers")
 
-        # Set up callbacks for each submissive to request from authoritive
+        # Set up callbacks for each submissive to request from authoritative
         for i, submissive in enumerate(self.submissive_managers):
             secondary_id = f"secondary-{i}"
 
             # Use default parameter to capture values in closure
             def make_callback(sec_id: str = secondary_id, sec_idx: int = i):
                 def callback(worker_id: int):
-                    # Request task from authoritive manager
+                    # Request task from authoritative manager
                     global_worker_id = self._get_global_worker_id(sec_id, worker_id)
-                    result = self.authoritive_manager.handle_task_request(global_worker_id)
+                    result = self.authoritative_manager.handle_task_request(global_worker_id)
                     if result:
                         binary, estimated_memory = result
                         submissive_for_sec = self.submissive_managers[sec_idx]
-                        submissive_for_sec.assign_task_from_authoritive(worker_id, binary, estimated_memory)
+                        submissive_for_sec.assign_task_from_authoritative(worker_id, binary, estimated_memory)
 
                 return callback
 
@@ -186,7 +186,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
     async def transfer_files(self, conn_result: ConnectionResult) -> None:
         """Transfer files phase - for single-process, just copy initial assignments.
 
-        In single-process mode, we copy the initial assignments from the authoritive
+        In single-process mode, we copy the initial assignments from the authoritative
         manager's workers to the submissive managers' workers. No actual file transfer
         is needed since they share the same filesystem.
 
@@ -200,19 +200,19 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
         """
         logger.info("Phase 4: File transfer (single-process - copying assignments)")
 
-        # The authoritive manager has already done initial assignments
+        # The authoritative manager has already done initial assignments
         # Now we copy those assignments to the submissive workers
         for i, submissive in enumerate(self.submissive_managers):
             base_worker_id = i * self.num_workers_per_secondary
             for local_worker_id in range(len(submissive.workers)):
                 global_worker_id = base_worker_id + local_worker_id
-                if global_worker_id >= len(self.authoritive_manager.workers):
+                if global_worker_id >= len(self.authoritative_manager.workers):
                     continue
 
-                auth_worker = self.authoritive_manager.workers[global_worker_id]
+                auth_worker = self.authoritative_manager.workers[global_worker_id]
                 sub_worker = submissive.workers[local_worker_id]
 
-                # Copy assignment from authoritive to submissive
+                # Copy assignment from authoritative to submissive
                 if auth_worker.current_binary is not None:
                     sub_worker.current_binary = auth_worker.current_binary
                     sub_worker.estimated_memory = auth_worker.estimated_memory
@@ -230,9 +230,9 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
         return FileTransferMode.SKIP_TRANSFER
 
     async def _preliminary_assignment(self) -> None:
-        """Perform preliminary assignment using existing authoritive manager.
+        """Perform preliminary assignment using existing authoritative manager.
 
-        Override base implementation to use the authoritive manager we already created
+        Override base implementation to use the authoritative manager we already created
         in prepare() instead of creating new ActualAuthoritativeWorkerManager instances.
         """
         logger.info("Phase 5: Preliminary assignment (single-process)")
@@ -245,11 +245,11 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
             logger.warning("No binaries to assign")
             return
 
-        # Use the existing authoritive manager we created
+        # Use the existing authoritative manager we created
         # Populate pending_binaries and perform initial assignment
-        self.authoritive_manager.pending_binaries = self.binaries.copy()
-        self.authoritive_manager._initialize_workers()
-        self.authoritive_manager._run_initial_assignments()
+        self.authoritative_manager.pending_binaries = self.binaries.copy()
+        self.authoritative_manager._initialize_workers()
+        self.authoritative_manager._run_initial_assignments()
 
         # Track assignments in task_assignments for protocol compatibility
         for i, submissive in enumerate(self.submissive_managers):
@@ -259,10 +259,10 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
 
             for local_worker_id in range(len(submissive.workers)):
                 global_worker_id = base_worker_id + local_worker_id
-                if global_worker_id >= len(self.authoritive_manager.workers):
+                if global_worker_id >= len(self.authoritative_manager.workers):
                     continue
 
-                auth_worker = self.authoritive_manager.workers[global_worker_id]
+                auth_worker = self.authoritative_manager.workers[global_worker_id]
                 if auth_worker.current_binary is not None:
                     task_hash = self._compute_task_hash(auth_worker.current_binary)
                     self.task_assignments[task_hash] = secondary_id
@@ -330,7 +330,7 @@ class SingleProcessPrimaryCoordinator(BaseCoordinator):
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.submissive_managers)) as executor:
             for i, submissive in enumerate(self.submissive_managers):
                 # Give each submissive the full list of binaries
-                # The authoritive manager will coordinate which ones get assigned
+                # The authoritative manager will coordinate which ones get assigned
                 # but the submissive needs the list for stats tracking
                 binaries_for_submissive = self.binaries.copy()
 
