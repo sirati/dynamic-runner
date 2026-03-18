@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use db_comm_api_base::{BinaryInfo, Identifier, WorkerId};
 use db_manager_runner_comm::ManagerEndpoint;
@@ -103,6 +103,10 @@ where
 
     // Deferred peer messages to send (queued from sync handlers)
     pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
+
+    // Per-worker task request rate limiting
+    last_request_time: HashMap<WorkerId, Instant>,
+    request_backoff: HashMap<WorkerId, Duration>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -140,6 +144,8 @@ where
             extraction_cache,
             peer_keepalives: HashMap::new(),
             pending_peer_messages: Vec::new(),
+            last_request_time: HashMap::new(),
+            request_backoff: HashMap::new(),
         }
     }
 
@@ -742,8 +748,22 @@ where
         }
     }
 
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
     /// Request a task from the primary for the given worker.
+    /// Skips the request if within the backoff window for this worker.
     async fn request_task_for_worker(&mut self, worker_id: WorkerId) -> Result<(), String> {
+        let now = Instant::now();
+        let backoff = self.request_backoff.get(&worker_id).copied()
+            .unwrap_or(Self::INITIAL_BACKOFF);
+
+        if let Some(last) = self.last_request_time.get(&worker_id) {
+            if now.duration_since(*last) < backoff {
+                return Ok(());
+            }
+        }
+
         let available_memory = if (worker_id as usize) < self.pool.workers.len() {
             self.pool.workers[worker_id as usize].reserved_budget
         } else {
@@ -757,7 +777,19 @@ where
             worker_id,
             available_memory,
         };
+        self.last_request_time.insert(worker_id, now);
+
+        // Double the backoff for next time (capped)
+        let next_backoff = (backoff * 2).min(Self::MAX_BACKOFF);
+        self.request_backoff.insert(worker_id, next_backoff);
+
         self.primary_transport.send(msg).await
+    }
+
+    /// Reset rate limiting for a worker after a successful task assignment.
+    fn reset_request_backoff(&mut self, worker_id: WorkerId) {
+        self.request_backoff.remove(&worker_id);
+        self.last_request_time.remove(&worker_id);
     }
 
     /// Dispatch a message from the primary.
@@ -804,6 +836,7 @@ where
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
+                            self.reset_request_backoff(target_wid);
                             tracing::info!(
                                 worker_id = target_wid,
                                 binary = ?binary_info.identifier,
