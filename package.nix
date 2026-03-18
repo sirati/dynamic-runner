@@ -15,7 +15,7 @@ buildPythonPackage {
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     src = lib.cleanSource ./.;
-    hash = "sha256-dbMLuh6acfke3dBpgBsBgiKOAGwkQUWdTspDmZvmTi0=";
+    hash = "sha256-zgbxq9XoflCH46frBANz//z04vT+JEl8uhHoUPIihC0=";
   };
 
   buildAndTestSubdir = "crates/db_python_provider";
