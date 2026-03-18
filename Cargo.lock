@@ -313,6 +313,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "db_slurm"
+version = "0.1.0"
+dependencies = [
+ "db_gateway",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "db_transport_channel"
 version = "0.1.0"
 dependencies = [

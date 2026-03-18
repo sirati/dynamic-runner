@@ -13,6 +13,7 @@ members = [
     "crates/db_local_manager",
     "crates/db_distributed_manager",
     "crates/db_gateway",
+    "crates/db_slurm",
     "crates/db_python_provider",
 ]
 
@@ -47,4 +48,5 @@ db_runner_impl = { path = "crates/db_runner_impl" }
 db_local_manager = { path = "crates/db_local_manager" }
 db_distributed_manager = { path = "crates/db_distributed_manager" }
 db_gateway = { path = "crates/db_gateway" }
+db_slurm = { path = "crates/db_slurm" }
 db_python_provider = { path = "crates/db_python_provider" }
