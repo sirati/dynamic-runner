@@ -6,7 +6,7 @@ from typing import Any
 
 from ...models import WorkerState
 from ...task import TaskDefinition
-from ...worker_manager import ActualSubmissiveWorkerManager
+from ...worker_manager import ActualAuthoritativeWorkerManager, ActualSubmissiveWorkerManager
 from ..message_router import MessageRouter
 from ..quic_transport import QuicTransport
 from .connection import ConnectionManager
@@ -62,6 +62,7 @@ class SecondaryCoordinator:
 
         # Worker management
         self.worker_manager: ActualSubmissiveWorkerManager | None = None
+        self.authoritative_manager: ActualAuthoritativeWorkerManager | None = None
         self.extracted_binaries: dict[str, Path] = {}  # hash -> extracted path
 
         # Task tracking

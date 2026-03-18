@@ -67,7 +67,11 @@ class WorkerManager:
         await self.coordinator.send_to_primary_ws(msg)
 
     async def _request_new_task(self, worker_id: int) -> None:
-        """Request a new task from primary"""
+        """Request a new task from primary, or handle locally if SLURM-primary."""
+        if self.coordinator.is_slurm_primary and self.coordinator.authoritative_manager:
+            self.coordinator.task_handler.handle_task_request(worker_id)
+            return
+
         if self.coordinator.connection_closing or not self.coordinator.message_router.primary_connection:
             logger.debug(f"Cannot request task for worker {worker_id}: not connected to primary")
             return
@@ -75,8 +79,6 @@ class WorkerManager:
         if not self.coordinator.worker_manager or worker_id >= len(self.coordinator.worker_manager.workers):
             logger.error(f"Invalid worker_id {worker_id}")
             return
-
-        worker = self.coordinator.worker_manager.workers[worker_id]
 
         msg = {
             "type": "task_request",
@@ -135,8 +137,8 @@ class WorkerManager:
                     # After completion, worker is ready for new task
                     # In submissive mode, request task from primary
                     if worker.ready and not worker.current_binary:
-                        logger.debug(f"[Worker {worker_id}] Completed task, requesting new task from primary")
-                        self.request_task_from_primary(worker_id)
+                        logger.debug(f"[Worker {worker_id}] Completed task, requesting new task")
+                        asyncio.create_task(self._request_new_task(worker_id))
 
         # Check memory pressure and kill workers if needed
         manager._check_memory_pressure_and_kill()

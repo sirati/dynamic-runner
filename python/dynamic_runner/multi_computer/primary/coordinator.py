@@ -592,16 +592,25 @@ class BaseCoordinator:
             logger.warning("No SLURM-primary to send task list to")
             return
 
-        # Convert binaries to task list
+        # Convert binaries to task list, including file_path for resolution
         tasks = []
+        pending_tasks = []
         for binary in self.binaries:
             task_hash = self._compute_task_hash(binary)
-            tasks.append({"hash": task_hash, "binary_info": binary.to_dict()})
+            task_entry = {
+                "hash": task_hash,
+                "binary_info": binary.to_dict(),
+                "file_path": str(binary.path),
+            }
+            tasks.append(task_entry)
+            if task_hash not in self.completed_tasks:
+                pending_tasks.append(task_hash)
 
         task_list_msg = {
             "type": "full_task_list",
             "all_tasks": tasks,
             "completed_tasks": list(self.completed_tasks),
+            "pending_tasks": pending_tasks,
         }
         await self._send_to_secondary(self.slurm_primary_id, task_list_msg)
 
@@ -667,7 +676,7 @@ class BaseCoordinator:
         hash_input = f"{binary.path}:{binary.binary_name}:{binary.platform}:{binary.compiler}:{binary.version}:{binary.opt_level}"
         return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
 
-    def _handle_task_complete(self, message: dict[str, Any], connection: Any) -> None:
+    async def _handle_task_complete(self, message: dict[str, Any], connection: Any) -> None:
         """Handle task complete message"""
         task_hash = message.get("task_hash")
         secondary_id = message.get("secondary_id")
@@ -687,6 +696,11 @@ class BaseCoordinator:
         self.failed_tasks.add(task_hash)
 
     async def _handle_task_request(self, message: dict[str, Any], connection: Any) -> None:
-        """Handle task request message"""
-        # Task assignment is handled by the promoted primary in distributed mode
-        pass
+        """Handle task request message.
+
+        After SLURM-primary promotion, relay task requests to the SLURM-primary secondary.
+        """
+        if self.slurm_primary_id:
+            await self._send_to_secondary(self.slurm_primary_id, message)
+        else:
+            logger.debug("No SLURM-primary to relay task request to")

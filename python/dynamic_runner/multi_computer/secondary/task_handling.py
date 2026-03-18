@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 from shared.binary_info import BinaryIdentifier
 
 from ...binary_info import BinaryInfo
+from ...worker_manager import ActualAuthoritativeWorkerManager
 
 if TYPE_CHECKING:
     from .coordinator import SecondaryCoordinator
@@ -251,7 +252,9 @@ class TaskHandler:
             return
 
         # Assign to worker via ActualSubmissiveWorkerManager
-        success = self.coordinator.worker_manager.assign_task_from_authoritative(worker_id, binary_info, estimated_memory)
+        success = self.coordinator.worker_manager.assign_task_from_authoritative(
+            worker_id, binary_info, estimated_memory
+        )
         if success:
             logger.info(f"Assigned task to worker {worker_id}: {extracted_path.name}")
         else:
@@ -422,6 +425,7 @@ class TaskHandler:
         self.coordinator.is_slurm_primary = slurm_primary_id == self.coordinator.secondary_id
         if self.coordinator.is_slurm_primary:
             logger.info("This secondary has been promoted to SLURM-primary")
+            self._create_authoritative_manager()
 
     async def handle_full_task_list(self, message: dict[str, Any], sender_id: str | None) -> None:
         """Handle full task list from primary"""
@@ -432,3 +436,107 @@ class TaskHandler:
 
         self.coordinator.all_tasks = all_tasks
         self.coordinator.completed_tasks = set(completed_tasks)
+
+        if self.coordinator.is_slurm_primary and self.coordinator.authoritative_manager:
+            self._populate_authoritative_manager_tasks(all_tasks, set(completed_tasks))
+
+    def _create_authoritative_manager(self) -> None:
+        """Create an authoritative manager when promoted to SLURM-primary.
+
+        Reuses the workers from the existing submissive manager.
+        """
+        if not self.coordinator.worker_manager:
+            logger.error("Cannot create authoritative manager: no submissive worker manager")
+            return
+
+        workers = list(self.coordinator.worker_manager.workers)
+        log_dir = self.coordinator.log_tmp
+
+        self.coordinator.authoritative_manager = ActualAuthoritativeWorkerManager(
+            num_workers=len(workers),
+            max_memory=self.coordinator.ram_bytes,
+            log_dir=log_dir,
+            task_definition=self.coordinator.task_definition,
+            workers=workers,
+        )
+
+        logger.info(f"Created authoritative manager with {len(workers)} workers")
+
+    def _populate_authoritative_manager_tasks(self, all_tasks: list[dict[str, Any]], completed_tasks: set[str]) -> None:
+        """Populate the authoritative manager with pending tasks from the full task list."""
+        manager = self.coordinator.authoritative_manager
+        if not manager:
+            return
+
+        pending_binaries: list[BinaryInfo] = []
+        for task in all_tasks:
+            task_hash = task.get("hash", "")
+            if task_hash in completed_tasks:
+                continue
+
+            binary_info_dict = task.get("binary_info", {})
+            file_path = task.get("file_path")
+
+            # Resolve the file path
+            resolved_path = None
+            if file_path:
+                resolved_path = self.get_file_by_hash(task_hash, file_path)
+            if not resolved_path:
+                resolved_path = self.coordinator.extracted_binaries.get(task_hash)
+            if not resolved_path:
+                logger.warning(f"Cannot resolve path for task {task_hash}, skipping")
+                continue
+
+            try:
+                identifier = BinaryIdentifier(
+                    binary_name=binary_info_dict.get("binary_name", ""),
+                    platform=binary_info_dict.get("platform", ""),
+                    compiler=binary_info_dict.get("compiler", ""),
+                    version=binary_info_dict.get("version", ""),
+                    opt_level=binary_info_dict.get("opt_level", ""),
+                )
+                binary_info = BinaryInfo(
+                    path=resolved_path,
+                    size=binary_info_dict.get("size", resolved_path.stat().st_size),
+                    identifier=identifier,
+                )
+                pending_binaries.append(binary_info)
+            except Exception as e:
+                logger.error(f"Failed to create BinaryInfo for task {task_hash}: {e}")
+
+        manager.pending_binaries = sorted(pending_binaries, key=lambda b: b.size, reverse=True)
+        manager.stats["total"] = len(all_tasks)
+        manager.stats["completed"] = len(completed_tasks)
+        manager.stats["errored"] = 0
+
+        logger.info(
+            f"Populated authoritative manager with {len(pending_binaries)} pending tasks "
+            f"({len(completed_tasks)} already completed)"
+        )
+
+    def handle_task_request(self, worker_id: int) -> None:
+        """Handle an incoming task request when acting as SLURM-primary.
+
+        For local workers: assign via authoritative_manager + submissive assign_task_from_authoritative.
+        """
+        manager = self.coordinator.authoritative_manager
+        if not manager:
+            logger.error("No authoritative manager for task request handling")
+            return
+
+        result = manager.handle_task_request(worker_id)
+        if result is None:
+            logger.debug(f"No task available for worker {worker_id}")
+            return
+
+        binary, estimated_memory = result
+
+        if not self.coordinator.worker_manager:
+            logger.error("No submissive worker manager for task assignment")
+            return
+
+        success = self.coordinator.worker_manager.assign_task_from_authoritative(worker_id, binary, estimated_memory)
+        if success:
+            logger.info(f"[Worker {worker_id}] Assigned task from authoritative: {binary.path.name}")
+        else:
+            logger.error(f"[Worker {worker_id}] Failed to assign task from authoritative")
