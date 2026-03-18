@@ -96,6 +96,9 @@ pub struct TaskInfo<I> {
     pub local_path: String,
     pub binary_info: DistributedBinaryInfo<I>,
     pub hash: String,
+    /// Original file path for resolution on SLURM-primary.
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 /// The typed message enum. Each variant carries exactly the payload
@@ -177,6 +180,8 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         all_tasks: Vec<TaskInfo<I>>,
         completed_tasks: Vec<String>,
+        #[serde(default)]
+        pending_tasks: Vec<String>,
     },
     TaskComplete {
         sender_id: String,

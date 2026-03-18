@@ -9,6 +9,7 @@ use db_local_manager::worker::WorkerEvent;
 use db_local_manager::WorkerFactory;
 use db_primary_secondary_comm::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, PrimaryTransport,
+    TaskInfo,
 };
 use db_scheduler_api::{MemoryEstimator, Scheduler};
 
@@ -107,6 +108,10 @@ where
     // Per-worker task request rate limiting
     last_request_time: HashMap<WorkerId, Instant>,
     request_backoff: HashMap<WorkerId, Duration>,
+
+    // SLURM-primary state (populated on promotion + full task list)
+    slurm_pending_binaries: Vec<BinaryInfo<I>>,
+    slurm_completed: HashSet<String>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -146,6 +151,8 @@ where
             pending_peer_messages: Vec::new(),
             last_request_time: HashMap::new(),
             request_backoff: HashMap::new(),
+            slurm_pending_binaries: Vec::new(),
+            slurm_completed: HashSet::new(),
         }
     }
 
@@ -752,8 +759,25 @@ where
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     /// Request a task from the primary for the given worker.
+    /// When acting as SLURM-primary, handles the request locally.
     /// Skips the request if within the backoff window for this worker.
     async fn request_task_for_worker(&mut self, worker_id: WorkerId) -> Result<(), String> {
+        // When SLURM-primary, handle task requests locally
+        if self.is_slurm_primary && !self.slurm_pending_binaries.is_empty() {
+            let available_memory = if (worker_id as usize) < self.pool.workers.len() {
+                self.pool.workers[worker_id as usize].reserved_budget
+            } else {
+                self.config.ram_bytes / self.config.num_workers as u64
+            };
+            return self
+                .handle_slurm_task_request(
+                    self.config.secondary_id.clone(),
+                    worker_id,
+                    available_memory,
+                )
+                .await;
+        }
+
         let now = Instant::now();
         let backoff = self.request_backoff.get(&worker_id).copied()
             .unwrap_or(Self::INITIAL_BACKOFF);
@@ -882,22 +906,210 @@ where
             }
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
                 self.is_slurm_primary = new_primary_id == self.config.secondary_id;
-                tracing::info!(
-                    promoted = self.is_slurm_primary,
-                    new_primary = %new_primary_id,
-                    "primary promotion"
-                );
+                if self.is_slurm_primary {
+                    tracing::info!("this secondary has been promoted to SLURM-primary");
+                } else {
+                    tracing::info!(
+                        new_primary = %new_primary_id,
+                        "another secondary promoted to SLURM-primary"
+                    );
+                }
                 Ok(())
             }
-            DistributedMessage::FullTaskList { .. } => {
-                tracing::info!("received full task list");
+            DistributedMessage::FullTaskList {
+                all_tasks,
+                completed_tasks,
+                pending_tasks,
+                ..
+            } => {
+                let completed_set: HashSet<String> = completed_tasks.into_iter().collect();
+                tracing::info!(
+                    total = all_tasks.len(),
+                    completed = completed_set.len(),
+                    pending = pending_tasks.len(),
+                    "received full task list"
+                );
+
+                if self.is_slurm_primary {
+                    self.populate_slurm_tasks(all_tasks, completed_set);
+                }
                 Ok(())
+            }
+            DistributedMessage::TaskRequest {
+                secondary_id,
+                worker_id,
+                available_memory,
+                ..
+            } if self.is_slurm_primary => {
+                self.handle_slurm_task_request(secondary_id, worker_id, available_memory)
+                    .await
             }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled message in secondary");
                 Ok(())
             }
         }
+    }
+
+    /// Populate SLURM-primary pending task list from full task list.
+    fn populate_slurm_tasks(
+        &mut self,
+        all_tasks: Vec<TaskInfo<I>>,
+        completed: HashSet<String>,
+    ) {
+        self.slurm_completed = completed.clone();
+        self.slurm_pending_binaries.clear();
+
+        for task in all_tasks {
+            if completed.contains(&task.hash)
+                || self.completed_tasks.contains(&task.hash)
+                || self.active_tasks.contains_key(&task.hash)
+            {
+                continue;
+            }
+
+            let path = task.file_path.as_deref().unwrap_or(&task.local_path);
+
+            // Try to resolve via extraction cache first
+            let resolved = self
+                .extraction_cache
+                .resolve_binary(None, path, &task.hash);
+
+            let binary_path = resolved.unwrap_or_else(|| std::path::PathBuf::from(path));
+
+            self.slurm_pending_binaries.push(BinaryInfo {
+                path: binary_path,
+                size: task.binary_info.size,
+                identifier: task.binary_info.identifier.clone(),
+            });
+        }
+
+        // Sort by size descending for better packing
+        self.slurm_pending_binaries.sort_by(|a, b| b.size.cmp(&a.size));
+
+        tracing::info!(
+            pending = self.slurm_pending_binaries.len(),
+            completed = self.slurm_completed.len(),
+            "populated SLURM-primary task list"
+        );
+    }
+
+    /// Handle a task request from a peer when acting as SLURM-primary.
+    /// Finds a suitable task and sends a TaskAssignment back.
+    async fn handle_slurm_task_request(
+        &mut self,
+        requesting_secondary_id: String,
+        worker_id: WorkerId,
+        available_memory: u64,
+    ) -> Result<(), String> {
+        if self.slurm_pending_binaries.is_empty() {
+            tracing::debug!(
+                secondary = %requesting_secondary_id,
+                worker_id,
+                "no pending tasks for SLURM-primary assignment"
+            );
+            return Ok(());
+        }
+
+        // Remove any tasks that have been completed since population
+        self.slurm_pending_binaries.retain(|b| {
+            let hash = format!("{:016x}", {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                b.path.hash(&mut h);
+                b.identifier.hash(&mut h);
+                h.finish()
+            });
+            !self.completed_tasks.contains(&hash)
+        });
+
+        if self.slurm_pending_binaries.is_empty() {
+            return Ok(());
+        }
+
+        // Find a task that fits the available memory
+        let mut assigned_idx = None;
+        for (i, binary) in self.slurm_pending_binaries.iter().enumerate() {
+            let estimated = self.estimator.estimate_memory(binary.size);
+            if estimated <= available_memory {
+                assigned_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = assigned_idx {
+            let binary = self.slurm_pending_binaries.remove(idx);
+            let file_hash = format!("{:016x}", {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut hasher = DefaultHasher::new();
+                binary.path.hash(&mut hasher);
+                binary.identifier.hash(&mut hasher);
+                hasher.finish()
+            });
+
+            if requesting_secondary_id == self.config.secondary_id {
+                // Assign directly to local worker (avoid recursive dispatch_message cycle)
+                let resolved = self
+                    .extraction_cache
+                    .resolve_binary(None, &binary.path.to_string_lossy(), &file_hash);
+                let actual_binary = match resolved {
+                    Some(path) => BinaryInfo {
+                        path,
+                        size: binary.size,
+                        identifier: binary.identifier.clone(),
+                    },
+                    None => binary.clone(),
+                };
+                let estimated = self.estimator.estimate_memory(actual_binary.size);
+                let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+                if self.pool.workers[wid as usize].is_idle_state() {
+                    match self.pool.workers[wid as usize]
+                        .assign_task(actual_binary, estimated, false)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.active_tasks.insert(file_hash, wid);
+                            self.reset_request_backoff(wid);
+                        }
+                        Err(e) => {
+                            tracing::error!(worker_id = wid, error = %e, "failed to assign SLURM task locally");
+                        }
+                    }
+                }
+            } else {
+                // Send TaskAssignment to peer
+                let msg = DistributedMessage::TaskAssignment {
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    secondary_id: requesting_secondary_id.clone(),
+                    worker_id,
+                    zip_file: None,
+                    binary_info: DistributedBinaryInfo {
+                        path: binary.path.to_string_lossy().into_owned(),
+                        size: binary.size,
+                        identifier: binary.identifier.clone(),
+                    },
+                    local_path: binary.path.to_string_lossy().into_owned(),
+                    file_hash,
+                };
+                let _ = self
+                    .peer_transport
+                    .send_to_peer(&requesting_secondary_id, msg)
+                    .await;
+            }
+
+            tracing::info!(
+                secondary = %requesting_secondary_id,
+                worker_id,
+                binary = ?binary.identifier,
+                remaining = self.slurm_pending_binaries.len(),
+                "SLURM-primary assigned task"
+            );
+        }
+
+        Ok(())
     }
 
     async fn stop_all_workers(&mut self) {

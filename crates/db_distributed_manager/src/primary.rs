@@ -4,7 +4,7 @@ use std::time::Duration;
 use db_comm_api_base::{BinaryInfo, Identifier, MemoryBytes};
 use db_primary_secondary_comm::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerConnectionInfo,
-    SecondaryTransport, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
+    SecondaryTransport, TaskInfo, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
 };
 use db_scheduler_api::{
     AssignmentDecision, MemoryEstimator, Scheduler, WorkerBudgetInfo,
@@ -75,9 +75,13 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Memo
 
     // Task state
     total_tasks: usize,
+    all_binaries: Vec<BinaryInfo<I>>,
     pending_binaries: Vec<BinaryInfo<I>>,
     completed_tasks: HashSet<String>,
     failed_tasks: HashSet<String>,
+
+    // SLURM-primary promotion
+    slurm_primary_id: Option<String>,
 }
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
@@ -90,9 +94,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
             secondaries: HashMap::new(),
             workers: Vec::new(),
             total_tasks: 0,
+            all_binaries: Vec::new(),
             pending_binaries: Vec::new(),
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
+            slurm_primary_id: None,
         }
     }
 
@@ -110,6 +116,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
 
     /// Run the full coordination pipeline.
     pub async fn run(&mut self, binaries: Vec<BinaryInfo<I>>) -> Result<(), String> {
+        self.all_binaries = binaries.clone();
         self.pending_binaries = binaries;
         self.total_tasks = self.pending_binaries.len();
         let total = self.total_tasks;
@@ -130,7 +137,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
         // Phase 6: Send transfer complete
         self.send_transfer_complete().await?;
 
-        // Phase 7: Operational loop
+        // Phase 7: Promote SLURM-primary
+        self.promote_slurm_primary().await?;
+
+        // Phase 8: Send full task list to SLURM-primary
+        self.send_full_task_list().await?;
+
+        // Phase 9: Operational loop
         self.operational_loop().await?;
 
         tracing::info!(
@@ -522,9 +535,85 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
         Ok(())
     }
 
+    // ── Phase 7: Promote SLURM-primary ──
+
+    async fn promote_slurm_primary(&mut self) -> Result<(), String> {
+        if let Some(first_id) = self.secondaries.keys().next().cloned() {
+            self.slurm_primary_id = Some(first_id.clone());
+            tracing::info!(slurm_primary = %first_id, "promoting secondary to SLURM-primary");
+
+            let msg = DistributedMessage::<I>::PromotePrimary {
+                sender_id: self.config.node_id.clone(),
+                timestamp: timestamp_now(),
+                new_primary_id: first_id.clone(),
+            };
+            self.transport.send_to(&first_id, msg).await?;
+        }
+        Ok(())
+    }
+
+    // ── Phase 8: Send full task list ──
+
+    async fn send_full_task_list(&mut self) -> Result<(), String> {
+        let slurm_id = match &self.slurm_primary_id {
+            Some(id) => id.clone(),
+            None => return Ok(()),
+        };
+
+        let all_tasks: Vec<TaskInfo<I>> = self
+            .all_binaries
+            .iter()
+            .map(|binary| {
+                let hash = compute_task_hash(binary);
+                TaskInfo {
+                    local_path: binary.path.to_string_lossy().into_owned(),
+                    binary_info: binary_to_distributed(binary),
+                    hash: hash.clone(),
+                    file_path: Some(binary.path.to_string_lossy().into_owned()),
+                }
+            })
+            .collect();
+
+        // Include both completed tasks and currently in-flight tasks as "completed"
+        // so the SLURM-primary doesn't re-assign tasks that are already being processed
+        let active_hashes: HashSet<String> = self
+            .workers
+            .iter()
+            .filter_map(|w| w.current_task.as_ref().map(compute_task_hash))
+            .collect();
+        let excluded: HashSet<String> = self
+            .completed_tasks
+            .union(&active_hashes)
+            .cloned()
+            .collect();
+
+        let completed_list: Vec<String> = excluded.iter().cloned().collect();
+        let pending_list: Vec<String> = all_tasks
+            .iter()
+            .filter(|t| !excluded.contains(&t.hash))
+            .map(|t| t.hash.clone())
+            .collect();
+
+        let msg = DistributedMessage::FullTaskList {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            all_tasks,
+            completed_tasks: completed_list,
+            pending_tasks: pending_list,
+        };
+        self.transport.send_to(&slurm_id, msg).await?;
+
+        tracing::info!(
+            slurm_primary = %slurm_id,
+            total = self.all_binaries.len(),
+            "sent full task list"
+        );
+        Ok(())
+    }
+
     async fn handle_task_request(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
-            secondary_id,
+            ref secondary_id,
             worker_id,
             available_memory,
             ..
@@ -534,7 +623,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
             let mut target_idx = None;
             let mut local_idx: u32 = 0;
             for (idx, w) in self.workers.iter().enumerate() {
-                if w.secondary_id == secondary_id {
+                if w.secondary_id == *secondary_id {
                     if local_idx == worker_id {
                         target_idx = Some(idx);
                         break;
@@ -542,6 +631,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
                     local_idx += 1;
                 }
             }
+
+            let mut assigned = false;
 
             if let Some(idx) = target_idx {
                 // Mark worker idle
@@ -552,49 +643,60 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
                     self.workers[idx].memory_budget = available_memory;
                 }
 
-                // Try to assign
-                let worker_info = self.workers[idx].budget_info();
-                let all_infos: Vec<WorkerBudgetInfo<I>> =
-                    self.workers.iter().map(|w| w.budget_info()).collect();
+                // Try to assign from local pending
+                if !self.pending_binaries.is_empty() {
+                    let worker_info = self.workers[idx].budget_info();
+                    let all_infos: Vec<WorkerBudgetInfo<I>> =
+                        self.workers.iter().map(|w| w.budget_info()).collect();
 
-                let decision = self.scheduler.assign_normal(
-                    &worker_info,
-                    &all_infos,
-                    &self.pending_binaries,
-                    self.workers[idx].memory_budget,
-                    &self.estimator,
-                    false,
-                );
-
-                if let AssignmentDecision::Assign {
-                    binary_index,
-                    estimated_memory,
-                    ..
-                } = decision
-                {
-                    let binary = self.pending_binaries.remove(binary_index);
-                    self.workers[idx].current_task = Some(binary.clone());
-                    self.workers[idx].estimated_memory = estimated_memory;
-                    self.workers[idx].is_idle = false;
-
-                    let assignment_msg = DistributedMessage::TaskAssignment {
-                        sender_id: self.config.node_id.clone(),
-                        timestamp: timestamp_now(),
-                        secondary_id: secondary_id.clone(),
-                        worker_id,
-                        zip_file: None,
-                        binary_info: binary_to_distributed(&binary),
-                        local_path: binary.path.to_string_lossy().into_owned(),
-                        file_hash: compute_task_hash(&binary),
-                    };
-                    self.transport.send_to(&secondary_id, assignment_msg).await?;
-
-                    tracing::debug!(
-                        secondary = %secondary_id,
-                        worker_id,
-                        binary = ?binary.identifier,
-                        "task assigned"
+                    let decision = self.scheduler.assign_normal(
+                        &worker_info,
+                        &all_infos,
+                        &self.pending_binaries,
+                        self.workers[idx].memory_budget,
+                        &self.estimator,
+                        false,
                     );
+
+                    if let AssignmentDecision::Assign {
+                        binary_index,
+                        estimated_memory,
+                        ..
+                    } = decision
+                    {
+                        let binary = self.pending_binaries.remove(binary_index);
+                        let sec_id = self.workers[idx].secondary_id.clone();
+                        self.workers[idx].current_task = Some(binary.clone());
+                        self.workers[idx].estimated_memory = estimated_memory;
+                        self.workers[idx].is_idle = false;
+
+                        let assignment_msg = DistributedMessage::TaskAssignment {
+                            sender_id: self.config.node_id.clone(),
+                            timestamp: timestamp_now(),
+                            secondary_id: sec_id.clone(),
+                            worker_id,
+                            zip_file: None,
+                            binary_info: binary_to_distributed(&binary),
+                            local_path: binary.path.to_string_lossy().into_owned(),
+                            file_hash: compute_task_hash(&binary),
+                        };
+                        self.transport.send_to(&sec_id, assignment_msg).await?;
+
+                        tracing::debug!(
+                            secondary = %sec_id,
+                            worker_id,
+                            binary = ?binary.identifier,
+                            "task assigned"
+                        );
+                        assigned = true;
+                    }
+                }
+            }
+
+            // If no local assignment was made, relay to SLURM-primary
+            if !assigned {
+                if let Some(slurm_id) = self.slurm_primary_id.clone() {
+                    self.transport.send_to(&slurm_id, msg).await?;
                 }
             }
         }
