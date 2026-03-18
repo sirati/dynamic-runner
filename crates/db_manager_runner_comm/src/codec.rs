@@ -9,7 +9,7 @@ use crate::command::{Command, Response};
 pub fn serialize_command(cmd: &Command) -> Vec<u8> {
     match cmd {
         Command::Stop => b"stop\n".to_vec(),
-        Command::ProcessBinary { relative_path } => format!("{relative_path}\n").into_bytes(),
+        Command::ProcessTask { relative_path } => format!("{relative_path}\n").into_bytes(),
     }
 }
 
@@ -24,7 +24,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
     if line == "stop" {
         return Some(Command::Stop);
     }
-    Some(Command::ProcessBinary {
+    Some(Command::ProcessTask {
         relative_path: line.to_owned(),
     })
 }
@@ -33,23 +33,20 @@ pub fn parse_command(line: &str) -> Option<Command> {
 ///
 /// Format:
 ///   "ready\n"
-///   "done\n" or "done:<warnings>:<filtered>\n"
+///   "done\n" or "done:<result_data_utf8>\n"
 ///   "error:<type>:<message>\n"
 ///   "phase:<name>\n"
 ///   "keepalive\n"
-///
-/// Note: PickledError is serialized as a plain error with the exception details
-/// concatenated. The pickle format is Python-specific and not reproduced here.
 pub fn serialize_response(resp: &Response) -> Vec<u8> {
     match resp {
         Response::Ready => b"ready\n".to_vec(),
-        Response::Done { warnings, filtered } => {
-            if *warnings == 0 && *filtered == 0 {
-                b"done\n".to_vec()
-            } else {
-                format!("done:{warnings}:{filtered}\n").into_bytes()
+        Response::Done { result_data } => match result_data {
+            None => b"done\n".to_vec(),
+            Some(data) => {
+                let text = String::from_utf8_lossy(data);
+                format!("done:{text}\n").into_bytes()
             }
-        }
+        },
         Response::Error {
             error_type,
             message,
@@ -59,8 +56,6 @@ pub fn serialize_response(resp: &Response) -> Vec<u8> {
             message,
             traceback,
         } => {
-            // For Rust-side serialization, emit as a structured error line.
-            // Python workers use pickle; Rust workers use this plain format.
             format!("error:recoverable:{exception_type}: {message}\n{traceback}\n").into_bytes()
         }
         Response::PhaseUpdate { phase_name } => format!("phase:{phase_name}\n").into_bytes(),
@@ -71,7 +66,6 @@ pub fn serialize_response(resp: &Response) -> Vec<u8> {
 /// Parse a single line into a Response.
 ///
 /// The line may or may not include the trailing newline.
-/// This matches the Python `parse_response` function exactly.
 pub fn parse_response(line: &str) -> Option<Response> {
     let line = line.trim();
     if line.is_empty() {
@@ -85,24 +79,18 @@ pub fn parse_response(line: &str) -> Option<Response> {
         return Some(Response::Ready);
     }
     if line == "done" {
-        return Some(Response::Done {
-            warnings: 0,
-            filtered: 0,
-        });
+        return Some(Response::Done { result_data: None });
     }
     if let Some(rest) = line.strip_prefix("done:") {
-        let parts: Vec<&str> = rest.splitn(2, ':').collect();
-        let warnings = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let filtered = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        return Some(Response::Done { warnings, filtered });
+        return Some(Response::Done {
+            result_data: Some(rest.as_bytes().to_vec()),
+        });
     }
     if let Some(phase_name) = line.strip_prefix("phase:") {
         return Some(Response::PhaseUpdate {
             phase_name: phase_name.to_owned(),
         });
     }
-    // Handle pickled errors from Python workers — we parse the raw bytes
-    // but cannot unpickle, so treat as a recoverable error with the raw content
     if let Some(rest) = line.strip_prefix("error:pickle:") {
         return Some(Response::PickledError {
             exception_type: "PythonPickledError".to_owned(),
@@ -128,6 +116,7 @@ pub fn parse_response(line: &str) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use db_comm_api_base::ResourceKind;
 
     #[test]
     fn command_stop_roundtrip() {
@@ -138,18 +127,18 @@ mod tests {
     }
 
     #[test]
-    fn command_process_binary_roundtrip() {
-        let cmd = Command::ProcessBinary {
+    fn command_process_task_roundtrip() {
+        let cmd = Command::ProcessTask {
             relative_path: "path/to/binary".into(),
         };
         let bytes = serialize_command(&cmd);
         assert_eq!(bytes, b"path/to/binary\n");
         let parsed = parse_command("path/to/binary\n").unwrap();
         match parsed {
-            Command::ProcessBinary { relative_path } => {
+            Command::ProcessTask { relative_path } => {
                 assert_eq!(relative_path, "path/to/binary");
             }
-            _ => panic!("expected ProcessBinary"),
+            _ => panic!("expected ProcessTask"),
         }
     }
 
@@ -162,36 +151,40 @@ mod tests {
     }
 
     #[test]
-    fn response_done_no_counts() {
-        let resp = Response::Done {
-            warnings: 0,
-            filtered: 0,
-        };
+    fn response_done_no_data() {
+        let resp = Response::Done { result_data: None };
         let bytes = serialize_response(&resp);
         assert_eq!(bytes, b"done\n");
         let parsed = parse_response("done\n").unwrap();
         match parsed {
-            Response::Done { warnings, filtered } => {
-                assert_eq!(warnings, 0);
-                assert_eq!(filtered, 0);
+            Response::Done { result_data } => assert!(result_data.is_none()),
+            _ => panic!("expected Done"),
+        }
+    }
+
+    #[test]
+    fn response_done_with_data() {
+        let resp = Response::Done {
+            result_data: Some(b"3:7".to_vec()),
+        };
+        let bytes = serialize_response(&resp);
+        assert_eq!(bytes, b"done:3:7\n");
+        let parsed = parse_response("done:3:7\n").unwrap();
+        match parsed {
+            Response::Done { result_data } => {
+                assert_eq!(result_data.unwrap(), b"3:7");
             }
             _ => panic!("expected Done"),
         }
     }
 
     #[test]
-    fn response_done_with_counts() {
-        let resp = Response::Done {
-            warnings: 3,
-            filtered: 7,
-        };
-        let bytes = serialize_response(&resp);
-        assert_eq!(bytes, b"done:3:7\n");
+    fn response_done_legacy_compat() {
+        // Python workers send done:3:7 — should parse as result_data bytes
         let parsed = parse_response("done:3:7\n").unwrap();
         match parsed {
-            Response::Done { warnings, filtered } => {
-                assert_eq!(warnings, 3);
-                assert_eq!(filtered, 7);
+            Response::Done { result_data } => {
+                assert_eq!(result_data.unwrap(), b"3:7");
             }
             _ => panic!("expected Done"),
         }
@@ -200,7 +193,7 @@ mod tests {
     #[test]
     fn response_error_roundtrip() {
         let resp = Response::Error {
-            error_type: ErrorType::OutOfMemory,
+            error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
             message: "worker exceeded budget".into(),
         };
         let bytes = serialize_response(&resp);
@@ -211,7 +204,7 @@ mod tests {
                 error_type,
                 message,
             } => {
-                assert_eq!(error_type, ErrorType::OutOfMemory);
+                assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::Memory));
                 assert_eq!(message, "worker exceeded budget");
             }
             _ => panic!("expected Error"),
@@ -298,14 +291,13 @@ mod tests {
 
     #[test]
     fn response_error_with_colons_in_message() {
-        // Messages can contain colons — only split on the first two
         let parsed = parse_response("error:oom:path:to:something ran out").unwrap();
         match parsed {
             Response::Error {
                 error_type,
                 message,
             } => {
-                assert_eq!(error_type, ErrorType::OutOfMemory);
+                assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::Memory));
                 assert_eq!(message, "path:to:something ran out");
             }
             _ => panic!("expected Error"),

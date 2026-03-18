@@ -1,14 +1,14 @@
-use db_comm_api_base::{Identifier, MemoryBytes, WorkerId};
+use db_comm_api_base::{Identifier, ResourceMap, WorkerId};
 use db_manager_runner_comm::ManagerEndpoint;
-use db_scheduler_api::{OomDecision, Scheduler, WorkerBudgetInfo};
+use db_scheduler_api::{ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc;
 
 use crate::manager::WorkerFactory;
 use crate::worker::{WorkerEvent, WorkerHandle};
 
-/// Result of an OOM check — tells the caller what happened so it can
-/// take manager-specific action (requeue task, report to primary, etc.).
-pub enum OomKillResult<I: Identifier> {
+/// Result of a resource pressure check — tells the caller what happened so it
+/// can take manager-specific action (requeue task, report to primary, etc.).
+pub enum ResourcePressureResult<I: Identifier> {
     /// A worker was killed. The caller should handle the displaced binary
     /// (e.g. requeue locally or report failure to primary).
     Killed {
@@ -16,7 +16,7 @@ pub enum OomKillResult<I: Identifier> {
         binary: Option<db_comm_api_base::BinaryInfo<I>>,
         reason: String,
     },
-    /// No action needed — memory is within limits.
+    /// No action needed — resources are within limits.
     NoAction,
 }
 
@@ -55,7 +55,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     pub async fn initialize<S: Scheduler<I>>(
         &mut self,
         num_workers: u32,
-        max_memory: MemoryBytes,
+        max_resources: &ResourceMap,
         scheduler: &S,
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
@@ -69,7 +69,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             }
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
-            handle.reserved_budget = scheduler.initial_budget(i, max_memory);
+            let budget = scheduler.initial_budget(i, max_resources);
+            handle.reserved_budget = budget.get(db_comm_api_base::ResourceKind::Memory);
             tracing::info!(
                 worker_id = i,
                 budget_mb = handle.reserved_budget / (1024 * 1024),
@@ -146,40 +147,40 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         }
     }
 
-    /// Check OOM via the scheduler, kill if needed.
+    /// Check resource pressure via the scheduler, kill if needed.
     ///
-    /// Returns `OomKillResult::Killed` with the displaced binary so the
-    /// caller can decide what to do (requeue locally, report to primary, etc.).
-    /// The worker is marked as OOM-killed but NOT restarted — the caller
+    /// Returns `ResourcePressureResult::Killed` with the displaced binary so
+    /// the caller can decide what to do (requeue locally, report to primary, etc.).
+    /// The worker is marked as killed but NOT restarted — the caller
     /// must call `restart_worker` if it wants the worker back.
-    pub fn check_oom<S: Scheduler<I>>(
+    pub fn check_resource_pressure<S: Scheduler<I>>(
         &mut self,
         scheduler: &S,
-        max_memory: MemoryBytes,
-        in_oom_phase: bool,
-    ) -> OomKillResult<I> {
+        max_resources: &ResourceMap,
+        in_pressure_phase: bool,
+    ) -> ResourcePressureResult<I> {
         self.update_all_memory_usage();
         let infos = self.budget_infos();
-        let decision = scheduler.check_oom(&infos, max_memory, in_oom_phase);
+        let decision = scheduler.check_resource_pressure(&infos, max_resources, in_pressure_phase);
 
         match decision {
-            OomDecision::Kill { worker_id, reason } => {
+            ResourcePressureDecision::Kill { worker_id, reason } => {
                 tracing::warn!(
                     worker_id,
                     reason = %reason,
-                    in_oom_phase,
-                    "OOM killing worker"
+                    in_pressure_phase,
+                    "killing worker under resource pressure"
                 );
                 let worker = &mut self.workers[worker_id as usize];
                 let binary = worker.current_binary.take();
                 worker.mark_oom_killed();
-                OomKillResult::Killed {
+                ResourcePressureResult::Killed {
                     worker_id,
                     binary,
                     reason,
                 }
             }
-            OomDecision::NoAction => OomKillResult::NoAction,
+            ResourcePressureDecision::NoAction => ResourcePressureResult::NoAction,
         }
     }
 

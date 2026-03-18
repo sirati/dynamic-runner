@@ -71,9 +71,9 @@ pub enum WaitReadyResult<M: ManagerEndpoint> {
 }
 
 impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
-    /// Transition: Idle -> Processing (send ProcessBinary command)
+    /// Transition: Idle -> Processing (send ProcessTask command)
     pub async fn assign_task(mut self, relative_path: String) -> AssignResult<M> {
-        let cmd = Command::ProcessBinary { relative_path };
+        let cmd = Command::ProcessTask { relative_path };
         match self.transport.send(cmd).await {
             Ok(()) => AssignResult::Assigned(RunnerProtocol {
                 _state: PhantomData,
@@ -127,7 +127,9 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                 }
             }
             Some(response) => match response {
-                Response::Done { warnings, filtered } => {
+                Response::Done { result_data } => {
+                    let (warnings, filtered) =
+                        decode_legacy_result_data(result_data.as_deref());
                     PollResult::Completed {
                         result: TaskResult::ok(warnings, filtered),
                         protocol: RunnerProtocol {
@@ -217,6 +219,21 @@ pub enum PollResult<M: ManagerEndpoint> {
         result: TaskResult,
         protocol: RunnerProtocol<Stopped, M>,
     },
+}
+
+/// Decode legacy result data bytes (format: "warnings:filtered") into (u32, u32).
+/// Returns (0, 0) if data is None or cannot be parsed.
+fn decode_legacy_result_data(data: Option<&[u8]>) -> (u32, u32) {
+    let Some(data) = data else {
+        return (0, 0);
+    };
+    let Ok(text) = std::str::from_utf8(data) else {
+        return (0, 0);
+    };
+    let parts: Vec<&str> = text.splitn(2, ':').collect();
+    let warnings = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let filtered = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (warnings, filtered)
 }
 
 /// Runtime enum wrapper for storing runners in a collection.

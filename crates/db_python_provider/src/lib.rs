@@ -7,7 +7,7 @@ use pyo3::types::PyList;
 use serde::{Deserialize, Serialize};
 
 use db_comm_api_base::{
-    BinaryInfo, MemoryBytes, MessageReceiver, MessageSender, WorkerId,
+    BinaryInfo, MessageReceiver, MessageSender, WorkerId,
 };
 use db_manager_runner_comm::{Command, Response};
 
@@ -26,8 +26,8 @@ pub struct TokenizerIdentifier {
     pub opt_level: String,
 }
 use db_local_manager::{LocalManager, LocalManagerConfig, ProcessingStats, WorkerFactory};
-use db_scheduler_api::MemoryEstimator;
-use db_scheduler_impl::MemoryStealingScheduler;
+use db_scheduler_api::ResourceEstimator;
+use db_scheduler_impl::ResourceStealingScheduler;
 use db_transport_socket::named_socket::NamedSocketManagerEnd;
 use db_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
 
@@ -244,9 +244,10 @@ impl PyMemoryEstimatorBridge {
     }
 }
 
-impl MemoryEstimator for PyMemoryEstimatorBridge {
-    fn estimate_memory(&self, binary_size: u64) -> MemoryBytes {
-        (self.slope * binary_size as f64 + self.intercept).max(0.0) as u64
+impl ResourceEstimator for PyMemoryEstimatorBridge {
+    fn estimate(&self, binary_size: u64) -> db_comm_api_base::ResourceMap {
+        let mem = (self.slope * binary_size as f64 + self.intercept).max(0.0) as u64;
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, mem)])
     }
 }
 
@@ -606,11 +607,12 @@ impl PyLocalManager {
 
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
-            max_memory: self.max_memory,
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.max_memory)]),
             always_restart_worker: self.always_restart_worker,
             print_pid: self.print_pid,
             memuse_log_path,
             stage_timeouts: self.stage_timeouts.clone(),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
         };
 
         let mut factory = SubprocessWorkerFactory {
@@ -637,7 +639,7 @@ impl PyLocalManager {
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
-                    LocalManager::new(config, MemoryStealingScheduler, estimator);
+                    LocalManager::new(config, ResourceStealingScheduler::memory(), estimator);
                 manager.process_binaries(rust_binaries, &mut factory).await;
 
                 self.stats = Some(manager.stats().clone());
@@ -922,7 +924,7 @@ impl PyDistributedManager {
                             config,
                             transport,
                             db_transport_quic::NoPeerTransport,
-                            MemoryStealingScheduler,
+                            ResourceStealingScheduler::memory(),
                             estimator,
                         );
                         let result = secondary.run(&mut factory).await;
@@ -953,7 +955,7 @@ impl PyDistributedManager {
                 let mut primary = PrimaryCoordinator::new(
                     config,
                     transport,
-                    MemoryStealingScheduler,
+                    ResourceStealingScheduler::memory(),
                     estimator,
                 );
 
@@ -1143,7 +1145,7 @@ impl PyPrimaryCoordinator {
                     PrimaryCoordinator::new(
                         config,
                         server,
-                        MemoryStealingScheduler,
+                        ResourceStealingScheduler::memory(),
                         estimator,
                     );
 
@@ -1406,7 +1408,7 @@ impl PySecondaryCoordinator {
                     config,
                     client,
                     peer_network,
-                    MemoryStealingScheduler,
+                    ResourceStealingScheduler::memory(),
                     estimator,
                 );
 

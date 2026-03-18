@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, Identifier, MemoryBytes, TaskResult, WorkerId,
+    BinaryInfo, ErrorType, Identifier, MemoryBytes, ResourceMap, TaskResult, WorkerId,
 };
 use db_manager_runner_comm::ManagerEndpoint;
 use db_manager_runner_comm::state::{
@@ -112,15 +112,17 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
 
     /// Build a snapshot for the scheduler.
     pub fn budget_info(&self) -> WorkerBudgetInfo<I> {
+        use db_comm_api_base::ResourceKind;
+        let mem = |v: MemoryBytes| ResourceMap::from([(ResourceKind::Memory, v)]);
         WorkerBudgetInfo {
             worker_id: self.worker_id,
-            reserved_budget: self.reserved_budget,
-            actual_memory_usage: self.actual_memory_usage,
+            reserved_budgets: mem(self.reserved_budget),
+            actual_usage: mem(self.actual_memory_usage),
             is_idle: self.idle && self.current_binary.is_none(),
             is_opportunistic: self.opportunistic,
             has_initial_assignment: self.has_initial_assignment,
             current_task: self.current_binary.clone(),
-            estimated_memory: self.estimated_memory,
+            estimated_usage: mem(self.estimated_memory),
         }
     }
 
@@ -301,14 +303,25 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// size (typically 4096) to get bytes. Returns 0 on non-Linux or if the
     /// process is gone.
     pub fn update_memory_usage(&mut self) {
+        self.actual_memory_usage = ProcStatmMonitor.measure(self.pid);
+    }
+}
+
+/// Trait for measuring resource usage of a worker process.
+pub trait ResourceMonitor {
+    fn measure(&self, pid: Option<u32>) -> MemoryBytes;
+}
+
+/// Default implementation that reads RSS from `/proc/[pid]/statm`.
+pub struct ProcStatmMonitor;
+
+impl ResourceMonitor for ProcStatmMonitor {
+    fn measure(&self, pid: Option<u32>) -> MemoryBytes {
         #[cfg(target_os = "linux")]
         {
-            let pid = match self.pid {
+            let pid = match pid {
                 Some(p) => p,
-                None => {
-                    self.actual_memory_usage = 0;
-                    return;
-                }
+                None => return 0,
             };
             let path = format!("/proc/{pid}/statm");
             match std::fs::read_to_string(&path) {
@@ -318,21 +331,18 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                     if let Some(rss_pages_str) = contents.split_whitespace().nth(1) {
                         if let Ok(rss_pages) = rss_pages_str.parse::<u64>() {
                             let page_size = 4096u64; // standard Linux page size
-                            self.actual_memory_usage = rss_pages * page_size;
-                            return;
+                            return rss_pages * page_size;
                         }
                     }
-                    self.actual_memory_usage = 0;
+                    0
                 }
-                Err(_) => {
-                    // Process may have exited
-                    self.actual_memory_usage = 0;
-                }
+                Err(_) => 0,
             }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            self.actual_memory_usage = 0;
+            let _ = pid;
+            0
         }
     }
 }

@@ -1,3 +1,4 @@
+use db_comm_api_base::ResourceAmount;
 use serde::{Deserialize, Serialize};
 
 /// All distributed message types.
@@ -33,7 +34,7 @@ pub enum MessageType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerReadyInfo {
     pub worker_id: u32,
-    pub memory_budget: u64,
+    pub resource_budgets: Vec<ResourceAmount>,
 }
 
 /// Peer connection information sent in PeerInfo.
@@ -117,7 +118,7 @@ pub enum DistributedMessage<I> {
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
-        ram_bytes: u64,
+        resources: Vec<ResourceAmount>,
         worker_count: u32,
         hostname: String,
     },
@@ -152,7 +153,7 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         secondary_id: String,
         worker_id: u32,
-        available_memory: u64,
+        available_resources: Vec<ResourceAmount>,
     },
     TaskAssignment {
         sender_id: String,
@@ -189,8 +190,8 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         worker_id: u32,
         task_hash: String,
-        warnings: u32,
-        filtered: u32,
+        #[serde(default)]
+        result_data: Option<Vec<u8>>,
     },
     TaskFailed {
         sender_id: String,

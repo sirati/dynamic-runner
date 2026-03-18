@@ -4,6 +4,6 @@ pub mod manager;
 pub mod stats;
 
 pub use manager::{LocalManager, LocalManagerConfig, WorkerFactory};
-pub use pool::{WorkerPool, OomKillResult};
+pub use pool::{WorkerPool, ResourcePressureResult};
 pub use stats::ProcessingStats;
-pub use worker::{WorkerHandle, WorkerEvent};
+pub use worker::{WorkerHandle, WorkerEvent, ResourceMonitor, ProcStatmMonitor};

@@ -7,7 +7,7 @@ use db_primary_secondary_comm::{
     SecondaryTransport, TaskInfo, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
 };
 use db_scheduler_api::{
-    AssignmentDecision, MemoryEstimator, Scheduler, WorkerBudgetInfo,
+    AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
 
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
@@ -44,15 +44,17 @@ struct RemoteWorkerState<I: Identifier> {
 
 impl<I: Identifier> RemoteWorkerState<I> {
     fn budget_info(&self) -> WorkerBudgetInfo<I> {
+        use db_comm_api_base::{ResourceKind, ResourceMap};
+        let mem = |v: MemoryBytes| ResourceMap::from([(ResourceKind::Memory, v)]);
         WorkerBudgetInfo {
             worker_id: self.worker_id,
-            reserved_budget: self.memory_budget,
-            actual_memory_usage: 0,
+            reserved_budgets: mem(self.memory_budget),
+            actual_usage: mem(0),
             is_idle: self.is_idle,
             is_opportunistic: false,
             has_initial_assignment: self.current_task.is_some(),
             current_task: self.current_task.clone(),
-            estimated_memory: self.estimated_memory,
+            estimated_usage: mem(self.estimated_memory),
         }
     }
 }
@@ -61,7 +63,7 @@ impl<I: Identifier> RemoteWorkerState<I> {
 ///
 /// Generic over `T: SecondaryTransport<I>` so it works with both QUIC connections
 /// and in-process channels for testing.
-pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> {
+pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> {
     config: PrimaryConfig,
     transport: T,
     scheduler: S,
@@ -84,7 +86,7 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Memo
     slurm_primary_id: Option<String>,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub fn new(config: PrimaryConfig, transport: T, scheduler: S, estimator: E) -> Self {
         Self {
             config,
@@ -213,12 +215,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
     fn handle_welcome(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::SecondaryWelcome {
             secondary_id,
-            ram_bytes,
+            resources,
             worker_count,
             hostname,
             ..
         } = msg
         {
+            let ram_bytes = resources.iter()
+                .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                .map(|r| r.amount)
+                .unwrap_or(0);
             tracing::info!(
                 secondary = %secondary_id,
                 workers = worker_count,
@@ -227,7 +233,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
             );
 
             let conn = SecondaryConnection::new(secondary_id.clone());
-            let conn = conn.receive_welcome(worker_count, ram_bytes, hostname, 0, None);
+            let conn = conn.receive_welcome(worker_count, resources, hostname, 0, None);
             self.secondaries.insert(
                 secondary_id,
                 SecondaryConnectionState::Handshaking(conn),
@@ -342,10 +348,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
         for secondary_id in &secondary_ids {
             let state = self.secondaries.get(secondary_id).unwrap();
             let num_workers = state.num_workers();
-            let ram_bytes = state.ram_bytes();
+            let ram_bytes = state.resources().iter()
+                .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                .map(|r| r.amount)
+                .unwrap_or(0);
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram_bytes)]);
 
             for local_idx in 0..num_workers {
-                let budget = self.scheduler.initial_budget(local_idx, ram_bytes);
+                let budget_map = self.scheduler.initial_budget(local_idx, &max_res);
+                let budget = budget_map.get(db_comm_api_base::ResourceKind::Memory);
                 self.workers.push(RemoteWorkerState {
                     worker_id: global_worker_id,
                     secondary_id: secondary_id.clone(),
@@ -368,20 +379,23 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
 
         for worker_idx in 0..self.workers.len() {
             let worker_info = self.workers[worker_idx].budget_info();
+            let total_assigned_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, total_assigned_memory)]);
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.workers[worker_idx].memory_budget)]);
             let decision = self.scheduler.assign_initial(
                 &worker_info,
                 &self.pending_binaries,
-                total_assigned_memory,
-                self.workers[worker_idx].memory_budget,
+                &total_assigned_res,
+                &max_res,
                 &self.estimator,
             );
 
             if let AssignmentDecision::Assign {
                 binary_index,
-                estimated_memory,
+                estimated_usage,
                 ..
             } = decision
             {
+                let estimated_memory = estimated_usage.get(db_comm_api_base::ResourceKind::Memory);
                 let binary = self.pending_binaries.remove(binary_index);
                 total_assigned_memory += estimated_memory;
 
@@ -422,7 +436,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
                 .iter()
                 .map(|(worker_id, _, est_mem)| WorkerReadyInfo {
                     worker_id: *worker_id,
-                    memory_budget: *est_mem,
+                    resource_budgets: vec![db_comm_api_base::ResourceAmount {
+                        kind: db_comm_api_base::ResourceKind::Memory,
+                        amount: *est_mem,
+                    }],
                 })
                 .collect();
 
@@ -615,10 +632,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
         if let DistributedMessage::TaskRequest {
             ref secondary_id,
             worker_id,
-            available_memory,
+            ref available_resources,
             ..
         } = msg
         {
+            let available_memory = available_resources.iter()
+                .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                .map(|r| r.amount)
+                .unwrap_or(0);
             // Find matching worker
             let mut target_idx = None;
             let mut local_idx: u32 = 0;
@@ -648,22 +669,24 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: MemoryEstimator, I: Identifie
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
                         self.workers.iter().map(|w| w.budget_info()).collect();
+                    let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.workers[idx].memory_budget)]);
 
                     let decision = self.scheduler.assign_normal(
                         &worker_info,
                         &all_infos,
                         &self.pending_binaries,
-                        self.workers[idx].memory_budget,
+                        &max_res,
                         &self.estimator,
                         false,
                     );
 
                     if let AssignmentDecision::Assign {
                         binary_index,
-                        estimated_memory,
+                        estimated_usage,
                         ..
                     } = decision
                     {
+                        let estimated_memory = estimated_usage.get(db_comm_api_base::ResourceKind::Memory);
                         let binary = self.pending_binaries.remove(binary_index);
                         let sec_id = self.workers[idx].secondary_id.clone();
                         self.workers[idx].current_task = Some(binary.clone());
@@ -822,7 +845,7 @@ fn compute_task_hash<I: Identifier>(binary: &BinaryInfo<I>) -> String {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use db_scheduler_impl::MemoryStealingScheduler;
+    use db_scheduler_impl::ResourceStealingScheduler;
     use tokio::sync::mpsc as tokio_mpsc;
 
     /// Minimal test identifier.
@@ -831,9 +854,9 @@ mod tests {
 
     #[derive(Clone)]
     struct FixedEstimator(u64);
-    impl MemoryEstimator for FixedEstimator {
-        fn estimate_memory(&self, _size: u64) -> MemoryBytes {
-            self.0
+    impl ResourceEstimator for FixedEstimator {
+        fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
+            db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
         }
     }
 
@@ -861,7 +884,10 @@ mod tests {
                 sender_id: secondary_id.clone(),
                 timestamp: 0.0,
                 secondary_id: secondary_id.clone(),
-                ram_bytes,
+                resources: vec![db_comm_api_base::ResourceAmount {
+                    kind: db_comm_api_base::ResourceKind::Memory,
+                    amount: ram_bytes,
+                }],
                 worker_count: num_workers,
                 hostname: "test-host".into(),
             })
@@ -897,8 +923,7 @@ mod tests {
                                     secondary_id: secondary_id.clone(),
                                     worker_id: 0,
                                     task_hash: entry.hash.clone(),
-                                    warnings: 0,
-                                    filtered: 0,
+                                    result_data: None,
                                 })
                                 .unwrap();
 
@@ -909,7 +934,10 @@ mod tests {
                                     timestamp: 0.0,
                                     secondary_id: secondary_id.clone(),
                                     worker_id: 0,
-                                    available_memory: ram_bytes,
+                                    available_resources: vec![db_comm_api_base::ResourceAmount {
+                                        kind: db_comm_api_base::ResourceKind::Memory,
+                                        amount: ram_bytes,
+                                    }],
                                 })
                                 .unwrap();
                         }
@@ -925,8 +953,7 @@ mod tests {
                             secondary_id: secondary_id.clone(),
                             worker_id: 0,
                             task_hash: file_hash,
-                            warnings: 0,
-                            filtered: 0,
+                            result_data: None,
                         })
                         .unwrap();
 
@@ -937,7 +964,10 @@ mod tests {
                             timestamp: 0.0,
                             secondary_id: secondary_id.clone(),
                             worker_id: 0,
-                            available_memory: ram_bytes,
+                            available_resources: vec![db_comm_api_base::ResourceAmount {
+                                kind: db_comm_api_base::ResourceKind::Memory,
+                                amount: ram_bytes,
+                            }],
                         })
                         .unwrap();
                 }
@@ -986,7 +1016,7 @@ mod tests {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                MemoryStealingScheduler,
+                ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 
@@ -1029,7 +1059,7 @@ mod tests {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                MemoryStealingScheduler,
+                ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 
@@ -1085,11 +1115,10 @@ mod tests {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
-                        Some(Command::ProcessBinary { .. }) => {
+                        Some(Command::ProcessTask { .. }) => {
                             let _ = runner
                                 .send(Response::Done {
-                                    warnings: 0,
-                                    filtered: 0,
+                                    result_data: None,
                                 })
                                 .await;
                         }
@@ -1137,7 +1166,7 @@ mod tests {
                 config,
                 transport,
                 NoPeers,
-                MemoryStealingScheduler,
+                ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
             let mut factory = FakeWorkerFactory;
@@ -1186,7 +1215,7 @@ mod tests {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                MemoryStealingScheduler,
+                ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 
@@ -1253,7 +1282,7 @@ mod tests {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                MemoryStealingScheduler,
+                ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
 

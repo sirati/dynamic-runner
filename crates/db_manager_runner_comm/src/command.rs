@@ -3,15 +3,14 @@ use db_comm_api_base::ErrorType;
 #[derive(Debug, Clone)]
 pub enum Command {
     Stop,
-    ProcessBinary { relative_path: String },
+    ProcessTask { relative_path: String },
 }
 
 #[derive(Debug, Clone)]
 pub enum Response {
     Ready,
     Done {
-        warnings: u32,
-        filtered: u32,
+        result_data: Option<Vec<u8>>,
     },
     Error {
         error_type: ErrorType,

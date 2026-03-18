@@ -4,12 +4,12 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use db_comm_api_base::{BinaryInfo, MemoryBytes, MessageReceiver, MessageSender};
+use db_comm_api_base::{BinaryInfo, MessageReceiver, MessageSender};
 use db_distributed_manager::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use db_local_manager::WorkerFactory;
 use db_manager_runner_comm::{Command, Response};
-use db_scheduler_api::MemoryEstimator;
-use db_scheduler_impl::MemoryStealingScheduler;
+use db_scheduler_api::ResourceEstimator;
+use db_scheduler_impl::ResourceStealingScheduler;
 use db_transport_channel::{channel_pair, ChannelManagerEnd};
 use db_transport_quic::{NetworkClient, NetworkServer, NoPeerTransport};
 use serde::{Deserialize, Serialize};
@@ -23,9 +23,9 @@ struct TestId {
 
 #[derive(Clone)]
 struct FixedEstimator(u64);
-impl MemoryEstimator for FixedEstimator {
-    fn estimate_memory(&self, _size: u64) -> MemoryBytes {
-        self.0
+impl ResourceEstimator for FixedEstimator {
+    fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
     }
 }
 
@@ -48,11 +48,10 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
             loop {
                 match MessageReceiver::<Command>::recv(&mut runner).await {
                     Some(Command::Stop) => break,
-                    Some(Command::ProcessBinary { .. }) => {
+                    Some(Command::ProcessTask { .. }) => {
                         let _ = runner
                             .send(Response::Done {
-                                warnings: 0,
-                                filtered: 0,
+                                result_data: None,
                             })
                             .await;
                     }
@@ -101,7 +100,7 @@ async fn e2e_primary_secondary_over_wss() {
                     config,
                     client,
                     NoPeerTransport,
-                    MemoryStealingScheduler,
+                    ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
             let mut factory = FakeWorkerFactory;
@@ -120,7 +119,7 @@ async fn e2e_primary_secondary_over_wss() {
         let mut primary = PrimaryCoordinator::new(
             config,
             server,
-            MemoryStealingScheduler,
+            ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
 
@@ -190,7 +189,7 @@ async fn e2e_primary_secondary_over_quic() {
                     config,
                     client,
                     NoPeerTransport,
-                    MemoryStealingScheduler,
+                    ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
             let mut factory = FakeWorkerFactory;
@@ -209,7 +208,7 @@ async fn e2e_primary_secondary_over_quic() {
         let mut primary = PrimaryCoordinator::new(
             config,
             server,
-            MemoryStealingScheduler,
+            ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
 

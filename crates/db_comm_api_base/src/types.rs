@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::path::PathBuf;
@@ -6,6 +8,84 @@ use serde::{Deserialize, Serialize};
 
 pub type WorkerId = u32;
 pub type MemoryBytes = u64;
+
+/// A kind of resource that can be scheduled and monitored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub enum ResourceKind {
+    Memory,
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceKind::Memory => write!(f, "memory"),
+        }
+    }
+}
+
+/// A quantity of a specific resource.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceAmount {
+    pub kind: ResourceKind,
+    pub amount: u64,
+}
+
+/// A map of resource kinds to quantities.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResourceMap(BTreeMap<ResourceKind, u64>);
+
+impl ResourceMap {
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub fn get(&self, kind: ResourceKind) -> u64 {
+        self.0.get(&kind).copied().unwrap_or(0)
+    }
+
+    pub fn insert(&mut self, kind: ResourceKind, amount: u64) {
+        self.0.insert(kind, amount);
+    }
+
+    pub fn contains_key(&self, kind: ResourceKind) -> bool {
+        self.0.contains_key(&kind)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (ResourceKind, u64)> + '_ {
+        self.0.iter().map(|(&k, &v)| (k, v))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<const N: usize> From<[(ResourceKind, u64); N]> for ResourceMap {
+    fn from(arr: [(ResourceKind, u64); N]) -> Self {
+        Self(BTreeMap::from(arr))
+    }
+}
+
+impl FromIterator<(ResourceKind, u64)> for ResourceMap {
+    fn from_iter<T: IntoIterator<Item = (ResourceKind, u64)>>(iter: T) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl fmt::Display for ResourceMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        write!(f, "{{")?;
+        for (kind, amount) in self.iter() {
+            if !first {
+                write!(f, ", ")?;
+            }
+            write!(f, "{kind}: {amount}")?;
+            first = false;
+        }
+        write!(f, "}}")
+    }
+}
 
 /// Trait alias for types that can serve as a binary identifier.
 ///
@@ -38,9 +118,11 @@ pub struct BinaryInfo<I> {
     pub identifier: I,
 }
 
+pub type TaskInput<I> = BinaryInfo<I>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorType {
-    OutOfMemory,
+    ResourceExhausted(ResourceKind),
     NonRecoverable,
     Recoverable,
 }
@@ -48,7 +130,7 @@ pub enum ErrorType {
 impl ErrorType {
     pub fn wire_value(&self) -> &'static str {
         match self {
-            ErrorType::OutOfMemory => "oom",
+            ErrorType::ResourceExhausted(ResourceKind::Memory) => "oom",
             ErrorType::NonRecoverable => "non_recoverable",
             ErrorType::Recoverable => "recoverable",
         }
@@ -56,7 +138,9 @@ impl ErrorType {
 
     pub fn from_wire(s: &str) -> Option<Self> {
         match s {
-            "oom" => Some(ErrorType::OutOfMemory),
+            "oom" | "resource_exhausted:memory" => {
+                Some(ErrorType::ResourceExhausted(ResourceKind::Memory))
+            }
             "non_recoverable" => Some(ErrorType::NonRecoverable),
             "recoverable" => Some(ErrorType::Recoverable),
             _ => None,
@@ -114,7 +198,7 @@ mod tests {
     #[test]
     fn error_type_wire_roundtrip() {
         for et in [
-            ErrorType::OutOfMemory,
+            ErrorType::ResourceExhausted(ResourceKind::Memory),
             ErrorType::NonRecoverable,
             ErrorType::Recoverable,
         ] {
@@ -130,6 +214,12 @@ mod tests {
     }
 
     #[test]
+    fn error_type_from_wire_forward_compat() {
+        let parsed = ErrorType::from_wire("resource_exhausted:memory").unwrap();
+        assert_eq!(parsed, ErrorType::ResourceExhausted(ResourceKind::Memory));
+    }
+
+    #[test]
     fn task_result_ok() {
         let r = TaskResult::ok(3, 5);
         assert!(r.success);
@@ -140,9 +230,15 @@ mod tests {
 
     #[test]
     fn task_result_error() {
-        let r = TaskResult::error(ErrorType::OutOfMemory, "out of memory".into());
+        let r = TaskResult::error(
+            ErrorType::ResourceExhausted(ResourceKind::Memory),
+            "out of memory".into(),
+        );
         assert!(!r.success);
-        assert_eq!(r.error_type, Some(ErrorType::OutOfMemory));
+        assert_eq!(
+            r.error_type,
+            Some(ErrorType::ResourceExhausted(ResourceKind::Memory))
+        );
     }
 
     #[test]
@@ -154,5 +250,29 @@ mod tests {
         };
         assert_eq!(bi.size, 1024);
         assert_eq!(bi.identifier.0, "test-binary");
+    }
+
+    #[test]
+    fn resource_map_basic() {
+        let mut map = ResourceMap::new();
+        assert!(map.is_empty());
+        assert_eq!(map.get(ResourceKind::Memory), 0);
+
+        map.insert(ResourceKind::Memory, 1024);
+        assert!(!map.is_empty());
+        assert_eq!(map.get(ResourceKind::Memory), 1024);
+        assert!(map.contains_key(ResourceKind::Memory));
+    }
+
+    #[test]
+    fn resource_map_from_array() {
+        let map = ResourceMap::from([(ResourceKind::Memory, 2048)]);
+        assert_eq!(map.get(ResourceKind::Memory), 2048);
+    }
+
+    #[test]
+    fn resource_map_display() {
+        let map = ResourceMap::from([(ResourceKind::Memory, 1024)]);
+        assert_eq!(format!("{map}"), "{memory: 1024}");
     }
 }

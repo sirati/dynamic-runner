@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use db_comm_api_base::ResourceAmount;
 use db_transport_quic::QuicConnection;
 
 // ── ZST State Markers ──
@@ -20,7 +21,7 @@ pub struct ShuttingDown;
 pub struct SecondaryConnection<S> {
     pub secondary_id: String,
     pub num_workers: u32,
-    pub ram_bytes: u64,
+    pub resources: Vec<ResourceAmount>,
     pub hostname: String,
     pub quic_port: u16,
     pub cert_pem: Option<String>,
@@ -36,7 +37,7 @@ impl SecondaryConnection<AwaitingWelcome> {
         Self {
             secondary_id,
             num_workers: 0,
-            ram_bytes: 0,
+            resources: Vec::new(),
             hostname: String::new(),
             quic_port: 0,
             cert_pem: None,
@@ -51,20 +52,20 @@ impl SecondaryConnection<AwaitingWelcome> {
     pub fn receive_welcome(
         mut self,
         num_workers: u32,
-        ram_bytes: u64,
+        resources: Vec<ResourceAmount>,
         hostname: String,
         quic_port: u16,
         cert_pem: Option<String>,
     ) -> SecondaryConnection<Handshaking> {
         self.num_workers = num_workers;
-        self.ram_bytes = ram_bytes;
+        self.resources = resources;
         self.hostname = hostname;
         self.quic_port = quic_port;
         self.cert_pem = cert_pem;
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
-            ram_bytes: self.ram_bytes,
+            resources: self.resources,
             hostname: self.hostname,
             quic_port: self.quic_port,
             cert_pem: self.cert_pem,
@@ -92,7 +93,7 @@ impl SecondaryConnection<Handshaking> {
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
-            ram_bytes: self.ram_bytes,
+            resources: self.resources,
             hostname: self.hostname,
             quic_port: self.quic_port,
             cert_pem: self.cert_pem,
@@ -110,7 +111,7 @@ impl SecondaryConnection<CertExchanging> {
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
-            ram_bytes: self.ram_bytes,
+            resources: self.resources,
             hostname: self.hostname,
             quic_port: self.quic_port,
             cert_pem: self.cert_pem,
@@ -128,7 +129,7 @@ impl SecondaryConnection<PeerDiscovery> {
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
-            ram_bytes: self.ram_bytes,
+            resources: self.resources,
             hostname: self.hostname,
             quic_port: self.quic_port,
             cert_pem: self.cert_pem,
@@ -146,7 +147,7 @@ impl SecondaryConnection<InitialAssigning> {
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
-            ram_bytes: self.ram_bytes,
+            resources: self.resources,
             hostname: self.hostname,
             quic_port: self.quic_port,
             cert_pem: self.cert_pem,
@@ -164,7 +165,7 @@ impl SecondaryConnection<Operational> {
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
-            ram_bytes: self.ram_bytes,
+            resources: self.resources,
             hostname: self.hostname,
             quic_port: self.quic_port,
             cert_pem: self.cert_pem,
@@ -226,15 +227,15 @@ impl SecondaryConnectionState {
         }
     }
 
-    pub fn ram_bytes(&self) -> u64 {
+    pub fn resources(&self) -> &[ResourceAmount] {
         match self {
-            Self::AwaitingWelcome(c) => c.ram_bytes,
-            Self::Handshaking(c) => c.ram_bytes,
-            Self::CertExchanging(c) => c.ram_bytes,
-            Self::PeerDiscovery(c) => c.ram_bytes,
-            Self::InitialAssigning(c) => c.ram_bytes,
-            Self::Operational(c) => c.ram_bytes,
-            Self::ShuttingDown(c) => c.ram_bytes,
+            Self::AwaitingWelcome(c) => &c.resources,
+            Self::Handshaking(c) => &c.resources,
+            Self::CertExchanging(c) => &c.resources,
+            Self::PeerDiscovery(c) => &c.resources,
+            Self::InitialAssigning(c) => &c.resources,
+            Self::Operational(c) => &c.resources,
+            Self::ShuttingDown(c) => &c.resources,
         }
     }
 
@@ -313,7 +314,13 @@ mod tests {
         let conn = SecondaryConnection::new("sec-0".into());
         assert_eq!(conn.id(), "sec-0");
 
-        let conn = conn.receive_welcome(4, 16 * 1024 * 1024 * 1024, "node1".into(), 5000, None);
+        let conn = conn.receive_welcome(
+            4,
+            vec![ResourceAmount { kind: db_comm_api_base::ResourceKind::Memory, amount: 16 * 1024 * 1024 * 1024 }],
+            "node1".into(),
+            5000,
+            None,
+        );
         assert_eq!(conn.num_workers, 4);
 
         let conn = conn.receive_cert_exchange("CERT".into(), Some("10.0.0.1".into()), None, 5001);

@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 
 use db_comm_api_base::{BinaryInfo, Identifier, WorkerId};
 use db_manager_runner_comm::ManagerEndpoint;
-use db_local_manager::pool::{OomKillResult, WorkerPool};
+use db_local_manager::pool::{ResourcePressureResult, WorkerPool};
 use db_local_manager::worker::WorkerEvent;
 use db_local_manager::WorkerFactory;
 use db_primary_secondary_comm::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, PrimaryTransport,
     TaskInfo,
 };
-use db_scheduler_api::{MemoryEstimator, Scheduler};
+use db_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::zip_extract::ExtractionCache;
 
@@ -73,7 +73,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint,
     S: Scheduler<I>,
-    E: MemoryEstimator,
+    E: ResourceEstimator,
     I: Identifier,
 {
     config: SecondaryConfig,
@@ -120,7 +120,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: MemoryEstimator + Clone,
+    E: ResourceEstimator + Clone,
     I: Identifier,
 {
     pub fn new(
@@ -206,11 +206,16 @@ where
         Ok(())
     }
 
+    fn max_resources(&self) -> db_comm_api_base::ResourceMap {
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.config.ram_bytes)])
+    }
+
     async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
+        let max = self.max_resources();
         self.pool
             .initialize(
                 self.config.num_workers,
-                self.config.ram_bytes,
+                &max,
                 &self.scheduler,
                 factory,
                 false,
@@ -223,7 +228,10 @@ where
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
-            ram_bytes: self.config.ram_bytes,
+            resources: vec![db_comm_api_base::ResourceAmount {
+                kind: db_comm_api_base::ResourceKind::Memory,
+                amount: self.config.ram_bytes,
+            }],
             worker_count: self.config.num_workers,
             hostname: self.config.hostname.clone(),
         };
@@ -351,7 +359,7 @@ where
                 None => distributed_to_binary(&binary_info),
             };
 
-            let estimated = self.estimator.estimate_memory(binary.size);
+            let estimated = self.estimator.estimate(binary.size).get(db_comm_api_base::ResourceKind::Memory);
 
             if (wid as usize) < self.pool.workers.len() && self.pool.workers[wid as usize].is_idle_state() {
                 match self.pool.workers[wid as usize]
@@ -433,7 +441,7 @@ where
                     self.check_peer_timeouts();
                 }
                 _ = oom_interval.tick() => {
-                    self.check_oom(factory).await;
+                    self.check_resource_pressure(factory).await;
                 }
             }
 
@@ -574,9 +582,10 @@ where
     ///
     /// Delegates to `WorkerPool::check_oom`, then reports the killed task
     /// to primary, restarts the worker, and requests a new task.
-    async fn check_oom(&mut self, factory: &mut impl WorkerFactory<M>) {
-        match self.pool.check_oom(&self.scheduler, self.config.ram_bytes, false) {
-            OomKillResult::Killed {
+    async fn check_resource_pressure(&mut self, factory: &mut impl WorkerFactory<M>) {
+        let max = self.max_resources();
+        match self.pool.check_resource_pressure(&self.scheduler, &max, false) {
+            ResourcePressureResult::Killed {
                 worker_id,
                 reason,
                 ..
@@ -608,7 +617,7 @@ where
                 self.pool.restart_worker(worker_id, factory, false).await;
                 let _ = self.request_task_for_worker(worker_id).await;
             }
-            OomKillResult::NoAction => {}
+            ResourcePressureResult::NoAction => {}
         }
     }
 
@@ -651,8 +660,7 @@ where
                             secondary_id: self.config.secondary_id.clone(),
                             worker_id,
                             task_hash: hash.clone(),
-                            warnings: result.warnings,
-                            filtered: result.filtered,
+                            result_data: None,
                         };
                         self.primary_transport.send(msg.clone()).await?;
                         // Broadcast to peers
@@ -799,7 +807,10 @@ where
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
             worker_id,
-            available_memory,
+            available_resources: vec![db_comm_api_base::ResourceAmount {
+                kind: db_comm_api_base::ResourceKind::Memory,
+                amount: available_memory,
+            }],
         };
         self.last_request_time.insert(worker_id, now);
 
@@ -841,7 +852,7 @@ where
                     },
                     None => distributed_to_binary(&binary_info),
                 };
-                let estimated = self.estimator.estimate_memory(binary.size);
+                let estimated = self.estimator.estimate(binary.size).get(db_comm_api_base::ResourceKind::Memory);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
 
                 // Find the target worker — prefer the requested one, fall back to any idle
@@ -938,9 +949,13 @@ where
             DistributedMessage::TaskRequest {
                 secondary_id,
                 worker_id,
-                available_memory,
+                available_resources,
                 ..
             } if self.is_slurm_primary => {
+                let available_memory = available_resources.iter()
+                    .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                    .map(|r| r.amount)
+                    .unwrap_or(0);
                 self.handle_slurm_task_request(secondary_id, worker_id, available_memory)
                     .await
             }
@@ -1031,7 +1046,7 @@ where
         // Find a task that fits the available memory
         let mut assigned_idx = None;
         for (i, binary) in self.slurm_pending_binaries.iter().enumerate() {
-            let estimated = self.estimator.estimate_memory(binary.size);
+            let estimated = self.estimator.estimate(binary.size).get(db_comm_api_base::ResourceKind::Memory);
             if estimated <= available_memory {
                 assigned_idx = Some(i);
                 break;
@@ -1062,7 +1077,7 @@ where
                     },
                     None => binary.clone(),
                 };
-                let estimated = self.estimator.estimate_memory(actual_binary.size);
+                let estimated = self.estimator.estimate(actual_binary.size).get(db_comm_api_base::ResourceKind::Memory);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
                 if self.pool.workers[wid as usize].is_idle_state() {
                     match self.pool.workers[wid as usize]
@@ -1137,7 +1152,7 @@ mod tests {
     use super::*;
     use db_comm_api_base::{MessageReceiver, MessageSender};
     use db_manager_runner_comm::{Command, Response};
-    use db_scheduler_impl::MemoryStealingScheduler;
+    use db_scheduler_impl::ResourceStealingScheduler;
     use db_transport_channel::{channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd};
     use serde::{Deserialize, Serialize};
     use tokio::sync::mpsc as tokio_mpsc;
@@ -1148,9 +1163,9 @@ mod tests {
 
     #[derive(Clone)]
     struct FixedEstimator(u64);
-    impl MemoryEstimator for FixedEstimator {
-        fn estimate_memory(&self, _size: u64) -> db_comm_api_base::MemoryBytes {
-            self.0
+    impl ResourceEstimator for FixedEstimator {
+        fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
+            db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
         }
     }
 
@@ -1194,11 +1209,10 @@ mod tests {
                 loop {
                     match MessageReceiver::<Command>::recv(&mut runner).await {
                         Some(Command::Stop) => break,
-                        Some(Command::ProcessBinary { .. }) => {
+                        Some(Command::ProcessTask { .. }) => {
                             let _ = runner
                                 .send(Response::Done {
-                                    warnings: 0,
-                                    filtered: 0,
+                                    result_data: None,
                                 })
                                 .await;
                         }
@@ -1373,7 +1387,7 @@ mod tests {
                     config,
                     transport,
                     NoPeers,
-                    MemoryStealingScheduler,
+                    ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
 
@@ -1428,7 +1442,7 @@ mod tests {
                     config,
                     transport,
                     NoPeers,
-                    MemoryStealingScheduler,
+                    ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
 

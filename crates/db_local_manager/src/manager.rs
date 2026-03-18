@@ -2,26 +2,29 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, FailedTask, Identifier, MemoryBytes, TaskResult, WorkerId,
+    BinaryInfo, ErrorType, FailedTask, Identifier, MemoryBytes, ResourceKind, ResourceMap, TaskResult, WorkerId,
 };
 use db_manager_runner_comm::ManagerEndpoint;
 use db_scheduler_api::{
-    AssignmentDecision, MemoryEstimator, ProcessingPhase, Scheduler,
+    AssignmentDecision, ResourceEstimator, ProcessingPhase, Scheduler,
 };
-use crate::pool::{OomKillResult, WorkerPool};
+use crate::pool::{ResourcePressureResult, WorkerPool};
 use crate::stats::ProcessingStats;
 use crate::worker::WorkerEvent;
 
 /// Configuration for the local manager.
 pub struct LocalManagerConfig {
     pub num_workers: u32,
-    pub max_memory: MemoryBytes,
+    pub max_resources: ResourceMap,
     pub always_restart_worker: bool,
     pub print_pid: bool,
     pub memuse_log_path: Option<std::path::PathBuf>,
     /// Phase name → timeout duration. If a worker is in a phase with a timeout
     /// and hasn't sent a keepalive within that duration, it is killed and restarted.
     pub stage_timeouts: HashMap<String, Duration>,
+    /// Minimum free system resources below which unassigned tasks are skipped.
+    /// Default: Memory → 300MB.
+    pub low_resource_thresholds: ResourceMap,
 }
 
 /// Callback trait for spawning/restarting worker transports.
@@ -41,7 +44,7 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
 /// real sockets and in-process channels for testing.
 /// Generic over `I` (the identifier type) so different task definitions
 /// can use different identifier structures.
-pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator, I: Identifier = ()> {
+pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimator, I: Identifier = ()> {
     config: LocalManagerConfig,
     scheduler: S,
     estimator: E,
@@ -56,7 +59,7 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: MemoryEstimator,
     stats: ProcessingStats,
 }
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
     pub fn new(config: LocalManagerConfig, scheduler: S, estimator: E) -> Self {
         Self {
             config,
@@ -97,9 +100,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
         self.stats.completed = 0;
         self.stats.errored = 0;
 
+        let max_mem_mb = self.config.max_resources.get(ResourceKind::Memory) / (1024 * 1024);
         tracing::info!(
             num_workers = self.config.num_workers,
-            max_memory_mb = self.config.max_memory / (1024 * 1024),
+            max_memory_mb = max_mem_mb,
             total = self.stats.total,
             "starting processing"
         );
@@ -123,11 +127,16 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
 
     // ── Initialization ──
 
+    fn max_resources(&self) -> &ResourceMap {
+        &self.config.max_resources
+    }
+
     async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
+        let max = self.config.max_resources.clone();
         self.pool
             .initialize(
                 self.config.num_workers,
-                self.config.max_memory,
+                &max,
                 &self.scheduler,
                 factory,
                 self.config.print_pid,
@@ -180,21 +189,24 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
 
     async fn try_assign_initial(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
+        let max = self.max_resources();
+        let total_assigned = ResourceMap::from([(ResourceKind::Memory, self.total_assigned_memory)]);
         let decision = self.scheduler.assign_initial(
             &worker_info,
             &self.pending_binaries,
-            self.total_assigned_memory,
-            self.config.max_memory,
+            &total_assigned,
+            max,
             &self.estimator,
         );
 
         match decision {
             AssignmentDecision::Assign {
                 binary_index,
-                estimated_memory,
+                estimated_usage,
                 opportunistic,
                 ..
             } => {
+                let estimated_memory = estimated_usage.get(ResourceKind::Memory);
                 let binary = self.pending_binaries.remove(binary_index);
                 self.total_assigned_memory += estimated_memory;
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -314,7 +326,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
         let mut active_workers: HashSet<WorkerId> = HashSet::new();
         active_workers.insert(0);
 
-        self.process_worker_loop(&mut active_workers, false, false, ProcessingPhase::OomPhase, factory)
+        self.process_worker_loop(&mut active_workers, false, false, ProcessingPhase::ResourcePressurePhase, factory)
             .await;
 
         self.in_oom_phase = false;
@@ -342,12 +354,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
         // Sort by size (smallest first) matching Python behavior
         self.unassigned_tasks.sort_by_key(|b| b.size);
 
-        // Filter out binaries if free system memory is critically low (< 300MB)
-        const LOW_MEMORY_THRESHOLD: u64 = 300 * 1024 * 1024;
+        let low_mem_threshold = self.config.low_resource_thresholds.get(ResourceKind::Memory);
         let mut kept = Vec::new();
         for task in self.unassigned_tasks.drain(..) {
             let free_mem = Self::get_free_system_memory();
-            if free_mem > 0 && free_mem < LOW_MEMORY_THRESHOLD {
+            if free_mem > 0 && free_mem < low_mem_threshold {
                 let name = task.path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
@@ -434,7 +445,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
                     // Periodic maintenance: OOM checks, memory updates, timeouts
                     self.pool.update_all_memory_usage();
                     if !self.pending_binaries.is_empty() {
-                        self.check_oom();
+                        self.check_resource_pressure();
                     }
                     self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
                 }
@@ -462,7 +473,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
                 for binary in remaining {
                     self.oom_tasks.push(FailedTask {
                         binary,
-                        error_type: ErrorType::OutOfMemory,
+                        error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
                         error_message: "Could not fit in any worker budget".into(),
                         retry_count: 0,
                     });
@@ -523,11 +534,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
         // Synchronous decision, async assign handled via pending_worker_assignments
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
+        let max = self.max_resources();
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
             &self.pending_binaries,
-            self.config.max_memory,
+            max,
             &self.estimator,
             false,
         );
@@ -548,7 +560,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
                     &worker_info,
                     &all_infos,
                     &self.pending_binaries,
-                    self.config.max_memory,
+                    max,
                     &self.estimator,
                     true,
                 );
@@ -583,11 +595,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
     async fn try_assign_normal(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
+        let max = self.max_resources();
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
             &self.pending_binaries,
-            self.config.max_memory,
+            max,
             &self.estimator,
             false,
         );
@@ -595,10 +608,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
         match decision {
             AssignmentDecision::Assign {
                 binary_index,
-                estimated_memory,
+                estimated_usage,
                 opportunistic,
                 ..
             } => {
+                let estimated_memory = estimated_usage.get(ResourceKind::Memory);
                 let binary = self.pending_binaries.remove(binary_index);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let worker = &mut self.pool.workers[worker_id as usize];
@@ -862,11 +876,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
             self.stats.completed += 1;
         } else {
             match result.error_type {
-                Some(ErrorType::OutOfMemory) => {
+                Some(ErrorType::ResourceExhausted(ResourceKind::Memory)) => {
                     if let Some(binary) = binary {
                         self.oom_tasks.push(FailedTask {
                             binary: binary.clone(),
-                            error_type: ErrorType::OutOfMemory,
+                            error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
                             error_message: result
                                 .error_message
                                 .clone()
@@ -962,9 +976,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
         }
     }
 
-    fn check_oom(&mut self) {
-        match self.pool.check_oom(&self.scheduler, self.config.max_memory, self.in_oom_phase) {
-            OomKillResult::Killed {
+    fn check_resource_pressure(&mut self) {
+        let max = self.config.max_resources.clone();
+        match self.pool.check_resource_pressure(&self.scheduler, &max, self.in_oom_phase) {
+            ResourcePressureResult::Killed {
                 worker_id,
                 binary,
                 reason,
@@ -976,7 +991,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
                         // This happens even during OOM phase (matching Python).
                         self.oom_tasks.push(FailedTask {
                             binary,
-                            error_type: ErrorType::OutOfMemory,
+                            error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
                             error_message: reason,
                             retry_count: 0,
                         });
@@ -990,7 +1005,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: MemoryEstimator, I: Ident
                     // matching Python's behavior where _handle_oom_killed_task is skipped.
                 }
             }
-            OomKillResult::NoAction => {}
+            ResourcePressureResult::NoAction => {}
         }
     }
 
@@ -1029,7 +1044,7 @@ mod tests {
     use super::*;
     use db_comm_api_base::{MessageReceiver, MessageSender};
     use db_manager_runner_comm::{Command, Response};
-    use db_scheduler_impl::MemoryStealingScheduler;
+    use db_scheduler_impl::ResourceStealingScheduler;
     use db_transport_channel::{ChannelManagerEnd, channel_pair};
     use serde::{Deserialize, Serialize};
 
@@ -1038,9 +1053,9 @@ mod tests {
     struct TestId(String);
 
     struct FixedEstimator(u64);
-    impl MemoryEstimator for FixedEstimator {
-        fn estimate_memory(&self, _binary_size: u64) -> MemoryBytes {
-            self.0
+    impl ResourceEstimator for FixedEstimator {
+        fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
+            db_comm_api_base::ResourceMap::from([(ResourceKind::Memory, self.0)])
         }
     }
 
@@ -1088,21 +1103,20 @@ mod tests {
         loop {
             match MessageReceiver::<Command>::recv(&mut runner).await {
                 Some(Command::Stop) => break,
-                Some(Command::ProcessBinary { .. }) => {
+                Some(Command::ProcessTask { .. }) => {
                     task_count += 1;
                     match &mode {
                         FakeWorkerMode::AlwaysSucceed => {
                             let _ = runner
                                 .send(Response::Done {
-                                    warnings: 0,
-                                    filtered: 0,
+                                    result_data: None,
                                 })
                                 .await;
                         }
                         FakeWorkerMode::AlwaysOom => {
                             let _ = runner
                                 .send(Response::Error {
-                                    error_type: ErrorType::OutOfMemory,
+                                    error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
                                     message: "out of memory".into(),
                                 })
                                 .await;
@@ -1118,8 +1132,7 @@ mod tests {
                             } else {
                                 let _ = runner
                                     .send(Response::Done {
-                                        warnings: 0,
-                                        filtered: 0,
+                                        result_data: None,
                                     })
                                     .await;
                             }
@@ -1134,11 +1147,12 @@ mod tests {
     fn test_config(num_workers: u32) -> LocalManagerConfig {
         LocalManagerConfig {
             num_workers,
-            max_memory: 1024 * 1024 * 1024, // 1GB
+            max_resources: ResourceMap::from([(ResourceKind::Memory, 1024 * 1024 * 1024)]), // 1GB
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: HashMap::new(),
+            low_resource_thresholds: ResourceMap::from([(ResourceKind::Memory, 300 * 1024 * 1024)]),
         }
     }
 
@@ -1147,7 +1161,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
             let config = test_config(1);
-            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::AlwaysSucceed,
             };
@@ -1173,7 +1187,7 @@ mod tests {
         local.run_until(async {
             let config = test_config(3);
             let mut manager =
-                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+                LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::AlwaysSucceed,
             };
@@ -1195,7 +1209,7 @@ mod tests {
         local.run_until(async {
             let config = test_config(1);
             let mut manager =
-                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+                LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::FailThenSucceed,
             };
@@ -1215,7 +1229,7 @@ mod tests {
         local.run_until(async {
             let config = test_config(1);
             let mut manager =
-                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+                LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::AlwaysOom,
             };
@@ -1235,7 +1249,7 @@ mod tests {
         local.run_until(async {
             let config = test_config(1);
             let mut manager =
-                LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+                LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::AlwaysSucceed,
             };
@@ -1268,11 +1282,10 @@ mod tests {
                     loop {
                         match MessageReceiver::<Command>::recv(&mut runner).await {
                             Some(Command::Stop) => break,
-                            Some(Command::ProcessBinary { .. }) => {
+                            Some(Command::ProcessTask { .. }) => {
                                 let _ = runner
                                     .send(Response::Done {
-                                        warnings: 0,
-                                        filtered: 0,
+                                        result_data: None,
                                     })
                                     .await;
                             }
@@ -1292,7 +1305,7 @@ mod tests {
             let mut config = test_config(1);
             config.always_restart_worker = true;
 
-            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = CountingFactory {
                 spawn_count: spawn_count_clone,
             };
@@ -1328,14 +1341,15 @@ mod tests {
 
             let config = LocalManagerConfig {
                 num_workers: 1,
-                max_memory: 1024 * 1024 * 1024,
+                max_resources: ResourceMap::from([(ResourceKind::Memory, 1024 * 1024 * 1024)]),
                 always_restart_worker: false,
                 print_pid: false,
                 memuse_log_path: Some(memuse_path.clone()),
                 stage_timeouts: HashMap::new(),
+                low_resource_thresholds: ResourceMap::from([(ResourceKind::Memory, 300 * 1024 * 1024)]),
             };
 
-            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::AlwaysSucceed,
             };
@@ -1381,7 +1395,7 @@ mod tests {
                     loop {
                         match MessageReceiver::<Command>::recv(&mut runner).await {
                             Some(Command::Stop) => break,
-                            Some(Command::ProcessBinary { .. }) => {
+                            Some(Command::ProcessTask { .. }) => {
                                 if count == 0 {
                                     // First spawn: send NonRecoverable error (triggers disconnect)
                                     let _ = runner
@@ -1395,8 +1409,7 @@ mod tests {
                                     // Restarted worker: succeed
                                     let _ = runner
                                         .send(Response::Done {
-                                            warnings: 0,
-                                            filtered: 0,
+                                            result_data: None,
                                         })
                                         .await;
                                 }
@@ -1415,7 +1428,7 @@ mod tests {
             let spawn_count_clone = spawn_count.clone();
 
             let config = test_config(1);
-            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = RestartCountingFactory {
                 spawn_count: spawn_count_clone,
             };
@@ -1445,7 +1458,7 @@ mod tests {
         local.run_until(async {
             // 2 workers, 6 binaries: worker 0 always succeeds, worker 1 first OOM then succeed
             let config = test_config(2);
-            let mut manager = LocalManager::new(config, MemoryStealingScheduler, FixedEstimator(100));
+            let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
             let mut factory = FakeWorkerFactory {
                 mode: FakeWorkerMode::AlwaysSucceed,
             };

@@ -91,11 +91,12 @@ mod tests {
 
     #[test]
     fn roundtrip_secondary_welcome() {
+        use db_comm_api_base::{ResourceAmount, ResourceKind};
         let msg: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
             sender_id: "sec-2".into(),
             timestamp: 9999.0,
             secondary_id: "sec-2".into(),
-            ram_bytes: 8 * 1024 * 1024 * 1024,
+            resources: vec![ResourceAmount { kind: ResourceKind::Memory, amount: 8 * 1024 * 1024 * 1024 }],
             worker_count: 4,
             hostname: "node-01".into(),
         };
@@ -105,12 +106,12 @@ mod tests {
 
         match decoded {
             DistributedMessage::SecondaryWelcome {
-                ram_bytes,
+                resources,
                 worker_count,
                 hostname,
                 ..
             } => {
-                assert_eq!(ram_bytes, 8 * 1024 * 1024 * 1024);
+                assert_eq!(resources[0].amount, 8 * 1024 * 1024 * 1024);
                 assert_eq!(worker_count, 4);
                 assert_eq!(hostname, "node-01");
             }
@@ -271,12 +272,13 @@ mod tests {
 
     #[test]
     fn roundtrip_all_message_types() {
+        use db_comm_api_base::{ResourceAmount, ResourceKind};
         let messages: Vec<DistributedMessage<TestId>> = vec![
             DistributedMessage::SecondaryWelcome {
                 sender_id: "s".into(),
                 timestamp: 0.0,
                 secondary_id: "s".into(),
-                ram_bytes: 1024,
+                resources: vec![ResourceAmount { kind: ResourceKind::Memory, amount: 1024 }],
                 worker_count: 1,
                 hostname: "h".into(),
             },
@@ -311,7 +313,7 @@ mod tests {
                 timestamp: 0.0,
                 secondary_id: "s".into(),
                 worker_id: 0,
-                available_memory: 1024,
+                available_resources: vec![ResourceAmount { kind: ResourceKind::Memory, amount: 1024 }],
             },
             DistributedMessage::TaskAssignment {
                 sender_id: "p".into(),
@@ -351,8 +353,7 @@ mod tests {
                 secondary_id: "s".into(),
                 worker_id: 0,
                 task_hash: "h".into(),
-                warnings: 0,
-                filtered: 0,
+                result_data: None,
             },
             DistributedMessage::TaskFailed {
                 sender_id: "s".into(),

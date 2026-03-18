@@ -134,7 +134,7 @@ mod tests {
         let mut runner = unsafe { SocketpairRunnerEnd::from_raw_fd(child_fd).unwrap() };
 
         manager
-            .send(Command::ProcessBinary {
+            .send(Command::ProcessTask {
                 relative_path: "test/bin".into(),
             })
             .await
@@ -142,10 +142,10 @@ mod tests {
 
         let cmd = runner.recv().await.unwrap();
         match cmd {
-            Command::ProcessBinary { relative_path } => {
+            Command::ProcessTask { relative_path } => {
                 assert_eq!(relative_path, "test/bin");
             }
-            _ => panic!("expected ProcessBinary"),
+            _ => panic!("expected ProcessTask"),
         }
     }
 
@@ -156,17 +156,15 @@ mod tests {
 
         runner
             .send(Response::Done {
-                warnings: 1,
-                filtered: 2,
+                result_data: Some(b"1:2".to_vec()),
             })
             .await
             .unwrap();
 
         let resp = manager.recv().await.unwrap();
         match resp {
-            Response::Done { warnings, filtered } => {
-                assert_eq!(warnings, 1);
-                assert_eq!(filtered, 2);
+            Response::Done { result_data } => {
+                assert_eq!(result_data.unwrap(), b"1:2");
             }
             _ => panic!("expected Done"),
         }
@@ -195,20 +193,19 @@ mod tests {
 
         // Manager sends task
         manager
-            .send(Command::ProcessBinary {
+            .send(Command::ProcessTask {
                 relative_path: "a/b".into(),
             })
             .await
             .unwrap();
 
         let cmd = runner.recv().await.unwrap();
-        assert!(matches!(cmd, Command::ProcessBinary { .. }));
+        assert!(matches!(cmd, Command::ProcessTask { .. }));
 
         // Runner sends Done
         runner
             .send(Response::Done {
-                warnings: 0,
-                filtered: 0,
+                result_data: None,
             })
             .await
             .unwrap();

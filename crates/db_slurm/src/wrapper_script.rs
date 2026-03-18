@@ -8,6 +8,7 @@ pub struct WrapperScriptConfig<'a> {
     pub image_name: &'a str,
     pub image_tag: &'a str,
     pub load_command: &'a str,
+    pub container_command: &'a str,
     pub connection: ConnectionMode<'a>,
     pub run_log_dir: Option<&'a str>,
 }
@@ -32,7 +33,7 @@ pub enum ConnectionMode<'a> {
 /// connection mode.
 pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     let rnd_suffix = format!("{:08x}", rand_u32());
-    let rndtmp = format!("/tmp/asm-{rnd_suffix}");
+    let rndtmp = format!("/tmp/db-{rnd_suffix}");
 
     let src_tmp = format!("{rndtmp}/src");
     let out_tmp = format!("{rndtmp}/out");
@@ -156,12 +157,13 @@ SOCKET_COUNTER=0
 CMD_RELAY_PID=$!
 
 # Copy Docker image to local /tmp for faster loading
-LOCAL_IMAGE="$RNDTMP/asm-tokenizer-docker.tar"
+LOCAL_IMAGE="$RNDTMP/{image_name}-docker.tar"
 cp "{image_path}" "$LOCAL_IMAGE"
 
 # Load Docker image with Podman
 {load_command}
 "##,
+        image_name = cfg.image_name,
         image_path = cfg.image_path,
         load_command = cfg.load_command,
     ));
@@ -179,6 +181,7 @@ cp "{image_path}" "$LOCAL_IMAGE"
 
     let image_ref = format!("{}:{}", cfg.image_name, cfg.image_tag);
     let sid = cfg.secondary_id;
+    let container_command = cfg.container_command;
 
     match &cfg.connection {
         ConnectionMode::Reverse { .. } => {
@@ -189,7 +192,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     --network host \
     {volumes} \
     {image_ref} \
-    dynamic_batch --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {sid} --secondary-quic-port $QUIC_PORT
+    {container_command} --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {sid} --secondary-quic-port $QUIC_PORT
 "##
             ));
         }
@@ -204,7 +207,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     --network host \
     {volumes} \
     {image_ref} \
-    dynamic_batch --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {sid} --secondary-quic-port $QUIC_PORT
+    {container_command} --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {sid} --secondary-quic-port $QUIC_PORT
 "##
             ));
         }
@@ -250,9 +253,10 @@ mod tests {
             slurm_config: &config,
             image_path: "/images/test.tar",
             secondary_id: "sec-01",
-            image_name: "asm-tokenizer",
+            image_name: "test-app",
             image_tag: "latest",
             load_command: "podman --root $PODMAN_STORAGE --runroot $PODMAN_RUN load -i $LOCAL_IMAGE",
+            container_command: "dynamic_batch",
             connection: ConnectionMode::Standard {
                 gateway_host: "gateway.example.com",
                 gateway_port: 9000,
@@ -264,6 +268,8 @@ mod tests {
         assert!(script.contains("--secondary-id sec-01"));
         assert!(script.contains("mkfifo"));
         assert!(!script.contains("TUNNEL_PORT"));
+        assert!(script.contains("test-app-docker.tar"));
+        assert!(script.contains("dynamic_batch --secondary"));
     }
 
     #[test]
@@ -273,9 +279,10 @@ mod tests {
             slurm_config: &config,
             image_path: "/images/test.tar",
             secondary_id: "sec-02",
-            image_name: "asm-tokenizer",
+            image_name: "test-app",
             image_tag: "latest",
             load_command: "podman --root $PODMAN_STORAGE --runroot $PODMAN_RUN load -i $LOCAL_IMAGE",
+            container_command: "my_runner",
             connection: ConnectionMode::Reverse {
                 connection_info_dir: "/logs/connection_info",
             },
@@ -285,5 +292,6 @@ mod tests {
         assert!(script.contains("TUNNEL_PORT"));
         assert!(script.contains("sec-02.info"));
         assert!(script.contains("localhost:$TUNNEL_PORT"));
+        assert!(script.contains("my_runner --secondary"));
     }
 }

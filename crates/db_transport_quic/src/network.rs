@@ -484,7 +484,10 @@ mod tests {
                     sender_id: "sec-0".into(),
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
-                    ram_bytes: 1024,
+                    resources: vec![db_comm_api_base::ResourceAmount {
+                        kind: db_comm_api_base::ResourceKind::Memory,
+                        amount: 1024,
+                    }],
                     worker_count: 1,
                     hostname: "test".into(),
                 };

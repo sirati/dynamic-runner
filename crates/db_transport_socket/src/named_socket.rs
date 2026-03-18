@@ -158,13 +158,12 @@ mod tests {
 
             // Receive command
             let cmd = runner.recv().await.unwrap();
-            assert!(matches!(cmd, Command::ProcessBinary { .. }));
+            assert!(matches!(cmd, Command::ProcessTask { .. }));
 
             // Send Done
             runner
                 .send(Response::Done {
-                    warnings: 5,
-                    filtered: 3,
+                    result_data: Some(b"5:3".to_vec()),
                 })
                 .await
                 .unwrap();
@@ -179,7 +178,7 @@ mod tests {
 
         // Send command
         manager
-            .send(Command::ProcessBinary {
+            .send(Command::ProcessTask {
                 relative_path: "x/y".into(),
             })
             .await
@@ -188,9 +187,8 @@ mod tests {
         // Receive Done
         let resp = manager.recv().await.unwrap();
         match resp {
-            Response::Done { warnings, filtered } => {
-                assert_eq!(warnings, 5);
-                assert_eq!(filtered, 3);
+            Response::Done { result_data } => {
+                assert_eq!(result_data.unwrap(), b"5:3");
             }
             _ => panic!("expected Done"),
         }

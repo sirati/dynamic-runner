@@ -109,7 +109,7 @@ mod tests {
         let (mut manager, mut runner) = channel_pair();
 
         manager
-            .send(Command::ProcessBinary {
+            .send(Command::ProcessTask {
                 relative_path: "test/bin".into(),
             })
             .await
@@ -117,10 +117,10 @@ mod tests {
 
         let cmd = runner.recv().await.unwrap();
         match cmd {
-            Command::ProcessBinary { relative_path } => {
+            Command::ProcessTask { relative_path } => {
                 assert_eq!(relative_path, "test/bin");
             }
-            _ => panic!("expected ProcessBinary"),
+            _ => panic!("expected ProcessTask"),
         }
     }
 
@@ -130,17 +130,15 @@ mod tests {
 
         runner
             .send(Response::Done {
-                warnings: 2,
-                filtered: 5,
+                result_data: Some(b"2:5".to_vec()),
             })
             .await
             .unwrap();
 
         let resp = manager.recv().await.unwrap();
         match resp {
-            Response::Done { warnings, filtered } => {
-                assert_eq!(warnings, 2);
-                assert_eq!(filtered, 5);
+            Response::Done { result_data } => {
+                assert_eq!(result_data.unwrap(), b"2:5");
             }
             _ => panic!("expected Done"),
         }

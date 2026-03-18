@@ -9,13 +9,13 @@ use std::path::PathBuf;
 use std::process;
 
 use db_comm_api_base::{
-    BinaryInfo, MemoryBytes, MessageReceiver, MessageSender, WorkerId,
+    BinaryInfo, MessageReceiver, MessageSender, WorkerId,
 };
 use db_manager_runner_comm::{Command, Response};
 use serde::{Deserialize, Serialize};
 use db_local_manager::{LocalManager, LocalManagerConfig, WorkerFactory};
-use db_scheduler_api::MemoryEstimator;
-use db_scheduler_impl::MemoryStealingScheduler;
+use db_scheduler_api::ResourceEstimator;
+use db_scheduler_impl::ResourceStealingScheduler;
 use db_transport_socket::named_socket::NamedSocketManagerEnd;
 use db_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
 
@@ -24,9 +24,9 @@ use db_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
 struct TestId(String);
 
 struct FixedEstimator(u64);
-impl MemoryEstimator for FixedEstimator {
-    fn estimate_memory(&self, _binary_size: u64) -> MemoryBytes {
-        self.0
+impl ResourceEstimator for FixedEstimator {
+    fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
     }
 }
 
@@ -118,11 +118,12 @@ async fn single_worker_subprocess_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 1,
-            max_memory: 1024 * 1024 * 1024,
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
         };
 
         let mut factory = PythonWorkerFactory {
@@ -140,7 +141,7 @@ async fn single_worker_subprocess_processes_all() {
 
         let mut manager = LocalManager::new(
             config,
-            MemoryStealingScheduler,
+            ResourceStealingScheduler::memory(),
             FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
         );
 
@@ -274,11 +275,12 @@ async fn single_worker_named_socket_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 1,
-            max_memory: 1024 * 1024 * 1024,
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -297,7 +299,7 @@ async fn single_worker_named_socket_processes_all() {
 
         let mut manager = LocalManager::new(
             config,
-            MemoryStealingScheduler,
+            ResourceStealingScheduler::memory(),
             FixedEstimator(50 * 1024 * 1024),
         );
 
@@ -324,11 +326,12 @@ async fn multi_worker_named_socket_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 3,
-            max_memory: 2 * 1024 * 1024 * 1024,
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -345,7 +348,7 @@ async fn multi_worker_named_socket_processes_all() {
 
         let mut manager = LocalManager::new(
             config,
-            MemoryStealingScheduler,
+            ResourceStealingScheduler::memory(),
             FixedEstimator(50 * 1024 * 1024),
         );
 
@@ -371,11 +374,12 @@ async fn multi_worker_subprocess_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 3,
-            max_memory: 2 * 1024 * 1024 * 1024,
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
         };
 
         let mut factory = PythonWorkerFactory {
@@ -391,7 +395,7 @@ async fn multi_worker_subprocess_processes_all() {
 
         let mut manager = LocalManager::new(
             config,
-            MemoryStealingScheduler,
+            ResourceStealingScheduler::memory(),
             FixedEstimator(50 * 1024 * 1024),
         );
 

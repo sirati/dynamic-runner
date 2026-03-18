@@ -3,8 +3,7 @@ use db_manager_runner_comm::{Command, Response, RunnerEndpoint};
 
 /// Output from a successful task execution.
 pub struct TaskOutput {
-    pub warnings: u32,
-    pub filtered: u32,
+    pub result_data: Option<Vec<u8>>,
 }
 
 /// Error from a failed task execution.
@@ -33,7 +32,7 @@ pub trait TaskExecutor<S: MessageSender<Response>> {
 ///
 /// 1. Sends Ready
 /// 2. Waits for commands
-/// 3. For each ProcessBinary: executes the task, sends Done/Error
+/// 3. For each ProcessTask: executes the task, sends Done/Error
 /// 4. On Stop or connection close: exits
 pub async fn runner_main_loop<E: RunnerEndpoint>(
     endpoint: &mut E,
@@ -47,13 +46,12 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
     loop {
         match MessageReceiver::<Command>::recv(endpoint).await {
             Some(Command::Stop) => break,
-            Some(Command::ProcessBinary { relative_path }) => {
+            Some(Command::ProcessTask { relative_path }) => {
                 match executor.execute(&relative_path, endpoint).await {
                     Ok(output) => {
                         let _ = endpoint
                             .send(Response::Done {
-                                warnings: output.warnings,
-                                filtered: output.filtered,
+                                result_data: output.result_data,
                             })
                             .await;
                     }
@@ -85,7 +83,6 @@ mod tests {
             relative_path: &str,
             status_sender: &mut ChannelRunnerEnd,
         ) -> Result<TaskOutput, TaskError> {
-            // Send a phase update
             let _ = status_sender
                 .send(Response::PhaseUpdate {
                     phase_name: "PROCESSING".into(),
@@ -99,10 +96,7 @@ mod tests {
                 });
             }
 
-            Ok(TaskOutput {
-                warnings: 0,
-                filtered: 0,
-            })
+            Ok(TaskOutput { result_data: None })
         }
     }
 
@@ -117,19 +111,16 @@ mod tests {
             runner_main_loop(&mut runner, &executor).await;
         });
 
-        // Should receive Ready
         let resp = manager.recv().await.unwrap();
         assert!(matches!(resp, Response::Ready));
 
-        // Send a task
         manager
-            .send(Command::ProcessBinary {
+            .send(Command::ProcessTask {
                 relative_path: "test/bin".into(),
             })
             .await
             .unwrap();
 
-        // Collect responses until we see Done
         let mut all = Vec::new();
         loop {
             match manager.recv().await {
@@ -151,7 +142,6 @@ mod tests {
         assert!(has_phase, "expected PhaseUpdate");
         assert!(has_done, "expected Done");
 
-        // Send stop
         manager.send(Command::Stop).await.unwrap();
         runner_handle.await.unwrap();
         }).await;
@@ -168,18 +158,15 @@ mod tests {
             runner_main_loop(&mut runner, &executor).await;
         });
 
-        // Ready
         let _ = manager.recv().await;
 
-        // Send failing task
         manager
-            .send(Command::ProcessBinary {
+            .send(Command::ProcessTask {
                 relative_path: "fail".into(),
             })
             .await
             .unwrap();
 
-        // Collect responses until we get Error
         let mut all = Vec::new();
         loop {
             match manager.recv().await {
@@ -225,10 +212,8 @@ mod tests {
             runner_main_loop(&mut runner, &executor).await;
         });
 
-        // Drop manager (close connection) — runner should see Ready send fail or recv None
         drop(manager);
 
-        // Runner should exit cleanly
         runner_handle.await.unwrap();
         }).await;
     }
