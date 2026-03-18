@@ -343,6 +343,7 @@ mod tests {
                 timestamp: 0.0,
                 all_tasks: vec![],
                 completed_tasks: vec![],
+                pending_tasks: vec![],
             },
             DistributedMessage::TaskComplete {
                 sender_id: "s".into(),
