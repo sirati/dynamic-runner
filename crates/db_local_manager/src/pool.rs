@@ -70,10 +70,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
             let budget = scheduler.initial_budget(i, max_resources);
-            handle.reserved_budget = budget.get(db_comm_api_base::ResourceKind::Memory);
+            let budget_mb = budget.get(db_comm_api_base::ResourceKind::Memory) / (1024 * 1024);
+            handle.reserved_budgets = budget;
             tracing::info!(
                 worker_id = i,
-                budget_mb = handle.reserved_budget / (1024 * 1024),
+                budget_mb,
                 "worker created"
             );
             self.workers.push(handle);
@@ -119,12 +120,12 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             }
         }
 
-        let reserved_budget = self.workers[worker_id as usize].reserved_budget;
+        let reserved_budgets = self.workers[worker_id as usize].reserved_budgets.clone();
         let failure_count = self.workers[worker_id as usize].assignment_failure_count;
 
         let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
         handle.pid = pid;
-        handle.reserved_budget = reserved_budget;
+        handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
         self.workers[worker_id as usize] = handle;
 
@@ -140,10 +141,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         tracing::info!(worker_id, "worker restarted and ready");
     }
 
-    /// Update actual memory usage for all workers from /proc/[pid]/statm.
-    pub fn update_all_memory_usage(&mut self) {
+    /// Update actual resource usage for all workers from /proc/[pid]/statm.
+    pub fn update_all_resource_usage(&mut self) {
         for worker in &mut self.workers {
-            worker.update_memory_usage();
+            worker.update_resource_usage();
         }
     }
 
@@ -159,7 +160,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         max_resources: &ResourceMap,
         in_pressure_phase: bool,
     ) -> ResourcePressureResult<I> {
-        self.update_all_memory_usage();
+        self.update_all_resource_usage();
         let infos = self.budget_infos();
         let decision = scheduler.check_resource_pressure(&infos, max_resources, in_pressure_phase);
 

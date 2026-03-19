@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, Identifier, MemoryBytes, ResourceMap, TaskResult, WorkerId,
+    BinaryInfo, ErrorType, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
 };
 use db_manager_runner_comm::ManagerEndpoint;
 use db_manager_runner_comm::state::{
@@ -21,7 +21,7 @@ pub enum WorkerEvent<I: Identifier> {
         worker_id: WorkerId,
         result: TaskResult,
         binary: Option<BinaryInfo<I>>,
-        estimated_memory: MemoryBytes,
+        estimated_resources: ResourceMap,
     },
     Disconnected {
         worker_id: WorkerId,
@@ -47,13 +47,13 @@ pub enum WorkerEvent<I: Identifier> {
 /// channel. This avoids head-of-line blocking when polling multiple workers.
 pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub worker_id: WorkerId,
-    pub reserved_budget: MemoryBytes,
-    pub estimated_memory: MemoryBytes,
+    pub reserved_budgets: ResourceMap,
+    pub estimated_resources: ResourceMap,
     pub current_binary: Option<BinaryInfo<I>>,
     pub opportunistic: bool,
     pub has_initial_assignment: bool,
     pub idle: bool,
-    pub actual_memory_usage: MemoryBytes,
+    pub actual_usage: ResourceMap,
     pub assignment_failure_count: u32,
     pub pid: Option<u32>,
     /// Current processing phase name (set by PhaseUpdate messages).
@@ -76,13 +76,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         let waiting = RunnerProtocol::connect(transport);
         Self {
             worker_id,
-            reserved_budget: 0,
-            estimated_memory: 0,
+            reserved_budgets: ResourceMap::new(),
+            estimated_resources: ResourceMap::new(),
             current_binary: None,
             opportunistic: false,
             has_initial_assignment: false,
             idle: false,
-            actual_memory_usage: 0,
+            actual_usage: ResourceMap::new(),
             assignment_failure_count: 0,
             pid: None,
             phase: None,
@@ -112,17 +112,15 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
 
     /// Build a snapshot for the scheduler.
     pub fn budget_info(&self) -> WorkerBudgetInfo<I> {
-        use db_comm_api_base::ResourceKind;
-        let mem = |v: MemoryBytes| ResourceMap::from([(ResourceKind::Memory, v)]);
         WorkerBudgetInfo {
             worker_id: self.worker_id,
-            reserved_budgets: mem(self.reserved_budget),
-            actual_usage: mem(self.actual_memory_usage),
+            reserved_budgets: self.reserved_budgets.clone(),
+            actual_usage: self.actual_usage.clone(),
             is_idle: self.idle && self.current_binary.is_none(),
             is_opportunistic: self.opportunistic,
             has_initial_assignment: self.has_initial_assignment,
             current_task: self.current_binary.clone(),
-            estimated_usage: mem(self.estimated_memory),
+            estimated_usage: self.estimated_resources.clone(),
         }
     }
 
@@ -163,7 +161,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     pub async fn assign_task(
         &mut self,
         binary: BinaryInfo<I>,
-        estimated_memory: MemoryBytes,
+        estimated_resources: ResourceMap,
         opportunistic: bool,
     ) -> Result<(), String> {
         let idle = self
@@ -179,15 +177,16 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 let binary_clone = binary.clone();
                 let tx = self.event_tx.clone();
 
+                let est_clone = estimated_resources.clone();
                 let handle = tokio::task::spawn_local(async move {
-                    Self::poll_loop(processing, worker_id, binary_clone, estimated_memory, tx).await
+                    Self::poll_loop(processing, worker_id, binary_clone, est_clone, tx).await
                 });
 
                 self.poll_task = Some(handle);
                 // Protocol is now owned by the spawned task; mark as Transitioning
                 self.protocol = RunnerProtocolState::Transitioning;
                 self.current_binary = Some(binary);
-                self.estimated_memory = estimated_memory;
+                self.estimated_resources = estimated_resources;
                 self.opportunistic = opportunistic;
                 self.has_initial_assignment = true;
                 self.idle = false;
@@ -207,7 +206,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         mut processing: RunnerProtocol<Processing, M>,
         worker_id: WorkerId,
         binary: BinaryInfo<I>,
-        estimated_memory: MemoryBytes,
+        estimated_resources: ResourceMap,
         tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     ) -> RunnerProtocolState<M> {
         loop {
@@ -217,7 +216,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                         worker_id,
                         result,
                         binary: Some(binary),
-                        estimated_memory,
+                        estimated_resources,
                     });
                     return RunnerProtocolState::Idle(protocol);
                 }
@@ -284,7 +283,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// Clear current task metadata (after completion or OOM kill).
     pub fn clear_task(&mut self) {
         self.current_binary = None;
-        self.estimated_memory = 0;
+        self.estimated_resources = ResourceMap::new();
         self.idle = true;
         self.phase = None;
         self.last_keepalive = None;
@@ -293,30 +292,37 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// Mark this worker as OOM-killed: clear task, mark opportunistic.
     pub fn mark_oom_killed(&mut self) {
         self.current_binary = None;
-        self.estimated_memory = 0;
+        self.estimated_resources = ResourceMap::new();
         self.opportunistic = true;
     }
 
-    /// Update actual memory usage by reading /proc/[pid]/statm (Linux only).
-    ///
-    /// The second field of statm is the RSS in pages. We multiply by the page
-    /// size (typically 4096) to get bytes. Returns 0 on non-Linux or if the
-    /// process is gone.
-    pub fn update_memory_usage(&mut self) {
-        self.actual_memory_usage = ProcStatmMonitor.measure(self.pid);
+    /// Update actual resource usage by reading /proc/[pid]/statm (Linux only).
+    pub fn update_resource_usage(&mut self) {
+        self.actual_usage = ProcStatmMonitor.measure(self.pid);
     }
 }
 
 /// Trait for measuring resource usage of a worker process.
 pub trait ResourceMonitor {
-    fn measure(&self, pid: Option<u32>) -> MemoryBytes;
+    fn measure(&self, pid: Option<u32>) -> ResourceMap;
 }
 
 /// Default implementation that reads RSS from `/proc/[pid]/statm`.
 pub struct ProcStatmMonitor;
 
 impl ResourceMonitor for ProcStatmMonitor {
-    fn measure(&self, pid: Option<u32>) -> MemoryBytes {
+    fn measure(&self, pid: Option<u32>) -> ResourceMap {
+        let mem = Self::read_rss(pid);
+        if mem > 0 {
+            ResourceMap::from([(ResourceKind::Memory, mem)])
+        } else {
+            ResourceMap::new()
+        }
+    }
+}
+
+impl ProcStatmMonitor {
+    fn read_rss(pid: Option<u32>) -> u64 {
         #[cfg(target_os = "linux")]
         {
             let pid = match pid {

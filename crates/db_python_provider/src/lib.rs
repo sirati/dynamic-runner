@@ -644,7 +644,7 @@ impl PyLocalManager {
 
                 self.stats = Some(manager.stats().clone());
                 self.failed_tasks = manager.failed_tasks().to_vec();
-                self.oom_tasks = manager.oom_tasks().to_vec();
+                self.oom_tasks = manager.resource_pressure_tasks().to_vec();
             }));
 
             // Clean up child processes
@@ -897,7 +897,7 @@ impl PyDistributedManager {
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
-                            ram_bytes: ram,
+                            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram)]),
                             hostname: "localhost".into(),
                             keepalive_interval: Duration::from_secs(60),
                             src_network: None,
@@ -1381,7 +1381,7 @@ impl PySecondaryCoordinator {
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
                     num_workers,
-                    ram_bytes,
+                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram_bytes)]),
                     hostname: gethostname(),
                     keepalive_interval: Duration::from_secs(1),
                     src_network: None,

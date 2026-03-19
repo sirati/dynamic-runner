@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use db_comm_api_base::{BinaryInfo, Identifier, MemoryBytes};
+use db_comm_api_base::{BinaryInfo, Identifier, ResourceMap};
 use db_primary_secondary_comm::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerConnectionInfo,
     SecondaryTransport, TaskInfo, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
@@ -36,25 +36,23 @@ impl Default for PrimaryConfig {
 struct RemoteWorkerState<I: Identifier> {
     worker_id: u32,
     secondary_id: String,
-    memory_budget: MemoryBytes,
+    resource_budgets: ResourceMap,
     current_task: Option<BinaryInfo<I>>,
-    estimated_memory: MemoryBytes,
+    estimated_resources: ResourceMap,
     is_idle: bool,
 }
 
 impl<I: Identifier> RemoteWorkerState<I> {
     fn budget_info(&self) -> WorkerBudgetInfo<I> {
-        use db_comm_api_base::{ResourceKind, ResourceMap};
-        let mem = |v: MemoryBytes| ResourceMap::from([(ResourceKind::Memory, v)]);
         WorkerBudgetInfo {
             worker_id: self.worker_id,
-            reserved_budgets: mem(self.memory_budget),
-            actual_usage: mem(0),
+            reserved_budgets: self.resource_budgets.clone(),
+            actual_usage: ResourceMap::new(),
             is_idle: self.is_idle,
             is_opportunistic: false,
             has_initial_assignment: self.current_task.is_some(),
             current_task: self.current_task.clone(),
-            estimated_usage: mem(self.estimated_memory),
+            estimated_usage: self.estimated_resources.clone(),
         }
     }
 }
@@ -355,14 +353,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram_bytes)]);
 
             for local_idx in 0..num_workers {
-                let budget_map = self.scheduler.initial_budget(local_idx, &max_res);
-                let budget = budget_map.get(db_comm_api_base::ResourceKind::Memory);
+                let budget = self.scheduler.initial_budget(local_idx, &max_res);
                 self.workers.push(RemoteWorkerState {
                     worker_id: global_worker_id,
                     secondary_id: secondary_id.clone(),
-                    memory_budget: budget,
+                    resource_budgets: budget,
                     current_task: None,
-                    estimated_memory: 0,
+                    estimated_resources: ResourceMap::new(),
                     is_idle: true,
                 });
                 global_worker_id += 1;
@@ -373,18 +370,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         self.pending_binaries.sort_by(|a, b| b.size.cmp(&a.size));
 
         // Perform initial assignment for each worker
-        let mut assignments_per_secondary: HashMap<String, Vec<(u32, BinaryInfo<I>, MemoryBytes)>> =
+        let mut assignments_per_secondary: HashMap<String, Vec<(u32, BinaryInfo<I>, ResourceMap)>> =
             HashMap::new();
-        let mut total_assigned_memory: MemoryBytes = 0;
+        let mut total_assigned_resources = ResourceMap::new();
 
         for worker_idx in 0..self.workers.len() {
             let worker_info = self.workers[worker_idx].budget_info();
-            let total_assigned_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, total_assigned_memory)]);
-            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.workers[worker_idx].memory_budget)]);
+            let max_res = self.workers[worker_idx].resource_budgets.clone();
             let decision = self.scheduler.assign_initial(
                 &worker_info,
                 &self.pending_binaries,
-                &total_assigned_res,
+                &total_assigned_resources,
                 &max_res,
                 &self.estimator,
             );
@@ -395,9 +391,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                 ..
             } = decision
             {
-                let estimated_memory = estimated_usage.get(db_comm_api_base::ResourceKind::Memory);
                 let binary = self.pending_binaries.remove(binary_index);
-                total_assigned_memory += estimated_memory;
+                total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();
                 // Compute local worker index within that secondary
@@ -408,13 +403,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                     - 1;
 
                 self.workers[worker_idx].current_task = Some(binary.clone());
-                self.workers[worker_idx].estimated_memory = estimated_memory;
+                self.workers[worker_idx].estimated_resources = estimated_usage.clone();
                 self.workers[worker_idx].is_idle = false;
 
                 assignments_per_secondary
                     .entry(secondary_id)
                     .or_default()
-                    .push((local_worker_id, binary, estimated_memory));
+                    .push((local_worker_id, binary, estimated_usage));
             }
         }
 
@@ -434,12 +429,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
 
             let workers_ready: Vec<WorkerReadyInfo> = assignments
                 .iter()
-                .map(|(worker_id, _, est_mem)| WorkerReadyInfo {
+                .map(|(worker_id, _, est_res)| WorkerReadyInfo {
                     worker_id: *worker_id,
-                    resource_budgets: vec![db_comm_api_base::ResourceAmount {
-                        kind: db_comm_api_base::ResourceKind::Memory,
-                        amount: *est_mem,
-                    }],
+                    resource_budgets: est_res.iter()
+                        .map(|(kind, amount)| db_comm_api_base::ResourceAmount { kind, amount })
+                        .collect(),
                 })
                 .collect();
 
@@ -540,7 +534,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                             if let Some(binary) = worker.current_task.take() {
                                 let hash = compute_task_hash(&binary);
                                 self.failed_tasks.insert(hash);
-                                worker.estimated_memory = 0;
+                                worker.estimated_resources = ResourceMap::new();
                                 worker.is_idle = true;
                             }
                         }
@@ -636,10 +630,9 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             ..
         } = msg
         {
-            let available_memory = available_resources.iter()
-                .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
-                .map(|r| r.amount)
-                .unwrap_or(0);
+            let available_res: ResourceMap = available_resources.iter()
+                .map(|r| (r.kind, r.amount))
+                .collect();
             // Find matching worker
             let mut target_idx = None;
             let mut local_idx: u32 = 0;
@@ -658,10 +651,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             if let Some(idx) = target_idx {
                 // Mark worker idle
                 self.workers[idx].current_task = None;
-                self.workers[idx].estimated_memory = 0;
+                self.workers[idx].estimated_resources = ResourceMap::new();
                 self.workers[idx].is_idle = true;
-                if available_memory > 0 {
-                    self.workers[idx].memory_budget = available_memory;
+                if !available_res.is_empty() {
+                    self.workers[idx].resource_budgets = available_res.clone();
                 }
 
                 // Try to assign from local pending
@@ -669,7 +662,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
                         self.workers.iter().map(|w| w.budget_info()).collect();
-                    let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.workers[idx].memory_budget)]);
+                    let max_res = self.workers[idx].resource_budgets.clone();
 
                     let decision = self.scheduler.assign_normal(
                         &worker_info,
@@ -686,11 +679,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                         ..
                     } = decision
                     {
-                        let estimated_memory = estimated_usage.get(db_comm_api_base::ResourceKind::Memory);
                         let binary = self.pending_binaries.remove(binary_index);
                         let sec_id = self.workers[idx].secondary_id.clone();
                         self.workers[idx].current_task = Some(binary.clone());
-                        self.workers[idx].estimated_memory = estimated_memory;
+                        self.workers[idx].estimated_resources = estimated_usage;
                         self.workers[idx].is_idle = false;
 
                         let assignment_msg = DistributedMessage::TaskAssignment {
@@ -742,7 +734,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                 if w.secondary_id == secondary_id {
                     if local_idx == worker_id {
                         w.current_task = None;
-                        w.estimated_memory = 0;
+                        w.estimated_resources = ResourceMap::new();
                         w.is_idle = true;
                         break;
                     }
@@ -777,7 +769,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                 if w.secondary_id == secondary_id {
                     if local_idx == worker_id {
                         recovered_binary = w.current_task.take();
-                        w.estimated_memory = 0;
+                        w.estimated_resources = ResourceMap::new();
                         w.is_idle = true;
                         break;
                     }
@@ -1136,7 +1128,7 @@ mod tests {
     fn spawn_real_secondary(
         secondary_id: String,
         num_workers: u32,
-        ram_bytes: u64,
+        max_resources: db_comm_api_base::ResourceMap,
     ) -> (
         tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,  // primary→secondary
         tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>, // secondary→primary
@@ -1155,7 +1147,7 @@ mod tests {
             let config = SecondaryConfig {
                 secondary_id,
                 num_workers,
-                ram_bytes,
+                max_resources,
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -1184,10 +1176,10 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
             let secondary_id = "sec-0".to_string();
-            let ram = 1024 * 1024 * 1024u64;
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024u64)]);
 
             let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
-                spawn_real_secondary(secondary_id.clone(), 2, ram);
+                spawn_real_secondary(secondary_id.clone(), 2, max_res);
 
             // Build primary transport wired to the real secondary
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
@@ -1245,7 +1237,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
-            let ram = 2 * 1024 * 1024 * 1024u64;
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024u64)]);
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
             let mut outgoing = HashMap::new();
             let mut sec_handles = Vec::new();
@@ -1253,7 +1245,7 @@ mod tests {
             for i in 0..2u32 {
                 let secondary_id = format!("sec-{i}");
                 let (pri_to_sec_tx, sec_to_pri_rx, handle) =
-                    spawn_real_secondary(secondary_id.clone(), 2, ram);
+                    spawn_real_secondary(secondary_id.clone(), 2, max_res.clone());
 
                 outgoing.insert(secondary_id, pri_to_sec_tx);
                 sec_handles.push(handle);

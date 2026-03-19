@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub type WorkerId = u32;
-pub type MemoryBytes = u64;
 
 /// A kind of resource that can be scheduled and monitored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
@@ -57,6 +56,26 @@ impl ResourceMap {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Add all amounts from `other` to self.
+    pub fn add(&mut self, other: &ResourceMap) {
+        for (kind, amount) in other.iter() {
+            *self.0.entry(kind).or_insert(0) += amount;
+        }
+    }
+
+    /// Convert to a `Vec<ResourceAmount>` for wire serialization.
+    pub fn to_resource_amounts(&self) -> Vec<ResourceAmount> {
+        self.0.iter().map(|(&kind, &amount)| ResourceAmount { kind, amount }).collect()
+    }
+
+    /// Subtract all amounts in `other` from self (saturating).
+    pub fn sub(&mut self, other: &ResourceMap) {
+        for (kind, amount) in other.iter() {
+            let entry = self.0.entry(kind).or_insert(0);
+            *entry = entry.saturating_sub(amount);
+        }
     }
 }
 

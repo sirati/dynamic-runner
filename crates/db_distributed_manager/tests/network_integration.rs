@@ -87,7 +87,7 @@ async fn e2e_primary_secondary_over_wss() {
             let config = SecondaryConfig {
                 secondary_id: sec_id,
                 num_workers: 2,
-                ram_bytes: ram,
+                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -176,7 +176,7 @@ async fn e2e_primary_secondary_over_quic() {
             let config = SecondaryConfig {
                 secondary_id: sec_id,
                 num_workers: 2,
-                ram_bytes: ram,
+                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,

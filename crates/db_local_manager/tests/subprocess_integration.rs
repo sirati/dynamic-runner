@@ -150,7 +150,7 @@ async fn single_worker_subprocess_processes_all() {
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
         assert!(manager.failed_tasks().is_empty());
-        assert!(manager.oom_tasks().is_empty());
+        assert!(manager.resource_pressure_tasks().is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }).await;
@@ -269,7 +269,7 @@ async fn single_worker_named_socket_processes_all() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let worker_dir = worker_module_dir();
-        let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_{}", process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("rin_{}", process::id()));
         let socket_dir = tmp_dir.join("sockets");
         let _ = std::fs::create_dir_all(&socket_dir);
 
@@ -308,7 +308,7 @@ async fn single_worker_named_socket_processes_all() {
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
         assert!(manager.failed_tasks().is_empty());
-        assert!(manager.oom_tasks().is_empty());
+        assert!(manager.resource_pressure_tasks().is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }).await;
@@ -320,7 +320,7 @@ async fn multi_worker_named_socket_processes_all() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let worker_dir = worker_module_dir();
-        let tmp_dir = std::env::temp_dir().join(format!("rust_integ_named_multi_{}", process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("rinm_{}", process::id()));
         let socket_dir = tmp_dir.join("sockets");
         let _ = std::fs::create_dir_all(&socket_dir);
 
@@ -357,7 +357,7 @@ async fn multi_worker_named_socket_processes_all() {
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);
         assert!(manager.failed_tasks().is_empty());
-        assert!(manager.oom_tasks().is_empty());
+        assert!(manager.resource_pressure_tasks().is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }).await;
@@ -404,7 +404,7 @@ async fn multi_worker_subprocess_processes_all() {
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);
         assert!(manager.failed_tasks().is_empty());
-        assert!(manager.oom_tasks().is_empty());
+        assert!(manager.resource_pressure_tasks().is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }).await;
