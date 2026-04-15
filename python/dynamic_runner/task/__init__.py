@@ -1,8 +1,7 @@
-from .base import StageDefinition, TaskDefinition
-from .tokenizer import TokenizerTask
+from .base import Phase, StageDefinition, TaskDefinition
 
 __all__ = [
     "TaskDefinition",
     "StageDefinition",
-    "TokenizerTask",
+    "Phase",
 ]

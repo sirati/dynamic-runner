@@ -256,7 +256,7 @@ mod tests {
             image_name: "test-app",
             image_tag: "latest",
             load_command: "podman --root $PODMAN_STORAGE --runroot $PODMAN_RUN load -i $LOCAL_IMAGE",
-            container_command: "dynamic_batch",
+            container_command: "dynamic_batch_tokenizer",
             connection: ConnectionMode::Standard {
                 gateway_host: "gateway.example.com",
                 gateway_port: 9000,
@@ -269,7 +269,7 @@ mod tests {
         assert!(script.contains("mkfifo"));
         assert!(!script.contains("TUNNEL_PORT"));
         assert!(script.contains("test-app-docker.tar"));
-        assert!(script.contains("dynamic_batch --secondary"));
+        assert!(script.contains("dynamic_batch_tokenizer --secondary"));
     }
 
     #[test]

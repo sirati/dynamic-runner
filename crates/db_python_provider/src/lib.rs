@@ -1015,11 +1015,10 @@ use db_transport_quic::{NetworkClient, NetworkServer};
 /// Rust `PrimaryCoordinator` with `NetworkServer` as the transport.
 #[pyclass(name = "RustPrimaryCoordinator")]
 struct PyPrimaryCoordinator {
-    python_executable: PathBuf,
     num_secondaries: u32,
     estimator_slope: f64,
     estimator_intercept: f64,
-    raw_logs: bool,
+    spawn_secondary: Py<PyAny>,
     completed: u32,
     failed: u32,
 }
@@ -1030,31 +1029,22 @@ impl PyPrimaryCoordinator {
     #[pyo3(signature = (
         num_secondaries,
         task_definition,
-        raw_logs = false,
+        spawn_secondary,
     ))]
     fn new(
         py: Python<'_>,
         num_secondaries: u32,
         task_definition: &Bound<'_, PyAny>,
-        raw_logs: bool,
+        spawn_secondary: Py<PyAny>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
 
-        let sys = py.import("sys")?;
-        let python_executable: String = sys.getattr("executable")?.extract()?;
-
-        // Validate arguments that the secondaries will need (fail early).
-        let _: String = task_definition
-            .call_method0("get_worker_module")?
-            .extract()?;
-
         Ok(Self {
-            python_executable: PathBuf::from(python_executable),
             num_secondaries,
             estimator_slope: bridge.slope,
             estimator_intercept: bridge.intercept,
-            raw_logs,
+            spawn_secondary: spawn_secondary.clone_ref(py),
             completed: 0,
             failed: 0,
         })
@@ -1067,8 +1057,31 @@ impl PyPrimaryCoordinator {
         let num_secondaries = self.num_secondaries;
         let slope = self.estimator_slope;
         let intercept = self.estimator_intercept;
-        let python_executable = self.python_executable.clone();
-        let raw_logs = self.raw_logs;
+
+        // Pick a free port for the primary server before spawning secondaries.
+        let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to bind: {e}")))?;
+        let port = tmp_listener.local_addr().unwrap().port();
+        drop(tmp_listener);
+
+        let primary_url = format!("tcp://127.0.0.1:{}", port);
+
+        // Call the Python spawn_secondary callback for each secondary.
+        // The callback receives (primary_url, secondary_id, quic_port) and
+        // should return a subprocess.Popen (or compatible object with kill/wait).
+        let mut child_processes: Vec<Py<PyAny>> = Vec::new();
+        for i in 0..num_secondaries {
+            let secondary_id = format!("secondary-{i}");
+            let process = self.spawn_secondary.call1(
+                py,
+                (&primary_url, &secondary_id, 0u16),
+            )?;
+            tracing::info!(
+                secondary_id = %secondary_id,
+                "spawned secondary process via callback"
+            );
+            child_processes.push(process);
+        }
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -1081,8 +1094,9 @@ impl PyPrimaryCoordinator {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
-                // Start the network server on a random port.
-                let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+                // Bind the network server to the port we already picked.
+                let bind_addr: std::net::SocketAddr =
+                    format!("127.0.0.1:{}", port).parse().unwrap();
                 let server: NetworkServer<TokenizerIdentifier> =
                     match NetworkServer::bind(bind_addr).await {
                         Ok(s) => s,
@@ -1091,43 +1105,7 @@ impl PyPrimaryCoordinator {
                             return;
                         }
                     };
-                let port = server.port();
                 tracing::info!(port, "primary network server listening");
-
-                // Spawn secondary subprocesses pointing at this port.
-                let primary_url = format!("tcp://127.0.0.1:{}", port);
-                let mut child_processes: Vec<std::process::Child> = Vec::new();
-
-                for i in 0..num_secondaries {
-                    let secondary_id = format!("secondary-{i}");
-
-                    let mut cmd = std::process::Command::new(python_executable.as_os_str());
-                    cmd.args(["-m", "dynamic_batch"]);
-                    cmd.args(["--secondary", &primary_url]);
-                    cmd.args(["--secondary-id", &secondary_id]);
-                    cmd.args(["--secondary-quic-port", "0"]);
-                    if raw_logs {
-                        cmd.arg("--raw-logs");
-                    }
-
-                    match cmd.spawn() {
-                        Ok(child) => {
-                            tracing::info!(
-                                secondary_id = %secondary_id,
-                                pid = child.id(),
-                                "spawned secondary process"
-                            );
-                            child_processes.push(child);
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                secondary_id = %secondary_id,
-                                error = %e,
-                                "failed to spawn secondary"
-                            );
-                        }
-                    }
-                }
 
                 // Give secondaries a moment to start up.
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1156,18 +1134,14 @@ impl PyPrimaryCoordinator {
 
                 completed = primary.completed_count() as u32;
                 failed = primary.failed_count() as u32;
-
-                drop(primary);
-
-                // Terminate secondary processes.
-                for mut child in child_processes {
-                    let pid = child.id();
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    tracing::debug!(pid, "secondary process terminated");
-                }
             }));
         });
+
+        // Back with the GIL — terminate secondary processes via the Python objects.
+        for process in &child_processes {
+            let _ = process.call_method0(py, "kill");
+            let _ = process.call_method0(py, "wait");
+        }
 
         self.completed = completed;
         self.failed = failed;
