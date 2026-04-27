@@ -9,3 +9,10 @@ requires-python = ">=3.12"
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
+# Mixed Rust + Python layout: ship pure-Python sources alongside the
+# compiled extension. The Rust pymodule is renamed to a private
+# `_native` submodule so the public `dynamic_batch_rs` namespace can be
+# extended with Python-only subpackages (today: `dynamic_batch_rs.comm`).
+python-source = "python"
+module-name = "dynamic_batch_rs._native"
+features = ["pyo3/extension-module"]

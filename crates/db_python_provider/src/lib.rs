@@ -28,8 +28,12 @@ use pyo3::wrap_pyfunction;
 use pytypes::{PyBinaryIdentifier, PyBinaryInfo, PyFailedTask, PyProcessingStats};
 
 /// Python module definition.
+/// The compiled extension is exposed as `dynamic_batch_rs._native`;
+/// the public `dynamic_batch_rs` namespace is the mixed-layout package
+/// in `python/dynamic_batch_rs/__init__.py` which re-exports from
+/// `_native` and adds the pure-Python `comm` subpackage.
 #[pymodule]
-fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
