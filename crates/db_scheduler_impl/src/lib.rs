@@ -23,10 +23,35 @@ pub struct ResourceStealingScheduler {
 
 impl ResourceStealingScheduler {
     pub fn memory() -> Self {
+        Self::for_kind(
+            ResourceKind::memory(),
+            150 * 1024 * 1024,
+            500 * 1024 * 1024,
+        )
+    }
+
+    /// Build a scheduler for an arbitrary resource kind. Pair with
+    /// task-tuned overheads/thresholds appropriate for the kind (e.g.
+    /// for `"gpu_vram"` you might pass overheads in MB instead of MiB,
+    /// and a pressure threshold proportional to the device's free
+    /// memory rather than a fixed 500 MiB).
+    ///
+    /// For multi-resource scheduling, instantiate one
+    /// `ResourceStealingScheduler` per kind and dispatch tasks to the
+    /// scheduler whose kind is the bottleneck for that task. The
+    /// `Scheduler` trait is per-kind by design — tasks that are
+    /// limited by both memory AND GPU VRAM register both schedulers
+    /// and the runner picks whichever yields a `NoFit` last (the
+    /// composed-AND across kinds).
+    pub fn for_kind(
+        resource_kind: ResourceKind,
+        base_overhead: u64,
+        pressure_threshold: u64,
+    ) -> Self {
         Self {
-            resource_kind: ResourceKind::memory(),
-            base_overhead: 150 * 1024 * 1024,
-            pressure_threshold: 500 * 1024 * 1024,
+            resource_kind,
+            base_overhead,
+            pressure_threshold,
             temp_factors: vec![1.5, 2.0, 3.0, 4.0],
         }
     }
