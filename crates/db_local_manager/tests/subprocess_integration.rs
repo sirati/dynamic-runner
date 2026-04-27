@@ -1,114 +1,25 @@
 //! Integration test: LocalManager with real Python subprocess workers.
 //!
 //! This test spawns actual Python worker subprocesses via socketpair,
-//! verifying the full pipeline end-to-end.
+//! verifying the full pipeline end-to-end. Fixtures live in
+//! `tests/common/mod.rs`.
+
+mod common;
+
+use common::{make_binary, worker_module_dir, FixedEstimator, PythonWorkerFactory, TestId};
 
 use std::os::fd::FromRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use db_comm_api_base::{
-    BinaryInfo, MessageReceiver, MessageSender, WorkerId,
-};
-use db_manager_runner_comm::{Command, Response};
-use serde::{Deserialize, Serialize};
+use db_comm_api_base::{BinaryInfo, MessageReceiver, MessageSender, WorkerId};
 use db_local_manager::{LocalManager, LocalManagerConfig, WorkerFactory};
-use db_scheduler_api::ResourceEstimator;
+use db_manager_runner_comm::{Command, Response};
 use db_scheduler_impl::ResourceStealingScheduler;
 use db_transport_socket::named_socket::NamedSocketManagerEnd;
-use db_transport_socket::socketpair::{SocketpairManagerEnd, create_socketpair};
+use db_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
 
-/// Minimal test identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct TestId(String);
-
-struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
-    }
-}
-
-/// Factory that spawns real Python test worker subprocesses.
-struct PythonWorkerFactory {
-    worker_module_dir: PathBuf,
-    source_dir: PathBuf,
-    output_dir: PathBuf,
-    children: Vec<Option<process::Child>>,
-}
-
-impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
-    fn spawn_worker(
-        &mut self,
-        worker_id: WorkerId,
-    ) -> Result<(SocketpairManagerEnd, Option<u32>), String> {
-        let (manager_end, child_fd) = create_socketpair()
-            .expect("failed to create socketpair");
-
-        let mut cmd = process::Command::new("python3");
-        cmd.arg("-m")
-            .arg("test_worker_mod")
-            .arg("--dynamic_queue")
-            .arg(child_fd.to_string())
-            .arg("--source")
-            .arg(&self.source_dir)
-            .arg("--output")
-            .arg(&self.output_dir);
-
-        // Set PYTHONPATH so the worker module can be found
-        cmd.env("PYTHONPATH", &self.worker_module_dir);
-
-        unsafe {
-            cmd.pre_exec(|| Ok(()));
-        }
-
-        cmd.stdin(process::Stdio::null())
-            .stdout(process::Stdio::null())
-            .stderr(process::Stdio::null());
-
-        let child = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn Python worker {worker_id}: {e}"));
-
-        // Close child fd on parent side
-        drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
-
-        let idx = worker_id as usize;
-        if self.children.len() <= idx {
-            self.children.resize_with(idx + 1, || None);
-        }
-        let pid = child.id();
-        self.children[idx] = Some(child);
-
-        Ok((manager_end, Some(pid)))
-    }
-}
-
-impl Drop for PythonWorkerFactory {
-    fn drop(&mut self) {
-        for child in &mut self.children {
-            if let Some(mut c) = child.take() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-        }
-    }
-}
-
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
-        path: PathBuf::from(name),
-        size,
-        identifier: TestId(name.into()),
-    }
-}
-
-/// Find the test_worker_mod directory relative to this test file.
-fn worker_module_dir() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir.join("tests")
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn single_worker_subprocess_processes_all() {

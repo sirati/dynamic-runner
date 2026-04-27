@@ -1,127 +1,17 @@
-//! Tests for the local manager. Kept in a sibling file so the
-//! production code stays at a manageable size.
+//! Tests for the local manager. Fixtures live in
+//! `super::test_helpers`; this file holds the test scenarios.
 
+use super::test_helpers::{
+    fake_worker_loop, make_binary, test_config, FakeWorkerFactory, FakeWorkerMode,
+    FixedEstimator, TestId,
+};
 use super::*;
-use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender};
+use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender, ResourceKind, ResourceMap};
 use db_manager_runner_comm::{Command, Response};
 use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::{ChannelManagerEnd, channel_pair};
-use serde::{Deserialize, Serialize};
+use db_transport_channel::{channel_pair, ChannelManagerEnd};
+use std::collections::HashMap;
 
-/// Minimal test identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct TestId(String);
-
-struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(ResourceKind::memory(), self.0)])
-    }
-}
-
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
-        path: std::path::PathBuf::from(name),
-        size,
-        identifier: TestId(name.into()),
-    }
-}
-
-/// A simple factory that spawns fake worker tasks that auto-respond.
-struct FakeWorkerFactory {
-    /// Each spawned worker's runner end is driven by a background task.
-    mode: FakeWorkerMode,
-}
-
-#[derive(Clone)]
-enum FakeWorkerMode {
-    /// Immediately complete all tasks successfully.
-    AlwaysSucceed,
-    /// Complete with OOM error.
-    AlwaysOom,
-    /// First task fails with recoverable error, second succeeds.
-    FailThenSucceed,
-}
-
-impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-    fn spawn_worker(
-        &mut self,
-        _worker_id: WorkerId,
-    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
-        let (manager_end, runner_end) = channel_pair();
-        let mode = self.mode.clone();
-        tokio::task::spawn_local(fake_worker_loop(runner_end, mode));
-        Ok((manager_end, None))
-    }
-}
-
-async fn fake_worker_loop(
-    mut runner: db_transport_channel::ChannelRunnerEnd,
-    mode: FakeWorkerMode,
-) {
-    // Send Ready
-    let _ = runner.send(Response::Ready).await;
-
-    let mut task_count = 0u32;
-    loop {
-        match MessageReceiver::<Command>::recv(&mut runner).await {
-            Some(Command::Stop) => break,
-            Some(Command::ProcessTask { .. }) => {
-                task_count += 1;
-                match &mode {
-                    FakeWorkerMode::AlwaysSucceed => {
-                        let _ = runner
-                            .send(Response::Done {
-                                result_data: None,
-                            })
-                            .await;
-                    }
-                    FakeWorkerMode::AlwaysOom => {
-                        let _ = runner
-                            .send(Response::Error {
-                                error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
-                                message: "out of memory".into(),
-                            })
-                            .await;
-                    }
-                    FakeWorkerMode::FailThenSucceed => {
-                        if task_count == 1 {
-                            let _ = runner
-                                .send(Response::Error {
-                                    error_type: ErrorType::Recoverable,
-                                    message: "transient failure".into(),
-                                })
-                                .await;
-                        } else {
-                            let _ = runner
-                                .send(Response::Done {
-                                    result_data: None,
-                                })
-                                .await;
-                        }
-                    }
-                }
-            }
-            None => break,
-        }
-    }
-}
-
-fn test_config(num_workers: u32) -> LocalManagerConfig {
-    LocalManagerConfig {
-        num_workers,
-        max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]), // 1GB
-        always_restart_worker: false,
-        restart_predicate: None,
-        retry_max_attempts: 1,
-        print_pid: false,
-        memuse_log_path: None,
-        stage_timeouts: HashMap::new(),
-        low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
-        resource_check_interval: std::time::Duration::from_millis(100),
-        phase_status_log_intervals: Vec::new(),
-    }
-}
 
 #[tokio::test(flavor = "current_thread")]
 async fn single_worker_processes_all_binaries() {

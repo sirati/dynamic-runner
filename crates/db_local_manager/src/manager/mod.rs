@@ -227,4 +227,7 @@ mod phases;
 mod worker_loop;
 
 #[cfg(test)]
+mod test_helpers;
+
+#[cfg(test)]
 mod tests;
