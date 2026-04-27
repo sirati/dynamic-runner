@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
 use pyo3::prelude::*;
 
@@ -118,6 +117,7 @@ impl PySecondaryCoordinator {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
+        let dist_connect_retry_delay = self.distributed_config.connect_retry_delay();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let worker_module = self.worker_module.clone();
@@ -152,7 +152,7 @@ impl PySecondaryCoordinator {
 
                 // Connect to primary via WSS, retrying until the configured timeout.
                 let connect_timeout = dist_connect_timeout;
-                let retry_delay = Duration::from_secs(1);
+                let retry_delay = dist_connect_retry_delay;
                 let start = std::time::Instant::now();
                 let mut attempt = 0u32;
                 let client = loop {

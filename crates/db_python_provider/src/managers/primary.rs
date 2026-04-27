@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
@@ -115,8 +113,9 @@ impl PyPrimaryCoordinator {
                     };
                 tracing::info!(port, "primary network server listening");
 
-                // Give secondaries a moment to start up.
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                // Secondaries retry-connect on their own; the accept loop in
+                // PrimaryCoordinator::run handles connections that arrive
+                // after we hand control to it.
 
                 // Run the primary coordinator with the network server transport.
                 let config = PrimaryConfig {
