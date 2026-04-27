@@ -342,6 +342,71 @@ impl WorkerSpec {
     }
 }
 
+/// Tuning knobs for the distributed primary/secondary loops.
+///
+/// All durations are seconds (f64 for sub-second precision). Defaults match
+/// the migration plan §18: 5s keepalive interval, 3 missed keepalives before
+/// declaring a peer dead, 600s connect timeout, 300s peer timeout.
+///
+/// `keepalive_miss_threshold` is read by the failover voting code (Phase 2);
+/// configurable now so callers don't have to revisit when failover lands.
+#[pyclass(name = "DistributedConfig", get_all, set_all, from_py_object)]
+#[derive(Clone, Debug)]
+struct DistributedConfig {
+    connect_timeout_secs: f64,
+    peer_timeout_secs: f64,
+    keepalive_interval_secs: f64,
+    keepalive_miss_threshold: u32,
+}
+
+impl Default for DistributedConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout_secs: 600.0,
+            peer_timeout_secs: 300.0,
+            keepalive_interval_secs: 5.0,
+            keepalive_miss_threshold: 3,
+        }
+    }
+}
+
+#[pymethods]
+impl DistributedConfig {
+    #[new]
+    #[pyo3(signature = (
+        connect_timeout_secs = None,
+        peer_timeout_secs = None,
+        keepalive_interval_secs = None,
+        keepalive_miss_threshold = None,
+    ))]
+    fn new(
+        connect_timeout_secs: Option<f64>,
+        peer_timeout_secs: Option<f64>,
+        keepalive_interval_secs: Option<f64>,
+        keepalive_miss_threshold: Option<u32>,
+    ) -> Self {
+        let d = DistributedConfig::default();
+        Self {
+            connect_timeout_secs: connect_timeout_secs.unwrap_or(d.connect_timeout_secs),
+            peer_timeout_secs: peer_timeout_secs.unwrap_or(d.peer_timeout_secs),
+            keepalive_interval_secs: keepalive_interval_secs.unwrap_or(d.keepalive_interval_secs),
+            keepalive_miss_threshold: keepalive_miss_threshold.unwrap_or(d.keepalive_miss_threshold),
+        }
+    }
+}
+
+impl DistributedConfig {
+    fn connect_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.connect_timeout_secs)
+    }
+    fn peer_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.peer_timeout_secs)
+    }
+    fn keepalive_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.keepalive_interval_secs)
+    }
+}
+
 /// Tuning knobs for `ResourceStealingScheduler` exposed to Python.
 ///
 /// The defaults match the prior hard-coded values:
@@ -887,6 +952,7 @@ impl PyLocalManager {
                 db_comm_api_base::ResourceKind::memory(),
                 self.low_memory_threshold,
             )]),
+            resource_check_interval: std::time::Duration::from_millis(100),
         };
 
         let mut factory = SubprocessWorkerFactory {
@@ -1028,6 +1094,7 @@ struct PyDistributedManager {
     log_dir: PathBuf,
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
+    distributed_config: DistributedConfig,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -1051,6 +1118,7 @@ impl PyDistributedManager {
         skip_existing = false,
         log_paths = None,
         worker_spec = None,
+        distributed_config = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -1064,6 +1132,7 @@ impl PyDistributedManager {
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
         worker_spec: Option<WorkerSpec>,
+        distributed_config: Option<DistributedConfig>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -1100,6 +1169,7 @@ impl PyDistributedManager {
             log_dir,
             log_paths,
             worker_spec,
+            distributed_config: distributed_config.unwrap_or_default(),
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -1124,6 +1194,9 @@ impl PyDistributedManager {
         let output_dir = self.output_dir.clone();
         let log_dir = self.log_dir.clone();
         let log_paths = self.log_paths.clone();
+        let dist_keepalive = self.distributed_config.keepalive_interval();
+        let dist_peer_timeout = self.distributed_config.peer_timeout();
+        let dist_connect_timeout = self.distributed_config.connect_timeout();
         let worker_spec = self.worker_spec.clone();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
@@ -1187,10 +1260,10 @@ impl PyDistributedManager {
                             num_workers,
                             max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
                             hostname: "localhost".into(),
-                            keepalive_interval: Duration::from_secs(60),
+                            keepalive_interval: dist_keepalive,
                             src_network: None,
                             src_tmp: None,
-                            peer_timeout: Duration::from_secs(120),
+                            peer_timeout: dist_peer_timeout,
                         };
 
                         let estimator = PyMemoryEstimatorBridge { slope, intercept };
@@ -1237,8 +1310,8 @@ impl PyDistributedManager {
                 let config = PrimaryConfig {
                     node_id: "primary".into(),
                     num_secondaries,
-                    connect_timeout: Duration::from_secs(30),
-                    peer_timeout: Duration::from_secs(30),
+                    connect_timeout: dist_connect_timeout,
+                    peer_timeout: dist_peer_timeout,
                 };
 
                 let estimator = PyMemoryEstimatorBridge { slope, intercept };
@@ -1309,6 +1382,7 @@ struct PyPrimaryCoordinator {
     estimator_slope: f64,
     estimator_intercept: f64,
     spawn_secondary: Py<PyAny>,
+    distributed_config: DistributedConfig,
     completed: u32,
     failed: u32,
 }
@@ -1320,12 +1394,14 @@ impl PyPrimaryCoordinator {
         num_secondaries,
         task_definition,
         spawn_secondary,
+        distributed_config = None,
     ))]
     fn new(
         py: Python<'_>,
         num_secondaries: u32,
         task_definition: &Bound<'_, PyAny>,
         spawn_secondary: Py<PyAny>,
+        distributed_config: Option<DistributedConfig>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -1335,6 +1411,7 @@ impl PyPrimaryCoordinator {
             estimator_slope: bridge.slope,
             estimator_intercept: bridge.intercept,
             spawn_secondary: spawn_secondary.clone_ref(py),
+            distributed_config: distributed_config.unwrap_or_default(),
             completed: 0,
             failed: 0,
         })
@@ -1347,6 +1424,8 @@ impl PyPrimaryCoordinator {
         let num_secondaries = self.num_secondaries;
         let slope = self.estimator_slope;
         let intercept = self.estimator_intercept;
+        let dist_connect_timeout = self.distributed_config.connect_timeout();
+        let dist_peer_timeout = self.distributed_config.peer_timeout();
 
         // Pick a free port for the primary server before spawning secondaries.
         let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -1404,8 +1483,8 @@ impl PyPrimaryCoordinator {
                 let config = PrimaryConfig {
                     node_id: "primary".into(),
                     num_secondaries,
-                    connect_timeout: Duration::from_secs(600),
-                    peer_timeout: Duration::from_secs(300),
+                    connect_timeout: dist_connect_timeout,
+                    peer_timeout: dist_peer_timeout,
                 };
 
                 let estimator = PyMemoryEstimatorBridge { slope, intercept };
@@ -1466,6 +1545,7 @@ struct PySecondaryCoordinator {
     log_dir: PathBuf,
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
+    distributed_config: DistributedConfig,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -1489,6 +1569,7 @@ impl PySecondaryCoordinator {
         skip_existing = false,
         log_paths = None,
         worker_spec = None,
+        distributed_config = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -1503,6 +1584,7 @@ impl PySecondaryCoordinator {
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
         worker_spec: Option<WorkerSpec>,
+        distributed_config: Option<DistributedConfig>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -1538,6 +1620,7 @@ impl PySecondaryCoordinator {
             log_dir,
             log_paths,
             worker_spec,
+            distributed_config: distributed_config.unwrap_or_default(),
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -1561,6 +1644,9 @@ impl PySecondaryCoordinator {
         let log_dir = self.log_dir.clone();
         let log_paths = self.log_paths.clone();
         let worker_spec = self.worker_spec.clone();
+        let dist_keepalive = self.distributed_config.keepalive_interval();
+        let dist_peer_timeout = self.distributed_config.peer_timeout();
+        let dist_connect_timeout = self.distributed_config.connect_timeout();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
@@ -1591,8 +1677,8 @@ impl PySecondaryCoordinator {
                     }
                 };
 
-                // Connect to primary via WSS with retry logic (up to 60 seconds)
-                let connect_timeout = Duration::from_secs(60);
+                // Connect to primary via WSS, retrying until the configured timeout.
+                let connect_timeout = dist_connect_timeout;
                 let retry_delay = Duration::from_secs(1);
                 let start = std::time::Instant::now();
                 let mut attempt = 0u32;
@@ -1655,10 +1741,10 @@ impl PySecondaryCoordinator {
                     num_workers,
                     max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram_bytes)]),
                     hostname: gethostname(),
-                    keepalive_interval: Duration::from_secs(1),
+                    keepalive_interval: dist_keepalive,
                     src_network: None,
                     src_tmp: None,
-                    peer_timeout: Duration::from_secs(120),
+                    peer_timeout: dist_peer_timeout,
                 };
 
                 let estimator = PyMemoryEstimatorBridge { slope, intercept };
@@ -1790,6 +1876,7 @@ fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LogPathConfig>()?;
     m.add_class::<WorkerSpec>()?;
     m.add_class::<SchedulerConfig>()?;
+    m.add_class::<DistributedConfig>()?;
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;

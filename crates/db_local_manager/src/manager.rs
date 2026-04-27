@@ -25,6 +25,24 @@ pub struct LocalManagerConfig {
     /// Minimum free system resources below which unassigned tasks are skipped.
     /// Default: Memory → 300MB.
     pub low_resource_thresholds: ResourceMap,
+    /// How often the OOM/resource-pressure check fires inside the worker loop.
+    /// Default: 100ms.
+    pub resource_check_interval: Duration,
+}
+
+impl Default for LocalManagerConfig {
+    fn default() -> Self {
+        Self {
+            num_workers: 0,
+            max_resources: ResourceMap::new(),
+            always_restart_worker: false,
+            print_pid: false,
+            memuse_log_path: None,
+            stage_timeouts: HashMap::new(),
+            low_resource_thresholds: ResourceMap::new(),
+            resource_check_interval: Duration::from_millis(100),
+        }
+    }
 }
 
 /// Callback trait for spawning/restarting worker transports.
@@ -416,7 +434,8 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         phase: ProcessingPhase,
         factory: &mut impl WorkerFactory<M>,
     ) {
-        let mut pressure_check_interval = tokio::time::interval(Duration::from_millis(100));
+        let mut pressure_check_interval =
+            tokio::time::interval(self.config.resource_check_interval);
 
         while !active_workers.is_empty() {
             // Try to assign tasks to any idle workers
@@ -1172,6 +1191,7 @@ mod tests {
             memuse_log_path: None,
             stage_timeouts: HashMap::new(),
             low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
+            resource_check_interval: std::time::Duration::from_millis(100),
         }
     }
 
@@ -1370,6 +1390,7 @@ mod tests {
                 memuse_log_path: Some(memuse_path.clone()),
                 stage_timeouts: HashMap::new(),
                 low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
+            resource_check_interval: std::time::Duration::from_millis(100),
             };
 
             let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
