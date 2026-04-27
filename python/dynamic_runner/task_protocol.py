@@ -34,8 +34,10 @@ class StageDefinition:
 class TaskDefinition(Protocol):
     """The duck-typed contract a task package implements.
 
-    Existing `dynamic_batch.task.base.TaskDefinition` subclasses satisfy
-    this protocol automatically — there is no required base class.
+    Any object with the right attributes satisfies this protocol —
+    there is no required base class. (Pre-migration callers subclassed
+    a `TaskDefinition` ABC; that base class is gone, but those
+    subclasses still satisfy the structural protocol unchanged.)
     """
 
     def get_stages(self) -> list[StageDefinition]: ...
