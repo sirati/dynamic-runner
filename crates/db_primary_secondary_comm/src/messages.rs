@@ -57,7 +57,10 @@ pub struct PeerConnectionInfo {
 pub struct DistributedBinaryInfo<I> {
     pub path: String,
     pub size: u64,
-    #[serde(flatten)]
+    /// Wire identity. Pre-B2 this was a flattened struct of typed fields
+    /// (e.g. {binary_name, platform, …}); post-B2 the runner treats every
+    /// identifier as an opaque key (`Arc<str>` Rust-side), so the field
+    /// is just `identifier`.
     pub identifier: I,
 }
 

@@ -1,11 +1,42 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use db_comm_api_base::BinaryInfo;
+use db_comm_api_base::{BinaryInfo, RunnerIdentifier};
 
-use crate::identifier::TokenizerIdentifier;
+/// Canonical identifier-key separator. Matches the Python
+/// `TokenizerIdentifier.identifier_key()` join order
+/// `"binary_name/platform/compiler/version/opt_level"`. Sibling task
+/// packages can compose their own key with the same separator.
+const ID_SEP: char = '/';
+
+fn join_identifier(
+    binary_name: &str,
+    platform: &str,
+    compiler: &str,
+    version: &str,
+    opt_level: &str,
+) -> RunnerIdentifier {
+    Arc::from(
+        format!(
+            "{binary_name}{ID_SEP}{platform}{ID_SEP}{compiler}{ID_SEP}{version}{ID_SEP}{opt_level}"
+        )
+        .as_str(),
+    )
+}
+
+fn split_identifier(id: &str) -> (String, String, String, String, String) {
+    let mut parts = id.splitn(5, ID_SEP);
+    (
+        parts.next().unwrap_or("").to_owned(),
+        parts.next().unwrap_or("").to_owned(),
+        parts.next().unwrap_or("").to_owned(),
+        parts.next().unwrap_or("").to_owned(),
+        parts.next().unwrap_or("").to_owned(),
+    )
+}
 
 /// Python-visible wrapper for BinaryIdentifier.
 #[pyclass(name = "BinaryIdentifier", from_py_object)]
@@ -43,15 +74,15 @@ impl PyBinaryIdentifier {
     }
 }
 
-impl From<&PyBinaryIdentifier> for TokenizerIdentifier {
+impl From<&PyBinaryIdentifier> for RunnerIdentifier {
     fn from(py: &PyBinaryIdentifier) -> Self {
-        TokenizerIdentifier {
-            binary_name: py.binary_name.clone(),
-            platform: py.platform.clone(),
-            compiler: py.compiler.clone(),
-            version: py.version.clone(),
-            opt_level: py.opt_level.clone(),
-        }
+        join_identifier(
+            &py.binary_name,
+            &py.platform,
+            &py.compiler,
+            &py.version,
+            &py.opt_level,
+        )
     }
 }
 
@@ -79,27 +110,29 @@ impl PyBinaryInfo {
     }
 }
 
-impl From<&PyBinaryInfo> for BinaryInfo<TokenizerIdentifier> {
+impl From<&PyBinaryInfo> for BinaryInfo<RunnerIdentifier> {
     fn from(py: &PyBinaryInfo) -> Self {
         BinaryInfo {
             path: PathBuf::from(&py.path),
             size: py.size,
-            identifier: TokenizerIdentifier::from(&py.identifier),
+            identifier: RunnerIdentifier::from(&py.identifier),
         }
     }
 }
 
-impl From<&BinaryInfo<TokenizerIdentifier>> for PyBinaryInfo {
-    fn from(bi: &BinaryInfo<TokenizerIdentifier>) -> Self {
+impl From<&BinaryInfo<RunnerIdentifier>> for PyBinaryInfo {
+    fn from(bi: &BinaryInfo<RunnerIdentifier>) -> Self {
+        let (binary_name, platform, compiler, version, opt_level) =
+            split_identifier(&bi.identifier);
         PyBinaryInfo {
             path: bi.path.to_string_lossy().into_owned(),
             size: bi.size,
             identifier: PyBinaryIdentifier {
-                binary_name: bi.identifier.binary_name.clone(),
-                platform: bi.identifier.platform.clone(),
-                compiler: bi.identifier.compiler.clone(),
-                version: bi.identifier.version.clone(),
-                opt_level: bi.identifier.opt_level.clone(),
+                binary_name,
+                platform,
+                compiler,
+                version,
+                opt_level,
             },
         }
     }
@@ -131,7 +164,7 @@ pub(crate) struct PyFailedTask {
 
 pub(crate) fn extract_binaries(
     binaries: &Bound<'_, PyList>,
-) -> PyResult<Vec<BinaryInfo<TokenizerIdentifier>>> {
+) -> PyResult<Vec<BinaryInfo<RunnerIdentifier>>> {
     binaries
         .iter()
         .map(|item| {
@@ -139,23 +172,30 @@ pub(crate) fn extract_binaries(
             let path: String = path_obj.str()?.to_string();
             let size: u64 = item.getattr("size")?.extract()?;
             let ident = item.getattr("identifier")?;
-            let binary_name: String = ident.getattr("binary_name")?.extract()?;
-            let platform: String = ident.getattr("platform")?.extract()?;
-            let compiler: String = ident.getattr("compiler")?.extract()?;
-            let version: String = ident.getattr("version")?.extract()?;
-            let opt_level: String = ident.getattr("opt_level")?.extract()?;
+
+            // Prefer the structured-identifier interface (`identifier_key()`)
+            // when the Python identifier is a TokenizerIdentifier dataclass
+            // or compatible. Fall back to PyBinaryIdentifier's 5 explicit
+            // fields for backward compat.
+            let identifier: RunnerIdentifier = if let Ok(key_attr) = ident.getattr("identifier_key")
+            {
+                let key: String = key_attr.call0()?.extract()?;
+                Arc::from(key.as_str())
+            } else {
+                let binary_name: String = ident.getattr("binary_name")?.extract()?;
+                let platform: String = ident.getattr("platform")?.extract()?;
+                let compiler: String = ident.getattr("compiler")?.extract()?;
+                let version: String = ident.getattr("version")?.extract()?;
+                let opt_level: String = ident.getattr("opt_level")?.extract()?;
+                join_identifier(&binary_name, &platform, &compiler, &version, &opt_level)
+            };
 
             Ok(BinaryInfo {
                 path: PathBuf::from(path),
                 size,
-                identifier: TokenizerIdentifier {
-                    binary_name,
-                    platform,
-                    compiler,
-                    version,
-                    opt_level,
-                },
+                identifier,
             })
         })
         .collect()
 }
+

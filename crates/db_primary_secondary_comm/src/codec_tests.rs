@@ -342,8 +342,10 @@ fn roundtrip_all_message_types() {
     }
 }
 
-/// Verify wire format backward compatibility: identifier fields are
-/// flattened into the JSON object, not nested under "identifier".
+/// Wire format post-B2: identifier is a single nested field (no longer
+/// `#[serde(flatten)]`). The runner treats every identifier as an opaque
+/// key; the structure pre-B2 was a tokenizer-specific leak through the
+/// generic protocol.
 #[test]
 fn wire_format_flattened_identifier() {
     let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
@@ -364,12 +366,13 @@ fn wire_format_flattened_identifier() {
     let json = serde_json::to_string(&msg).unwrap();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-    // binary_info should have flattened fields
     let bi = &v["binary_info"];
-    assert_eq!(bi["binary_name"], "test_binary");
-    assert_eq!(bi["platform"], "x86_64");
     assert_eq!(bi["path"], "/tmp/test");
     assert_eq!(bi["size"], 1024);
-    // Should NOT have a nested "identifier" key
-    assert!(bi.get("identifier").is_none());
+    // Identifier is now nested as a single field; pre-B2 the tokenizer's
+    // 5 fields were flattened directly into binary_info.
+    assert!(bi.get("identifier").is_some());
+    let id = &bi["identifier"];
+    assert_eq!(id["binary_name"], "test_binary");
+    assert_eq!(id["platform"], "x86_64");
 }
