@@ -15,6 +15,7 @@ use config::log_paths::LogPathConfig;
 use config::scheduler::SchedulerConfig;
 use config::worker_spec::WorkerSpec;
 use managers::distributed::PyDistributedManager;
+use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFactory};
 use managers::local::PyLocalManager;
 use managers::primary::PyPrimaryCoordinator;
 use managers::secondary::PySecondaryCoordinator;
@@ -42,5 +43,7 @@ fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
     m.add_class::<PySecondaryCoordinator>()?;
+    m.add_class::<PyCallbackWorkerFactory>()?;
+    m.add_class::<PyCallbackResourceMonitor>()?;
     Ok(())
 }
