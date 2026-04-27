@@ -177,6 +177,8 @@ async fn single_secondary_processes_all_tasks() {
             num_secondaries: 1,
             connect_timeout: Duration::from_secs(5),
             peer_timeout: Duration::from_secs(5),
+                    keepalive_interval: Duration::from_secs(5),
+                    keepalive_miss_threshold: 3,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -220,6 +222,8 @@ async fn two_secondaries_distribute_work() {
             num_secondaries: 2,
             connect_timeout: Duration::from_secs(5),
             peer_timeout: Duration::from_secs(5),
+                    keepalive_interval: Duration::from_secs(5),
+                    keepalive_miss_threshold: 3,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -376,6 +380,8 @@ async fn e2e_primary_and_secondary_single_node() {
             num_secondaries: 1,
             connect_timeout: Duration::from_secs(10),
             peer_timeout: Duration::from_secs(10),
+                    keepalive_interval: Duration::from_secs(5),
+                    keepalive_miss_threshold: 3,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -443,6 +449,8 @@ async fn e2e_primary_and_two_secondaries() {
             num_secondaries: 2,
             connect_timeout: Duration::from_secs(10),
             peer_timeout: Duration::from_secs(10),
+                    keepalive_interval: Duration::from_secs(5),
+                    keepalive_miss_threshold: 3,
         };
 
         let mut primary = PrimaryCoordinator::new(

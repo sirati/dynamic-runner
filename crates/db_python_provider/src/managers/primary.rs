@@ -62,6 +62,9 @@ impl PyPrimaryCoordinator {
         let intercept = self.estimator_intercept;
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
+        let dist_keepalive = self.distributed_config.keepalive_interval();
+        let dist_keepalive_miss_threshold =
+            self.distributed_config.keepalive_miss_threshold();
 
         // Pick a free port for the primary server before spawning secondaries.
         let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -121,6 +124,8 @@ impl PyPrimaryCoordinator {
                     num_secondaries,
                     connect_timeout: dist_connect_timeout,
                     peer_timeout: dist_peer_timeout,
+                    keepalive_interval: dist_keepalive,
+                    keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
                 let estimator = PyMemoryEstimatorBridge { slope, intercept };

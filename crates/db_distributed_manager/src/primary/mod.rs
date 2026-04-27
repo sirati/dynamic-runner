@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use db_comm_api_base::{BinaryInfo, Identifier, ResourceMap};
 use db_primary_secondary_comm::SecondaryTransport;
@@ -15,6 +15,12 @@ pub struct PrimaryConfig {
     pub num_secondaries: u32,
     pub connect_timeout: Duration,
     pub peer_timeout: Duration,
+    /// Cadence at which the operational loop checks for missed keepalives
+    /// from secondaries. A secondary is declared dead after
+    /// `keepalive_miss_threshold * keepalive_interval` of silence.
+    pub keepalive_interval: Duration,
+    /// Number of missed keepalives that constitute a death (default 3).
+    pub keepalive_miss_threshold: u32,
 }
 
 impl Default for PrimaryConfig {
@@ -24,6 +30,8 @@ impl Default for PrimaryConfig {
             num_secondaries: 1,
             connect_timeout: Duration::from_secs(600),
             peer_timeout: Duration::from_secs(300),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
         }
     }
 }
@@ -77,6 +85,9 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     pub(super) completed_tasks: HashSet<String>,
     pub(super) failed_tasks: HashSet<String>,
 
+    // Per-secondary last-keepalive tracking for failover detection (F1).
+    pub(super) secondary_keepalives: HashMap<String, Instant>,
+
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
 }
@@ -95,6 +106,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             pending_binaries: Vec::new(),
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
+            secondary_keepalives: HashMap::new(),
             slurm_primary_id: None,
         }
     }
@@ -156,6 +168,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
 
 mod assignment;
 mod connect;
+mod heartbeat;
 mod lifecycle;
 mod peer_setup;
 mod task;

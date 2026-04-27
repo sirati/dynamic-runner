@@ -51,13 +51,19 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
 
     /// Central message dispatcher — routes incoming messages by type.
     pub(super) async fn dispatch_message(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        // Every cross-secondary message bumps the per-secondary heartbeat,
+        // not just `Keepalive`. A secondary that's actively processing
+        // tasks shouldn't be falsely declared dead just because keepalives
+        // are sparser than task traffic.
+        self.record_keepalive(msg.sender_id());
+
         match msg.msg_type() {
             MessageType::SecondaryWelcome => self.handle_welcome(msg),
             MessageType::CertExchange => self.handle_cert_exchange(msg),
             MessageType::TaskRequest => self.handle_task_request(msg).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg),
             MessageType::TaskFailed => self.handle_task_failed(msg),
-            MessageType::Keepalive => { /* consume silently */ }
+            MessageType::Keepalive => { /* tracked above, no further action */ }
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
@@ -88,9 +94,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             let conn = SecondaryConnection::new(secondary_id.clone());
             let conn = conn.receive_welcome(worker_count, resources, hostname, 0, None);
             self.secondaries.insert(
-                secondary_id,
+                secondary_id.clone(),
                 SecondaryConnectionState::Handshaking(conn),
             );
+            self.seed_keepalive(&secondary_id);
         }
     }
 

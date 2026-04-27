@@ -116,6 +116,8 @@ impl PyDistributedManager {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
+        let dist_keepalive_miss_threshold =
+            self.distributed_config.keepalive_miss_threshold();
         let worker_spec = self.worker_spec.clone();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
@@ -231,6 +233,8 @@ impl PyDistributedManager {
                     num_secondaries,
                     connect_timeout: dist_connect_timeout,
                     peer_timeout: dist_peer_timeout,
+                    keepalive_interval: dist_keepalive,
+                    keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
                 let estimator = PyMemoryEstimatorBridge { slope, intercept };

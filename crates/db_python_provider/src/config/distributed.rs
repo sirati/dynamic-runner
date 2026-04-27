@@ -63,5 +63,8 @@ impl DistributedConfig {
     pub(crate) fn keepalive_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.keepalive_interval_secs)
     }
+    pub(crate) fn keepalive_miss_threshold(&self) -> u32 {
+        self.keepalive_miss_threshold
+    }
 }
 

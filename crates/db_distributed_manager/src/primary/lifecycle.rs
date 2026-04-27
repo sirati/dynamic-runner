@@ -35,6 +35,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
     pub(super) async fn operational_loop(&mut self) -> Result<(), String> {
         tracing::info!("entering operational loop");
 
+        let mut heartbeat_tick =
+            tokio::time::interval(self.config.keepalive_interval);
+        // Skip the immediate first tick — secondaries might not have sent
+        // their first keepalive yet at the moment we enter the loop.
+        heartbeat_tick.tick().await;
+
         loop {
             // Check termination: all tasks accounted for
             if self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks {
@@ -60,6 +66,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                             tracing::info!("transport closed");
                             break;
                         }
+                    }
+                }
+                _ = heartbeat_tick.tick() => {
+                    let report = self.collect_heartbeat_report();
+                    for dead in report.dead {
+                        self.requeue_dead_secondary(dead).await?;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
