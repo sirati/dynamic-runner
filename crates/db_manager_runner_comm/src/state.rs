@@ -127,13 +127,13 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                 }
             }
             Some(response) => match response {
-                Response::Done { result_data: _ } => {
-                    // The opaque `result_data` bytes will be plumbed through to
-                    // the task-specific aggregator in a later phase (M6). For
-                    // now they're discarded; the runner only records that the
-                    // task succeeded.
+                Response::Done { result_data } => {
+                    // `result_data` is forwarded as opaque bytes to the manager
+                    // and surfaced via `LocalManager::task_results()` for the
+                    // Python-side task-specific aggregator (M6).
                     PollResult::Completed {
                         result: TaskResult::ok(),
+                        result_data,
                         protocol: RunnerProtocol {
                             _state: PhantomData,
                             transport: self.transport,
@@ -157,6 +157,7 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                     } else {
                         PollResult::Completed {
                             result,
+                            result_data: None,
                             protocol: RunnerProtocol {
                                 _state: PhantomData,
                                 transport: self.transport,
@@ -210,6 +211,9 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
 pub enum PollResult<M: ManagerEndpoint> {
     Completed {
         result: TaskResult,
+        /// Opaque task-specific payload returned by the worker on `done:<bytes>`.
+        /// The runner does not interpret these bytes — Python decodes them.
+        result_data: Option<Vec<u8>>,
         protocol: RunnerProtocol<Idle, M>,
     },
     StillRunning {

@@ -20,6 +20,9 @@ pub enum WorkerEvent<I: Identifier> {
     TaskCompleted {
         worker_id: WorkerId,
         result: TaskResult,
+        /// Opaque task-specific payload (the bytes after `done:` on the wire).
+        /// `None` if the worker sent a bare `done`.
+        result_data: Option<Vec<u8>>,
         binary: Option<BinaryInfo<I>>,
         estimated_resources: ResourceMap,
     },
@@ -218,10 +221,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     ) -> RunnerProtocolState<M> {
         loop {
             match processing.poll_status().await {
-                PollResult::Completed { result, protocol } => {
+                PollResult::Completed { result, result_data, protocol } => {
                     let _ = tx.send(WorkerEvent::TaskCompleted {
                         worker_id,
                         result,
+                        result_data,
                         binary: Some(binary),
                         estimated_resources,
                     });

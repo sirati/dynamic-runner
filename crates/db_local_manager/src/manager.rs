@@ -90,6 +90,9 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     in_pressure_phase: bool,
     total_assigned_resources: ResourceMap,
     stats: ProcessingStats,
+    /// Successful per-task opaque payloads, surfaced for the Python-side
+    /// task-specific aggregator. Populated as TaskCompleted events arrive.
+    task_payloads: Vec<(BinaryInfo<I>, Option<Vec<u8>>)>,
 }
 
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
@@ -107,6 +110,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             in_pressure_phase: false,
             total_assigned_resources: ResourceMap::new(),
             stats: ProcessingStats::default(),
+            task_payloads: Vec::new(),
         }
     }
 
@@ -120,6 +124,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
 
     pub fn resource_pressure_tasks(&self) -> &[FailedTask<I>] {
         &self.resource_pressure_tasks
+    }
+
+    /// Successful per-task opaque payloads in completion order.
+    pub fn task_payloads(&self) -> &[(BinaryInfo<I>, Option<Vec<u8>>)] {
+        &self.task_payloads
     }
 
     /// Main entry point: process a list of binaries through the 5-phase pipeline.
@@ -745,12 +754,19 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             WorkerEvent::TaskCompleted {
                 worker_id,
                 result,
+                result_data,
                 binary,
                 estimated_resources,
             } => {
                 // Reclaim protocol state from the spawned poll task
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
+
+                if result.success {
+                    if let Some(b) = binary.as_ref() {
+                        self.task_payloads.push((b.clone(), result_data));
+                    }
+                }
 
                 self.handle_task_completed(
                     worker_id,

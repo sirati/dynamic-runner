@@ -789,6 +789,7 @@ struct PyLocalManager {
     stats: Option<ProcessingStats>,
     failed_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
     oom_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
+    task_payloads: Vec<(BinaryInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
 }
 
 #[pymethods]
@@ -924,6 +925,7 @@ impl PyLocalManager {
             stats: None,
             failed_tasks: Vec::new(),
             oom_tasks: Vec::new(),
+            task_payloads: Vec::new(),
         })
     }
 
@@ -997,6 +999,7 @@ impl PyLocalManager {
                 self.stats = Some(manager.stats().clone());
                 self.failed_tasks = manager.failed_tasks().to_vec();
                 self.oom_tasks = manager.resource_pressure_tasks().to_vec();
+                self.task_payloads = manager.task_payloads().to_vec();
                 outcome
             }));
 
@@ -1035,6 +1038,14 @@ impl PyLocalManager {
                 error_type: format!("{:?}", t.error_type),
                 error_message: t.error_message.clone(),
             })
+            .collect()
+    }
+
+    #[getter]
+    fn task_results(&self) -> Vec<(PyBinaryInfo, Option<Vec<u8>>)> {
+        self.task_payloads
+            .iter()
+            .map(|(bi, data)| (PyBinaryInfo::from(bi), data.clone()))
             .collect()
     }
 
