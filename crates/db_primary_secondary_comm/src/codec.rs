@@ -221,35 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_command_result() {
-        let msg: DistributedMessage<TestId> = DistributedMessage::CommandResult {
-            sender_id: "host".into(),
-            timestamp: 400.0,
-            command_id: "cmd-1".into(),
-            return_code: 0,
-            stdout: "hello\n".into(),
-            stderr: String::new(),
-        };
-
-        let bytes = serialize_message(&msg).unwrap();
-        let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
-
-        match decoded {
-            DistributedMessage::CommandResult {
-                command_id,
-                return_code,
-                stdout,
-                ..
-            } => {
-                assert_eq!(command_id, "cmd-1");
-                assert_eq!(return_code, 0);
-                assert_eq!(stdout, "hello\n");
-            }
-            _ => panic!("expected CommandResult"),
-        }
-    }
-
-    #[test]
     fn decode_frame_incomplete_length() {
         assert!(decode_frame::<TestId>(&[0, 0]).unwrap().is_none());
     }
@@ -398,20 +369,6 @@ mod tests {
                 timestamp: 0.0,
                 new_primary_id: "s".into(),
                 vote_round: 1,
-            },
-            DistributedMessage::ExecuteCommand {
-                sender_id: "c".into(),
-                timestamp: 0.0,
-                command: "ls".into(),
-                command_id: "cmd-1".into(),
-            },
-            DistributedMessage::CommandResult {
-                sender_id: "h".into(),
-                timestamp: 0.0,
-                command_id: "cmd-1".into(),
-                return_code: 0,
-                stdout: "".into(),
-                stderr: "".into(),
             },
         ];
 

@@ -1390,7 +1390,7 @@ impl PySecondaryCoordinator {
                 secondary.set_peer_cert_info(
                     db_distributed_manager::PeerCertInfo {
                         public_cert_pem: peer_cert_pem,
-                        ipv4_address: Some(detect_ipv4()),
+                        ipv4_address: Some(detect_ipv4(None)),
                         ipv6_address: None,
                         quic_port: peer_port,
                     },
@@ -1437,17 +1437,39 @@ fn gethostname() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Detect the local IPv4 address by connecting a UDP socket to 8.8.8.8.
-/// Returns "127.0.0.1" if detection fails.
-fn detect_ipv4() -> String {
-    use std::net::UdpSocket;
-    UdpSocket::bind("0.0.0.0:0")
-        .and_then(|sock| {
-            sock.connect("8.8.8.8:80")?;
-            sock.local_addr()
-        })
-        .map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".into())
+/// Detect the local IPv4 address.
+///
+/// Resolution order:
+///   1. If `override_ip` is `Some`, use it verbatim. This is the explicit
+///      Python-side `local_ip` config knob (wired in via PrimaryConfig /
+///      SecondaryConfig once those typed configs exist).
+///   2. Otherwise, parse the first non-loopback IPv4 from `hostname -I`.
+///   3. Otherwise, fall back to "127.0.0.1".
+///
+/// No outbound network connection is made — this works in air-gapped
+/// clusters where the previous `8.8.8.8:80` UDP probe failed.
+fn detect_ipv4(override_ip: Option<&str>) -> String {
+    if let Some(ip) = override_ip {
+        return ip.to_string();
+    }
+
+    let output = std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+
+    if let Some(line) = output {
+        for token in line.split_whitespace() {
+            if let Ok(addr) = token.parse::<std::net::Ipv4Addr>() {
+                if !addr.is_loopback() && !addr.is_unspecified() {
+                    return addr.to_string();
+                }
+            }
+        }
+    }
+
+    "127.0.0.1".into()
 }
 
 /// Python module definition.

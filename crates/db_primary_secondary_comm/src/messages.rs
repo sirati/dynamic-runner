@@ -25,9 +25,6 @@ pub enum MessageType {
     TimeoutResponse,
     PromotionVote,
     PromotionConfirm,
-    // Host <-> Container
-    ExecuteCommand,
-    CommandResult,
 }
 
 /// Worker readiness information.
@@ -237,20 +234,6 @@ pub enum DistributedMessage<I> {
         new_primary_id: String,
         vote_round: u32,
     },
-    ExecuteCommand {
-        sender_id: String,
-        timestamp: f64,
-        command: String,
-        command_id: String,
-    },
-    CommandResult {
-        sender_id: String,
-        timestamp: f64,
-        command_id: String,
-        return_code: i32,
-        stdout: String,
-        stderr: String,
-    },
 }
 
 impl<I> DistributedMessage<I> {
@@ -273,9 +256,7 @@ impl<I> DistributedMessage<I> {
             | Self::TimeoutQuery { sender_id, .. }
             | Self::TimeoutResponse { sender_id, .. }
             | Self::PromotionVote { sender_id, .. }
-            | Self::PromotionConfirm { sender_id, .. }
-            | Self::ExecuteCommand { sender_id, .. }
-            | Self::CommandResult { sender_id, .. } => sender_id,
+            | Self::PromotionConfirm { sender_id, .. } => sender_id,
         }
     }
 
@@ -298,9 +279,7 @@ impl<I> DistributedMessage<I> {
             | Self::TimeoutQuery { timestamp, .. }
             | Self::TimeoutResponse { timestamp, .. }
             | Self::PromotionVote { timestamp, .. }
-            | Self::PromotionConfirm { timestamp, .. }
-            | Self::ExecuteCommand { timestamp, .. }
-            | Self::CommandResult { timestamp, .. } => *timestamp,
+            | Self::PromotionConfirm { timestamp, .. } => *timestamp,
         }
     }
 
@@ -324,8 +303,6 @@ impl<I> DistributedMessage<I> {
             Self::TimeoutResponse { .. } => MessageType::TimeoutResponse,
             Self::PromotionVote { .. } => MessageType::PromotionVote,
             Self::PromotionConfirm { .. } => MessageType::PromotionConfirm,
-            Self::ExecuteCommand { .. } => MessageType::ExecuteCommand,
-            Self::CommandResult { .. } => MessageType::CommandResult,
         }
     }
 }
