@@ -1,13 +1,22 @@
-from .worker_manager import (
-    ActualAuthoritativeWorkerManager,
-    ActualSubmissiveWorkerManager,
-    LocalWorkerManager,
-    WorkerManagerBase,
-)
+"""Generic dynamic batch runner. Task-specific code lives in sibling
+packages (e.g. `dynamic_batch_tokenizer`).
+
+Public surface:
+- `run(task, ...)` — the canonical entry point.
+- `TaskDefinition`, `Phase`, `StageDefinition` — Protocol + dataclass for
+  task packages.
+- `make_subprocess_spawn_factory(package_name)` — convenience factory for
+  the `spawn_secondary` callback.
+"""
+
+from .run import run
+from .spawn_secondary import make_subprocess_spawn_factory
+from .task_protocol import Phase, StageDefinition, TaskDefinition
 
 __all__ = [
-    "LocalWorkerManager",
-    "WorkerManagerBase",
-    "ActualAuthoritativeWorkerManager",
-    "ActualSubmissiveWorkerManager",
+    "run",
+    "make_subprocess_spawn_factory",
+    "TaskDefinition",
+    "Phase",
+    "StageDefinition",
 ]
