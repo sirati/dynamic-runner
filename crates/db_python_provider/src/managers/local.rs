@@ -25,6 +25,8 @@ pub(crate) struct PyLocalManager {
     max_memory: u64,
     low_memory_threshold: u64,
     always_restart_worker: bool,
+    restart_predicate: Option<Py<PyAny>>,
+    retry_max_attempts: u32,
     print_pid: bool,
     source_dir: PathBuf,
     output_dir: PathBuf,
@@ -59,6 +61,8 @@ impl PyLocalManager {
         task_args,
         skip_existing = false,
         always_restart_worker = false,
+        restart_predicate = None,
+        retry_max_attempts = 1,
         print_pid = false,
         connection_mode = "socketpair",
         socket_dir = None,
@@ -79,6 +83,8 @@ impl PyLocalManager {
         task_args: &Bound<'_, PyAny>,
         skip_existing: bool,
         always_restart_worker: bool,
+        restart_predicate: Option<Py<PyAny>>,
+        retry_max_attempts: u32,
         print_pid: bool,
         connection_mode: &str,
         socket_dir: Option<String>,
@@ -127,6 +133,8 @@ impl PyLocalManager {
             max_memory,
             low_memory_threshold: low_memory_threshold.unwrap_or(300 * 1024 * 1024),
             always_restart_worker,
+            restart_predicate,
+            retry_max_attempts,
             print_pid,
             source_dir: task.source_path,
             output_dir: task.output_path,
@@ -170,10 +178,21 @@ impl PyLocalManager {
 
         let memuse_log_path = Some(self.output_dir.join("memuse.log"));
 
+        let restart_predicate = self.restart_predicate.as_ref().map(|cb| {
+            let cb = cb.clone_ref(py);
+            let predicate: db_local_manager::RestartPredicate =
+                Box::new(move |ctx: &db_local_manager::RestartContext<'_>| -> bool {
+                    crate::managers::factory_callback::invoke_restart_predicate(&cb, ctx)
+                });
+            predicate
+        });
+
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
             max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.max_memory)]),
             always_restart_worker: self.always_restart_worker,
+            restart_predicate,
+            retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
             memuse_log_path,
             stage_timeouts: self.stage_timeouts.clone(),

@@ -112,6 +112,8 @@ fn test_config(num_workers: u32) -> LocalManagerConfig {
         num_workers,
         max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]), // 1GB
         always_restart_worker: false,
+        restart_predicate: None,
+        retry_max_attempts: 1,
         print_pid: false,
         memuse_log_path: None,
         stage_timeouts: HashMap::new(),
@@ -312,12 +314,14 @@ async fn memuse_log_written() {
             num_workers: 1,
             max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
             always_restart_worker: false,
+            restart_predicate: None,
+            retry_max_attempts: 1,
             print_pid: false,
             memuse_log_path: Some(memuse_path.clone()),
             stage_timeouts: HashMap::new(),
             low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
-        resource_check_interval: std::time::Duration::from_millis(100),
-        phase_status_log_intervals: Vec::new(),
+            resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
         };
 
         let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));

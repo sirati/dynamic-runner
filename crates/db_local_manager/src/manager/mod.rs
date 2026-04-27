@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use db_comm_api_base::{
@@ -12,11 +13,39 @@ use crate::pool::{ResourcePressureResult, WorkerPool};
 use crate::stats::ProcessingStats;
 use crate::worker::WorkerEvent;
 
+/// Per-completion context handed to a `RestartPredicate`. References borrow
+/// from the manager's per-worker state and live only for the predicate call.
+pub struct RestartContext<'a> {
+    pub success: bool,
+    pub binary_path: &'a Path,
+    pub binary_size: u64,
+    pub estimated_resources: &'a ResourceMap,
+    pub actual_resources: &'a ResourceMap,
+}
+
+/// Decide whether to recycle a worker after a task completes. Used in
+/// addition to the coarse `always_restart_worker` flag — if either is true,
+/// the worker is restarted (when there's still pending work).
+///
+/// `Send` so that callers may construct the predicate before crossing a
+/// thread boundary (e.g. `pyo3::Python::detach`); the predicate itself runs
+/// on the manager's single-threaded LocalSet.
+pub type RestartPredicate = Box<dyn Fn(&RestartContext<'_>) -> bool + Send>;
+
 /// Configuration for the local manager.
 pub struct LocalManagerConfig {
     pub num_workers: u32,
     pub max_resources: ResourceMap,
     pub always_restart_worker: bool,
+    /// Optional fine-grained predicate. Considered alongside (OR'd with)
+    /// `always_restart_worker`. Receives per-completion stats; returning
+    /// `true` triggers a restart.
+    pub restart_predicate: Option<RestartPredicate>,
+    /// Maximum number of times a single binary will be retried after a
+    /// recoverable failure. The first attempt counts; default `1` means
+    /// "no retry" (a binary fails after the first attempt). Setting to `2`
+    /// gives one retry after the initial failure, etc.
+    pub retry_max_attempts: u32,
     pub print_pid: bool,
     pub memuse_log_path: Option<std::path::PathBuf>,
     /// Phase name → timeout duration. If a worker is in a phase with a timeout
@@ -42,6 +71,8 @@ impl Default for LocalManagerConfig {
             num_workers: 0,
             max_resources: ResourceMap::new(),
             always_restart_worker: false,
+            restart_predicate: None,
+            retry_max_attempts: 1,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: HashMap::new(),

@@ -143,13 +143,30 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             self.stats.errored += 1;
         }
 
-        // Restart worker after successful completion if always_restart_worker
-        // is enabled and there are still binaries to process
-        if self.config.always_restart_worker && result.success && !self.pending_binaries.is_empty() {
-            tracing::info!(worker_id, "restarting worker after successful completion (always_restart_worker)");
-            self.restart_worker(worker_id, factory).await;
-            self.pending_worker_assignments.insert(worker_id);
-            return;
+        // Restart worker after successful completion if either the coarse
+        // always_restart_worker flag is set or the optional restart_predicate
+        // returns true; only when there's still pending work.
+        if result.success && !self.pending_binaries.is_empty() {
+            let predicate_says_restart = if let (Some(predicate), Some(b)) =
+                (self.config.restart_predicate.as_ref(), binary.as_ref())
+            {
+                let ctx = super::RestartContext {
+                    success: true,
+                    binary_path: &b.path,
+                    binary_size: b.size,
+                    estimated_resources: &estimated_resources,
+                    actual_resources: &actual_usage,
+                };
+                predicate(&ctx)
+            } else {
+                false
+            };
+            if self.config.always_restart_worker || predicate_says_restart {
+                tracing::info!(worker_id, "restarting worker after successful completion");
+                self.restart_worker(worker_id, factory).await;
+                self.pending_worker_assignments.insert(worker_id);
+                return;
+            }
         }
 
         // Try to assign next task

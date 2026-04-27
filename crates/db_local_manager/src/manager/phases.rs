@@ -141,27 +141,50 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             return;
         }
 
-        tracing::info!(count = self.failed_tasks.len(), "starting retry phase");
+        let max_passes = self.config.retry_max_attempts;
+        tracing::info!(
+            count = self.failed_tasks.len(),
+            max_passes,
+            "starting retry phase"
+        );
 
-        let retry_tasks: Vec<FailedTask<I>> = self.failed_tasks.drain(..).collect();
-        for task in retry_tasks {
-            self.pending_binaries.push(task.binary);
-        }
-
-        // Restart any stopped/dead workers before retry (matching Python behavior)
-        for i in 0..self.config.num_workers {
-            if self.pool.workers[i as usize].is_stopped() || !self.pool.workers[i as usize].is_ready() {
-                tracing::info!(worker_id = i, "restarting worker for retry phase");
-                self.restart_worker(i, factory).await;
-                self.pending_worker_assignments.insert(i);
+        for pass in 0..max_passes {
+            if self.failed_tasks.is_empty() {
+                break;
             }
-        }
 
-        let mut active_workers: HashSet<WorkerId> =
-            (0..self.config.num_workers).collect();
+            let retry_tasks: Vec<FailedTask<I>> = self.failed_tasks.drain(..).collect();
+            tracing::info!(
+                pass = pass + 1,
+                count = retry_tasks.len(),
+                "retry pass"
+            );
+            for task in retry_tasks {
+                self.pending_binaries.push(task.binary);
+            }
 
-        self.process_worker_loop(&mut active_workers, true, true, ProcessingPhase::RetryPhase, factory)
+            // Restart any stopped/dead workers before retry (matching Python behavior)
+            for i in 0..self.config.num_workers {
+                if self.pool.workers[i as usize].is_stopped()
+                    || !self.pool.workers[i as usize].is_ready()
+                {
+                    tracing::info!(worker_id = i, "restarting worker for retry phase");
+                    self.restart_worker(i, factory).await;
+                    self.pending_worker_assignments.insert(i);
+                }
+            }
+
+            let mut active_workers: HashSet<WorkerId> = (0..self.config.num_workers).collect();
+
+            self.process_worker_loop(
+                &mut active_workers,
+                true,
+                true,
+                ProcessingPhase::RetryPhase,
+                factory,
+            )
             .await;
+        }
 
         tracing::info!(
             completed = self.stats.completed,

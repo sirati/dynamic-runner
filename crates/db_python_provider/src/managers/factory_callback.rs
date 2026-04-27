@@ -12,9 +12,10 @@ use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use db_comm_api_base::{ResourceKind, ResourceMap, WorkerId};
-use db_local_manager::{ResourceMonitor, WorkerFactory};
+use db_local_manager::{RestartContext, ResourceMonitor, WorkerFactory};
 use db_transport_socket::named_socket::NamedSocketManagerEnd;
 use db_transport_socket::socketpair::create_socketpair;
 
@@ -148,4 +149,44 @@ impl ResourceMonitor for PyCallbackResourceMonitor {
             }
         }
     }
+}
+
+/// Bridge a Python `restart_predicate` callable into a `RestartPredicate`
+/// closure. The Python callable is invoked with keyword arguments
+/// (`success`, `binary_path`, `binary_size`, `estimated_resources`,
+/// `actual_resources`) and is expected to return a bool. Failures degrade
+/// to "no restart" and are logged.
+pub(crate) fn invoke_restart_predicate(
+    callback: &Py<PyAny>,
+    ctx: &RestartContext<'_>,
+) -> bool {
+    let result = Python::attach(|py| -> PyResult<bool> {
+        let estimated: HashMap<String, u64> = ctx
+            .estimated_resources
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v))
+            .collect();
+        let actual: HashMap<String, u64> = ctx
+            .actual_resources
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v))
+            .collect();
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("success", ctx.success)?;
+        kwargs.set_item(
+            "binary_path",
+            ctx.binary_path.to_string_lossy().into_owned(),
+        )?;
+        kwargs.set_item("binary_size", ctx.binary_size)?;
+        kwargs.set_item("estimated_resources", estimated)?;
+        kwargs.set_item("actual_resources", actual)?;
+        callback.bind(py).call((), Some(&kwargs))?.extract::<bool>()
+    });
+    result.unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "python restart_predicate callback failed; treating as no-restart"
+        );
+        false
+    })
 }
