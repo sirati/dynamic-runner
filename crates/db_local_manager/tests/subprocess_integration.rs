@@ -128,6 +128,7 @@ async fn single_worker_subprocess_processes_all() {
             stage_timeouts: std::collections::HashMap::new(),
             low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
         };
 
         let mut factory = PythonWorkerFactory {
@@ -289,6 +290,7 @@ async fn single_worker_named_socket_processes_all() {
             stage_timeouts: std::collections::HashMap::new(),
             low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -341,6 +343,7 @@ async fn multi_worker_named_socket_processes_all() {
             stage_timeouts: std::collections::HashMap::new(),
             low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -390,6 +393,7 @@ async fn multi_worker_subprocess_processes_all() {
             stage_timeouts: std::collections::HashMap::new(),
             low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
         };
 
         let mut factory = PythonWorkerFactory {

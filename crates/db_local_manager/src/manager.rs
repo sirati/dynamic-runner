@@ -28,6 +28,12 @@ pub struct LocalManagerConfig {
     /// How often the OOM/resource-pressure check fires inside the worker loop.
     /// Default: 100ms.
     pub resource_check_interval: Duration,
+    /// Stuck-worker reporting cadence. After a worker has been in the same
+    /// phase for any of these durations the manager logs its current phase +
+    /// elapsed time. The list does not have to be sorted; the first matching
+    /// interval that the worker has just crossed will fire. Empty disables
+    /// the reporter. Default: 60s, 5min, 10min, 30min, 1h.
+    pub phase_status_log_intervals: Vec<Duration>,
 }
 
 impl Default for LocalManagerConfig {
@@ -41,6 +47,13 @@ impl Default for LocalManagerConfig {
             stage_timeouts: HashMap::new(),
             low_resource_thresholds: ResourceMap::new(),
             resource_check_interval: Duration::from_millis(100),
+            phase_status_log_intervals: vec![
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+                Duration::from_secs(600),
+                Duration::from_secs(1800),
+                Duration::from_secs(3600),
+            ],
         }
     }
 }
@@ -472,6 +485,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                         self.check_resource_pressure();
                     }
                     self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
+                    self.report_stuck_workers();
                 }
             }
 
@@ -800,6 +814,8 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                 let worker = &mut self.pool.workers[worker_id as usize];
                 worker.phase = Some(phase_name);
                 worker.last_keepalive = Some(Instant::now());
+                worker.phase_started_at = Some(Instant::now());
+                worker.phase_status_log_idx = 0;
             }
             WorkerEvent::Keepalive { worker_id } => {
                 tracing::trace!(worker_id, "keepalive");
@@ -1011,6 +1027,42 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         }
     }
 
+    /// Walk all workers and emit a status log for any that has been in their
+    /// current phase longer than the next configured interval. Each worker
+    /// fires at most once per interval until it transitions phases.
+    fn report_stuck_workers(&mut self) {
+        if self.config.phase_status_log_intervals.is_empty() {
+            return;
+        }
+        let intervals = &self.config.phase_status_log_intervals;
+        let now = Instant::now();
+        for worker in &mut self.pool.workers {
+            let Some(started_at) = worker.phase_started_at else {
+                continue;
+            };
+            let elapsed = now.duration_since(started_at);
+            while worker.phase_status_log_idx < intervals.len()
+                && elapsed >= intervals[worker.phase_status_log_idx]
+            {
+                let phase = worker.phase.as_deref().unwrap_or("(unknown)");
+                let task = worker
+                    .current_binary
+                    .as_ref()
+                    .map(|b| b.path.display().to_string())
+                    .unwrap_or_else(|| "(no task)".into());
+                tracing::warn!(
+                    worker_id = worker.worker_id,
+                    phase,
+                    elapsed_s = elapsed.as_secs_f64(),
+                    task = %task,
+                    "worker has been in the same phase for {:.0}s",
+                    elapsed.as_secs_f64()
+                );
+                worker.phase_status_log_idx += 1;
+            }
+        }
+    }
+
     fn check_resource_pressure(&mut self) {
         let max = self.config.max_resources.clone();
         match self.pool.check_resource_pressure(&self.scheduler, &max, self.in_pressure_phase) {
@@ -1192,6 +1244,7 @@ mod tests {
             stage_timeouts: HashMap::new(),
             low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
         }
     }
 
@@ -1391,6 +1444,7 @@ mod tests {
                 stage_timeouts: HashMap::new(),
                 low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: Vec::new(),
             };
 
             let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));

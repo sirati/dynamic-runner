@@ -60,6 +60,11 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub phase: Option<String>,
     /// Timestamp of the last keepalive or phase update.
     pub last_keepalive: Option<Instant>,
+    /// When the worker entered its current phase. Reset on PhaseUpdate.
+    pub phase_started_at: Option<Instant>,
+    /// Index of the next stuck-worker interval to fire from
+    /// `LocalManagerConfig::phase_status_log_intervals`.
+    pub phase_status_log_idx: usize,
     protocol: RunnerProtocolState<M>,
     /// Shared channel for sending worker events to the manager.
     event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
@@ -87,6 +92,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             pid: None,
             phase: None,
             last_keepalive: None,
+            phase_started_at: None,
+            phase_status_log_idx: 0,
             protocol: RunnerProtocolState::WaitingForReady(waiting),
             event_tx,
             poll_task: None,
@@ -287,6 +294,8 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         self.idle = true;
         self.phase = None;
         self.last_keepalive = None;
+        self.phase_started_at = None;
+        self.phase_status_log_idx = 0;
     }
 
     /// Mark this worker as OOM-killed: clear task, mark opportunistic.

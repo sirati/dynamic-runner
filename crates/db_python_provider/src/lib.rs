@@ -777,6 +777,7 @@ struct PyLocalManager {
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
     scheduler_config: SchedulerConfig,
+    phase_status_log_intervals_secs: Vec<f64>,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -810,6 +811,7 @@ impl PyLocalManager {
         worker_spec = None,
         low_memory_threshold = None,
         scheduler_config = None,
+        phase_status_log_intervals_secs = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -829,6 +831,7 @@ impl PyLocalManager {
         worker_spec: Option<WorkerSpec>,
         low_memory_threshold: Option<u64>,
         scheduler_config: Option<SchedulerConfig>,
+        phase_status_log_intervals_secs: Option<Vec<f64>>,
     ) -> PyResult<Self> {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
@@ -908,6 +911,8 @@ impl PyLocalManager {
             log_paths,
             worker_spec,
             scheduler_config: scheduler_config.unwrap_or_default(),
+            phase_status_log_intervals_secs: phase_status_log_intervals_secs
+                .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -953,6 +958,11 @@ impl PyLocalManager {
                 self.low_memory_threshold,
             )]),
             resource_check_interval: std::time::Duration::from_millis(100),
+            phase_status_log_intervals: self
+                .phase_status_log_intervals_secs
+                .iter()
+                .map(|s| std::time::Duration::from_secs_f64(*s))
+                .collect(),
         };
 
         let mut factory = SubprocessWorkerFactory {
