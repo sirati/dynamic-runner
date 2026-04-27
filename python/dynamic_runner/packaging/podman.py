@@ -21,12 +21,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class PodmanImageMetadata:
-    """Metadata for remotely available Podman image artifacts."""
+    """Metadata for remotely available Podman image artifacts.
+
+    `base_uploaded` and `app_uploaded` reflect whether the local hash
+    matched the remote marker (i.e. the upload was skipped). With
+    layer caching enabled both images can be cache-hits, turning the
+    "transfer" phase into a couple of `cat` commands instead of a
+    1+ GB upload.
+    """
 
     base_remote_path: Path
     app_remote_path: Path
     base_hash: str
     base_uploaded: bool
+    app_hash: str = ""
+    app_uploaded: bool = True
 
 
 class PodmanPackaging:
@@ -35,6 +44,7 @@ class PodmanPackaging:
     BASE_IMAGE_NAME = "asm-tokenizer-base.tar"
     APP_IMAGE_NAME = "asm-tokenizer-app.tar"
     BASE_MARKER_NAME = "asm-tokenizer-base.sha256"
+    APP_MARKER_NAME = "asm-tokenizer-app.sha256"
 
     def __init__(self) -> None:
         self.image_name = "asm-tokenizer"
@@ -113,30 +123,31 @@ class PodmanPackaging:
         output_dir_path = self._normalize_path(output_dir)
         base_remote_path = output_dir_path / self.BASE_IMAGE_NAME
         app_remote_path = output_dir_path / self.APP_IMAGE_NAME
-        marker_remote_path = output_dir_path / self.BASE_MARKER_NAME
+        base_marker_remote_path = output_dir_path / self.BASE_MARKER_NAME
+        app_marker_remote_path = output_dir_path / self.APP_MARKER_NAME
 
         gateway.create_directory(str(output_dir_path))
 
-        base_hash = self._compute_sha256(local_base_path)
-        remote_marker_hash = self._read_remote_file(gateway, marker_remote_path)
-        remote_base_exists = self._remote_file_exists(gateway, base_remote_path)
+        # Per-image hash-marker cache: each image (base + app) keeps a
+        # sha256 file on the gateway alongside the tarball. When the
+        # local image's hash matches the marker AND the tarball still
+        # exists, skip the upload entirely. With this, an app-only
+        # change re-uploads ~MB of code instead of ~1 GB of base.
+        base_uploaded, base_hash = self._maybe_upload(
+            gateway,
+            local_base_path,
+            base_remote_path,
+            base_marker_remote_path,
+            label="Base",
+        )
 
-        should_upload_base = not (remote_marker_hash == base_hash and remote_base_exists)
-
-        if should_upload_base:
-            logger.info("Base image upload required (hash mismatch or missing remote artifact).")
-            gateway.execute_command(f"rm -f {base_remote_path}")
-            self._upload_artifact(gateway, local_base_path, base_remote_path)
-            gateway.execute_command(f"printf '%s\n' '{base_hash}' > {marker_remote_path}")
-            base_uploaded = True
-            logger.info("Base image uploaded and marker updated at %s", marker_remote_path)
-        else:
-            base_uploaded = False
-            logger.info("Base image cache hit: reusing remote base image %s", base_remote_path)
-
-        logger.info("App image upload is always enabled.")
-        gateway.execute_command(f"rm -f {app_remote_path}")
-        self._upload_artifact(gateway, local_app_path, app_remote_path)
+        app_uploaded, app_hash = self._maybe_upload(
+            gateway,
+            local_app_path,
+            app_remote_path,
+            app_marker_remote_path,
+            label="App",
+        )
 
         self._cleanup_symlink(local_base_path)
         self._cleanup_symlink(local_app_path)
@@ -147,7 +158,35 @@ class PodmanPackaging:
             app_remote_path=app_remote_path,
             base_hash=base_hash,
             base_uploaded=base_uploaded,
+            app_hash=app_hash,
+            app_uploaded=app_uploaded,
         )
+
+    def _maybe_upload(
+        self,
+        gateway: Any,
+        local_path: Path,
+        remote_path: Path,
+        marker_path: Path,
+        label: str,
+    ) -> tuple[bool, str]:
+        """Upload `local_path` only if the local sha256 doesn't match the
+        remote marker. Returns `(uploaded, local_hash)`.
+        """
+        local_hash = self._compute_sha256(local_path)
+        remote_marker_hash = self._read_remote_file(gateway, marker_path)
+        remote_exists = self._remote_file_exists(gateway, remote_path)
+
+        if remote_marker_hash == local_hash and remote_exists:
+            logger.info("%s image cache hit: reusing remote %s", label, remote_path)
+            return (False, local_hash)
+
+        logger.info("%s image upload required (hash mismatch or missing remote artifact).", label)
+        gateway.execute_command(f"rm -f {remote_path}")
+        self._upload_artifact(gateway, local_path, remote_path)
+        gateway.execute_command(f"printf '%s\n' '{local_hash}' > {marker_path}")
+        logger.info("%s image uploaded; marker updated at %s", label, marker_path)
+        return (True, local_hash)
 
     def get_load_command(self, image_path: str, storage_root: str, run_root: str) -> str:
         return f"podman --root {storage_root} --runroot {run_root} --runtime /usr/bin/crun load < {image_path}"
