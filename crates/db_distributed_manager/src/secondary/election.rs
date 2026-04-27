@@ -459,6 +459,94 @@ mod tests {
         assert!(matches!(sec.election, ElectionState::Promoted));
     }
 
+    /// Once promoted, a secondary's `slurm_pending_binaries` is hydrated
+    /// from the cached `FullTaskList` it observed earlier from the live
+    /// primary. Validates the post-promotion takeover wiring (#34).
+    #[tokio::test(flavor = "current_thread")]
+    async fn promotion_hydrates_slurm_tasks_from_cache() {
+        use db_comm_api_base::ResourceMap;
+        use db_primary_secondary_comm::{DistributedBinaryInfo, TaskInfo};
+        use std::collections::HashSet;
+
+        let mut sec = make_secondary(election_config("sec-a"));
+        sec.peer_keepalives.insert("sec-b".into(), 0.0);
+
+        // Pre-seed the cache as if the live primary had broadcast
+        // FullTaskList earlier in the run.
+        sec.cached_full_task_list = Some((
+            vec![TaskInfo {
+                local_path: "bin1".into(),
+                binary_info: DistributedBinaryInfo {
+                    path: "bin1".into(),
+                    size: 100,
+                    identifier: super::super::test_helpers::TestId("bin1".into()),
+                },
+                hash: "hash_bin1".into(),
+                file_path: None,
+            }],
+            HashSet::new(),
+        ));
+
+        // Simulate the candidate path: become candidate, then receive
+        // confirm to flip to Promoted. peer_count=1, quorum=2, so we need
+        // confirms from {self, sec-b} to promote.
+        sec.election = ElectionState::Candidate {
+            round: 1,
+            confirms: HashSet::from(["sec-a".to_string()]),
+            started: std::time::Instant::now(),
+        };
+        sec.is_slurm_primary = false; // not yet
+        let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
+        assert!(promoted, "majority confirm should promote");
+
+        assert!(matches!(sec.election, ElectionState::Promoted));
+        assert!(sec.is_slurm_primary, "promotion sets is_slurm_primary");
+        assert_eq!(
+            sec.slurm_pending_binaries.len(),
+            1,
+            "cache should have hydrated one pending binary"
+        );
+        assert!(
+            sec.cached_full_task_list.is_none(),
+            "cache is consumed on hydration"
+        );
+        let _ = ResourceMap::new(); // silence unused import on some configs
+    }
+
+    /// `record_primary_message` resets election state and clears any
+    /// remembered new-primary-peer routing target — the live primary is
+    /// alive again, so TaskRequest routes back to primary_transport.
+    #[tokio::test(flavor = "current_thread")]
+    async fn primary_recovery_clears_routing_target() {
+        let mut sec = make_secondary(election_config("sec-a"));
+        sec.slurm_primary_peer_id = Some("sec-c".into());
+        sec.election = ElectionState::Voting {
+            round: 1,
+            candidate: "sec-c".into(),
+        };
+        sec.record_primary_message();
+        assert!(matches!(sec.election, ElectionState::Normal));
+        assert!(
+            sec.slurm_primary_peer_id.is_none(),
+            "live primary message should clear the routing target"
+        );
+    }
+
+    /// `Promoted` state survives a `record_primary_message`: once we've
+    /// taken over, a stray late message from the dead primary doesn't
+    /// dethrone us.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promoted_state_survives_late_primary_message() {
+        let mut sec = make_secondary(election_config("sec-a"));
+        sec.election = ElectionState::Promoted;
+        sec.is_slurm_primary = true;
+        sec.slurm_primary_peer_id = Some("sec-a".into());
+
+        sec.record_primary_message();
+        assert!(matches!(sec.election, ElectionState::Promoted));
+        assert!(sec.is_slurm_primary);
+    }
+
     /// Scenario (d): two peers detect primary death simultaneously and both
     /// would-be-candidates start voting. The lowest-id rule + quorum
     /// resolves to a single winner; the higher-id peer defers to Voting
