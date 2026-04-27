@@ -1,17 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
+    BinaryInfo, FailedTask, Identifier, ResourceKind, ResourceMap, WorkerId,
 };
 use db_manager_runner_comm::ManagerEndpoint;
 use db_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, ProcessingPhase, Scheduler,
+    ResourceEstimator, Scheduler,
 };
-use crate::pool::{ResourcePressureResult, WorkerPool};
+use crate::pool::WorkerPool;
 use crate::stats::ProcessingStats;
-use crate::worker::WorkerEvent;
 
 /// Per-completion context handed to a `RestartPredicate`. References borrow
 /// from the manager's per-worker state and live only for the predicate call.

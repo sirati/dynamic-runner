@@ -2,7 +2,7 @@
 //! production code stays at a manageable size.
 
 use super::*;
-use db_comm_api_base::{MessageReceiver, MessageSender};
+use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender};
 use db_manager_runner_comm::{Command, Response};
 use db_scheduler_impl::ResourceStealingScheduler;
 use db_transport_channel::{ChannelManagerEnd, channel_pair};

@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
+    BinaryInfo, ErrorType, Identifier, ResourceMap, TaskResult, WorkerId,
 };
 use db_manager_runner_comm::ManagerEndpoint;
 

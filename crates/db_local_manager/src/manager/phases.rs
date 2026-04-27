@@ -1,16 +1,13 @@
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 
 use db_comm_api_base::{
-    BinaryInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
+    BinaryInfo, FailedTask, Identifier, ResourceKind, WorkerId,
 };
 use db_manager_runner_comm::ManagerEndpoint;
 use db_scheduler_api::{
     AssignmentDecision, ResourceEstimator, ProcessingPhase, Scheduler,
 };
 
-use crate::pool::ResourcePressureResult;
-use crate::worker::WorkerEvent;
 
 use super::{LocalManager, WorkerFactory};
 
