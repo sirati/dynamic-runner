@@ -262,12 +262,96 @@ enum ConnectionMode {
     },
 }
 
+/// Path-naming policy for log files, sockets, and the per-run log directory.
+///
+/// Templates accept simple `{worker_id}` and `{timestamp}` placeholders. Defaults
+/// preserve the legacy layout: `<output>/logs/<%Y%m%d_%H%M%S>/worker_<id>.log`
+/// and `worker_<id>.sock` inside the named-socket directory.
+#[pyclass(name = "LogPathConfig", get_all, set_all, from_py_object)]
+#[derive(Clone, Debug)]
+struct LogPathConfig {
+    log_dir_template: String,
+    worker_log_pattern: String,
+    socket_path_pattern: String,
+    timestamp_fmt: String,
+}
+
+impl Default for LogPathConfig {
+    fn default() -> Self {
+        Self {
+            log_dir_template: "logs/{timestamp}".into(),
+            worker_log_pattern: "worker_{worker_id}.log".into(),
+            socket_path_pattern: "worker_{worker_id}.sock".into(),
+            timestamp_fmt: "%Y%m%d_%H%M%S".into(),
+        }
+    }
+}
+
+#[pymethods]
+impl LogPathConfig {
+    #[new]
+    #[pyo3(signature = (
+        log_dir_template = None,
+        worker_log_pattern = None,
+        socket_path_pattern = None,
+        timestamp_fmt = None,
+    ))]
+    fn new(
+        log_dir_template: Option<String>,
+        worker_log_pattern: Option<String>,
+        socket_path_pattern: Option<String>,
+        timestamp_fmt: Option<String>,
+    ) -> Self {
+        let d = LogPathConfig::default();
+        Self {
+            log_dir_template: log_dir_template.unwrap_or(d.log_dir_template),
+            worker_log_pattern: worker_log_pattern.unwrap_or(d.worker_log_pattern),
+            socket_path_pattern: socket_path_pattern.unwrap_or(d.socket_path_pattern),
+            timestamp_fmt: timestamp_fmt.unwrap_or(d.timestamp_fmt),
+        }
+    }
+}
+
+impl LogPathConfig {
+    fn worker_log(&self, log_dir: &Path, worker_id: WorkerId) -> PathBuf {
+        log_dir.join(
+            self.worker_log_pattern
+                .replace("{worker_id}", &worker_id.to_string()),
+        )
+    }
+
+    fn socket_path(&self, socket_dir: &Path, worker_id: WorkerId) -> PathBuf {
+        socket_dir.join(
+            self.socket_path_pattern
+                .replace("{worker_id}", &worker_id.to_string()),
+        )
+    }
+
+    /// Build the per-run log directory under `output_dir` from the template
+    /// using the current timestamp. The template may include `{timestamp}`.
+    fn resolve_log_dir(&self, py: Python<'_>, output_dir: &Path) -> PyResult<PathBuf> {
+        let datetime_mod = py.import("datetime")?;
+        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
+        let timestamp: String = now
+            .call_method1("strftime", (self.timestamp_fmt.as_str(),))?
+            .extract()?;
+        let rendered = self.log_dir_template.replace("{timestamp}", &timestamp);
+        let path = PathBuf::from(rendered);
+        Ok(if path.is_absolute() {
+            path
+        } else {
+            output_dir.join(path)
+        })
+    }
+}
+
 /// Subprocess worker factory: spawns Python workers via socketpair or named socket.
 struct SubprocessWorkerFactory {
     python_executable: PathBuf,
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_dir: PathBuf,
+    log_paths: LogPathConfig,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -277,17 +361,12 @@ struct SubprocessWorkerFactory {
 }
 
 impl SubprocessWorkerFactory {
-    /// Get the socket path for a worker in named socket mode.
-    fn socket_path_for_worker(socket_dir: &Path, worker_id: WorkerId) -> PathBuf {
-        socket_dir.join(format!("worker_{worker_id}.sock"))
-    }
-
     /// Spawn using socketpair mode: create a socketpair, pass child FD.
     fn spawn_socketpair(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
         let (manager_end, child_fd) = create_socketpair()
             .unwrap_or_else(|e| panic!("failed to create socketpair for worker {worker_id}: {e}"));
 
-        let worker_log = self.log_dir.join(format!("worker_{worker_id}.log"));
+        let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
         let mut cmd = std::process::Command::new(&self.python_executable);
         cmd.arg("-m")
             .arg(&self.worker_module)
@@ -343,13 +422,13 @@ impl SubprocessWorkerFactory {
         worker_id: WorkerId,
         socket_dir: &PathBuf,
     ) -> (EitherManagerEnd, Option<u32>) {
-        let socket_path = Self::socket_path_for_worker(socket_dir, worker_id);
+        let socket_path = self.log_paths.socket_path(socket_dir, worker_id);
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)
             .unwrap_or_else(|e| panic!("failed to bind named socket for worker {worker_id}: {e}"));
 
         if self.manual_start_worker {
             // Print command for manual execution
-            let worker_log = self.log_dir.join(format!("worker_{worker_id}.log"));
+            let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
             let mut parts = vec![
                 self.python_executable.to_string_lossy().into_owned(),
                 "-m".into(),
@@ -386,7 +465,7 @@ impl SubprocessWorkerFactory {
         }
 
         // Auto-spawn subprocess with --socket-path
-        let worker_log = self.log_dir.join(format!("worker_{worker_id}.log"));
+        let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
         let mut cmd = std::process::Command::new(&self.python_executable);
         cmd.arg("-m")
             .arg(&self.worker_module)
@@ -452,6 +531,7 @@ struct PyLocalManager {
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_dir: PathBuf,
+    log_paths: LogPathConfig,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -481,6 +561,7 @@ impl PyLocalManager {
         connection_mode = "socketpair",
         socket_dir = None,
         manual_start_worker = false,
+        log_paths = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -496,6 +577,7 @@ impl PyLocalManager {
         connection_mode: &str,
         socket_dir: Option<String>,
         manual_start_worker: bool,
+        log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
@@ -532,11 +614,9 @@ impl PyLocalManager {
             )?
             .extract()?;
 
-        // Create timestamped log subdirectory (matching Python's logs/<timestamp>/)
-        let datetime_mod = py.import("datetime")?;
-        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
-        let timestamp: String = now.call_method1("strftime", ("%Y%m%d_%H%M%S",))?.extract()?;
-        let log_dir = output_path.join("logs").join(&timestamp);
+        // Create the per-run log directory from the LogPathConfig template.
+        let log_paths = log_paths.unwrap_or_default();
+        let log_dir = log_paths.resolve_log_dir(py, &output_path)?;
         std::fs::create_dir_all(&log_dir).ok();
 
         // Detect the current Python interpreter so workers use the same one.
@@ -573,6 +653,7 @@ impl PyLocalManager {
             source_dir: source_path,
             output_dir: output_path,
             log_dir,
+            log_paths,
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -620,6 +701,7 @@ impl PyLocalManager {
             source_dir: self.source_dir.clone(),
             output_dir: self.output_dir.clone(),
             log_dir: self.log_dir.clone(),
+            log_paths: self.log_paths.clone(),
             worker_module: self.worker_module.clone(),
             worker_cmd_args: self.worker_cmd_args.clone(),
             skip_existing: self.skip_existing,
@@ -748,6 +830,7 @@ struct PyDistributedManager {
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_dir: PathBuf,
+    log_paths: LogPathConfig,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -769,6 +852,7 @@ impl PyDistributedManager {
         task_definition,
         task_args,
         skip_existing = false,
+        log_paths = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -780,6 +864,7 @@ impl PyDistributedManager {
         task_definition: &Bound<'_, PyAny>,
         task_args: &Bound<'_, PyAny>,
         skip_existing: bool,
+        log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -797,11 +882,9 @@ impl PyDistributedManager {
             )?
             .extract()?;
 
-        // Create timestamped log subdirectory (matching Python's logs/<timestamp>/)
-        let datetime_mod = py.import("datetime")?;
-        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
-        let timestamp: String = now.call_method1("strftime", ("%Y%m%d_%H%M%S",))?.extract()?;
-        let log_dir = output_path.join("logs").join(&timestamp);
+        // Create the per-run log directory from the LogPathConfig template.
+        let log_paths = log_paths.unwrap_or_default();
+        let log_dir = log_paths.resolve_log_dir(py, &output_path)?;
         std::fs::create_dir_all(&log_dir).ok();
 
         // Detect the current Python interpreter so workers use the same one.
@@ -816,6 +899,7 @@ impl PyDistributedManager {
             source_dir: source_path,
             output_dir: output_path,
             log_dir,
+            log_paths,
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -839,6 +923,7 @@ impl PyDistributedManager {
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
         let log_dir = self.log_dir.clone();
+        let log_paths = self.log_paths.clone();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
@@ -886,6 +971,7 @@ impl PyDistributedManager {
                     let sec_source = source_dir.clone();
                     let sec_output = output_dir.clone();
                     let sec_log = log_dir.clone();
+                    let sec_log_paths = log_paths.clone();
                     let sec_worker_module = worker_module.clone();
                     let sec_worker_args = worker_cmd_args.clone();
 
@@ -912,6 +998,7 @@ impl PyDistributedManager {
                             source_dir: sec_source,
                             output_dir: sec_output,
                             log_dir: sec_log,
+                            log_paths: sec_log_paths,
                             worker_module: sec_worker_module,
                             worker_cmd_args: sec_worker_args,
                             skip_existing,
@@ -1174,6 +1261,7 @@ struct PySecondaryCoordinator {
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_dir: PathBuf,
+    log_paths: LogPathConfig,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -1195,6 +1283,7 @@ impl PySecondaryCoordinator {
         task_definition,
         task_args,
         skip_existing = false,
+        log_paths = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -1207,6 +1296,7 @@ impl PySecondaryCoordinator {
         task_definition: &Bound<'_, PyAny>,
         task_args: &Bound<'_, PyAny>,
         skip_existing: bool,
+        log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -1224,10 +1314,8 @@ impl PySecondaryCoordinator {
             )?
             .extract()?;
 
-        let datetime_mod = py.import("datetime")?;
-        let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
-        let timestamp: String = now.call_method1("strftime", ("%Y%m%d_%H%M%S",))?.extract()?;
-        let log_dir = output_path.join("logs").join(&timestamp);
+        let log_paths = log_paths.unwrap_or_default();
+        let log_dir = log_paths.resolve_log_dir(py, &output_path)?;
         std::fs::create_dir_all(&log_dir).ok();
 
         let sys = py.import("sys")?;
@@ -1242,6 +1330,7 @@ impl PySecondaryCoordinator {
             source_dir: source_path,
             output_dir: output_path,
             log_dir,
+            log_paths,
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -1263,6 +1352,7 @@ impl PySecondaryCoordinator {
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
         let log_dir = self.log_dir.clone();
+        let log_paths = self.log_paths.clone();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
@@ -1370,6 +1460,7 @@ impl PySecondaryCoordinator {
                     source_dir,
                     output_dir,
                     log_dir,
+                    log_paths,
                     worker_module,
                     worker_cmd_args,
                     skip_existing,
@@ -1487,6 +1578,7 @@ fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBinaryInfo>()?;
     m.add_class::<PyProcessingStats>()?;
     m.add_class::<PyFailedTask>()?;
+    m.add_class::<LogPathConfig>()?;
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
