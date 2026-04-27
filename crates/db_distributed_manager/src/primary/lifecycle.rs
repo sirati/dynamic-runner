@@ -69,6 +69,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                     }
                 }
                 _ = heartbeat_tick.tick() => {
+                    self.broadcast_primary_keepalive().await;
                     let report = self.collect_heartbeat_report();
                     for dead in report.dead {
                         self.requeue_dead_secondary(dead).await?;

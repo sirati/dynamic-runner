@@ -185,6 +185,7 @@ impl PyDistributedManager {
                             src_network: None,
                             src_tmp: None,
                             peer_timeout: dist_peer_timeout,
+                            keepalive_miss_threshold: dist_keepalive_miss_threshold,
                         };
 
                         let estimator = PyMemoryEstimatorBridge { slope, intercept };

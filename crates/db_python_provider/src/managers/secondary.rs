@@ -118,6 +118,8 @@ impl PySecondaryCoordinator {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
+        let dist_keepalive_miss_threshold =
+            self.distributed_config.keepalive_miss_threshold();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
@@ -216,6 +218,7 @@ impl PySecondaryCoordinator {
                     src_network: None,
                     src_tmp: None,
                     peer_timeout: dist_peer_timeout,
+                    keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
                 let estimator = PyMemoryEstimatorBridge { slope, intercept };

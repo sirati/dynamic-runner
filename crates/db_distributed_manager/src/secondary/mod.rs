@@ -27,6 +27,10 @@ pub struct SecondaryConfig {
     /// Peer timeout threshold (default: 120s). A peer is considered dead if no
     /// keepalive is received within this duration.
     pub peer_timeout: Duration,
+    /// Number of missed keepalives from the primary before the secondary
+    /// suspects primary death and starts the failover election (default 3,
+    /// matching the primary's `keepalive_miss_threshold`).
+    pub keepalive_miss_threshold: u32,
 }
 
 impl Default for SecondaryConfig {
@@ -40,6 +44,7 @@ impl Default for SecondaryConfig {
             src_network: None,
             src_tmp: None,
             peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
         }
     }
 }
@@ -100,6 +105,16 @@ where
     // Peer keepalive tracking: peer_id -> last_seen timestamp
     peer_keepalives: HashMap<String, f64>,
 
+    // Primary keepalive tracking for failover detection (F2). `None` until
+    // the first primary message arrives. Updated on every primary message,
+    // not just `Keepalive`, so an actively-routing primary doesn't get
+    // falsely declared dead.
+    primary_last_seen: Option<Instant>,
+
+    // Failover election state (F2). Defaults to Normal until the primary
+    // misses keepalives.
+    election: election::ElectionState,
+
     // Deferred peer messages to send (queued from sync handlers)
     pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
 
@@ -146,6 +161,8 @@ where
             is_slurm_primary: false,
             extraction_cache,
             peer_keepalives: HashMap::new(),
+            primary_last_seen: None,
+            election: election::ElectionState::Normal,
             pending_peer_messages: Vec::new(),
             last_request_time: HashMap::new(),
             request_backoff: HashMap::new(),
@@ -210,6 +227,7 @@ where
 }
 
 mod dispatch;
+mod election;
 mod peer;
 mod processing;
 mod resource;

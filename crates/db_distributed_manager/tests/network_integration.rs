@@ -96,6 +96,7 @@ async fn e2e_primary_secondary_over_wss() {
                 src_network: None,
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
@@ -187,6 +188,7 @@ async fn e2e_primary_secondary_over_quic() {
                 src_network: None,
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =

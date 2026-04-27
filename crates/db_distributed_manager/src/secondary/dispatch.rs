@@ -21,6 +21,10 @@ where
     I: Identifier,
 {
     pub(super) async fn dispatch_message(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        // Any message from the primary side resets the election state and
+        // bumps the keepalive timestamp (F2).
+        self.record_primary_message();
+
         match msg {
             DistributedMessage::TaskAssignment {
                 worker_id,

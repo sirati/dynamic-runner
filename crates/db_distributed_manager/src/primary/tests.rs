@@ -331,6 +331,7 @@ fn spawn_real_secondary(
             src_network: None,
             src_tmp: None,
             peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,

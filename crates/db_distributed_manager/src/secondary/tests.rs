@@ -223,6 +223,7 @@ async fn secondary_with_real_workers_processes_tasks() {
                 src_network: None,
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
             };
 
             let binaries = vec![
@@ -280,6 +281,7 @@ async fn secondary_multi_worker_processes_tasks() {
                 src_network: None,
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
             };
 
             let binaries: Vec<BinaryInfo<TestId>> = (0..6)

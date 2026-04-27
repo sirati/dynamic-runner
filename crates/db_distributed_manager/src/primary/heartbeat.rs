@@ -74,6 +74,33 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         SecondaryHeartbeatReport { dead }
     }
 
+    /// Send a `Keepalive` to every connected secondary. Secondaries use this
+    /// to detect primary death (F2): if a secondary stops seeing primary
+    /// keepalives for `keepalive_miss_threshold` intervals, it kicks off the
+    /// failover election. Called from the operational loop on the same
+    /// cadence as `collect_heartbeat_report`.
+    pub(super) async fn broadcast_primary_keepalive(&mut self) {
+        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
+        if secondary_ids.is_empty() {
+            return;
+        }
+        let msg = DistributedMessage::<I>::Keepalive {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.node_id.clone(),
+            active_workers: self.workers.iter().filter(|w| !w.is_idle).count() as u32,
+        };
+        for secondary_id in secondary_ids {
+            if let Err(e) = self.transport.send_to(&secondary_id, msg.clone()).await {
+                tracing::debug!(
+                    secondary = %secondary_id,
+                    error = %e,
+                    "primary keepalive delivery failed"
+                );
+            }
+        }
+    }
+
     /// Take in-flight tasks back, drop the secondary from the routable set,
     /// and broadcast a `TimeoutDetected` to every surviving secondary so
     /// they can prune the dead peer from their own peer maps.

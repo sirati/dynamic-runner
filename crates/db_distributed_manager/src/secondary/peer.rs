@@ -88,6 +88,32 @@ where
                 // Queue for async send — will be flushed in the main loop
                 self.pending_peer_messages.push((sender_id, response));
             }
+            DistributedMessage::TimeoutResponse {
+                sender_id,
+                query_node_id: _,
+                last_keepalive,
+                ..
+            } => {
+                self.record_timeout_response(sender_id, last_keepalive);
+            }
+            DistributedMessage::PromotionVote {
+                sender_id,
+                candidate_id,
+                vote_round,
+                ..
+            } => {
+                if let Some(reply) = self.record_promotion_vote(candidate_id, vote_round) {
+                    self.pending_peer_messages.push((sender_id, reply));
+                }
+            }
+            DistributedMessage::PromotionConfirm {
+                sender_id,
+                new_primary_id,
+                vote_round,
+                ..
+            } => {
+                self.record_promotion_confirm(sender_id, new_primary_id, vote_round);
+            }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled peer message");
             }
