@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use db_comm_api_base::{Identifier, MessageReceiver, MessageSender};
-use db_primary_secondary_comm::{DistributedMessage, SecondaryTransport};
+use db_primary_secondary_comm::{
+    DistributedMessage, PeerConnectionInfo, PeerTransport, SecondaryTransport,
+};
 use db_manager_runner_comm::{Command, Response};
 use tokio::sync::mpsc;
 
@@ -98,6 +100,88 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for ChannelPrimaryTra
     async fn recv(&mut self) -> Option<DistributedMessage<I>> {
         self.rx.recv().await
     }
+}
+
+// ── Peer-to-peer channel transport (for multi-secondary in-process tests) ──
+
+/// Channel-based PeerTransport. Each instance owns one inbox (mpsc receiver)
+/// and a dictionary of outboxes (mpsc senders), one per remote peer.
+/// `broadcast` clones the message and fans it out to every outbox; the
+/// inbox receives whatever other peers sent to *this* secondary.
+pub struct ChannelPeerTransport<I: Identifier> {
+    incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
+    outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
+}
+
+impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        for tx in self.outgoing.values() {
+            // Closed senders are tolerated — the peer simply went away.
+            let _ = tx.send(msg.clone());
+        }
+        Ok(())
+    }
+
+    async fn send_to_peer(
+        &mut self,
+        peer_id: &str,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        if let Some(tx) = self.outgoing.get(peer_id) {
+            tx.send(msg).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        self.incoming_rx.recv().await
+    }
+
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        self.incoming_rx.try_recv().ok()
+    }
+
+    fn peer_count(&self) -> usize {
+        self.outgoing.len()
+    }
+
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {
+        // No-op: peers are pre-wired via `peer_mesh`.
+    }
+}
+
+/// Wire up an all-to-all peer mesh for the given ids and return one
+/// `ChannelPeerTransport` per id, in input order. Each transport's
+/// `outgoing` map contains every other peer's inbox sender.
+pub fn peer_mesh<I: Identifier>(peer_ids: &[String]) -> Vec<ChannelPeerTransport<I>> {
+    // Allocate inbox + outbox-sender for each peer.
+    let mut inboxes: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>> = HashMap::new();
+    let mut receivers: HashMap<String, mpsc::UnboundedReceiver<DistributedMessage<I>>> =
+        HashMap::new();
+    for id in peer_ids {
+        let (tx, rx) = mpsc::unbounded_channel();
+        inboxes.insert(id.clone(), tx);
+        receivers.insert(id.clone(), rx);
+    }
+
+    let mut transports = Vec::with_capacity(peer_ids.len());
+    for id in peer_ids {
+        let incoming_rx = receivers
+            .remove(id)
+            .expect("inbox was inserted above for every id");
+        let mut outgoing = HashMap::new();
+        for other in peer_ids {
+            if other == id {
+                continue;
+            }
+            outgoing.insert(other.clone(), inboxes[other].clone());
+        }
+        transports.push(ChannelPeerTransport {
+            incoming_rx,
+            outgoing,
+        });
+    }
+    transports
 }
 
 #[cfg(test)]
@@ -197,5 +281,62 @@ mod tests {
         // Manager recv should return None (disconnected)
         let resp = manager.recv().await;
         assert!(resp.is_none());
+    }
+
+    /// `peer_mesh` wires N transports with all-to-all senders. A broadcast
+    /// from one peer should reach every other peer's inbox; nothing should
+    /// loop back to the sender.
+    #[tokio::test]
+    async fn peer_mesh_broadcasts_to_all_others() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        struct TestId(String);
+
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut transports = peer_mesh::<TestId>(&ids);
+
+        assert_eq!(transports.len(), 3);
+        assert_eq!(transports[0].peer_count(), 2);
+        assert_eq!(transports[1].peer_count(), 2);
+        assert_eq!(transports[2].peer_count(), 2);
+
+        let msg = DistributedMessage::Keepalive {
+            sender_id: "a".into(),
+            timestamp: 1.0,
+            secondary_id: "a".into(),
+            active_workers: 0,
+        };
+        transports[0].broadcast(msg).await.unwrap();
+
+        // a does not receive its own broadcast
+        assert!(transports[0].try_recv_peer().is_none());
+        // b and c do
+        assert!(transports[1].try_recv_peer().is_some());
+        assert!(transports[2].try_recv_peer().is_some());
+    }
+
+    /// `send_to_peer` reaches exactly one inbox.
+    #[tokio::test]
+    async fn peer_mesh_send_to_specific_peer() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        struct TestId(String);
+
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut transports = peer_mesh::<TestId>(&ids);
+
+        let msg = DistributedMessage::Keepalive {
+            sender_id: "a".into(),
+            timestamp: 1.0,
+            secondary_id: "a".into(),
+            active_workers: 0,
+        };
+        transports[0].send_to_peer("b", msg).await.unwrap();
+
+        assert!(transports[1].try_recv_peer().is_some());
+        assert!(transports[2].try_recv_peer().is_none());
+        assert!(transports[0].try_recv_peer().is_none());
     }
 }

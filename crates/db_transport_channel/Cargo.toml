@@ -8,3 +8,6 @@ db_comm_api_base = { workspace = true }
 db_manager_runner_comm = { workspace = true }
 db_primary_secondary_comm = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
