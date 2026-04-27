@@ -262,6 +262,86 @@ enum ConnectionMode {
     },
 }
 
+/// Argv + env + cwd template for worker subprocesses.
+///
+/// Python supplies the executable, flag names, and argument order. Rust
+/// substitutes runtime values for the following placeholders inside any
+/// argv element, env value, or cwd:
+///
+/// - `{COMM_FD}` — child socketpair file descriptor (decimal). Empty in
+///   named-socket mode.
+/// - `{SOCKET_PATH}` — named-socket path. Empty in socketpair mode.
+/// - `{WORKER_ID}` — integer worker id (decimal).
+/// - `{LOG_FILE}` — per-worker log file path (resolved via `LogPathConfig`).
+///
+/// `argv[0]` is the executable. If no `WorkerSpec` is provided, the
+/// SubprocessWorkerFactory falls back to building the legacy
+/// `python -m <module> --dynamic_queue/--socket-path --source --output
+/// --log-file [--skip_existing] <task_args...>` shape.
+#[pyclass(name = "WorkerSpec", get_all, set_all, from_py_object)]
+#[derive(Clone, Debug)]
+struct WorkerSpec {
+    argv: Vec<String>,
+    env: std::collections::HashMap<String, String>,
+    cwd: Option<String>,
+}
+
+#[pymethods]
+impl WorkerSpec {
+    #[new]
+    #[pyo3(signature = (argv, env = None, cwd = None))]
+    fn new(
+        argv: Vec<String>,
+        env: Option<std::collections::HashMap<String, String>>,
+        cwd: Option<String>,
+    ) -> PyResult<Self> {
+        if argv.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "WorkerSpec.argv must contain at least one element (the executable)",
+            ));
+        }
+        Ok(Self {
+            argv,
+            env: env.unwrap_or_default(),
+            cwd,
+        })
+    }
+}
+
+/// Runtime values substituted into a `WorkerSpec` template.
+struct WorkerVars<'a> {
+    comm_fd: Option<i32>,
+    socket_path: Option<&'a Path>,
+    worker_id: WorkerId,
+    log_file: &'a Path,
+}
+
+impl WorkerSpec {
+    fn render(&self, vars: &WorkerVars<'_>) -> (Vec<String>, std::collections::HashMap<String, String>, Option<String>) {
+        let comm_fd = vars
+            .comm_fd
+            .map(|fd| fd.to_string())
+            .unwrap_or_default();
+        let socket_path = vars
+            .socket_path
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let worker_id = vars.worker_id.to_string();
+        let log_file = vars.log_file.to_string_lossy().into_owned();
+        let subst = |s: &str| -> String {
+            s.replace("{COMM_FD}", &comm_fd)
+                .replace("{SOCKET_PATH}", &socket_path)
+                .replace("{WORKER_ID}", &worker_id)
+                .replace("{LOG_FILE}", &log_file)
+        };
+        (
+            self.argv.iter().map(|a| subst(a)).collect(),
+            self.env.iter().map(|(k, v)| (k.clone(), subst(v))).collect(),
+            self.cwd.as_deref().map(subst),
+        )
+    }
+}
+
 /// Path-naming policy for log files, sockets, and the per-run log directory.
 ///
 /// Templates accept simple `{worker_id}` and `{timestamp}` placeholders. Defaults
@@ -345,6 +425,13 @@ impl LogPathConfig {
     }
 }
 
+/// One of the two transport-specific values that have to flow into the worker
+/// argv: a socketpair file descriptor or a named-socket path.
+enum FdOrSocket<'a> {
+    Fd(i32),
+    Socket(&'a Path),
+}
+
 /// Subprocess worker factory: spawns Python workers via socketpair or named socket.
 struct SubprocessWorkerFactory {
     python_executable: PathBuf,
@@ -357,10 +444,76 @@ struct SubprocessWorkerFactory {
     skip_existing: bool,
     connection_mode: ConnectionMode,
     manual_start_worker: bool,
+    /// If `Some`, Python supplies the full argv/env/cwd template and the
+    /// fields above are only used to render placeholders. If `None`, the
+    /// factory falls back to the legacy hardcoded argv shape.
+    worker_spec: Option<WorkerSpec>,
     child_processes: Vec<Option<std::process::Child>>,
 }
 
 impl SubprocessWorkerFactory {
+    /// Build the legacy hardcoded argv when no explicit `WorkerSpec` was
+    /// provided. The first element is the executable.
+    fn legacy_argv(&self, worker_id: WorkerId, fd_or_socket: FdOrSocket<'_>) -> Vec<String> {
+        let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
+        let mut argv: Vec<String> = vec![
+            self.python_executable.to_string_lossy().into_owned(),
+            "-m".into(),
+            self.worker_module.clone(),
+        ];
+        match fd_or_socket {
+            FdOrSocket::Fd(fd) => {
+                argv.push("--dynamic_queue".into());
+                argv.push(fd.to_string());
+            }
+            FdOrSocket::Socket(p) => {
+                argv.push("--socket-path".into());
+                argv.push(p.to_string_lossy().into_owned());
+            }
+        }
+        argv.push("--source".into());
+        argv.push(self.source_dir.to_string_lossy().into_owned());
+        argv.push("--output".into());
+        argv.push(self.output_dir.to_string_lossy().into_owned());
+        argv.push("--log-file".into());
+        argv.push(worker_log.to_string_lossy().into_owned());
+        if self.skip_existing {
+            argv.push("--skip_existing".into());
+        }
+        for arg in &self.worker_cmd_args {
+            argv.push(arg.clone());
+        }
+        argv
+    }
+
+    /// Build (argv, env, cwd) for a worker, picking the explicit `WorkerSpec`
+    /// template when present and falling back to the legacy argv otherwise.
+    fn render_command(
+        &self,
+        worker_id: WorkerId,
+        fd_or_socket: FdOrSocket<'_>,
+    ) -> (Vec<String>, std::collections::HashMap<String, String>, Option<String>) {
+        let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
+        if let Some(spec) = &self.worker_spec {
+            let (fd, sock) = match fd_or_socket {
+                FdOrSocket::Fd(fd) => (Some(fd), None),
+                FdOrSocket::Socket(p) => (None, Some(p)),
+            };
+            spec.render(&WorkerVars {
+                comm_fd: fd,
+                socket_path: sock,
+                worker_id,
+                log_file: &worker_log,
+            })
+        } else {
+            (
+                self.legacy_argv(worker_id, fd_or_socket),
+                std::collections::HashMap::new(),
+                None,
+            )
+        }
+    }
+
     /// Spawn using socketpair mode: create a socketpair, pass child FD.
     fn spawn_socketpair(
         &mut self,
@@ -369,24 +522,14 @@ impl SubprocessWorkerFactory {
         let (manager_end, child_fd) =
             create_socketpair().map_err(|e| format!("failed to create socketpair: {e}"))?;
 
-        let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
-        let mut cmd = std::process::Command::new(&self.python_executable);
-        cmd.arg("-m")
-            .arg(&self.worker_module)
-            .arg("--dynamic_queue")
-            .arg(child_fd.to_string())
-            .arg("--source")
-            .arg(&self.source_dir)
-            .arg("--output")
-            .arg(&self.output_dir)
-            .arg("--log-file")
-            .arg(&worker_log);
-
-        if self.skip_existing {
-            cmd.arg("--skip_existing");
+        let (argv, env, cwd) = self.render_command(worker_id, FdOrSocket::Fd(child_fd));
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        for (k, v) in &env {
+            cmd.env(k, v);
         }
-        for arg in &self.worker_cmd_args {
-            cmd.arg(arg);
+        if let Some(cwd) = &cwd {
+            cmd.current_dir(cwd);
         }
 
         // Pass the child fd
@@ -429,33 +572,13 @@ impl SubprocessWorkerFactory {
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)
             .map_err(|e| format!("failed to bind named socket: {e}"))?;
 
-        if self.manual_start_worker {
-            // Print command for manual execution
-            let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
-            let mut parts = vec![
-                self.python_executable.to_string_lossy().into_owned(),
-                "-m".into(),
-                self.worker_module.clone(),
-                "--socket-path".into(),
-                socket_path.to_string_lossy().into_owned(),
-                "--source".into(),
-                self.source_dir.to_string_lossy().into_owned(),
-                "--output".into(),
-                self.output_dir.to_string_lossy().into_owned(),
-                "--log-file".into(),
-                worker_log.to_string_lossy().into_owned(),
-            ];
-            if self.skip_existing {
-                parts.push("--skip_existing".into());
-            }
-            for arg in &self.worker_cmd_args {
-                parts.push(arg.clone());
-            }
+        let (argv, env, cwd) = self.render_command(worker_id, FdOrSocket::Socket(&socket_path));
 
+        if self.manual_start_worker {
             tracing::info!(
                 worker_id,
                 "\n[Worker {worker_id}] Please run the following command in another terminal:\n  {}\n[Worker {worker_id}] Manager will detect when worker connects via socket: {}",
-                parts.join(" "),
+                argv.join(" "),
                 socket_path.display()
             );
 
@@ -468,24 +591,13 @@ impl SubprocessWorkerFactory {
         }
 
         // Auto-spawn subprocess with --socket-path
-        let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
-        let mut cmd = std::process::Command::new(&self.python_executable);
-        cmd.arg("-m")
-            .arg(&self.worker_module)
-            .arg("--socket-path")
-            .arg(&socket_path)
-            .arg("--source")
-            .arg(&self.source_dir)
-            .arg("--output")
-            .arg(&self.output_dir)
-            .arg("--log-file")
-            .arg(&worker_log);
-
-        if self.skip_existing {
-            cmd.arg("--skip_existing");
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        for (k, v) in &env {
+            cmd.env(k, v);
         }
-        for arg in &self.worker_cmd_args {
-            cmd.arg(arg);
+        if let Some(cwd) = &cwd {
+            cmd.current_dir(cwd);
         }
 
         cmd.stdin(std::process::Stdio::null())
@@ -538,6 +650,7 @@ struct PyLocalManager {
     output_dir: PathBuf,
     log_dir: PathBuf,
     log_paths: LogPathConfig,
+    worker_spec: Option<WorkerSpec>,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -568,6 +681,7 @@ impl PyLocalManager {
         socket_dir = None,
         manual_start_worker = false,
         log_paths = None,
+        worker_spec = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -584,6 +698,7 @@ impl PyLocalManager {
         socket_dir: Option<String>,
         manual_start_worker: bool,
         log_paths: Option<LogPathConfig>,
+        worker_spec: Option<WorkerSpec>,
     ) -> PyResult<Self> {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
@@ -660,6 +775,7 @@ impl PyLocalManager {
             output_dir: output_path,
             log_dir,
             log_paths,
+            worker_spec,
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -713,6 +829,7 @@ impl PyLocalManager {
             skip_existing: self.skip_existing,
             connection_mode: self.connection_mode.clone(),
             manual_start_worker: self.manual_start_worker,
+            worker_spec: self.worker_spec.clone(),
             child_processes: Vec::new(),
         };
 
@@ -839,6 +956,7 @@ struct PyDistributedManager {
     output_dir: PathBuf,
     log_dir: PathBuf,
     log_paths: LogPathConfig,
+    worker_spec: Option<WorkerSpec>,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -861,6 +979,7 @@ impl PyDistributedManager {
         task_args,
         skip_existing = false,
         log_paths = None,
+        worker_spec = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -873,6 +992,7 @@ impl PyDistributedManager {
         task_args: &Bound<'_, PyAny>,
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
+        worker_spec: Option<WorkerSpec>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -908,6 +1028,7 @@ impl PyDistributedManager {
             output_dir: output_path,
             log_dir,
             log_paths,
+            worker_spec,
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -932,6 +1053,7 @@ impl PyDistributedManager {
         let output_dir = self.output_dir.clone();
         let log_dir = self.log_dir.clone();
         let log_paths = self.log_paths.clone();
+        let worker_spec = self.worker_spec.clone();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
@@ -976,6 +1098,7 @@ impl PyDistributedManager {
                     });
 
                     let sec_python = python_executable.clone();
+                    let sec_worker_spec = worker_spec.clone();
                     let sec_source = source_dir.clone();
                     let sec_output = output_dir.clone();
                     let sec_log = log_dir.clone();
@@ -1012,6 +1135,7 @@ impl PyDistributedManager {
                             skip_existing,
                             connection_mode: ConnectionMode::Socketpair,
                             manual_start_worker: false,
+                            worker_spec: sec_worker_spec.clone(),
                             child_processes: Vec::new(),
                         };
 
@@ -1270,6 +1394,7 @@ struct PySecondaryCoordinator {
     output_dir: PathBuf,
     log_dir: PathBuf,
     log_paths: LogPathConfig,
+    worker_spec: Option<WorkerSpec>,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -1292,6 +1417,7 @@ impl PySecondaryCoordinator {
         task_args,
         skip_existing = false,
         log_paths = None,
+        worker_spec = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -1305,6 +1431,7 @@ impl PySecondaryCoordinator {
         task_args: &Bound<'_, PyAny>,
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
+        worker_spec: Option<WorkerSpec>,
     ) -> PyResult<Self> {
         let estimate_fn = task_definition.getattr("estimate_memory")?;
         let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
@@ -1339,6 +1466,7 @@ impl PySecondaryCoordinator {
             output_dir: output_path,
             log_dir,
             log_paths,
+            worker_spec,
             worker_module,
             worker_cmd_args: args_list,
             skip_existing,
@@ -1361,6 +1489,7 @@ impl PySecondaryCoordinator {
         let output_dir = self.output_dir.clone();
         let log_dir = self.log_dir.clone();
         let log_paths = self.log_paths.clone();
+        let worker_spec = self.worker_spec.clone();
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
@@ -1474,6 +1603,7 @@ impl PySecondaryCoordinator {
                     skip_existing,
                     connection_mode: ConnectionMode::Socketpair,
                     manual_start_worker: false,
+                    worker_spec,
                     child_processes: Vec::new(),
                 };
 
@@ -1587,6 +1717,7 @@ fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyProcessingStats>()?;
     m.add_class::<PyFailedTask>()?;
     m.add_class::<LogPathConfig>()?;
+    m.add_class::<WorkerSpec>()?;
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
