@@ -350,12 +350,12 @@ mod tests {
             DistributedMessage::TimeoutQuery {
                 sender_id: "s".into(),
                 timestamp: 0.0,
-                query_secondary_id: "s2".into(),
+                query_node_id: "s2".into(),
             },
             DistributedMessage::TimeoutResponse {
                 sender_id: "s".into(),
                 timestamp: 0.0,
-                query_secondary_id: "s2".into(),
+                query_node_id: "s2".into(),
                 last_keepalive: Some(1.0),
             },
             DistributedMessage::PromotionVote {

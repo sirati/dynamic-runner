@@ -72,16 +72,16 @@ where
                 );
             }
             DistributedMessage::TimeoutQuery {
-                query_secondary_id,
+                query_node_id,
                 sender_id,
                 ..
             } => {
-                // Respond with our last known keepalive for the queried secondary
-                let last_keepalive = self.peer_keepalives.get(&query_secondary_id).copied();
+                // Respond with our last known keepalive for the queried node.
+                let last_keepalive = self.peer_keepalives.get(&query_node_id).copied();
                 let response: DistributedMessage<I> = DistributedMessage::TimeoutResponse {
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
-                    query_secondary_id,
+                    query_node_id,
                     last_keepalive,
                 };
                 tracing::debug!(peer = %sender_id, "timeout query received, queueing response");

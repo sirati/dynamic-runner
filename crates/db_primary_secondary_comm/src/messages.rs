@@ -214,12 +214,18 @@ pub enum DistributedMessage<I> {
     TimeoutQuery {
         sender_id: String,
         timestamp: f64,
-        query_secondary_id: String,
+        /// Node id of the suspected-dead party. May be a secondary (when
+        /// the querier is the primary or a peer auditing a secondary) or
+        /// the primary's node id (when secondaries are checking primary
+        /// liveness during failover detection).
+        query_node_id: String,
     },
     TimeoutResponse {
         sender_id: String,
         timestamp: f64,
-        query_secondary_id: String,
+        /// Echoes the `query_node_id` from the corresponding TimeoutQuery
+        /// so concurrent queries can be matched up by the aggregator.
+        query_node_id: String,
         last_keepalive: Option<f64>,
     },
     PromotionVote {
