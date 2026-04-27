@@ -127,11 +127,13 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                 }
             }
             Some(response) => match response {
-                Response::Done { result_data } => {
-                    let (warnings, filtered) =
-                        decode_legacy_result_data(result_data.as_deref());
+                Response::Done { result_data: _ } => {
+                    // The opaque `result_data` bytes will be plumbed through to
+                    // the task-specific aggregator in a later phase (M6). For
+                    // now they're discarded; the runner only records that the
+                    // task succeeded.
                     PollResult::Completed {
-                        result: TaskResult::ok(warnings, filtered),
+                        result: TaskResult::ok(),
                         protocol: RunnerProtocol {
                             _state: PhantomData,
                             transport: self.transport,
@@ -219,21 +221,6 @@ pub enum PollResult<M: ManagerEndpoint> {
         result: TaskResult,
         protocol: RunnerProtocol<Stopped, M>,
     },
-}
-
-/// Decode legacy result data bytes (format: "warnings:filtered") into (u32, u32).
-/// Returns (0, 0) if data is None or cannot be parsed.
-fn decode_legacy_result_data(data: Option<&[u8]>) -> (u32, u32) {
-    let Some(data) = data else {
-        return (0, 0);
-    };
-    let Ok(text) = std::str::from_utf8(data) else {
-        return (0, 0);
-    };
-    let parts: Vec<&str> = text.splitn(2, ':').collect();
-    let warnings = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let filtered = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (warnings, filtered)
 }
 
 /// Runtime enum wrapper for storing runners in a collection.

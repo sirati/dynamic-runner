@@ -211,23 +211,37 @@ impl ErrorType {
     }
 }
 
+/// Outcome of one worker task. Generic over `R` so a task definition can
+/// attach a typed payload (e.g. tokenizer counts, GPU profile data) — the
+/// runner itself never inspects `R`.
 #[derive(Debug, Clone)]
-pub struct TaskResult {
+pub struct TaskResult<R = ()> {
     pub success: bool,
     pub error_type: Option<ErrorType>,
     pub error_message: Option<String>,
-    pub warnings: u32,
-    pub filtered: u32,
+    /// Task-defined payload returned on success. `None` on failure or for
+    /// tasks that don't produce a payload.
+    pub result: Option<R>,
 }
 
-impl TaskResult {
-    pub fn ok(warnings: u32, filtered: u32) -> Self {
+impl<R> TaskResult<R> {
+    /// Successful completion with no payload.
+    pub fn ok() -> Self {
         Self {
             success: true,
             error_type: None,
             error_message: None,
-            warnings,
-            filtered,
+            result: None,
+        }
+    }
+
+    /// Successful completion carrying a typed payload.
+    pub fn ok_with(result: R) -> Self {
+        Self {
+            success: true,
+            error_type: None,
+            error_message: None,
+            result: Some(result),
         }
     }
 
@@ -236,8 +250,7 @@ impl TaskResult {
             success: false,
             error_type: Some(error_type),
             error_message: Some(message),
-            warnings: 0,
-            filtered: 0,
+            result: None,
         }
     }
 }
@@ -293,16 +306,36 @@ mod tests {
 
     #[test]
     fn task_result_ok() {
-        let r = TaskResult::ok(3, 5);
+        let r: TaskResult = TaskResult::ok();
         assert!(r.success);
         assert!(r.error_type.is_none());
-        assert_eq!(r.warnings, 3);
-        assert_eq!(r.filtered, 5);
+        assert!(r.result.is_none());
+    }
+
+    #[test]
+    fn task_result_ok_with_payload() {
+        #[derive(Clone, Debug, PartialEq)]
+        struct Payload {
+            warnings: u32,
+            filtered: u32,
+        }
+        let r = TaskResult::ok_with(Payload {
+            warnings: 3,
+            filtered: 5,
+        });
+        assert!(r.success);
+        assert_eq!(
+            r.result,
+            Some(Payload {
+                warnings: 3,
+                filtered: 5
+            })
+        );
     }
 
     #[test]
     fn task_result_error() {
-        let r = TaskResult::error(
+        let r: TaskResult = TaskResult::error(
             ErrorType::ResourceExhausted(ResourceKind::memory()),
             "out of memory".into(),
         );
