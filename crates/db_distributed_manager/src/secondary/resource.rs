@@ -117,6 +117,17 @@ where
         let next_backoff = (backoff * 2).min(Self::MAX_BACKOFF);
         self.request_backoff.insert(worker_id, next_backoff);
 
+        // If the original primary is dead and an election has named a new
+        // SLURM-primary peer, route the request there over the peer
+        // transport instead of the (likely dead) primary_transport.
+        if let Some(new_primary) = &self.slurm_primary_peer_id {
+            if new_primary != &self.config.secondary_id {
+                let peer = new_primary.clone();
+                return self.peer_transport.send_to_peer(&peer, msg).await;
+            }
+            // new_primary == us means is_slurm_primary should already be true
+            // and the local-handle path above handled the request.
+        }
         self.primary_transport.send(msg).await
     }
 

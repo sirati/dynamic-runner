@@ -61,7 +61,7 @@ where
                 }
                 peer_msg = self.peer_transport.recv_peer() => {
                     if let Some(m) = peer_msg {
-                        self.handle_peer_message(m);
+                        self.handle_peer_message(m).await;
                     }
                 }
                 _ = keepalive_interval.tick() => {

@@ -74,11 +74,14 @@ where
 {
     /// Bump the primary-keepalive timestamp on every primary message and
     /// reset election state if we're not yet the new primary. Called from
-    /// the dispatch path before any other handling.
+    /// the dispatch path before any other handling. Also clears any
+    /// remembered new-primary-peer routing target — the original primary
+    /// is alive, so TaskRequest goes back to `primary_transport`.
     pub(super) fn record_primary_message(&mut self) {
         self.primary_last_seen = Some(Instant::now());
         if !matches!(self.election, ElectionState::Promoted) {
             self.election = ElectionState::Normal;
+            self.slurm_primary_peer_id = None;
         }
     }
 
@@ -159,6 +162,7 @@ where
                         confirms: HashSet::from([self.config.secondary_id.clone()]),
                         started: Instant::now(),
                     };
+                    self.slurm_primary_peer_id = Some(self.config.secondary_id.clone());
                     actions.broadcast.push(DistributedMessage::PromotionVote {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -167,6 +171,7 @@ where
                     });
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
+                    self.slurm_primary_peer_id = Some(candidate.clone());
                     self.election = ElectionState::Voting { round, candidate };
                 }
             }
@@ -250,6 +255,7 @@ where
                 round,
                 candidate: candidate.clone(),
             };
+            self.slurm_primary_peer_id = Some(candidate.clone());
         }
         Some(DistributedMessage::PromotionConfirm {
             sender_id: self.config.secondary_id.clone(),

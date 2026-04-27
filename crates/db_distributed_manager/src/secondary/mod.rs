@@ -135,6 +135,14 @@ where
         Vec<db_primary_secondary_comm::TaskInfo<I>>,
         HashSet<String>,
     )>,
+
+    // Identity of the current SLURM-primary peer, if the original primary
+    // is dead and an election has resolved. `None` while the original
+    // primary is alive (TaskRequest goes to `primary_transport`); `Some`
+    // while we're voting for or have voted for a candidate (TaskRequest
+    // is routed to that peer via `peer_transport`). Cleared whenever a
+    // live primary message arrives.
+    slurm_primary_peer_id: Option<String>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -179,6 +187,7 @@ where
             slurm_pending_binaries: Vec::new(),
             slurm_completed: HashSet::new(),
             cached_full_task_list: None,
+            slurm_primary_peer_id: None,
         }
     }
 

@@ -19,7 +19,7 @@ where
     E: ResourceEstimator + Clone,
     I: Identifier,
 {
-    pub(super) fn handle_peer_message(&mut self, msg: DistributedMessage<I>) {
+    pub(super) async fn handle_peer_message(&mut self, msg: DistributedMessage<I>) {
         match msg {
             DistributedMessage::Keepalive {
                 secondary_id,
@@ -113,6 +113,27 @@ where
                 ..
             } => {
                 self.record_promotion_confirm(sender_id, new_primary_id, vote_round);
+            }
+            DistributedMessage::TaskRequest {
+                secondary_id,
+                worker_id,
+                available_resources,
+                ..
+            } if self.is_slurm_primary => {
+                // Peer routed this to us because we won the election. Same
+                // dispatch path that the live-primary case uses, just
+                // arriving over peer_transport instead of primary_transport.
+                let available_memory = available_resources
+                    .iter()
+                    .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
+                    .map(|r| r.amount)
+                    .unwrap_or(0);
+                if let Err(e) = self
+                    .handle_slurm_task_request(secondary_id, worker_id, available_memory)
+                    .await
+                {
+                    tracing::warn!(error = %e, "post-promotion peer TaskRequest dispatch failed");
+                }
             }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled peer message");
