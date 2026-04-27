@@ -159,6 +159,16 @@ impl<T> Identifier for T where
 {
 }
 
+/// String-based runner identifier.
+///
+/// Task definitions Python-side compose a stable, unique string per work item
+/// (e.g. `"<binary_name>/<platform>/<compiler>/<version>/<opt_level>"` for the
+/// tokenizer task) and pass it through Rust as an `Arc<str>`. The runtime
+/// uses string equality for identity — no hashing collisions, no opaque
+/// `PyObject` round-tripping. The Python wrapper layer caches the dataclass
+/// instances so Rust→Python returns can be translated back to typed objects.
+pub type RunnerIdentifier = std::sync::Arc<str>;
+
 /// Information about a binary to be processed.
 ///
 /// Generic over the identifier type `I` so different task definitions
