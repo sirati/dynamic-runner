@@ -644,6 +644,7 @@ struct PyLocalManager {
     python_executable: PathBuf,
     num_workers: u32,
     max_memory: u64,
+    low_memory_threshold: u64,
     always_restart_worker: bool,
     print_pid: bool,
     source_dir: PathBuf,
@@ -682,6 +683,7 @@ impl PyLocalManager {
         manual_start_worker = false,
         log_paths = None,
         worker_spec = None,
+        low_memory_threshold = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -699,6 +701,7 @@ impl PyLocalManager {
         manual_start_worker: bool,
         log_paths: Option<LogPathConfig>,
         worker_spec: Option<WorkerSpec>,
+        low_memory_threshold: Option<u64>,
     ) -> PyResult<Self> {
         // Extract memory estimator from task_definition
         let estimate_fn = task_definition.getattr("estimate_memory")?;
@@ -769,6 +772,7 @@ impl PyLocalManager {
             python_executable: PathBuf::from(python_executable),
             num_workers,
             max_memory,
+            low_memory_threshold: low_memory_threshold.unwrap_or(300 * 1024 * 1024),
             always_restart_worker,
             print_pid,
             source_dir: source_path,
@@ -815,7 +819,10 @@ impl PyLocalManager {
             print_pid: self.print_pid,
             memuse_log_path,
             stage_timeouts: self.stage_timeouts.clone(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(
+                db_comm_api_base::ResourceKind::memory(),
+                self.low_memory_threshold,
+            )]),
         };
 
         let mut factory = SubprocessWorkerFactory {
