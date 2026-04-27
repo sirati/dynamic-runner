@@ -331,3 +331,157 @@ fn next_round(state: &ElectionState) -> u32 {
         _ => 1,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Failover scenarios (b), (c), (d) from the migration plan, exercised
+    //! at the election state-machine level. The full multi-process
+    //! integration tests over channels would require post-promotion task
+    //! takeover (re-distributing pending work from the dead primary), which
+    //! is not yet implemented in pure Rust — these tests cover the
+    //! detection + voting algorithm itself.
+    //!
+    //! Scenario (a) — secondary dies → primary requeues — is covered in
+    //! `crate::primary::heartbeat::tests`.
+
+    use super::super::test_helpers::{election_config, make_secondary};
+    use super::*;
+    use std::time::Duration;
+
+    /// The death deadline given the helper's keepalive_interval (50ms) and
+    /// keepalive_miss_threshold (2). 100ms exact; sleep slightly over.
+    const PAST_DEATH: Duration = Duration::from_millis(110);
+    /// One full keepalive interval, the gather window for `Suspecting` to
+    /// progress to a vote.
+    const ONE_INTERVAL: Duration = Duration::from_millis(60);
+
+    /// Scenario (b): primary stops sending keepalives. The lowest-id
+    /// secondary observes the death, runs the election, collects quorum,
+    /// and promotes itself.
+    #[tokio::test(flavor = "current_thread")]
+    async fn primary_dies_lowest_id_promotes() {
+        let mut sec = make_secondary(election_config("sec-a"));
+        sec.peer_keepalives.insert("sec-b".into(), 0.0);
+        sec.peer_keepalives.insert("sec-c".into(), 0.0);
+        sec.record_primary_message();
+
+        tokio::time::sleep(PAST_DEATH).await;
+
+        // First tick: enter Suspecting and broadcast TimeoutQuery.
+        let actions = sec.run_election_tick();
+        assert!(matches!(sec.election, ElectionState::Suspecting { .. }));
+        assert!(actions
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })));
+
+        // Wait the gather window so the Suspecting tick is eligible to vote.
+        tokio::time::sleep(ONE_INTERVAL).await;
+
+        // Peers report primary silent (None means "haven't seen recently").
+        sec.record_timeout_response("sec-b".into(), None);
+        sec.record_timeout_response("sec-c".into(), None);
+
+        // Second tick: tally quorum, transition Suspecting → Candidate
+        // (sec-a is the lowest id), and broadcast PromotionVote.
+        let actions = sec.run_election_tick();
+        assert!(matches!(sec.election, ElectionState::Candidate { .. }));
+        assert!(actions
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::PromotionVote { .. })));
+
+        // One peer confirms — combined with the candidate's own vote that
+        // is the quorum (peer_count=2 → quorum=2).
+        let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
+        assert!(promoted, "majority confirm should promote");
+        assert!(matches!(sec.election, ElectionState::Promoted));
+    }
+
+    /// Scenario (c): with four peers including self, one peer is dead at
+    /// the same time as the primary. The election still has quorum from
+    /// the remaining three live secondaries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn double_failure_election_still_succeeds() {
+        let mut sec = make_secondary(election_config("sec-a"));
+        sec.peer_keepalives.insert("sec-b".into(), 0.0);
+        sec.peer_keepalives.insert("sec-c".into(), 0.0);
+        sec.peer_keepalives.insert("sec-d".into(), 0.0); // will not respond
+        sec.record_primary_message();
+
+        tokio::time::sleep(PAST_DEATH).await;
+        sec.run_election_tick();
+        tokio::time::sleep(ONE_INTERVAL).await;
+
+        // Only b and c respond; d is silent.
+        sec.record_timeout_response("sec-b".into(), None);
+        sec.record_timeout_response("sec-c".into(), None);
+
+        sec.run_election_tick();
+        assert!(
+            matches!(sec.election, ElectionState::Candidate { .. }),
+            "quorum (3 of 4) reached even with one peer dead"
+        );
+
+        // Confirm quorum for promotion: peer_count=3 → quorum=3, candidate
+        // counts itself, needs two peer confirms.
+        sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
+        let promoted = sec.record_promotion_confirm("sec-c".into(), "sec-a".into(), 1);
+        assert!(promoted, "two peer confirms + self = quorum");
+        assert!(matches!(sec.election, ElectionState::Promoted));
+    }
+
+    /// Scenario (d): two peers detect primary death simultaneously and both
+    /// would-be-candidates start voting. The lowest-id rule + quorum
+    /// resolves to a single winner; the higher-id peer defers to Voting
+    /// instead of becoming Candidate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn split_brain_lowest_id_wins() {
+        let mut sec_a = make_secondary(election_config("sec-a"));
+        sec_a.peer_keepalives.insert("sec-b".into(), 0.0);
+        sec_a.peer_keepalives.insert("sec-c".into(), 0.0);
+        sec_a.record_primary_message();
+
+        let mut sec_b = make_secondary(election_config("sec-b"));
+        sec_b.peer_keepalives.insert("sec-a".into(), 0.0);
+        sec_b.peer_keepalives.insert("sec-c".into(), 0.0);
+        sec_b.record_primary_message();
+
+        tokio::time::sleep(PAST_DEATH).await;
+
+        // Both detect primary death simultaneously and enter Suspecting.
+        sec_a.run_election_tick();
+        sec_b.run_election_tick();
+
+        tokio::time::sleep(ONE_INTERVAL).await;
+
+        // Both gather peer responses.
+        sec_a.record_timeout_response("sec-b".into(), None);
+        sec_a.record_timeout_response("sec-c".into(), None);
+        sec_b.record_timeout_response("sec-a".into(), None);
+        sec_b.record_timeout_response("sec-c".into(), None);
+
+        // Tally + decide: sec-a is lowest in its peer set → Candidate.
+        // sec-b sees sec-a as lowest in its peer set → Voting.
+        sec_a.run_election_tick();
+        sec_b.run_election_tick();
+
+        assert!(
+            matches!(sec_a.election, ElectionState::Candidate { .. }),
+            "sec-a (lowest id) should self-promote"
+        );
+        match &sec_b.election {
+            ElectionState::Voting { candidate, .. } => assert_eq!(candidate, "sec-a"),
+            other => panic!("sec-b should defer to sec-a, got {:?}", std::mem::discriminant(other)),
+        }
+
+        // sec-b confirms sec-a; quorum 2 (peer_count=2). sec-a + sec-b = 2.
+        let promoted = sec_a.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
+        assert!(promoted);
+        assert!(matches!(sec_a.election, ElectionState::Promoted));
+        assert!(
+            !matches!(sec_b.election, ElectionState::Promoted),
+            "sec-b must NOT also promote — split-brain prevented"
+        );
+    }
+}

@@ -1,84 +1,12 @@
 //! Tests for the secondary coordinator. Kept in a sibling file so the
 //! production code stays at a manageable size.
 
+use super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::*;
-use db_comm_api_base::{MessageReceiver, MessageSender};
-use db_manager_runner_comm::{Command, Response};
 use db_primary_secondary_comm::{DistributedBinaryInfo, MessageType};
 use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::{channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd};
-use serde::{Deserialize, Serialize};
+use db_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
-
-/// Minimal test identifier.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-struct TestId(String);
-
-#[derive(Clone)]
-struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
-    }
-}
-
-/// No-op peer transport for tests that don't need peers.
-struct NoPeers;
-impl<I: Identifier> PeerTransport<I> for NoPeers {
-    async fn broadcast(&mut self, _msg: DistributedMessage<I>) -> Result<(), String> {
-        Ok(())
-    }
-    async fn send_to_peer(
-        &mut self,
-        _peer_id: &str,
-        _msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
-        std::future::pending().await
-    }
-    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
-        None
-    }
-    fn peer_count(&self) -> usize {
-        0
-    }
-    async fn connect_to_peers(
-        &mut self,
-        _peers: &[db_primary_secondary_comm::PeerConnectionInfo],
-    ) {
-    }
-}
-
-/// Factory that spawns fake workers via channel transport.
-struct FakeWorkerFactory;
-impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-    fn spawn_worker(
-        &mut self,
-        _worker_id: WorkerId,
-    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
-        let (manager_end, runner_end) = channel_pair();
-        tokio::task::spawn_local(async move {
-            let mut runner = runner_end;
-            let _ = runner.send(Response::Ready).await;
-            loop {
-                match MessageReceiver::<Command>::recv(&mut runner).await {
-                    Some(Command::Stop) => break,
-                    Some(Command::ProcessTask { .. }) => {
-                        let _ = runner
-                            .send(Response::Done {
-                                result_data: None,
-                            })
-                            .await;
-                    }
-                    None => break,
-                }
-            }
-        });
-        Ok((manager_end, None))
-    }
-}
 
 /// Simulate a primary that coordinates with the secondary.
 async fn fake_primary(
