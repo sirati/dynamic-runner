@@ -16,7 +16,9 @@ pub enum Response {
         error_type: ErrorType,
         message: String,
     },
-    PickledError {
+    /// Unhandled exception in the worker (formerly `PickledError`).
+    /// Carries plain strings: no Python objects are deserialised.
+    WorkerException {
         exception_type: String,
         message: String,
         traceback: String,

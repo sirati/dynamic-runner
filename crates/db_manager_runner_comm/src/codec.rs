@@ -1,5 +1,20 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use db_comm_api_base::ErrorType;
+use serde::{Deserialize, Serialize};
+
 use crate::command::{Command, Response};
+
+/// Wire payload for `Response::WorkerException` — three plain strings.
+/// Encoded as base64-JSON to keep the line-delimited text format intact even
+/// when tracebacks contain newlines or `:` characters.
+#[derive(Debug, Serialize, Deserialize)]
+struct WorkerExceptionWire {
+    #[serde(rename = "type")]
+    exception_type: String,
+    message: String,
+    traceback: String,
+}
 
 /// Serialize a command to bytes (line-delimited text, backward-compatible with Python).
 ///
@@ -51,12 +66,20 @@ pub fn serialize_response(resp: &Response) -> Vec<u8> {
             error_type,
             message,
         } => format!("error:{}:{message}\n", error_type.wire_value()).into_bytes(),
-        Response::PickledError {
+        Response::WorkerException {
             exception_type,
             message,
             traceback,
         } => {
-            format!("error:recoverable:{exception_type}: {message}\n{traceback}\n").into_bytes()
+            let wire = WorkerExceptionWire {
+                exception_type: exception_type.clone(),
+                message: message.clone(),
+                traceback: traceback.clone(),
+            };
+            let json = serde_json::to_string(&wire)
+                .unwrap_or_else(|_| "{\"type\":\"\",\"message\":\"\",\"traceback\":\"\"}".into());
+            let encoded = BASE64.encode(json.as_bytes());
+            format!("error:exception:{encoded}\n").into_bytes()
         }
         Response::PhaseUpdate { phase_name } => format!("phase:{phase_name}\n").into_bytes(),
         Response::Keepalive => b"keepalive\n".to_vec(),
@@ -91,9 +114,29 @@ pub fn parse_response(line: &str) -> Option<Response> {
             phase_name: phase_name.to_owned(),
         });
     }
+    if let Some(rest) = line.strip_prefix("error:exception:") {
+        // New shape: base64-JSON {type, message, traceback}.
+        if let Ok(json_bytes) = BASE64.decode(rest.as_bytes()) {
+            if let Ok(wire) = serde_json::from_slice::<WorkerExceptionWire>(&json_bytes) {
+                return Some(Response::WorkerException {
+                    exception_type: wire.exception_type,
+                    message: wire.message,
+                    traceback: wire.traceback,
+                });
+            }
+        }
+        return Some(Response::WorkerException {
+            exception_type: "MalformedException".to_owned(),
+            message: rest.to_owned(),
+            traceback: String::new(),
+        });
+    }
     if let Some(rest) = line.strip_prefix("error:pickle:") {
-        return Some(Response::PickledError {
-            exception_type: "PythonPickledError".to_owned(),
+        // Legacy shape from older Python workers. Bytes after the prefix are the
+        // pickle blob; we don't deserialise Python objects, so surface them as
+        // an opaque message and lose type/traceback fidelity.
+        return Some(Response::WorkerException {
+            exception_type: "LegacyPickledException".to_owned(),
             message: rest.to_owned(),
             traceback: String::new(),
         });
@@ -274,18 +317,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_pickled_error() {
+    fn parse_legacy_pickled_error() {
         let parsed = parse_response("error:pickle:some_raw_data").unwrap();
         match parsed {
-            Response::PickledError {
+            Response::WorkerException {
                 exception_type,
                 message,
                 ..
             } => {
-                assert_eq!(exception_type, "PythonPickledError");
+                assert_eq!(exception_type, "LegacyPickledException");
                 assert_eq!(message, "some_raw_data");
             }
-            _ => panic!("expected PickledError"),
+            _ => panic!("expected WorkerException"),
+        }
+    }
+
+    #[test]
+    fn worker_exception_roundtrip() {
+        let resp = Response::WorkerException {
+            exception_type: "ValueError".into(),
+            message: "thing went wrong: detail".into(),
+            traceback: "Traceback (most recent call last):\n  File ...".into(),
+        };
+        let bytes = serialize_response(&resp);
+        let line = std::str::from_utf8(&bytes).unwrap();
+        let parsed = parse_response(line).unwrap();
+        match parsed {
+            Response::WorkerException {
+                exception_type,
+                message,
+                traceback,
+            } => {
+                assert_eq!(exception_type, "ValueError");
+                assert_eq!(message, "thing went wrong: detail");
+                assert_eq!(traceback, "Traceback (most recent call last):\n  File ...");
+            }
+            _ => panic!("expected WorkerException"),
         }
     }
 

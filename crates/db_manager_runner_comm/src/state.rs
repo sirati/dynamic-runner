@@ -162,7 +162,7 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                         }
                     }
                 }
-                Response::PickledError {
+                Response::WorkerException {
                     exception_type,
                     message,
                     traceback,

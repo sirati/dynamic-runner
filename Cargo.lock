@@ -253,7 +253,10 @@ dependencies = [
 name = "db_manager_runner_comm"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "db_comm_api_base",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
