@@ -485,7 +485,7 @@ mod tests {
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
                     resources: vec![db_comm_api_base::ResourceAmount {
-                        kind: db_comm_api_base::ResourceKind::Memory,
+                        kind: db_comm_api_base::ResourceKind::memory(),
                         amount: 1024,
                     }],
                     worker_count: 1,

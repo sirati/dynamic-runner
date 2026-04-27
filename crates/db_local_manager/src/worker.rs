@@ -314,7 +314,7 @@ impl ResourceMonitor for ProcStatmMonitor {
     fn measure(&self, pid: Option<u32>) -> ResourceMap {
         let mem = Self::read_rss(pid);
         if mem > 0 {
-            ResourceMap::from([(ResourceKind::Memory, mem)])
+            ResourceMap::from([(ResourceKind::memory(), mem)])
         } else {
             ResourceMap::new()
         }

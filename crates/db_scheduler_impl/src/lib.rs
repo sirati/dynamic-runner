@@ -17,18 +17,18 @@ pub struct ResourceStealingScheduler {
 impl ResourceStealingScheduler {
     pub fn memory() -> Self {
         Self {
-            resource_kind: ResourceKind::Memory,
+            resource_kind: ResourceKind::memory(),
             base_overhead: 150 * 1024 * 1024,
             pressure_threshold: 500 * 1024 * 1024,
         }
     }
 
     fn get(&self, map: &ResourceMap) -> u64 {
-        map.get(self.resource_kind)
+        map.get(&self.resource_kind)
     }
 
     fn singleton(&self, value: u64) -> ResourceMap {
-        ResourceMap::from([(self.resource_kind, value)])
+        ResourceMap::from([(self.resource_kind.clone(), value)])
     }
 }
 
@@ -213,14 +213,14 @@ mod tests {
     struct FixedEstimator(u64);
     impl ResourceEstimator for FixedEstimator {
         fn estimate(&self, _binary_size: u64) -> ResourceMap {
-            ResourceMap::from([(ResourceKind::Memory, self.0)])
+            ResourceMap::from([(ResourceKind::memory(), self.0)])
         }
     }
 
     struct LinearEstimator;
     impl ResourceEstimator for LinearEstimator {
         fn estimate(&self, binary_size: u64) -> ResourceMap {
-            ResourceMap::from([(ResourceKind::Memory, binary_size * 2)])
+            ResourceMap::from([(ResourceKind::memory(), binary_size * 2)])
         }
     }
 
@@ -233,7 +233,7 @@ mod tests {
     }
 
     fn mem(value: u64) -> ResourceMap {
-        ResourceMap::from([(ResourceKind::Memory, value)])
+        ResourceMap::from([(ResourceKind::memory(), value)])
     }
 
     fn make_worker(
@@ -332,7 +332,7 @@ mod tests {
             } => {
                 assert_eq!(worker_id, 0);
                 assert_eq!(binary_index, 1);
-                assert_eq!(estimated_usage.get(ResourceKind::Memory), 200);
+                assert_eq!(estimated_usage.get(&ResourceKind::memory()), 200);
                 assert!(!opportunistic);
             }
             _ => panic!("expected Assign, got {decision:?}"),
@@ -403,7 +403,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(binary_index, 0);
-                assert_eq!(estimated_usage.get(ResourceKind::Memory), 200);
+                assert_eq!(estimated_usage.get(&ResourceKind::memory()), 200);
             }
             _ => panic!("expected Assign, got {decision:?}"),
         }

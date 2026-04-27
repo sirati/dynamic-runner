@@ -96,7 +96,7 @@ mod tests {
             sender_id: "sec-2".into(),
             timestamp: 9999.0,
             secondary_id: "sec-2".into(),
-            resources: vec![ResourceAmount { kind: ResourceKind::Memory, amount: 8 * 1024 * 1024 * 1024 }],
+            resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 8 * 1024 * 1024 * 1024 }],
             worker_count: 4,
             hostname: "node-01".into(),
         };
@@ -249,7 +249,7 @@ mod tests {
                 sender_id: "s".into(),
                 timestamp: 0.0,
                 secondary_id: "s".into(),
-                resources: vec![ResourceAmount { kind: ResourceKind::Memory, amount: 1024 }],
+                resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 1024 }],
                 worker_count: 1,
                 hostname: "h".into(),
             },
@@ -284,7 +284,7 @@ mod tests {
                 timestamp: 0.0,
                 secondary_id: "s".into(),
                 worker_id: 0,
-                available_resources: vec![ResourceAmount { kind: ResourceKind::Memory, amount: 1024 }],
+                available_resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 1024 }],
             },
             DistributedMessage::TaskAssignment {
                 sender_id: "p".into(),

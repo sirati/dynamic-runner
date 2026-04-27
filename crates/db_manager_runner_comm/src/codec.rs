@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn response_error_roundtrip() {
         let resp = Response::Error {
-            error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
+            error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
             message: "worker exceeded budget".into(),
         };
         let bytes = serialize_response(&resp);
@@ -247,7 +247,7 @@ mod tests {
                 error_type,
                 message,
             } => {
-                assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::Memory));
+                assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::memory()));
                 assert_eq!(message, "worker exceeded budget");
             }
             _ => panic!("expected Error"),
@@ -364,7 +364,7 @@ mod tests {
                 error_type,
                 message,
             } => {
-                assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::Memory));
+                assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::memory()));
                 assert_eq!(message, "path:to:something ran out");
             }
             _ => panic!("expected Error"),

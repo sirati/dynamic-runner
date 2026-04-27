@@ -220,7 +220,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         } = msg
         {
             let ram_bytes = resources.iter()
-                .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
             tracing::info!(
@@ -347,10 +347,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             let state = self.secondaries.get(secondary_id).unwrap();
             let num_workers = state.num_workers();
             let ram_bytes = state.resources().iter()
-                .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
-            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram_bytes)]);
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram_bytes)]);
 
             for local_idx in 0..num_workers {
                 let budget = self.scheduler.initial_budget(local_idx, &max_res);
@@ -432,7 +432,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                 .map(|(worker_id, _, est_res)| WorkerReadyInfo {
                     worker_id: *worker_id,
                     resource_budgets: est_res.iter()
-                        .map(|(kind, amount)| db_comm_api_base::ResourceAmount { kind, amount })
+                        .map(|(kind, amount)| db_comm_api_base::ResourceAmount {
+                            kind: kind.clone(),
+                            amount,
+                        })
                         .collect(),
                 })
                 .collect();
@@ -631,7 +634,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         } = msg
         {
             let available_res: ResourceMap = available_resources.iter()
-                .map(|r| (r.kind, r.amount))
+                .map(|r| (r.kind.clone(), r.amount))
                 .collect();
             // Find matching worker
             let mut target_idx = None;
@@ -848,7 +851,7 @@ mod tests {
     struct FixedEstimator(u64);
     impl ResourceEstimator for FixedEstimator {
         fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
-            db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
+            db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
         }
     }
 
@@ -877,7 +880,7 @@ mod tests {
                 timestamp: 0.0,
                 secondary_id: secondary_id.clone(),
                 resources: vec![db_comm_api_base::ResourceAmount {
-                    kind: db_comm_api_base::ResourceKind::Memory,
+                    kind: db_comm_api_base::ResourceKind::memory(),
                     amount: ram_bytes,
                 }],
                 worker_count: num_workers,
@@ -927,7 +930,7 @@ mod tests {
                                     secondary_id: secondary_id.clone(),
                                     worker_id: 0,
                                     available_resources: vec![db_comm_api_base::ResourceAmount {
-                                        kind: db_comm_api_base::ResourceKind::Memory,
+                                        kind: db_comm_api_base::ResourceKind::memory(),
                                         amount: ram_bytes,
                                     }],
                                 })
@@ -957,7 +960,7 @@ mod tests {
                             secondary_id: secondary_id.clone(),
                             worker_id: 0,
                             available_resources: vec![db_comm_api_base::ResourceAmount {
-                                kind: db_comm_api_base::ResourceKind::Memory,
+                                kind: db_comm_api_base::ResourceKind::memory(),
                                 amount: ram_bytes,
                             }],
                         })
@@ -1179,7 +1182,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
             let secondary_id = "sec-0".to_string();
-            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024u64)]);
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
 
             let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
                 spawn_real_secondary(secondary_id.clone(), 2, max_res);
@@ -1240,7 +1243,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let local = tokio::task::LocalSet::new();
         local.run_until(async {
-            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024u64)]);
+            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024u64)]);
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
             let mut outgoing = HashMap::new();
             let mut sec_handles = Vec::new();

@@ -36,7 +36,7 @@ impl Default for SecondaryConfig {
         Self {
             secondary_id: String::new(),
             num_workers: 1,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024)]),
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
             hostname: String::new(),
             keepalive_interval: Duration::from_secs(1),
             src_network: None,
@@ -779,9 +779,9 @@ where
         // When SLURM-primary, handle task requests locally
         if self.is_slurm_primary && !self.slurm_pending_binaries.is_empty() {
             let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-                self.pool.workers[worker_id as usize].reserved_budgets.get(db_comm_api_base::ResourceKind::Memory)
+                self.pool.workers[worker_id as usize].reserved_budgets.get(&db_comm_api_base::ResourceKind::memory())
             } else {
-                self.config.max_resources.get(db_comm_api_base::ResourceKind::Memory) / self.config.num_workers as u64
+                self.config.max_resources.get(&db_comm_api_base::ResourceKind::memory()) / self.config.num_workers as u64
             };
             return self
                 .handle_slurm_task_request(
@@ -803,9 +803,9 @@ where
         }
 
         let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-            self.pool.workers[worker_id as usize].reserved_budgets.get(db_comm_api_base::ResourceKind::Memory)
+            self.pool.workers[worker_id as usize].reserved_budgets.get(&db_comm_api_base::ResourceKind::memory())
         } else {
-            self.config.max_resources.get(db_comm_api_base::ResourceKind::Memory) / self.config.num_workers as u64
+            self.config.max_resources.get(&db_comm_api_base::ResourceKind::memory()) / self.config.num_workers as u64
         };
 
         let msg = DistributedMessage::TaskRequest {
@@ -814,7 +814,7 @@ where
             secondary_id: self.config.secondary_id.clone(),
             worker_id,
             available_resources: vec![db_comm_api_base::ResourceAmount {
-                kind: db_comm_api_base::ResourceKind::Memory,
+                kind: db_comm_api_base::ResourceKind::memory(),
                 amount: available_memory,
             }],
         };
@@ -874,7 +874,7 @@ where
 
                 let worker = &mut self.pool.workers[target_wid as usize];
                 if worker.is_idle_state() {
-                    let estimated_mb = estimated.get(db_comm_api_base::ResourceKind::Memory) / (1024 * 1024);
+                    let estimated_mb = estimated.get(&db_comm_api_base::ResourceKind::memory()) / (1024 * 1024);
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
@@ -960,7 +960,7 @@ where
                 ..
             } if self.is_slurm_primary => {
                 let available_memory = available_resources.iter()
-                    .find(|r| r.kind == db_comm_api_base::ResourceKind::Memory)
+                    .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
                     .map(|r| r.amount)
                     .unwrap_or(0);
                 self.handle_slurm_task_request(secondary_id, worker_id, available_memory)
@@ -1054,7 +1054,7 @@ where
         let mut assigned_idx = None;
         for (i, binary) in self.slurm_pending_binaries.iter().enumerate() {
             let estimated = self.estimator.estimate(binary.size);
-            if estimated.get(db_comm_api_base::ResourceKind::Memory) <= available_memory {
+            if estimated.get(&db_comm_api_base::ResourceKind::memory()) <= available_memory {
                 assigned_idx = Some(i);
                 break;
             }
@@ -1172,7 +1172,7 @@ mod tests {
     struct FixedEstimator(u64);
     impl ResourceEstimator for FixedEstimator {
         fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
-            db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
+            db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
         }
     }
 
@@ -1371,7 +1371,7 @@ mod tests {
                 let config = SecondaryConfig {
                     secondary_id: "sec-0".into(),
                     num_workers: 1,
-                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024)]),
+                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
                     hostname: "test-host".into(),
                     keepalive_interval: Duration::from_secs(60),
                     src_network: None,
@@ -1428,7 +1428,7 @@ mod tests {
                 let config = SecondaryConfig {
                     secondary_id: "sec-0".into(),
                     num_workers: 2,
-                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024)]),
+                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
                     hostname: "test-host".into(),
                     keepalive_interval: Duration::from_secs(60),
                     src_network: None,

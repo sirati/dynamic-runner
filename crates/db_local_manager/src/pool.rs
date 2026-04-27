@@ -73,7 +73,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
             let budget = scheduler.initial_budget(i, max_resources);
-            let budget_mb = budget.get(db_comm_api_base::ResourceKind::Memory) / (1024 * 1024);
+            let budget_mb = budget.get(&db_comm_api_base::ResourceKind::memory()) / (1024 * 1024);
             handle.reserved_budgets = budget;
             tracing::info!(
                 worker_id = i,

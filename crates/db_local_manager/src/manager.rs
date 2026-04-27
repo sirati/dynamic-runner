@@ -102,7 +102,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         self.stats.completed = 0;
         self.stats.errored = 0;
 
-        let max_mem_mb = self.config.max_resources.get(ResourceKind::Memory) / (1024 * 1024);
+        let max_mem_mb = self.config.max_resources.get(&ResourceKind::memory()) / (1024 * 1024);
         tracing::info!(
             num_workers = self.config.num_workers,
             max_memory_mb = max_mem_mb,
@@ -177,16 +177,16 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             .pool.workers
             .iter()
             .filter(|w| w.opportunistic && w.current_binary.is_some())
-            .map(|w| w.estimated_resources.get(ResourceKind::Memory))
+            .map(|w| w.estimated_resources.get(&ResourceKind::memory()))
             .sum();
         let non_opp_mem: u64 = self
             .pool.workers
             .iter()
             .filter(|w| !w.opportunistic && w.current_binary.is_some())
-            .map(|w| w.estimated_resources.get(ResourceKind::Memory))
+            .map(|w| w.estimated_resources.get(&ResourceKind::memory()))
             .sum();
         tracing::info!(
-            total_assigned_mb = self.total_assigned_resources.get(ResourceKind::Memory) / (1024 * 1024),
+            total_assigned_mb = self.total_assigned_resources.get(&ResourceKind::memory()) / (1024 * 1024),
             non_opportunistic_mb = non_opp_mem / (1024 * 1024),
             opportunistic_mb = opp_mem / (1024 * 1024),
             "initial assignments complete"
@@ -213,7 +213,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             } => {
                 let binary = self.pending_binaries.remove(binary_index);
                 self.total_assigned_resources.add(&estimated_usage);
-                let estimated_mb = estimated_usage.get(ResourceKind::Memory) / (1024 * 1024);
+                let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
                 let worker = &mut self.pool.workers[worker_id as usize];
@@ -359,7 +359,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         // Sort by size (smallest first) matching Python behavior
         self.unassigned_tasks.sort_by_key(|b| b.size);
 
-        let low_mem_threshold = self.config.low_resource_thresholds.get(ResourceKind::Memory);
+        let low_mem_threshold = self.config.low_resource_thresholds.get(&ResourceKind::memory());
         let mut kept = Vec::new();
         for task in self.unassigned_tasks.drain(..) {
             let free_mem = Self::get_free_system_memory();
@@ -478,7 +478,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                 for binary in remaining {
                     self.resource_pressure_tasks.push(FailedTask {
                         binary,
-                        error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
+                        error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
                         error_message: "Could not fit in any worker budget".into(),
                         retry_count: 0,
                     });
@@ -619,7 +619,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             } => {
                 let binary = self.pending_binaries.remove(binary_index);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let estimated_mb = estimated_usage.get(ResourceKind::Memory) / (1024 * 1024);
+                let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let worker = &mut self.pool.workers[worker_id as usize];
                 match worker
                     .assign_task(binary.clone(), estimated_usage.clone(), opportunistic)
@@ -867,8 +867,8 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        let estimated_mem = estimated.get(ResourceKind::Memory);
-        let actual_mem = actual.get(ResourceKind::Memory);
+        let estimated_mem = estimated.get(&ResourceKind::memory());
+        let actual_mem = actual.get(&ResourceKind::memory());
 
         use std::io::Write;
         match std::fs::OpenOptions::new()
@@ -890,12 +890,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         if result.success {
             self.stats.completed += 1;
         } else {
-            match result.error_type {
-                Some(ErrorType::ResourceExhausted(ResourceKind::Memory)) => {
+            match &result.error_type {
+                Some(ErrorType::ResourceExhausted(kind)) if kind.as_str() == "memory" => {
                     if let Some(binary) = binary {
                         self.resource_pressure_tasks.push(FailedTask {
                             binary: binary.clone(),
-                            error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
+                            error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
                             error_message: result
                                 .error_message
                                 .clone()
@@ -910,6 +910,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                             binary: binary.clone(),
                             error_type: result
                                 .error_type
+                                .clone()
                                 .unwrap_or(ErrorType::Recoverable),
                             error_message: result
                                 .error_message
@@ -1006,7 +1007,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                         // This happens even during OOM phase (matching Python).
                         self.resource_pressure_tasks.push(FailedTask {
                             binary,
-                            error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
+                            error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
                             error_message: reason,
                             retry_count: 0,
                         });
@@ -1070,7 +1071,7 @@ mod tests {
     struct FixedEstimator(u64);
     impl ResourceEstimator for FixedEstimator {
         fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
-            db_comm_api_base::ResourceMap::from([(ResourceKind::Memory, self.0)])
+            db_comm_api_base::ResourceMap::from([(ResourceKind::memory(), self.0)])
         }
     }
 
@@ -1134,7 +1135,7 @@ mod tests {
                         FakeWorkerMode::AlwaysOom => {
                             let _ = runner
                                 .send(Response::Error {
-                                    error_type: ErrorType::ResourceExhausted(ResourceKind::Memory),
+                                    error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
                                     message: "out of memory".into(),
                                 })
                                 .await;
@@ -1165,12 +1166,12 @@ mod tests {
     fn test_config(num_workers: u32) -> LocalManagerConfig {
         LocalManagerConfig {
             num_workers,
-            max_resources: ResourceMap::from([(ResourceKind::Memory, 1024 * 1024 * 1024)]), // 1GB
+            max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]), // 1GB
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: HashMap::new(),
-            low_resource_thresholds: ResourceMap::from([(ResourceKind::Memory, 300 * 1024 * 1024)]),
+            low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
         }
     }
 
@@ -1363,12 +1364,12 @@ mod tests {
 
             let config = LocalManagerConfig {
                 num_workers: 1,
-                max_resources: ResourceMap::from([(ResourceKind::Memory, 1024 * 1024 * 1024)]),
+                max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
                 always_restart_worker: false,
                 print_pid: false,
                 memuse_log_path: Some(memuse_path.clone()),
                 stage_timeouts: HashMap::new(),
-                low_resource_thresholds: ResourceMap::from([(ResourceKind::Memory, 300 * 1024 * 1024)]),
+                low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
             };
 
             let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));

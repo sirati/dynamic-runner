@@ -25,7 +25,7 @@ struct TestId {
 struct FixedEstimator(u64);
 impl ResourceEstimator for FixedEstimator {
     fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
     }
 }
 
@@ -90,7 +90,7 @@ async fn e2e_primary_secondary_over_wss() {
             let config = SecondaryConfig {
                 secondary_id: sec_id,
                 num_workers: 2,
-                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram)]),
+                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -179,7 +179,7 @@ async fn e2e_primary_secondary_over_quic() {
             let config = SecondaryConfig {
                 secondary_id: sec_id,
                 num_workers: 2,
-                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram)]),
+                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,

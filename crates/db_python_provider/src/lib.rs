@@ -247,7 +247,7 @@ impl PyMemoryEstimatorBridge {
 impl ResourceEstimator for PyMemoryEstimatorBridge {
     fn estimate(&self, binary_size: u64) -> db_comm_api_base::ResourceMap {
         let mem = (self.slope * binary_size as f64 + self.intercept).max(0.0) as u64;
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, mem)])
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), mem)])
     }
 }
 
@@ -694,12 +694,12 @@ impl PyLocalManager {
 
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.max_memory)]),
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.max_memory)]),
             always_restart_worker: self.always_restart_worker,
             print_pid: self.print_pid,
             memuse_log_path,
             stage_timeouts: self.stage_timeouts.clone(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
         };
 
         let mut factory = SubprocessWorkerFactory {
@@ -991,7 +991,7 @@ impl PyDistributedManager {
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
-                            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram)]),
+                            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
                             hostname: "localhost".into(),
                             keepalive_interval: Duration::from_secs(60),
                             src_network: None,
@@ -1453,7 +1453,7 @@ impl PySecondaryCoordinator {
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
                     num_workers,
-                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, ram_bytes)]),
+                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram_bytes)]),
                     hostname: gethostname(),
                     keepalive_interval: Duration::from_secs(1),
                     src_network: None,

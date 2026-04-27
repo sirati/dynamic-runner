@@ -316,7 +316,7 @@ mod tests {
 
         let conn = conn.receive_welcome(
             4,
-            vec![ResourceAmount { kind: db_comm_api_base::ResourceKind::Memory, amount: 16 * 1024 * 1024 * 1024 }],
+            vec![ResourceAmount { kind: db_comm_api_base::ResourceKind::memory(), amount: 16 * 1024 * 1024 * 1024 }],
             "node1".into(),
             5000,
             None,

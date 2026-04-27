@@ -26,7 +26,7 @@ struct TestId(String);
 struct FixedEstimator(u64);
 impl ResourceEstimator for FixedEstimator {
     fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, self.0)])
+        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
     }
 }
 
@@ -121,12 +121,12 @@ async fn single_worker_subprocess_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 1,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024)]),
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
         };
 
         let mut factory = PythonWorkerFactory {
@@ -281,12 +281,12 @@ async fn single_worker_named_socket_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 1,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 1024 * 1024 * 1024)]),
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -332,12 +332,12 @@ async fn multi_worker_named_socket_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 3,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024)]),
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -380,12 +380,12 @@ async fn multi_worker_subprocess_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 3,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 2 * 1024 * 1024 * 1024)]),
+            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::Memory, 300 * 1024 * 1024)]),
+            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
         };
 
         let mut factory = PythonWorkerFactory {
