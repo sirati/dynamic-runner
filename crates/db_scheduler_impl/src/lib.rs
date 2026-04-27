@@ -12,6 +12,13 @@ pub struct ResourceStealingScheduler {
     pub resource_kind: ResourceKind,
     pub base_overhead: u64,
     pub pressure_threshold: u64,
+    /// Temporary-budget divisors used when an opportunistic worker requests
+    /// a task in `assign_normal`. The slowest idle worker (rank 0) gets
+    /// `available / temp_factors[0]`; rank 1 gets `available / temp_factors[1]`;
+    /// later ranks fall back to the final element of the slice. Empty
+    /// vector means "no temporary budget" — opportunistic workers stick
+    /// with their reserved budget only.
+    pub temp_factors: Vec<f64>,
 }
 
 impl ResourceStealingScheduler {
@@ -20,6 +27,7 @@ impl ResourceStealingScheduler {
             resource_kind: ResourceKind::memory(),
             base_overhead: 150 * 1024 * 1024,
             pressure_threshold: 500 * 1024 * 1024,
+            temp_factors: vec![1.5, 2.0, 3.0, 4.0],
         }
     }
 
@@ -29,6 +37,18 @@ impl ResourceStealingScheduler {
 
     fn singleton(&self, value: u64) -> ResourceMap {
         ResourceMap::from([(self.resource_kind.clone(), value)])
+    }
+
+    /// Pick the temp-budget divisor for an opportunistic worker at the given
+    /// idle-rank index. Empty `temp_factors` means "infinite" — return f64::INFINITY
+    /// so the caller's temp budget collapses to zero and the worker uses its
+    /// reserved budget unchanged.
+    fn temp_factor_for(&self, idle_rank: usize) -> f64 {
+        if self.temp_factors.is_empty() {
+            return f64::INFINITY;
+        }
+        let last = self.temp_factors.len() - 1;
+        self.temp_factors[idle_rank.min(last)]
     }
 }
 
@@ -114,11 +134,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
             None => return AssignmentDecision::NoFit,
         };
 
-        let temp_factor: f64 = match worker_idle_index {
-            0 => 1.5,
-            1 => 2.0,
-            n => (n + 1) as f64,
-        };
+        let temp_factor: f64 = self.temp_factor_for(worker_idle_index);
 
         let worker_budget = self.get(&worker.reserved_budgets);
         let effective_budget = if worker.is_opportunistic {
