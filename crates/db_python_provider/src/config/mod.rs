@@ -1,5 +1,9 @@
 pub(crate) mod connection;
 pub(crate) mod distributed;
+pub(crate) mod local_manager;
 pub(crate) mod log_paths;
+pub(crate) mod phase;
+pub(crate) mod primary_secondary;
+pub(crate) mod resources;
 pub(crate) mod scheduler;
 pub(crate) mod worker_spec;

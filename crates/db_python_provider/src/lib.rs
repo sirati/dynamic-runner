@@ -11,14 +11,20 @@ mod task_def;
 mod transport;
 
 use config::distributed::DistributedConfig;
+use config::local_manager::PyLocalManagerConfig;
 use config::log_paths::LogPathConfig;
+use config::phase::PyPhase;
+use config::primary_secondary::{PyPrimaryConfig, PySecondaryConfig};
+use config::resources::PyResourceMap;
 use config::scheduler::SchedulerConfig;
 use config::worker_spec::WorkerSpec;
 use managers::distributed::PyDistributedManager;
 use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFactory};
 use managers::local::PyLocalManager;
 use managers::primary::PyPrimaryCoordinator;
+use managers::run::{run_distributed, run_local, run_primary, run_secondary};
 use managers::secondary::PySecondaryCoordinator;
+use pyo3::wrap_pyfunction;
 use pytypes::{PyBinaryIdentifier, PyBinaryInfo, PyFailedTask, PyProcessingStats};
 
 /// Python module definition.
@@ -39,11 +45,20 @@ fn dynamic_batch_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<WorkerSpec>()?;
     m.add_class::<SchedulerConfig>()?;
     m.add_class::<DistributedConfig>()?;
+    m.add_class::<PyResourceMap>()?;
+    m.add_class::<PyPhase>()?;
+    m.add_class::<PyLocalManagerConfig>()?;
+    m.add_class::<PyPrimaryConfig>()?;
+    m.add_class::<PySecondaryConfig>()?;
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
     m.add_class::<PySecondaryCoordinator>()?;
     m.add_class::<PyCallbackWorkerFactory>()?;
     m.add_class::<PyCallbackResourceMonitor>()?;
+    m.add_function(wrap_pyfunction!(run_local, m)?)?;
+    m.add_function(wrap_pyfunction!(run_primary, m)?)?;
+    m.add_function(wrap_pyfunction!(run_secondary, m)?)?;
+    m.add_function(wrap_pyfunction!(run_distributed, m)?)?;
     Ok(())
 }
