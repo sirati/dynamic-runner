@@ -34,8 +34,10 @@ pub struct LocalManagerConfig {
 pub trait WorkerFactory<M: ManagerEndpoint> {
     /// Create a new transport connection for the given worker.
     /// Called at initial startup and on restart.
-    /// Returns (transport, optional_pid).
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> (M, Option<u32>);
+    /// Returns (transport, optional_pid) on success.
+    /// Returns an error string if the spawn fails (caller decides whether to
+    /// abort the run, log and continue with fewer workers, etc.).
+    fn spawn_worker(&mut self, worker_id: WorkerId) -> Result<(M, Option<u32>), String>;
 }
 
 /// The local manager: owns workers, scheduler, and the 5-phase pipeline.
@@ -94,7 +96,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         &mut self,
         binaries: Vec<BinaryInfo<I>>,
         factory: &mut impl WorkerFactory<M>,
-    ) {
+    ) -> Result<(), String> {
         self.pending_binaries = binaries;
         self.stats.total = self.pending_binaries.len() as u32;
         self.stats.completed = 0;
@@ -108,7 +110,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             "starting processing"
         );
 
-        self.initialize_workers(factory).await;
+        self.initialize_workers(factory).await?;
         self.run_initial_assignments(factory).await;
         self.run_main_phase(factory).await;
         self.run_retry_phase(factory).await;
@@ -123,6 +125,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
             resource_pressure = self.resource_pressure_tasks.len(),
             "processing complete"
         );
+        Ok(())
     }
 
     // ── Initialization ──
@@ -131,7 +134,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         &self.config.max_resources
     }
 
-    async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
+    async fn initialize_workers(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<(), String> {
         let max = self.config.max_resources.clone();
         self.pool
             .initialize(
@@ -141,7 +147,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                 factory,
                 self.config.print_pid,
             )
-            .await;
+            .await
     }
 
     // ── Phase 1: Initial Assignments ──
@@ -680,10 +686,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
     }
 
     /// Restart a worker: stop the old one, spawn a new transport via factory.
+    /// Mid-run respawn failures are logged and the worker is left stopped;
+    /// the orchestrator continues with the remaining workers rather than
+    /// aborting the whole run for one slot.
     async fn restart_worker(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
-        self.pool
+        if let Err(e) = self
+            .pool
             .restart_worker(worker_id, factory, self.config.print_pid)
-            .await;
+            .await
+        {
+            tracing::error!(worker_id, error = %e, "worker restart failed; slot will remain stopped");
+        }
     }
 
     async fn handle_event(
@@ -1086,11 +1099,14 @@ mod tests {
     }
 
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-        fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
+        fn spawn_worker(
+            &mut self,
+            _worker_id: WorkerId,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             let (manager_end, runner_end) = channel_pair();
             let mode = self.mode.clone();
             tokio::task::spawn_local(fake_worker_loop(runner_end, mode));
-            (manager_end, None)
+            Ok((manager_end, None))
         }
     }
 
@@ -1174,7 +1190,7 @@ mod tests {
                 make_binary("c", 70),
             ];
 
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             assert_eq!(manager.stats().completed, 3);
             assert_eq!(manager.stats().total, 3);
@@ -1198,7 +1214,7 @@ mod tests {
                 .map(|i| make_binary(&format!("bin_{i}"), 100))
                 .collect();
 
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             assert_eq!(manager.stats().completed, 10);
             assert!(manager.failed_tasks().is_empty());
@@ -1217,7 +1233,7 @@ mod tests {
             };
 
             let binaries = vec![make_binary("retry_me", 50)];
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             // First attempt fails, retry succeeds
             assert_eq!(manager.stats().completed, 1);
@@ -1237,7 +1253,7 @@ mod tests {
             };
 
             let binaries = vec![make_binary("oom_bin", 50)];
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             // OOM in main → retry → OOM again → OOM phase → OOM again
             // Eventually ends up in resource_pressure_tasks or failed_tasks
@@ -1258,7 +1274,8 @@ mod tests {
 
             manager
                 .process_binaries(Vec::<BinaryInfo<TestId>>::new(), &mut factory)
-                .await;
+                .await
+                .unwrap();
 
             assert_eq!(manager.stats().completed, 0);
             assert_eq!(manager.stats().total, 0);
@@ -1275,7 +1292,10 @@ mod tests {
         }
 
         impl WorkerFactory<ChannelManagerEnd> for CountingFactory {
-            fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
+            fn spawn_worker(
+                &mut self,
+                _worker_id: WorkerId,
+            ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
                 self.spawn_count.fetch_add(1, Ordering::SeqCst);
                 let (manager_end, runner_end) = channel_pair();
                 tokio::task::spawn_local(async move {
@@ -1295,7 +1315,7 @@ mod tests {
                         }
                     }
                 });
-                (manager_end, Some(42))
+                Ok((manager_end, Some(42)))
             }
         }
 
@@ -1318,7 +1338,7 @@ mod tests {
                 make_binary("c", 70),
             ];
 
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             assert_eq!(manager.stats().completed, 3);
             assert_eq!(manager.stats().total, 3);
@@ -1361,7 +1381,7 @@ mod tests {
                 make_binary("b", 60),
             ];
 
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             assert_eq!(manager.stats().completed, 2);
 
@@ -1388,7 +1408,10 @@ mod tests {
         }
 
         impl WorkerFactory<ChannelManagerEnd> for RestartCountingFactory {
-            fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
+            fn spawn_worker(
+                &mut self,
+                _worker_id: WorkerId,
+            ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
                 let count = self.spawn_count.fetch_add(1, Ordering::SeqCst);
                 let (manager_end, runner_end) = channel_pair();
                 tokio::task::spawn_local(async move {
@@ -1420,7 +1443,7 @@ mod tests {
                         }
                     }
                 });
-                (manager_end, None)
+                Ok((manager_end, None))
             }
         }
 
@@ -1440,7 +1463,7 @@ mod tests {
                 make_binary("succeed", 60),
             ];
 
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             // First task: NonRecoverable -> fails, worker restarted
             // Second task: succeeds on restarted worker
@@ -1469,7 +1492,7 @@ mod tests {
                 .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
                 .collect();
 
-            manager.process_binaries(binaries, &mut factory).await;
+            manager.process_binaries(binaries, &mut factory).await.unwrap();
 
             assert_eq!(manager.stats().completed, 6);
             assert_eq!(manager.stats().total, 6);

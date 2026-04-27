@@ -39,7 +39,10 @@ struct PythonWorkerFactory {
 }
 
 impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> (SocketpairManagerEnd, Option<u32>) {
+    fn spawn_worker(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> Result<(SocketpairManagerEnd, Option<u32>), String> {
         let (manager_end, child_fd) = create_socketpair()
             .expect("failed to create socketpair");
 
@@ -78,7 +81,7 @@ impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
         let pid = child.id();
         self.children[idx] = Some(child);
 
-        (manager_end, Some(pid))
+        Ok((manager_end, Some(pid)))
     }
 }
 
@@ -145,7 +148,7 @@ async fn single_worker_subprocess_processes_all() {
             FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
         );
 
-        manager.process_binaries(binaries, &mut factory).await;
+        manager.process_binaries(binaries, &mut factory).await.unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -212,10 +215,13 @@ struct NamedSocketWorkerFactory {
 }
 
 impl WorkerFactory<EitherManagerEnd> for NamedSocketWorkerFactory {
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
+    fn spawn_worker(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         let socket_path = self.socket_dir.join(format!("worker_{worker_id}.sock"));
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)
-            .unwrap_or_else(|e| panic!("failed to bind named socket for worker {worker_id}: {e}"));
+            .map_err(|e| format!("failed to bind named socket for worker {worker_id}: {e}"))?;
 
         let mut cmd = process::Command::new("python3");
         cmd.arg("-m")
@@ -235,7 +241,7 @@ impl WorkerFactory<EitherManagerEnd> for NamedSocketWorkerFactory {
 
         let child = cmd
             .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn Python worker {worker_id}: {e}"));
+            .map_err(|e| format!("failed to spawn Python worker {worker_id}: {e}"))?;
 
         let pid = child.id();
         let idx = worker_id as usize;
@@ -248,7 +254,7 @@ impl WorkerFactory<EitherManagerEnd> for NamedSocketWorkerFactory {
             inner: manager_end,
             accepted: false,
         };
-        (endpoint, Some(pid))
+        Ok((endpoint, Some(pid)))
     }
 }
 
@@ -303,7 +309,7 @@ async fn single_worker_named_socket_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await;
+        manager.process_binaries(binaries, &mut factory).await.unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -352,7 +358,7 @@ async fn multi_worker_named_socket_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await;
+        manager.process_binaries(binaries, &mut factory).await.unwrap();
 
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);
@@ -399,7 +405,7 @@ async fn multi_worker_subprocess_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await;
+        manager.process_binaries(binaries, &mut factory).await.unwrap();
 
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);

@@ -180,7 +180,7 @@ where
         );
 
         // Initialize workers
-        self.initialize_workers(factory).await;
+        self.initialize_workers(factory).await?;
 
         // Phase 1: Send welcome
         self.send_welcome().await?;
@@ -210,7 +210,10 @@ where
         self.config.max_resources.clone()
     }
 
-    async fn initialize_workers(&mut self, factory: &mut impl WorkerFactory<M>) {
+    async fn initialize_workers(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<(), String> {
         let max = self.max_resources();
         self.pool
             .initialize(
@@ -220,7 +223,7 @@ where
                 factory,
                 false,
             )
-            .await;
+            .await
     }
 
     async fn send_welcome(&mut self) -> Result<(), String> {
@@ -449,7 +452,10 @@ where
 
             // Restart any workers that disconnected
             for wid in workers_to_restart {
-                self.pool.restart_worker(wid, factory, false).await;
+                if let Err(e) = self.pool.restart_worker(wid, factory, false).await {
+                    tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
+                    continue;
+                }
                 let _ = self.request_task_for_worker(wid).await;
             }
         }
@@ -611,7 +617,10 @@ where
                 }
 
                 // Restart the worker and request a new task
-                self.pool.restart_worker(worker_id, factory, false).await;
+                if let Err(e) = self.pool.restart_worker(worker_id, factory, false).await {
+                    tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
+                    return;
+                }
                 let _ = self.request_task_for_worker(worker_id).await;
             }
             ResourcePressureResult::NoAction => {}
@@ -1199,7 +1208,10 @@ mod tests {
     /// Factory that spawns fake workers via channel transport.
     struct FakeWorkerFactory;
     impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
-        fn spawn_worker(&mut self, _worker_id: WorkerId) -> (ChannelManagerEnd, Option<u32>) {
+        fn spawn_worker(
+            &mut self,
+            _worker_id: WorkerId,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             let (manager_end, runner_end) = channel_pair();
             tokio::task::spawn_local(async move {
                 let mut runner = runner_end;
@@ -1218,7 +1230,7 @@ mod tests {
                     }
                 }
             });
-            (manager_end, None)
+            Ok((manager_end, None))
         }
     }
 

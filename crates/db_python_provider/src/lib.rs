@@ -362,9 +362,12 @@ struct SubprocessWorkerFactory {
 
 impl SubprocessWorkerFactory {
     /// Spawn using socketpair mode: create a socketpair, pass child FD.
-    fn spawn_socketpair(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
-        let (manager_end, child_fd) = create_socketpair()
-            .unwrap_or_else(|e| panic!("failed to create socketpair for worker {worker_id}: {e}"));
+    fn spawn_socketpair(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> Result<(EitherManagerEnd, Option<u32>), String> {
+        let (manager_end, child_fd) =
+            create_socketpair().map_err(|e| format!("failed to create socketpair: {e}"))?;
 
         let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
         let mut cmd = std::process::Command::new(&self.python_executable);
@@ -401,7 +404,7 @@ impl SubprocessWorkerFactory {
 
         let child = cmd
             .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn worker {worker_id}: {e}"));
+            .map_err(|e| format!("failed to exec worker {worker_id}: {e}"))?;
 
         // Close child fd on parent side (duped into child).
         drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(child_fd) });
@@ -413,7 +416,7 @@ impl SubprocessWorkerFactory {
         }
         self.child_processes[idx] = Some(child);
 
-        (EitherManagerEnd::Socketpair(manager_end), Some(pid))
+        Ok((EitherManagerEnd::Socketpair(manager_end), Some(pid)))
     }
 
     /// Spawn using named socket mode: bind socket, then optionally spawn subprocess.
@@ -421,10 +424,10 @@ impl SubprocessWorkerFactory {
         &mut self,
         worker_id: WorkerId,
         socket_dir: &PathBuf,
-    ) -> (EitherManagerEnd, Option<u32>) {
+    ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         let socket_path = self.log_paths.socket_path(socket_dir, worker_id);
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)
-            .unwrap_or_else(|e| panic!("failed to bind named socket for worker {worker_id}: {e}"));
+            .map_err(|e| format!("failed to bind named socket: {e}"))?;
 
         if self.manual_start_worker {
             // Print command for manual execution
@@ -461,7 +464,7 @@ impl SubprocessWorkerFactory {
                 accepted: false,
             };
             // No child process — worker started manually
-            return (endpoint, None);
+            return Ok((endpoint, None));
         }
 
         // Auto-spawn subprocess with --socket-path
@@ -491,7 +494,7 @@ impl SubprocessWorkerFactory {
 
         let child = cmd
             .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn worker {worker_id}: {e}"));
+            .map_err(|e| format!("failed to exec worker {worker_id}: {e}"))?;
 
         let pid = child.id();
         let idx = worker_id as usize;
@@ -504,12 +507,15 @@ impl SubprocessWorkerFactory {
             inner: manager_end,
             accepted: false,
         };
-        (endpoint, Some(pid))
+        Ok((endpoint, Some(pid)))
     }
 }
 
 impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> (EitherManagerEnd, Option<u32>) {
+    fn spawn_worker(
+        &mut self,
+        worker_id: WorkerId,
+    ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         match &self.connection_mode {
             ConnectionMode::Socketpair => self.spawn_socketpair(worker_id),
             ConnectionMode::Named { socket_dir } => {
@@ -712,21 +718,22 @@ impl PyLocalManager {
 
         // Run the async manager on a current-thread tokio runtime,
         // releasing the GIL during processing.
-        py.detach(|| {
+        let run_result: Result<(), String> = py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime");
 
             let local = tokio::task::LocalSet::new();
-            rt.block_on(local.run_until(async {
+            let result = rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, ResourceStealingScheduler::memory(), estimator);
-                manager.process_binaries(rust_binaries, &mut factory).await;
+                let outcome = manager.process_binaries(rust_binaries, &mut factory).await;
 
                 self.stats = Some(manager.stats().clone());
                 self.failed_tasks = manager.failed_tasks().to_vec();
                 self.oom_tasks = manager.resource_pressure_tasks().to_vec();
+                outcome
             }));
 
             // Clean up child processes
@@ -736,9 +743,10 @@ impl PyLocalManager {
                     let _ = c.wait();
                 }
             }
+            result
         });
 
-        Ok(())
+        run_result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
 
     #[getter]

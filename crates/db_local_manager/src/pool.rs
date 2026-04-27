@@ -52,6 +52,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     }
 
     /// Initialize N workers using the factory, assigning budgets via the scheduler.
+    /// Returns an error if any spawn fails — the caller should abort the run.
     pub async fn initialize<S: Scheduler<I>>(
         &mut self,
         num_workers: u32,
@@ -59,9 +60,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         scheduler: &S,
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
-    ) {
+    ) -> Result<(), String> {
         for i in 0..num_workers {
-            let (transport, pid) = factory.spawn_worker(i);
+            let (transport, pid) = factory
+                .spawn_worker(i)
+                .map_err(|e| format!("failed to spawn worker {i}: {e}"))?;
             if print_pid {
                 if let Some(pid) = pid {
                     tracing::info!(worker_id = i, pid, "worker PID");
@@ -81,6 +84,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         }
 
         self.wait_for_all_ready().await;
+        Ok(())
     }
 
     /// Block until every worker has reported Ready.
@@ -102,18 +106,22 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
     /// Restart a single worker: stop the old one, spawn a fresh transport,
     /// preserve budget and assignment_failure_count, wait for Ready.
+    /// Returns an error if the spawn fails — the caller decides how to react
+    /// (typically: log, mark the slot dead, continue with remaining workers).
     pub async fn restart_worker(
         &mut self,
         worker_id: WorkerId,
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
-    ) {
+    ) -> Result<(), String> {
         let old = &mut self.workers[worker_id as usize];
         if !old.is_stopped() {
             old.stop().await;
         }
 
-        let (transport, pid) = factory.spawn_worker(worker_id);
+        let (transport, pid) = factory
+            .spawn_worker(worker_id)
+            .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?;
         if print_pid {
             if let Some(pid) = pid {
                 tracing::info!(worker_id, pid, "worker PID (restart)");
@@ -139,6 +147,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         }
 
         tracing::info!(worker_id, "worker restarted and ready");
+        Ok(())
     }
 
     /// Update actual resource usage for all workers from /proc/[pid]/statm.
