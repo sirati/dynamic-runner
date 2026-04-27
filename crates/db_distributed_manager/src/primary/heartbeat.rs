@@ -180,3 +180,156 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use db_comm_api_base::{BinaryInfo, ResourceMap};
+    use db_primary_secondary_comm::DistributedMessage;
+    use db_scheduler_impl::ResourceStealingScheduler;
+    use db_transport_channel::ChannelSecondaryTransportEnd;
+    use serde::{Deserialize, Serialize};
+    use tokio::sync::mpsc as tokio_mpsc;
+
+    use crate::primary::{PrimaryConfig, PrimaryCoordinator, RemoteWorkerState};
+    use crate::state::{SecondaryConnection, SecondaryConnectionState};
+    use db_scheduler_api::ResourceEstimator;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    #[derive(Clone)]
+    struct FixedEstimator;
+    impl ResourceEstimator for FixedEstimator {
+        fn estimate(&self, _size: u64) -> ResourceMap {
+            ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1)])
+        }
+    }
+
+    fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
+        PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval,
+            keepalive_miss_threshold: miss_threshold,
+        }
+    }
+
+    fn empty_transport() -> (
+        ChannelSecondaryTransportEnd<TestId>,
+        tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    ) {
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let (sec_tx, sec_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert("dead-sec".into(), sec_tx);
+        (
+            ChannelSecondaryTransportEnd {
+                outgoing,
+                incoming_rx,
+            },
+            sec_rx,
+            incoming_tx,
+        )
+    }
+
+    /// Build a primary with one registered secondary that owns one in-flight
+    /// task; advance time past the death threshold; verify the heartbeat
+    /// report flags the secondary as dead and `requeue_dead_secondary`
+    /// requeues the task and drops the worker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dead_secondary_requeues_in_flight_task() {
+        let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config(Duration::from_millis(50), 2),
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator,
+        );
+
+        // Register the secondary at the connection level — the heartbeat
+        // tracker only flags secondaries it knows about.
+        let conn = SecondaryConnection::new("dead-sec".into()).receive_welcome(
+            1,
+            vec![],
+            "host".into(),
+            0,
+            None,
+        );
+        primary.secondaries.insert(
+            "dead-sec".into(),
+            SecondaryConnectionState::Handshaking(conn),
+        );
+        primary.seed_keepalive("dead-sec");
+
+        // Stage one in-flight task on a single virtual worker.
+        let in_flight = BinaryInfo {
+            path: std::path::PathBuf::from("victim.bin"),
+            size: 100,
+            identifier: TestId("victim".into()),
+        };
+        primary.workers.push(RemoteWorkerState {
+            worker_id: 0,
+            secondary_id: "dead-sec".into(),
+            resource_budgets: ResourceMap::new(),
+            current_task: Some(in_flight.clone()),
+            estimated_resources: ResourceMap::new(),
+            is_idle: false,
+        });
+
+        // Sleep past `keepalive_interval * miss_threshold` so the deadline
+        // expires, then collect the report.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let report = primary.collect_heartbeat_report();
+        assert_eq!(report.dead.len(), 1);
+        assert_eq!(report.dead[0].secondary_id, "dead-sec");
+
+        for dead in report.dead {
+            primary.requeue_dead_secondary(dead).await.unwrap();
+        }
+
+        assert_eq!(primary.workers.len(), 0, "dead worker should be evicted");
+        assert_eq!(primary.pending_binaries.len(), 1, "in-flight task requeued");
+        assert_eq!(primary.pending_binaries[0].identifier.0, "victim");
+        assert!(!primary.secondaries.contains_key("dead-sec"));
+    }
+
+    /// A secondary that's still sending keepalives stays in the routable
+    /// set even when other secondaries die.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_secondary_is_not_falsely_declared_dead() {
+        let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config(Duration::from_millis(50), 2),
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator,
+        );
+
+        let conn = SecondaryConnection::new("dead-sec".into()).receive_welcome(
+            1,
+            vec![],
+            "host".into(),
+            0,
+            None,
+        );
+        primary.secondaries.insert(
+            "dead-sec".into(),
+            SecondaryConnectionState::Handshaking(conn),
+        );
+        primary.seed_keepalive("dead-sec");
+
+        // Bump the keepalive within the deadline window so the heartbeat
+        // report should leave it alone.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        primary.record_keepalive("dead-sec");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let report = primary.collect_heartbeat_report();
+        assert_eq!(report.dead.len(), 0);
+    }
+}
+
