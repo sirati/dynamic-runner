@@ -7,6 +7,11 @@ Public surface:
   task packages.
 - `make_subprocess_spawn_factory(package_name)` — convenience factory for
   the `spawn_secondary` callback.
+- `factories.PodmanExecWorkerFactory`, `factories.CgroupResourceMonitor`
+  — reference implementations for unusual deployments (containerised
+  workers, cgroup-aware resource accounting). Lazy-imported via the
+  `factories` submodule to avoid pulling podman/cgroup imports for
+  the common case.
 """
 
 from .run import run
