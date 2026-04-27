@@ -125,6 +125,16 @@ where
     // SLURM-primary state (populated on promotion + full task list)
     slurm_pending_binaries: Vec<BinaryInfo<I>>,
     slurm_completed: HashSet<String>,
+
+    // Cached snapshot of the live primary's last `FullTaskList` broadcast.
+    // Every secondary keeps the cache up to date so that, on promotion,
+    // we can populate `slurm_pending_binaries` immediately without
+    // round-tripping through a fresh `FullTaskList` (which would require
+    // a now-dead primary).
+    cached_full_task_list: Option<(
+        Vec<db_primary_secondary_comm::TaskInfo<I>>,
+        HashSet<String>,
+    )>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -168,6 +178,7 @@ where
             request_backoff: HashMap::new(),
             slurm_pending_binaries: Vec::new(),
             slurm_completed: HashSet::new(),
+            cached_full_task_list: None,
         }
     }
 

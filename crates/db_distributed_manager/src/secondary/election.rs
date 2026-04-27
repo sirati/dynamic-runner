@@ -288,8 +288,30 @@ where
             tracing::info!(round, "won election — taking over as primary");
             self.election = ElectionState::Promoted;
             self.is_slurm_primary = true;
+            self.populate_slurm_from_cache();
         }
         promoted
+    }
+
+    /// On promotion, hydrate `slurm_pending_binaries` from whatever the
+    /// most recent live primary broadcast in `FullTaskList`. If no
+    /// broadcast was ever observed (e.g. the election fired before the
+    /// primary even sent one), the new primary starts with an empty
+    /// pending list — peers will still request work and the primary will
+    /// reply "no tasks available", which is the safe degrade.
+    pub(super) fn populate_slurm_from_cache(&mut self) {
+        if let Some((all_tasks, completed)) = self.cached_full_task_list.take() {
+            tracing::info!(
+                total = all_tasks.len(),
+                completed = completed.len(),
+                "post-promotion: hydrating SLURM-primary pending list from cached FullTaskList"
+            );
+            self.populate_slurm_tasks(all_tasks, completed);
+        } else {
+            tracing::warn!(
+                "post-promotion: no cached FullTaskList; new primary starts with empty pending list"
+            );
+        }
     }
 
     /// Whether the secondary has been elected primary in this run.

@@ -138,6 +138,11 @@ where
                     "received full task list"
                 );
 
+                // Cache on every secondary: if we get promoted later we
+                // can populate slurm_pending_binaries directly from this
+                // snapshot without depending on a (then-dead) primary.
+                self.cached_full_task_list = Some((all_tasks.clone(), completed_set.clone()));
+
                 if self.is_slurm_primary {
                     self.populate_slurm_tasks(all_tasks, completed_set);
                 }
