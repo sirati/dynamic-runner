@@ -1,0 +1,64 @@
+# Wheel-build workflow for dynamic_runner.
+#
+# Triggers:
+#   - push of any tag matching v* (e.g. v0.1.0, v1.2.3-rc1)
+#
+# Builds binary wheels via cibuildwheel for:
+#   - Linux  manylinux_2_28 x86_64       (CPython 3.12, 3.13)
+#   - macOS  13 (Intel x86_64)           (CPython 3.12, 3.13)
+#   - macOS  14 (Apple Silicon arm64)    (CPython 3.12, 3.13)
+#
+# Each matrix leg uploads its wheels as `wheels-<os>` so the publish workflow
+# can later pull every leg's artifacts from the same commit.
+
+name: wheels
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-wheels:
+    name: build wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cibw_build: "cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+            cibw_archs: "x86_64"
+          - os: macos-13
+            cibw_build: "cp312-macosx_x86_64 cp313-macosx_x86_64"
+            cibw_archs: "x86_64"
+          - os: macos-14
+            cibw_build: "cp312-macosx_arm64 cp313-macosx_arm64"
+            cibw_archs: "arm64"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # On macOS the cibuildwheel build runs directly on the runner, so the
+      # rust toolchain must be present on the host. On Linux the build runs
+      # inside the manylinux container, so rustup is installed via
+      # CIBW_BEFORE_BUILD instead (see env block below).
+      - name: Install Rust toolchain (macOS only)
+        if: runner.os == 'macOS'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build wheels with cibuildwheel
+        uses: pypa/cibuildwheel@v2.20
+        env:
+          CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_BUILD_LINUX: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && source $HOME/.cargo/env"
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error

@@ -1,0 +1,72 @@
+# CI workflow for dynamic_runner.
+#
+# Triggers:
+#   - pull_request targeting main
+#   - push to main
+#
+# Runs three independent validators in parallel:
+#   - cargo: rustfmt, clippy (warnings = errors), and the workspace test suite
+#   - nix:   `nix flake check --no-build` to validate flake metadata
+#   - pytest: runs the Python test suite inside `nix develop` (skipped until
+#             tests/ exists in the tree)
+
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  cargo:
+    name: cargo (fmt + clippy + test)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  nix:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: nix flake check --no-build
+        run: nix flake check --no-build
+
+  pytest:
+    name: pytest (inside nix develop)
+    runs-on: ubuntu-latest
+    if: hashFiles('tests/**') != ''
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Run pytest
+        run: nix develop --command pytest tests/
