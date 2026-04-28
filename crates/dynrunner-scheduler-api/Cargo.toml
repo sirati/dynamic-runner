@@ -1,7 +1,15 @@
 [package]
-name = "dynrunner-scheduler-api"
-version = "0.1.0"
-edition = "2024"
+name             = "dynrunner-scheduler-api"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+description            = "Scheduler API: traits + types consumed by manager implementations."
+keywords.workspace     = true
+categories.workspace   = true
+readme.workspace       = true
 
 [dependencies]
 dynrunner-core = { workspace = true }
