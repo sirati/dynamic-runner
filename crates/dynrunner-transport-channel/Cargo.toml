@@ -1,12 +1,12 @@
 [package]
-name = "db_transport_channel"
+name = "dynrunner-transport-channel"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-db_comm_api_base = { workspace = true }
-db_manager_runner_comm = { workspace = true }
-db_primary_secondary_comm = { workspace = true }
+dynrunner-core = { workspace = true }
+dynrunner-protocol-manager-worker = { workspace = true }
+dynrunner-protocol-primary-secondary = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

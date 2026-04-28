@@ -1,11 +1,11 @@
 [package]
-name = "db_scheduler_impl"
+name = "dynrunner-scheduler"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-db_scheduler_api = { workspace = true }
-db_comm_api_base = { workspace = true }
+dynrunner-scheduler-api = { workspace = true }
+dynrunner-core = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

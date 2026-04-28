@@ -1,20 +1,20 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/db_comm_api_base",
-    "crates/db_manager_runner_comm",
-    "crates/db_primary_secondary_comm",
-    "crates/db_scheduler_api",
-    "crates/db_scheduler_impl",
-    "crates/db_transport_socket",
-    "crates/db_transport_channel",
-    "crates/db_transport_quic",
-    "crates/db_runner_impl",
-    "crates/db_local_manager",
-    "crates/db_distributed_manager",
-    "crates/db_gateway",
-    "crates/db_slurm",
-    "crates/db_python_provider",
+    "crates/dynrunner-core",
+    "crates/dynrunner-protocol-manager-worker",
+    "crates/dynrunner-protocol-primary-secondary",
+    "crates/dynrunner-scheduler-api",
+    "crates/dynrunner-scheduler",
+    "crates/dynrunner-transport-socket",
+    "crates/dynrunner-transport-channel",
+    "crates/dynrunner-transport-quic",
+    "crates/dynrunner-worker",
+    "crates/dynrunner-manager-local",
+    "crates/dynrunner-manager-distributed",
+    "crates/dynrunner-gateway",
+    "crates/dynrunner-slurm",
+    "crates/dynrunner-pyo3",
 ]
 
 [workspace.dependencies]
@@ -36,17 +36,17 @@ sha2 = "0.10"
 base64 = "0.22"
 
 # Internal crates
-db_comm_api_base = { path = "crates/db_comm_api_base" }
-db_manager_runner_comm = { path = "crates/db_manager_runner_comm" }
-db_primary_secondary_comm = { path = "crates/db_primary_secondary_comm" }
-db_scheduler_api = { path = "crates/db_scheduler_api" }
-db_scheduler_impl = { path = "crates/db_scheduler_impl" }
-db_transport_socket = { path = "crates/db_transport_socket" }
-db_transport_channel = { path = "crates/db_transport_channel" }
-db_transport_quic = { path = "crates/db_transport_quic" }
-db_runner_impl = { path = "crates/db_runner_impl" }
-db_local_manager = { path = "crates/db_local_manager" }
-db_distributed_manager = { path = "crates/db_distributed_manager" }
-db_gateway = { path = "crates/db_gateway" }
-db_slurm = { path = "crates/db_slurm" }
-db_python_provider = { path = "crates/db_python_provider" }
+dynrunner-core = { path = "crates/dynrunner-core" }
+dynrunner-protocol-manager-worker = { path = "crates/dynrunner-protocol-manager-worker" }
+dynrunner-protocol-primary-secondary = { path = "crates/dynrunner-protocol-primary-secondary" }
+dynrunner-scheduler-api = { path = "crates/dynrunner-scheduler-api" }
+dynrunner-scheduler = { path = "crates/dynrunner-scheduler" }
+dynrunner-transport-socket = { path = "crates/dynrunner-transport-socket" }
+dynrunner-transport-channel = { path = "crates/dynrunner-transport-channel" }
+dynrunner-transport-quic = { path = "crates/dynrunner-transport-quic" }
+dynrunner-worker = { path = "crates/dynrunner-worker" }
+dynrunner-manager-local = { path = "crates/dynrunner-manager-local" }
+dynrunner-manager-distributed = { path = "crates/dynrunner-manager-distributed" }
+dynrunner-gateway = { path = "crates/dynrunner-gateway" }
+dynrunner-slurm = { path = "crates/dynrunner-slurm" }
+dynrunner-pyo3 = { path = "crates/dynrunner-pyo3" }

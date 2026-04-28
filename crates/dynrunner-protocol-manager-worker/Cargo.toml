@@ -1,10 +1,10 @@
 [package]
-name = "db_manager_runner_comm"
+name = "dynrunner-protocol-manager-worker"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-db_comm_api_base = { workspace = true }
+dynrunner-core = { workspace = true }
 base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
