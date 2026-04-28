@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use db_distributed_manager::{PrimaryConfig as RustPrimaryConfig, SecondaryConfig as RustSecondaryConfig};
+use dynrunner_manager_distributed::{PrimaryConfig as RustPrimaryConfig, SecondaryConfig as RustSecondaryConfig};
 
 use super::distributed::DistributedConfig;
 use super::resources::PyResourceMap;

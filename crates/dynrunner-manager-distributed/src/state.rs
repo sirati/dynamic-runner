@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
-use db_comm_api_base::ResourceAmount;
-use db_transport_quic::QuicConnection;
+use dynrunner_core::ResourceAmount;
+use dynrunner_transport_quic::QuicConnection;
 
 // ── ZST State Markers ──
 
@@ -316,7 +316,7 @@ mod tests {
 
         let conn = conn.receive_welcome(
             4,
-            vec![ResourceAmount { kind: db_comm_api_base::ResourceKind::memory(), amount: 16 * 1024 * 1024 * 1024 }],
+            vec![ResourceAmount { kind: dynrunner_core::ResourceKind::memory(), amount: 16 * 1024 * 1024 * 1024 }],
             "node1".into(),
             5000,
             None,

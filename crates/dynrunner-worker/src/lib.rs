@@ -1,5 +1,5 @@
-use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender};
-use db_manager_runner_comm::{Command, Response, RunnerEndpoint};
+use dynrunner_core::{ErrorType, MessageReceiver, MessageSender};
+use dynrunner_protocol_manager_worker::{Command, Response, RunnerEndpoint};
 
 /// Output from a successful task execution.
 pub struct TaskOutput {
@@ -73,7 +73,7 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use db_transport_channel::{ChannelRunnerEnd, channel_pair};
+    use dynrunner_transport_channel::{ChannelRunnerEnd, channel_pair};
 
     struct EchoExecutor;
 

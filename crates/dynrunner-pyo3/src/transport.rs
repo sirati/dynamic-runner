@@ -1,7 +1,7 @@
-use db_comm_api_base::{MessageReceiver, MessageSender};
-use db_manager_runner_comm::{Command, Response};
-use db_transport_socket::named_socket::NamedSocketManagerEnd;
-use db_transport_socket::socketpair::SocketpairManagerEnd;
+use dynrunner_core::{MessageReceiver, MessageSender};
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
+use dynrunner_transport_socket::socketpair::SocketpairManagerEnd;
 
 // ── EitherManagerEnd: unified transport for socketpair + named socket ──
 

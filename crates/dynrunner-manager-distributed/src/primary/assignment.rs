@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use db_comm_api_base::{BinaryInfo, Identifier, ResourceMap};
-use db_primary_secondary_comm::{
+use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
 };
-use db_scheduler_api::{
+use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, Scheduler,
 };
 
@@ -25,10 +25,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             let state = self.secondaries.get(secondary_id).unwrap();
             let num_workers = state.num_workers();
             let ram_bytes = state.resources().iter()
-                .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
+                .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
-            let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram_bytes)]);
+            let max_res = dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram_bytes)]);
 
             for local_idx in 0..num_workers {
                 let budget = self.scheduler.initial_budget(local_idx, &max_res);
@@ -110,7 +110,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                 .map(|(worker_id, _, est_res)| WorkerReadyInfo {
                     worker_id: *worker_id,
                     resource_budgets: est_res.iter()
-                        .map(|(kind, amount)| db_comm_api_base::ResourceAmount {
+                        .map(|(kind, amount)| dynrunner_core::ResourceAmount {
                             kind: kind.clone(),
                             amount,
                         })

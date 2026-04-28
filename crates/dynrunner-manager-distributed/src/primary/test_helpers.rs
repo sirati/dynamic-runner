@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use db_comm_api_base::{BinaryInfo, Identifier, MessageReceiver, MessageSender};
-use db_local_manager::WorkerFactory;
-use db_manager_runner_comm::{Command, Response};
-use db_primary_secondary_comm::{DistributedMessage, PeerConnectionInfo, PeerTransport};
-use db_scheduler_api::ResourceEstimator;
-use db_transport_channel::{
+use dynrunner_core::{BinaryInfo, Identifier, MessageReceiver, MessageSender};
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_transport_channel::{
     channel_pair, ChannelManagerEnd, ChannelSecondaryTransportEnd,
 };
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ pub(super) struct TestId(pub String);
 pub(super) struct FixedEstimator(pub u64);
 
 impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
+    fn estimate(&self, _size: u64) -> dynrunner_core::ResourceMap {
+        dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.0)])
     }
 }
 
@@ -102,8 +102,8 @@ pub(super) async fn fake_secondary(
             sender_id: secondary_id.clone(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
-            resources: vec![db_comm_api_base::ResourceAmount {
-                kind: db_comm_api_base::ResourceKind::memory(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
                 amount: ram_bytes,
             }],
             worker_count: num_workers,
@@ -146,8 +146,8 @@ pub(super) async fn fake_secondary(
                                 timestamp: 0.0,
                                 secondary_id: secondary_id.clone(),
                                 worker_id: 0,
-                                available_resources: vec![db_comm_api_base::ResourceAmount {
-                                    kind: db_comm_api_base::ResourceKind::memory(),
+                                available_resources: vec![dynrunner_core::ResourceAmount {
+                                    kind: dynrunner_core::ResourceKind::memory(),
                                     amount: ram_bytes,
                                 }],
                             })
@@ -174,8 +174,8 @@ pub(super) async fn fake_secondary(
                         timestamp: 0.0,
                         secondary_id: secondary_id.clone(),
                         worker_id: 0,
-                        available_resources: vec![db_comm_api_base::ResourceAmount {
-                            kind: db_comm_api_base::ResourceKind::memory(),
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
                             amount: ram_bytes,
                         }],
                     })

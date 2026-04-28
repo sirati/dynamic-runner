@@ -21,10 +21,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use db_comm_api_base::Identifier;
-use db_manager_runner_comm::ManagerEndpoint;
-use db_primary_secondary_comm::{DistributedMessage, PeerTransport, PrimaryTransport};
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport, PrimaryTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
@@ -464,8 +464,8 @@ mod tests {
     /// primary. Validates the post-promotion takeover wiring (#34).
     #[tokio::test(flavor = "current_thread")]
     async fn promotion_hydrates_slurm_tasks_from_cache() {
-        use db_comm_api_base::ResourceMap;
-        use db_primary_secondary_comm::{DistributedBinaryInfo, TaskInfo};
+        use dynrunner_core::ResourceMap;
+        use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, TaskInfo};
         use std::collections::HashSet;
 
         let mut sec = make_secondary(election_config("sec-a"));

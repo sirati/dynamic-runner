@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use db_comm_api_base::BinaryInfo;
-use db_local_manager::{LocalManager, LocalManagerConfig, ProcessingStats};
+use dynrunner_core::BinaryInfo;
+use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 
 use crate::config::connection::ConnectionMode;
 use crate::config::log_paths::LogPathConfig;
@@ -44,8 +44,8 @@ pub(crate) struct PyLocalManager {
     connection_mode: ConnectionMode,
     manual_start_worker: bool,
     stats: Option<ProcessingStats>,
-    failed_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
-    oom_tasks: Vec<db_comm_api_base::FailedTask<TokenizerIdentifier>>,
+    failed_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
+    oom_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
     task_payloads: Vec<(BinaryInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
 }
 
@@ -180,8 +180,8 @@ impl PyLocalManager {
 
         let restart_predicate = self.restart_predicate.as_ref().map(|cb| {
             let cb = cb.clone_ref(py);
-            let predicate: db_local_manager::RestartPredicate =
-                Box::new(move |ctx: &db_local_manager::RestartContext<'_>| -> bool {
+            let predicate: dynrunner_manager_local::RestartPredicate =
+                Box::new(move |ctx: &dynrunner_manager_local::RestartContext<'_>| -> bool {
                     crate::managers::factory_callback::invoke_restart_predicate(&cb, ctx)
                 });
             predicate
@@ -189,15 +189,15 @@ impl PyLocalManager {
 
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.max_memory)]),
+            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.max_memory)]),
             always_restart_worker: self.always_restart_worker,
             restart_predicate,
             retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
             memuse_log_path,
             stage_timeouts: self.stage_timeouts.clone(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(
-                db_comm_api_base::ResourceKind::memory(),
+            low_resource_thresholds: dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
                 self.low_memory_threshold,
             )]),
             resource_check_interval: std::time::Duration::from_millis(100),

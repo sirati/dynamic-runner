@@ -1,13 +1,13 @@
 use std::time::Instant;
 
-use db_comm_api_base::{Identifier, WorkerId};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_local_manager::pool::ResourcePressureResult;
-use db_local_manager::WorkerFactory;
-use db_primary_secondary_comm::{
+use dynrunner_core::{Identifier, WorkerId};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::pool::ResourcePressureResult;
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;
@@ -72,9 +72,9 @@ where
         // When SLURM-primary, handle task requests locally
         if self.is_slurm_primary && !self.slurm_pending_binaries.is_empty() {
             let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-                self.pool.workers[worker_id as usize].reserved_budgets.get(&db_comm_api_base::ResourceKind::memory())
+                self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
             } else {
-                self.config.max_resources.get(&db_comm_api_base::ResourceKind::memory()) / self.config.num_workers as u64
+                self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
             };
             return self
                 .handle_slurm_task_request(
@@ -96,9 +96,9 @@ where
         }
 
         let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-            self.pool.workers[worker_id as usize].reserved_budgets.get(&db_comm_api_base::ResourceKind::memory())
+            self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
         } else {
-            self.config.max_resources.get(&db_comm_api_base::ResourceKind::memory()) / self.config.num_workers as u64
+            self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
         };
 
         let msg = DistributedMessage::TaskRequest {
@@ -106,8 +106,8 @@ where
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
             worker_id,
-            available_resources: vec![db_comm_api_base::ResourceAmount {
-                kind: db_comm_api_base::ResourceKind::memory(),
+            available_resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
                 amount: available_memory,
             }],
         };

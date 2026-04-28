@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 
-use db_comm_api_base::{BinaryInfo, Identifier, WorkerId};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_primary_secondary_comm::{
+use dynrunner_core::{BinaryInfo, Identifier, WorkerId};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, PeerTransport, PrimaryTransport,
     TaskInfo,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;
@@ -101,7 +101,7 @@ where
         let mut assigned_idx = None;
         for (i, binary) in self.slurm_pending_binaries.iter().enumerate() {
             let estimated = self.estimator.estimate(binary.size);
-            if estimated.get(&db_comm_api_base::ResourceKind::memory()) <= available_memory {
+            if estimated.get(&dynrunner_core::ResourceKind::memory()) <= available_memory {
                 assigned_idx = Some(i);
                 break;
             }

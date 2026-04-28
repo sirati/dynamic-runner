@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use db_comm_api_base::WorkerId;
+use dynrunner_core::WorkerId;
 use serde::{Deserialize, Serialize};
 
 use super::*;

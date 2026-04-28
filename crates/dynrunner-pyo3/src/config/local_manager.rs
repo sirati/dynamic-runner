@@ -2,14 +2,14 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
-use db_local_manager::{LocalManagerConfig as RustLocalManagerConfig, RestartPredicate};
+use dynrunner_manager_local::{LocalManagerConfig as RustLocalManagerConfig, RestartPredicate};
 
 use super::resources::PyResourceMap;
 use super::scheduler::SchedulerConfig;
 
 /// Python-facing configuration for the in-process local manager.
 ///
-/// Mirrors `db_local_manager::LocalManagerConfig` but uses the Python-typed
+/// Mirrors `dynrunner_manager_local::LocalManagerConfig` but uses the Python-typed
 /// pyclasses (`ResourceMap`, callables, seconds-as-f64) and provides a
 /// `to_rust(...)` builder that consumes the Python `restart_predicate`
 /// callable (which is single-use because the resulting RestartPredicate
@@ -100,7 +100,7 @@ impl PyLocalManagerConfig {
         let restart_predicate = self.restart_predicate.as_ref().map(|cb| {
             let cb = cb.clone_ref(py);
             let predicate: RestartPredicate =
-                Box::new(move |ctx: &db_local_manager::RestartContext<'_>| {
+                Box::new(move |ctx: &dynrunner_manager_local::RestartContext<'_>| {
                     crate::managers::factory_callback::invoke_restart_predicate(&cb, ctx)
                 });
             predicate

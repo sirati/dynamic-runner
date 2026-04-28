@@ -1,6 +1,6 @@
-use db_comm_api_base::{Identifier, ResourceMap, WorkerId};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_scheduler_api::{ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
+use dynrunner_core::{Identifier, ResourceMap, WorkerId};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_scheduler_api::{ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc;
 
 use crate::manager::WorkerFactory;
@@ -13,7 +13,7 @@ pub enum ResourcePressureResult<I: Identifier> {
     /// (e.g. requeue locally or report failure to primary).
     Killed {
         worker_id: WorkerId,
-        binary: Option<db_comm_api_base::BinaryInfo<I>>,
+        binary: Option<dynrunner_core::BinaryInfo<I>>,
         reason: String,
     },
     /// No action needed — resources are within limits.
@@ -73,7 +73,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
             let budget = scheduler.initial_budget(i, max_resources);
-            let budget_mb = budget.get(&db_comm_api_base::ResourceKind::memory()) / (1024 * 1024);
+            let budget_mb = budget.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
             handle.reserved_budgets = budget;
             tracing::info!(
                 worker_id = i,

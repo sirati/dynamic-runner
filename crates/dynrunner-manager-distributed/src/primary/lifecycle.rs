@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use db_comm_api_base::{Identifier, ResourceMap};
-use db_primary_secondary_comm::{
+use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport, TaskInfo,
 };
-use db_scheduler_api::{
+use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
 

@@ -1,5 +1,5 @@
-use db_comm_api_base::{BinaryInfo, Identifier};
-use db_primary_secondary_comm::DistributedBinaryInfo;
+use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 
 pub(super) fn timestamp_now() -> f64 {
     std::time::SystemTime::now()

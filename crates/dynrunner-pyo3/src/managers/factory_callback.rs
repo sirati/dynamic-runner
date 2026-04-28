@@ -14,10 +14,10 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use db_comm_api_base::{ResourceKind, ResourceMap, WorkerId};
-use db_local_manager::{RestartContext, ResourceMonitor, WorkerFactory};
-use db_transport_socket::named_socket::NamedSocketManagerEnd;
-use db_transport_socket::socketpair::create_socketpair;
+use dynrunner_core::{ResourceKind, ResourceMap, WorkerId};
+use dynrunner_manager_local::{RestartContext, ResourceMonitor, WorkerFactory};
+use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
+use dynrunner_transport_socket::socketpair::create_socketpair;
 
 use crate::config::log_paths::LogPathConfig;
 use crate::transport::EitherManagerEnd;

@@ -1,5 +1,5 @@
-use db_comm_api_base::{BinaryInfo, Identifier, ResourceKind, ResourceMap};
-use db_scheduler_api::{
+use dynrunner_core::{BinaryInfo, Identifier, ResourceKind, ResourceMap};
+use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, ResourcePressureDecision, Scheduler, WorkerBudgetInfo,
 };
 

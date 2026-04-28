@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use db_comm_api_base::{BinaryInfo, Identifier, ResourceMap};
-use db_primary_secondary_comm::SecondaryTransport;
-use db_scheduler_api::{
+use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_protocol_primary_secondary::SecondaryTransport;
+use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
 

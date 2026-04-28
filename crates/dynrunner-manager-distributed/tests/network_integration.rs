@@ -4,14 +4,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use db_comm_api_base::{BinaryInfo, MessageReceiver, MessageSender};
-use db_distributed_manager::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
-use db_local_manager::WorkerFactory;
-use db_manager_runner_comm::{Command, Response};
-use db_scheduler_api::ResourceEstimator;
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::{channel_pair, ChannelManagerEnd};
-use db_transport_quic::{NetworkClient, NetworkServer, NoPeerTransport};
+use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender};
+use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd};
+use dynrunner_transport_quic::{NetworkClient, NetworkServer, NoPeerTransport};
 use serde::{Deserialize, Serialize};
 
 /// Test identifier that can be flattened by serde (must be a struct with named
@@ -24,8 +24,8 @@ struct TestId {
 #[derive(Clone)]
 struct FixedEstimator(u64);
 impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
+    fn estimate(&self, _size: u64) -> dynrunner_core::ResourceMap {
+        dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.0)])
     }
 }
 
@@ -90,7 +90,7 @@ async fn e2e_primary_secondary_over_wss() {
             let config = SecondaryConfig {
                 secondary_id: sec_id,
                 num_workers: 2,
-                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -182,7 +182,7 @@ async fn e2e_primary_secondary_over_quic() {
             let config = SecondaryConfig {
                 secondary_id: sec_id,
                 num_workers: 2,
-                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,

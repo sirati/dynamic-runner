@@ -1,10 +1,10 @@
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerConnectionInfo,
     SecondaryTransport,
 };
-use db_scheduler_api::{
+use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
 

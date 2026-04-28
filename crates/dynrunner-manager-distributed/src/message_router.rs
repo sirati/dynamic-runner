@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{DistributedMessage, MessageType};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, MessageType};
 use tokio::sync::mpsc;
 
 /// A message tagged with its source.

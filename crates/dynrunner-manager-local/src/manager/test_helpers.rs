@@ -3,12 +3,12 @@
 
 use std::collections::HashMap;
 
-use db_comm_api_base::{
+use dynrunner_core::{
     BinaryInfo, ErrorType, MessageReceiver, MessageSender, ResourceKind, ResourceMap, WorkerId,
 };
-use db_manager_runner_comm::{Command, Response};
-use db_scheduler_api::ResourceEstimator;
-use db_transport_channel::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
 use serde::{Deserialize, Serialize};
 
 use super::{LocalManagerConfig, WorkerFactory};

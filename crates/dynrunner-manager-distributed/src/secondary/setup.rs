@@ -1,11 +1,11 @@
 
-use db_comm_api_base::{BinaryInfo, Identifier};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_local_manager::WorkerFactory;
-use db_primary_secondary_comm::{
+use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, PrimaryTransport,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;
@@ -129,8 +129,8 @@ where
     /// Handle initial assignment from primary.
     pub(super) async fn handle_initial_assignment(
         &mut self,
-        zip_files: Vec<db_primary_secondary_comm::ZipFileAssignment<I>>,
-        workers_ready: Vec<db_primary_secondary_comm::WorkerReadyInfo>,
+        zip_files: Vec<dynrunner_protocol_primary_secondary::ZipFileAssignment<I>>,
+        workers_ready: Vec<dynrunner_protocol_primary_secondary::WorkerReadyInfo>,
     ) {
         let mut tasks: Vec<(String, String, DistributedBinaryInfo<I>, String)> = Vec::new();
         for zip_file in &zip_files {

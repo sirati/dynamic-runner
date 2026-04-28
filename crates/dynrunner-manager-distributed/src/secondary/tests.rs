@@ -3,9 +3,9 @@
 
 use super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::*;
-use db_primary_secondary_comm::{DistributedBinaryInfo, MessageType};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::ChannelPrimaryTransportEnd;
+use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// Simulate a primary that coordinates with the secondary.
@@ -145,7 +145,7 @@ async fn secondary_with_real_workers_processes_tasks() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 1,
-                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -203,7 +203,7 @@ async fn secondary_multi_worker_processes_tasks() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 2,
-                max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
                 hostname: "test-host".into(),
                 keepalive_interval: Duration::from_secs(60),
                 src_network: None,
@@ -264,8 +264,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
             let config = SecondaryConfig {
                 secondary_id: "sec-0".into(),
                 num_workers: 1,
-                max_resources: db_comm_api_base::ResourceMap::from([(
-                    db_comm_api_base::ResourceKind::memory(),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
                     1024 * 1024 * 1024,
                 )]),
                 hostname: "test-host".into(),
@@ -354,8 +354,8 @@ async fn stage_file_then_assign_task_succeeds() {
             let config = SecondaryConfig {
                 secondary_id: "sec-stage".into(),
                 num_workers: 1,
-                max_resources: db_comm_api_base::ResourceMap::from([(
-                    db_comm_api_base::ResourceKind::memory(),
+                max_resources: dynrunner_core::ResourceMap::from([(
+                    dynrunner_core::ResourceKind::memory(),
                     1024 * 1024 * 1024,
                 )]),
                 hostname: "test-host".into(),

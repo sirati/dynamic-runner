@@ -1,10 +1,10 @@
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, MessageType,
     SecondaryTransport,
 };
-use db_scheduler_api::{
+use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
 
@@ -81,7 +81,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         } = msg
         {
             let ram_bytes = resources.iter()
-                .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
+                .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                 .map(|r| r.amount)
                 .unwrap_or(0);
             tracing::info!(

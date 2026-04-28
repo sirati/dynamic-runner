@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
-use db_comm_api_base::{
+use dynrunner_core::{
     BinaryInfo, FailedTask, Identifier, ResourceKind, ResourceMap, WorkerId,
 };
-use db_manager_runner_comm::ManagerEndpoint;
-use db_scheduler_api::{
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
 use crate::pool::WorkerPool;

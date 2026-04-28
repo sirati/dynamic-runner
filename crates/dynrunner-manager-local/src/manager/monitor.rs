@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use db_comm_api_base::{
+use dynrunner_core::{
     ErrorType, FailedTask, Identifier, ResourceKind, TaskResult, WorkerId,
 };
-use db_manager_runner_comm::ManagerEndpoint;
-use db_scheduler_api::{
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
 

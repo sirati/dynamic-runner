@@ -1,9 +1,9 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use db_distributed_manager::{PrimaryConfig, PrimaryCoordinator};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_quic::NetworkServer;
+use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_quic::NetworkServer;
 
 use crate::config::distributed::DistributedConfig;
 use crate::estimator::PyMemoryEstimatorBridge;

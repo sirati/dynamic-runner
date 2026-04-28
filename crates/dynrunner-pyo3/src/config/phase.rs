@@ -1,8 +1,8 @@
 use pyo3::prelude::*;
 
-use db_scheduler_api::ProcessingPhase;
+use dynrunner_scheduler_api::ProcessingPhase;
 
-/// Python mirror of `db_scheduler_api::ProcessingPhase`. Not equal to the
+/// Python mirror of `dynrunner_scheduler_api::ProcessingPhase`. Not equal to the
 /// worker-side phase strings (which stay open) — this enum names only the
 /// orchestrator's pipeline phases.
 #[pyclass(name = "Phase", eq, eq_int)]

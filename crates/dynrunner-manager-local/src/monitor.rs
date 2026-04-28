@@ -1,7 +1,7 @@
 //! Resource-usage monitor abstraction + the default
 //! `/proc/[pid]/statm` implementation.
 
-use db_comm_api_base::{ResourceKind, ResourceMap};
+use dynrunner_core::{ResourceKind, ResourceMap};
 
 /// Trait for measuring resource usage of a worker process.
 pub trait ResourceMonitor {

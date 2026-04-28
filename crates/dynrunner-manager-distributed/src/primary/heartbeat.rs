@@ -12,9 +12,9 @@
 
 use std::time::Instant;
 
-use db_comm_api_base::{Identifier, ResourceMap};
-use db_primary_secondary_comm::{DistributedMessage, SecondaryTransport};
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, SecondaryTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
@@ -185,16 +185,16 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use db_comm_api_base::{BinaryInfo, ResourceMap};
-    use db_primary_secondary_comm::DistributedMessage;
-    use db_scheduler_impl::ResourceStealingScheduler;
-    use db_transport_channel::ChannelSecondaryTransportEnd;
+    use dynrunner_core::{BinaryInfo, ResourceMap};
+    use dynrunner_protocol_primary_secondary::DistributedMessage;
+    use dynrunner_scheduler::ResourceStealingScheduler;
+    use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
     use serde::{Deserialize, Serialize};
     use tokio::sync::mpsc as tokio_mpsc;
 
     use crate::primary::{PrimaryConfig, PrimaryCoordinator, RemoteWorkerState};
     use crate::state::{SecondaryConnection, SecondaryConnectionState};
-    use db_scheduler_api::ResourceEstimator;
+    use dynrunner_scheduler_api::ResourceEstimator;
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
     struct TestId(String);
@@ -203,7 +203,7 @@ mod tests {
     struct FixedEstimator;
     impl ResourceEstimator for FixedEstimator {
         fn estimate(&self, _size: u64) -> ResourceMap {
-            ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1)])
+            ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1)])
         }
     }
 
