@@ -63,11 +63,16 @@ impl<I: Identifier> NetworkServer<I> {
     pub async fn bind(addr: SocketAddr) -> Result<Self, String> {
         let cert = CertPair::generate("primary")?;
 
-        // Bind QUIC (UDP) first to get the actual port
-        let quic_listener = QuicListener::bind(&cert).await?;
+        // Bind QUIC (UDP) on the requested address. If the caller
+        // passed port 0 the OS picks; if they passed a fixed port we
+        // honour it (so a primary that already published a URL to
+        // its secondaries can bind to that exact port).
+        let quic_listener = QuicListener::bind_addr(&cert, addr).await?;
         let port = quic_listener.port();
 
-        // Bind WSS (TCP) on the same port
+        // Bind WSS (TCP) on the same port. Use the QUIC-resolved port
+        // (which equals the requested port when non-zero, or the
+        // OS-assigned port when zero) so both protocols match.
         let wss_addr = SocketAddr::new(addr.ip(), port);
         let wss_listener = WssListener::bind(wss_addr).await?;
 

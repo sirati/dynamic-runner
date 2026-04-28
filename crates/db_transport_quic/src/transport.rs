@@ -80,15 +80,22 @@ pub struct QuicListener {
 }
 
 impl QuicListener {
-    /// Bind a QUIC server using the given cert pair on an OS-allocated port.
+    /// Bind a QUIC server using the given cert pair on an OS-allocated
+    /// port. Convenience wrapper around `bind_addr` that uses
+    /// `0.0.0.0:0` (any-interface, OS-allocated port).
     pub async fn bind(cert: &CertPair) -> Result<Self, String> {
+        Self::bind_addr(cert, "0.0.0.0:0".parse().unwrap()).await
+    }
+
+    /// Bind a QUIC server using the given cert pair on the requested
+    /// address. Pass port 0 to let the OS choose; pass a fixed port
+    /// to coordinate with a secondary that already knows where to
+    /// connect (e.g. when the primary published its URL before the
+    /// server was up).
+    pub async fn bind_addr(cert: &CertPair, addr: SocketAddr) -> Result<Self, String> {
         let server_config = cert.server_config()?;
 
-        let endpoint = Endpoint::server(
-            server_config,
-            "0.0.0.0:0".parse().unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
+        let endpoint = Endpoint::server(server_config, addr).map_err(|e| e.to_string())?;
 
         let local_addr = endpoint.local_addr().map_err(|e| e.to_string())?;
         tracing::info!(%local_addr, "QUIC listener bound");
