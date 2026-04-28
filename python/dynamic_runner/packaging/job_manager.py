@@ -44,8 +44,8 @@ class SlurmJobManager:
         logger.info("Directories created successfully")
 
     def build_and_transfer_images(self, local_project_root: Path) -> PodmanImageMetadata:
-        """Build dual images locally and transfer to gateway."""
-        logger.info("Building and transferring Docker images...")
+        """Build the single docker image locally and transfer to gateway."""
+        logger.info("Building and transferring Docker image...")
 
         metadata = self.packaging.build_images(
             gateway=self.gateway,
@@ -54,14 +54,12 @@ class SlurmJobManager:
         )
 
         normalized = PodmanImageMetadata(
-            base_remote_path=self._expanded_remote_path(metadata.base_remote_path),
-            app_remote_path=self._expanded_remote_path(metadata.app_remote_path),
-            base_hash=metadata.base_hash,
-            base_uploaded=metadata.base_uploaded,
+            remote_path=self._expanded_remote_path(metadata.remote_path),
+            image_hash=metadata.image_hash,
+            uploaded=metadata.uploaded,
         )
 
-        logger.info("Base image path: %s", normalized.base_remote_path)
-        logger.info("App image path: %s", normalized.app_remote_path)
+        logger.info("Image path: %s", normalized.remote_path)
         return normalized
 
     def generate_wrapper_script(
@@ -88,8 +86,7 @@ class SlurmJobManager:
         output_network = self._expand_path(self.slurm_config.get_output_dir())
         log_network = self._expand_path(run_log_dir or self.slurm_config.get_log_dir())
 
-        base_image_path = self._expand_path(image_metadata.base_remote_path)
-        app_image_path = self._expand_path(image_metadata.app_remote_path)
+        image_path = self._expand_path(image_metadata.remote_path)
 
         socket_dir = f"{rndtmp}/sockets"
         cmd_socket = f"{socket_dir}/cmd.sock"
@@ -188,21 +185,14 @@ SOCKET_COUNTER=0
 }} &
 CMD_RELAY_PID=$!
 
-echo "Copying base and app images to local temp directory..."
-LOCAL_BASE_IMAGE="$RNDTMP/asm-tokenizer-base.tar"
-LOCAL_APP_IMAGE="$RNDTMP/asm-tokenizer-app.tar"
-cp "{base_image_path}" "$LOCAL_BASE_IMAGE"
-cp "{app_image_path}" "$LOCAL_APP_IMAGE"
-echo "Base image copied to: $LOCAL_BASE_IMAGE"
-echo "App image copied to: $LOCAL_APP_IMAGE"
+echo "Copying image to local temp directory..."
+LOCAL_IMAGE="$RNDTMP/asm-tokenizer.tar"
+cp "{image_path}" "$LOCAL_IMAGE"
+echo "Image copied to: $LOCAL_IMAGE"
 
-echo "Loading base image into container runtime..."
-{self.packaging.get_load_command("$LOCAL_BASE_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
-echo "Base image loaded successfully"
-
-echo "Loading app image into container runtime..."
-{self.packaging.get_load_command("$LOCAL_APP_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
-echo "App image loaded successfully"
+echo "Loading image into container runtime..."
+{self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
+echo "Image loaded successfully"
 
 echo "Starting Docker container..."
 echo "  Volumes:"
@@ -270,8 +260,7 @@ exit $CONTAINER_EXIT_CODE
         image_name = self.packaging.get_image_name()
         image_tag = self.packaging.get_image_tag()
 
-        base_image_path = self._expand_path(image_metadata.base_remote_path)
-        app_image_path = self._expand_path(image_metadata.app_remote_path)
+        image_path = self._expand_path(image_metadata.remote_path)
 
         podman_storage = f"{rndtmp}/storage"
         podman_run = f"{rndtmp}/run"
@@ -308,21 +297,15 @@ echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
 
-echo "Copying base and app images to local /tmp..."
-LOCAL_BASE_IMAGE="$RNDTMP/asm-tokenizer-base.tar"
-LOCAL_APP_IMAGE="$RNDTMP/asm-tokenizer-app.tar"
-echo "  Base source: {base_image_path}"
-echo "  App source: {app_image_path}"
-cp "{base_image_path}" "$LOCAL_BASE_IMAGE"
-cp "{app_image_path}" "$LOCAL_APP_IMAGE"
-echo "  Base size: $(du -h "$LOCAL_BASE_IMAGE" | cut -f1)"
-echo "  App size: $(du -h "$LOCAL_APP_IMAGE" | cut -f1)"
+echo "Copying image to local /tmp..."
+LOCAL_IMAGE="$RNDTMP/asm-tokenizer.tar"
+echo "  Source: {image_path}"
+cp "{image_path}" "$LOCAL_IMAGE"
+echo "  Size: $(du -h "$LOCAL_IMAGE" | cut -f1)"
 echo ""
 
-echo "Loading base image..."
-{self.packaging.get_load_command("$LOCAL_BASE_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
-echo "Loading app image..."
-{self.packaging.get_load_command("$LOCAL_APP_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
+echo "Loading image..."
+{self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
 echo ""
 
 echo "Verifying image is loaded..."

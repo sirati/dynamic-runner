@@ -1,10 +1,10 @@
-"""Podman container image build + dual-image artifact transfer.
+"""Podman container image build + layered transfer.
 
-Faithful port of the legacy `runtime_env.podman.podman_packaging` so the
-gateway protocol stays byte-compatible during the legacy-deletion
-transition. Sibling modules in the `packaging` package own SLURM job
-submission (`job_manager`), gateway abstraction (`gateway/`), per-run
-preparation (`preparation`), and the top-level pipeline (`pipeline`).
+Owns the single-image build (via `nix build .#dockerImage`) and
+upload to the gateway. Sibling modules in the `packaging` package
+own SLURM job submission (`job_manager`), gateway abstraction
+(`gateway/`), per-run preparation (`preparation`), and the top-level
+pipeline (`pipeline`).
 
 Transfer strategy (two-tier cache):
 
@@ -24,9 +24,16 @@ Transfer strategy (two-tier cache):
 
 The 1+2 pairing matters: tier 1 catches the "no change at all" case
 in one round-trip; tier 2 catches "small change in a big image"
-(e.g. a 160 KB project-source layer change inside a 3 GB app image).
-Without tier 1 we'd needlessly extract+hash multi-GB tarballs every
-run; without tier 2 a one-line fix triggers a multi-GB upload.
+(e.g. a 160 KB project-source layer change). Without tier 1 we'd
+needlessly extract+hash multi-GB tarballs every run; without tier 2
+a one-line fix triggers a multi-GB upload.
+
+The flake's `dockerImage` package uses an explicit `layeringPipeline`
+(see flake.nix) that puts each semantic concern in its own layer:
+project code, rust wheel, ghidra, openjdk, each major python package,
+basics. With this layout, an edit-then-rebuild typically invalidates
+only one or two layers — usually <10 MB on the wire after layered
+transfer's blob cache hits.
 """
 
 from __future__ import annotations
@@ -55,30 +62,25 @@ def _human_bytes(n: int) -> str:
 
 @dataclass(frozen=True, slots=True)
 class PodmanImageMetadata:
-    """Metadata for remotely available Podman image artifacts.
+    """Metadata for the single remote Podman image artifact.
 
-    `base_uploaded` and `app_uploaded` reflect whether the local hash
-    matched the remote marker (i.e. the upload was skipped). With
-    layer caching enabled both images can be cache-hits, turning the
-    "transfer" phase into a couple of `cat` commands instead of a
-    1+ GB upload.
+    `uploaded` reflects whether the local hash matched the remote
+    marker (i.e. the upload was a cache hit and skipped). With
+    layered transfer enabled, even on a cache miss the actual
+    bytes-on-the-wire are usually a small fraction of the image
+    size — see `layered_transfer.py`.
     """
 
-    base_remote_path: Path
-    app_remote_path: Path
-    base_hash: str
-    base_uploaded: bool
-    app_hash: str = ""
-    app_uploaded: bool = True
+    remote_path: Path
+    image_hash: str
+    uploaded: bool
 
 
 class PodmanPackaging:
     """Podman-based packaging implementation for SLURM cluster environments."""
 
-    BASE_IMAGE_NAME = "asm-tokenizer-base.tar"
-    APP_IMAGE_NAME = "asm-tokenizer-app.tar"
-    BASE_MARKER_NAME = "asm-tokenizer-base.sha256"
-    APP_MARKER_NAME = "asm-tokenizer-app.sha256"
+    IMAGE_NAME = "asm-tokenizer.tar"
+    MARKER_NAME = "asm-tokenizer.sha256"
     LAYER_CACHE_SUBDIR = "layer-cache"
 
     def __init__(self, *, layered_transfer: bool = True) -> None:
@@ -144,67 +146,46 @@ class PodmanPackaging:
         gateway.transfer_file(local_path, str(remote_path))
 
     def build_images(self, gateway: Any, local_project_root: Path, output_dir: str | Path) -> PodmanImageMetadata:
-        """Build and transfer dual image artifacts with base-image cache marker logic."""
-        logger.info("Building container images locally using Nix...")
+        """Build and transfer the single image artifact.
 
-        local_base_path = self._build_nix_target(
+        The flake's `dockerImage` package is a layered docker-archive
+        with explicit per-concern layers (see flake.nix's
+        `layeringPipeline`). The base/app split that previous versions
+        of this method handled is gone — layered_transfer.py provides
+        the same "skip unchanged content" optimisation at the layer
+        level, regardless of how many top-level images there are.
+        """
+        logger.info("Building container image locally using Nix...")
+
+        local_image_path = self._build_nix_target(
             local_project_root=local_project_root,
-            target=".#dockerImageBase",
-            out_link="docker-image-base-result",
-        )
-        local_app_path = self._build_nix_target(
-            local_project_root=local_project_root,
-            target=".#dockerImageApp",
-            out_link="docker-image-app-result",
+            target=".#dockerImage",
+            out_link="docker-image-result",
         )
 
         output_dir_path = self._normalize_path(output_dir)
-        base_remote_path = output_dir_path / self.BASE_IMAGE_NAME
-        app_remote_path = output_dir_path / self.APP_IMAGE_NAME
-        base_marker_remote_path = output_dir_path / self.BASE_MARKER_NAME
-        app_marker_remote_path = output_dir_path / self.APP_MARKER_NAME
+        remote_path = output_dir_path / self.IMAGE_NAME
+        marker_remote_path = output_dir_path / self.MARKER_NAME
+        layer_cache_root = output_dir_path / self.LAYER_CACHE_SUBDIR
 
         gateway.create_directory(str(output_dir_path))
 
-        # Shared blob cache for both base and app — when the app
-        # image inherits layers from base via `fromImage`, the layer
-        # blobs are byte-identical and dedupe automatically through
-        # this single content-addressed cache.
-        layer_cache_root = output_dir_path / self.LAYER_CACHE_SUBDIR
-
-        # Per-image hash-marker cache (tier 1): each image keeps a
-        # sha256 of the full tar.gz on the gateway. When local==remote
-        # AND the tarball still exists, skip everything. Layered
-        # transfer (tier 2) only kicks in when this fast path misses.
-        base_uploaded, base_hash = self._maybe_upload(
+        uploaded, image_hash = self._maybe_upload(
             gateway,
-            local_base_path,
-            base_remote_path,
-            base_marker_remote_path,
-            label="Base",
+            local_image_path,
+            remote_path,
+            marker_remote_path,
+            label="asm-tokenizer",
             layer_cache_root=layer_cache_root,
         )
 
-        app_uploaded, app_hash = self._maybe_upload(
-            gateway,
-            local_app_path,
-            app_remote_path,
-            app_marker_remote_path,
-            label="App",
-            layer_cache_root=layer_cache_root,
-        )
+        self._cleanup_symlink(local_image_path)
 
-        self._cleanup_symlink(local_base_path)
-        self._cleanup_symlink(local_app_path)
-
-        logger.info("Container images ready on gateway")
+        logger.info("Container image ready on gateway")
         return PodmanImageMetadata(
-            base_remote_path=base_remote_path,
-            app_remote_path=app_remote_path,
-            base_hash=base_hash,
-            base_uploaded=base_uploaded,
-            app_hash=app_hash,
-            app_uploaded=app_uploaded,
+            remote_path=remote_path,
+            image_hash=image_hash,
+            uploaded=uploaded,
         )
 
     def _maybe_upload(

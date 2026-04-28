@@ -96,32 +96,28 @@ class SlurmPreparation:
         )
 
     async def _prepare_docker_images(self, skip_image_build: bool) -> PodmanImageMetadata:
-        """Build and transfer Docker images or verify existing paths."""
+        """Build and transfer the docker image, or verify existing path."""
         image_dir = Path(self.job_manager._expand_path(self.slurm_config.get_image_dir()))
-        base_path = image_dir / "asm-tokenizer-base.tar"
-        app_path = image_dir / "asm-tokenizer-app.tar"
+        image_path = image_dir / "asm-tokenizer.tar"
 
         if skip_image_build:
             logger.info("Skipping image build and transfer (--skip-image-build)")
-            logger.info("Assuming base image exists at: %s", base_path)
-            logger.info("Assuming app image exists at: %s", app_path)
+            logger.info("Assuming image exists at: %s", image_path)
             return PodmanImageMetadata(
-                base_remote_path=base_path,
-                app_remote_path=app_path,
-                base_hash="",
-                base_uploaded=False,
+                remote_path=image_path,
+                image_hash="",
+                uploaded=False,
             )
 
         project_root = Path.cwd()
         image_metadata = self.job_manager.build_and_transfer_images(project_root)
 
         logger.info(
-            "Base image %s at: %s",
-            "uploaded" if image_metadata.base_uploaded else "reused",
-            image_metadata.base_remote_path,
+            "Image %s at: %s",
+            "uploaded" if image_metadata.uploaded else "reused",
+            image_metadata.remote_path,
         )
-        logger.info("App image uploaded at: %s", image_metadata.app_remote_path)
-        logger.info("Base hash: %s", image_metadata.base_hash)
+        logger.info("Image hash: %s", image_metadata.image_hash)
 
         return image_metadata
 

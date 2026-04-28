@@ -10,16 +10,15 @@ that aren't already present in the gateway's blob cache.
 
 ## Why this matters
 
-Both `dockerImageBase` (~2.8 GB across 3 layers) and `dockerImageApp`
-(~3.0 GB across 6 layers; the first 3 layers are *bit-identical* to
-base via `fromImage`) re-upload from scratch on every image-hash
-mismatch in the legacy flow. A one-line edit to the project source
-typically:
-- Leaves base unchanged (already-cached, full-image fast-skip).
-- Touches only the project-source layer in app (~160 KB) plus a
-  tiny config-blob refresh.
+The flake's `dockerImage` is a layered docker-archive (~3 GB across
+80+ explicit layers — see `flake.nix`'s layeringPipeline). Without
+layered transfer, every image-hash mismatch (which happens whenever
+ANY layer changes) re-uploads the whole tarball.
 
-Layered transfer turns that ~3 GB upload into ~160 KB.
+A one-line edit to the project source typically invalidates only the
+project-code layer (~160 KB compressed) and possibly the customisation
+layer (a few KB of symlinks + metadata). Layered transfer turns that
+~3 GB upload into ~200 KB.
 
 ## Wire layout (gateway-side)
 
