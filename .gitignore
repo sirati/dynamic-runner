@@ -1,1 +1,18 @@
 target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Nix build outputs
+result
+result-*
+
+# Editor / direnv
+.direnv/
+.vscode/
+*.swp
+*~

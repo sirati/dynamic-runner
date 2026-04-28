@@ -193,179 +193,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
-name = "db_comm_api_base"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "db_distributed_manager"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_local_manager",
- "db_manager_runner_comm",
- "db_primary_secondary_comm",
- "db_scheduler_api",
- "db_scheduler_impl",
- "db_transport_channel",
- "db_transport_quic",
- "serde",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zip",
-]
-
-[[package]]
-name = "db_gateway"
-version = "0.1.0"
-dependencies = [
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "db_local_manager"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_manager_runner_comm",
- "db_scheduler_api",
- "db_scheduler_impl",
- "db_transport_channel",
- "db_transport_socket",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "db_manager_runner_comm"
-version = "0.1.0"
-dependencies = [
- "base64",
- "db_comm_api_base",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "db_primary_secondary_comm"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "db_python_provider"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_distributed_manager",
- "db_local_manager",
- "db_manager_runner_comm",
- "db_primary_secondary_comm",
- "db_scheduler_api",
- "db_scheduler_impl",
- "db_transport_channel",
- "db_transport_quic",
- "db_transport_socket",
- "pyo3",
- "serde",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "db_runner_impl"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_manager_runner_comm",
- "db_transport_channel",
- "tokio",
-]
-
-[[package]]
-name = "db_scheduler_api"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
-]
-
-[[package]]
-name = "db_scheduler_impl"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_scheduler_api",
- "serde",
-]
-
-[[package]]
-name = "db_slurm"
-version = "0.1.0"
-dependencies = [
- "db_gateway",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "db_transport_channel"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_manager_runner_comm",
- "db_primary_secondary_comm",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "db_transport_quic"
-version = "0.1.0"
-dependencies = [
- "base64",
- "db_comm_api_base",
- "db_primary_secondary_comm",
- "futures-util",
- "quinn",
- "rcgen",
- "rustls",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "db_transport_socket"
-version = "0.1.0"
-dependencies = [
- "db_comm_api_base",
- "db_manager_runner_comm",
- "nix",
- "tokio",
-]
-
-[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -411,6 +238,179 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "dynrunner-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "dynrunner-gateway"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dynrunner-manager-distributed"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-manager-local",
+ "dynrunner-protocol-manager-worker",
+ "dynrunner-protocol-primary-secondary",
+ "dynrunner-scheduler",
+ "dynrunner-scheduler-api",
+ "dynrunner-transport-channel",
+ "dynrunner-transport-quic",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zip",
+]
+
+[[package]]
+name = "dynrunner-manager-local"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-protocol-manager-worker",
+ "dynrunner-scheduler",
+ "dynrunner-scheduler-api",
+ "dynrunner-transport-channel",
+ "dynrunner-transport-socket",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dynrunner-protocol-manager-worker"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "dynrunner-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dynrunner-protocol-primary-secondary"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "dynrunner-pyo3"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-manager-distributed",
+ "dynrunner-manager-local",
+ "dynrunner-protocol-manager-worker",
+ "dynrunner-protocol-primary-secondary",
+ "dynrunner-scheduler",
+ "dynrunner-scheduler-api",
+ "dynrunner-transport-channel",
+ "dynrunner-transport-quic",
+ "dynrunner-transport-socket",
+ "pyo3",
+ "serde",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "dynrunner-scheduler"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-scheduler-api",
+ "serde",
+]
+
+[[package]]
+name = "dynrunner-scheduler-api"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+]
+
+[[package]]
+name = "dynrunner-slurm"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-gateway",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dynrunner-transport-channel"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-protocol-manager-worker",
+ "dynrunner-protocol-primary-secondary",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "dynrunner-transport-quic"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "dynrunner-core",
+ "dynrunner-protocol-primary-secondary",
+ "futures-util",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+]
+
+[[package]]
+name = "dynrunner-transport-socket"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-protocol-manager-worker",
+ "nix",
+ "tokio",
+]
+
+[[package]]
+name = "dynrunner-worker"
+version = "0.1.0"
+dependencies = [
+ "dynrunner-core",
+ "dynrunner-protocol-manager-worker",
+ "dynrunner-transport-channel",
+ "tokio",
+]
 
 [[package]]
 name = "equivalent"
