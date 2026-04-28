@@ -38,9 +38,9 @@ buildPythonPackage {
   doCheck = false;
 
   meta = with lib; {
-    description = "Generic Rust runner backend exposed to Python as dynamic_runner._native";
-    homepage = "https://github.com/sirati/dynamic_runner";
-    license = licenses.mit;
+    description = "Multi-process / multi-host Python task runner backed by a Rust workspace.";
+    homepage = "https://github.com/sirati/dynamic-runner";
+    license = licenses.asl20;
     platforms = platforms.unix;
   };
 }
