@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,19 @@ from typing import Any
 from .layered_transfer import LayeredUploader, UploadStats, make_bundle_from_archive
 
 logger = logging.getLogger(__name__)
+
+
+# Default location for the partial-build layer-assignment cache
+# (per developer machine; not committed). Lives next to the project
+# root so different projects' caches don't collide.
+DEFAULT_LAYER_CACHE_REL = ".docker-layer-cache.json"
+
+# Path to the nix script that extracts a built image's layer
+# assignment. Resolved relative to the project root at call time.
+LAYER_EXTRACTOR_SCRIPT_REL = Path("nix") / "extract-layer-assignment.py"
+
+# Env var name read by flake.nix's previousAssignment hook.
+LAYER_CACHE_ENV_VAR = "NIX_DOCKER_LAYER_CACHE"
 
 
 def _human_bytes(n: int) -> str:
@@ -83,25 +97,75 @@ class PodmanPackaging:
     MARKER_NAME = "asm-tokenizer.sha256"
     LAYER_CACHE_SUBDIR = "layer-cache"
 
-    def __init__(self, *, layered_transfer: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        layered_transfer: bool = True,
+        layer_cache_path: Path | str | None = None,
+    ) -> None:
         self.image_name = "asm-tokenizer"
         self.image_tag = "latest"
         # Layered transfer is opt-out (defaults on). Disable for
         # diagnostics / regression bisect by passing False.
         self.layered_transfer = layered_transfer
+        # Local file path used for the partial-build layer-assignment
+        # cache. When None we resolve to `<project_root>/.docker-layer-cache.json`
+        # at build time. Pass an explicit path (or False to disable
+        # entirely) to override.
+        self._layer_cache_path = layer_cache_path
 
     def _normalize_path(self, path: str | Path) -> Path:
         if isinstance(path, Path):
             return path
         return Path(path)
 
+    def _resolve_layer_cache_path(self, local_project_root: Path) -> Path | None:
+        """Resolve the local file path for the partial-build cache.
+
+        Returns None if caching is explicitly disabled (caller passed
+        `layer_cache_path=False`). Otherwise resolves to the
+        configured path or the default beside `local_project_root`.
+        """
+        if self._layer_cache_path is False:
+            return None
+        if self._layer_cache_path is None:
+            return local_project_root / DEFAULT_LAYER_CACHE_REL
+        return Path(self._layer_cache_path)
+
     def _build_nix_target(self, local_project_root: Path, target: str, out_link: str) -> Path:
+        """Build a nix target. If a layer-assignment cache from a
+        previous build exists, this run becomes incremental: the
+        flake reads the cache via NIX_DOCKER_LAYER_CACHE (impure)
+        and the layeringPipeline preserves each pre-existing layer's
+        content grouping. After a successful build we refresh the
+        cache from the new image so the NEXT run is incremental too.
+
+        Without a cache (cold first build), the nix build runs in
+        pure mode as usual.
+        """
+        cache_path = self._resolve_layer_cache_path(local_project_root)
+        env = os.environ.copy()
         build_cmd = ["nix", "build", target, "--out-link", out_link]
+
+        if cache_path is not None and cache_path.exists():
+            logger.info(
+                "Layer-cache hit at %s; running incremental nix build (--impure).",
+                cache_path,
+            )
+            env[LAYER_CACHE_ENV_VAR] = str(cache_path.resolve())
+            build_cmd.append("--impure")
+        elif cache_path is not None:
+            logger.info(
+                "No layer-cache at %s; cold nix build. (Cache will be primed after this run.)",
+                cache_path,
+            )
+
         result = subprocess.run(
             build_cmd,
             cwd=str(local_project_root),
             capture_output=True,
             text=True,
+            env=env,
         )
 
         if result.returncode != 0:
@@ -112,7 +176,55 @@ class PodmanPackaging:
         if not built_path.exists():
             raise RuntimeError(f"Container image result not found after build for {target}")
 
+        # Refresh the layer-assignment cache from the new image so
+        # the next build can run incrementally. Cache failures are
+        # warnings, not fatal — the build itself succeeded and the
+        # next run will fall back to a cold build.
+        if cache_path is not None:
+            self._refresh_layer_cache(local_project_root, built_path, cache_path)
+
         return built_path
+
+    def _refresh_layer_cache(
+        self,
+        local_project_root: Path,
+        built_image_path: Path,
+        cache_path: Path,
+    ) -> None:
+        """Run the extract-layer-assignment script against the just-
+        built image and write the result to `cache_path`. Atomic via
+        temp + rename so an interrupted refresh can't leave a
+        half-written cache that breaks the next build.
+        """
+        extractor = local_project_root / LAYER_EXTRACTOR_SCRIPT_REL
+        if not extractor.exists():
+            logger.warning(
+                "Layer extractor not found at %s; skipping cache refresh. "
+                "Next build will be cold.",
+                extractor,
+            )
+            return
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".partial")
+        try:
+            # Use system python3 (not nix-develop) so the dev-shell
+            # banner doesn't pollute stdout — the extractor only
+            # uses stdlib.
+            with tmp_path.open("wb") as out:
+                subprocess.run(
+                    ["python3", str(extractor), str(built_image_path.resolve())],
+                    check=True,
+                    stdout=out,
+                )
+            tmp_path.replace(cache_path)
+            logger.info("Layer-cache refreshed at %s", cache_path)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            logger.warning("Layer-cache refresh failed: %s", exc)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _compute_sha256(self, file_path: Path) -> str:
         hasher = hashlib.sha256()
@@ -148,12 +260,30 @@ class PodmanPackaging:
     def build_images(self, gateway: Any, local_project_root: Path, output_dir: str | Path) -> PodmanImageMetadata:
         """Build and transfer the single image artifact.
 
-        The flake's `dockerImage` package is a layered docker-archive
-        with explicit per-concern layers (see flake.nix's
-        `layeringPipeline`). The base/app split that previous versions
-        of this method handled is gone — layered_transfer.py provides
-        the same "skip unchanged content" optimisation at the layer
-        level, regardless of how many top-level images there are.
+        The flake's `dockerImage` is a semantically-layered
+        docker-archive with one layer per declared unit (see
+        flake.nix and nix/semantic-layering.nix). The base/app split
+        that earlier versions of this method handled is gone.
+
+        Two-tier upload optimisation:
+
+        1. The nix build itself runs INCREMENTALLY when a previous
+           build's layer assignment is cached locally at
+           `<project_root>/.docker-layer-cache.json` (configurable
+           via `layer_cache_path` arg to PodmanPackaging). The flake
+           reads the cache via NIX_DOCKER_LAYER_CACHE + --impure
+           and preserves each pre-existing layer's grouping so
+           unchanged units produce byte-identical layer.tar bytes.
+           After a successful build, we refresh the cache from the
+           new image for the next run.
+
+        2. The upload itself is done via layered_transfer.py's
+           content-addressed blob cache on the gateway: only layers
+           whose sha256 differs from what's cached on the gateway
+           get re-transmitted.
+
+        Together these mean a typical edit-test cycle (one Python
+        file changed) ships a few MB instead of the full ~3 GB image.
         """
         logger.info("Building container image locally using Nix...")
 
