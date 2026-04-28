@@ -1,9 +1,9 @@
-"""Re-export binary info types and functions from shared module.
+"""Re-export binary info types and functions from the _shared module.
 
-This module maintains backward compatibility for existing imports within dynamic_batch.
+This module maintains backward compatibility for existing imports within dynamic_runner.
 """
 
-from shared.binary_info import (
+from ._shared.binary_info import (
     FIELD_MAPPING,
     REQUIRED_FIELDS,
     BinaryFilenameFormat,

@@ -3,7 +3,7 @@
 Replaces the legacy `slurm.primary.SlurmPrimaryCoordinator` for the new
 runner architecture: build the container image (`podman.PodmanPackaging`),
 transfer it to the gateway, submit the SLURM jobs (`job_manager`), then
-hand control to `dynamic_batch_rs.run_primary` to coordinate the work.
+hand control to `dynamic_runner.run_primary` to coordinate the work.
 
 The legacy coordinator inherited a lot of QUIC-handshake / file-transfer
 plumbing from `multi_computer.primary.coordinator.BaseCoordinator` —
@@ -22,7 +22,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from shared import find_matching_binaries, process_selection_arguments
+from .._shared import find_matching_binaries, process_selection_arguments
 
 from .gateway import create_gateway, parse_gateway_url
 from .job_manager import SlurmJobManager
@@ -80,9 +80,9 @@ def run_slurm_pipeline(
     log: logging.Logger,
 ) -> None:
     """Build the image, transfer it, submit slurm jobs, then run the
-    primary coordinator (Rust-side via `dynamic_batch_rs.run_primary`).
+    primary coordinator (Rust-side via `dynamic_runner.run_primary`).
 
-    Compatibility fallback: if `dynamic_batch_rs` is unavailable (e.g.
+    Compatibility fallback: if `dynamic_runner` is unavailable (e.g.
     development checkout without maturin build), the function logs an
     actionable error and exits cleanly instead of crashing inside the
     coordinator. The build/transfer/submit half still runs so the user
@@ -198,15 +198,15 @@ def _drive_rust_primary(
     own the secondary processes; SLURM does).
     """
     try:
-        import dynamic_batch_rs as _rs
+        import dynamic_runner as _rs
     except ImportError:
         log.error(
-            "dynamic_batch_rs is not installed; cannot run the primary coordinator. "
+            "dynamic_runner is not installed; cannot run the primary coordinator. "
             "Install it via: cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
         )
         log.warning(
             "Build/transfer/submit completed successfully — your SLURM jobs are running. "
-            "Re-invoke once dynamic_batch_rs is available, or use the legacy --use-python-backend "
+            "Re-invoke once dynamic_runner is available, or use the legacy --use-python-backend "
             "flag with a previous release for end-to-end coordination."
         )
         return

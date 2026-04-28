@@ -1,7 +1,7 @@
-"""argparse setup for the dynamic_batch runner.
+"""argparse setup for the dynamic_runner.
 
 The public surface of this module is `build_arg_parser(description)`,
-called by `dynamic_batch.run.run`. The legacy `run(task, ...)` entry
+called by `dynamic_runner.run.run`. The legacy `run(task, ...)` entry
 point is preserved as a deprecated alias for one release.
 """
 
@@ -10,11 +10,11 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable
 
-from shared import add_selection_arguments
+from ._shared import add_selection_arguments
 
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
-    """Construct the runner argparse with all generic dynamic_batch flags.
+    """Construct the runner argparse with all generic dynamic_runner flags.
 
     Task-specific arguments are added by the caller via
     `task.add_task_arguments(parser)` after this function returns.
@@ -186,15 +186,15 @@ def run(
     spawn_secondary_factory: Callable[[argparse.Namespace], Callable] | None = None,
     description: str = "Dynamic batch processing with memory-aware parallel execution",
 ) -> None:
-    """Deprecated alias for `dynamic_batch.run.run`.
+    """Deprecated alias for `dynamic_runner.run.run`.
 
     Kept for one release so that existing
-    `from dynamic_batch.cli import run` callers don't break.
+    `from dynamic_runner.cli import run` callers don't break.
     """
     import warnings
 
     warnings.warn(
-        "dynamic_batch.cli.run is deprecated; import from dynamic_batch.run instead",
+        "dynamic_runner.cli.run is deprecated; import from dynamic_runner.run instead",
         DeprecationWarning,
         stacklevel=2,
     )

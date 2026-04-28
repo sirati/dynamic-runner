@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from dynamic_batch.packaging.podman import (
+from dynamic_runner.packaging.podman import (
     DEFAULT_LAYER_CACHE_REL,
     LAYER_CACHE_ENV_VAR,
     LAYER_EXTRACTOR_SCRIPT_REL,

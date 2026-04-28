@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from shared import BinaryInfo
+from ._shared import BinaryInfo
 
 
 class Phase(Enum):

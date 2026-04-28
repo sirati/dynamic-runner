@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from dynamic_batch.packaging.layered_transfer import (
+from dynamic_runner.packaging.layered_transfer import (
     ImageBundle,
     LayerBlob,
     LayeredUploader,
@@ -280,7 +280,7 @@ def test_corrupt_layer_dirname_raises(tmp_path):
 
 
 def test_prune_orphan_blobs_removes_unreferenced(tmp_path):
-    from dynamic_batch.packaging.layered_transfer import (
+    from dynamic_runner.packaging.layered_transfer import (
         iter_referenced_digests,
         prune_orphan_blobs,
     )
