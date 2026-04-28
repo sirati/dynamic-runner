@@ -2,7 +2,7 @@
 SLURM job submission → handoff to the Rust primary coordinator.
 
 Self-contained: nothing in this package imports from the legacy
-`dynamic_batch.{gateway, runtime_env, slurm, multi_computer}` chain, so
+`dynamic_runner.{gateway, runtime_env, slurm, multi_computer}` chain, so
 those legacy directories can be deleted in the next pass without
 breaking `--multi-computer slurm`.
 """

@@ -3,7 +3,7 @@
 Ported from `dynamic_batch_tokenizer/__main__.py::_make_spawn_secondary` so
 each task package can reuse the same canonical spawn shape. Task packages
 that need a different spawn shape (e.g. running under SLURM srun) supply
-their own factory and pass it directly to `dynamic_batch.run`.
+their own factory and pass it directly to `dynamic_runner.run`.
 """
 
 from __future__ import annotations

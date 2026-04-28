@@ -4,7 +4,7 @@ Used as both:
 - a TaskDefinition handed to RustSecondaryCoordinator (it's an attribute
   bag, not an instance — `run_secondary` introspects via getattr)
 - a worker module the secondary spawns (the worker reads commands from
-  the manager via the dynamic_batch_rs.comm interface and replies Done
+  the manager via the dynamic_runner.comm interface and replies Done
   after a short sleep)
 
 Kept minimal so the F5 test focuses on the failover protocol, not on
@@ -30,7 +30,7 @@ def organize_and_sort_items(items):
 
 
 def get_worker_module() -> str:
-    return "dynamic_batch.tests._failover_stub_worker"
+    return "dynamic_runner.tests._failover_stub_worker"
 
 
 def add_task_arguments(parser) -> None:
@@ -52,13 +52,13 @@ def get_reserved_memory_per_worker() -> int:
 def _run_worker_loop() -> None:
     """Worker subprocess entrypoint.
 
-    Connects via dynamic_batch_rs.comm, replies Ready, then for each
+    Connects via dynamic_runner.comm, replies Ready, then for each
     ProcessTask sleeps briefly and replies Done. Stops on Stop or when
     the manager disconnects.
     """
     import argparse
 
-    from dynamic_batch_rs.comm import (
+    from dynamic_runner.comm import (
         DoneResponse,
         NamedSocketInterface,
         ReadyResponse,

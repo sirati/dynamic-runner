@@ -1,7 +1,7 @@
 """Thin runner facade: parse argparse, build typed configs, dispatch to Rust.
 
 `run(task, spawn_secondary_factory=None, description="...")` is the new
-canonical entry point. It replaces `dynamic_batch.cli.run`, which becomes a
+canonical entry point. It replaces `dynamic_runner.cli.run`, which becomes a
 deprecated alias for one release.
 """
 
@@ -13,7 +13,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from shared import (
+from ._shared import (
     filter_existing_outputs,
     find_matching_binaries,
     format_binary_info,
@@ -130,7 +130,7 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
 
 def _dispatch_local(task, args, config, logger) -> None:
     """Standard in-process local manager."""
-    import dynamic_batch_rs as _rs
+    import dynamic_runner as _rs
 
     num_cores = parse_cores(args.cores)
     max_memory = parse_memory(args.max_memory)
@@ -184,7 +184,7 @@ def _dispatch_secondary(task, args, logger) -> None:
     import tempfile
 
     import psutil
-    import dynamic_batch_rs as _rs
+    import dynamic_runner as _rs
 
     if not args.secondary_id:
         logger.error("--secondary-id is required when running in secondary mode")
@@ -241,7 +241,7 @@ def _dispatch_secondary(task, args, logger) -> None:
 
 def _dispatch_single_process(task, args, config, logger) -> None:
     """In-process distributed manager (primary + N secondaries via channels)."""
-    import dynamic_batch_rs as _rs
+    import dynamic_runner as _rs
 
     binaries = _collect_binaries(task, args, config)
     if not binaries:
@@ -280,7 +280,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
 
 def _dispatch_multi_computer_local(task, args, logger, spawn_secondary_factory) -> None:
     """Network-based primary that spawns local secondaries via subprocess."""
-    import dynamic_batch_rs as _rs
+    import dynamic_runner as _rs
 
     config = process_selection_arguments(args)
     binaries = _collect_binaries(task, args, config)

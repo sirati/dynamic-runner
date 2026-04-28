@@ -21,7 +21,7 @@ Use these by passing them through the typed configs:
 
 (The current `run_local` doesn't yet accept a factory kwarg; pass via
 the legacy `RustLocalManager` constructor or wrap them in
-`dynamic_batch_rs.PyCallbackWorkerFactory` directly.)
+`dynamic_runner.PyCallbackWorkerFactory` directly.)
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-import dynamic_batch_rs as _rs
+import dynamic_runner as _rs
 
 
 class PodmanExecWorkerFactory:

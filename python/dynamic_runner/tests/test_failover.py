@@ -5,8 +5,8 @@ kills one mid-run, and asserts that the run still completes through the
 post-promotion takeover wired in F1+F2 (Rust-side commits 8ef3386 and
 c7a0113).
 
-Run with: pytest dynamic_batch/tests/test_failover.py -s -v
-Requires: dynamic_batch_rs installed (maturin develop --release in
+Run with: pytest dynamic_runner/tests/test_failover.py -s -v
+Requires: dynamic_runner installed (maturin develop --release in
 the rust/dynamic_batch/crates/db_python_provider directory).
 
 The test is intentionally tolerant of timing — failover involves
@@ -28,11 +28,11 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip(
-    "dynamic_batch_rs",
-    reason="dynamic_batch_rs not installed; run `maturin develop --release` first",
+    "dynamic_runner",
+    reason="dynamic_runner not installed; run `maturin develop --release` first",
 )
 
-import dynamic_batch_rs as _rs  # noqa: E402
+import dynamic_runner as _rs  # noqa: E402
 
 
 @dataclass
@@ -71,7 +71,7 @@ class _SleepTask:
         return 100 * 1024 * 1024  # 100 MiB
 
     def get_worker_module(self) -> str:
-        return "dynamic_batch.tests._failover_stub_worker"
+        return "dynamic_runner.tests._failover_stub_worker"
 
     def add_task_arguments(self, parser) -> None:
         pass
@@ -117,7 +117,7 @@ def _spawn_secondary_factory(args, kill_marker_dir: Path):
         cmd = [
             sys.executable,
             "-m",
-            "dynamic_batch.tests._failover_secondary",
+            "dynamic_runner.tests._failover_secondary",
             "--secondary",
             primary_url,
             "--secondary-id",

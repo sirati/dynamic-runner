@@ -15,7 +15,7 @@ import threading
 import time
 from pathlib import Path
 
-import dynamic_batch_rs as _rs
+import dynamic_runner as _rs
 
 
 def _watch_kill_marker(secondary_id: str) -> None:
