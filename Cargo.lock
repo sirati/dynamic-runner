@@ -333,6 +333,7 @@ dependencies = [
  "db_comm_api_base",
  "db_manager_runner_comm",
  "db_primary_secondary_comm",
+ "serde",
  "tokio",
 ]
 

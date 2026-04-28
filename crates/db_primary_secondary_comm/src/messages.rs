@@ -14,6 +14,7 @@ pub enum MessageType {
     TaskRequest,
     TaskAssignment,
     TransferComplete,
+    StageFile,
     PromotePrimary,
     FullTaskList,
     // Secondary <-> Secondary (peer-to-peer)
@@ -171,6 +172,21 @@ pub enum DistributedMessage<I> {
         total_files: u64,
         total_bytes: u64,
     },
+    /// Per-file staging notification: tells `secondary_id` to copy the
+    /// file from `src_path` (relative to the secondary's `src_network`,
+    /// or absolute if out-of-band-staged) to `dest_path` (relative to
+    /// `src_tmp`), then hash-verify and register it in the
+    /// ExtractionCache. The runner does NOT transfer file payloads —
+    /// the assumption is shared storage; this message just tells the
+    /// secondary "the file is now available, copy it locally".
+    StageFile {
+        sender_id: String,
+        timestamp: f64,
+        secondary_id: String,
+        file_hash: String,
+        src_path: String,
+        dest_path: String,
+    },
     PromotePrimary {
         sender_id: String,
         timestamp: f64,
@@ -256,6 +272,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskRequest { sender_id, .. }
             | Self::TaskAssignment { sender_id, .. }
             | Self::TransferComplete { sender_id, .. }
+            | Self::StageFile { sender_id, .. }
             | Self::PromotePrimary { sender_id, .. }
             | Self::FullTaskList { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
@@ -279,6 +296,7 @@ impl<I> DistributedMessage<I> {
             | Self::TaskRequest { timestamp, .. }
             | Self::TaskAssignment { timestamp, .. }
             | Self::TransferComplete { timestamp, .. }
+            | Self::StageFile { timestamp, .. }
             | Self::PromotePrimary { timestamp, .. }
             | Self::FullTaskList { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
@@ -302,6 +320,7 @@ impl<I> DistributedMessage<I> {
             Self::TaskRequest { .. } => MessageType::TaskRequest,
             Self::TaskAssignment { .. } => MessageType::TaskAssignment,
             Self::TransferComplete { .. } => MessageType::TransferComplete,
+            Self::StageFile { .. } => MessageType::StageFile,
             Self::PromotePrimary { .. } => MessageType::PromotePrimary,
             Self::FullTaskList { .. } => MessageType::FullTaskList,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
