@@ -12,7 +12,7 @@ categories.workspace   = true
 readme.workspace       = true
 
 [lib]
-name = "dynamic_batch_rs"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
