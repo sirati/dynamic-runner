@@ -98,6 +98,22 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         help="Port for QUIC server to listen on (0 = let OS pick, default: 0)",
     )
     parser.add_argument(
+        "--src-network",
+        type=str,
+        default=None,
+        help="Shared-drive directory where the primary stages source binaries. "
+        "Secondaries copy from here on StageFile notifications. Defaults to "
+        "/app/src-network in container deployments.",
+    )
+    parser.add_argument(
+        "--src-tmp",
+        type=str,
+        default=None,
+        help="Per-secondary scratch directory where staged files land. "
+        "Defaults to /app/src-tmp in container deployments or a system tempdir "
+        "otherwise.",
+    )
+    parser.add_argument(
         "--gateway",
         type=str,
         help="Gateway for SLURM controller. Use 'local' or 'ssh://user@host[:port]'",

@@ -19,6 +19,12 @@ pub(crate) struct PyPrimaryCoordinator {
     distributed_config: DistributedConfig,
     completed: u32,
     failed: u32,
+    // Pre-`run()` queue of StageFile notifications. The pipeline calls
+    // `notify_stage_file(...)` on this pyclass as part of packaging
+    // (before `run()` ever starts the coordinator). On `run()`, this
+    // list is moved into `PrimaryCoordinator::queue_stage_file` so the
+    // coordinator flushes them once secondary connections are up.
+    pending_stage_files: Vec<(String, String, String, String)>,
 }
 
 #[pymethods]
@@ -48,7 +54,25 @@ impl PyPrimaryCoordinator {
             distributed_config: distributed_config.unwrap_or_default(),
             completed: 0,
             failed: 0,
+            pending_stage_files: Vec::new(),
         })
+    }
+
+    /// Queue a `StageFile` notification for a secondary. Must be called
+    /// BEFORE `run()` (the typical pipeline pattern: stage all files
+    /// during packaging, then start the coordinator). The Rust
+    /// coordinator flushes these notifications once the secondary
+    /// handshake completes and before initial task assignment.
+    fn notify_stage_file(
+        &mut self,
+        secondary_id: String,
+        file_hash: String,
+        src_path: String,
+        dest_path: String,
+    ) -> PyResult<()> {
+        self.pending_stage_files
+            .push((secondary_id, file_hash, src_path, dest_path));
+        Ok(())
     }
 
     /// Run the primary coordination pipeline over real network connections.
@@ -63,6 +87,7 @@ impl PyPrimaryCoordinator {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
+        let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
 
         // Pick a free port for the primary server before spawning secondaries.
         let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -135,6 +160,10 @@ impl PyPrimaryCoordinator {
                         ResourceStealingScheduler::memory(),
                         estimator,
                     );
+
+                for (sec_id, hash, src, dest) in pending_stage_files {
+                    primary.queue_stage_file(sec_id, hash, src, dest);
+                }
 
                 let result = primary.run(rust_binaries).await;
                 if let Err(e) = &result {

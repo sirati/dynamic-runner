@@ -342,3 +342,68 @@ async fn live_distribution_continues_past_initial_batch() {
         assert_eq!(primary.failed_count(), 0);
     }).await;
 }
+
+/// Pin that `notify_stage_file` actually emits a `StageFile` wire
+/// message into the targeted secondary's incoming channel with the
+/// exact fields supplied. This is what the packaging pipeline
+/// depends on — without correct routing, the ExtractionCache on the
+/// receiving secondary never gets primed.
+#[tokio::test(flavor = "current_thread")]
+async fn notify_stage_file_emits_wire_message() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+        };
+
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
+            PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+        // Send directly via inherent method (skips the queue + run loop).
+        primary
+            .notify_stage_file(
+                "sec-0",
+                "deadbeefcafebabe".to_string(),
+                "rel/binary".to_string(),
+                "scratch/binary".to_string(),
+            )
+            .await
+            .expect("notify_stage_file should succeed");
+
+        // Pull the message out of the targeted secondary's channel.
+        let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+        assert_eq!(id, "sec-0");
+        let msg = to_sec_rx
+            .recv()
+            .await
+            .expect("StageFile should be delivered to sec-0");
+        match msg {
+            DistributedMessage::StageFile {
+                secondary_id,
+                file_hash,
+                src_path,
+                dest_path,
+                ..
+            } => {
+                assert_eq!(secondary_id, "sec-0");
+                assert_eq!(file_hash, "deadbeefcafebabe");
+                assert_eq!(src_path, "rel/binary");
+                assert_eq!(dest_path, "scratch/binary");
+            }
+            other => panic!("expected StageFile, got {:?}", other.msg_type()),
+        }
+    }).await;
+}
+

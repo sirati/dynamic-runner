@@ -90,6 +90,13 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
 
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
+
+    // Stage-file notifications queued before `run()` (or during init,
+    // before secondary connections are up). Flushed once the welcome
+    // + peer-connect handshake completes — at that point `send_to`
+    // can route to a known secondary. Each entry is
+    // (secondary_id, file_hash, src_path, dest_path).
+    pub(super) pending_stage_files: Vec<(String, String, String, String)>,
 }
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
@@ -108,7 +115,23 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             failed_tasks: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             slurm_primary_id: None,
+            pending_stage_files: Vec::new(),
         }
+    }
+
+    /// Queue a `StageFile` notification to be sent to `secondary_id`
+    /// once the secondary handshake completes. Must be called BEFORE
+    /// `run()` (or from outside the run-loop) — once flushed,
+    /// subsequent calls happen inline via `notify_stage_file`.
+    pub fn queue_stage_file(
+        &mut self,
+        secondary_id: String,
+        file_hash: String,
+        src_path: String,
+        dest_path: String,
+    ) {
+        self.pending_stage_files
+            .push((secondary_id, file_hash, src_path, dest_path));
     }
 
     pub fn completed_count(&self) -> usize {
@@ -139,6 +162,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
 
         // Phase 4: Wait for peer connections (skip for single secondary)
         self.wait_for_peer_connections().await?;
+
+        // Phase 4.5: Flush any queued StageFile notifications. Done
+        // after handshake (so send_to has a target) and before
+        // initial assignment (so the secondary's ExtractionCache is
+        // primed before any TaskAssignment for those hashes).
+        self.flush_pending_stage_files().await?;
 
         // Phase 5: Initial assignment
         self.perform_initial_assignment().await?;
@@ -171,8 +200,9 @@ mod connect;
 mod heartbeat;
 mod lifecycle;
 mod peer_setup;
+mod staging;
 mod task;
-mod wire;
+pub mod wire;
 
 #[cfg(test)]
 mod test_helpers;

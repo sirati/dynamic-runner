@@ -29,6 +29,14 @@ pub(crate) struct PySecondaryCoordinator {
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
     distributed_config: DistributedConfig,
+    /// Shared-drive directory where the primary stages source binaries.
+    /// `None` for single-node modes (file-ready resolution falls back
+    /// to absolute paths from the primary's view).
+    src_network: Option<PathBuf>,
+    /// Per-secondary scratch directory where StageFile copies land.
+    /// `None` falls back to a system tempdir under
+    /// `db_secondary_<id>` (the historical default).
+    src_tmp: Option<PathBuf>,
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
@@ -53,6 +61,8 @@ impl PySecondaryCoordinator {
         log_paths = None,
         worker_spec = None,
         distributed_config = None,
+        src_network = None,
+        src_tmp = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -68,6 +78,8 @@ impl PySecondaryCoordinator {
         log_paths: Option<LogPathConfig>,
         worker_spec: Option<WorkerSpec>,
         distributed_config: Option<DistributedConfig>,
+        src_network: Option<PathBuf>,
+        src_tmp: Option<PathBuf>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -91,6 +103,8 @@ impl PySecondaryCoordinator {
             log_paths: task.log_paths,
             worker_spec,
             distributed_config: distributed_config.unwrap_or_default(),
+            src_network,
+            src_tmp,
             worker_module: task.worker_module,
             worker_cmd_args: task.worker_cmd_args,
             skip_existing,
@@ -123,6 +137,8 @@ impl PySecondaryCoordinator {
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
+        let cfg_src_network = self.src_network.clone();
+        let cfg_src_tmp = self.src_tmp.clone();
 
         let mut completed = 0u32;
 
@@ -215,8 +231,8 @@ impl PySecondaryCoordinator {
                     max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram_bytes)]),
                     hostname: gethostname(),
                     keepalive_interval: dist_keepalive,
-                    src_network: None,
-                    src_tmp: None,
+                    src_network: cfg_src_network,
+                    src_tmp: cfg_src_tmp,
                     peer_timeout: dist_peer_timeout,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };

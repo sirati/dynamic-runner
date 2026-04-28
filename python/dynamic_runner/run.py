@@ -191,16 +191,32 @@ def _dispatch_secondary(task, args, logger) -> None:
         return
 
     in_docker = Path("/app").exists() and Path("/.dockerenv").exists()
-    if in_docker:
+
+    # Source-binary staging directories: explicit CLI flags override the
+    # container/local defaults. `src_network` is the shared-drive directory
+    # the primary writes into; `src_tmp` is this secondary's per-process
+    # scratch dir where StageFile copies land.
+    src_network = Path(args.src_network) if args.src_network else (
+        Path("/app/src-network") if in_docker else None
+    )
+
+    if args.src_tmp:
+        src_tmp = Path(args.src_tmp)
+    elif in_docker:
         src_tmp = Path("/app/src-tmp")
-        out_tmp = Path("/app/out-tmp")
     else:
         temp_dir = Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-"))
         src_tmp = temp_dir / "src-tmp"
-        out_tmp = temp_dir / "out-tmp"
+    out_tmp = Path("/app/out-tmp") if in_docker else (
+        Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-out-"))
+    )
+
+    src_tmp.mkdir(parents=True, exist_ok=True)
+    out_tmp.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Secondary ID: {args.secondary_id}")
     logger.info(f"Primary URL: {args.secondary}")
+    logger.info(f"src_network={src_network}, src_tmp={src_tmp}")
 
     ram_bytes = psutil.virtual_memory().total
     num_workers = psutil.cpu_count(logical=False) or 4
@@ -209,6 +225,8 @@ def _dispatch_secondary(task, args, logger) -> None:
         secondary_id=args.secondary_id,
         num_workers=num_workers,
         max_resources=_rs.ResourceMap({"memory": ram_bytes}),
+        src_network=str(src_network) if src_network else None,
+        src_tmp=str(src_tmp),
     )
     _rs.run_secondary(
         cfg,

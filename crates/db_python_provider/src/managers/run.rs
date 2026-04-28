@@ -18,6 +18,22 @@ use crate::config::local_manager::PyLocalManagerConfig;
 use crate::config::log_paths::LogPathConfig;
 use crate::config::primary_secondary::{PyPrimaryConfig, PySecondaryConfig};
 use crate::config::worker_spec::WorkerSpec;
+use crate::pytypes::extract_binaries;
+
+/// Compute the file_hash that the Rust primary will assign to a Python
+/// `BinaryInfo` when it sends a `TaskAssignment`. The hash is stable
+/// for a given (path, identifier) pair — pipelines pre-stage files
+/// against this hash so the secondary's `ExtractionCache` accepts the
+/// stage notification.
+#[pyfunction]
+pub(crate) fn compute_task_hash(py: Python<'_>, binary: &Bound<'_, PyAny>) -> PyResult<String> {
+    let single = pyo3::types::PyList::new(py, [binary])?;
+    let mut rust_binaries = extract_binaries(&single)?;
+    let bin = rust_binaries.pop().ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("compute_task_hash: failed to extract binary")
+    })?;
+    Ok(db_distributed_manager::compute_task_hash(&bin))
+}
 
 fn module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     py.import("dynamic_batch_rs")
@@ -177,6 +193,12 @@ pub(crate) fn run_secondary<'py>(
         kwargs.set_item("worker_spec", ws)?;
     }
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
+    if let Some(sn) = config.src_network.as_ref() {
+        kwargs.set_item("src_network", sn.clone())?;
+    }
+    if let Some(st) = config.src_tmp.as_ref() {
+        kwargs.set_item("src_tmp", st.clone())?;
+    }
 
     let cls = module(py)?.getattr("RustSecondaryCoordinator")?;
     let args = (

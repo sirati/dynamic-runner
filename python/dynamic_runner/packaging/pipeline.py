@@ -220,17 +220,43 @@ def _drive_rust_primary(
         sel_result.opt_levels,
     )
 
-    primary_cfg = _rs.PrimaryConfig(
-        num_secondaries=prep_result.num_secondaries,
-    )
-
     def _slurm_already_spawned(_primary_url: str, _secondary_id: str, _quic_port: int):
         # SLURM did the actual spawning; the Rust runner's spawn_secondary
         # callback isn't responsible for any subprocess. Returning None tells
         # the Rust side it doesn't own a process to clean up at the end.
         return None
 
-    log.info("Handing off to dynamic_batch_rs.run_primary…")
-    result = _rs.run_primary(primary_cfg, task, _slurm_already_spawned, binaries)
-    log.info(f"Completed: {result['completed']}")
-    log.info(f"Failed: {result['failed']}")
+    # Construct the coordinator pyclass directly (rather than the
+    # `run_primary` free function) so we can pre-stage every binary on
+    # every secondary before the coordinator's run-loop starts assigning
+    # work. The coordinator flushes these notifications once secondary
+    # connections are established and before TaskAssignment dispatch.
+    coord = _rs.RustPrimaryCoordinator(
+        prep_result.num_secondaries,
+        task,
+        _slurm_already_spawned,
+        distributed_config=None,
+    )
+
+    source_root = Path(sel_result.source_dir)
+    for binary in binaries:
+        try:
+            rel = str(Path(binary.path).relative_to(source_root))
+        except ValueError:
+            # Binary lives outside source_root (e.g. absolute path scan).
+            # Fall back to the full path; the secondary's StageFile
+            # handler treats absolute src_path as out-of-band staged.
+            rel = str(binary.path)
+        file_hash = _rs.compute_task_hash(binary)
+        for i in range(prep_result.num_secondaries):
+            sec_id = f"secondary-{i}"
+            coord.notify_stage_file(sec_id, file_hash, rel, rel)
+
+    log.info(
+        "Queued %d StageFile notifications across %d secondaries; starting coordinator",
+        len(binaries),
+        prep_result.num_secondaries,
+    )
+    coord.run(binaries)
+    log.info(f"Completed: {coord.completed}")
+    log.info(f"Failed: {coord.failed}")

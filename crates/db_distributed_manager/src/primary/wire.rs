@@ -18,7 +18,7 @@ pub(super) fn binary_to_distributed<I: Identifier>(
     }
 }
 
-pub(super) fn compute_task_hash<I: Identifier>(binary: &BinaryInfo<I>) -> String {
+pub fn compute_task_hash<I: Identifier>(binary: &BinaryInfo<I>) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();
