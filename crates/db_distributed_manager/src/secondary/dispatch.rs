@@ -40,6 +40,31 @@ where
                     .extraction_cache
                     .resolve_binary(zip_ref, &local_path, &file_hash);
 
+                // When the secondary is configured with a staging
+                // directory (`src_network` set) and resolution failed,
+                // the file is genuinely missing — fail loudly here
+                // instead of silently falling through to the primary's
+                // filesystem-view path (which won't exist on this
+                // secondary either, surfacing only at worker exec
+                // time as a confusing crash).
+                if resolved_path.is_none() && self.config.src_network.is_some() {
+                    let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+                    let msg = DistributedMessage::TaskFailed {
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        secondary_id: self.config.secondary_id.clone(),
+                        worker_id: wid,
+                        task_hash: file_hash.clone(),
+                        error_type: "NonRecoverable".into(),
+                        error_message: format!(
+                            "file_hash {file_hash} not pre-staged at {local_path}; \
+                             expected StageFile notification first"
+                        ),
+                    };
+                    self.primary_transport.send(msg).await?;
+                    return Ok(());
+                }
+
                 let binary = match resolved_path {
                     Some(path) => BinaryInfo {
                         path,
@@ -109,6 +134,52 @@ where
                         error_message: "No idle worker available".into(),
                     };
                     self.primary_transport.send(msg).await?;
+                }
+                Ok(())
+            }
+            DistributedMessage::StageFile {
+                secondary_id,
+                file_hash,
+                src_path,
+                dest_path,
+                ..
+            } => {
+                // Only act if addressed to us. The wire is broadcast-shaped
+                // but each StageFile names exactly one secondary.
+                if secondary_id != self.config.secondary_id {
+                    tracing::debug!(
+                        target = %secondary_id,
+                        self_id = %self.config.secondary_id,
+                        "ignoring StageFile addressed to another secondary"
+                    );
+                    return Ok(());
+                }
+                let src_tmp = self
+                    .extraction_cache
+                    .tmp_dir()
+                    .to_path_buf();
+                match super::staging::stage_file(
+                    self.config.src_network.as_deref(),
+                    &src_tmp,
+                    &src_path,
+                    &dest_path,
+                    &file_hash,
+                ) {
+                    Ok(outcome) => {
+                        self.extraction_cache
+                            .register_path(&file_hash, outcome.dest);
+                        tracing::info!(
+                            file_hash = %file_hash,
+                            "staged file registered"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            file_hash = %file_hash,
+                            error = %e,
+                            "stage_file failed; the next TaskAssignment for this hash will be reported as TaskFailed"
+                        );
+                    }
                 }
                 Ok(())
             }

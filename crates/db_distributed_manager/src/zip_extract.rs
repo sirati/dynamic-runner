@@ -69,6 +69,33 @@ impl ExtractionCache {
                     }
                 }
             }
+
+            // Try src_network fallbacks (when configured): the primary may
+            // have placed the file on the shared drive without sending an
+            // explicit StageFile. Try both `src_network/<basename>` and
+            // `src_network/<full local_path>`. Both with hash verification.
+            if let Some(net) = self.src_network.as_ref() {
+                let base_in_net = net.join(file_name);
+                if base_in_net.exists() {
+                    if let Some(computed) = compute_file_hash(&base_in_net) {
+                        if computed == file_hash {
+                            self.extracted
+                                .insert(file_hash.to_string(), base_in_net.clone());
+                            return Some(base_in_net);
+                        }
+                    }
+                }
+                let full_in_net = net.join(path_str);
+                if full_in_net != base_in_net && full_in_net.exists() {
+                    if let Some(computed) = compute_file_hash(&full_in_net) {
+                        if computed == file_hash {
+                            self.extracted
+                                .insert(file_hash.to_string(), full_in_net.clone());
+                            return Some(full_in_net);
+                        }
+                    }
+                }
+            }
         }
 
         None
@@ -184,6 +211,11 @@ impl ExtractionCache {
     /// Register a direct file path (file-ready mode, no extraction).
     pub fn register_path(&mut self, file_hash: &str, path: PathBuf) {
         self.extracted.insert(file_hash.to_string(), path);
+    }
+
+    /// Local scratch directory backing this cache.
+    pub fn tmp_dir(&self) -> &Path {
+        &self.tmp_dir
     }
 
     /// Resolve a binary: try file-ready mode first, then ZIP extraction.
@@ -316,6 +348,58 @@ mod tests {
         // Should be cached
         let result2 = cache.extract_from_zip("test.zip", "inner/binary.bin", &expected_hash);
         assert!(result2.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_via_src_network_basename() {
+        let dir = std::env::temp_dir()
+            .join(format!("net_basename_test_{}", std::process::id()));
+        let tmp = dir.join("tmp");
+        let net = dir.join("src_network");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&net).unwrap();
+
+        let payload = b"shared-drive payload A";
+        let basename = "binary.bin";
+        let staged = net.join(basename);
+        std::fs::write(&staged, payload).unwrap();
+        let hash = compute_file_hash(&staged).unwrap();
+
+        let mut cache = ExtractionCache::new(tmp, Some(net));
+        // local_path the primary thinks the file is at — does not exist
+        // here; resolution must fall through to src_network/<basename>.
+        let primary_view = format!("/nonexistent/dir/{}", basename);
+        let result = cache.resolve_binary(None, &primary_view, &hash);
+        assert!(result.is_some(), "expected resolution via src_network/<basename>");
+        assert_eq!(result.unwrap(), staged);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_via_src_network_local_path() {
+        let dir = std::env::temp_dir()
+            .join(format!("net_localpath_test_{}", std::process::id()));
+        let tmp = dir.join("tmp");
+        let net = dir.join("src_network");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&net).unwrap();
+
+        let payload = b"shared-drive payload B";
+        // The relative local_path the primary sends; place the file at
+        // src_network/<full local_path>, NOT at src_network/<basename>.
+        let rel = "subdir/inner/binary2.bin";
+        let staged = net.join(rel);
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, payload).unwrap();
+        let hash = compute_file_hash(&staged).unwrap();
+
+        let mut cache = ExtractionCache::new(tmp, Some(net));
+        let result = cache.resolve_binary(None, rel, &hash);
+        assert!(result.is_some(), "expected resolution via src_network/<full local_path>");
+        assert_eq!(result.unwrap(), staged);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

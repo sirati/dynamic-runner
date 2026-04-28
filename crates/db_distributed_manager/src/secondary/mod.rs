@@ -253,6 +253,7 @@ mod processing;
 mod resource;
 mod setup;
 mod slurm;
+mod staging;
 mod wire;
 
 #[cfg(test)]
