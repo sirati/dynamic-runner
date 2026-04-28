@@ -1,7 +1,7 @@
 use std::os::unix::io::{FromRawFd, IntoRawFd, RawFd};
 
-use db_comm_api_base::{MessageReceiver, MessageSender};
-use db_manager_runner_comm::{Command, Response, codec};
+use dynrunner_core::{MessageReceiver, MessageSender};
+use dynrunner_protocol_manager_worker::{Command, Response, codec};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 

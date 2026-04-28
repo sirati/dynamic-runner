@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender, TaskResult};
+use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, TaskResult};
 use crate::command::{Command, Response};
 
 /// Composite trait: a manager endpoint can send commands and receive responses.

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use db_comm_api_base::{Identifier, MessageReceiver, MessageSender};
-use db_primary_secondary_comm::{
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerConnectionInfo, PeerTransport, SecondaryTransport,
 };
-use db_manager_runner_comm::{Command, Response};
+use dynrunner_protocol_manager_worker::{Command, Response};
 use tokio::sync::mpsc;
 
 // ── Manager ↔ Runner channel transport ──

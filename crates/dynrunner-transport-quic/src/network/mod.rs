@@ -13,8 +13,8 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::DistributedMessage;
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use tokio::sync::mpsc;
 
 use crate::certs::CertPair;

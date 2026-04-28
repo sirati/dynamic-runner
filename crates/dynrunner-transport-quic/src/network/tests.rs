@@ -1,7 +1,7 @@
 use super::*;
 use crate::wss::WssListener;
-use db_comm_api_base::{MessageReceiver, MessageSender};
-use db_primary_secondary_comm::{DistributedMessage, SecondaryTransport};
+use dynrunner_core::{MessageReceiver, MessageSender};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, SecondaryTransport};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -32,8 +32,8 @@ async fn server_accepts_wss_bidirectional() {
                     sender_id: "sec-0".into(),
                     timestamp: 1.0,
                     secondary_id: "sec-0".into(),
-                    resources: vec![db_comm_api_base::ResourceAmount {
-                        kind: db_comm_api_base::ResourceKind::memory(),
+                    resources: vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
                         amount: 1024,
                     }],
                     worker_count: 1,

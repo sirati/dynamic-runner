@@ -2,8 +2,8 @@
 //! Inherent methods stay in `mod.rs`; this file is purely the
 //! trait-glue layer.
 
-use db_comm_api_base::{Identifier, MessageReceiver};
-use db_primary_secondary_comm::{DistributedMessage, SecondaryTransport};
+use dynrunner_core::{Identifier, MessageReceiver};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, SecondaryTransport};
 
 use super::NetworkServer;
 

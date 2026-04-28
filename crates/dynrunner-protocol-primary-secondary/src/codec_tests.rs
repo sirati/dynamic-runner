@@ -52,7 +52,7 @@ fn roundtrip_keepalive() {
 
 #[test]
 fn roundtrip_secondary_welcome() {
-    use db_comm_api_base::{ResourceAmount, ResourceKind};
+    use dynrunner_core::{ResourceAmount, ResourceKind};
     let msg: DistributedMessage<TestId> = DistributedMessage::SecondaryWelcome {
         sender_id: "sec-2".into(),
         timestamp: 9999.0,
@@ -204,7 +204,7 @@ fn msg_type_and_sender() {
 
 #[test]
 fn roundtrip_all_message_types() {
-    use db_comm_api_base::{ResourceAmount, ResourceKind};
+    use dynrunner_core::{ResourceAmount, ResourceKind};
     let messages: Vec<DistributedMessage<TestId>> = vec![
         DistributedMessage::SecondaryWelcome {
             sender_id: "s".into(),

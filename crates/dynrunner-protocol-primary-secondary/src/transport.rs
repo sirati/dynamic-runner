@@ -1,4 +1,4 @@
-use db_comm_api_base::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
 use crate::DistributedMessage;
 

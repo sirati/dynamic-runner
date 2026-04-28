@@ -1,7 +1,7 @@
 use super::util::parse_cert_pem;
 use super::{NoPeerTransport, PeerNetwork};
 use crate::certs::CertPair;
-use db_primary_secondary_comm::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 

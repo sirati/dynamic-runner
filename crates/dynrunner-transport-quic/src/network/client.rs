@@ -2,15 +2,15 @@
 //! back to WSS if QUIC fails.
 //!
 //! Implements `PrimaryTransport<I>` via the blanket impl in
-//! `db_primary_secondary_comm::transport` (since it implements both
+//! `dynrunner_protocol_primary_secondary::transport` (since it implements both
 //! `MessageSender<DistributedMessage<I>>` and
 //! `MessageReceiver<DistributedMessage<I>>`).
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use db_comm_api_base::{Identifier, MessageReceiver, MessageSender};
-use db_primary_secondary_comm::DistributedMessage;
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 
 use crate::transport::QuicConnection;
 use crate::wss::{WssConnection, connect_wss};
