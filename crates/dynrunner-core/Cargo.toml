@@ -1,7 +1,15 @@
 [package]
-name = "dynrunner-core"
-version = "0.1.0"
-edition = "2024"
+name             = "dynrunner-core"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+description            = "Shared types and traits for the dynrunner workspace."
+keywords.workspace     = true
+categories.workspace   = true
+readme.workspace       = true
 
 [dependencies]
 serde = { workspace = true, features = ["rc"] }

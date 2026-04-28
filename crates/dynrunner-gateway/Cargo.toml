@@ -1,7 +1,15 @@
 [package]
-name = "dynrunner-gateway"
-version = "0.1.0"
-edition = "2024"
+name             = "dynrunner-gateway"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+description            = "Gateway abstraction for command execution + file transfer (local + SSH)."
+keywords.workspace     = true
+categories.workspace   = true
+readme.workspace       = true
 
 [dependencies]
 tokio = { workspace = true, features = ["process", "fs"] }

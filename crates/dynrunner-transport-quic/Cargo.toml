@@ -1,7 +1,15 @@
 [package]
-name = "dynrunner-transport-quic"
-version = "0.1.0"
-edition = "2024"
+name             = "dynrunner-transport-quic"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+description            = "QUIC transport with optional WebSocket fallback."
+keywords.workspace     = true
+categories.workspace   = true
+readme.workspace       = true
 
 [dependencies]
 dynrunner-core = { workspace = true }

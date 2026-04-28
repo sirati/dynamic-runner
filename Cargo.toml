@@ -17,6 +17,18 @@ members = [
     "crates/dynrunner-pyo3",
 ]
 
+[workspace.package]
+version       = "0.1.0"
+edition       = "2024"
+license       = "Apache-2.0"
+authors       = ["sirati"]
+repository    = "https://github.com/sirati/dynamic-runner"
+homepage      = "https://github.com/sirati/dynamic-runner"
+description   = "Multi-process / multi-host Python task runner backed by a Rust workspace."
+readme        = "README.md"
+keywords      = ["runner", "batch", "pyo3", "tokio", "ipc"]
+categories    = ["concurrency", "asynchronous"]
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "process", "macros"] }
 serde = { version = "1", features = ["derive"] }
