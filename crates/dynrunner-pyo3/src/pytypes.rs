@@ -4,7 +4,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use db_comm_api_base::{BinaryInfo, RunnerIdentifier};
+use dynrunner_core::{BinaryInfo, RunnerIdentifier};
 
 /// Canonical identifier-key separator. Matches the Python
 /// `TokenizerIdentifier.identifier_key()` join order

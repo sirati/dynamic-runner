@@ -1,13 +1,13 @@
 use std::time::Duration;
 
-use db_comm_api_base::{Identifier, WorkerId};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_local_manager::worker::WorkerEvent;
-use db_local_manager::WorkerFactory;
-use db_primary_secondary_comm::{
+use dynrunner_core::{Identifier, WorkerId};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::worker::WorkerEvent;
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;

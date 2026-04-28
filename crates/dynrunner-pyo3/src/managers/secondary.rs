@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use db_distributed_manager::{SecondaryConfig, SecondaryCoordinator};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_quic::NetworkClient;
+use dynrunner_manager_distributed::{SecondaryConfig, SecondaryCoordinator};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_quic::NetworkClient;
 
 use crate::config::connection::ConnectionMode;
 use crate::config::distributed::DistributedConfig;
@@ -212,8 +212,8 @@ impl PySecondaryCoordinator {
                 };
 
                 // Start peer network for peer-to-peer communication
-                let peer_network: db_transport_quic::PeerNetwork<TokenizerIdentifier> =
-                    db_transport_quic::PeerNetwork::start(&format!("sec-{}", num_workers))
+                let peer_network: dynrunner_transport_quic::PeerNetwork<TokenizerIdentifier> =
+                    dynrunner_transport_quic::PeerNetwork::start(&format!("sec-{}", num_workers))
                         .await
                         .unwrap_or_else(|e| {
                             tracing::error!(error = %e, "failed to start peer network, using no-op");
@@ -228,7 +228,7 @@ impl PySecondaryCoordinator {
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
                     num_workers,
-                    max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram_bytes)]),
+                    max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram_bytes)]),
                     hostname: gethostname(),
                     keepalive_interval: dist_keepalive,
                     src_network: cfg_src_network,
@@ -264,7 +264,7 @@ impl PySecondaryCoordinator {
 
                 // Set peer cert info so the CertExchange message includes our QUIC details
                 secondary.set_peer_cert_info(
-                    db_distributed_manager::PeerCertInfo {
+                    dynrunner_manager_distributed::PeerCertInfo {
                         public_cert_pem: peer_cert_pem,
                         ipv4_address: Some(detect_ipv4(None)),
                         ipv6_address: None,

@@ -6,10 +6,10 @@ use super::test_helpers::{
     FixedEstimator, TestId,
 };
 use super::*;
-use db_comm_api_base::{ErrorType, MessageReceiver, MessageSender, ResourceKind, ResourceMap};
-use db_manager_runner_comm::{Command, Response};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::{channel_pair, ChannelManagerEnd};
+use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, ResourceKind, ResourceMap};
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd};
 use std::collections::HashMap;
 
 

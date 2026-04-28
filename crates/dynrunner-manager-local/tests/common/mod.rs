@@ -8,10 +8,10 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use db_comm_api_base::{BinaryInfo, WorkerId};
-use db_local_manager::WorkerFactory;
-use db_scheduler_api::ResourceEstimator;
-use db_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
+use dynrunner_core::{BinaryInfo, WorkerId};
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_scheduler_api::ResourceEstimator;
+use dynrunner_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -20,8 +20,8 @@ pub struct TestId(pub String);
 pub struct FixedEstimator(pub u64);
 
 impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _binary_size: u64) -> db_comm_api_base::ResourceMap {
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), self.0)])
+    fn estimate(&self, _binary_size: u64) -> dynrunner_core::ResourceMap {
+        dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.0)])
     }
 }
 

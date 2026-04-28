@@ -7,7 +7,7 @@
 //! existing call sites that spell out the type don't all have to flip
 //! at once. New code should use `RunnerIdentifier` directly.
 
-pub use db_comm_api_base::RunnerIdentifier;
+pub use dynrunner_core::RunnerIdentifier;
 
 /// Deprecated alias for `RunnerIdentifier`. Kept for one release; new
 /// code should use `RunnerIdentifier` (or just `Arc<str>`) directly.

@@ -5,12 +5,12 @@ use super::test_helpers::{
     fake_secondary, make_binary, setup_test, FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
 };
 use super::*;
-use db_primary_secondary_comm::{DistributedMessage, MessageType, PeerTransport};
-use db_local_manager::WorkerFactory;
-use db_comm_api_base::{MessageReceiver, MessageSender};
-use db_manager_runner_comm::{Command, Response};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::{
+use dynrunner_protocol_primary_secondary::{DistributedMessage, MessageType, PeerTransport};
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_core::{MessageReceiver, MessageSender};
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_channel::{
     channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd,
 };
 use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
@@ -115,7 +115,7 @@ async fn two_secondaries_distribute_work() {
 fn spawn_real_secondary(
     secondary_id: String,
     num_workers: u32,
-    max_resources: db_comm_api_base::ResourceMap,
+    max_resources: dynrunner_core::ResourceMap,
 ) -> (
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,  // primary→secondary
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>, // secondary→primary
@@ -164,7 +164,7 @@ async fn e2e_primary_and_secondary_single_node() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let secondary_id = "sec-0".to_string();
-        let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+        let max_res = dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
 
         let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
             spawn_real_secondary(secondary_id.clone(), 2, max_res);
@@ -227,7 +227,7 @@ async fn e2e_primary_and_two_secondaries() {
     let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
-        let max_res = db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024u64)]);
+        let max_res = dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024u64)]);
         let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
         let mut outgoing = HashMap::new();
         let mut sec_handles = Vec::new();

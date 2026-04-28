@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use db_comm_api_base::{BinaryInfo, Identifier, WorkerId};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_local_manager::pool::WorkerPool;
-use db_local_manager::WorkerFactory;
-use db_primary_secondary_comm::{
+use dynrunner_core::{BinaryInfo, Identifier, WorkerId};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::pool::WorkerPool;
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::zip_extract::ExtractionCache;
 
@@ -17,7 +17,7 @@ use crate::zip_extract::ExtractionCache;
 pub struct SecondaryConfig {
     pub secondary_id: String,
     pub num_workers: u32,
-    pub max_resources: db_comm_api_base::ResourceMap,
+    pub max_resources: dynrunner_core::ResourceMap,
     pub hostname: String,
     pub keepalive_interval: Duration,
     /// Directory containing ZIP files (for SLURM mode). `None` for local/channel mode.
@@ -38,7 +38,7 @@ impl Default for SecondaryConfig {
         Self {
             secondary_id: String::new(),
             num_workers: 1,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
             hostname: String::new(),
             keepalive_interval: Duration::from_secs(1),
             src_network: None,
@@ -132,7 +132,7 @@ where
     // round-tripping through a fresh `FullTaskList` (which would require
     // a now-dead primary).
     cached_full_task_list: Option<(
-        Vec<db_primary_secondary_comm::TaskInfo<I>>,
+        Vec<dynrunner_protocol_primary_secondary::TaskInfo<I>>,
         HashSet<String>,
     )>,
 
@@ -241,7 +241,7 @@ where
         Ok(())
     }
 
-    fn max_resources(&self) -> db_comm_api_base::ResourceMap {
+    fn max_resources(&self) -> dynrunner_core::ResourceMap {
         self.config.max_resources.clone()
     }
 }

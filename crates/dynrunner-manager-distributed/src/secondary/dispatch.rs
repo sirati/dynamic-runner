@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
-use db_comm_api_base::{BinaryInfo, Identifier};
-use db_manager_runner_comm::ManagerEndpoint;
-use db_primary_secondary_comm::{
+use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;
@@ -89,7 +89,7 @@ where
 
                 let worker = &mut self.pool.workers[target_wid as usize];
                 if worker.is_idle_state() {
-                    let estimated_mb = estimated.get(&db_comm_api_base::ResourceKind::memory()) / (1024 * 1024);
+                    let estimated_mb = estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
@@ -226,7 +226,7 @@ where
                 ..
             } if self.is_slurm_primary => {
                 let available_memory = available_resources.iter()
-                    .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
+                    .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                     .map(|r| r.amount)
                     .unwrap_or(0);
                 self.handle_slurm_task_request(secondary_id, worker_id, available_memory)

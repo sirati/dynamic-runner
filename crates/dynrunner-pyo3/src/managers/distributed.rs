@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use db_distributed_manager::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
+use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
 
 use crate::config::connection::ConnectionMode;
 use crate::config::distributed::DistributedConfig;
@@ -179,7 +179,7 @@ impl PyDistributedManager {
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
-                            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), ram)]),
+                            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram)]),
                             hostname: "localhost".into(),
                             keepalive_interval: dist_keepalive,
                             src_network: None,
@@ -208,7 +208,7 @@ impl PyDistributedManager {
                         let mut secondary = SecondaryCoordinator::new(
                             config,
                             transport,
-                            db_transport_quic::NoPeerTransport,
+                            dynrunner_transport_quic::NoPeerTransport,
                             ResourceStealingScheduler::memory(),
                             estimator,
                         );

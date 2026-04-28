@@ -1,10 +1,10 @@
 
-use db_comm_api_base::Identifier;
-use db_manager_runner_comm::ManagerEndpoint;
-use db_primary_secondary_comm::{
+use dynrunner_core::Identifier;
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
 };
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;
@@ -125,7 +125,7 @@ where
                 // arriving over peer_transport instead of primary_transport.
                 let available_memory = available_resources
                     .iter()
-                    .find(|r| r.kind == db_comm_api_base::ResourceKind::memory())
+                    .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                     .map(|r| r.amount)
                     .unwrap_or(0);
                 if let Err(e) = self

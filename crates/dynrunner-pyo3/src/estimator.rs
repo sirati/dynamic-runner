@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 
-use db_scheduler_api::ResourceEstimator;
+use dynrunner_scheduler_api::ResourceEstimator;
 
 /// Memory estimator that calls a Python function.
 #[derive(Clone)]
@@ -42,8 +42,8 @@ impl PyMemoryEstimatorBridge {
 }
 
 impl ResourceEstimator for PyMemoryEstimatorBridge {
-    fn estimate(&self, binary_size: u64) -> db_comm_api_base::ResourceMap {
+    fn estimate(&self, binary_size: u64) -> dynrunner_core::ResourceMap {
         let mem = (self.slope * binary_size as f64 + self.intercept).max(0.0) as u64;
-        db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), mem)])
+        dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), mem)])
     }
 }

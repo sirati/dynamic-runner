@@ -1,4 +1,4 @@
-use db_comm_api_base::{BinaryInfo, Identifier, ResourceMap, WorkerId};
+use dynrunner_core::{BinaryInfo, Identifier, ResourceMap, WorkerId};
 
 /// Processing phases that the manager cycles through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

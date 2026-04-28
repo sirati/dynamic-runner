@@ -7,9 +7,9 @@
 //! file is now available at `<src_path>`; please stage it to
 //! `<dest_path>` so the next TaskAssignment for it resolves cleanly."
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{DistributedMessage, SecondaryTransport};
-use db_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, SecondaryTransport};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::wire::timestamp_now;
 use super::PrimaryCoordinator;

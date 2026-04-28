@@ -1,10 +1,10 @@
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 
-use db_comm_api_base::WorkerId;
-use db_local_manager::WorkerFactory;
-use db_transport_socket::named_socket::NamedSocketManagerEnd;
-use db_transport_socket::socketpair::create_socketpair;
+use dynrunner_core::WorkerId;
+use dynrunner_manager_local::WorkerFactory;
+use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
+use dynrunner_transport_socket::socketpair::create_socketpair;
 
 use crate::config::connection::ConnectionMode;
 use crate::config::log_paths::LogPathConfig;

@@ -1,7 +1,7 @@
 use pyo3::prelude::*;
 
-use db_comm_api_base::ResourceKind;
-use db_scheduler_impl::ResourceStealingScheduler;
+use dynrunner_core::ResourceKind;
+use dynrunner_scheduler::ResourceStealingScheduler;
 
 /// Tuning knobs for `ResourceStealingScheduler` exposed to Python.
 ///

@@ -13,12 +13,12 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use db_comm_api_base::{BinaryInfo, MessageReceiver, MessageSender, WorkerId};
-use db_local_manager::{LocalManager, LocalManagerConfig, WorkerFactory};
-use db_manager_runner_comm::{Command, Response};
-use db_scheduler_impl::ResourceStealingScheduler;
-use db_transport_socket::named_socket::NamedSocketManagerEnd;
-use db_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
+use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_manager_local::{LocalManager, LocalManagerConfig, WorkerFactory};
+use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_scheduler::ResourceStealingScheduler;
+use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
+use dynrunner_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
 
 
 #[tokio::test(flavor = "current_thread")]
@@ -32,14 +32,14 @@ async fn single_worker_subprocess_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 1,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             restart_predicate: None,
             retry_max_attempts: 1,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
+            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
         };
@@ -196,14 +196,14 @@ async fn single_worker_named_socket_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 1,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             restart_predicate: None,
             retry_max_attempts: 1,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
+            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
         };
@@ -251,14 +251,14 @@ async fn multi_worker_named_socket_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 3,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
+            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             restart_predicate: None,
             retry_max_attempts: 1,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
+            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
         };
@@ -303,14 +303,14 @@ async fn multi_worker_subprocess_processes_all() {
 
         let config = LocalManagerConfig {
             num_workers: 3,
-            max_resources: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
+            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024)]),
             always_restart_worker: false,
             restart_predicate: None,
             retry_max_attempts: 1,
             print_pid: false,
             memuse_log_path: None,
             stage_timeouts: std::collections::HashMap::new(),
-            low_resource_thresholds: db_comm_api_base::ResourceMap::from([(db_comm_api_base::ResourceKind::memory(), 300 * 1024 * 1024)]),
+            low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
         };

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
-use db_comm_api_base::{ResourceKind, ResourceMap as RustResourceMap};
+use dynrunner_core::{ResourceKind, ResourceMap as RustResourceMap};
 
 /// Python-facing typed resource map: a kind-name → amount (u64) mapping.
 ///

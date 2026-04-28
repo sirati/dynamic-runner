@@ -8,7 +8,7 @@ pub use primary::{PrimaryCoordinator, PrimaryConfig};
 pub use primary::wire::compute_task_hash;
 pub use secondary::{SecondaryCoordinator, SecondaryConfig, PeerCertInfo};
 // Re-export transport traits from the comm API crate for convenience.
-pub use db_primary_secondary_comm::{PrimaryTransport, SecondaryTransport};
+pub use dynrunner_protocol_primary_secondary::{PrimaryTransport, SecondaryTransport};
 pub use state::{
     SecondaryConnection, AwaitingWelcome, Handshaking, CertExchanging, PeerDiscovery,
     InitialAssigning, Operational, ShuttingDown, SecondaryConnectionState,

@@ -1,4 +1,4 @@
-use db_gateway::traits::{Gateway, GatewayError};
+use dynrunner_gateway::traits::{Gateway, GatewayError};
 use tracing;
 
 use crate::config::SlurmConfig;

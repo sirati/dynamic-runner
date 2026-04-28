@@ -1,15 +1,15 @@
 use std::time::Instant;
 
-use db_comm_api_base::{
+use dynrunner_core::{
     BinaryInfo, ErrorType, Identifier, ResourceMap, TaskResult, WorkerId,
 };
-use db_manager_runner_comm::ManagerEndpoint;
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
 
 use crate::monitor::{ProcStatmMonitor, ResourceMonitor};
-use db_manager_runner_comm::state::{
+use dynrunner_protocol_manager_worker::state::{
     AssignResult, PollResult, Processing, RunnerProtocol, RunnerProtocolState, WaitReadyResult,
 };
-use db_scheduler_api::WorkerBudgetInfo;
+use dynrunner_scheduler_api::WorkerBudgetInfo;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 

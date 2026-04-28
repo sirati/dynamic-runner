@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use db_comm_api_base::WorkerId;
+use dynrunner_core::WorkerId;
 use pyo3::prelude::*;
 
 /// Argv + env + cwd template for worker subprocesses.

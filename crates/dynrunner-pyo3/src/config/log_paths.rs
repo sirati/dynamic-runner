@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use db_comm_api_base::WorkerId;
+use dynrunner_core::WorkerId;
 use pyo3::prelude::*;
 
 /// Path-naming policy for log files, sockets, and the per-run log directory.

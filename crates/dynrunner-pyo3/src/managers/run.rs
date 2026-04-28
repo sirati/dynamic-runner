@@ -32,7 +32,7 @@ pub(crate) fn compute_task_hash(py: Python<'_>, binary: &Bound<'_, PyAny>) -> Py
     let bin = rust_binaries.pop().ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("compute_task_hash: failed to extract binary")
     })?;
-    Ok(db_distributed_manager::compute_task_hash(&bin))
+    Ok(dynrunner_manager_distributed::compute_task_hash(&bin))
 }
 
 fn module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {

@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-use db_comm_api_base::{
+use dynrunner_core::{
     BinaryInfo, FailedTask, Identifier, ResourceKind, WorkerId,
 };
-use db_manager_runner_comm::ManagerEndpoint;
-use db_scheduler_api::{
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, ProcessingPhase, Scheduler,
 };
 

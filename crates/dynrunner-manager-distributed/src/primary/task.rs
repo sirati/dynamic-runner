@@ -1,10 +1,10 @@
 
-use db_comm_api_base::{BinaryInfo, Identifier, ResourceMap};
-use db_primary_secondary_comm::{
+use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport,
 };
-use db_scheduler_api::{
+use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
 
