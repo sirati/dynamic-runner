@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
-use db_comm_api_base::{Identifier, MessageReceiver, MessageSender};
-use db_primary_secondary_comm::{DistributedMessage, codec};
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
 use quinn::{Endpoint, RecvStream, SendStream};
 use rustls::pki_types::CertificateDer;
 

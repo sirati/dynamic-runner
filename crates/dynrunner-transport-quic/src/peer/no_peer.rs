@@ -1,7 +1,7 @@
 //! No-op peer transport for single-secondary deployments and tests.
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
 
 /// A no-op peer transport for when peer-to-peer is not needed
 /// (single-secondary or in-process distributed mode).

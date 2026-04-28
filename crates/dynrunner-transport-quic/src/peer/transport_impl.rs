@@ -1,8 +1,8 @@
 //! `PeerTransport` impl for `PeerNetwork`. The inherent methods stay in
 //! `mod.rs` so this file is purely the trait-glue layer.
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
 
 use super::PeerNetwork;
 

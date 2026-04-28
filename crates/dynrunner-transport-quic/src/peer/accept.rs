@@ -7,8 +7,8 @@
 //! `PeerNetwork` via `new_conn_tx`, and then runs reader + writer tasks
 //! over the underlying transport until the peer disconnects.
 
-use db_comm_api_base::{Identifier, MessageReceiver};
-use db_primary_secondary_comm::{codec, DistributedMessage};
+use dynrunner_core::{Identifier, MessageReceiver};
+use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;

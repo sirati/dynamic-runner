@@ -1,4 +1,4 @@
-use db_comm_api_base::Identifier;
+use dynrunner_core::Identifier;
 use crate::messages::DistributedMessage;
 
 /// Serialize a distributed message to a length-prefixed JSON frame.

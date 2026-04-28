@@ -148,7 +148,7 @@ impl fmt::Display for ResourceMap {
 /// Any type implementing these bounds can be used as the identifier
 /// in `BinaryInfo<I>`. The concrete identifier (e.g. with fields like
 /// `binary_name`, `platform`, `compiler`, etc.) is defined by the
-/// task-specific crate (e.g. `db_python_provider`).
+/// task-specific crate (e.g. `dynrunner_pyo3`).
 pub trait Identifier:
     Clone + Debug + Hash + Eq + Serialize + for<'de> Deserialize<'de> + Send + 'static
 {

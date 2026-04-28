@@ -1,5 +1,5 @@
 use super::*;
-use db_comm_api_base::ResourceKind;
+use dynrunner_core::ResourceKind;
 
 #[test]
 fn command_stop_roundtrip() {

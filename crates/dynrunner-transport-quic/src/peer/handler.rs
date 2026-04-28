@@ -5,8 +5,8 @@
 //! connection with the owning `PeerNetwork`); this module only handles
 //! connections we initiated via `connect_to_peers`.
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{codec, DistributedMessage};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;

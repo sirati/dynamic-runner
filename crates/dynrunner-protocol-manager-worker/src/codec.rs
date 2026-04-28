@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use db_comm_api_base::ErrorType;
+use dynrunner_core::ErrorType;
 use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, Response};

@@ -1,4 +1,4 @@
-use db_comm_api_base::ErrorType;
+use dynrunner_core::ErrorType;
 
 #[derive(Debug, Clone)]
 pub enum Command {

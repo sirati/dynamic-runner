@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use db_comm_api_base::Identifier;
-use db_primary_secondary_comm::{DistributedMessage, PeerConnectionInfo};
+use dynrunner_core::Identifier;
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo};
 use tokio::sync::mpsc;
 
 use crate::certs::CertPair;

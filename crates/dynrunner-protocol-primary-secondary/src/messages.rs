@@ -1,4 +1,4 @@
-use db_comm_api_base::ResourceAmount;
+use dynrunner_core::ResourceAmount;
 use serde::{Deserialize, Serialize};
 
 /// All distributed message types.
