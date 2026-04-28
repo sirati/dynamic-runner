@@ -1,0 +1,27 @@
+[build-system]
+requires      = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name            = "dynamic_runner"
+version         = "0.1.0"
+description     = "Multi-process / multi-host Python task runner backed by a Rust workspace."
+readme          = "README.md"
+license         = { text = "Apache-2.0" }
+authors         = [{ name = "sirati" }]
+requires-python = ">=3.12"
+
+# Runtime Python deps (pure-Python add-ons; the native extension is bundled).
+# Add task packages do NOT belong here — they import dynamic_runner.
+dependencies    = []
+
+[project.urls]
+Homepage = "https://github.com/sirati/dynamic-runner"
+Source   = "https://github.com/sirati/dynamic-runner"
+
+[tool.maturin]
+manifest-path  = "crates/dynrunner-pyo3/Cargo.toml"
+python-source  = "python"
+module-name    = "dynamic_runner._native"
+features       = ["pyo3/extension-module"]
+strip          = true

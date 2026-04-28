@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "dynamic_batch_rs"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
