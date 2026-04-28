@@ -292,3 +292,53 @@ async fn e2e_primary_and_two_secondaries() {
         assert_eq!(total_sec_completed, 10);
     }).await;
 }
+
+/// Live distribution past the initial assignment, primary side: 1 secondary
+/// with 2 workers, 20 binaries. The initial assignment can cover at most
+/// 2 binaries (one per worker); the operational loop is responsible for
+/// the remaining 18+. Pins the live-flow path that the legacy Python
+/// never managed to get right.
+#[tokio::test(flavor = "current_thread")]
+async fn live_distribution_continues_past_initial_batch() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries: Vec<BinaryInfo<TestId>> = (0..20)
+            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+            .collect();
+
+        for (id, rx, tx) in secondary_ends {
+            tokio::task::spawn_local(fake_secondary(
+                id,
+                2,
+                1024 * 1024 * 1024,
+                rx,
+                tx,
+            ));
+        }
+
+        primary.run(binaries).await.unwrap();
+
+        // All 20 must complete; ≥ 18 went via the operational TaskRequest
+        // → TaskAssignment loop (one secondary × 2 workers = 2 initial).
+        assert_eq!(primary.completed_count(), 20);
+        assert_eq!(primary.failed_count(), 0);
+    }).await;
+}

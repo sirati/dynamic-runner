@@ -241,3 +241,70 @@ async fn secondary_multi_worker_processes_tasks() {
         })
         .await;
 }
+
+/// Live distribution past the initial assignment: 15 binaries, 1 worker.
+/// The initial assignment can cover at most 1 binary (one per worker), so
+/// the remaining 14+ must come via the operational TaskRequest →
+/// TaskAssignment loop. The legacy Python had a known gap here; this test
+/// pins the Rust behaviour so it can't silently regress.
+#[tokio::test(flavor = "current_thread")]
+async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-0".into(),
+                num_workers: 1,
+                max_resources: db_comm_api_base::ResourceMap::from([(
+                    db_comm_api_base::ResourceKind::memory(),
+                    1024 * 1024 * 1024,
+                )]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+            };
+
+            let binaries: Vec<BinaryInfo<TestId>> = (0..15)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+
+            let secondary_id = config.secondary_id.clone();
+            let primary_handle = tokio::task::spawn_local(fake_primary(
+                binaries,
+                secondary_id,
+                sec_to_pri_rx,
+                pri_to_sec_tx,
+            ));
+
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                transport,
+                NoPeers,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let mut factory = FakeWorkerFactory;
+            secondary.run(&mut factory).await.unwrap();
+
+            // All 15 must complete; the operational loop is responsible
+            // for >= 14 of them since one worker can hold at most one
+            // initial assignment.
+            assert_eq!(secondary.completed_count(), 15);
+
+            primary_handle.await.unwrap();
+        })
+        .await;
+}
