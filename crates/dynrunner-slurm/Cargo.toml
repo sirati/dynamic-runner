@@ -1,10 +1,10 @@
 [package]
-name = "db_slurm"
+name = "dynrunner-slurm"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-db_gateway = { workspace = true }
+dynrunner-gateway = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
