@@ -1,0 +1,22 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.0] - 2026-04-29
+
+### Added
+- Initial release. Extracted from `asm-tokenizer` (commit history preserved
+  via `git filter-repo`).
+- Python frontend `dynamic_runner` (mixed-layout maturin wheel).
+- 14 internal Rust crates under `crates/dynrunner-*`.
+- Local + distributed manager implementations.
+- QUIC, Unix-socket, and in-process channel transports.
+- Slurm gateway integration.
+
+[Unreleased]: https://github.com/sirati/dynamic-runner/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/sirati/dynamic-runner/releases/tag/v0.1.0
