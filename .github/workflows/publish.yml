@@ -1,0 +1,83 @@
+# PyPI publish workflow for dynamic_runner.
+#
+# Triggers:
+#   - GitHub Release published (manually created against an existing v* tag
+#     whose wheels.yml run already produced wheel artifacts).
+#
+# This workflow uses **PyPI Trusted Publishing** (OIDC), so no API token is
+# stored in GitHub secrets. Before the first publish, the maintainer MUST
+# register `dynamic_runner` on PyPI and add a Trusted Publisher pointing at:
+#     owner:        sirati
+#     repository:   dynamic-runner
+#     workflow:     publish.yml
+#     environment:  pypi
+# See https://docs.pypi.org/trusted-publishers/ for the exact form fields.
+#
+# The job locates the wheels.yml run that already built artifacts for the
+# release commit (release.target_commitish), downloads every wheels-* artifact
+# from that run, and pushes them to PyPI in a single upload.
+
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-pypi:
+    name: publish wheels to PyPI
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Required by pypa/gh-action-pypi-publish for OIDC trusted publishing.
+      id-token: write
+      # Required so the gh CLI can list workflow runs in this repo.
+      actions: read
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate wheels.yml run for release commit
+        id: find-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ github.event.release.target_commitish }}
+        run: |
+          set -euo pipefail
+          # Resolve the release's target (branch or tag name) to a concrete SHA.
+          sha="$(git rev-parse "$RELEASE_SHA^{commit}")"
+          echo "Release commit SHA: $sha"
+          run_id="$(gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow wheels.yml \
+            --commit "$sha" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId')"
+          if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+            echo "No successful wheels.yml run found for commit $sha" >&2
+            exit 1
+          fi
+          echo "wheels.yml run id: $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download all wheels-* artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-run.outputs.run_id }}
+
+      - name: List downloaded wheels
+        run: ls -la dist/
+
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
