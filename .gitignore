@@ -7,6 +7,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
+# Maturin develop install artifacts (the built cdylib gets dropped
+# inside python/dynamic_runner/ when running `maturin develop`).
+python/dynamic_runner/_native*.so
+
 # Nix build outputs
 result
 result-*

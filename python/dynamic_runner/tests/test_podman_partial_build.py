@@ -107,9 +107,15 @@ def _make_fake_project_root(tmp_path: Path) -> Path:
         # actual logic against our synthetic image.
         (root / LAYER_EXTRACTOR_SCRIPT_REL).symlink_to(real_extractor)
     else:
-        # Fallback: a stub that just emits an empty array
+        # Fallback stub: the real extract-layer-assignment.py now lives
+        # in the sibling nix-docker-layered-image flake, not in this
+        # repo. The synthetic image FakeNix produces contains exactly
+        # one /nix/store path (`/nix/store/abc123-fakepkg`); mirror that
+        # so the cache-refresh path can be exercised end-to-end without
+        # the real extractor being on disk.
         (root / LAYER_EXTRACTOR_SCRIPT_REL).write_text(
-            "#!/usr/bin/env python3\nimport sys, json; json.dump([], sys.stdout)\n"
+            '#!/usr/bin/env python3\nimport sys, json\n'
+            'json.dump([["/nix/store/abc123-fakepkg"]], sys.stdout)\n'
         )
         (root / LAYER_EXTRACTOR_SCRIPT_REL).chmod(0o755)
     return root

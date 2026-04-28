@@ -28,9 +28,9 @@ use pyo3::wrap_pyfunction;
 use pytypes::{PyBinaryIdentifier, PyBinaryInfo, PyFailedTask, PyProcessingStats};
 
 /// Python module definition.
-/// The compiled extension is exposed as `dynamic_batch_rs._native`;
-/// the public `dynamic_batch_rs` namespace is the mixed-layout package
-/// in `python/dynamic_batch_rs/__init__.py` which re-exports from
+/// The compiled extension is exposed as `dynamic_runner._native`;
+/// the public `dynamic_runner` namespace is the mixed-layout package
+/// in `python/dynamic_runner/__init__.py` which re-exports from
 /// `_native` and adds the pure-Python `comm` subpackage.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {

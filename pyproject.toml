@@ -24,4 +24,3 @@ manifest-path  = "crates/dynrunner-pyo3/Cargo.toml"
 python-source  = "python"
 module-name    = "dynamic_runner._native"
 features       = ["pyo3/extension-module"]
-strip          = true

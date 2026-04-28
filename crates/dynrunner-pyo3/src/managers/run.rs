@@ -36,7 +36,7 @@ pub(crate) fn compute_task_hash(py: Python<'_>, binary: &Bound<'_, PyAny>) -> Py
 }
 
 fn module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
-    py.import("dynamic_batch_rs")
+    py.import("dynamic_runner")
 }
 
 /// Run the in-process local manager. Equivalent to constructing and using
