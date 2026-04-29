@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **rename**: `BinaryInfo` -> `TaskInfo`. The type carries
+  phase/type/affinity/payload now, not just binary metadata.
+  `BinaryIdentifier` is unchanged. The wire-format
+  `dynrunner_protocol_primary_secondary::TaskInfo` was renamed to
+  `TaskListEntry` to disambiguate from the (renamed) core `TaskInfo`;
+  `DistributedBinaryInfo` is unchanged and tracked by Phase 4B.
+
 ## [0.1.1] - 2026-04-29
 
 ### Fixed

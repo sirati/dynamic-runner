@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, WorkerId};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, WorkerFactory};
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
@@ -271,7 +271,7 @@ async fn multi_worker_named_socket_processes_all() {
             children: Vec::new(),
         };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+        let binaries: Vec<TaskInfo<TestId>> = (0..8)
             .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
             .collect();
 
@@ -322,7 +322,7 @@ async fn multi_worker_subprocess_processes_all() {
             children: Vec::new(),
         };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+        let binaries: Vec<TaskInfo<TestId>> = (0..8)
             .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
             .collect();
 

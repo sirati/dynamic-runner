@@ -85,7 +85,7 @@ async fn two_secondaries_distribute_work() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+        let binaries: Vec<TaskInfo<TestId>> = (0..6)
             .map(|i| make_binary(&format!("bin_{i}"), 100))
             .collect();
 
@@ -201,7 +201,7 @@ async fn e2e_primary_and_secondary_single_node() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+        let binaries: Vec<TaskInfo<TestId>> = (0..5)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
@@ -270,7 +270,7 @@ async fn e2e_primary_and_two_secondaries() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..10)
+        let binaries: Vec<TaskInfo<TestId>> = (0..10)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
@@ -320,7 +320,7 @@ async fn live_distribution_continues_past_initial_batch() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..20)
+        let binaries: Vec<TaskInfo<TestId>> = (0..20)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 

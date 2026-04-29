@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use dynrunner_core::{
-    BinaryInfo, FailedTask, Identifier, ResourceKind, ResourceMap, WorkerId,
+    TaskInfo, FailedTask, Identifier, ResourceKind, ResourceMap, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -112,17 +112,17 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     scheduler: S,
     estimator: E,
     pool: WorkerPool<M, I>,
-    pending_binaries: Vec<BinaryInfo<I>>,
+    pending_binaries: Vec<TaskInfo<I>>,
     failed_tasks: Vec<FailedTask<I>>,
     resource_pressure_tasks: Vec<FailedTask<I>>,
-    unassigned_tasks: Vec<BinaryInfo<I>>,
+    unassigned_tasks: Vec<TaskInfo<I>>,
     pending_worker_assignments: HashSet<WorkerId>,
     in_pressure_phase: bool,
     total_assigned_resources: ResourceMap,
     stats: ProcessingStats,
     /// Successful per-task opaque payloads, surfaced for the Python-side
     /// task-specific aggregator. Populated as TaskCompleted events arrive.
-    task_payloads: Vec<(BinaryInfo<I>, Option<Vec<u8>>)>,
+    task_payloads: Vec<(TaskInfo<I>, Option<Vec<u8>>)>,
 }
 
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
@@ -157,14 +157,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
     }
 
     /// Successful per-task opaque payloads in completion order.
-    pub fn task_payloads(&self) -> &[(BinaryInfo<I>, Option<Vec<u8>>)] {
+    pub fn task_payloads(&self) -> &[(TaskInfo<I>, Option<Vec<u8>>)] {
         &self.task_payloads
     }
 
     /// Main entry point: process a list of binaries through the 5-phase pipeline.
     pub async fn process_binaries(
         &mut self,
-        binaries: Vec<BinaryInfo<I>>,
+        binaries: Vec<TaskInfo<I>>,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         self.pending_binaries = binaries;

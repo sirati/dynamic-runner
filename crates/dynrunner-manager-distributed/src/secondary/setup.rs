@@ -1,5 +1,5 @@
 
-use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_core::{TaskInfo, Identifier, PhaseId, TypeId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
@@ -161,10 +161,16 @@ where
                 .resolve_binary(zip_ref, &local_path, &hash);
 
             let binary = match resolved_path {
-                Some(path) => BinaryInfo {
+                // TODO(phases-4b): wire phase_id/type_id/affinity_id/payload through
+                // DistributedBinaryInfo so the secondary preserves them on assignment.
+                Some(path) => TaskInfo {
                     path,
                     size: binary_info.size,
                     identifier: binary_info.identifier.clone(),
+                    phase_id: PhaseId::from("default"),
+                    type_id: TypeId::from("default"),
+                    affinity_id: None,
+                    payload: serde_json::Value::Null,
                 },
                 None => distributed_to_binary(&binary_info),
             };

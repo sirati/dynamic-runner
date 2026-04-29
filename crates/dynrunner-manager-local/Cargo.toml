@@ -24,4 +24,5 @@ thiserror = { workspace = true }
 dynrunner-scheduler = { workspace = true }
 dynrunner-transport-socket = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }

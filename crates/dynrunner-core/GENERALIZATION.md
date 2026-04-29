@@ -7,7 +7,7 @@ crate depends on this.
 
 ## What is Already Generic
 - `Identifier` trait — any task can plug its own identifier type.
-- `BinaryInfo<I>` — generic over identifier.
+- `TaskInfo<I>` — generic over identifier.
 - `FailedTask<I>` — generic over identifier.
 - `MessageSender<M>` / `MessageReceiver<M>` — fully transport-agnostic.
 - `ErrorType` — three-way classification (OOM, recoverable, non-recoverable).
@@ -71,12 +71,12 @@ pub struct ResourceAmount {
 }
 ```
 
-### 4. `BinaryInfo` naming
+### 4. `TaskInfo` naming
 "Binary" implies an executable. The struct is really "a unit of work with an
-associated file." Consider renaming to `TaskInput<I>` or keeping `BinaryInfo`
+associated file." Consider renaming to `TaskInput<I>` or keeping `TaskInfo`
 but documenting it clearly.
 
-**Suggested:** Keep the name but add a type alias `pub type TaskInput<I> = BinaryInfo<I>;`
+**Suggested:** Keep the name but add a type alias `pub type TaskInput<I> = TaskInfo<I>;`
 so consumers can use the clearer name.
 
 ## Python API Restoration (`db_python_provider`)

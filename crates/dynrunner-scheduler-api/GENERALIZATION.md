@@ -33,7 +33,7 @@ pub struct WorkerBudgetInfo<I: Identifier> {
     pub is_idle: bool,
     pub is_opportunistic: bool,
     pub has_initial_assignment: bool,
-    pub current_task: Option<BinaryInfo<I>>,
+    pub current_task: Option<TaskInfo<I>>,
     pub estimated_usage: ResourceMap,      // estimated per resource kind
 }
 ```
@@ -66,7 +66,7 @@ fn assign_normal(
     &self,
     worker: &WorkerBudgetInfo<I>,
     all_workers: &[WorkerBudgetInfo<I>],
-    pending: &[BinaryInfo<I>],
+    pending: &[TaskInfo<I>],
     max_resources: &ResourceMap,
     estimator: &dyn ResourceEstimator,
     retry_attempt: bool,

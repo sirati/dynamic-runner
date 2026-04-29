@@ -1,4 +1,4 @@
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap, WorkerId};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap, WorkerId};
 
 /// Processing phases that the manager cycles through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub struct WorkerBudgetInfo<I: Identifier> {
     pub is_idle: bool,
     pub is_opportunistic: bool,
     pub has_initial_assignment: bool,
-    pub current_task: Option<BinaryInfo<I>>,
+    pub current_task: Option<TaskInfo<I>>,
     pub estimated_usage: ResourceMap,
 }
 
@@ -63,7 +63,7 @@ pub trait Scheduler<I: Identifier> {
     fn assign_initial(
         &self,
         worker: &WorkerBudgetInfo<I>,
-        pending: &[BinaryInfo<I>],
+        pending: &[TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator,
@@ -74,7 +74,7 @@ pub trait Scheduler<I: Identifier> {
         &self,
         worker: &WorkerBudgetInfo<I>,
         all_workers: &[WorkerBudgetInfo<I>],
-        pending: &[BinaryInfo<I>],
+        pending: &[TaskInfo<I>],
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator,
         retry_attempt: bool,

@@ -1,5 +1,5 @@
 
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport,
@@ -154,7 +154,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         {
             // Find the specific worker and recover the binary if it's a
             // recoverable error so it can be re-assigned to another worker.
-            let mut recovered_binary: Option<BinaryInfo<I>> = None;
+            let mut recovered_binary: Option<TaskInfo<I>> = None;
             let mut local_idx: u32 = 0;
             for w in &mut self.workers {
                 if w.secondary_id == secondary_id {

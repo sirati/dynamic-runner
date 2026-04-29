@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use dynrunner_core::{
-    BinaryInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
+    TaskInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -117,7 +117,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         &mut self,
         worker_id: WorkerId,
         result: TaskResult,
-        binary: Option<BinaryInfo<I>>,
+        binary: Option<TaskInfo<I>>,
         estimated_resources: ResourceMap,
         active_workers: &mut HashSet<WorkerId>,
         allow_stop: bool,
@@ -187,7 +187,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
     /// Log resource usage to memuse.log in CSV format: size,estimated_mem,actual_mem,filename,status
     pub(super) fn log_resource_usage(
         &self,
-        binary: Option<&BinaryInfo<I>>,
+        binary: Option<&TaskInfo<I>>,
         estimated: &ResourceMap,
         actual: &ResourceMap,
         errored: bool,
@@ -227,7 +227,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         }
     }
 
-    pub(super) fn record_result(&mut self, result: &TaskResult, binary: Option<&BinaryInfo<I>>) {
+    pub(super) fn record_result(&mut self, result: &TaskResult, binary: Option<&TaskInfo<I>>) {
         if result.success {
             self.stats.completed += 1;
         } else {

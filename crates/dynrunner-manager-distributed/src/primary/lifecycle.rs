@@ -4,7 +4,7 @@ use std::time::Duration;
 use dynrunner_core::{Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
-    SecondaryTransport, TaskInfo,
+    SecondaryTransport, TaskListEntry,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -127,12 +127,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             None => return Ok(()),
         };
 
-        let all_tasks: Vec<TaskInfo<I>> = self
+        let all_tasks: Vec<TaskListEntry<I>> = self
             .all_binaries
             .iter()
             .map(|binary| {
                 let hash = compute_task_hash(binary);
-                TaskInfo {
+                TaskListEntry {
                     local_path: binary.path.to_string_lossy().into_owned(),
                     binary_info: binary_to_distributed(binary),
                     hash: hash.clone(),

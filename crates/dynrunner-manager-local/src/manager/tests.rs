@@ -49,7 +49,7 @@ async fn multiple_workers_process_binaries() {
             mode: FakeWorkerMode::AlwaysSucceed,
         };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..10)
+        let binaries: Vec<TaskInfo<TestId>> = (0..10)
             .map(|i| make_binary(&format!("bin_{i}"), 100))
             .collect();
 
@@ -112,7 +112,7 @@ async fn no_binaries_completes_immediately() {
         };
 
         manager
-            .process_binaries(Vec::<BinaryInfo<TestId>>::new(), &mut factory)
+            .process_binaries(Vec::<TaskInfo<TestId>>::new(), &mut factory)
             .await
             .unwrap();
 
@@ -331,7 +331,7 @@ async fn multiple_workers_with_mixed_results() {
             mode: FakeWorkerMode::AlwaysSucceed,
         };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+        let binaries: Vec<TaskInfo<TestId>> = (0..6)
             .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
             .collect();
 

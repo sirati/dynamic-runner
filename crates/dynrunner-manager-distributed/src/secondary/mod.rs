@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{BinaryInfo, Identifier, WorkerId};
+use dynrunner_core::{TaskInfo, Identifier, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
@@ -123,7 +123,7 @@ where
     request_backoff: HashMap<WorkerId, Duration>,
 
     // SLURM-primary state (populated on promotion + full task list)
-    slurm_pending_binaries: Vec<BinaryInfo<I>>,
+    slurm_pending_binaries: Vec<TaskInfo<I>>,
     slurm_completed: HashSet<String>,
 
     // Cached snapshot of the live primary's last `FullTaskList` broadcast.
@@ -132,7 +132,7 @@ where
     // round-tripping through a fresh `FullTaskList` (which would require
     // a now-dead primary).
     cached_full_task_list: Option<(
-        Vec<dynrunner_protocol_primary_secondary::TaskInfo<I>>,
+        Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>>,
         HashSet<String>,
     )>,
 

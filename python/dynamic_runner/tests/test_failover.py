@@ -49,7 +49,7 @@ class _StubBinaryIdentifier:
 
 
 @dataclass
-class _StubBinaryInfo:
+class _StubTaskInfo:
     path: str
     size: int
     identifier: _StubBinaryIdentifier
@@ -109,9 +109,9 @@ class _SleepTask:
         pass
 
 
-def _make_binaries(n: int) -> list[_StubBinaryInfo]:
+def _make_binaries(n: int) -> list[_StubTaskInfo]:
     return [
-        _StubBinaryInfo(
+        _StubTaskInfo(
             path=f"bin_{i}",
             size=1000 + i,
             identifier=_StubBinaryIdentifier(

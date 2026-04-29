@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_core::{TaskInfo, Identifier, PhaseId, TypeId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
@@ -66,10 +66,16 @@ where
                 }
 
                 let binary = match resolved_path {
-                    Some(path) => BinaryInfo {
+                    // TODO(phases-4b): wire phase_id/type_id/affinity_id/payload through
+                    // DistributedBinaryInfo so the secondary preserves them.
+                    Some(path) => TaskInfo {
                         path,
                         size: binary_info.size,
                         identifier: binary_info.identifier.clone(),
+                        phase_id: PhaseId::from("default"),
+                        type_id: TypeId::from("default"),
+                        affinity_id: None,
+                        payload: serde_json::Value::Null,
                     },
                     None => distributed_to_binary(&binary_info),
                 };

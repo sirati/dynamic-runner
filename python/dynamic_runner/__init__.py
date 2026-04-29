@@ -16,8 +16,8 @@ Public surface:
   `dynamic_runner._native` and re-exported here: `run_local`,
   `run_distributed`, `run_primary`, `run_secondary`, `compute_task_hash`,
   the config dataclasses, and the `Rust*Manager`/`Rust*Coordinator`
-  classes. The native `BinaryInfo` collides with the Python dataclass
-  form above; reach it as `dynamic_runner._native.BinaryInfo` if needed.
+  classes. The native `TaskInfo` collides with the Python dataclass
+  form above; reach it as `dynamic_runner._native.TaskInfo` if needed.
 """
 
 from .run import run

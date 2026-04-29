@@ -88,13 +88,16 @@ pub struct ZipBinaryEntry<I> {
     pub hash: String,
 }
 
-/// Task info in full task list.
+/// Wire-format entry in a `FullTaskList` broadcast. Distinct from
+/// `dynrunner_core::TaskInfo` (the in-process content type) — this is the
+/// flat, hash-keyed, file-path-aware shape that primaries and secondaries
+/// exchange over the network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "I: Serialize",
     deserialize = "I: for<'a> Deserialize<'a>",
 ))]
-pub struct TaskInfo<I> {
+pub struct TaskListEntry<I> {
     pub local_path: String,
     pub binary_info: DistributedBinaryInfo<I>,
     pub hash: String,
@@ -195,7 +198,7 @@ pub enum DistributedMessage<I> {
     FullTaskList {
         sender_id: String,
         timestamp: f64,
-        all_tasks: Vec<TaskInfo<I>>,
+        all_tasks: Vec<TaskListEntry<I>>,
         completed_tasks: Vec<String>,
         #[serde(default)]
         pending_tasks: Vec<String>,

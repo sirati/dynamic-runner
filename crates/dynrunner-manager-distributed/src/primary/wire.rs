@@ -1,4 +1,4 @@
-use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_core::{TaskInfo, Identifier};
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 
 pub(super) fn timestamp_now() -> f64 {
@@ -9,7 +9,7 @@ pub(super) fn timestamp_now() -> f64 {
 }
 
 pub(super) fn binary_to_distributed<I: Identifier>(
-    binary: &BinaryInfo<I>,
+    binary: &TaskInfo<I>,
 ) -> DistributedBinaryInfo<I> {
     DistributedBinaryInfo {
         path: binary.path.to_string_lossy().into_owned(),
@@ -18,7 +18,7 @@ pub(super) fn binary_to_distributed<I: Identifier>(
     }
 }
 
-pub fn compute_task_hash<I: Identifier>(binary: &BinaryInfo<I>) -> String {
+pub fn compute_task_hash<I: Identifier>(binary: &TaskInfo<I>) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut hasher = DefaultHasher::new();

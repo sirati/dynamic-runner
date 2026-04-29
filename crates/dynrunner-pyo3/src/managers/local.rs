@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::BinaryInfo;
+use dynrunner_core::TaskInfo;
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 
 use crate::config::connection::ConnectionMode;
@@ -12,7 +12,7 @@ use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
-use crate::pytypes::{PyBinaryInfo, PyFailedTask, PyProcessingStats, extract_binaries};
+use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 use crate::task_def::{LoadedTaskDefinition, extract_stage_timeouts};
 use crate::transport::EitherManagerEnd;
@@ -46,7 +46,7 @@ pub(crate) struct PyLocalManager {
     stats: Option<ProcessingStats>,
     failed_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
     oom_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
-    task_payloads: Vec<(BinaryInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
+    task_payloads: Vec<(TaskInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
 }
 
 #[pymethods]
@@ -159,7 +159,7 @@ impl PyLocalManager {
         })
     }
 
-    /// Process a list of PyBinaryInfo objects.
+    /// Process a list of PyTaskInfo objects.
     fn process_binaries(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
         let mut rust_binaries = extract_binaries(binaries)?;
 
@@ -275,7 +275,7 @@ impl PyLocalManager {
         self.failed_tasks
             .iter()
             .map(|t| PyFailedTask {
-                binary: PyBinaryInfo::from(&t.binary),
+                binary: PyTaskInfo::from(&t.binary),
                 error_type: format!("{:?}", t.error_type),
                 error_message: t.error_message.clone(),
             })
@@ -283,10 +283,10 @@ impl PyLocalManager {
     }
 
     #[getter]
-    fn task_results(&self) -> Vec<(PyBinaryInfo, Option<Vec<u8>>)> {
+    fn task_results(&self) -> Vec<(PyTaskInfo, Option<Vec<u8>>)> {
         self.task_payloads
             .iter()
-            .map(|(bi, data)| (PyBinaryInfo::from(bi), data.clone()))
+            .map(|(bi, data)| (PyTaskInfo::from(bi), data.clone()))
             .collect()
     }
 
@@ -295,7 +295,7 @@ impl PyLocalManager {
         self.oom_tasks
             .iter()
             .map(|t| PyFailedTask {
-                binary: PyBinaryInfo::from(&t.binary),
+                binary: PyTaskInfo::from(&t.binary),
                 error_type: format!("{:?}", t.error_type),
                 error_message: t.error_message.clone(),
             })
