@@ -40,8 +40,7 @@ pub(crate) struct PySecondaryCoordinator {
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
     completed: u32,
 }
 
@@ -108,8 +107,7 @@ impl PySecondaryCoordinator {
             worker_module: task.worker_module,
             worker_cmd_args: task.worker_cmd_args,
             skip_existing,
-            estimator_slope: task.estimator.slope,
-            estimator_intercept: task.estimator.intercept,
+            estimator: task.estimator,
             completed: 0,
         })
     }
@@ -120,8 +118,7 @@ impl PySecondaryCoordinator {
         let secondary_id = self.secondary_id.clone();
         let num_workers = self.num_workers;
         let ram_bytes = self.ram_bytes;
-        let slope = self.estimator_slope;
-        let intercept = self.estimator_intercept;
+        let estimator = self.estimator.clone();
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
@@ -236,8 +233,6 @@ impl PySecondaryCoordinator {
                     peer_timeout: dist_peer_timeout,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
-
-                let estimator = PyMemoryEstimatorBridge { slope, intercept };
 
                 let mut factory = SubprocessWorkerFactory {
                     python_executable,

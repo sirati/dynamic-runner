@@ -95,7 +95,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         pending: &[TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
-        estimator: &dyn ResourceEstimator,
+        estimator: &dyn ResourceEstimator<I>,
     ) -> AssignmentDecision {
         if worker.has_initial_assignment {
             return AssignmentDecision::NoFit;
@@ -109,7 +109,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         let max = self.get(max_resources);
 
         for (i, binary) in pending.iter().enumerate() {
-            let est_map = estimator.estimate(binary.size);
+            let est_map = estimator.estimate(binary);
             let estimated = self.get(&est_map);
             if estimated > budget {
                 continue;
@@ -134,7 +134,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         all_workers: &[WorkerBudgetInfo<I>],
         pending: &[TaskInfo<I>],
         max_resources: &ResourceMap,
-        estimator: &dyn ResourceEstimator,
+        estimator: &dyn ResourceEstimator<I>,
         _retry_attempt: bool,
     ) -> AssignmentDecision {
         if pending.is_empty() {
@@ -170,7 +170,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         };
 
         for (i, binary) in pending.iter().enumerate() {
-            let est_map = estimator.estimate(binary.size);
+            let est_map = estimator.estimate(binary);
             let estimated = self.get(&est_map);
             if estimated <= effective_budget {
                 return AssignmentDecision::Assign {

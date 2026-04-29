@@ -13,7 +13,7 @@ use crate::worker::WorkerEvent;
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
     pub(super) async fn handle_event(
         &mut self,
         event: WorkerEvent<I>,

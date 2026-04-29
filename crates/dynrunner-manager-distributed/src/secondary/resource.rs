@@ -19,7 +19,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn check_resource_pressure(&mut self, factory: &mut impl WorkerFactory<M>) {

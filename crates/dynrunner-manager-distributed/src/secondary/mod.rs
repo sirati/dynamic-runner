@@ -76,7 +76,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint,
     S: Scheduler<I>,
-    E: ResourceEstimator,
+    E: ResourceEstimator<I>,
     I: Identifier,
 {
     config: SecondaryConfig,
@@ -151,7 +151,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub fn new(

@@ -31,7 +31,7 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier>
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
     PrimaryCoordinator<T, S, E, I>
 {
     /// Update the keepalive timestamp for a known secondary. No-op if the
@@ -201,8 +201,8 @@ mod tests {
 
     #[derive(Clone)]
     struct FixedEstimator;
-    impl ResourceEstimator for FixedEstimator {
-        fn estimate(&self, _size: u64) -> ResourceMap {
+    impl ResourceEstimator<TestId> for FixedEstimator {
+        fn estimate(&self, _task: &dynrunner_core::TaskInfo<TestId>) -> ResourceMap {
             ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1)])
         }
     }

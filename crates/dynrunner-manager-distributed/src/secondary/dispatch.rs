@@ -17,7 +17,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn dispatch_message(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
@@ -79,7 +79,7 @@ where
                     },
                     None => distributed_to_binary(&binary_info),
                 };
-                let estimated = self.estimator.estimate(binary.size);
+                let estimated = self.estimator.estimate(&binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
 
                 // Find the target worker — prefer the requested one, fall back to any idle

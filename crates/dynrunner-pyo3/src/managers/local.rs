@@ -38,8 +38,7 @@ pub(crate) struct PyLocalManager {
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
     stage_timeouts: std::collections::HashMap<String, std::time::Duration>,
     connection_mode: ConnectionMode,
     manual_start_worker: bool,
@@ -147,8 +146,7 @@ impl PyLocalManager {
             worker_module: task.worker_module,
             worker_cmd_args: task.worker_cmd_args,
             skip_existing,
-            estimator_slope: task.estimator.slope,
-            estimator_intercept: task.estimator.intercept,
+            estimator: task.estimator,
             stage_timeouts,
             connection_mode: conn_mode,
             manual_start_worker,
@@ -170,10 +168,7 @@ impl PyLocalManager {
             }
         }
 
-        let estimator = PyMemoryEstimatorBridge {
-            slope: self.estimator_slope,
-            intercept: self.estimator_intercept,
-        };
+        let estimator = self.estimator.clone();
         let scheduler = self.scheduler_config.build_memory_scheduler();
 
         let memuse_log_path = Some(self.output_dir.join("memuse.log"));

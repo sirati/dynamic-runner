@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
+use dynrunner_core::TypeId;
+
 use crate::config::log_paths::LogPathConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
 
@@ -37,8 +39,12 @@ impl LoadedTaskDefinition {
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
-        let estimate_fn = task_definition.getattr("estimate_memory")?;
-        let estimator = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
+        // TODO(phases-5a): replace this single ("default", "estimate_memory")
+        // tuple with the full set of (TypeId, estimator_attr) pairs extracted
+        // from `task_definition.get_phases()`. Phase 3 only wires the new
+        // constructor signature; Phase 5A will walk the phase graph.
+        let types = vec![(TypeId::from("default"), "estimate_memory".to_string())];
+        let estimator = PyMemoryEstimatorBridge::from_python(py, task_definition, &types)?;
 
         let worker_module: String = task_definition
             .call_method0("get_worker_module")?

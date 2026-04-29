@@ -66,7 +66,7 @@ impl<I: Identifier> RemoteWorkerState<I> {
 ///
 /// Generic over `T: SecondaryTransport<I>` so it works with both QUIC connections
 /// and in-process channels for testing.
-pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> {
+pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
     pub(super) config: PrimaryConfig,
     pub(super) transport: T,
     pub(super) scheduler: S,
@@ -99,7 +99,7 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     pub(super) pending_stage_files: Vec<(String, String, String, String)>,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub fn new(config: PrimaryConfig, transport: T, scheduler: S, estimator: E) -> Self {
         Self {
             config,

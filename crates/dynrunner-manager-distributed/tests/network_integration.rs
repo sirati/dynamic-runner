@@ -23,8 +23,8 @@ struct TestId {
 
 #[derive(Clone)]
 struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _size: u64) -> dynrunner_core::ResourceMap {
+impl ResourceEstimator<TestId> for FixedEstimator {
+    fn estimate(&self, _task: &TaskInfo<TestId>) -> dynrunner_core::ResourceMap {
         dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.0)])
     }
 }

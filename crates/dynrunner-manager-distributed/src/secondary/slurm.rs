@@ -18,7 +18,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) fn populate_slurm_tasks(
@@ -106,7 +106,7 @@ where
         // Find a task that fits the available memory
         let mut assigned_idx = None;
         for (i, binary) in self.slurm_pending_binaries.iter().enumerate() {
-            let estimated = self.estimator.estimate(binary.size);
+            let estimated = self.estimator.estimate(binary);
             if estimated.get(&dynrunner_core::ResourceKind::memory()) <= available_memory {
                 assigned_idx = Some(i);
                 break;
@@ -143,7 +143,7 @@ where
                     },
                     None => binary.clone(),
                 };
-                let estimated = self.estimator.estimate(actual_binary.size);
+                let estimated = self.estimator.estimate(&actual_binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
                 if self.pool.workers[wid as usize].is_idle_state() {
                     match self.pool.workers[wid as usize]

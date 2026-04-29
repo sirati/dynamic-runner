@@ -69,7 +69,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     /// Bump the primary-keepalive timestamp on every primary message and

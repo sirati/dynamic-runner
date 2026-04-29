@@ -17,7 +17,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn initialize_workers(
@@ -175,7 +175,7 @@ where
                 None => distributed_to_binary(&binary_info),
             };
 
-            let estimated = self.estimator.estimate(binary.size);
+            let estimated = self.estimator.estimate(&binary);
 
             if (wid as usize) < self.pool.workers.len() && self.pool.workers[wid as usize].is_idle_state() {
                 match self.pool.workers[wid as usize]

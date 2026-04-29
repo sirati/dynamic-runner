@@ -32,8 +32,7 @@ pub(crate) struct PyDistributedManager {
     worker_module: String,
     worker_cmd_args: Vec<String>,
     skip_existing: bool,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
     completed: u32,
     failed: u32,
 }
@@ -92,8 +91,7 @@ impl PyDistributedManager {
             worker_module: task.worker_module,
             worker_cmd_args: task.worker_cmd_args,
             skip_existing,
-            estimator_slope: task.estimator.slope,
-            estimator_intercept: task.estimator.intercept,
+            estimator: task.estimator,
             completed: 0,
             failed: 0,
         })
@@ -106,8 +104,7 @@ impl PyDistributedManager {
         let num_secondaries = self.num_secondaries;
         let num_workers = self.num_workers_per_secondary;
         let ram = self.ram_per_secondary;
-        let slope = self.estimator_slope;
-        let intercept = self.estimator_intercept;
+        let estimator = self.estimator.clone();
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
@@ -170,6 +167,7 @@ impl PyDistributedManager {
                     let sec_log_paths = log_paths.clone();
                     let sec_worker_module = worker_module.clone();
                     let sec_worker_args = worker_cmd_args.clone();
+                    let sec_estimator = estimator.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -188,7 +186,7 @@ impl PyDistributedManager {
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
                         };
 
-                        let estimator = PyMemoryEstimatorBridge { slope, intercept };
+                        let estimator = sec_estimator;
 
                         let mut factory = SubprocessWorkerFactory {
                             python_executable: sec_python,
@@ -238,7 +236,6 @@ impl PyDistributedManager {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
-                let estimator = PyMemoryEstimatorBridge { slope, intercept };
                 let mut primary = PrimaryCoordinator::new(
                     config,
                     transport,
