@@ -20,3 +20,4 @@ result-*
 .vscode/
 *.swp
 *~
+.claude/
