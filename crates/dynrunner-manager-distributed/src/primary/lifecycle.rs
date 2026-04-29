@@ -167,6 +167,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             all_tasks,
             completed_tasks: completed_list,
             pending_tasks: pending_list,
+            // TODO(phase-4b): the primary owns the canonical phase-deps
+            // graph for the run; thread it through here so a promoted
+            // secondary can rebuild a `PendingPool` faithfully. Empty
+            // for now → receivers treat every phase as zero-deps.
+            phase_deps: std::collections::HashMap::new(),
         };
         self.transport.send_to(&slurm_id, msg).await?;
 

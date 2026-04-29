@@ -378,6 +378,70 @@ impl<I: Identifier> PendingPool<I> {
         self.buckets.values().flat_map(|b| b.items.iter())
     }
 
+    /// Drop every queued item for which `pred` returns `false`. Iterates
+    /// every bucket in deterministic key order; empty buckets are left
+    /// in place (cheap, and matches the lazy-creation pattern in
+    /// `extend`). Does NOT touch in-flight items: removal of an item
+    /// already handed to a worker is the manager's concern, surfaced
+    /// via `release_worker` / `on_item_finished`.
+    ///
+    /// Used by callers (e.g. SLURM-primary) to drop items completed
+    /// elsewhere in the cluster without disturbing the phase machine.
+    pub fn retain<F>(&mut self, mut pred: F)
+    where
+        F: FnMut(&TaskInfo<I>) -> bool,
+    {
+        for bucket in self.buckets.values_mut() {
+            bucket.items.retain(|item| pred(item));
+        }
+    }
+
+    /// Find the first queued item (in bucket-key order, FIFO within a
+    /// bucket) for which `pred` returns `true`, remove it from its
+    /// bucket and return it. Returns `None` if no item matches.
+    ///
+    /// Does NOT update in-flight counts or worker affinity — this is
+    /// a *removal* primitive, not a *dispatch* primitive. Intended for
+    /// callers (SLURM-promoted primary) that need to extract a task
+    /// matching a runtime predicate (e.g. memory-fit) without going
+    /// through the soft-pin algorithm `pop_for_worker` implements.
+    ///
+    /// If a matched item leaves its bucket empty, the bucket's pinned
+    /// workers are unpinned (mirroring `take_from_bucket`'s behaviour),
+    /// so soft-pin invariants stay correct for any later dispatch.
+    pub fn take_first_match<F>(&mut self, mut pred: F) -> Option<TaskInfo<I>>
+    where
+        F: FnMut(&TaskInfo<I>) -> bool,
+    {
+        let mut hit_key: Option<BucketKey> = None;
+        let mut hit_idx: usize = 0;
+        for (key, bucket) in &self.buckets {
+            if let Some(idx) = bucket.items.iter().position(&mut pred) {
+                hit_key = Some(key.clone());
+                hit_idx = idx;
+                break;
+            }
+        }
+        let key = hit_key?;
+        let bucket = self.buckets.get_mut(&key)?;
+        let item = bucket.items.remove(hit_idx)?;
+
+        // Clear soft-pin slots if this drained the bucket, mirroring
+        // the bookkeeping in `take_from_bucket` so a later dispatch
+        // doesn't see stale pin state.
+        if bucket.items.is_empty() {
+            let drained_pinners = std::mem::take(&mut bucket.pinned_workers);
+            for w in drained_pinners {
+                if let Some(slot) = self.worker_affinity.get_mut(&w)
+                    && slot.as_ref() == Some(&key)
+                {
+                    *slot = None;
+                }
+            }
+        }
+        Some(item)
+    }
+
     /// Phases currently in `Active` state (callers may need this to
     /// filter scheduling decisions).
     pub fn active_phases(&self) -> Vec<PhaseId> {

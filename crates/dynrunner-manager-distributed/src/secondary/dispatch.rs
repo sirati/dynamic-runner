@@ -205,6 +205,7 @@ where
                 all_tasks,
                 completed_tasks,
                 pending_tasks,
+                phase_deps,
                 ..
             } => {
                 let completed_set: HashSet<String> = completed_tasks.into_iter().collect();
@@ -212,16 +213,22 @@ where
                     total = all_tasks.len(),
                     completed = completed_set.len(),
                     pending = pending_tasks.len(),
+                    phases = phase_deps.len(),
                     "received full task list"
                 );
 
                 // Cache on every secondary: if we get promoted later we
-                // can populate slurm_pending_binaries directly from this
-                // snapshot without depending on a (then-dead) primary.
-                self.cached_full_task_list = Some((all_tasks.clone(), completed_set.clone()));
+                // can rebuild the SLURM-primary `PendingPool` from this
+                // snapshot (the live primary may by then be dead, so we
+                // can't ask for it again).
+                self.cached_full_task_list = Some((
+                    all_tasks.clone(),
+                    completed_set.clone(),
+                    phase_deps.clone(),
+                ));
 
                 if self.is_slurm_primary {
-                    self.populate_slurm_tasks(all_tasks, completed_set);
+                    self.populate_slurm_tasks(all_tasks, completed_set, phase_deps);
                 }
                 Ok(())
             }

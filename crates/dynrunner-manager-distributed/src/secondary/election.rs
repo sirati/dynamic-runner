@@ -299,23 +299,26 @@ where
         promoted
     }
 
-    /// On promotion, hydrate `slurm_pending_binaries` from whatever the
-    /// most recent live primary broadcast in `FullTaskList`. If no
-    /// broadcast was ever observed (e.g. the election fired before the
-    /// primary even sent one), the new primary starts with an empty
-    /// pending list — peers will still request work and the primary will
+    /// On promotion, hydrate `slurm_pending` from whatever the most
+    /// recent live primary broadcast in `FullTaskList`. If no broadcast
+    /// was ever observed (e.g. the election fired before the primary
+    /// even sent one), the new primary starts with an empty pending
+    /// pool — peers will still request work and the primary will
     /// reply "no tasks available", which is the safe degrade.
     pub(super) fn populate_slurm_from_cache(&mut self) {
-        if let Some((all_tasks, completed)) = self.cached_full_task_list.take() {
+        if let Some((all_tasks, completed, phase_deps)) =
+            self.cached_full_task_list.take()
+        {
             tracing::info!(
                 total = all_tasks.len(),
                 completed = completed.len(),
-                "post-promotion: hydrating SLURM-primary pending list from cached FullTaskList"
+                phases = phase_deps.len(),
+                "post-promotion: hydrating SLURM-primary pending pool from cached FullTaskList"
             );
-            self.populate_slurm_tasks(all_tasks, completed);
+            self.populate_slurm_tasks(all_tasks, completed, phase_deps);
         } else {
             tracing::warn!(
-                "post-promotion: no cached FullTaskList; new primary starts with empty pending list"
+                "post-promotion: no cached FullTaskList; new primary starts with empty pending pool"
             );
         }
     }
@@ -459,20 +462,22 @@ mod tests {
         assert!(matches!(sec.election, ElectionState::Promoted));
     }
 
-    /// Once promoted, a secondary's `slurm_pending_binaries` is hydrated
+    /// Once promoted, a secondary's `slurm_pending` pool is hydrated
     /// from the cached `FullTaskList` it observed earlier from the live
     /// primary. Validates the post-promotion takeover wiring (#34).
     #[tokio::test(flavor = "current_thread")]
     async fn promotion_hydrates_slurm_tasks_from_cache() {
         use dynrunner_core::ResourceMap;
         use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, TaskListEntry};
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
 
         let mut sec = make_secondary(election_config("sec-a"));
         sec.peer_keepalives.insert("sec-b".into(), 0.0);
 
         // Pre-seed the cache as if the live primary had broadcast
-        // FullTaskList earlier in the run.
+        // FullTaskList earlier in the run. Empty phase-deps map means
+        // the (synthesised) "default" phase has zero parents and the
+        // pool is immediately Active.
         sec.cached_full_task_list = Some((
             vec![TaskListEntry {
                 local_path: "bin1".into(),
@@ -485,6 +490,7 @@ mod tests {
                 file_path: None,
             }],
             HashSet::new(),
+            HashMap::new(),
         ));
 
         // Simulate the candidate path: become candidate, then receive
@@ -502,9 +508,9 @@ mod tests {
         assert!(matches!(sec.election, ElectionState::Promoted));
         assert!(sec.is_slurm_primary, "promotion sets is_slurm_primary");
         assert_eq!(
-            sec.slurm_pending_binaries.len(),
+            sec.slurm_pending_len(),
             1,
-            "cache should have hydrated one pending binary"
+            "cache should have hydrated one pending binary into the pool"
         );
         assert!(
             sec.cached_full_task_list.is_none(),

@@ -278,6 +278,7 @@ fn roundtrip_all_message_types() {
             all_tasks: vec![],
             completed_tasks: vec![],
             pending_tasks: vec![],
+            phase_deps: std::collections::HashMap::new(),
         },
         DistributedMessage::TaskComplete {
             sender_id: "s".into(),

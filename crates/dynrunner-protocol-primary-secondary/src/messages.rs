@@ -1,4 +1,6 @@
-use dynrunner_core::ResourceAmount;
+use std::collections::HashMap;
+
+use dynrunner_core::{PhaseId, ResourceAmount};
 use serde::{Deserialize, Serialize};
 
 /// All distributed message types.
@@ -202,6 +204,15 @@ pub enum DistributedMessage<I> {
         completed_tasks: Vec<String>,
         #[serde(default)]
         pending_tasks: Vec<String>,
+        /// Run-level phase dependency graph: `child -> [parents]`.
+        /// Travels alongside the task list so a promoted secondary can
+        /// rebuild a `PendingPool` with the same phase machine the live
+        /// primary used. Defaults to an empty map for backward
+        /// compatibility with primaries that pre-date the dep wiring;
+        /// the receiver treats every phase as having zero deps in
+        /// that case.
+        #[serde(default)]
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     },
     TaskComplete {
         sender_id: String,
