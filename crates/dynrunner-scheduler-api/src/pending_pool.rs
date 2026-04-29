@@ -688,6 +688,13 @@ impl<I: Identifier> PendingPool<I> {
     /// bucket) for which `pred` returns `true`, remove it from its
     /// bucket and return it. Returns `None` if no item matches.
     ///
+    /// Buckets whose phase is not `Active` or `Draining` are skipped
+    /// — a `Blocked` phase's items must not be dispatched out of order,
+    /// and `Drained`/`Done` phases hold no live work. `Draining` is
+    /// included so items pushed back into a draining phase via
+    /// `requeue` (which flips it back to `Active`) and `reinject` paths
+    /// remain reachable through this primitive.
+    ///
     /// Does NOT update in-flight counts or worker affinity — this is
     /// a *removal* primitive, not a *dispatch* primitive. Intended for
     /// callers (SLURM-promoted primary) that need to extract a task
@@ -704,6 +711,17 @@ impl<I: Identifier> PendingPool<I> {
         let mut hit_key: Option<BucketKey> = None;
         let mut hit_idx: usize = 0;
         for (key, bucket) in &self.buckets {
+            // Skip buckets whose phase is not currently dispatchable.
+            // Active = items may dispatch; Draining = items requeued/
+            // reinjected after a drain transition flipped back to
+            // Active are dispatchable too. Blocked / Drained / Done
+            // phases must not have items pulled out of order.
+            if !matches!(
+                self.phase_state.get(&key.0),
+                Some(PhaseState::Active | PhaseState::Draining)
+            ) {
+                continue;
+            }
             if let Some(idx) = bucket.items.iter().position(&mut pred) {
                 hit_key = Some(key.clone());
                 hit_idx = idx;

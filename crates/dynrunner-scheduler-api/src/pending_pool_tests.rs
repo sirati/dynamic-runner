@@ -434,6 +434,31 @@ fn take_first_match_empties_bucket_clears_pin_state() {
     assert!(p.pop_for_worker(1).is_none());
 }
 
+/// Regression for Bug #23: `take_first_match` walked all buckets in
+/// `BTreeMap` order regardless of `phase_state`, so items belonging to
+/// a `Blocked` phase could get dispatched (the SLURM-primary's
+/// `handle_slurm_task_request` hit this on every request). The fix
+/// filters the candidate set to phases in `Active` or `Draining` state
+/// (Draining still serves to support reinject / requeue revival).
+#[test]
+fn take_first_match_skips_blocked_phases() {
+    // Two phases A, B with B depending on A. A has no items but B has one.
+    // B is Blocked because A hasn't been marked Done.
+    let mut p = pool_with(&["A", "B"], &[("B", &["A"])]);
+    p.extend([t("B", "T", "alpha", 1)]);
+    assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Blocked));
+    let got = p.take_first_match(|_| true);
+    assert!(got.is_none(), "Blocked phase B's item must not dispatch");
+    // The item is still in the pool — it must not have been removed.
+    assert_eq!(p.len(), 1);
+
+    // After A is marked done, B becomes Active and serves.
+    p.mark_phase_done(&phase("A"));
+    assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Active));
+    let got = p.take_first_match(|_| true).expect("B is now Active");
+    assert_eq!(got.phase_id.as_str(), "B");
+}
+
 #[test]
 fn activation_cascade_through_chain() {
     let mut p = pool_with(
