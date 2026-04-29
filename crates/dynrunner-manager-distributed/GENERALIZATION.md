@@ -12,12 +12,18 @@ Implements the full distributed coordination system:
 
 ## What is Already Generic
 - All coordinators generic over `I: Identifier`, `S: Scheduler<I>`,
-  `E: MemoryEstimator`, transport traits.
+  `E: ResourceEstimator`, transport traits.
 - No tokenizer/ASM/text-processing references anywhere.
 - Typestate pattern for `SecondaryConnection` — compile-time protocol enforcement.
 - ZIP extraction, file hashing, peer discovery — all domain-agnostic.
 - SLURM-primary promotion and peer timeout detection — generic coordination.
 - Comprehensive tests using `TestId(String)` — not tied to any concrete task.
+- Inter-phase ordering between task-definition phases
+  (`PhaseSpec.depends_on`) is the primary's responsibility: a
+  secondary only ever sees items the primary has already cleared
+  for dispatch. Secondaries do not read flag files, do not
+  cross-check `phase_id`s against an in-memory drain table, and do
+  not negotiate phase order peer-to-peer.
 
 ## What Needs to Change
 

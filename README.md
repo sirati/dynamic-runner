@@ -58,42 +58,60 @@ Add the flake as an input and apply its overlay:
 ## Minimal task example
 
 A task is any object whose attributes match the `TaskDefinition`
-protocol. No subclassing is required.
+protocol. No subclassing is required. Topology is declared as
+**phases** of **task types**; each item carries its `phase_id`,
+`type_id`, and (optionally) an `affinity_id` for soft worker
+pinning. See [`docs/PHASES.md`](docs/PHASES.md) for the full
+migration guide and a deeper walk-through of the model.
 
 ```python
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from enum import Enum
 
 import dynamic_runner
-from dynamic_runner import StageDefinition, Phase
-
-
-class MyPhase(Phase):
-    ANALYZE = "analyze"
+from dynamic_runner._shared import TaskInfo
+from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec
 
 
 class MyTask:
-    def get_stages(self):
-        return [StageDefinition(phase=MyPhase.ANALYZE, timeout_seconds=300.0)]
+    def get_phases(self):
+        return (
+            PhaseSpec(
+                phase_id="analyze",
+                types=(
+                    TaskTypeSpec(
+                        type_id="analyze",
+                        worker_module="my_task.worker",
+                        timeout_seconds=300.0,
+                        reserved_memory_per_worker=128 * 1024 * 1024,
+                    ),
+                ),
+            ),
+        )
 
-    def organize_and_sort_items(self, items):
-        return sorted(items, key=lambda b: b.size)
+    def discover_items(self, source_dir: Path, args: Namespace):
+        for path in self._walk(source_dir, args):
+            yield TaskInfo(
+                path=path,
+                size=path.stat().st_size,
+                identifier=self._parse(path),
+                phase_id="analyze",
+                type_id="analyze",
+            )
 
-    def estimate_memory(self, binary_size: int) -> int:
-        return 4 * binary_size + 256 * 1024 * 1024  # 4x + 256 MB headroom
-
-    def get_reserved_memory_per_worker(self) -> int:
-        return 128 * 1024 * 1024
-
-    def get_worker_module(self) -> str:
-        return "my_task.worker"  # python -m my_task.worker ...
+    def estimate_memory(self, item: TaskInfo) -> int:
+        return 4 * item.size + 256 * 1024 * 1024  # 4x + 256 MB headroom
 
     def add_task_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument("--my-flag", action="store_true")
 
     def build_worker_command_args(
-        self, args: Namespace, source_dir: Path, output_dir: Path, skip_existing: bool
+        self,
+        type_id: str,
+        args: Namespace,
+        source_dir: Path,
+        output_dir: Path,
+        skip_existing: bool,
     ) -> list[str]:
         cmd = [str(source_dir), str(output_dir)]
         if skip_existing:
@@ -102,8 +120,13 @@ class MyTask:
             cmd.append("--my-flag")
         return cmd
 
-    def get_output_filename_pattern(self, input_filename: str) -> str:
-        return f"{input_filename}.out"
+    def get_output_filename_pattern(
+        self, type_id: str, item: TaskInfo
+    ) -> str:
+        return f"{item.path.name}.out"
+
+    # Lifecycle hooks default to no-ops; implement only as needed:
+    # on_run_start, on_run_end, on_phase_start, on_phase_end.
 
 
 if __name__ == "__main__":
