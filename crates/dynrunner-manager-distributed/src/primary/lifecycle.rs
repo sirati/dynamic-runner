@@ -14,7 +14,7 @@ use dynrunner_scheduler_api::{
 use super::PrimaryCoordinator;
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn send_transfer_complete(&mut self) -> Result<(), String> {
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
         for secondary_id in secondary_ids {

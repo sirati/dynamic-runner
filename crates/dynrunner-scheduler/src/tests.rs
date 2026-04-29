@@ -9,16 +9,16 @@ use super::*;
 struct TestId(String);
 
 struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _binary_size: u64) -> ResourceMap {
+impl ResourceEstimator<TestId> for FixedEstimator {
+    fn estimate(&self, _task: &TaskInfo<TestId>) -> ResourceMap {
         ResourceMap::from([(ResourceKind::memory(), self.0)])
     }
 }
 
 struct LinearEstimator;
-impl ResourceEstimator for LinearEstimator {
-    fn estimate(&self, binary_size: u64) -> ResourceMap {
-        ResourceMap::from([(ResourceKind::memory(), binary_size * 2)])
+impl ResourceEstimator<TestId> for LinearEstimator {
+    fn estimate(&self, task: &TaskInfo<TestId>) -> ResourceMap {
+        ResourceMap::from([(ResourceKind::memory(), task.size * 2)])
     }
 }
 

@@ -10,7 +10,7 @@ use dynrunner_scheduler_api::{
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
     pub(super) async fn process_worker_loop(
         &mut self,
         active_workers: &mut HashSet<WorkerId>,

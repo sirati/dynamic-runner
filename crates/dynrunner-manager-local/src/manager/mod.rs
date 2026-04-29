@@ -107,7 +107,7 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
 /// real sockets and in-process channels for testing.
 /// Generic over `I` (the identifier type) so different task definitions
 /// can use different identifier structures.
-pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimator, I: Identifier = ()> {
+pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier = ()> {
     config: LocalManagerConfig,
     scheduler: S,
     estimator: E,
@@ -125,7 +125,7 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     task_payloads: Vec<(TaskInfo<I>, Option<Vec<u8>>)>,
 }
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
     pub fn new(config: LocalManagerConfig, scheduler: S, estimator: E) -> Self {
         Self {
             config,

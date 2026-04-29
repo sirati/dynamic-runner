@@ -13,8 +13,7 @@ use crate::pytypes::extract_binaries;
 #[pyclass(name = "RustPrimaryCoordinator")]
 pub(crate) struct PyPrimaryCoordinator {
     num_secondaries: u32,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
     spawn_secondary: Py<PyAny>,
     distributed_config: DistributedConfig,
     completed: u32,
@@ -43,13 +42,18 @@ impl PyPrimaryCoordinator {
         spawn_secondary: Py<PyAny>,
         distributed_config: Option<DistributedConfig>,
     ) -> PyResult<Self> {
-        let estimate_fn = task_definition.getattr("estimate_memory")?;
-        let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
+        // TODO(phases-5a): replace this single ("default", "estimate_memory")
+        // tuple with the full set of (TypeId, estimator_attr) pairs extracted
+        // from `task_definition.get_phases()`.
+        let types = vec![(
+            dynrunner_core::TypeId::from("default"),
+            "estimate_memory".to_string(),
+        )];
+        let bridge = PyMemoryEstimatorBridge::from_python(py, task_definition, &types)?;
 
         Ok(Self {
             num_secondaries,
-            estimator_slope: bridge.slope,
-            estimator_intercept: bridge.intercept,
+            estimator: bridge,
             spawn_secondary: spawn_secondary.clone_ref(py),
             distributed_config: distributed_config.unwrap_or_default(),
             completed: 0,
@@ -80,8 +84,7 @@ impl PyPrimaryCoordinator {
         let rust_binaries = extract_binaries(binaries)?;
 
         let num_secondaries = self.num_secondaries;
-        let slope = self.estimator_slope;
-        let intercept = self.estimator_intercept;
+        let estimator = self.estimator.clone();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_keepalive = self.distributed_config.keepalive_interval();
@@ -152,7 +155,6 @@ impl PyPrimaryCoordinator {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
-                let estimator = PyMemoryEstimatorBridge { slope, intercept };
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =
                     PrimaryCoordinator::new(
                         config,

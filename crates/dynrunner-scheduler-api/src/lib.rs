@@ -45,8 +45,14 @@ pub enum ResourcePressureDecision {
 }
 
 /// Abstract resource estimation function, provided by the task definition.
-pub trait ResourceEstimator {
-    fn estimate(&self, binary_size: u64) -> ResourceMap;
+///
+/// Generic over `I` (identifier type) so the implementation can dispatch
+/// on `task.type_id`, read fields from `task.payload`, etc.
+pub trait ResourceEstimator<I: Identifier> {
+    /// Memory budget the worker should reserve before running this item.
+    /// Receives the full `TaskInfo` so the implementation can dispatch
+    /// on `task.type_id`, read fields from `task.payload`, etc.
+    fn estimate(&self, task: &TaskInfo<I>) -> ResourceMap;
 }
 
 /// The scheduler trait — stateless decisions based on current state snapshot.
@@ -66,7 +72,7 @@ pub trait Scheduler<I: Identifier> {
         pending: &[TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
-        estimator: &dyn ResourceEstimator,
+        estimator: &dyn ResourceEstimator<I>,
     ) -> AssignmentDecision;
 
     /// Called during the normal phase for one idle worker.
@@ -76,7 +82,7 @@ pub trait Scheduler<I: Identifier> {
         all_workers: &[WorkerBudgetInfo<I>],
         pending: &[TaskInfo<I>],
         max_resources: &ResourceMap,
-        estimator: &dyn ResourceEstimator,
+        estimator: &dyn ResourceEstimator<I>,
         retry_attempt: bool,
     ) -> AssignmentDecision;
 

@@ -20,8 +20,8 @@ pub(super) struct TestId(pub String);
 
 pub(super) struct FixedEstimator(pub u64);
 
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _binary_size: u64) -> ResourceMap {
+impl ResourceEstimator<TestId> for FixedEstimator {
+    fn estimate(&self, _task: &TaskInfo<TestId>) -> ResourceMap {
         ResourceMap::from([(ResourceKind::memory(), self.0)])
     }
 }

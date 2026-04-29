@@ -4,7 +4,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{AffinityId, TaskInfo, PhaseId, RunnerIdentifier, TypeId};
+use dynrunner_core::{AffinityId, Identifier, TaskInfo, PhaseId, RunnerIdentifier, TypeId};
 
 /// Canonical identifier-key separator. Matches the Python
 /// `TokenizerIdentifier.identifier_key()` join order
@@ -213,6 +213,56 @@ pub(crate) struct PyFailedTask {
     pub(crate) error_type: String,
     #[pyo3(get)]
     pub(crate) error_message: String,
+}
+
+/// Build a `PyTaskInfo` Python object from any `TaskInfo<I>`.
+///
+/// The identifier is rendered as a stand-in `PyBinaryIdentifier` whose
+/// `binary_name` field carries the JSON-serialized `I`; the other
+/// identifier fields are empty. The probe / PyCallable estimator paths
+/// only ever read `size`, `type_id`, `phase_id`, `affinity_id`, and
+/// `payload`, so this stand-in is sufficient when we don't know the
+/// concrete `I` (and we never do at the bridge layer — the bridge is
+/// generic over `I`).
+pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
+    let identifier_json = serde_json::to_string(&task.identifier).unwrap_or_else(|_| "null".into());
+    PyTaskInfo {
+        path: task.path.to_string_lossy().into_owned(),
+        size: task.size,
+        identifier: PyBinaryIdentifier {
+            binary_name: identifier_json,
+            platform: String::new(),
+            compiler: String::new(),
+            version: String::new(),
+            opt_level: String::new(),
+        },
+        phase_id: task.phase_id.as_str().to_owned(),
+        type_id: task.type_id.as_str().to_owned(),
+        affinity_id: task.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
+        payload_json: serde_json::to_string(&task.payload).unwrap_or_else(|_| "null".into()),
+    }
+}
+
+/// Build a probe-only `PyTaskInfo` carrying just `size` and `type_id`.
+/// Used during estimator probing where the rest of the fields don't
+/// matter — the Python estimator under test typically only reads
+/// `item.size` (or returns a constant).
+pub(crate) fn probe_pytask(size: u64, type_id: &str) -> PyTaskInfo {
+    PyTaskInfo {
+        path: String::new(),
+        size,
+        identifier: PyBinaryIdentifier {
+            binary_name: String::new(),
+            platform: String::new(),
+            compiler: String::new(),
+            version: String::new(),
+            opt_level: String::new(),
+        },
+        phase_id: String::new(),
+        type_id: type_id.to_owned(),
+        affinity_id: None,
+        payload_json: "null".into(),
+    }
 }
 
 pub(crate) fn extract_binaries(

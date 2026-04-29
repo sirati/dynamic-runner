@@ -13,7 +13,7 @@ use crate::pool::ResourcePressureResult;
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
     pub(super) async fn check_timeouts(
         &mut self,
         _active_workers: &mut HashSet<WorkerId>,
