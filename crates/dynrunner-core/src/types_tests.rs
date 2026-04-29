@@ -85,9 +85,35 @@ fn binary_info_generic() {
         path: PathBuf::from("/tmp/test"),
         size: 1024,
         identifier: TestId("test-binary".into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     };
     assert_eq!(bi.size, 1024);
     assert_eq!(bi.identifier.0, "test-binary");
+}
+
+#[test]
+fn binary_info_serde_roundtrip_with_phase_fields() {
+    let bi = BinaryInfo {
+        path: PathBuf::from("/tmp/test"),
+        size: 4096,
+        identifier: TestId("rt-binary".into()),
+        phase_id: PhaseId::from("warmup"),
+        type_id: TypeId::from("tokenize"),
+        affinity_id: Some(AffinityId::from("shard-7")),
+        payload: serde_json::json!({"k": "v", "n": 42}),
+    };
+    let json = serde_json::to_string(&bi).unwrap();
+    let parsed: BinaryInfo<TestId> = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.path, bi.path);
+    assert_eq!(parsed.size, bi.size);
+    assert_eq!(parsed.identifier, bi.identifier);
+    assert_eq!(parsed.phase_id, bi.phase_id);
+    assert_eq!(parsed.type_id, bi.type_id);
+    assert_eq!(parsed.affinity_id, bi.affinity_id);
+    assert_eq!(parsed.payload, bi.payload);
 }
 
 #[test]

@@ -294,6 +294,17 @@ pub struct BinaryInfo<I> {
     pub path: PathBuf,
     pub size: u64,
     pub identifier: I,
+    /// Which phase declared by `TaskDefinition.get_phases()` this item belongs to.
+    /// Items only dispatch when their phase is active.
+    pub phase_id: PhaseId,
+    /// Which task type within the phase. Selects the worker module + memory estimator.
+    pub type_id: TypeId,
+    /// Optional soft worker-pinning class. Items with the same `Some(id)` prefer
+    /// the same worker for kernel page-cache reuse; `None` joins the free pool.
+    pub affinity_id: Option<AffinityId>,
+    /// Opaque per-item data passed through to the worker. The framework never
+    /// inspects this; consumers can stash JSON-serializable metadata here.
+    pub payload: serde_json::Value,
 }
 
 pub type TaskInput<I> = BinaryInfo<I>;

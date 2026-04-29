@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use dynrunner_core::{
-    BinaryInfo, ErrorType, MessageReceiver, MessageSender, ResourceKind, ResourceMap, WorkerId,
+    BinaryInfo, ErrorType, MessageReceiver, MessageSender, PhaseId, ResourceKind, ResourceMap,
+    TypeId, WorkerId,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler_api::ResourceEstimator;
@@ -30,6 +31,10 @@ pub(super) fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId(name.into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 

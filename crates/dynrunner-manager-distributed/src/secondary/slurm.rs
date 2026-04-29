@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use dynrunner_core::{BinaryInfo, Identifier, WorkerId};
+use dynrunner_core::{BinaryInfo, Identifier, PhaseId, TypeId, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, PeerTransport, PrimaryTransport,
@@ -46,10 +46,16 @@ where
 
             let binary_path = resolved.unwrap_or_else(|| std::path::PathBuf::from(path));
 
+            // TODO(phases-4b): wire phase_id/type_id/affinity_id/payload through
+            // TaskInfo / DistributedBinaryInfo so SLURM-primary preserves them.
             self.slurm_pending_binaries.push(BinaryInfo {
                 path: binary_path,
                 size: task.binary_info.size,
                 identifier: task.binary_info.identifier.clone(),
+                phase_id: PhaseId::from("default"),
+                type_id: TypeId::from("default"),
+                affinity_id: None,
+                payload: serde_json::Value::Null,
             });
         }
 
@@ -124,10 +130,16 @@ where
                     .extraction_cache
                     .resolve_binary(None, &binary.path.to_string_lossy(), &file_hash);
                 let actual_binary = match resolved {
+                    // TODO(phases-4b): once DistributedBinaryInfo carries phase/type/affinity/payload,
+                    // propagate them from `binary` instead of resetting to defaults.
                     Some(path) => BinaryInfo {
                         path,
                         size: binary.size,
                         identifier: binary.identifier.clone(),
+                        phase_id: binary.phase_id.clone(),
+                        type_id: binary.type_id.clone(),
+                        affinity_id: binary.affinity_id.clone(),
+                        payload: binary.payload.clone(),
                     },
                     None => binary.clone(),
                 };

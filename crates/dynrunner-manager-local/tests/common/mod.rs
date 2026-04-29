@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use dynrunner_core::{BinaryInfo, WorkerId};
+use dynrunner_core::{BinaryInfo, PhaseId, TypeId, WorkerId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
@@ -95,6 +95,10 @@ pub fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
         path: PathBuf::from(name),
         size,
         identifier: TestId(name.into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 

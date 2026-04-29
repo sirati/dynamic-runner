@@ -125,6 +125,10 @@ fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId(name.into()),
+        phase_id: dynrunner_core::PhaseId::from("default"),
+        type_id: dynrunner_core::TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 

@@ -271,6 +271,7 @@ dependencies = [
  "dynrunner-transport-channel",
  "dynrunner-transport-quic",
  "serde",
+ "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -290,6 +291,7 @@ dependencies = [
  "dynrunner-transport-channel",
  "dynrunner-transport-socket",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -331,6 +333,7 @@ dependencies = [
  "dynrunner-transport-socket",
  "pyo3",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -343,6 +346,7 @@ dependencies = [
  "dynrunner-core",
  "dynrunner-scheduler-api",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

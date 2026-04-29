@@ -4,7 +4,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{BinaryInfo, RunnerIdentifier};
+use dynrunner_core::{AffinityId, BinaryInfo, PhaseId, RunnerIdentifier, TypeId};
 
 /// Canonical identifier-key separator. Matches the Python
 /// `TokenizerIdentifier.identifier_key()` join order
@@ -96,26 +96,75 @@ pub(crate) struct PyBinaryInfo {
     size: u64,
     #[pyo3(get)]
     identifier: PyBinaryIdentifier,
+    #[pyo3(get)]
+    phase_id: String,
+    #[pyo3(get)]
+    type_id: String,
+    #[pyo3(get)]
+    affinity_id: Option<String>,
+    /// Stored as a JSON-serialized string so we can pass it across the FFI
+    /// boundary without depending on pythonize. Phase 2A's Python-side
+    /// `payload` is a JSON-serializable dict; we json.dumps on extraction.
+    #[pyo3(get)]
+    payload_json: String,
 }
 
 #[pymethods]
 impl PyBinaryInfo {
     #[new]
-    fn new(path: String, size: u64, identifier: PyBinaryIdentifier) -> Self {
+    #[pyo3(signature = (
+        path,
+        size,
+        identifier,
+        phase_id = String::new(),
+        type_id = String::new(),
+        affinity_id = None,
+        payload_json = "null".to_string(),
+    ))]
+    fn new(
+        path: String,
+        size: u64,
+        identifier: PyBinaryIdentifier,
+        phase_id: String,
+        type_id: String,
+        affinity_id: Option<String>,
+        payload_json: String,
+    ) -> Self {
         Self {
             path,
             size,
             identifier,
+            phase_id,
+            type_id,
+            affinity_id,
+            payload_json,
         }
     }
 }
 
 impl From<&PyBinaryInfo> for BinaryInfo<RunnerIdentifier> {
     fn from(py: &PyBinaryInfo) -> Self {
+        let phase_id = if py.phase_id.is_empty() {
+            PhaseId::from("default")
+        } else {
+            PhaseId::from(py.phase_id.as_str())
+        };
+        let type_id = if py.type_id.is_empty() {
+            TypeId::from("default")
+        } else {
+            TypeId::from(py.type_id.as_str())
+        };
+        let affinity_id = py.affinity_id.as_deref().map(AffinityId::from);
+        let payload: serde_json::Value =
+            serde_json::from_str(&py.payload_json).unwrap_or(serde_json::Value::Null);
         BinaryInfo {
             path: PathBuf::from(&py.path),
             size: py.size,
             identifier: RunnerIdentifier::from(&py.identifier),
+            phase_id,
+            type_id,
+            affinity_id,
+            payload,
         }
     }
 }
@@ -134,6 +183,10 @@ impl From<&BinaryInfo<RunnerIdentifier>> for PyBinaryInfo {
                 version,
                 opt_level,
             },
+            phase_id: bi.phase_id.as_str().to_owned(),
+            type_id: bi.type_id.as_str().to_owned(),
+            affinity_id: bi.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
+            payload_json: serde_json::to_string(&bi.payload).unwrap_or_else(|_| "null".into()),
         }
     }
 }
@@ -165,6 +218,14 @@ pub(crate) struct PyFailedTask {
 pub(crate) fn extract_binaries(
     binaries: &Bound<'_, PyList>,
 ) -> PyResult<Vec<BinaryInfo<RunnerIdentifier>>> {
+    let py = binaries.py();
+    // We use Python's `json.dumps` on the (potentially-arbitrary) `payload`
+    // dict to bridge it through to a `serde_json::Value`. Round-tripping via
+    // a string avoids adding `pythonize` as a dep; called once per item at
+    // run start, so the cost is negligible.
+    let json_module = py.import("json")?;
+    let dumps = json_module.getattr("dumps")?;
+
     binaries
         .iter()
         .map(|item| {
@@ -190,10 +251,52 @@ pub(crate) fn extract_binaries(
                 join_identifier(&binary_name, &platform, &compiler, &version, &opt_level)
             };
 
+            // Phase 2A added phase_id / type_id / affinity_id / payload to the
+            // Python BinaryInfo with safe defaults (empty strings / None / {}).
+            // Fall back to "default" / "default" / None / Null when the
+            // attribute is missing so legacy callers still parse.
+            let phase_id_str: String = item
+                .getattr("phase_id")
+                .and_then(|v| v.extract())
+                .unwrap_or_default();
+            let phase_id = if phase_id_str.is_empty() {
+                PhaseId::from("default")
+            } else {
+                PhaseId::from(phase_id_str)
+            };
+
+            let type_id_str: String = item
+                .getattr("type_id")
+                .and_then(|v| v.extract())
+                .unwrap_or_default();
+            let type_id = if type_id_str.is_empty() {
+                TypeId::from("default")
+            } else {
+                TypeId::from(type_id_str)
+            };
+
+            let affinity_id: Option<AffinityId> = item
+                .getattr("affinity_id")
+                .ok()
+                .and_then(|v| v.extract::<Option<String>>().ok().flatten())
+                .map(AffinityId::from);
+
+            let payload = match item.getattr("payload") {
+                Ok(p) if !p.is_none() => {
+                    let json_str: String = dumps.call1((&p,))?.extract()?;
+                    serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null)
+                }
+                _ => serde_json::Value::Null,
+            };
+
             Ok(BinaryInfo {
                 path: PathBuf::from(path),
                 size,
                 identifier,
+                phase_id,
+                type_id,
+                affinity_id,
+                payload,
             })
         })
         .collect()

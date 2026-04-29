@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{BinaryInfo, Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::{BinaryInfo, Identifier, MessageReceiver, MessageSender, PhaseId, TypeId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
@@ -33,6 +33,10 @@ pub(super) fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId(name.into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 

@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender};
+use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender, PhaseId, TypeId};
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -34,6 +34,10 @@ fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId { name: name.into() },
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 
