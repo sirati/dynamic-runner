@@ -86,6 +86,7 @@ def _run_worker_loop() -> None:
     the manager disconnects.
     """
     import argparse
+    import socket
 
     from dynamic_runner.comm import (
         DoneResponse,
@@ -107,7 +108,12 @@ def _run_worker_loop() -> None:
     if args.socket_path:
         comm = NamedSocketInterface(args.socket_path, is_server=False)
     else:
-        comm = UnixSocketInterface(args.dynamic_queue)
+        # `UnixSocketInterface` takes a `socket.socket`, not a raw FD —
+        # wrap the inherited FD via `socket.socket(fileno=...)` first
+        # (the manager's `SubprocessWorkerFactory` passes a socketpair
+        # FD via `--dynamic_queue`).
+        sock = socket.socket(fileno=args.dynamic_queue)
+        comm = UnixSocketInterface(sock)
 
     comm.send_response(ReadyResponse())
 

@@ -143,7 +143,12 @@ def test_on_run_hooks_fire_once_per_run(tmp_path: Path) -> None:
     import dynamic_runner as _rs
 
     task = _RecordingTask()
-    cfg = _rs.LocalManagerConfig(num_workers=1, max_memory=64 * 1024 * 1024)
+    # Native config takes a typed ResourceMap, not a scalar `max_memory=`.
+    # See `dynamic_runner.run._dispatch_local` for the canonical shape.
+    cfg = _rs.LocalManagerConfig(
+        num_workers=1,
+        max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
+    )
     args = SimpleNamespace()
 
     _rs.run_local(
@@ -169,7 +174,12 @@ def test_on_phase_hooks_fire_once_per_phase(tmp_path: Path) -> None:
     import dynamic_runner as _rs
 
     task = _RecordingTask()
-    cfg = _rs.LocalManagerConfig(num_workers=1, max_memory=64 * 1024 * 1024)
+    # Native config takes a typed ResourceMap, not a scalar `max_memory=`.
+    # See `dynamic_runner.run._dispatch_local` for the canonical shape.
+    cfg = _rs.LocalManagerConfig(
+        num_workers=1,
+        max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
+    )
     args = SimpleNamespace()
 
     binaries = [
@@ -221,7 +231,12 @@ def test_on_phase_hook_exception_does_not_abort_run(tmp_path: Path) -> None:
             raise RuntimeError("boom")
 
     task = _BadTask()
-    cfg = _rs.LocalManagerConfig(num_workers=1, max_memory=64 * 1024 * 1024)
+    # Native config takes a typed ResourceMap, not a scalar `max_memory=`.
+    # See `dynamic_runner.run._dispatch_local` for the canonical shape.
+    cfg = _rs.LocalManagerConfig(
+        num_workers=1,
+        max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
+    )
     args = SimpleNamespace()
 
     # Should not raise.
@@ -251,7 +266,12 @@ def test_on_run_start_exception_aborts_run(tmp_path: Path) -> None:
             raise RuntimeError("setup failed")
 
     task = _BadStartTask()
-    cfg = _rs.LocalManagerConfig(num_workers=1, max_memory=64 * 1024 * 1024)
+    # Native config takes a typed ResourceMap, not a scalar `max_memory=`.
+    # See `dynamic_runner.run._dispatch_local` for the canonical shape.
+    cfg = _rs.LocalManagerConfig(
+        num_workers=1,
+        max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
+    )
     args = SimpleNamespace()
 
     with pytest.raises(RuntimeError, match="setup failed"):
