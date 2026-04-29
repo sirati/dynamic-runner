@@ -29,6 +29,9 @@ pub(crate) struct PyPrimaryCoordinator {
     // list is moved into `PrimaryCoordinator::queue_stage_file` so the
     // coordinator flushes them once secondary connections are up.
     pending_stage_files: Vec<(String, String, String, String)>,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// from inside `PrimaryCoordinator::run` (Phase 5B).
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -58,6 +61,7 @@ impl PyPrimaryCoordinator {
             completed: 0,
             failed: 0,
             pending_stage_files: Vec::new(),
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
@@ -91,6 +95,21 @@ impl PyPrimaryCoordinator {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
+
+        // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
+        // and dispatch to the Python TaskDefinition's `on_phase_*`
+        // methods. Each closure owns its own ref-bumped `Py<PyAny>` so
+        // the manager owns the lifetime independent of `self`.
+        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_start(
+                self.task_definition.clone_ref(py),
+            ),
+        );
+        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_end(
+                self.task_definition.clone_ref(py),
+            ),
+        );
 
         // Pick a free port for the primary server before spawning secondaries.
         let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -167,16 +186,9 @@ impl PyPrimaryCoordinator {
                     primary.queue_stage_file(sec_id, hash, src, dest);
                 }
 
-                // Phase 5A: phase_deps now sourced from
-                // LoadedTopology. The lifecycle closures stay no-op
-                // until Phase 5B wires them to the Python
-                // TaskDefinition's `on_phase_*` methods.
-                let on_phase_start: Box<
-                    dyn FnMut(&dynrunner_core::PhaseId) + Send,
-                > = Box::new(|_| {});
-                let on_phase_end: Box<
-                    dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send,
-                > = Box::new(|_, _, _| {});
+                // phase_deps + lifecycle closures captured from the
+                // outer scope (5A built phase_deps; 5B built the
+                // GIL-reacquiring on_phase_* closures).
                 let result = primary
                     .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
                     .await;

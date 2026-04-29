@@ -46,6 +46,12 @@ pub(crate) struct PyLocalManager {
     failed_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
     oom_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
     task_payloads: Vec<(TaskInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// and call back into Python from the manager's LocalSet (Phase 5B).
+    /// `Py<PyAny>` is `Send + Sync + 'static` so it satisfies the
+    /// `FnMut + Send + 'static` bounds on `process_binaries`'s closure
+    /// arguments.
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -152,6 +158,7 @@ impl PyLocalManager {
             failed_tasks: Vec::new(),
             oom_tasks: Vec::new(),
             task_payloads: Vec::new(),
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
@@ -232,6 +239,14 @@ impl PyLocalManager {
         };
 
         let phase_deps = self.phase_deps.clone();
+        // GIL-reacquiring closures that dispatch to the Python
+        // TaskDefinition's on_phase_start / on_phase_end. Each closure
+        // owns its own ref-bumped Py<PyAny> so the manager's lifetime
+        // is independent of `self`.
+        let on_phase_start =
+            crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py));
+        let on_phase_end =
+            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py));
 
         // Run the async manager on a current-thread tokio runtime,
         // releasing the GIL during processing.
@@ -245,17 +260,14 @@ impl PyLocalManager {
             let result = rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, scheduler, estimator);
-                // Phase 5A: phase_deps now comes from the
-                // `LoadedTaskDefinition` extraction of get_phases().
-                // The user-facing phase-lifecycle hooks remain
-                // plumbing-only until the Python bridge lands in
-                // Phase 5B — pass no-op closures here.
+                // phase_deps comes from LoadedTaskDefinition (5A);
+                // on_phase_* closures bridge to Python (5B).
                 let outcome = manager
                     .process_binaries(
                         rust_binaries,
                         phase_deps,
-                        |_phase| {},
-                        |_phase, _completed, _failed| {},
+                        on_phase_start,
+                        on_phase_end,
                         &mut factory,
                     )
                     .await;
