@@ -487,6 +487,7 @@ impl<I: Identifier> PendingPool<I> {
         item
     }
 
+
     /// Notify the pool that an item finished (success or failure).
     /// Decrements in-flight count; may transition the phase
     /// `Draining → Drained` (queued for `poll_drain_transitions`).

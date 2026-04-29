@@ -209,6 +209,59 @@ fn mark_phase_done_activates_dependents() {
     assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Active));
 }
 
+/// `view_for_worker` produces the same priority order as `pop_for_worker`
+/// for a fresh worker (no affinity, no pins) — typed buckets first,
+/// free-pool last. The scheduler's chosen index commits via
+/// `take_from_view`.
+#[test]
+fn view_for_worker_orders_typed_then_free_pool() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t("P", "T", "", 9),       // free-pool item
+        t("P", "T", "alpha", 10), // typed
+    ]);
+    let view = p.view_for_worker(1);
+    assert_eq!(view.len(), 2);
+    // First entry is from the typed bucket (step 2 wins over step 3).
+    assert_eq!(view.as_slice()[0].affinity_id.as_ref().unwrap().as_str(), "alpha");
+    // Second is the free-pool item.
+    assert!(view.as_slice()[1].affinity_id.is_none());
+}
+
+/// `take_from_view` commits the scheduler's chosen index — soft-pin,
+/// in-flight, and drain bookkeeping fire just like `pop_for_worker`.
+#[test]
+fn take_from_view_commits_chosen_index() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t("P", "T", "alpha", 1),
+        t("P", "T", "alpha", 2),
+        t("P", "T", "beta", 3),
+    ]);
+    // Worker 1 sees both typed buckets.
+    let view = p.view_for_worker(1);
+    // Find the beta entry (BTreeMap key order: alpha < beta).
+    let beta_idx = view
+        .as_slice()
+        .iter()
+        .position(|t| t.affinity_id.as_ref().unwrap().as_str() == "beta")
+        .expect("beta visible");
+    let item = p.take_from_view(view, beta_idx);
+    assert_eq!(item.affinity_id.as_ref().unwrap().as_str(), "beta");
+    // Worker 1 is now pinned to beta; subsequent pop stays in beta until
+    // it drains.
+    assert_eq!(p.in_flight(&phase("P")), 1);
+}
+
+/// Empty pool → empty view; `tasks()` is `&[]`.
+#[test]
+fn view_for_worker_empty_pool() {
+    let p = pool_with(&["P"], &[]);
+    let view = p.view_for_worker(1);
+    assert!(view.is_empty());
+    assert_eq!(view.len(), 0);
+}
+
 #[test]
 fn reinject_revives_drained_phase_to_active() {
     let mut p = pool_with(&["P"], &[]);

@@ -11,11 +11,7 @@ pub(super) fn timestamp_now() -> f64 {
 pub(super) fn binary_to_distributed<I: Identifier>(
     binary: &TaskInfo<I>,
 ) -> DistributedBinaryInfo<I> {
-    DistributedBinaryInfo {
-        path: binary.path.to_string_lossy().into_owned(),
-        size: binary.size,
-        identifier: binary.identifier.clone(),
-    }
+    DistributedBinaryInfo::from_task_info(binary)
 }
 
 pub fn compute_task_hash<I: Identifier>(binary: &TaskInfo<I>) -> String {

@@ -49,8 +49,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             }
 
             let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            if self.pending_binaries.is_empty() && active_workers == 0 {
-                tracing::info!("no pending binaries and no active workers");
+            // Drain check: pool's `is_run_complete` returns true iff
+            // queued + in-flight is zero AND no phase is Active or
+            // Draining. The active-workers guard catches the edge
+            // where in-flight is zero but a worker hasn't reported
+            // completion yet (mostly defensive — `on_item_finished`
+            // runs synchronously off the wire message).
+            if self.pool().is_run_complete() && active_workers == 0 {
+                tracing::info!("pool drained and no active workers");
                 break;
             }
 

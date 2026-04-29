@@ -16,11 +16,15 @@ lifecycle from welcome → cert exchange → task distribution → completion/fa
 - Peer-to-peer discovery, timeout detection, promotion voting — all domain-agnostic.
 - `ExecuteCommand` / `CommandResult` — generic remote command execution.
 - Transport traits — fully abstract.
-- `DistributedBinaryInfo<I>` carries `path` + `size` + `identifier`
-  only; the in-process `dynrunner_core::TaskInfo<I>` additionally
-  carries `phase_id` / `type_id` / `affinity_id` / `payload`. The
-  wire type does not yet propagate those tags — Phase 4B will extend
-  it; until then, defaults are filled in on receive.
+- `DistributedBinaryInfo<I>` carries `path` + `size` + `identifier` +
+  `phase_id` (String) + `type_id` (String) + `affinity_id`
+  (`Option<String>`) + `payload_json` (String of JSON). Phase 4B
+  extended the wire so secondaries hydrate `TaskInfo<I>` with the same
+  tags the primary's `PendingPool` had — see
+  `DistributedBinaryInfo::{from_task_info, to_task_info}` for the
+  paired conversion. The new fields are `#[serde(default)]`-gated so
+  pre-4B senders still decode (their items get phase/type `"default"`,
+  no affinity, payload `null`).
 
 ## What Needs to Change
 
