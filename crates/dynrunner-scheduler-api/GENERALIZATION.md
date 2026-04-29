@@ -8,7 +8,16 @@ tasks, and returns assignment/OOM-kill decisions. Currently memory-only.
 ## What is Already Generic
 - `Scheduler<I>` — generic over identifier type.
 - `AssignmentDecision` — describes assignment with `opportunistic` flag (supports stealing).
-- `ProcessingPhase` — lifecycle phases (InitialAssignment, MainPhase, RetryPhase, etc.).
+- `ProcessingPhase` — internal manager lifecycle phases
+  (InitialAssignment, MainPhase, RetryPhase,
+  ResourcePressurePhase, UnassignedPhase, Complete). These are the
+  scheduler-side state machine and are unrelated to the
+  task-definition-declared `PhaseId` / `TaskTypeSpec` topology
+  (which lives in `dynrunner-core`).
+- Pending tasks are passed as `&[TaskInfo<I>]`; each entry carries
+  the `phase_id` / `type_id` / `affinity_id` tags set by
+  `TaskDefinition.discover_items`, so any future bucketed pool
+  built on top of this trait sees the tags without an API change.
 - Stateless design — all state passed as parameters, trivially testable.
 
 ## What Needs to Change

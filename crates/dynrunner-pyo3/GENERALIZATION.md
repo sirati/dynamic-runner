@@ -12,8 +12,11 @@ Python. It does NOT implement any logic itself.
 ## What is Already Generic (in the underlying crates)
 - All Rust crates use `I: Identifier` — fully generic over task type.
 - `WorkerPool`, `LocalManager`, schedulers, transports — all parameterized.
-- This crate is the **only place** where the generic `I` is concretized to
-  `TokenizerIdentifier`.
+- This crate concretizes `I` to `RunnerIdentifier` (an
+  `Arc<str>`-backed string composed Python-side from a stable
+  `(binary_name, platform, compiler, version, opt_level)` tuple).
+  The previous `TokenizerIdentifier` 5-field struct is kept as a
+  deprecated alias for one release.
 
 ## What Needs to Change
 
@@ -47,25 +50,21 @@ allow the Python module to be parameterized. Less practical with PyO3.
 **Recommended: Option A.** A `HashMap<String, String>` satisfies the
 `Identifier` trait bounds and is maximally flexible from Python.
 
-### 2. `PyMemoryEstimatorBridge` is memory-only
+### 2. `PyMemoryEstimatorBridge` is memory-only and per-task (not per-type)
 ```rust
-struct PyMemoryEstimatorBridge {
-    slope: f64,
-    intercept: f64,
+pub(crate) struct PyMemoryEstimatorBridge {
+    pub(crate) slope: f64,
+    pub(crate) intercept: f64,
 }
 ```
-Linear memory estimation from two probe points.
-
-**Change:** Generalize to `PyResourceEstimatorBridge`:
-```rust
-struct PyResourceEstimatorBridge {
-    estimators: HashMap<ResourceKind, LinearEstimator>,
-}
-
-struct LinearEstimator { slope: f64, intercept: f64 }
-```
-The Python `task_definition` provides `estimate_memory()` plus optional
-`estimate_cpu()`, `estimate_gpu()`, etc. Each is probed and stored.
+Linear memory estimation from two probe points of a single
+`estimate_memory(binary_size)` callable. The bridge implements
+`ResourceEstimator` and emits `ResourceMap::from([(memory, ...)])`.
+With the new `TaskTypeSpec.estimator_attr` field, downstream consumers
+can declare per-type estimator method names; resolving those into
+distinct cached bridges (and feeding them the full `TaskInfo` rather
+than `binary_size: u64`) is in flight on integration branches and
+not yet on this branch.
 
 ### 3. `MemoryStealingScheduler` is hardcoded
 The scheduler choice is not configurable from Python.

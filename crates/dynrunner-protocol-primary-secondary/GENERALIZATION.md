@@ -9,10 +9,18 @@ lifecycle from welcome → cert exchange → task distribution → completion/fa
 ## What is Already Generic
 - `DistributedMessage<I>` — generic over identifier type `I`.
 - `DistributedBinaryInfo<I>`, `TaskListEntry<I>`, `ZipFileAssignment<I>` — all generic.
+  `TaskListEntry<I>` is the wire-format counterpart to
+  `dynrunner_core::TaskInfo<I>` and was renamed from the older
+  `TaskInfo` to free that name for the in-process scheduling type.
 - `#[serde(flatten)]` on identifier for wire format.
 - Peer-to-peer discovery, timeout detection, promotion voting — all domain-agnostic.
 - `ExecuteCommand` / `CommandResult` — generic remote command execution.
 - Transport traits — fully abstract.
+- `DistributedBinaryInfo<I>` carries `path` + `size` + `identifier`
+  only; the in-process `dynrunner_core::TaskInfo<I>` additionally
+  carries `phase_id` / `type_id` / `affinity_id` / `payload`. The
+  wire type does not yet propagate those tags — Phase 4B will extend
+  it; until then, defaults are filled in on receive.
 
 ## What Needs to Change
 

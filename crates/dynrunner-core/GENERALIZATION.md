@@ -7,7 +7,16 @@ crate depends on this.
 
 ## What is Already Generic
 - `Identifier` trait — any task can plug its own identifier type.
-- `TaskInfo<I>` — generic over identifier.
+- `TaskInfo<I>` — generic over identifier. Carries
+  `path` + `size` + `identifier` + `phase_id` + `type_id` +
+  `affinity_id` + `payload`. `phase_id` / `type_id` / `affinity_id`
+  are `Arc<str>`-backed newtypes (`PhaseId` / `TypeId` /
+  `AffinityId`) that share the cheap-clone shape of `ResourceKind`.
+  `payload` is a `serde_json::Value` opaque to the framework — task
+  definitions stash per-item metadata there.
+- `PhaseId` / `TypeId` / `AffinityId` newtypes — opaque
+  task-definition-controlled string identifiers used by the
+  framework's phase scheduler and affinity pinning.
 - `FailedTask<I>` — generic over identifier.
 - `MessageSender<M>` / `MessageReceiver<M>` — fully transport-agnostic.
 - `ErrorType` — three-way classification (OOM, recoverable, non-recoverable).
@@ -72,12 +81,12 @@ pub struct ResourceAmount {
 ```
 
 ### 4. `TaskInfo` naming
-"Binary" implies an executable. The struct is really "a unit of work with an
-associated file." Consider renaming to `TaskInput<I>` or keeping `TaskInfo`
-but documenting it clearly.
-
-**Suggested:** Keep the name but add a type alias `pub type TaskInput<I> = TaskInfo<I>;`
-so consumers can use the clearer name.
+"Binary" implied an executable; the struct is really "a unit of
+work with an associated file plus the scheduling tags that decide
+where it dispatches." The crate now exposes the type as
+`TaskInfo<I>` (the `BinaryInfo` name was retired in the
+phases / types / affinity rename). A `TaskInput<I>` type alias is
+kept as a convenience for callers that prefer the clearer name.
 
 ## Python API Restoration (`db_python_provider`)
 After these changes, the Python provider must restore current behavior:
