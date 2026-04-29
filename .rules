@@ -1,0 +1,33 @@
+If run in claude code, also check .rules-zed-provided, for zed-agents they are auto injected. 
+
+## Tool Usage Rules
+- Always prefer language-python MCP tools over manually reading files or listing directories.
+- Prefer `definition` and `references` for navigating code structure and dependencies.
+- 'definition' can only find local symbols, be careful to use the python symbol name, not e.g. file names.
+- Use `rename_symbol` whenever renaming is an appropriate subtask (e.g., when you need to rename a function and update all callers).
+- Use `hover` only when code is not understood; avoid unnecessary hovers.
+- Use `diagnostics` only as a final check before ending a session; it produces noisy output so avoid relying on it for exploration.
+- When editing a file where only a small section changes: use `definition` or `references` to find the line number first, then read only the relevant lines using `offset`/`limit`,
+  not the whole file.
+- Only read full files when required for editing with no clear targeted subsection.
+- never use the lang-server-* edit-file tool, it does not integrate correctly with the IDE.
+
+Do not read files unless absolutely necessary. i.e. only read a file if it is proven that its content is required for the task at hand. Use `definition`, `references`, and `rename_symbol` to navigate and modify code without reading full files. Prefer {dir}/index.md for understanding structure. 
+
+
+before writing code always think about how to achive the cleanest solution. use `definition` and `references` to understand needed context before implementation.
+
+do not provice a summary. Do not explain changes. Do not provide other comments. Do not create readme or other markdown files unless explicitly asked for. Only minimally adjust code that requires adjustment based on the requested changes. Do not change code unrelated to the request. 
+
+Do however use the provided tools as explained by the tool documentation, if this requires you to chat, do so normally.
+
+Code should be written in a manner that allows future changes without being error prone. Avoid using strings, tuples, positional arguments, instead use dataclasses or records when approriate. Function should not return dicts if they return multiple values, instead the type hint must avoid ambiguity. Code should avoid dublicated sections, always refactor these. Do not leave section unimplemented or to implement later.
+
+When checking your code, never write code that simply prints that everything is working or correct. This does not qualify as a test or validation.
+
+
+when running nix builds please always pass max jobs = 6 max cores = 4 otherwise we will OOM
+
+when building always set the timeout to >1h as building can take a very very long time. because of this always do all other checks to avoid building, and only build if asked to
+
+whenever possible common shared code should be placed at the appropirate location for shared code. Boilerplate should be avoided by having sane default.

@@ -1,0 +1,7 @@
+# Maintainable Code
+Code always must be maintainable, and source files should be kept at single separate concern and less than 300 lines of code. If that is not fulfilled files must be split.
+Functions should usually not be longer than 50 lines, up to 150 lines are allowed. Long functions should be refactored to be more easily readable by splitting subtask and separate concerns into their own function located at a sensible and sane location.
+Extract common code into util functions, upgrade files into module folders.
+
+# No Separate Documentation
+Never create Markdown/text/text-like files to summarize or document or else. Markdown files must only be created or edited upon explicit request mentioning Markdown.
