@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender, PhaseId, TypeId};
+use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, PhaseId, TypeId};
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -29,8 +29,8 @@ impl ResourceEstimator for FixedEstimator {
     }
 }
 
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId { name: name.into() },
@@ -133,7 +133,7 @@ async fn e2e_primary_secondary_over_wss() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+        let binaries: Vec<TaskInfo<TestId>> = (0..5)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
@@ -225,7 +225,7 @@ async fn e2e_primary_secondary_over_quic() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+        let binaries: Vec<TaskInfo<TestId>> = (0..5)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 

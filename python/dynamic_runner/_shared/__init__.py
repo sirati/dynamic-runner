@@ -9,7 +9,8 @@ This package contains reusable code for:
 from .binary_filter import filter_existing_outputs
 from .binary_info import (
     BinaryFilenameFormat,
-    BinaryInfo,
+    BinaryIdentifier,
+    TaskInfo,
     FieldRegexes,
     build_binary_filename_format,
     build_field_regexes,
@@ -35,7 +36,8 @@ from .selection_args import (
 )
 
 __all__ = [
-    "BinaryInfo",
+    "TaskInfo",
+    "BinaryIdentifier",
     "BinaryFilenameFormat",
     "FieldRegexes",
     "build_binary_filename_format",

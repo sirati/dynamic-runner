@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
@@ -48,7 +48,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         self.pending_binaries.sort_by(|a, b| b.size.cmp(&a.size));
 
         // Perform initial assignment for each worker
-        let mut assignments_per_secondary: HashMap<String, Vec<(u32, BinaryInfo<I>, ResourceMap)>> =
+        let mut assignments_per_secondary: HashMap<String, Vec<(u32, TaskInfo<I>, ResourceMap)>> =
             HashMap::new();
         let mut total_assigned_resources = ResourceMap::new();
 

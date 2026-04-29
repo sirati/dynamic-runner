@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::SecondaryTransport;
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler, WorkerBudgetInfo,
@@ -42,7 +42,7 @@ pub(super) struct RemoteWorkerState<I: Identifier> {
     pub(super) worker_id: u32,
     pub(super) secondary_id: String,
     pub(super) resource_budgets: ResourceMap,
-    pub(super) current_task: Option<BinaryInfo<I>>,
+    pub(super) current_task: Option<TaskInfo<I>>,
     pub(super) estimated_resources: ResourceMap,
     pub(super) is_idle: bool,
 }
@@ -80,8 +80,8 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
 
     // Task state
     pub(super) total_tasks: usize,
-    pub(super) all_binaries: Vec<BinaryInfo<I>>,
-    pub(super) pending_binaries: Vec<BinaryInfo<I>>,
+    pub(super) all_binaries: Vec<TaskInfo<I>>,
+    pub(super) pending_binaries: Vec<TaskInfo<I>>,
     pub(super) completed_tasks: HashSet<String>,
     pub(super) failed_tasks: HashSet<String>,
 
@@ -147,7 +147,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
     }
 
     /// Run the full coordination pipeline.
-    pub async fn run(&mut self, binaries: Vec<BinaryInfo<I>>) -> Result<(), String> {
+    pub async fn run(&mut self, binaries: Vec<TaskInfo<I>>) -> Result<(), String> {
         self.all_binaries = binaries.clone();
         self.pending_binaries = binaries;
         self.total_tasks = self.pending_binaries.len();

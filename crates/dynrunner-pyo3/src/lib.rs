@@ -25,7 +25,7 @@ use managers::primary::PyPrimaryCoordinator;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
-use pytypes::{PyBinaryIdentifier, PyBinaryInfo, PyFailedTask, PyProcessingStats};
+use pytypes::{PyBinaryIdentifier, PyTaskInfo, PyFailedTask, PyProcessingStats};
 
 /// Python module definition.
 /// The compiled extension is exposed as `dynamic_runner._native`;
@@ -42,7 +42,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .try_init();
 
     m.add_class::<PyBinaryIdentifier>()?;
-    m.add_class::<PyBinaryInfo>()?;
+    m.add_class::<PyTaskInfo>()?;
     m.add_class::<PyProcessingStats>()?;
     m.add_class::<PyFailedTask>()?;
     m.add_class::<LogPathConfig>()?;

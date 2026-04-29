@@ -465,7 +465,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn promotion_hydrates_slurm_tasks_from_cache() {
         use dynrunner_core::ResourceMap;
-        use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, TaskInfo};
+        use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, TaskListEntry};
         use std::collections::HashSet;
 
         let mut sec = make_secondary(election_config("sec-a"));
@@ -474,7 +474,7 @@ mod tests {
         // Pre-seed the cache as if the live primary had broadcast
         // FullTaskList earlier in the run.
         sec.cached_full_task_list = Some((
-            vec![TaskInfo {
+            vec![TaskListEntry {
                 local_path: "bin1".into(),
                 binary_info: DistributedBinaryInfo {
                     path: "bin1".into(),

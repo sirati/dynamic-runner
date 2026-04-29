@@ -8,7 +8,7 @@ lifecycle from welcome → cert exchange → task distribution → completion/fa
 
 ## What is Already Generic
 - `DistributedMessage<I>` — generic over identifier type `I`.
-- `DistributedBinaryInfo<I>`, `TaskInfo<I>`, `ZipFileAssignment<I>` — all generic.
+- `DistributedBinaryInfo<I>`, `TaskListEntry<I>`, `ZipFileAssignment<I>` — all generic.
 - `#[serde(flatten)]` on identifier for wire format.
 - Peer-to-peer discovery, timeout detection, promotion voting — all domain-agnostic.
 - `ExecuteCommand` / `CommandResult` — generic remote command execution.

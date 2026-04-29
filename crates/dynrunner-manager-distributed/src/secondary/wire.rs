@@ -1,4 +1,4 @@
-use dynrunner_core::{BinaryInfo, Identifier, PhaseId, TypeId};
+use dynrunner_core::{TaskInfo, Identifier, PhaseId, TypeId};
 use dynrunner_protocol_primary_secondary::DistributedBinaryInfo;
 
 pub(super) fn timestamp_now() -> f64 {
@@ -10,8 +10,8 @@ pub(super) fn timestamp_now() -> f64 {
 
 // TODO(phases-4b): wire phase_id/type_id/affinity_id/payload through
 // DistributedBinaryInfo so the secondary preserves them across the network.
-pub(super) fn distributed_to_binary<I: Identifier>(info: &DistributedBinaryInfo<I>) -> BinaryInfo<I> {
-    BinaryInfo {
+pub(super) fn distributed_to_binary<I: Identifier>(info: &DistributedBinaryInfo<I>) -> TaskInfo<I> {
+    TaskInfo {
         path: std::path::PathBuf::from(&info.path),
         size: info.size,
         identifier: info.identifier.clone(),

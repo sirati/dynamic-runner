@@ -80,8 +80,8 @@ fn task_result_error() {
 }
 
 #[test]
-fn binary_info_generic() {
-    let bi = BinaryInfo {
+fn task_info_generic() {
+    let bi = TaskInfo {
         path: PathBuf::from("/tmp/test"),
         size: 1024,
         identifier: TestId("test-binary".into()),
@@ -95,8 +95,8 @@ fn binary_info_generic() {
 }
 
 #[test]
-fn binary_info_serde_roundtrip_with_phase_fields() {
-    let bi = BinaryInfo {
+fn task_info_serde_roundtrip_with_phase_fields() {
+    let bi = TaskInfo {
         path: PathBuf::from("/tmp/test"),
         size: 4096,
         identifier: TestId("rt-binary".into()),
@@ -106,7 +106,7 @@ fn binary_info_serde_roundtrip_with_phase_fields() {
         payload: serde_json::json!({"k": "v", "n": 42}),
     };
     let json = serde_json::to_string(&bi).unwrap();
-    let parsed: BinaryInfo<TestId> = serde_json::from_str(&json).unwrap();
+    let parsed: TaskInfo<TestId> = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.path, bi.path);
     assert_eq!(parsed.size, bi.size);
     assert_eq!(parsed.identifier, bi.identifier);

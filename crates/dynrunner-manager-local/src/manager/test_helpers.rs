@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use dynrunner_core::{
-    BinaryInfo, ErrorType, MessageReceiver, MessageSender, PhaseId, ResourceKind, ResourceMap,
+    TaskInfo, ErrorType, MessageReceiver, MessageSender, PhaseId, ResourceKind, ResourceMap,
     TypeId, WorkerId,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -26,8 +26,8 @@ impl ResourceEstimator for FixedEstimator {
     }
 }
 
-pub(super) fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId(name.into()),

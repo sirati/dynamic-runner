@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    BinaryInfo, FailedTask, Identifier, ResourceKind, WorkerId,
+    TaskInfo, FailedTask, Identifier, ResourceKind, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -118,7 +118,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
 
         // Move remaining pending to unassigned
         if !self.pending_binaries.is_empty() {
-            let remaining: Vec<BinaryInfo<I>> = self.pending_binaries.drain(..).collect();
+            let remaining: Vec<TaskInfo<I>> = self.pending_binaries.drain(..).collect();
             self.unassigned_tasks.extend(remaining);
         }
 

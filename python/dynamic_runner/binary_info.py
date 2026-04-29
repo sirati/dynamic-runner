@@ -7,7 +7,7 @@ from ._shared.binary_info import (
     FIELD_MAPPING,
     REQUIRED_FIELDS,
     BinaryFilenameFormat,
-    BinaryInfo,
+    TaskInfo,
     FieldRegexes,
     build_binary_filename_format,
     build_field_regexes,
@@ -19,7 +19,7 @@ from ._shared.binary_info import (
 )
 
 __all__ = [
-    "BinaryInfo",
+    "TaskInfo",
     "BinaryFilenameFormat",
     "FieldRegexes",
     "FIELD_MAPPING",

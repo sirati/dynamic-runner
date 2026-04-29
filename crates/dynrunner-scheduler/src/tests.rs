@@ -22,8 +22,8 @@ impl ResourceEstimator for LinearEstimator {
     }
 }
 
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: PathBuf::from(format!("/tmp/{name}")),
         size,
         identifier: TestId(name.into()),

@@ -13,7 +13,7 @@ class BinaryIdentifier:
 
 
 @dataclass
-class BinaryInfo:
+class TaskInfo:
     path: Path
     size: int
     identifier: BinaryIdentifier
@@ -43,7 +43,7 @@ class BinaryInfo:
         return self.identifier.opt_level
 
     def to_dict(self) -> dict:
-        """Convert BinaryInfo to dictionary representation."""
+        """Convert TaskInfo to dictionary representation."""
         return {
             "path": str(self.path),
             "size": self.size,
@@ -347,11 +347,11 @@ def format_size(size: int) -> str:
         return f"{size / (1024 * 1024 * 1024):.1f}GiB"
 
 
-def format_binary_info(binary: BinaryInfo, base_path: Path | None = None) -> str:
-    """Format BinaryInfo for display.
+def format_binary_info(binary: TaskInfo, base_path: Path | None = None) -> str:
+    """Format TaskInfo for display.
 
     Args:
-        binary: BinaryInfo to format
+        binary: TaskInfo to format
         base_path: Optional base path to compute relative path from
 
     Returns:

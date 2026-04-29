@@ -258,7 +258,7 @@ impl fmt::Display for ResourceMap {
 /// Trait alias for types that can serve as a binary identifier.
 ///
 /// Any type implementing these bounds can be used as the identifier
-/// in `BinaryInfo<I>`. The concrete identifier (e.g. with fields like
+/// in `TaskInfo<I>`. The concrete identifier (e.g. with fields like
 /// `binary_name`, `platform`, `compiler`, etc.) is defined by the
 /// task-specific crate (e.g. `dynrunner_pyo3`).
 pub trait Identifier:
@@ -281,7 +281,9 @@ impl<T> Identifier for T where
 /// instances so Rust→Python returns can be translated back to typed objects.
 pub type RunnerIdentifier = std::sync::Arc<str>;
 
-/// Information about a binary to be processed.
+/// One scheduling unit handed to the runtime: an identifier, an on-disk
+/// payload (`path` + `size`), the phase/type tag that decides where it
+/// dispatches, an optional affinity hint, and an opaque per-item payload.
 ///
 /// Generic over the identifier type `I` so different task definitions
 /// can use different identifier structures.
@@ -290,7 +292,7 @@ pub type RunnerIdentifier = std::sync::Arc<str>;
     serialize = "I: Serialize",
     deserialize = "I: for<'a> Deserialize<'a>",
 ))]
-pub struct BinaryInfo<I> {
+pub struct TaskInfo<I> {
     pub path: PathBuf,
     pub size: u64,
     pub identifier: I,
@@ -307,7 +309,7 @@ pub struct BinaryInfo<I> {
     pub payload: serde_json::Value,
 }
 
-pub type TaskInput<I> = BinaryInfo<I>;
+pub type TaskInput<I> = TaskInfo<I>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorType {
@@ -390,7 +392,7 @@ impl<R> TaskResult<R> {
 
 #[derive(Debug, Clone)]
 pub struct FailedTask<I> {
-    pub binary: BinaryInfo<I>,
+    pub binary: TaskInfo<I>,
     pub error_type: ErrorType,
     pub error_message: String,
     pub retry_count: u32,

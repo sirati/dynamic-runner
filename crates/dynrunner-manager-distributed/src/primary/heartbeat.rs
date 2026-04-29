@@ -185,7 +185,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use dynrunner_core::{BinaryInfo, PhaseId, ResourceMap, TypeId};
+    use dynrunner_core::{TaskInfo, PhaseId, ResourceMap, TypeId};
     use dynrunner_protocol_primary_secondary::DistributedMessage;
     use dynrunner_scheduler::ResourceStealingScheduler;
     use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
@@ -267,7 +267,7 @@ mod tests {
         primary.seed_keepalive("dead-sec");
 
         // Stage one in-flight task on a single virtual worker.
-        let in_flight = BinaryInfo {
+        let in_flight = TaskInfo {
             path: std::path::PathBuf::from("victim.bin"),
             size: 100,
             identifier: TestId("victim".into()),

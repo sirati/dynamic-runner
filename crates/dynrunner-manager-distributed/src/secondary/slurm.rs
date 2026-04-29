@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
-use dynrunner_core::{BinaryInfo, Identifier, PhaseId, TypeId, WorkerId};
+use dynrunner_core::{TaskInfo, Identifier, PhaseId, TypeId, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, PeerTransport, PrimaryTransport,
-    TaskInfo,
+    TaskListEntry,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -23,7 +23,7 @@ where
 {
     pub(super) fn populate_slurm_tasks(
         &mut self,
-        all_tasks: Vec<TaskInfo<I>>,
+        all_tasks: Vec<TaskListEntry<I>>,
         completed: HashSet<String>,
     ) {
         self.slurm_completed = completed.clone();
@@ -48,7 +48,7 @@ where
 
             // TODO(phases-4b): wire phase_id/type_id/affinity_id/payload through
             // TaskInfo / DistributedBinaryInfo so SLURM-primary preserves them.
-            self.slurm_pending_binaries.push(BinaryInfo {
+            self.slurm_pending_binaries.push(TaskInfo {
                 path: binary_path,
                 size: task.binary_info.size,
                 identifier: task.binary_info.identifier.clone(),
@@ -132,7 +132,7 @@ where
                 let actual_binary = match resolved {
                     // TODO(phases-4b): once DistributedBinaryInfo carries phase/type/affinity/payload,
                     // propagate them from `binary` instead of resetting to defaults.
-                    Some(path) => BinaryInfo {
+                    Some(path) => TaskInfo {
                         path,
                         size: binary.size,
                         identifier: binary.identifier.clone(),

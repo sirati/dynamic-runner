@@ -1,4 +1,4 @@
-use dynrunner_core::{BinaryInfo, Identifier, ResourceKind, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceKind, ResourceMap};
 use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, ResourcePressureDecision, Scheduler, WorkerBudgetInfo,
 };
@@ -92,7 +92,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
     fn assign_initial(
         &self,
         worker: &WorkerBudgetInfo<I>,
-        pending: &[BinaryInfo<I>],
+        pending: &[TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator,
@@ -132,7 +132,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         &self,
         worker: &WorkerBudgetInfo<I>,
         all_workers: &[WorkerBudgetInfo<I>],
-        pending: &[BinaryInfo<I>],
+        pending: &[TaskInfo<I>],
         max_resources: &ResourceMap,
         estimator: &dyn ResourceEstimator,
         _retry_attempt: bool,

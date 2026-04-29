@@ -21,7 +21,7 @@ use crate::config::worker_spec::WorkerSpec;
 use crate::pytypes::extract_binaries;
 
 /// Compute the file_hash that the Rust primary will assign to a Python
-/// `BinaryInfo` when it sends a `TaskAssignment`. The hash is stable
+/// `TaskInfo` when it sends a `TaskAssignment`. The hash is stable
 /// for a given (path, identifier) pair — pipelines pre-stage files
 /// against this hash so the secondary's `ExtractionCache` accepts the
 /// stage notification.

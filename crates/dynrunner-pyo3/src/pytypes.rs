@@ -4,7 +4,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{AffinityId, BinaryInfo, PhaseId, RunnerIdentifier, TypeId};
+use dynrunner_core::{AffinityId, TaskInfo, PhaseId, RunnerIdentifier, TypeId};
 
 /// Canonical identifier-key separator. Matches the Python
 /// `TokenizerIdentifier.identifier_key()` join order
@@ -86,10 +86,10 @@ impl From<&PyBinaryIdentifier> for RunnerIdentifier {
     }
 }
 
-/// Python-visible wrapper for BinaryInfo.
-#[pyclass(name = "BinaryInfo", from_py_object)]
+/// Python-visible wrapper for TaskInfo.
+#[pyclass(name = "TaskInfo", from_py_object)]
 #[derive(Clone)]
-pub(crate) struct PyBinaryInfo {
+pub(crate) struct PyTaskInfo {
     #[pyo3(get)]
     path: String,
     #[pyo3(get)]
@@ -110,7 +110,7 @@ pub(crate) struct PyBinaryInfo {
 }
 
 #[pymethods]
-impl PyBinaryInfo {
+impl PyTaskInfo {
     #[new]
     #[pyo3(signature = (
         path,
@@ -142,8 +142,8 @@ impl PyBinaryInfo {
     }
 }
 
-impl From<&PyBinaryInfo> for BinaryInfo<RunnerIdentifier> {
-    fn from(py: &PyBinaryInfo) -> Self {
+impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
+    fn from(py: &PyTaskInfo) -> Self {
         let phase_id = if py.phase_id.is_empty() {
             PhaseId::from("default")
         } else {
@@ -157,7 +157,7 @@ impl From<&PyBinaryInfo> for BinaryInfo<RunnerIdentifier> {
         let affinity_id = py.affinity_id.as_deref().map(AffinityId::from);
         let payload: serde_json::Value =
             serde_json::from_str(&py.payload_json).unwrap_or(serde_json::Value::Null);
-        BinaryInfo {
+        TaskInfo {
             path: PathBuf::from(&py.path),
             size: py.size,
             identifier: RunnerIdentifier::from(&py.identifier),
@@ -169,11 +169,11 @@ impl From<&PyBinaryInfo> for BinaryInfo<RunnerIdentifier> {
     }
 }
 
-impl From<&BinaryInfo<RunnerIdentifier>> for PyBinaryInfo {
-    fn from(bi: &BinaryInfo<RunnerIdentifier>) -> Self {
+impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
+    fn from(bi: &TaskInfo<RunnerIdentifier>) -> Self {
         let (binary_name, platform, compiler, version, opt_level) =
             split_identifier(&bi.identifier);
-        PyBinaryInfo {
+        PyTaskInfo {
             path: bi.path.to_string_lossy().into_owned(),
             size: bi.size,
             identifier: PyBinaryIdentifier {
@@ -208,7 +208,7 @@ pub(crate) struct PyProcessingStats {
 #[pyclass(name = "FailedTask")]
 pub(crate) struct PyFailedTask {
     #[pyo3(get)]
-    pub(crate) binary: PyBinaryInfo,
+    pub(crate) binary: PyTaskInfo,
     #[pyo3(get)]
     pub(crate) error_type: String,
     #[pyo3(get)]
@@ -217,7 +217,7 @@ pub(crate) struct PyFailedTask {
 
 pub(crate) fn extract_binaries(
     binaries: &Bound<'_, PyList>,
-) -> PyResult<Vec<BinaryInfo<RunnerIdentifier>>> {
+) -> PyResult<Vec<TaskInfo<RunnerIdentifier>>> {
     let py = binaries.py();
     // We use Python's `json.dumps` on the (potentially-arbitrary) `payload`
     // dict to bridge it through to a `serde_json::Value`. Round-tripping via
@@ -252,7 +252,7 @@ pub(crate) fn extract_binaries(
             };
 
             // Phase 2A added phase_id / type_id / affinity_id / payload to the
-            // Python BinaryInfo with safe defaults (empty strings / None / {}).
+            // Python TaskInfo with safe defaults (empty strings / None / {}).
             // Fall back to "default" / "default" / None / Null when the
             // attribute is missing so legacy callers still parse.
             let phase_id_str: String = item
@@ -289,7 +289,7 @@ pub(crate) fn extract_binaries(
                 _ => serde_json::Value::Null,
             };
 
-            Ok(BinaryInfo {
+            Ok(TaskInfo {
                 path: PathBuf::from(path),
                 size,
                 identifier,

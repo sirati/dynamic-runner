@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .binary_info import (
     BinaryIdentifier,
-    BinaryInfo,
+    TaskInfo,
     build_binary_filename_format,
     build_field_regexes,
     parse_binary_filename,
@@ -22,7 +22,7 @@ def find_matching_binaries(
     opt_regex: str | None = None,
     name_regex: str | None = None,
     exclude_subfolders: list[str] | None = None,
-) -> list[BinaryInfo]:
+) -> list[TaskInfo]:
     """Find all binaries matching the filter criteria by traversing the source directory.
 
     This function handles:
@@ -44,7 +44,7 @@ def find_matching_binaries(
         exclude_subfolders: List of subfolder patterns to exclude from traversal
 
     Returns:
-        List of BinaryInfo objects for all matching binaries found
+        List of TaskInfo objects for all matching binaries found
     """
 
     field_regexes = build_field_regexes(
@@ -76,7 +76,7 @@ def find_matching_binaries(
             else:
                 normalized_opt_levels.append(opt)
 
-    binaries: list[BinaryInfo] = []
+    binaries: list[TaskInfo] = []
 
     exclude_pattern = None
     if exclude_subfolders:
@@ -130,7 +130,7 @@ def find_matching_binaries(
 
             # Add to results
             binaries.append(
-                BinaryInfo(
+                TaskInfo(
                     path=filepath,
                     size=size,
                     identifier=BinaryIdentifier(

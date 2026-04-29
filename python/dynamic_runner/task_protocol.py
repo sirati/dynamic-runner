@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from ._shared import BinaryInfo
+from ._shared import TaskInfo
 
 
 PhaseId = str
@@ -54,7 +54,7 @@ class TaskTypeSpec:
     that returns per-item memory in bytes. Defaults to
     ``"estimate_memory"`` (one estimator shared by all types of this
     task); set it to a type-specific name to give each type its own
-    estimator. The method receives the full :class:`BinaryInfo`, not
+    estimator. The method receives the full :class:`TaskInfo`, not
     just its ``size``.
     """
 
@@ -103,11 +103,11 @@ class TaskDefinition(Protocol):
 
     def discover_items(
         self, source_dir: Path, args: Namespace
-    ) -> Iterable[BinaryInfo]: ...
+    ) -> Iterable[TaskInfo]: ...
 
     # ── Per-type plumbing ──────────────────────────────────────────────
 
-    def estimate_memory(self, item: BinaryInfo) -> int: ...
+    def estimate_memory(self, item: TaskInfo) -> int: ...
 
     def add_task_arguments(self, parser: ArgumentParser) -> None: ...
 
@@ -121,7 +121,7 @@ class TaskDefinition(Protocol):
     ) -> list[str]: ...
 
     def get_output_filename_pattern(
-        self, type_id: TypeId, item: BinaryInfo
+        self, type_id: TypeId, item: TaskInfo
     ) -> str: ...
 
     # ── Lifecycle hooks ────────────────────────────────────────────────
