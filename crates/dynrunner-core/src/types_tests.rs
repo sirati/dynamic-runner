@@ -114,3 +114,60 @@ fn resource_map_display() {
     let map = ResourceMap::from([(ResourceKind::memory(), 1024)]);
     assert_eq!(format!("{map}"), "{memory: 1024}");
 }
+
+#[test]
+fn phase_id_constructors_clone_display_serde() {
+    let a = PhaseId::new("foo");
+    let b = PhaseId::from("foo");
+    let c = PhaseId::from("foo".to_string());
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+
+    let cloned = a.clone();
+    assert!(std::ptr::eq(a.as_str().as_ptr(), cloned.as_str().as_ptr()));
+
+    assert_eq!(format!("{}", PhaseId::from("x")), "x");
+
+    let json = serde_json::to_string(&PhaseId::from("x")).unwrap();
+    assert_eq!(json, "\"x\"");
+    let parsed: PhaseId = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, PhaseId::from("x"));
+}
+
+#[test]
+fn type_id_constructors_clone_display_serde() {
+    let a = TypeId::new("foo");
+    let b = TypeId::from("foo");
+    let c = TypeId::from("foo".to_string());
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+
+    let cloned = a.clone();
+    assert!(std::ptr::eq(a.as_str().as_ptr(), cloned.as_str().as_ptr()));
+
+    assert_eq!(format!("{}", TypeId::from("x")), "x");
+
+    let json = serde_json::to_string(&TypeId::from("x")).unwrap();
+    assert_eq!(json, "\"x\"");
+    let parsed: TypeId = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, TypeId::from("x"));
+}
+
+#[test]
+fn affinity_id_constructors_clone_display_serde() {
+    let a = AffinityId::new("foo");
+    let b = AffinityId::from("foo");
+    let c = AffinityId::from("foo".to_string());
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+
+    let cloned = a.clone();
+    assert!(std::ptr::eq(a.as_str().as_ptr(), cloned.as_str().as_ptr()));
+
+    assert_eq!(format!("{}", AffinityId::from("x")), "x");
+
+    let json = serde_json::to_string(&AffinityId::from("x")).unwrap();
+    assert_eq!(json, "\"x\"");
+    let parsed: AffinityId = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, AffinityId::from("x"));
+}
