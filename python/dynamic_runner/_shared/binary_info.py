@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -17,6 +17,10 @@ class BinaryInfo:
     path: Path
     size: int
     identifier: BinaryIdentifier
+    phase_id: str = ""
+    type_id: str = ""
+    affinity_id: str | None = None
+    payload: dict = field(default_factory=dict)
 
     @property
     def binary_name(self) -> str:
@@ -48,6 +52,10 @@ class BinaryInfo:
             "compiler": self.identifier.compiler,
             "version": self.identifier.version,
             "opt_level": self.identifier.opt_level,
+            "phase_id": self.phase_id,
+            "type_id": self.type_id,
+            "affinity_id": self.affinity_id,
+            "payload": self.payload,
         }
 
 

@@ -3,7 +3,7 @@ packages (e.g. `dynamic_runner_tokenizer`).
 
 Public surface:
 - `run(task, ...)` — the canonical Python entry point.
-- `TaskDefinition`, `Phase`, `StageDefinition` — Protocol + dataclass for
+- `TaskDefinition`, `PhaseSpec`, `TaskTypeSpec` — Protocol + dataclasses for
   task packages.
 - `make_subprocess_spawn_factory(package_name)` — convenience factory for
   the `spawn_secondary` callback.
@@ -16,14 +16,13 @@ Public surface:
   `dynamic_runner._native` and re-exported here: `run_local`,
   `run_distributed`, `run_primary`, `run_secondary`, `compute_task_hash`,
   the config dataclasses, and the `Rust*Manager`/`Rust*Coordinator`
-  classes. The native `Phase` and `BinaryInfo` collide with the Python
-  Protocol+dataclass forms above; reach them as
-  `dynamic_runner._native.Phase` / `_native.BinaryInfo` if needed.
+  classes. The native `BinaryInfo` collides with the Python dataclass
+  form above; reach it as `dynamic_runner._native.BinaryInfo` if needed.
 """
 
 from .run import run
 from .spawn_secondary import make_subprocess_spawn_factory
-from .task_protocol import Phase, StageDefinition, TaskDefinition
+from .task_protocol import PhaseSpec, TaskDefinition, TaskTypeSpec
 
 from ._native import (
     BinaryIdentifier,
@@ -54,8 +53,8 @@ __all__ = [
     "run",
     "make_subprocess_spawn_factory",
     "TaskDefinition",
-    "Phase",
-    "StageDefinition",
+    "PhaseSpec",
+    "TaskTypeSpec",
     "BinaryIdentifier",
     "DistributedConfig",
     "FailedTask",
