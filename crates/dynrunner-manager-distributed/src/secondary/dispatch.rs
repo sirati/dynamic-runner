@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
@@ -17,7 +17,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn dispatch_message(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
@@ -65,15 +65,14 @@ where
                     return Ok(());
                 }
 
-                let binary = match resolved_path {
-                    Some(path) => BinaryInfo {
-                        path,
-                        size: binary_info.size,
-                        identifier: binary_info.identifier.clone(),
-                    },
-                    None => distributed_to_binary(&binary_info),
-                };
-                let estimated = self.estimator.estimate(binary.size);
+                // Hydrate from the wire info first (preserves
+                // phase/type/affinity/payload), then override the path
+                // if extraction-cache resolution found a local copy.
+                let mut binary = distributed_to_binary(&binary_info);
+                if let Some(path) = resolved_path {
+                    binary.path = path;
+                }
+                let estimated = self.estimator.estimate(&binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
 
                 // Find the target worker — prefer the requested one, fall back to any idle
@@ -199,6 +198,7 @@ where
                 all_tasks,
                 completed_tasks,
                 pending_tasks,
+                phase_deps,
                 ..
             } => {
                 let completed_set: HashSet<String> = completed_tasks.into_iter().collect();
@@ -206,16 +206,22 @@ where
                     total = all_tasks.len(),
                     completed = completed_set.len(),
                     pending = pending_tasks.len(),
+                    phases = phase_deps.len(),
                     "received full task list"
                 );
 
                 // Cache on every secondary: if we get promoted later we
-                // can populate slurm_pending_binaries directly from this
-                // snapshot without depending on a (then-dead) primary.
-                self.cached_full_task_list = Some((all_tasks.clone(), completed_set.clone()));
+                // can rebuild the SLURM-primary `PendingPool` from this
+                // snapshot (the live primary may by then be dead, so we
+                // can't ask for it again).
+                self.cached_full_task_list = Some((
+                    all_tasks.clone(),
+                    completed_set.clone(),
+                    phase_deps.clone(),
+                ));
 
                 if self.is_slurm_primary {
-                    self.populate_slurm_tasks(all_tasks, completed_set);
+                    self.populate_slurm_tasks(all_tasks, completed_set, phase_deps);
                 }
                 Ok(())
             }

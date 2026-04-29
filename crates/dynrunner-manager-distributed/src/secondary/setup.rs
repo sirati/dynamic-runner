@@ -1,5 +1,5 @@
 
-use dynrunner_core::{BinaryInfo, Identifier};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
@@ -17,7 +17,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn initialize_workers(
@@ -160,16 +160,15 @@ where
                 .extraction_cache
                 .resolve_binary(zip_ref, &local_path, &hash);
 
-            let binary = match resolved_path {
-                Some(path) => BinaryInfo {
-                    path,
-                    size: binary_info.size,
-                    identifier: binary_info.identifier.clone(),
-                },
-                None => distributed_to_binary(&binary_info),
-            };
+            // Hydrate from the wire info first (preserves
+            // phase/type/affinity/payload), then override the path
+            // if extraction-cache resolution found a local copy.
+            let mut binary = distributed_to_binary(&binary_info);
+            if let Some(path) = resolved_path {
+                binary.path = path;
+            }
 
-            let estimated = self.estimator.estimate(binary.size);
+            let estimated = self.estimator.estimate(&binary);
 
             if (wid as usize) < self.pool.workers.len() && self.pool.workers[wid as usize].is_idle_state() {
                 match self.pool.workers[wid as usize]

@@ -14,7 +14,7 @@ use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
 use crate::network::{detect_ipv4, gethostname};
 use crate::subprocess_factory::SubprocessWorkerFactory;
-use crate::task_def::LoadedTaskDefinition;
+use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 
 #[pyclass(name = "RustSecondaryCoordinator")]
 pub(crate) struct PySecondaryCoordinator {
@@ -37,11 +37,9 @@ pub(crate) struct PySecondaryCoordinator {
     /// `None` falls back to a system tempdir under
     /// `db_secondary_<id>` (the historical default).
     src_tmp: Option<PathBuf>,
-    worker_module: String,
-    worker_cmd_args: Vec<String>,
+    types: TypeRegistry,
     skip_existing: bool,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
     completed: u32,
 }
 
@@ -105,11 +103,9 @@ impl PySecondaryCoordinator {
             distributed_config: distributed_config.unwrap_or_default(),
             src_network,
             src_tmp,
-            worker_module: task.worker_module,
-            worker_cmd_args: task.worker_cmd_args,
+            types: task.types,
             skip_existing,
-            estimator_slope: task.estimator.slope,
-            estimator_intercept: task.estimator.intercept,
+            estimator: task.estimator,
             completed: 0,
         })
     }
@@ -120,8 +116,7 @@ impl PySecondaryCoordinator {
         let secondary_id = self.secondary_id.clone();
         let num_workers = self.num_workers;
         let ram_bytes = self.ram_bytes;
-        let slope = self.estimator_slope;
-        let intercept = self.estimator_intercept;
+        let estimator = self.estimator.clone();
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
@@ -134,8 +129,17 @@ impl PySecondaryCoordinator {
         let dist_connect_retry_delay = self.distributed_config.connect_retry_delay();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
-        let worker_module = self.worker_module.clone();
-        let worker_cmd_args = self.worker_cmd_args.clone();
+        // TODO(phase-5a-followup): worker subprocesses currently use the
+        // first type's worker_module + cmd_args; restart-on-type-shift
+        // is not yet implemented. The factory will need a per-type
+        // dispatch path that consults the full TypeRegistry.
+        let first_type = self.types.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "task_definition.get_phases() yielded zero TaskTypeSpec entries",
+            )
+        })?;
+        let worker_module = first_type.worker_module.clone();
+        let worker_cmd_args = first_type.cmd_args.clone();
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
@@ -236,8 +240,6 @@ impl PySecondaryCoordinator {
                     peer_timeout: dist_peer_timeout,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
-
-                let estimator = PyMemoryEstimatorBridge { slope, intercept };
 
                 let mut factory = SubprocessWorkerFactory {
                     python_executable,

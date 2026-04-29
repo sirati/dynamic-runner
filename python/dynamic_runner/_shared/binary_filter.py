@@ -1,19 +1,19 @@
 from collections.abc import Callable
 from pathlib import Path
 
-from .binary_info import BinaryInfo
+from .binary_info import TaskInfo
 
 
 def filter_existing_outputs(
-    binaries: list[BinaryInfo],
+    binaries: list[TaskInfo],
     source_dir: Path,
     output_dir: Path,
     output_filename_fn: Callable[[str], str],
-) -> tuple[list[BinaryInfo], int]:
+) -> tuple[list[TaskInfo], int]:
     """Filter out binaries that already have output files.
 
     Args:
-        binaries: List of BinaryInfo objects to filter
+        binaries: List of TaskInfo objects to filter
         source_dir: Source directory path
         output_dir: Output directory path
         output_filename_fn: Function that takes input filename and returns expected output filename

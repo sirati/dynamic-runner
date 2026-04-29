@@ -1,5 +1,5 @@
 
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport,
@@ -12,7 +12,7 @@ use dynrunner_scheduler_api::{
 use super::PrimaryCoordinator;
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn handle_task_request(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
             ref secondary_id,
@@ -48,8 +48,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                     self.workers[idx].resource_budgets = available_res.clone();
                 }
 
-                // Try to assign from local pending
-                if !self.pending_binaries.is_empty() {
+                // Try to assign from local pending. The pool's
+                // `view_for_worker` returns the soft-pin priority order
+                // for this worker; the scheduler picks the index, the
+                // pool commits the take.
+                let global_wid = self.workers[idx].worker_id;
+                let view = self.pool().view_for_worker(global_wid);
+                if !view.is_empty() {
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
                         self.workers.iter().map(|w| w.budget_info()).collect();
@@ -58,7 +63,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                     let decision = self.scheduler.assign_normal(
                         &worker_info,
                         &all_infos,
-                        &self.pending_binaries,
+                        view.as_slice(),
                         &max_res,
                         &self.estimator,
                         false,
@@ -70,7 +75,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                         ..
                     } = decision
                     {
-                        let binary = self.pending_binaries.remove(binary_index);
+                        let binary = self.pool_mut().take_from_view(view, binary_index);
                         let sec_id = self.workers[idx].secondary_id.clone();
                         self.workers[idx].current_task = Some(binary.clone());
                         self.workers[idx].estimated_resources = estimated_usage;
@@ -119,18 +124,27 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         {
             self.completed_tasks.insert(task_hash);
 
-            // Mark the specific worker idle using secondary_id + local worker_id
+            // Mark the specific worker idle using secondary_id + local worker_id.
+            // Capture the phase of the just-finished item so we can fold it
+            // into per-phase counters and run the phase lifecycle cascade.
+            let mut completed_phase: Option<dynrunner_core::PhaseId> = None;
             let mut local_idx: u32 = 0;
             for w in &mut self.workers {
                 if w.secondary_id == secondary_id {
                     if local_idx == worker_id {
-                        w.current_task = None;
+                        if let Some(task) = w.current_task.take() {
+                            completed_phase = Some(task.phase_id.clone());
+                        }
                         w.estimated_resources = ResourceMap::new();
                         w.is_idle = true;
                         break;
                     }
                     local_idx += 1;
                 }
+            }
+
+            if let Some(phase) = completed_phase {
+                self.note_item_completed(&phase);
             }
 
             tracing::debug!(
@@ -154,7 +168,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         {
             // Find the specific worker and recover the binary if it's a
             // recoverable error so it can be re-assigned to another worker.
-            let mut recovered_binary: Option<BinaryInfo<I>> = None;
+            let mut recovered_binary: Option<TaskInfo<I>> = None;
             let mut local_idx: u32 = 0;
             for w in &mut self.workers {
                 if w.secondary_id == secondary_id {
@@ -169,7 +183,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             }
 
             if error_type == "Recoverable" {
-                // Re-enqueue recoverable failures for assignment to another worker
+                // Re-enqueue recoverable failures for assignment to another
+                // worker. Pool's `requeue` decrements in-flight and inserts
+                // at the FRONT of the bucket — same retry semantics as the
+                // pre-pool Vec push, just bucket-aware.
                 if let Some(binary) = recovered_binary {
                     tracing::info!(
                         secondary = %secondary_id,
@@ -177,14 +194,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                         error = %error_message,
                         "recoverable failure, re-enqueuing task"
                     );
-                    self.pending_binaries.push(binary);
+                    self.pool_mut().requeue(binary);
                 } else {
                     // Can't recover — no binary info available
                     self.failed_tasks.insert(task_hash);
                 }
             } else {
-                // Non-recoverable: permanently mark as failed
+                // Non-recoverable: permanently mark as failed and drain
+                // the phase counter so on_phase_end fires correctly.
                 self.failed_tasks.insert(task_hash);
+                if let Some(binary) = recovered_binary {
+                    self.note_item_failed(&binary.phase_id);
+                }
             }
 
             tracing::warn!(

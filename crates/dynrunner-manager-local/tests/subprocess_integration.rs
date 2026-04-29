@@ -13,7 +13,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, WorkerId};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, WorkerFactory};
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
@@ -63,7 +63,16 @@ async fn single_worker_subprocess_processes_all() {
             FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -228,7 +237,16 @@ async fn single_worker_named_socket_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -271,7 +289,7 @@ async fn multi_worker_named_socket_processes_all() {
             children: Vec::new(),
         };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+        let binaries: Vec<TaskInfo<TestId>> = (0..8)
             .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
             .collect();
 
@@ -281,7 +299,16 @@ async fn multi_worker_named_socket_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);
@@ -322,7 +349,7 @@ async fn multi_worker_subprocess_processes_all() {
             children: Vec::new(),
         };
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..8)
+        let binaries: Vec<TaskInfo<TestId>> = (0..8)
             .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 50))
             .collect();
 
@@ -332,7 +359,16 @@ async fn multi_worker_subprocess_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);

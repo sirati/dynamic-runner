@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use dynrunner_core::WorkerId;
+use dynrunner_core::{PhaseId, TypeId, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -9,24 +9,28 @@ use super::*;
 struct TestId(String);
 
 struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _binary_size: u64) -> ResourceMap {
+impl ResourceEstimator<TestId> for FixedEstimator {
+    fn estimate(&self, _task: &TaskInfo<TestId>) -> ResourceMap {
         ResourceMap::from([(ResourceKind::memory(), self.0)])
     }
 }
 
 struct LinearEstimator;
-impl ResourceEstimator for LinearEstimator {
-    fn estimate(&self, binary_size: u64) -> ResourceMap {
-        ResourceMap::from([(ResourceKind::memory(), binary_size * 2)])
+impl ResourceEstimator<TestId> for LinearEstimator {
+    fn estimate(&self, task: &TaskInfo<TestId>) -> ResourceMap {
+        ResourceMap::from([(ResourceKind::memory(), task.size * 2)])
     }
 }
 
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: PathBuf::from(format!("/tmp/{name}")),
         size,
         identifier: TestId(name.into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 

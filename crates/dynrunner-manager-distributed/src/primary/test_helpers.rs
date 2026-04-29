@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{BinaryInfo, Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::{TaskInfo, Identifier, MessageReceiver, MessageSender, PhaseId, TypeId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
@@ -22,17 +22,21 @@ pub(super) struct TestId(pub String);
 #[derive(Clone)]
 pub(super) struct FixedEstimator(pub u64);
 
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _size: u64) -> dynrunner_core::ResourceMap {
+impl ResourceEstimator<TestId> for FixedEstimator {
+    fn estimate(&self, _task: &TaskInfo<TestId>) -> dynrunner_core::ResourceMap {
         dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.0)])
     }
 }
 
-pub(super) fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId(name.into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 

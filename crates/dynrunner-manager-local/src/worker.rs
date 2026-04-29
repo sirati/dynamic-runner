@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use dynrunner_core::{
-    BinaryInfo, ErrorType, Identifier, ResourceMap, TaskResult, WorkerId,
+    TaskInfo, ErrorType, Identifier, ResourceMap, TaskResult, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 
@@ -25,13 +25,13 @@ pub enum WorkerEvent<I: Identifier> {
         /// Opaque task-specific payload (the bytes after `done:` on the wire).
         /// `None` if the worker sent a bare `done`.
         result_data: Option<Vec<u8>>,
-        binary: Option<BinaryInfo<I>>,
+        binary: Option<TaskInfo<I>>,
         estimated_resources: ResourceMap,
     },
     Disconnected {
         worker_id: WorkerId,
         result: TaskResult,
-        binary: Option<BinaryInfo<I>>,
+        binary: Option<TaskInfo<I>>,
     },
     PhaseUpdate {
         worker_id: WorkerId,
@@ -54,7 +54,7 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub worker_id: WorkerId,
     pub reserved_budgets: ResourceMap,
     pub estimated_resources: ResourceMap,
-    pub current_binary: Option<BinaryInfo<I>>,
+    pub current_binary: Option<TaskInfo<I>>,
     pub opportunistic: bool,
     pub has_initial_assignment: bool,
     pub idle: bool,
@@ -172,7 +172,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// events for all workers from a single channel without blocking.
     pub async fn assign_task(
         &mut self,
-        binary: BinaryInfo<I>,
+        binary: TaskInfo<I>,
         estimated_resources: ResourceMap,
         opportunistic: bool,
     ) -> Result<(), String> {
@@ -217,7 +217,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     async fn poll_loop(
         mut processing: RunnerProtocol<Processing, M>,
         worker_id: WorkerId,
-        binary: BinaryInfo<I>,
+        binary: TaskInfo<I>,
         estimated_resources: ResourceMap,
         tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     ) -> RunnerProtocolState<M> {

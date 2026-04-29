@@ -8,11 +8,23 @@ lifecycle from welcome → cert exchange → task distribution → completion/fa
 
 ## What is Already Generic
 - `DistributedMessage<I>` — generic over identifier type `I`.
-- `DistributedBinaryInfo<I>`, `TaskInfo<I>`, `ZipFileAssignment<I>` — all generic.
+- `DistributedBinaryInfo<I>`, `TaskListEntry<I>`, `ZipFileAssignment<I>` — all generic.
+  `TaskListEntry<I>` is the wire-format counterpart to
+  `dynrunner_core::TaskInfo<I>` and was renamed from the older
+  `TaskInfo` to free that name for the in-process scheduling type.
 - `#[serde(flatten)]` on identifier for wire format.
 - Peer-to-peer discovery, timeout detection, promotion voting — all domain-agnostic.
 - `ExecuteCommand` / `CommandResult` — generic remote command execution.
 - Transport traits — fully abstract.
+- `DistributedBinaryInfo<I>` carries `path` + `size` + `identifier` +
+  `phase_id` (String) + `type_id` (String) + `affinity_id`
+  (`Option<String>`) + `payload_json` (String of JSON). Phase 4B
+  extended the wire so secondaries hydrate `TaskInfo<I>` with the same
+  tags the primary's `PendingPool` had — see
+  `DistributedBinaryInfo::{from_task_info, to_task_info}` for the
+  paired conversion. The new fields are `#[serde(default)]`-gated so
+  pre-4B senders still decode (their items get phase/type `"default"`,
+  no affinity, payload `null`).
 
 ## What Needs to Change
 

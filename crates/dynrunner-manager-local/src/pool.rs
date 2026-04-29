@@ -13,7 +13,7 @@ pub enum ResourcePressureResult<I: Identifier> {
     /// (e.g. requeue locally or report failure to primary).
     Killed {
         worker_id: WorkerId,
-        binary: Option<dynrunner_core::BinaryInfo<I>>,
+        binary: Option<dynrunner_core::TaskInfo<I>>,
         reason: String,
     },
     /// No action needed — resources are within limits.

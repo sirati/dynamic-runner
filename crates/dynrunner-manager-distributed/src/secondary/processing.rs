@@ -19,7 +19,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn process_tasks(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
@@ -139,6 +139,12 @@ where
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
                     self.completed_tasks.insert(hash.clone());
+                    // Drive the SLURM-primary's phase machine if this
+                    // node is acting as one and dispatched the task —
+                    // a no-op otherwise. Mid-run firing is what
+                    // unblocks chained phases in the SLURM-primary
+                    // pool.
+                    self.note_slurm_item_completed(&hash);
 
                     if result.success {
                         // Report completion to primary

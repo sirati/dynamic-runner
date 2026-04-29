@@ -8,7 +8,16 @@ tasks, and returns assignment/OOM-kill decisions. Currently memory-only.
 ## What is Already Generic
 - `Scheduler<I>` — generic over identifier type.
 - `AssignmentDecision` — describes assignment with `opportunistic` flag (supports stealing).
-- `ProcessingPhase` — lifecycle phases (InitialAssignment, MainPhase, RetryPhase, etc.).
+- `ProcessingPhase` — internal manager lifecycle phases
+  (InitialAssignment, MainPhase, RetryPhase,
+  ResourcePressurePhase, UnassignedPhase, Complete). These are the
+  scheduler-side state machine and are unrelated to the
+  task-definition-declared `PhaseId` / `TaskTypeSpec` topology
+  (which lives in `dynrunner-core`).
+- Pending tasks are passed as `&[TaskInfo<I>]`; each entry carries
+  the `phase_id` / `type_id` / `affinity_id` tags set by
+  `TaskDefinition.discover_items`, so any future bucketed pool
+  built on top of this trait sees the tags without an API change.
 - Stateless design — all state passed as parameters, trivially testable.
 
 ## What Needs to Change
@@ -33,7 +42,7 @@ pub struct WorkerBudgetInfo<I: Identifier> {
     pub is_idle: bool,
     pub is_opportunistic: bool,
     pub has_initial_assignment: bool,
-    pub current_task: Option<BinaryInfo<I>>,
+    pub current_task: Option<TaskInfo<I>>,
     pub estimated_usage: ResourceMap,      // estimated per resource kind
 }
 ```
@@ -66,7 +75,7 @@ fn assign_normal(
     &self,
     worker: &WorkerBudgetInfo<I>,
     all_workers: &[WorkerBudgetInfo<I>],
-    pending: &[BinaryInfo<I>],
+    pending: &[TaskInfo<I>],
     max_resources: &ResourceMap,
     estimator: &dyn ResourceEstimator,
     retry_attempt: bool,

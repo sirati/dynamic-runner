@@ -5,17 +5,25 @@ use super::test_helpers::{
     fake_secondary, make_binary, setup_test, FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
 };
 use super::*;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, MessageType, PeerTransport};
-use dynrunner_manager_local::WorkerFactory;
-use dynrunner_core::{MessageReceiver, MessageSender};
-use dynrunner_protocol_manager_worker::{Command, Response};
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{
-    channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd,
+    ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd,
 };
 use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
 use std::collections::HashMap;
 use tokio::sync::mpsc as tokio_mpsc;
+
+/// Phase 4b: tests that don't care about phase lifecycle pass an empty
+/// dep map and no-op closures. Centralised here so individual tests
+/// stay focused on the wire-flow they actually exercise.
+fn noop_phase_args() -> (
+    HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>,
+    OnPhaseStart,
+    OnPhaseEnd,
+) {
+    (HashMap::new(), Box::new(|_| {}), Box::new(|_, _, _| {}))
+}
 
 
 #[tokio::test(flavor = "current_thread")]
@@ -56,7 +64,7 @@ async fn single_secondary_processes_all_tasks() {
             ));
         }
 
-        primary.run(binaries).await.unwrap();
+        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
 
         assert_eq!(primary.completed_count(), 3);
         assert_eq!(primary.failed_count(), 0);
@@ -85,7 +93,7 @@ async fn two_secondaries_distribute_work() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+        let binaries: Vec<TaskInfo<TestId>> = (0..6)
             .map(|i| make_binary(&format!("bin_{i}"), 100))
             .collect();
 
@@ -99,7 +107,7 @@ async fn two_secondaries_distribute_work() {
             ));
         }
 
-        primary.run(binaries).await.unwrap();
+        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
 
         assert_eq!(primary.completed_count(), 6);
         assert_eq!(primary.failed_count(), 0);
@@ -201,11 +209,11 @@ async fn e2e_primary_and_secondary_single_node() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+        let binaries: Vec<TaskInfo<TestId>> = (0..5)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
-        primary.run(binaries).await.unwrap();
+        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
 
         let completed = primary.completed_count();
         let failed = primary.failed_count();
@@ -270,11 +278,11 @@ async fn e2e_primary_and_two_secondaries() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..10)
+        let binaries: Vec<TaskInfo<TestId>> = (0..10)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
-        primary.run(binaries).await.unwrap();
+        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
 
         let completed = primary.completed_count();
         let failed = primary.failed_count();
@@ -320,7 +328,7 @@ async fn live_distribution_continues_past_initial_batch() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..20)
+        let binaries: Vec<TaskInfo<TestId>> = (0..20)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
@@ -334,7 +342,7 @@ async fn live_distribution_continues_past_initial_batch() {
             ));
         }
 
-        primary.run(binaries).await.unwrap();
+        { let (deps, ops, ope) = noop_phase_args(); primary.run(binaries, deps, ops, ope).await.unwrap() };
 
         // All 20 must complete; ≥ 18 went via the operational TaskRequest
         // → TaskAssignment loop (one secondary × 2 workers = 2 initial).

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
@@ -14,7 +14,7 @@ use crate::state::SecondaryConnectionState;
 use super::{PrimaryCoordinator, RemoteWorkerState};
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
         tracing::info!("performing initial assignment");
 
@@ -44,20 +44,25 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             }
         }
 
-        // Sort pending by size descending for better packing
-        self.pending_binaries.sort_by(|a, b| b.size.cmp(&a.size));
-
-        // Perform initial assignment for each worker
-        let mut assignments_per_secondary: HashMap<String, Vec<(u32, BinaryInfo<I>, ResourceMap)>> =
+        // Perform initial assignment for each worker. The pool is
+        // pre-sorted by `run()` (size DESC) and bucketed by
+        // `(phase, type, affinity)`; per-worker visibility is the
+        // `view_for_worker` slice the scheduler chooses from.
+        let mut assignments_per_secondary: HashMap<String, Vec<(u32, TaskInfo<I>, ResourceMap)>> =
             HashMap::new();
         let mut total_assigned_resources = ResourceMap::new();
 
         for worker_idx in 0..self.workers.len() {
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
+            let global_wid = self.workers[worker_idx].worker_id;
+            let view = self.pool().view_for_worker(global_wid);
+            if view.is_empty() {
+                continue;
+            }
             let decision = self.scheduler.assign_initial(
                 &worker_info,
-                &self.pending_binaries,
+                view.as_slice(),
                 &total_assigned_resources,
                 &max_res,
                 &self.estimator,
@@ -69,7 +74,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
                 ..
             } = decision
             {
-                let binary = self.pending_binaries.remove(binary_index);
+                let binary = self.pool_mut().take_from_view(view, binary_index);
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();
@@ -144,7 +149,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         let assigned: usize = assignments_per_secondary.values().map(|v| v.len()).sum();
         tracing::info!(
             assigned,
-            remaining = self.pending_binaries.len(),
+            remaining = self.pool().len(),
             "initial assignment complete"
         );
 

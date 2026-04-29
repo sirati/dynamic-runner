@@ -51,6 +51,118 @@ impl From<String> for ResourceKind {
     }
 }
 
+/// Opaque identifier for one phase declared by a TaskDefinition.
+///
+/// Phases group items that share an ordering barrier; the framework
+/// gates dispatch at phase boundaries based on `PhaseSpec.depends_on`.
+/// `PhaseId` is just a thin newtype around `Arc<str>` so the same
+/// id can be cheaply shared across thousands of items.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct PhaseId(Arc<str>);
+
+impl PhaseId {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PhaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for PhaseId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for PhaseId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+/// Opaque identifier for one task type within a phase.
+///
+/// A `TaskTypeSpec` binds a `TypeId` to a worker entry-point and
+/// per-type memory estimator; the framework dispatches items to the
+/// worker matching their `type_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct TypeId(Arc<str>);
+
+impl TypeId {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for TypeId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for TypeId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+/// Opaque identifier for a soft worker-pinning class.
+///
+/// Items sharing an `AffinityId` prefer the same worker so kernel
+/// page-cache reuse is realized; pinning is soft — a worker never
+/// refuses work to stay busy when its bucket is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct AffinityId(Arc<str>);
+
+impl AffinityId {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AffinityId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for AffinityId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for AffinityId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
 /// A quantity of a specific resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceAmount {
@@ -146,7 +258,7 @@ impl fmt::Display for ResourceMap {
 /// Trait alias for types that can serve as a binary identifier.
 ///
 /// Any type implementing these bounds can be used as the identifier
-/// in `BinaryInfo<I>`. The concrete identifier (e.g. with fields like
+/// in `TaskInfo<I>`. The concrete identifier (e.g. with fields like
 /// `binary_name`, `platform`, `compiler`, etc.) is defined by the
 /// task-specific crate (e.g. `dynrunner_pyo3`).
 pub trait Identifier:
@@ -169,7 +281,9 @@ impl<T> Identifier for T where
 /// instances so Rust→Python returns can be translated back to typed objects.
 pub type RunnerIdentifier = std::sync::Arc<str>;
 
-/// Information about a binary to be processed.
+/// One scheduling unit handed to the runtime: an identifier, an on-disk
+/// payload (`path` + `size`), the phase/type tag that decides where it
+/// dispatches, an optional affinity hint, and an opaque per-item payload.
 ///
 /// Generic over the identifier type `I` so different task definitions
 /// can use different identifier structures.
@@ -178,13 +292,24 @@ pub type RunnerIdentifier = std::sync::Arc<str>;
     serialize = "I: Serialize",
     deserialize = "I: for<'a> Deserialize<'a>",
 ))]
-pub struct BinaryInfo<I> {
+pub struct TaskInfo<I> {
     pub path: PathBuf,
     pub size: u64,
     pub identifier: I,
+    /// Which phase declared by `TaskDefinition.get_phases()` this item belongs to.
+    /// Items only dispatch when their phase is active.
+    pub phase_id: PhaseId,
+    /// Which task type within the phase. Selects the worker module + memory estimator.
+    pub type_id: TypeId,
+    /// Optional soft worker-pinning class. Items with the same `Some(id)` prefer
+    /// the same worker for kernel page-cache reuse; `None` joins the free pool.
+    pub affinity_id: Option<AffinityId>,
+    /// Opaque per-item data passed through to the worker. The framework never
+    /// inspects this; consumers can stash JSON-serializable metadata here.
+    pub payload: serde_json::Value,
 }
 
-pub type TaskInput<I> = BinaryInfo<I>;
+pub type TaskInput<I> = TaskInfo<I>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorType {
@@ -267,7 +392,7 @@ impl<R> TaskResult<R> {
 
 #[derive(Debug, Clone)]
 pub struct FailedTask<I> {
-    pub binary: BinaryInfo<I>,
+    pub binary: TaskInfo<I>,
     pub error_type: ErrorType,
     pub error_message: String,
     pub retry_count: u32,

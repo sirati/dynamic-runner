@@ -1,13 +1,27 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, PhaseId, ResourceMap};
 use dynrunner_protocol_primary_secondary::SecondaryTransport;
 use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler, WorkerBudgetInfo,
+    PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
 
 use crate::state::SecondaryConnectionState;
+
+/// Per-phase lifecycle hook invoked by the coordinator when a phase
+/// flips Blocked → Active. The pyo3 layer (Phase 5B) wires this to the
+/// Python `TaskDefinition.on_phase_start` so user code can spin up
+/// per-phase resources (e.g. dedicated worker pools, dataset shards)
+/// before items dispatch.
+pub type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
+
+/// Per-phase lifecycle hook invoked when a phase reaches Drained
+/// (`queued == 0` and `in_flight == 0`). Receives the phase id, plus
+/// counts of completed and failed items in that phase. The pyo3 layer
+/// (Phase 5B) wires this to `TaskDefinition.on_phase_end` so user code
+/// can finalise per-phase aggregates before the next phase activates.
+pub type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32) + Send>;
 
 /// Configuration for the primary coordinator.
 pub struct PrimaryConfig {
@@ -42,7 +56,7 @@ pub(super) struct RemoteWorkerState<I: Identifier> {
     pub(super) worker_id: u32,
     pub(super) secondary_id: String,
     pub(super) resource_budgets: ResourceMap,
-    pub(super) current_task: Option<BinaryInfo<I>>,
+    pub(super) current_task: Option<TaskInfo<I>>,
     pub(super) estimated_resources: ResourceMap,
     pub(super) is_idle: bool,
 }
@@ -66,7 +80,7 @@ impl<I: Identifier> RemoteWorkerState<I> {
 ///
 /// Generic over `T: SecondaryTransport<I>` so it works with both QUIC connections
 /// and in-process channels for testing.
-pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> {
+pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
     pub(super) config: PrimaryConfig,
     pub(super) transport: T,
     pub(super) scheduler: S,
@@ -80,10 +94,34 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
 
     // Task state
     pub(super) total_tasks: usize,
-    pub(super) all_binaries: Vec<BinaryInfo<I>>,
-    pub(super) pending_binaries: Vec<BinaryInfo<I>>,
+    pub(super) all_binaries: Vec<TaskInfo<I>>,
+    /// Phase-aware pending pool. Lazily initialised at `run()` start so
+    /// the constructor doesn't need the phase set / dependency graph;
+    /// `pool_mut()` / `pool()` accessors expose it after that. `None`
+    /// before `run()` is called.
+    pub(super) pending: Option<PendingPool<I>>,
+    /// Canonical phase dependency graph for the run, captured at
+    /// `run()` start. Sent to the SLURM-primary alongside the task
+    /// list (`send_full_task_list`) so the promoted secondary can
+    /// rebuild its `PendingPool` with the same phase-state machine the
+    /// primary used. Empty between runs.
+    pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
     pub(super) failed_tasks: HashSet<String>,
+    /// Per-phase completion counters fed to `on_phase_end`. Incremented
+    /// inside the same code paths that update `completed_tasks` /
+    /// `failed_tasks`.
+    pub(super) phase_completed: HashMap<PhaseId, u32>,
+    pub(super) phase_failed: HashMap<PhaseId, u32>,
+    /// Lifecycle hooks. `None` outside the run window or when the
+    /// caller didn't supply a hook.
+    pub(super) on_phase_start: Option<OnPhaseStart>,
+    pub(super) on_phase_end: Option<OnPhaseEnd>,
+    /// Phases that have already had `on_phase_start` fired. The pool's
+    /// state machine doesn't track "did we observe this transition" —
+    /// that's the manager's bookkeeping, kept here so the pool stays
+    /// purely about queue + dependency state.
+    pub(super) phase_started_emitted: HashSet<PhaseId>,
 
     // Per-secondary last-keepalive tracking for failover detection (F1).
     pub(super) secondary_keepalives: HashMap<String, Instant>,
@@ -99,7 +137,7 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     pub(super) pending_stage_files: Vec<(String, String, String, String)>,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub fn new(config: PrimaryConfig, transport: T, scheduler: S, estimator: E) -> Self {
         Self {
             config,
@@ -110,13 +148,35 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             workers: Vec::new(),
             total_tasks: 0,
             all_binaries: Vec::new(),
-            pending_binaries: Vec::new(),
+            pending: None,
+            phase_deps: HashMap::new(),
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
+            phase_completed: HashMap::new(),
+            phase_failed: HashMap::new(),
+            on_phase_start: None,
+            on_phase_end: None,
+            phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             slurm_primary_id: None,
             pending_stage_files: Vec::new(),
         }
+    }
+
+    /// Borrow the pending pool. Panics if called before `run()` has
+    /// initialised it — every internal call site is inside the run
+    /// pipeline so this is a contract violation, not a runtime path.
+    pub(super) fn pool(&self) -> &PendingPool<I> {
+        self.pending
+            .as_ref()
+            .expect("PendingPool initialised at run() start")
+    }
+
+    /// Mutably borrow the pending pool.
+    pub(super) fn pool_mut(&mut self) -> &mut PendingPool<I> {
+        self.pending
+            .as_mut()
+            .expect("PendingPool initialised at run() start")
     }
 
     /// Queue a `StageFile` notification to be sent to `secondary_id`
@@ -147,12 +207,68 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
     }
 
     /// Run the full coordination pipeline.
-    pub async fn run(&mut self, binaries: Vec<BinaryInfo<I>>) -> Result<(), String> {
-        self.all_binaries = binaries.clone();
-        self.pending_binaries = binaries;
-        self.total_tasks = self.pending_binaries.len();
+    ///
+    /// `phase_deps` declares the per-phase `depends_on` graph. Items in
+    /// `binaries` whose `phase_id` doesn't appear in `phase_deps` are
+    /// treated as a single zero-deps phase (the framework still
+    /// registers it). `on_phase_start` / `on_phase_end` fire as the
+    /// pool's state machine transitions phases through
+    /// `Blocked → Active → Drained → Done` — Phase 5B wires these
+    /// closures to the Python `TaskDefinition` lifecycle hooks.
+    pub async fn run(
+        &mut self,
+        binaries: Vec<TaskInfo<I>>,
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        on_phase_start: OnPhaseStart,
+        on_phase_end: OnPhaseEnd,
+    ) -> Result<(), String> {
+        // Discover the phase set: union of (1) every phase referenced
+        // by an item, (2) every phase mentioned as a key or parent in
+        // the deps map. The pool's constructor validates that every
+        // dep references a known phase.
+        let mut phase_set: HashSet<PhaseId> =
+            binaries.iter().map(|b| b.phase_id.clone()).collect();
+        for (k, v) in &phase_deps {
+            phase_set.insert(k.clone());
+            for p in v {
+                phase_set.insert(p.clone());
+            }
+        }
+        // Capture the canonical phase-deps graph for the run before
+        // handing it to the pool — `send_full_task_list` relays it to
+        // the promoted SLURM-primary so the post-promotion pool has
+        // the same dependency machine.
+        self.phase_deps = phase_deps.clone();
+        // PendingPool::new wants an iterator yielding owned PhaseIds.
+        let pool = PendingPool::new(phase_set.clone(), phase_deps)
+            .map_err(|e| format!("PendingPool: {e:?}"))?;
+        self.pending = Some(pool);
+        self.on_phase_start = Some(on_phase_start);
+        self.on_phase_end = Some(on_phase_end);
+        self.phase_completed.clear();
+        self.phase_failed.clear();
+        self.phase_started_emitted.clear();
+        for p in &phase_set {
+            self.phase_completed.insert(p.clone(), 0);
+            self.phase_failed.insert(p.clone(), 0);
+        }
+
+        // Sort by size descending for better packing — same intent as
+        // pre-Phase-4b. The pool preserves insertion order within a
+        // bucket, so we pre-sort here and `extend` once.
+        let mut sorted = binaries;
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.size));
+        self.all_binaries = sorted.clone();
+        self.total_tasks = sorted.len();
+        self.pool_mut().extend(sorted);
+
         let total = self.total_tasks;
         tracing::info!(total, num_secondaries = self.config.num_secondaries, "primary starting");
+
+        // Fire on_phase_start for every phase the pool initialised as
+        // Active (zero-deps phases). Subsequent activations triggered
+        // by `mark_phase_done` are observed via `process_phase_lifecycle`.
+        self.fire_initial_phase_starts();
 
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections().await?;
@@ -192,6 +308,66 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
         );
 
         Ok(())
+    }
+
+    /// Fire `on_phase_start` for every phase the pool currently
+    /// reports as `Active` that we haven't notified yet. Idempotent:
+    /// re-running visits only newly-active phases. Called once at
+    /// run start (for zero-deps phases) and again from
+    /// `process_phase_lifecycle` after `mark_phase_done` cascades.
+    pub(super) fn fire_initial_phase_starts(&mut self) {
+        let active: Vec<PhaseId> = self.pool().active_phases();
+        for p in active {
+            if self.phase_started_emitted.insert(p.clone())
+                && let Some(cb) = self.on_phase_start.as_mut()
+            {
+                cb(&p);
+            }
+        }
+    }
+
+    /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`
+    /// → newly-Active phases through `on_phase_start`. Called from
+    /// the same code paths that update `completed_tasks` / `failed_tasks`
+    /// (i.e. after `pool.on_item_finished` runs). The cascade keeps
+    /// running until no phase is in `Drained` — phases with empty
+    /// dependency chains can transition through several states in
+    /// one tick.
+    pub(super) fn process_phase_lifecycle(&mut self) {
+        loop {
+            let drained = self.pool_mut().poll_drain_transitions();
+            if drained.is_empty() {
+                break;
+            }
+            for p in &drained {
+                let completed = self.phase_completed.get(p).copied().unwrap_or(0);
+                let failed = self.phase_failed.get(p).copied().unwrap_or(0);
+                if let Some(cb) = self.on_phase_end.as_mut() {
+                    cb(p, completed, failed);
+                }
+                self.pool_mut().mark_phase_done(p);
+            }
+            // mark_phase_done may have flipped Blocked → Active for
+            // dependents; emit on_phase_start for them.
+            self.fire_initial_phase_starts();
+        }
+    }
+
+    /// Per-completion bookkeeping shared between `handle_task_complete`
+    /// and the failover path: increments per-phase counters and runs
+    /// the lifecycle cascade. Decoupled so the call sites stay focused
+    /// on their wire-message logic.
+    pub(super) fn note_item_completed(&mut self, phase_id: &PhaseId) {
+        *self.phase_completed.entry(phase_id.clone()).or_insert(0) += 1;
+        self.pool_mut().on_item_finished(phase_id);
+        self.process_phase_lifecycle();
+    }
+
+    /// Per-failure bookkeeping. Same shape as `note_item_completed`.
+    pub(super) fn note_item_failed(&mut self, phase_id: &PhaseId) {
+        *self.phase_failed.entry(phase_id.clone()).or_insert(0) += 1;
+        self.pool_mut().on_item_finished(phase_id);
+        self.process_phase_lifecycle();
     }
 }
 

@@ -31,7 +31,7 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier>
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
     PrimaryCoordinator<T, S, E, I>
 {
     /// Update the keepalive timestamp for a known secondary. No-op if the
@@ -122,10 +122,24 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
 
         let mut requeued = 0usize;
         let mut survivors_workers = Vec::with_capacity(self.workers.len());
+        // Snapshot the dead workers' global ids first; we need them to
+        // call `pool.release_worker` AFTER requeue (release_worker
+        // clears the affinity record, requeue uses it for routing —
+        // and even if `requeue` doesn't read it, it's the documented
+        // ordering in the brief).
+        let dead_global_ids: Vec<u32> = self
+            .workers
+            .iter()
+            .filter(|w| w.secondary_id == secondary_id)
+            .map(|w| w.worker_id)
+            .collect();
         for mut worker in std::mem::take(&mut self.workers) {
             if worker.secondary_id == secondary_id {
                 if let Some(binary) = worker.current_task.take() {
-                    self.pending_binaries.push(binary);
+                    // requeue lands the item at the FRONT of its
+                    // (phase, type, affinity) bucket and decrements
+                    // the phase's in-flight count.
+                    self.pool_mut().requeue(binary);
                     requeued += 1;
                 }
                 worker.estimated_resources = ResourceMap::new();
@@ -136,6 +150,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             survivors_workers.push(worker);
         }
         self.workers = survivors_workers;
+        // Now clear pool-side affinity for the dead workers so any
+        // bucket they pinned is free for survivors.
+        for wid in dead_global_ids {
+            self.pool_mut().release_worker(wid);
+        }
 
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
@@ -173,7 +192,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             secondary = %secondary_id,
             requeued_tasks = requeued,
             surviving_secondaries = self.secondaries.len(),
-            pending = self.pending_binaries.len(),
+            pending = self.pool().len(),
             "dead secondary cleaned up"
         );
         Ok(())
@@ -185,7 +204,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use dynrunner_core::{BinaryInfo, ResourceMap};
+    use dynrunner_core::{TaskInfo, PhaseId, ResourceMap, TypeId};
     use dynrunner_protocol_primary_secondary::DistributedMessage;
     use dynrunner_scheduler::ResourceStealingScheduler;
     use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
@@ -194,15 +213,38 @@ mod tests {
 
     use crate::primary::{PrimaryConfig, PrimaryCoordinator, RemoteWorkerState};
     use crate::state::{SecondaryConnection, SecondaryConnectionState};
-    use dynrunner_scheduler_api::ResourceEstimator;
+    use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
+
+    /// Test fixture: install an empty pool with a single "default" phase
+    /// onto a freshly-constructed primary. Mirrors what `run()` does in
+    /// production; tests that exercise post-initialisation paths
+    /// (heartbeat re-queue, etc.) need this so `pool_mut()` doesn't
+    /// panic.
+    fn install_default_pool<T, S, E>(
+        primary: &mut PrimaryCoordinator<T, S, E, TestId>,
+    ) where
+        T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
+        S: dynrunner_scheduler_api::Scheduler<TestId>,
+        E: ResourceEstimator<TestId>,
+    {
+        let phase = PhaseId::from("default");
+        let pool = PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
     struct TestId(String);
 
     #[derive(Clone)]
     struct FixedEstimator;
-    impl ResourceEstimator for FixedEstimator {
-        fn estimate(&self, _size: u64) -> ResourceMap {
+    impl ResourceEstimator<TestId> for FixedEstimator {
+        fn estimate(&self, _task: &dynrunner_core::TaskInfo<TestId>) -> ResourceMap {
             ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1)])
         }
     }
@@ -250,6 +292,7 @@ mod tests {
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
+        install_default_pool(&mut primary);
 
         // Register the secondary at the connection level — the heartbeat
         // tracker only flags secondaries it knows about.
@@ -267,10 +310,14 @@ mod tests {
         primary.seed_keepalive("dead-sec");
 
         // Stage one in-flight task on a single virtual worker.
-        let in_flight = BinaryInfo {
+        let in_flight = TaskInfo {
             path: std::path::PathBuf::from("victim.bin"),
             size: 100,
             identifier: TestId("victim".into()),
+            phase_id: PhaseId::from("default"),
+            type_id: TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
         };
         primary.workers.push(RemoteWorkerState {
             worker_id: 0,
@@ -293,8 +340,11 @@ mod tests {
         }
 
         assert_eq!(primary.workers.len(), 0, "dead worker should be evicted");
-        assert_eq!(primary.pending_binaries.len(), 1, "in-flight task requeued");
-        assert_eq!(primary.pending_binaries[0].identifier.0, "victim");
+        // After requeue, the in-flight item is back in the pool (queued),
+        // not in_flight.
+        assert_eq!(primary.pool().len(), 1, "in-flight task requeued");
+        let requeued: Vec<_> = primary.pool().iter().collect();
+        assert_eq!(requeued[0].identifier.0, "victim");
         assert!(!primary.secondaries.contains_key("dead-sec"));
     }
 

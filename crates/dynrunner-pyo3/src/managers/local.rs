@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::BinaryInfo;
+use dynrunner_core::{PhaseId, TaskInfo};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 
 use crate::config::connection::ConnectionMode;
@@ -12,9 +13,9 @@ use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
-use crate::pytypes::{PyBinaryInfo, PyFailedTask, PyProcessingStats, extract_binaries};
+use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
-use crate::task_def::{LoadedTaskDefinition, extract_stage_timeouts};
+use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 use crate::transport::EitherManagerEnd;
 
 /// The main Python-facing local manager class.
@@ -35,18 +36,22 @@ pub(crate) struct PyLocalManager {
     worker_spec: Option<WorkerSpec>,
     scheduler_config: SchedulerConfig,
     phase_status_log_intervals_secs: Vec<f64>,
-    worker_module: String,
-    worker_cmd_args: Vec<String>,
+    types: TypeRegistry,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
-    estimator_slope: f64,
-    estimator_intercept: f64,
-    stage_timeouts: std::collections::HashMap<String, std::time::Duration>,
+    estimator: PyMemoryEstimatorBridge,
     connection_mode: ConnectionMode,
     manual_start_worker: bool,
     stats: Option<ProcessingStats>,
     failed_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
     oom_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
-    task_payloads: Vec<(BinaryInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
+    task_payloads: Vec<(TaskInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// and call back into Python from the manager's LocalSet (Phase 5B).
+    /// `Py<PyAny>` is `Send + Sync + 'static` so it satisfies the
+    /// `FnMut + Send + 'static` bounds on `process_binaries`'s closure
+    /// arguments.
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -104,7 +109,6 @@ impl PyLocalManager {
             skip_existing,
             log_paths,
         )?;
-        let stage_timeouts = extract_stage_timeouts(task_definition)?;
 
         // Parse connection mode
         let conn_mode = match connection_mode {
@@ -144,22 +148,21 @@ impl PyLocalManager {
             scheduler_config: scheduler_config.unwrap_or_default(),
             phase_status_log_intervals_secs: phase_status_log_intervals_secs
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
-            worker_module: task.worker_module,
-            worker_cmd_args: task.worker_cmd_args,
+            types: task.types,
+            phase_deps: task.phase_deps,
             skip_existing,
-            estimator_slope: task.estimator.slope,
-            estimator_intercept: task.estimator.intercept,
-            stage_timeouts,
+            estimator: task.estimator,
             connection_mode: conn_mode,
             manual_start_worker,
             stats: None,
             failed_tasks: Vec::new(),
             oom_tasks: Vec::new(),
             task_payloads: Vec::new(),
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
-    /// Process a list of PyBinaryInfo objects.
+    /// Process a list of PyTaskInfo objects.
     fn process_binaries(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
         let mut rust_binaries = extract_binaries(binaries)?;
 
@@ -170,10 +173,7 @@ impl PyLocalManager {
             }
         }
 
-        let estimator = PyMemoryEstimatorBridge {
-            slope: self.estimator_slope,
-            intercept: self.estimator_intercept,
-        };
+        let estimator = self.estimator.clone();
         let scheduler = self.scheduler_config.build_memory_scheduler();
 
         let memuse_log_path = Some(self.output_dir.join("memuse.log"));
@@ -195,7 +195,11 @@ impl PyLocalManager {
             retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
             memuse_log_path,
-            stage_timeouts: self.stage_timeouts.clone(),
+            // TODO(phase-5a-followup): wire per-type TypeRuntime.timeout
+            // through to the manager-local stage-timeout watchdog. Until
+            // that follow-up lands, the watchdog stays inactive (empty
+            // map) — same effective behaviour as a no-`get_stages` task.
+            stage_timeouts: HashMap::new(),
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(
                 dynrunner_core::ResourceKind::memory(),
                 self.low_memory_threshold,
@@ -208,20 +212,41 @@ impl PyLocalManager {
                 .collect(),
         };
 
+        // TODO(phase-5a-followup): worker subprocesses currently use the
+        // first type's worker_module + cmd_args; restart-on-type-shift
+        // (so each worker is bound to a single TypeId for its lifetime)
+        // is not yet implemented. The subprocess factory should grow a
+        // `spawn_worker(worker_id, type_id)` overload that consults the
+        // full `TypeRegistry` instead of a single string.
+        let first_type = self.types.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "task_definition.get_phases() yielded zero TaskTypeSpec entries",
+            )
+        })?;
         let mut factory = SubprocessWorkerFactory {
             python_executable: self.python_executable.clone(),
             source_dir: self.source_dir.clone(),
             output_dir: self.output_dir.clone(),
             log_dir: self.log_dir.clone(),
             log_paths: self.log_paths.clone(),
-            worker_module: self.worker_module.clone(),
-            worker_cmd_args: self.worker_cmd_args.clone(),
+            worker_module: first_type.worker_module.clone(),
+            worker_cmd_args: first_type.cmd_args.clone(),
             skip_existing: self.skip_existing,
             connection_mode: self.connection_mode.clone(),
             manual_start_worker: self.manual_start_worker,
             worker_spec: self.worker_spec.clone(),
             child_processes: Vec::new(),
         };
+
+        let phase_deps = self.phase_deps.clone();
+        // GIL-reacquiring closures that dispatch to the Python
+        // TaskDefinition's on_phase_start / on_phase_end. Each closure
+        // owns its own ref-bumped Py<PyAny> so the manager's lifetime
+        // is independent of `self`.
+        let on_phase_start =
+            crate::managers::lifecycle::make_on_phase_start(self.task_definition.clone_ref(py));
+        let on_phase_end =
+            crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py));
 
         // Run the async manager on a current-thread tokio runtime,
         // releasing the GIL during processing.
@@ -235,7 +260,17 @@ impl PyLocalManager {
             let result = rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, scheduler, estimator);
-                let outcome = manager.process_binaries(rust_binaries, &mut factory).await;
+                // phase_deps comes from LoadedTaskDefinition (5A);
+                // on_phase_* closures bridge to Python (5B).
+                let outcome = manager
+                    .process_binaries(
+                        rust_binaries,
+                        phase_deps,
+                        on_phase_start,
+                        on_phase_end,
+                        &mut factory,
+                    )
+                    .await;
 
                 self.stats = Some(manager.stats().clone());
                 self.failed_tasks = manager.failed_tasks().to_vec();
@@ -275,7 +310,7 @@ impl PyLocalManager {
         self.failed_tasks
             .iter()
             .map(|t| PyFailedTask {
-                binary: PyBinaryInfo::from(&t.binary),
+                binary: PyTaskInfo::from(&t.binary),
                 error_type: format!("{:?}", t.error_type),
                 error_message: t.error_message.clone(),
             })
@@ -283,10 +318,10 @@ impl PyLocalManager {
     }
 
     #[getter]
-    fn task_results(&self) -> Vec<(PyBinaryInfo, Option<Vec<u8>>)> {
+    fn task_results(&self) -> Vec<(PyTaskInfo, Option<Vec<u8>>)> {
         self.task_payloads
             .iter()
-            .map(|(bi, data)| (PyBinaryInfo::from(bi), data.clone()))
+            .map(|(bi, data)| (PyTaskInfo::from(bi), data.clone()))
             .collect()
     }
 
@@ -295,7 +330,7 @@ impl PyLocalManager {
         self.oom_tasks
             .iter()
             .map(|t| PyFailedTask {
-                binary: PyBinaryInfo::from(&t.binary),
+                binary: PyTaskInfo::from(&t.binary),
                 error_type: format!("{:?}", t.error_type),
                 error_message: t.error_message.clone(),
             })

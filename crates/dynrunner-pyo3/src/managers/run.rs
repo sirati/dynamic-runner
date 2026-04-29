@@ -18,10 +18,11 @@ use crate::config::local_manager::PyLocalManagerConfig;
 use crate::config::log_paths::LogPathConfig;
 use crate::config::primary_secondary::{PyPrimaryConfig, PySecondaryConfig};
 use crate::config::worker_spec::WorkerSpec;
+use crate::managers::lifecycle::{fire_on_run_end, fire_on_run_start};
 use crate::pytypes::extract_binaries;
 
 /// Compute the file_hash that the Rust primary will assign to a Python
-/// `BinaryInfo` when it sends a `TaskAssignment`. The hash is stable
+/// `TaskInfo` when it sends a `TaskAssignment`. The hash is stable
 /// for a given (path, identifier) pair — pipelines pre-stage files
 /// against this hash so the secondary's `ExtractionCache` accepts the
 /// stage notification.
@@ -107,13 +108,27 @@ pub(crate) fn run_local<'py>(
     let args = (
         config.num_workers,
         max_memory,
-        source_dir,
-        output_dir,
+        source_dir.clone(),
+        output_dir.clone(),
         task_definition.clone(),
         task_args.clone(),
     );
     let manager = cls.call(args, Some(&kwargs))?;
-    manager.call_method1("process_binaries", (binaries.clone(),))?;
+
+    // Phase 5B: fire `on_run_start` synchronously under the GIL before
+    // any item dispatches. A failure here aborts the run — the
+    // consumer's setup hasn't completed, so dispatching would race
+    // half-built resources.
+    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args)?;
+
+    let run_outcome = manager.call_method1("process_binaries", (binaries.clone(),));
+
+    // Phase 5B: fire `on_run_end` regardless of whether the run
+    // succeeded or errored. Exceptions out of the hook log and are
+    // swallowed (we are already done — propagating would mask the real
+    // outcome). The manager's own error, if any, is propagated below.
+    fire_on_run_end(task_definition, run_outcome.is_ok());
+    run_outcome?;
 
     let dict = PyDict::new(py);
     dict.set_item("stats", manager.getattr("stats")?)?;
@@ -149,7 +164,16 @@ pub(crate) fn run_primary<'py>(
         spawn_secondary,
     );
     let coord = cls.call(args, Some(&kwargs))?;
-    coord.call_method1("run", (binaries.clone(),))?;
+
+    // Phase 5B: `run_primary` does not invoke `on_run_start` because
+    // the primary entrypoint does not own a source/output dir or
+    // task_args (those live on the secondaries' nodes — see
+    // `run_secondary`). The per-phase hooks still fire from inside the
+    // PrimaryCoordinator. `on_run_end` is fired at the end with just
+    // `success`, which is well-defined here.
+    let run_outcome = coord.call_method1("run", (binaries.clone(),));
+    fire_on_run_end(task_definition, run_outcome.is_ok());
+    run_outcome?;
 
     let dict = PyDict::new(py);
     dict.set_item("completed", coord.getattr("completed")?)?;
@@ -273,13 +297,23 @@ pub(crate) fn run_distributed<'py>(
         primary_config.num_secondaries,
         secondary_template.num_workers,
         ram_per_secondary,
-        source_dir,
-        output_dir,
+        source_dir.clone(),
+        output_dir.clone(),
         task_definition.clone(),
         task_args.clone(),
     );
     let mgr = cls.call(args, Some(&kwargs))?;
-    mgr.call_method1("run", (binaries.clone(),))?;
+
+    // Phase 5B: fire `on_run_start` under the GIL. Failure aborts the
+    // run (consumer's setup hasn't completed; no point dispatching).
+    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args)?;
+
+    let run_outcome = mgr.call_method1("run", (binaries.clone(),));
+
+    // Phase 5B: fire `on_run_end` regardless. Exceptions log and are
+    // swallowed; the manager error (if any) is propagated below.
+    fire_on_run_end(task_definition, run_outcome.is_ok());
+    run_outcome?;
 
     let dict = PyDict::new(py);
     dict.set_item("completed", mgr.getattr("completed")?)?;

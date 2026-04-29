@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use dynrunner_core::{
-    BinaryInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
+    TaskInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -13,7 +13,7 @@ use crate::worker::WorkerEvent;
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
     pub(super) async fn handle_event(
         &mut self,
         event: WorkerEvent<I>,
@@ -117,7 +117,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         &mut self,
         worker_id: WorkerId,
         result: TaskResult,
-        binary: Option<BinaryInfo<I>>,
+        binary: Option<TaskInfo<I>>,
         estimated_resources: ResourceMap,
         active_workers: &mut HashSet<WorkerId>,
         allow_stop: bool,
@@ -145,7 +145,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         // Restart worker after successful completion if either the coarse
         // always_restart_worker flag is set or the optional restart_predicate
         // returns true; only when there's still pending work.
-        if result.success && !self.pending_binaries.is_empty() {
+        if result.success && !self.pool_ref().is_empty() {
             let predicate_says_restart = if let (Some(predicate), Some(b)) =
                 (self.config.restart_predicate.as_ref(), binary.as_ref())
             {
@@ -169,13 +169,13 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         }
 
         // Try to assign next task
-        if !self.pending_binaries.is_empty() {
+        if !self.pool_ref().is_empty() {
             self.try_assign_normal(worker_id, factory).await;
         }
 
         // If still no task and no pending, remove from active
         if self.pool.workers[worker_id as usize].current_binary.is_none()
-            && self.pending_binaries.is_empty()
+            && self.pool_ref().is_empty()
         {
             if allow_stop {
                 tracing::info!(worker_id, "stopping (no more tasks after completion)");
@@ -187,7 +187,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
     /// Log resource usage to memuse.log in CSV format: size,estimated_mem,actual_mem,filename,status
     pub(super) fn log_resource_usage(
         &self,
-        binary: Option<&BinaryInfo<I>>,
+        binary: Option<&TaskInfo<I>>,
         estimated: &ResourceMap,
         actual: &ResourceMap,
         errored: bool,
@@ -227,7 +227,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         }
     }
 
-    pub(super) fn record_result(&mut self, result: &TaskResult, binary: Option<&BinaryInfo<I>>) {
+    pub(super) fn record_result(&mut self, result: &TaskResult, binary: Option<&TaskInfo<I>>) {
+        // Update the per-phase counter and notify the pool the item is no
+        // longer in-flight. The post-event `process_drain_transitions`
+        // call in the worker loop surfaces this through `on_phase_end`
+        // (deferred when the item lands in a side queue; see
+        // `LocalManager::process_drain_transitions`).
+        if let Some(b) = binary {
+            self.record_phase_completion(&b.phase_id, result.success);
+        }
         if result.success {
             self.stats.completed += 1;
         } else {

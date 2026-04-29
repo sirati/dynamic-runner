@@ -22,7 +22,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -33,6 +33,7 @@ pytest.importorskip(
 )
 
 import dynamic_runner as _rs  # noqa: E402
+from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec  # noqa: E402
 
 
 @dataclass
@@ -48,47 +49,69 @@ class _StubBinaryIdentifier:
 
 
 @dataclass
-class _StubBinaryInfo:
+class _StubTaskInfo:
     path: str
     size: int
     identifier: _StubBinaryIdentifier
+    phase_id: str = ""
+    type_id: str = ""
+    affinity_id: str | None = None
+    payload: dict = field(default_factory=dict)
 
 
 class _SleepTask:
     """Minimal TaskDefinition for failover testing.
 
-    Workers just sleep briefly per task — enough time for the failover
-    election to fire mid-run, short enough to keep the test bounded.
+    One phase with one type; workers just sleep briefly per task —
+    enough time for the failover election to fire mid-run, short enough
+    to keep the test bounded.
     """
 
-    def get_stages(self):
-        return []
+    def get_phases(self):
+        return (
+            PhaseSpec(
+                phase_id="sleep",
+                types=(
+                    TaskTypeSpec(
+                        type_id="default",
+                        worker_module="dynamic_runner.tests._failover_stub_worker",
+                        reserved_memory_per_worker=50 * 1024 * 1024,
+                    ),
+                ),
+            ),
+        )
 
-    def organize_and_sort_items(self, items):
-        return list(items)
+    def discover_items(self, source_dir, args):
+        return _make_binaries(args.task_count if hasattr(args, "task_count") else 0)
 
-    def estimate_memory(self, binary_size: int) -> int:
+    def estimate_memory(self, item) -> int:
         return 100 * 1024 * 1024  # 100 MiB
-
-    def get_worker_module(self) -> str:
-        return "dynamic_runner.tests._failover_stub_worker"
 
     def add_task_arguments(self, parser) -> None:
         pass
 
-    def build_worker_command_args(self, args, source_dir, output_dir, skip_existing):
+    def build_worker_command_args(self, type_id, args, source_dir, output_dir, skip_existing):
         return []
 
-    def get_output_filename_pattern(self, input_filename: str) -> str:
-        return f"{input_filename}.done"
+    def get_output_filename_pattern(self, type_id, item) -> str:
+        return f"{item.path}.done"
 
-    def get_reserved_memory_per_worker(self) -> int:
-        return 50 * 1024 * 1024
+    def on_run_start(self, source_dir, output_dir, args) -> None:
+        pass
+
+    def on_run_end(self, success: bool) -> None:
+        pass
+
+    def on_phase_start(self, phase_id) -> None:
+        pass
+
+    def on_phase_end(self, phase_id, completed: int, failed: int) -> None:
+        pass
 
 
-def _make_binaries(n: int) -> list[_StubBinaryInfo]:
+def _make_binaries(n: int) -> list[_StubTaskInfo]:
     return [
-        _StubBinaryInfo(
+        _StubTaskInfo(
             path=f"bin_{i}",
             size=1000 + i,
             identifier=_StubBinaryIdentifier(
@@ -98,6 +121,8 @@ def _make_binaries(n: int) -> list[_StubBinaryInfo]:
                 version="11",
                 opt_level="O0",
             ),
+            phase_id="sleep",
+            type_id="default",
         )
         for i in range(n)
     ]

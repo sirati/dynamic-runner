@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -13,10 +13,14 @@ class BinaryIdentifier:
 
 
 @dataclass
-class BinaryInfo:
+class TaskInfo:
     path: Path
     size: int
     identifier: BinaryIdentifier
+    phase_id: str = ""
+    type_id: str = ""
+    affinity_id: str | None = None
+    payload: dict = field(default_factory=dict)
 
     @property
     def binary_name(self) -> str:
@@ -39,7 +43,7 @@ class BinaryInfo:
         return self.identifier.opt_level
 
     def to_dict(self) -> dict:
-        """Convert BinaryInfo to dictionary representation."""
+        """Convert TaskInfo to dictionary representation."""
         return {
             "path": str(self.path),
             "size": self.size,
@@ -48,6 +52,10 @@ class BinaryInfo:
             "compiler": self.identifier.compiler,
             "version": self.identifier.version,
             "opt_level": self.identifier.opt_level,
+            "phase_id": self.phase_id,
+            "type_id": self.type_id,
+            "affinity_id": self.affinity_id,
+            "payload": self.payload,
         }
 
 
@@ -339,11 +347,11 @@ def format_size(size: int) -> str:
         return f"{size / (1024 * 1024 * 1024):.1f}GiB"
 
 
-def format_binary_info(binary: BinaryInfo, base_path: Path | None = None) -> str:
-    """Format BinaryInfo for display.
+def format_binary_info(binary: TaskInfo, base_path: Path | None = None) -> str:
+    """Format TaskInfo for display.
 
     Args:
-        binary: BinaryInfo to format
+        binary: TaskInfo to format
         base_path: Optional base path to compute relative path from
 
     Returns:

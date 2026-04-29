@@ -92,6 +92,10 @@ fn roundtrip_task_assignment() {
             path: "/data/bins/test".into(),
             size: 1024,
             identifier: test_id("test"),
+            phase_id: "phase_a".into(),
+            type_id: "type_x".into(),
+            affinity_id: Some("aff_42".into()),
+            payload_json: "{\"k\":1}".into(),
         },
         local_path: "test".into(),
         file_hash: "abc123".into(),
@@ -112,6 +116,11 @@ fn roundtrip_task_assignment() {
             assert_eq!(zip_file.as_deref(), Some("batch_0.zip"));
             assert_eq!(binary_info.identifier.binary_name, "test");
             assert_eq!(file_hash, "abc123");
+            // Phase 4b: phase/type/affinity/payload survive the round trip.
+            assert_eq!(binary_info.phase_id, "phase_a");
+            assert_eq!(binary_info.type_id, "type_x");
+            assert_eq!(binary_info.affinity_id.as_deref(), Some("aff_42"));
+            assert_eq!(binary_info.payload_json, "{\"k\":1}");
         }
         _ => panic!("expected TaskAssignment"),
     }
@@ -257,6 +266,10 @@ fn roundtrip_all_message_types() {
                 path: "p".into(),
                 size: 1,
                 identifier: test_id("b"),
+                phase_id: "default".into(),
+                type_id: "default".into(),
+                affinity_id: None,
+                payload_json: "null".into(),
             },
             local_path: "l".into(),
             file_hash: "h".into(),
@@ -278,6 +291,7 @@ fn roundtrip_all_message_types() {
             all_tasks: vec![],
             completed_tasks: vec![],
             pending_tasks: vec![],
+            phase_deps: std::collections::HashMap::new(),
         },
         DistributedMessage::TaskComplete {
             sender_id: "s".into(),
@@ -358,6 +372,10 @@ fn wire_format_flattened_identifier() {
             path: "/tmp/test".into(),
             size: 1024,
             identifier: test_id("test_binary"),
+            phase_id: "default".into(),
+            type_id: "default".into(),
+            affinity_id: None,
+            payload_json: "null".into(),
         },
         local_path: "test".into(),
         file_hash: "h".into(),
@@ -375,6 +393,84 @@ fn wire_format_flattened_identifier() {
     let id = &bi["identifier"];
     assert_eq!(id["binary_name"], "test_binary");
     assert_eq!(id["platform"], "x86_64");
+}
+
+/// Phase 4b: `DistributedBinaryInfo` carries phase/type/affinity/payload
+/// across the wire so secondaries hydrate `TaskInfo<I>` with the exact
+/// tags the primary held in its `PendingPool` — round-trip preserves
+/// all four new fields end-to-end.
+#[test]
+fn roundtrip_distributed_binary_info_phase_tags() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        sender_id: "primary".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-0".into(),
+        worker_id: 3,
+        zip_file: None,
+        binary_info: DistributedBinaryInfo {
+            path: "/tmp/x".into(),
+            size: 42,
+            identifier: test_id("phased"),
+            phase_id: "embed".into(),
+            type_id: "tokenize".into(),
+            affinity_id: Some("shard_7".into()),
+            payload_json: "{\"shard\":7,\"chunk\":\"abc\"}".into(),
+        },
+        local_path: "x".into(),
+        file_hash: "h".into(),
+    };
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { binary_info, .. } => {
+            assert_eq!(binary_info.phase_id, "embed");
+            assert_eq!(binary_info.type_id, "tokenize");
+            assert_eq!(binary_info.affinity_id.as_deref(), Some("shard_7"));
+            assert_eq!(binary_info.payload_json, "{\"shard\":7,\"chunk\":\"abc\"}");
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
+/// Backward-compat: a JSON payload from a pre-Phase-4b sender (missing
+/// the new four fields) decodes with sensible defaults — `default` for
+/// `phase_id`/`type_id`, `None` for `affinity_id`, `"null"` for
+/// `payload_json`. Without `#[serde(default)]` this would refuse the
+/// frame and break rolling upgrades.
+#[test]
+fn legacy_distributed_binary_info_decodes_with_defaults() {
+    let legacy = serde_json::json!({
+        "msg_type": "task_assignment",
+        "sender_id": "primary",
+        "timestamp": 0.0,
+        "secondary_id": "sec-0",
+        "worker_id": 0,
+        "zip_file": null,
+        "binary_info": {
+            "path": "/tmp/x",
+            "size": 1,
+            "identifier": {
+                "binary_name": "legacy",
+                "platform": "x86_64",
+                "compiler": "gcc",
+                "version": "12.0",
+                "opt_level": "O2"
+            }
+        },
+        "local_path": "x",
+        "file_hash": "h"
+    });
+    let json = serde_json::to_vec(&legacy).unwrap();
+    let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { binary_info, .. } => {
+            assert_eq!(binary_info.phase_id, "default");
+            assert_eq!(binary_info.type_id, "default");
+            assert_eq!(binary_info.affinity_id, None);
+            assert_eq!(binary_info.payload_json, "null");
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
 }
 
 /// StageFile roundtrip: per-file location notification serializes

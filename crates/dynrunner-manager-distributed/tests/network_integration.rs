@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dynrunner_core::{BinaryInfo, MessageReceiver, MessageSender};
+use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, PhaseId, TypeId};
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -23,17 +23,21 @@ struct TestId {
 
 #[derive(Clone)]
 struct FixedEstimator(u64);
-impl ResourceEstimator for FixedEstimator {
-    fn estimate(&self, _size: u64) -> dynrunner_core::ResourceMap {
+impl ResourceEstimator<TestId> for FixedEstimator {
+    fn estimate(&self, _task: &TaskInfo<TestId>) -> dynrunner_core::ResourceMap {
         dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.0)])
     }
 }
 
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId { name: name.into() },
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 
@@ -129,11 +133,19 @@ async fn e2e_primary_secondary_over_wss() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+        let binaries: Vec<TaskInfo<TestId>> = (0..5)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
-        primary.run(binaries).await.unwrap();
+        primary
+            .run(
+                binaries,
+                std::collections::HashMap::new(),
+                Box::new(|_| {}),
+                Box::new(|_, _, _| {}),
+            )
+            .await
+            .unwrap();
 
         let completed = primary.completed_count();
         let failed = primary.failed_count();
@@ -221,11 +233,19 @@ async fn e2e_primary_secondary_over_quic() {
             FixedEstimator(100),
         );
 
-        let binaries: Vec<BinaryInfo<TestId>> = (0..5)
+        let binaries: Vec<TaskInfo<TestId>> = (0..5)
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
-        primary.run(binaries).await.unwrap();
+        primary
+            .run(
+                binaries,
+                std::collections::HashMap::new(),
+                Box::new(|_| {}),
+                Box::new(|_, _, _| {}),
+            )
+            .await
+            .unwrap();
 
         let completed = primary.completed_count();
         let failed = primary.failed_count();

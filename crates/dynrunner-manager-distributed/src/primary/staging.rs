@@ -18,7 +18,7 @@ impl<T, S, E, I> PrimaryCoordinator<T, S, E, I>
 where
     T: SecondaryTransport<I>,
     S: Scheduler<I>,
-    E: ResourceEstimator,
+    E: ResourceEstimator<I>,
     I: Identifier,
 {
     /// Send a `StageFile` notification to a specific secondary.

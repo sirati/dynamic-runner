@@ -1,17 +1,17 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    BinaryInfo, FailedTask, Identifier, ResourceKind, WorkerId,
+    FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, ProcessingPhase, Scheduler,
+    AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler,
 };
 
 
 use super::{LocalManager, WorkerFactory};
 
-impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> LocalManager<M, S, E, I> {
+impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
     pub(super) async fn run_initial_assignments(&mut self, factory: &mut impl WorkerFactory<M>) {
         tracing::info!("starting initial assignment phase");
 
@@ -55,9 +55,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
     pub(super) async fn try_assign_initial(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let max = self.max_resources();
+        let view = self.pool_ref().view_for_worker(worker_id);
         let decision = self.scheduler.assign_initial(
             &worker_info,
-            &self.pending_binaries,
+            view.as_slice(),
             &self.total_assigned_resources,
             max,
             &self.estimator,
@@ -70,7 +71,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                 opportunistic,
                 ..
             } => {
-                let binary = self.pending_binaries.remove(binary_index);
+                let binary = self.pool_mut().take_from_view(view, binary_index);
                 self.total_assigned_resources.add(&estimated_usage);
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -88,8 +89,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                         self.pool.workers[worker_id as usize].assignment_failure_count = 0;
                     }
                     Err(e) => {
-                        // Put binary back and undo resource increment
-                        self.pending_binaries.insert(0, binary);
+                        // Put binary back at the front of its bucket and undo
+                        // resource increment. Item was in-flight (take_from_view
+                        // bumped in-flight) — `requeue` decrements it again.
+                        self.pool_mut().requeue(binary);
                         self.total_assigned_resources.sub(&estimated_usage);
                         self.handle_assignment_failure(worker_id, &e, factory).await;
                     }
@@ -116,9 +119,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         self.process_worker_loop(&mut active_workers, false, true, ProcessingPhase::MainPhase, factory)
             .await;
 
-        // Move remaining pending to unassigned
-        if !self.pending_binaries.is_empty() {
-            let remaining: Vec<BinaryInfo<I>> = self.pending_binaries.drain(..).collect();
+        // Move any items still queued in the pool into `unassigned_tasks`.
+        // These are tasks the scheduler couldn't fit during the main phase
+        // (NoFit decisions across all idle attempts).
+        if !self.pool_ref().is_empty() {
+            let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
             self.unassigned_tasks.extend(remaining);
         }
 
@@ -157,7 +162,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
                 "retry pass"
             );
             for task in retry_tasks {
-                self.pending_binaries.push(task.binary);
+                // Re-inject preserves in-flight counts (these tasks were
+                // never `on_item_finished`'d) and reactivates the phase
+                // if it had drained or was draining.
+                self.pool_mut().reinject(task.binary);
             }
 
             // Restart any stopped/dead workers before retry (matching Python behavior)
@@ -205,7 +213,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
 
         let pressure_tasks: Vec<FailedTask<I>> = self.resource_pressure_tasks.drain(..).collect();
         for task in pressure_tasks {
-            self.pending_binaries.push(task.binary);
+            self.pool_mut().reinject(task.binary);
         }
 
         // Process with only worker 0
@@ -265,7 +273,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator, I: Ide
         }
 
         for task in kept {
-            self.pending_binaries.push(task);
+            self.pool_mut().reinject(task);
         }
 
         let mut active_workers: HashSet<WorkerId> = HashSet::new();

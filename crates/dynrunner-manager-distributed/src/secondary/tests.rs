@@ -3,6 +3,7 @@
 
 use super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::*;
+use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
@@ -10,7 +11,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 /// Simulate a primary that coordinates with the secondary.
 async fn fake_primary(
-    binaries: Vec<BinaryInfo<TestId>>,
+    binaries: Vec<TaskInfo<TestId>>,
     secondary_id: String,
     mut from_secondary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     to_secondary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
@@ -99,7 +100,7 @@ fn extract_worker_id(msg: &DistributedMessage<TestId>) -> WorkerId {
 fn send_task_assignment(
     tx: &tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
     secondary_id: &str,
-    binary: &BinaryInfo<TestId>,
+    binary: &TaskInfo<TestId>,
     worker_id: WorkerId,
 ) {
     let hash = format!("hash_{}", binary.identifier.0);
@@ -109,22 +110,22 @@ fn send_task_assignment(
         secondary_id: secondary_id.into(),
         worker_id,
         zip_file: None,
-        binary_info: DistributedBinaryInfo {
-            path: binary.path.to_string_lossy().into_owned(),
-            size: binary.size,
-            identifier: binary.identifier.clone(),
-        },
+        binary_info: DistributedBinaryInfo::from_task_info(binary),
         local_path: binary.path.to_string_lossy().into_owned(),
         file_hash: hash,
     })
     .unwrap();
 }
 
-fn make_binary(name: &str, size: u64) -> BinaryInfo<TestId> {
-    BinaryInfo {
+fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
         path: std::path::PathBuf::from(name),
         size,
         identifier: TestId(name.into()),
+        phase_id: dynrunner_core::PhaseId::from("default"),
+        type_id: dynrunner_core::TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     }
 }
 
@@ -212,7 +213,7 @@ async fn secondary_multi_worker_processes_tasks() {
                 keepalive_miss_threshold: 3,
             };
 
-            let binaries: Vec<BinaryInfo<TestId>> = (0..6)
+            let binaries: Vec<TaskInfo<TestId>> = (0..6)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
                 .collect();
 
@@ -276,7 +277,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 keepalive_miss_threshold: 3,
             };
 
-            let binaries: Vec<BinaryInfo<TestId>> = (0..15)
+            let binaries: Vec<TaskInfo<TestId>> = (0..15)
                 .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
                 .collect();
 
@@ -435,6 +436,10 @@ async fn stage_file_then_assign_task_succeeds() {
                                             path: "/nowhere/staged_bin".into(),
                                             size: payload_len,
                                             identifier: TestId("staged_bin".into()),
+                                            phase_id: "default".into(),
+                                            type_id: "default".into(),
+                                            affinity_id: None,
+                                            payload_json: "null".into(),
                                         },
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),

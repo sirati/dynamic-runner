@@ -1,4 +1,7 @@
-use dynrunner_core::{BinaryInfo, Identifier, ResourceMap, WorkerId};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap, WorkerId};
+
+pub mod pending_pool;
+pub use pending_pool::{BucketKey, PendingPool, PendingPoolError, PhaseState, WorkerView};
 
 /// Processing phases that the manager cycles through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +23,7 @@ pub struct WorkerBudgetInfo<I: Identifier> {
     pub is_idle: bool,
     pub is_opportunistic: bool,
     pub has_initial_assignment: bool,
-    pub current_task: Option<BinaryInfo<I>>,
+    pub current_task: Option<TaskInfo<I>>,
     pub estimated_usage: ResourceMap,
 }
 
@@ -45,8 +48,14 @@ pub enum ResourcePressureDecision {
 }
 
 /// Abstract resource estimation function, provided by the task definition.
-pub trait ResourceEstimator {
-    fn estimate(&self, binary_size: u64) -> ResourceMap;
+///
+/// Generic over `I` (identifier type) so the implementation can dispatch
+/// on `task.type_id`, read fields from `task.payload`, etc.
+pub trait ResourceEstimator<I: Identifier> {
+    /// Memory budget the worker should reserve before running this item.
+    /// Receives the full `TaskInfo` so the implementation can dispatch
+    /// on `task.type_id`, read fields from `task.payload`, etc.
+    fn estimate(&self, task: &TaskInfo<I>) -> ResourceMap;
 }
 
 /// The scheduler trait — stateless decisions based on current state snapshot.
@@ -63,10 +72,10 @@ pub trait Scheduler<I: Identifier> {
     fn assign_initial(
         &self,
         worker: &WorkerBudgetInfo<I>,
-        pending: &[BinaryInfo<I>],
+        pending: &[TaskInfo<I>],
         total_assigned: &ResourceMap,
         max_resources: &ResourceMap,
-        estimator: &dyn ResourceEstimator,
+        estimator: &dyn ResourceEstimator<I>,
     ) -> AssignmentDecision;
 
     /// Called during the normal phase for one idle worker.
@@ -74,9 +83,9 @@ pub trait Scheduler<I: Identifier> {
         &self,
         worker: &WorkerBudgetInfo<I>,
         all_workers: &[WorkerBudgetInfo<I>],
-        pending: &[BinaryInfo<I>],
+        pending: &[TaskInfo<I>],
         max_resources: &ResourceMap,
-        estimator: &dyn ResourceEstimator,
+        estimator: &dyn ResourceEstimator<I>,
         retry_attempt: bool,
     ) -> AssignmentDecision;
 

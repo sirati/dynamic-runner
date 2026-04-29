@@ -80,14 +80,40 @@ fn task_result_error() {
 }
 
 #[test]
-fn binary_info_generic() {
-    let bi = BinaryInfo {
+fn task_info_generic() {
+    let bi = TaskInfo {
         path: PathBuf::from("/tmp/test"),
         size: 1024,
         identifier: TestId("test-binary".into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
     };
     assert_eq!(bi.size, 1024);
     assert_eq!(bi.identifier.0, "test-binary");
+}
+
+#[test]
+fn task_info_serde_roundtrip_with_phase_fields() {
+    let bi = TaskInfo {
+        path: PathBuf::from("/tmp/test"),
+        size: 4096,
+        identifier: TestId("rt-binary".into()),
+        phase_id: PhaseId::from("warmup"),
+        type_id: TypeId::from("tokenize"),
+        affinity_id: Some(AffinityId::from("shard-7")),
+        payload: serde_json::json!({"k": "v", "n": 42}),
+    };
+    let json = serde_json::to_string(&bi).unwrap();
+    let parsed: TaskInfo<TestId> = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.path, bi.path);
+    assert_eq!(parsed.size, bi.size);
+    assert_eq!(parsed.identifier, bi.identifier);
+    assert_eq!(parsed.phase_id, bi.phase_id);
+    assert_eq!(parsed.type_id, bi.type_id);
+    assert_eq!(parsed.affinity_id, bi.affinity_id);
+    assert_eq!(parsed.payload, bi.payload);
 }
 
 #[test]
@@ -113,4 +139,61 @@ fn resource_map_from_array() {
 fn resource_map_display() {
     let map = ResourceMap::from([(ResourceKind::memory(), 1024)]);
     assert_eq!(format!("{map}"), "{memory: 1024}");
+}
+
+#[test]
+fn phase_id_constructors_clone_display_serde() {
+    let a = PhaseId::new("foo");
+    let b = PhaseId::from("foo");
+    let c = PhaseId::from("foo".to_string());
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+
+    let cloned = a.clone();
+    assert!(std::ptr::eq(a.as_str().as_ptr(), cloned.as_str().as_ptr()));
+
+    assert_eq!(format!("{}", PhaseId::from("x")), "x");
+
+    let json = serde_json::to_string(&PhaseId::from("x")).unwrap();
+    assert_eq!(json, "\"x\"");
+    let parsed: PhaseId = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, PhaseId::from("x"));
+}
+
+#[test]
+fn type_id_constructors_clone_display_serde() {
+    let a = TypeId::new("foo");
+    let b = TypeId::from("foo");
+    let c = TypeId::from("foo".to_string());
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+
+    let cloned = a.clone();
+    assert!(std::ptr::eq(a.as_str().as_ptr(), cloned.as_str().as_ptr()));
+
+    assert_eq!(format!("{}", TypeId::from("x")), "x");
+
+    let json = serde_json::to_string(&TypeId::from("x")).unwrap();
+    assert_eq!(json, "\"x\"");
+    let parsed: TypeId = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, TypeId::from("x"));
+}
+
+#[test]
+fn affinity_id_constructors_clone_display_serde() {
+    let a = AffinityId::new("foo");
+    let b = AffinityId::from("foo");
+    let c = AffinityId::from("foo".to_string());
+    assert_eq!(a, b);
+    assert_eq!(a, c);
+
+    let cloned = a.clone();
+    assert!(std::ptr::eq(a.as_str().as_ptr(), cloned.as_str().as_ptr()));
+
+    assert_eq!(format!("{}", AffinityId::from("x")), "x");
+
+    let json = serde_json::to_string(&AffinityId::from("x")).unwrap();
+    assert_eq!(json, "\"x\"");
+    let parsed: AffinityId = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, AffinityId::from("x"));
 }

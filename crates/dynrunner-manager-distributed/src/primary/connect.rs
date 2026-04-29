@@ -12,7 +12,7 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn wait_for_connections(&mut self) -> Result<(), String> {
         tracing::info!("waiting for {} secondaries", self.config.num_secondaries);
 

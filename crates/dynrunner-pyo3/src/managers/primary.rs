@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
@@ -9,12 +12,13 @@ use crate::config::distributed::DistributedConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
 use crate::pytypes::extract_binaries;
+use crate::task_def::LoadedTopology;
 
 #[pyclass(name = "RustPrimaryCoordinator")]
 pub(crate) struct PyPrimaryCoordinator {
     num_secondaries: u32,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     spawn_secondary: Py<PyAny>,
     distributed_config: DistributedConfig,
     completed: u32,
@@ -25,6 +29,9 @@ pub(crate) struct PyPrimaryCoordinator {
     // list is moved into `PrimaryCoordinator::queue_stage_file` so the
     // coordinator flushes them once secondary connections are up.
     pending_stage_files: Vec<(String, String, String, String)>,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// from inside `PrimaryCoordinator::run` (Phase 5B).
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -43,18 +50,18 @@ impl PyPrimaryCoordinator {
         spawn_secondary: Py<PyAny>,
         distributed_config: Option<DistributedConfig>,
     ) -> PyResult<Self> {
-        let estimate_fn = task_definition.getattr("estimate_memory")?;
-        let bridge = PyMemoryEstimatorBridge::from_python(py, &estimate_fn)?;
+        let topology = LoadedTopology::from_python(py, task_definition)?;
 
         Ok(Self {
             num_secondaries,
-            estimator_slope: bridge.slope,
-            estimator_intercept: bridge.intercept,
+            estimator: topology.estimator,
+            phase_deps: topology.phase_deps,
             spawn_secondary: spawn_secondary.clone_ref(py),
             distributed_config: distributed_config.unwrap_or_default(),
             completed: 0,
             failed: 0,
             pending_stage_files: Vec::new(),
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
@@ -80,14 +87,29 @@ impl PyPrimaryCoordinator {
         let rust_binaries = extract_binaries(binaries)?;
 
         let num_secondaries = self.num_secondaries;
-        let slope = self.estimator_slope;
-        let intercept = self.estimator_intercept;
+        let estimator = self.estimator.clone();
+        let phase_deps = self.phase_deps.clone();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
+
+        // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
+        // and dispatch to the Python TaskDefinition's `on_phase_*`
+        // methods. Each closure owns its own ref-bumped `Py<PyAny>` so
+        // the manager owns the lifetime independent of `self`.
+        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_start(
+                self.task_definition.clone_ref(py),
+            ),
+        );
+        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_end(
+                self.task_definition.clone_ref(py),
+            ),
+        );
 
         // Pick a free port for the primary server before spawning secondaries.
         let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -152,7 +174,6 @@ impl PyPrimaryCoordinator {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
-                let estimator = PyMemoryEstimatorBridge { slope, intercept };
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =
                     PrimaryCoordinator::new(
                         config,
@@ -165,7 +186,12 @@ impl PyPrimaryCoordinator {
                     primary.queue_stage_file(sec_id, hash, src, dest);
                 }
 
-                let result = primary.run(rust_binaries).await;
+                // phase_deps + lifecycle closures captured from the
+                // outer scope (5A built phase_deps; 5B built the
+                // GIL-reacquiring on_phase_* closures).
+                let result = primary
+                    .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
+                    .await;
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary coordinator failed");
                 }

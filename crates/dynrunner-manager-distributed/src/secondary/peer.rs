@@ -16,7 +16,7 @@ where
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
-    E: ResourceEstimator + Clone,
+    E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
     pub(super) async fn handle_peer_message(&mut self, msg: DistributedMessage<I>) {
@@ -41,6 +41,11 @@ where
             } => {
                 // Track peer's completed task to avoid duplicate processing
                 self.completed_tasks.insert(task_hash.clone());
+                // Drive the SLURM-primary's phase machine: if this
+                // node dispatched the task as SLURM-primary, the
+                // peer's completion message is the only signal the
+                // pool gets that the item is no longer in flight.
+                self.note_slurm_item_completed(&task_hash);
                 tracing::debug!(
                     peer = %secondary_id,
                     task_hash,
@@ -53,6 +58,11 @@ where
                 error_type,
                 ..
             } => {
+                // Same SLURM-primary phase-machine bookkeeping as
+                // TaskComplete: the in-flight ledger doesn't care
+                // whether the dispatch ended in success or failure,
+                // only that it's done.
+                self.note_slurm_item_completed(&task_hash);
                 tracing::debug!(
                     peer = %secondary_id,
                     task_hash,

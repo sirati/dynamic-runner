@@ -2,17 +2,25 @@
 
 ## Role
 Core orchestration crate. `LocalManager<M, S, E, I>` manages a pool of worker
-processes through a 5-phase pipeline (InitialAssignment → Main → Retry → OOM →
-Unassigned). Contains `WorkerPool<M, I>` for worker lifecycle, `WorkerHandle`
-for per-worker state machines, and event-driven task dispatch via
-`tokio::select!`.
+processes through the scheduler-side `ProcessingPhase` pipeline
+(InitialAssignment → MainPhase → RetryPhase → ResourcePressurePhase →
+UnassignedPhase → Complete). Contains `WorkerPool<M, I>` for worker lifecycle,
+`WorkerHandle` for per-worker state machines, and event-driven task dispatch via
+`tokio::select!`. These scheduler-side phases are independent of the
+task-definition-declared `PhaseId` topology (`PhaseSpec` / `TaskTypeSpec`):
+the manager runs them as the inner loop while the framework gates which
+task-definition phase's items are eligible for dispatch.
 
 ## What is Already Generic
-- Generic over `M: ManagerEndpoint`, `S: Scheduler<I>`, `E: MemoryEstimator`, `I: Identifier`.
+- Generic over `M: ManagerEndpoint`, `S: Scheduler<I>`, `E: ResourceEstimator`, `I: Identifier`.
 - `WorkerFactory<M>` trait — pluggable worker spawning (subprocess, channel, socket).
 - `WorkerPool<M, I>` — generic worker lifecycle management.
 - Protocol state machine (`RunnerProtocol`) — compile-time enforced transitions.
 - Event-driven loop — no task-specific logic in dispatch.
+- Pending items are held in a flat `pending_binaries: Vec<TaskInfo<I>>`
+  field; each `TaskInfo<I>` carries the task-definition's `phase_id`
+  / `type_id` / `affinity_id` tags so a phase-aware pool can be
+  introduced over this state without changing the dispatch loop.
 - No tokenizer, ASM, or text-processing knowledge anywhere.
 
 ## What Needs to Change

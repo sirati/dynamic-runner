@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
@@ -15,7 +16,7 @@ use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
-use crate::task_def::LoadedTaskDefinition;
+use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 
 #[pyclass(name = "RustDistributedManager")]
 pub(crate) struct PyDistributedManager {
@@ -29,13 +30,17 @@ pub(crate) struct PyDistributedManager {
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
     distributed_config: DistributedConfig,
-    worker_module: String,
-    worker_cmd_args: Vec<String>,
+    types: TypeRegistry,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
-    estimator_slope: f64,
-    estimator_intercept: f64,
+    estimator: PyMemoryEstimatorBridge,
     completed: u32,
     failed: u32,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// from inside `PrimaryCoordinator::run` (Phase 5B). The
+    /// distributed in-process pipeline drives a primary; secondaries
+    /// don't fire user-visible phase hooks.
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -89,13 +94,13 @@ impl PyDistributedManager {
             log_paths: task.log_paths,
             worker_spec,
             distributed_config: distributed_config.unwrap_or_default(),
-            worker_module: task.worker_module,
-            worker_cmd_args: task.worker_cmd_args,
+            types: task.types,
+            phase_deps: task.phase_deps,
             skip_existing,
-            estimator_slope: task.estimator.slope,
-            estimator_intercept: task.estimator.intercept,
+            estimator: task.estimator,
             completed: 0,
             failed: 0,
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
@@ -106,8 +111,7 @@ impl PyDistributedManager {
         let num_secondaries = self.num_secondaries;
         let num_workers = self.num_workers_per_secondary;
         let ram = self.ram_per_secondary;
-        let slope = self.estimator_slope;
-        let intercept = self.estimator_intercept;
+        let estimator = self.estimator.clone();
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
@@ -119,9 +123,34 @@ impl PyDistributedManager {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let worker_spec = self.worker_spec.clone();
-        let worker_module = self.worker_module.clone();
-        let worker_cmd_args = self.worker_cmd_args.clone();
+        // TODO(phase-5a-followup): worker subprocesses currently use the
+        // first type's worker_module + cmd_args; restart-on-type-shift
+        // is not yet implemented. The factory will need a per-type
+        // dispatch path that consults the full TypeRegistry.
+        let first_type = self.types.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "task_definition.get_phases() yielded zero TaskTypeSpec entries",
+            )
+        })?;
+        let worker_module = first_type.worker_module.clone();
+        let worker_cmd_args = first_type.cmd_args.clone();
         let skip_existing = self.skip_existing;
+        let phase_deps = self.phase_deps.clone();
+
+        // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
+        // and dispatch to the Python TaskDefinition's `on_phase_*`
+        // methods. Built before `py.detach` so the closures can capture
+        // ref-bumped `Py<PyAny>` clones.
+        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_start(
+                self.task_definition.clone_ref(py),
+            ),
+        );
+        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_end(
+                self.task_definition.clone_ref(py),
+            ),
+        );
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -170,6 +199,7 @@ impl PyDistributedManager {
                     let sec_log_paths = log_paths.clone();
                     let sec_worker_module = worker_module.clone();
                     let sec_worker_args = worker_cmd_args.clone();
+                    let sec_estimator = estimator.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -188,7 +218,7 @@ impl PyDistributedManager {
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
                         };
 
-                        let estimator = PyMemoryEstimatorBridge { slope, intercept };
+                        let estimator = sec_estimator;
 
                         let mut factory = SubprocessWorkerFactory {
                             python_executable: sec_python,
@@ -238,7 +268,6 @@ impl PyDistributedManager {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                 };
 
-                let estimator = PyMemoryEstimatorBridge { slope, intercept };
                 let mut primary = PrimaryCoordinator::new(
                     config,
                     transport,
@@ -246,7 +275,12 @@ impl PyDistributedManager {
                     estimator,
                 );
 
-                let result = primary.run(rust_binaries).await;
+                // phase_deps + lifecycle closures captured from the
+                // outer scope (5A built phase_deps; 5B built the
+                // GIL-reacquiring on_phase_* closures).
+                let result = primary
+                    .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
+                    .await;
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary failed");
                 }

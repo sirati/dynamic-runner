@@ -4,7 +4,7 @@ use std::time::Duration;
 use dynrunner_core::{Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
-    SecondaryTransport, TaskInfo,
+    SecondaryTransport, TaskListEntry,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -14,7 +14,7 @@ use dynrunner_scheduler_api::{
 use super::PrimaryCoordinator;
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn send_transfer_complete(&mut self) -> Result<(), String> {
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
         for secondary_id in secondary_ids {
@@ -49,8 +49,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             }
 
             let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            if self.pending_binaries.is_empty() && active_workers == 0 {
-                tracing::info!("no pending binaries and no active workers");
+            // Drain check: pool's `is_run_complete` returns true iff
+            // queued + in-flight is zero AND no phase is Active or
+            // Draining. The active-workers guard catches the edge
+            // where in-flight is zero but a worker hasn't reported
+            // completion yet (mostly defensive — `on_item_finished`
+            // runs synchronously off the wire message).
+            if self.pool().is_run_complete() && active_workers == 0 {
+                tracing::info!("pool drained and no active workers");
                 break;
             }
 
@@ -127,12 +133,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             None => return Ok(()),
         };
 
-        let all_tasks: Vec<TaskInfo<I>> = self
+        let all_tasks: Vec<TaskListEntry<I>> = self
             .all_binaries
             .iter()
             .map(|binary| {
                 let hash = compute_task_hash(binary);
-                TaskInfo {
+                TaskListEntry {
                     local_path: binary.path.to_string_lossy().into_owned(),
                     binary_info: binary_to_distributed(binary),
                     hash: hash.clone(),
@@ -167,6 +173,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator, I: Identif
             all_tasks,
             completed_tasks: completed_list,
             pending_tasks: pending_list,
+            // Canonical phase-deps captured at `run()` start. Lets the
+            // promoted SLURM-primary build its post-promotion pool
+            // with the same dependency-machine the primary used —
+            // otherwise every phase looks zero-deps to the new
+            // primary and dependent phases dispatch out of order.
+            phase_deps: self.phase_deps.clone(),
         };
         self.transport.send_to(&slurm_id, msg).await?;
 

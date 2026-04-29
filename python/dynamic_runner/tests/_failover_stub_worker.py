@@ -16,37 +16,66 @@ from __future__ import annotations
 import sys
 import time
 
-
-def estimate_memory(binary_size: int) -> int:
-    return 100 * 1024 * 1024
+from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec
 
 
-def get_stages():
+# ── Module-level TaskDefinition surface ─────────────────────────────────
+# The failover-secondary subprocess imports this module and passes it as
+# the `task` argument to `run_secondary`; the duck-typed protocol reads
+# attributes off the module. Keep this in sync with `task_protocol.py`.
+
+def get_phases() -> tuple[PhaseSpec, ...]:
+    return (
+        PhaseSpec(
+            phase_id="sleep",
+            types=(
+                TaskTypeSpec(
+                    type_id="default",
+                    worker_module="dynamic_runner.tests._failover_stub_worker",
+                    reserved_memory_per_worker=50 * 1024 * 1024,
+                ),
+            ),
+        ),
+    )
+
+
+def discover_items(source_dir, args):
     return []
 
 
-def organize_and_sort_items(items):
-    return list(items)
-
-
-def get_worker_module() -> str:
-    return "dynamic_runner.tests._failover_stub_worker"
+def estimate_memory(item) -> int:
+    return 100 * 1024 * 1024
 
 
 def add_task_arguments(parser) -> None:
     pass
 
 
-def build_worker_command_args(args, source_dir, output_dir, skip_existing):
+def build_worker_command_args(type_id, args, source_dir, output_dir, skip_existing):
     return []
 
 
-def get_output_filename_pattern(input_filename: str) -> str:
-    return f"{input_filename}.done"
+def get_output_filename_pattern(type_id, item) -> str:
+    return f"{item.path}.done"
 
 
-def get_reserved_memory_per_worker() -> int:
-    return 50 * 1024 * 1024
+def on_run_start(source_dir, output_dir, args) -> None:
+    pass
+
+
+def on_run_end(success: bool) -> None:
+    pass
+
+
+def on_phase_start(phase_id) -> None:
+    pass
+
+
+def on_phase_end(phase_id, completed: int, failed: int) -> None:
+    pass
+
+
+# ── Worker subprocess entrypoint ────────────────────────────────────────
 
 
 def _run_worker_loop() -> None:
@@ -57,6 +86,7 @@ def _run_worker_loop() -> None:
     the manager disconnects.
     """
     import argparse
+    import socket
 
     from dynamic_runner.comm import (
         DoneResponse,
@@ -78,7 +108,12 @@ def _run_worker_loop() -> None:
     if args.socket_path:
         comm = NamedSocketInterface(args.socket_path, is_server=False)
     else:
-        comm = UnixSocketInterface(args.dynamic_queue)
+        # `UnixSocketInterface` takes a `socket.socket`, not a raw FD —
+        # wrap the inherited FD via `socket.socket(fileno=...)` first
+        # (the manager's `SubprocessWorkerFactory` passes a socketpair
+        # FD via `--dynamic_queue`).
+        sock = socket.socket(fileno=args.dynamic_queue)
+        comm = UnixSocketInterface(sock)
 
     comm.send_response(ReadyResponse())
 
