@@ -230,7 +230,20 @@ impl PyLocalManager {
             let result = rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, scheduler, estimator);
-                let outcome = manager.process_binaries(rust_binaries, &mut factory).await;
+                // Phase 4A: pool is wired in but the user-facing
+                // phase-lifecycle hooks remain plumbing-only until the
+                // Python bridge lands in Phase 5B. Pass an empty deps
+                // map and no-op closures so behaviour matches the
+                // pre-pool single-phase default run.
+                let outcome = manager
+                    .process_binaries(
+                        rust_binaries,
+                        std::collections::HashMap::new(),
+                        |_phase| {},
+                        |_phase, _completed, _failed| {},
+                        &mut factory,
+                    )
+                    .await;
 
                 self.stats = Some(manager.stats().clone());
                 self.failed_tasks = manager.failed_tasks().to_vec();

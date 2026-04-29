@@ -41,7 +41,7 @@ fn affinity_key<I>(item: &TaskInfo<I>) -> AffinityId {
 }
 
 /// Composite bucket key.
-type BucketKey = (PhaseId, TypeId, AffinityId);
+pub type BucketKey = (PhaseId, TypeId, AffinityId);
 
 /// Phase lifecycle. Transitions are monotonic in this order
 /// (with the one exception that `requeue` can flip
@@ -75,6 +75,45 @@ impl<I: Identifier> Bucket<I> {
             items: VecDeque::new(),
             pinned_workers: Vec::new(),
         }
+    }
+}
+
+/// Affinity-ordered snapshot of a worker's eligible items, suitable as
+/// input to a `Scheduler::assign_normal` call.
+///
+/// Built by [`PendingPool::view_for_worker`]; consumed by
+/// [`PendingPool::take_from_view`]. The `items` slice exposes cloned
+/// `TaskInfo<I>` values so the scheduler does not borrow the pool. The
+/// internal `locators` vector preserves `(bucket_key, index)` pointers
+/// so `take_from_view` can remove the chosen item from its actual
+/// bucket.
+#[derive(Debug)]
+pub struct WorkerView<I: Identifier> {
+    items: Vec<TaskInfo<I>>,
+    locators: Vec<(BucketKey, usize)>,
+    worker_id: WorkerId,
+}
+
+impl<I: Identifier> WorkerView<I> {
+    /// The affinity-ordered slice of cloned candidate items.
+    /// Indexed positionally by `take_from_view`.
+    pub fn as_slice(&self) -> &[TaskInfo<I>] {
+        &self.items
+    }
+
+    /// Number of candidate items in the view.
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    /// `true` iff the view has no candidate items.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// The worker the view was built for.
+    pub fn worker_id(&self) -> WorkerId {
+        self.worker_id
     }
 }
 
@@ -246,8 +285,206 @@ impl<I: Identifier> PendingPool<I> {
     /// cleared so they fall back to the free pool on subsequent calls.
     pub fn pop_for_worker(&mut self, worker_id: WorkerId) -> Option<TaskInfo<I>> {
         let key = self.choose_bucket_for(worker_id)?;
-        let item = self.take_from_bucket(&key, worker_id)?;
-        Some(item)
+        // Always pop the front item of the chosen bucket. take_at handles
+        // affinity / in-flight bookkeeping and drain transitions.
+        let bucket = self.buckets.get(&key)?;
+        if bucket.items.is_empty() {
+            return None;
+        }
+        Some(self.take_at(&key, 0, worker_id))
+    }
+
+    /// Affinity-ordered view of items currently eligible for `worker_id`.
+    ///
+    /// The returned [`WorkerView`] holds **cloned** `TaskInfo<I>` values so
+    /// the borrow on the pool is released by the time the caller hands the
+    /// slice to a `Scheduler`. To consume the view (and remove the chosen
+    /// item from the underlying bucket) use [`take_from_view`].
+    ///
+    /// Ordering matches the soft-pin priority of [`pop_for_worker`]:
+    /// 1. items in the worker's currently-pinned bucket (if its phase is
+    ///    `Active` or `Draining`),
+    /// 2. items in unpinned typed (non-free-pool) buckets of `Active` phases
+    ///    (BTreeMap key order across buckets, FIFO within each bucket),
+    /// 3. items in free-pool (`AffinityId::""`) buckets of `Active` phases,
+    /// 4. items in any remaining bucket of an `Active` phase (co-pin
+    ///    candidates).
+    ///
+    /// Buckets in `Blocked`, `Drained`, or `Done` phases are skipped. A
+    /// bucket appears in at most one priority class.
+    ///
+    /// **Concurrency note**: this method does not record any reservation;
+    /// the corresponding `take_from_view` must run before any other
+    /// mutation to the pool, otherwise the locator indices stored in the
+    /// view may become stale. The local manager's single-threaded loop
+    /// satisfies this; multi-threaded callers must guard the pair with a
+    /// lock.
+    pub fn view_for_worker(&self, worker_id: WorkerId) -> WorkerView<I> {
+        let no_aff = no_affinity();
+        let mut emitted: HashSet<BucketKey> = HashSet::new();
+        let mut items: Vec<TaskInfo<I>> = Vec::new();
+        let mut locators: Vec<(BucketKey, usize)> = Vec::new();
+
+        let emit_bucket = |key: &BucketKey,
+                           bucket: &Bucket<I>,
+                           emitted: &mut HashSet<BucketKey>,
+                           items: &mut Vec<TaskInfo<I>>,
+                           locators: &mut Vec<(BucketKey, usize)>| {
+            for (idx, item) in bucket.items.iter().enumerate() {
+                items.push(item.clone());
+                locators.push((key.clone(), idx));
+            }
+            emitted.insert(key.clone());
+        };
+
+        let phase_active_or_draining = |phase: &PhaseId| {
+            matches!(
+                self.phase_state.get(phase),
+                Some(PhaseState::Active | PhaseState::Draining)
+            )
+        };
+        let phase_active = |phase: &PhaseId| {
+            self.phase_state.get(phase) == Some(&PhaseState::Active)
+        };
+
+        // Step 1: worker's pinned bucket if eligible.
+        if let Some(Some(key)) = self.worker_affinity.get(&worker_id)
+            && phase_active_or_draining(&key.0)
+            && let Some(bucket) = self.buckets.get(key)
+            && !bucket.items.is_empty()
+        {
+            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+        }
+
+        // Step 2: unpinned typed buckets in Active phases.
+        for (key, bucket) in &self.buckets {
+            if emitted.contains(key) || bucket.items.is_empty() {
+                continue;
+            }
+            if key.2 == no_aff {
+                continue;
+            }
+            if !phase_active(&key.0) {
+                continue;
+            }
+            if !bucket.pinned_workers.is_empty() {
+                continue;
+            }
+            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+        }
+
+        // Step 3: free-pool buckets in Active phases.
+        for (key, bucket) in &self.buckets {
+            if emitted.contains(key) || bucket.items.is_empty() {
+                continue;
+            }
+            if key.2 != no_aff {
+                continue;
+            }
+            if !phase_active(&key.0) {
+                continue;
+            }
+            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+        }
+
+        // Step 4: any remaining bucket with items in an Active phase.
+        for (key, bucket) in &self.buckets {
+            if emitted.contains(key) || bucket.items.is_empty() {
+                continue;
+            }
+            if !phase_active(&key.0) {
+                continue;
+            }
+            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+        }
+
+        WorkerView {
+            items,
+            locators,
+            worker_id,
+        }
+    }
+
+    /// Remove the item at `slice_idx` of `view` from its bucket, recording
+    /// the worker's affinity claim and incrementing the in-flight count
+    /// for the phase. Returns the owned `TaskInfo<I>`.
+    ///
+    /// Panics if `slice_idx` is out of range, or if the underlying bucket
+    /// has shrunk (debug builds only) since the view was constructed —
+    /// callers are required to consume the view before any other pool
+    /// mutation. See [`view_for_worker`].
+    pub fn take_from_view(
+        &mut self,
+        view: WorkerView<I>,
+        slice_idx: usize,
+    ) -> TaskInfo<I> {
+        let (bucket_key, item_idx) = view
+            .locators
+            .get(slice_idx)
+            .cloned()
+            .expect("slice_idx out of range for WorkerView");
+        let worker_id = view.worker_id;
+        // The bucket must still hold the same item at the recorded index.
+        // This invariant is required for correctness; any caller that
+        // mutated the pool between view construction and take_from_view
+        // is buggy.
+        debug_assert!(
+            self.buckets
+                .get(&bucket_key)
+                .map(|b| item_idx < b.items.len())
+                .unwrap_or(false),
+            "WorkerView locator points past end of bucket; pool was \
+             mutated between view construction and take_from_view"
+        );
+        self.take_at(&bucket_key, item_idx, worker_id)
+    }
+
+    // ---- internals shared by pop_for_worker and take_from_view ----
+
+    /// Remove the item at `index` of bucket `key`, run the same
+    /// affinity / in-flight bookkeeping as `take_from_bucket`, and
+    /// return the owned item. Internal helper — bounds and existence are
+    /// trusted; callers must have verified them.
+    fn take_at(
+        &mut self,
+        key: &BucketKey,
+        index: usize,
+        worker_id: WorkerId,
+    ) -> TaskInfo<I> {
+        let no_aff = no_affinity();
+        let bucket = self
+            .buckets
+            .get_mut(key)
+            .expect("take_at called on missing bucket");
+        let item = bucket
+            .items
+            .remove(index)
+            .expect("take_at called with out-of-range index");
+
+        if key.2 != no_aff {
+            if !bucket.pinned_workers.contains(&worker_id) {
+                bucket.pinned_workers.push(worker_id);
+            }
+            self.worker_affinity.insert(worker_id, Some(key.clone()));
+        } else {
+            self.worker_affinity.entry(worker_id).or_insert(None);
+        }
+
+        *self.in_flight_per_phase.entry(key.0.clone()).or_insert(0) += 1;
+
+        if bucket.items.is_empty() {
+            let drained_pinners = std::mem::take(&mut bucket.pinned_workers);
+            for w in drained_pinners {
+                if let Some(slot) = self.worker_affinity.get_mut(&w)
+                    && slot.as_ref() == Some(key)
+                {
+                    *slot = None;
+                }
+            }
+            self.maybe_transition_drain(&key.0);
+        }
+
+        item
     }
 
     /// Notify the pool that an item finished (success or failure).
@@ -283,6 +520,56 @@ impl<I: Identifier> PendingPool<I> {
         if self.phase_state.get(&phase_id) == Some(&PhaseState::Draining) {
             self.phase_state.insert(phase_id, PhaseState::Active);
         }
+    }
+
+    /// Re-inject an item whose previous attempt has already been
+    /// finalised via `on_item_finished` (so it is no longer counted as
+    /// in-flight). Pushes to the BACK of its bucket and, if the phase
+    /// has reached `Draining` or `Drained`, flips it back to `Active`
+    /// so the newly-injected item is dispatchable. Any pending drained
+    /// notification for the phase is cancelled (the phase is no longer
+    /// drained).
+    ///
+    /// This is the right hook for manager-side retry queues that
+    /// re-introduce already-finished tasks: the in-flight count is
+    /// untouched, only the queue contents and phase state move.
+    pub fn reinject(&mut self, item: TaskInfo<I>) {
+        let phase_id = item.phase_id.clone();
+        let key = (
+            item.phase_id.clone(),
+            item.type_id.clone(),
+            affinity_key(&item),
+        );
+        self.buckets
+            .entry(key)
+            .or_insert_with(Bucket::new)
+            .items
+            .push_back(item);
+        let current = self.phase_state.get(&phase_id).copied();
+        if matches!(
+            current,
+            Some(PhaseState::Draining | PhaseState::Drained)
+        ) {
+            self.phase_state.insert(phase_id.clone(), PhaseState::Active);
+            // If it was queued for drain notification, drop that entry —
+            // the phase is no longer drained.
+            self.drained_pending.retain(|p| p != &phase_id);
+        }
+    }
+
+    /// Drain all currently queued items from the pool (without touching
+    /// in-flight counts or phase state). Used by managers that need to
+    /// move leftover queued items into a side queue between manager-
+    /// internal phase transitions (e.g. moving NoFit items from the
+    /// main phase queue into an "unassigned" bucket).
+    pub fn drain_queued(&mut self) -> Vec<TaskInfo<I>> {
+        let mut out = Vec::new();
+        for bucket in self.buckets.values_mut() {
+            while let Some(item) = bucket.items.pop_front() {
+                out.push(item);
+            }
+        }
+        out
     }
 
     /// Worker died / left — clear its affinity record and remove it
@@ -402,8 +689,7 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Pick a bucket for `worker_id` per the soft-pin algorithm,
     /// returning the bucket key (or `None` if nothing is dispatchable).
-    /// Pure: doesn't mutate state — `take_from_bucket` performs
-    /// the actual claim.
+    /// Pure: doesn't mutate state — `take_at` performs the actual claim.
     fn choose_bucket_for(&self, worker_id: WorkerId) -> Option<BucketKey> {
         let no_aff = no_affinity();
 
@@ -464,52 +750,6 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         None
-    }
-
-    /// Pop the front item of `key` for `worker_id`, updating affinity,
-    /// in-flight count, and phase state as required.
-    fn take_from_bucket(
-        &mut self,
-        key: &BucketKey,
-        worker_id: WorkerId,
-    ) -> Option<TaskInfo<I>> {
-        let no_aff = no_affinity();
-        let bucket = self.buckets.get_mut(key)?;
-        let item = bucket.items.pop_front()?;
-
-        // Soft-pin update: only typed (non-free-pool) buckets get pinned.
-        if key.2 != no_aff {
-            if !bucket.pinned_workers.contains(&worker_id) {
-                bucket.pinned_workers.push(worker_id);
-            }
-            self.worker_affinity.insert(worker_id, Some(key.clone()));
-        } else {
-            // Free-pool dispatch does not record affinity. If the worker
-            // had affinity to a now-empty (or vanished) bucket, leave
-            // its slot as None or absent — both behave identically in
-            // the choose path.
-            self.worker_affinity.entry(worker_id).or_insert(None);
-        }
-
-        // In-flight bookkeeping.
-        *self.in_flight_per_phase.entry(key.0.clone()).or_insert(0) += 1;
-
-        // If the bucket is now empty, clear its pinned workers'
-        // affinity slots so they're free-pool eligible next call.
-        if bucket.items.is_empty() {
-            let drained_pinners = std::mem::take(&mut bucket.pinned_workers);
-            for w in drained_pinners {
-                if let Some(slot) = self.worker_affinity.get_mut(&w)
-                    && slot.as_ref() == Some(key)
-                {
-                    *slot = None;
-                }
-            }
-            // Phase may have just emptied of queued work.
-            self.maybe_transition_drain(&key.0);
-        }
-
-        Some(item)
     }
 
     /// Inspect a phase to decide if it should transition between
