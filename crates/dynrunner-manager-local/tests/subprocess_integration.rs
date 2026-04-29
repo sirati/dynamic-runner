@@ -63,7 +63,16 @@ async fn single_worker_subprocess_processes_all() {
             FixedEstimator(50 * 1024 * 1024), // 50MB estimate per binary
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -228,7 +237,16 @@ async fn single_worker_named_socket_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -281,7 +299,16 @@ async fn multi_worker_named_socket_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);
@@ -332,7 +359,16 @@ async fn multi_worker_subprocess_processes_all() {
             FixedEstimator(50 * 1024 * 1024),
         );
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 8);
         assert_eq!(manager.stats().total, 8);

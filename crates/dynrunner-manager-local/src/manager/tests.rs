@@ -29,7 +29,16 @@ async fn single_worker_processes_all_binaries() {
             make_binary("c", 70),
         ];
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -53,7 +62,16 @@ async fn multiple_workers_process_binaries() {
             .map(|i| make_binary(&format!("bin_{i}"), 100))
             .collect();
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 10);
         assert!(manager.failed_tasks().is_empty());
@@ -72,7 +90,16 @@ async fn retry_phase_retries_failed_tasks() {
         };
 
         let binaries = vec![make_binary("retry_me", 50)];
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         // First attempt fails, retry succeeds
         assert_eq!(manager.stats().completed, 1);
@@ -92,7 +119,16 @@ async fn resource_pressure_tasks_collected() {
         };
 
         let binaries = vec![make_binary("oom_bin", 50)];
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         // OOM in main → retry → OOM again → OOM phase → OOM again
         // Eventually ends up in resource_pressure_tasks or failed_tasks
@@ -112,7 +148,13 @@ async fn no_binaries_completes_immediately() {
         };
 
         manager
-            .process_binaries(Vec::<TaskInfo<TestId>>::new(), &mut factory)
+            .process_binaries(
+                Vec::<TaskInfo<TestId>>::new(),
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
             .await
             .unwrap();
 
@@ -177,7 +219,16 @@ async fn always_restart_worker_respawns_after_success() {
             make_binary("c", 70),
         ];
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 3);
         assert_eq!(manager.stats().total, 3);
@@ -224,7 +275,16 @@ async fn memuse_log_written() {
             make_binary("b", 60),
         ];
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 2);
 
@@ -306,7 +366,16 @@ async fn non_recoverable_error_restarts_worker_and_continues() {
             make_binary("succeed", 60),
         ];
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         // First task: NonRecoverable -> fails, worker restarted
         // Second task: succeeds on restarted worker
@@ -335,7 +404,16 @@ async fn multiple_workers_with_mixed_results() {
             .map(|i| make_binary(&format!("bin_{i}"), 100 + i * 10))
             .collect();
 
-        manager.process_binaries(binaries, &mut factory).await.unwrap();
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(manager.stats().completed, 6);
         assert_eq!(manager.stats().total, 6);

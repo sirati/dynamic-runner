@@ -210,6 +210,122 @@ fn mark_phase_done_activates_dependents() {
 }
 
 #[test]
+fn reinject_revives_drained_phase_to_active() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t("P", "T", "alpha", 1)]);
+    let item = p.pop_for_worker(1).unwrap();
+    p.on_item_finished(&phase("P"));
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Drained));
+    p.reinject(item);
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
+    // No drained notification leaks through since reinject cleared it.
+    assert!(p.poll_drain_transitions().is_empty());
+    // The reinjected item is at the back of its bucket and dispatchable.
+    let again = p.pop_for_worker(1).unwrap();
+    assert_eq!(again.size, 1);
+}
+
+#[test]
+fn drain_queued_empties_buckets_without_touching_inflight() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t("P", "T", "alpha", 1),
+        t("P", "T", "beta", 2),
+        t("P", "T", "", 3),
+    ]);
+    // Take one to bump in-flight.
+    let _ = p.pop_for_worker(1).unwrap();
+    let in_flight_before = p.in_flight(&phase("P"));
+    let drained = p.drain_queued();
+    assert_eq!(drained.len(), 2, "two queued items expected");
+    assert_eq!(p.in_flight(&phase("P")), in_flight_before);
+    // Bucket totals are now zero queued.
+    assert_eq!(p.iter().count(), 0);
+}
+
+#[test]
+fn view_for_worker_orders_pinned_then_typed_then_free_then_copin() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        // alpha: typed bucket, will become worker 1's pin
+        t("P", "T", "alpha", 1),
+        t("P", "T", "alpha", 2),
+        // beta: another typed bucket, unpinned at start
+        t("P", "T", "beta", 3),
+        // free pool
+        t("P", "T", "", 4),
+    ]);
+
+    // First, worker 1 grabs alpha (Step 2). After this, the view for
+    // worker 1 should put alpha first (Step 1: pinned), then beta
+    // (Step 2: unpinned typed), then free pool.
+    let _ = p.pop_for_worker(1).unwrap();
+
+    let view = p.view_for_worker(1);
+    let sizes: Vec<u64> = view.as_slice().iter().map(|t| t.size).collect();
+    // alpha #2 (the remaining alpha item) → beta #3 → free #4
+    assert_eq!(sizes, vec![2, 3, 4], "got {sizes:?}");
+}
+
+#[test]
+fn view_for_worker_skips_blocked_phases() {
+    let mut p = pool_with(&["A", "B"], &[("B", &["A"])]);
+    p.extend([
+        t("A", "T", "", 1),
+        t("B", "T", "", 2),
+    ]);
+    let view = p.view_for_worker(1);
+    // Only A's item is visible; B is Blocked.
+    assert_eq!(view.len(), 1);
+    assert_eq!(view.as_slice()[0].size, 1);
+}
+
+#[test]
+fn take_from_view_removes_chosen_item_and_records_affinity() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t("P", "T", "alpha", 1),
+        t("P", "T", "beta", 2),
+    ]);
+    let view = p.view_for_worker(1);
+    // View order: alpha (BTreeMap "alpha" < "beta") then beta. Pick beta
+    // to verify non-zero index removal.
+    assert_eq!(view.as_slice()[0].size, 1);
+    assert_eq!(view.as_slice()[1].size, 2);
+    let taken = p.take_from_view(view, 1);
+    assert_eq!(taken.size, 2);
+    assert_eq!(taken.affinity_id.as_ref().unwrap().as_str(), "beta");
+    // Worker 1 is now pinned to beta. Next view starts with the alpha
+    // bucket only (alpha #1 still present, beta drained).
+    let view2 = p.view_for_worker(1);
+    let sizes: Vec<u64> = view2.as_slice().iter().map(|t| t.size).collect();
+    assert_eq!(sizes, vec![1]);
+    // In-flight count for P incremented to 1.
+    assert_eq!(p.in_flight(&phase("P")), 1);
+}
+
+#[test]
+fn take_from_view_increments_in_flight_and_drains_phase() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t("P", "T", "alpha", 1)]);
+    let view = p.view_for_worker(1);
+    assert_eq!(view.len(), 1);
+    let _ = p.take_from_view(view, 0);
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Draining));
+    assert_eq!(p.in_flight(&phase("P")), 1);
+}
+
+#[test]
+fn view_for_worker_empty_when_no_eligible_items() {
+    let mut p = pool_with(&["P"], &[]);
+    let view = p.view_for_worker(0);
+    assert!(view.is_empty());
+    p.extend([t("P", "T", "", 1)]);
+    let view = p.view_for_worker(0);
+    assert_eq!(view.len(), 1);
+}
+
+#[test]
 fn activation_cascade_through_chain() {
     let mut p = pool_with(
         &["A", "B", "C"],

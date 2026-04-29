@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    TaskInfo, ErrorType, FailedTask, Identifier, ResourceKind, WorkerId,
+    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, ProcessingPhase, Scheduler,
+    AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler,
 };
 
 use super::{LocalManager, WorkerFactory};
@@ -53,7 +53,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 _ = pressure_check_interval.tick() => {
                     // Periodic maintenance: resource pressure checks, usage updates, timeouts
                     self.pool.update_all_resource_usage();
-                    if !self.pending_binaries.is_empty() {
+                    if !self.pool_ref().is_empty() {
                         self.check_resource_pressure();
                     }
                     self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
@@ -77,17 +77,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 
         // Move remaining pending to resource pressure queue at end of retry phase
         // (Main phase leftovers go to unassigned_tasks in run_main_phase)
-        if phase == ProcessingPhase::RetryPhase {
-            if !self.pending_binaries.is_empty() {
-                let remaining: Vec<TaskInfo<I>> = self.pending_binaries.drain(..).collect();
-                for binary in remaining {
-                    self.resource_pressure_tasks.push(FailedTask {
-                        binary,
-                        error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
-                        error_message: "Could not fit in any worker budget".into(),
-                        retry_count: 0,
-                    });
-                }
+        if phase == ProcessingPhase::RetryPhase
+            && !self.pool_ref().is_empty()
+        {
+            let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
+            for binary in remaining {
+                self.resource_pressure_tasks.push(FailedTask {
+                    binary,
+                    error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
+                    error_message: "Could not fit in any worker budget".into(),
+                    retry_count: 0,
+                });
             }
         }
     }
@@ -108,7 +108,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             if !self.pool.workers[idx].is_ready() {
                 self.pool.workers[idx].poll_ready().await;
                 if !self.pool.workers[idx].is_ready() {
-                    if self.pending_binaries.is_empty() && allow_stop {
+                    if self.pool_ref().is_empty() && allow_stop {
                         active_workers.remove(&worker_id);
                     }
                     continue;
@@ -141,35 +141,38 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         allow_stop: bool,
         _phase: ProcessingPhase,
     ) -> bool {
-        // Synchronous decision, async assign handled via pending_worker_assignments
+        // Synchronous decision: peek at the affinity-ordered candidate
+        // slice for this worker and ask the scheduler whether anything
+        // fits. The actual `take` happens asynchronously in
+        // `try_assign_normal` below; we just decide here whether to keep
+        // the worker active or stop it.
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
         let max = self.max_resources();
+        let view = self.pool_ref().view_for_worker(worker_id);
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
-            &self.pending_binaries,
+            view.as_slice(),
             max,
             &self.estimator,
             false,
         );
 
         match decision {
-            AssignmentDecision::Assign { binary_index, .. } => {
-                // Mark for async assignment
+            AssignmentDecision::Assign { .. } => {
+                // Mark for async assignment; try_assign_normal will
+                // re-run the scheduler against a fresh view and take.
                 self.pending_worker_assignments.insert(worker_id);
-                // We'll do the actual assign in the pending_worker_assignments loop
-                // But we can't await here (not async fn), so let's just return true
-                // to keep the worker active. The assignment happens next iteration.
-                let _ = binary_index;
                 true
             }
             AssignmentDecision::NoFit => {
                 // Retry with retry_attempt=true
+                let view2 = self.pool_ref().view_for_worker(worker_id);
                 let decision2 = self.scheduler.assign_normal(
                     &worker_info,
                     &all_infos,
-                    &self.pending_binaries,
+                    view2.as_slice(),
                     max,
                     &self.estimator,
                     true,
@@ -180,7 +183,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         true
                     }
                     _ => {
-                        if self.pending_binaries.is_empty() {
+                        if self.pool_ref().is_empty() {
                             if allow_stop {
                                 tracing::info!(worker_id, "stopping (no more tasks)");
                             }
@@ -206,10 +209,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
         let max = self.max_resources();
+        let view = self.pool_ref().view_for_worker(worker_id);
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
-            &self.pending_binaries,
+            view.as_slice(),
             max,
             &self.estimator,
             false,
@@ -222,7 +226,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 opportunistic,
                 ..
             } => {
-                let binary = self.pending_binaries.remove(binary_index);
+                let binary = self.pool_mut().take_from_view(view, binary_index);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let worker = &mut self.pool.workers[worker_id as usize];
@@ -242,8 +246,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         self.pool.workers[worker_id as usize].assignment_failure_count = 0;
                     }
                     Err(e) => {
-                        // Put binary back
-                        self.pending_binaries.insert(0, binary);
+                        // Put binary back at the front of its bucket — it
+                        // was in-flight (take_from_view bumped in-flight)
+                        // and now needs to be re-attempted.
+                        self.pool_mut().requeue(binary);
                         self.handle_assignment_failure(worker_id, &e, factory).await;
                     }
                 }

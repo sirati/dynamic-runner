@@ -128,6 +128,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         // Worker 0 is the last resort — if it can't fit, the task
                         // is truly OOM and goes to the resource_pressure_tasks queue.
                         // This happens even during OOM phase (matching Python).
+                        // Mark the task finished from the pool's perspective so
+                        // its phase can drain; bump the failed counter.
+                        self.record_phase_completion(&binary.phase_id, false);
                         self.resource_pressure_tasks.push(FailedTask {
                             binary,
                             error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
@@ -138,10 +141,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         // Other workers: requeue for local retry.
                         // During OOM phase, Python skips _handle_oom_killed_task
                         // (which does the requeue), so we also skip requeuing.
-                        self.pending_binaries.insert(0, binary);
+                        // The task was in-flight in the pool (take_from_view
+                        // bumped in-flight); `requeue` decrements in-flight
+                        // and pushes the item to the front of its bucket.
+                        self.pool_mut().requeue(binary);
+                    } else {
+                        // OOM phase for non-worker-0: task is dropped, matching
+                        // Python's behavior where _handle_oom_killed_task is
+                        // skipped. The task was in-flight; finalise it so the
+                        // phase can drain.
+                        self.record_phase_completion(&binary.phase_id, false);
                     }
-                    // During OOM phase for non-worker-0: task is dropped (not requeued)
-                    // matching Python's behavior where _handle_oom_killed_task is skipped.
                 }
             }
             ResourcePressureResult::NoAction => {}
