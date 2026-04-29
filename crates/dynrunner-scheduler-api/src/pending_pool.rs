@@ -498,6 +498,18 @@ impl<I: Identifier> PendingPool<I> {
         self.maybe_transition_drain(phase_id);
     }
 
+    /// Notify the pool that a task has been dispatched outside the
+    /// `pop_for_worker` / `take_from_view` path (which already do the
+    /// in-flight bookkeeping). Pair with [`on_item_finished`] when the
+    /// task completes. Used by the SLURM-promoted secondary, which
+    /// extracts items via [`take_first_match`] (a removal primitive
+    /// that does not touch in-flight counters) but needs the phase
+    /// machine to observe the dispatch so a `Draining` transition
+    /// fires only after the cluster reports the item finished.
+    pub fn mark_in_flight(&mut self, phase_id: &PhaseId) {
+        *self.in_flight_per_phase.entry(phase_id.clone()).or_insert(0) += 1;
+    }
+
     /// Re-queue an item that needs retry (worker death, transient
     /// failure). Inserts at the FRONT of its `(phase, type, affinity)`
     /// bucket. Decrements the phase's in-flight count (the item was

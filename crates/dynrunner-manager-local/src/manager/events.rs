@@ -229,8 +229,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 
     pub(super) fn record_result(&mut self, result: &TaskResult, binary: Option<&TaskInfo<I>>) {
         // Update the per-phase counter and notify the pool the item is no
-        // longer in-flight. The end-of-run drain-transitions flush
-        // surfaces this through `on_phase_end`.
+        // longer in-flight. The post-event `process_drain_transitions`
+        // call in the worker loop surfaces this through `on_phase_end`
+        // (deferred when the item lands in a side queue; see
+        // `LocalManager::process_drain_transitions`).
         if let Some(b) = binary {
             self.record_phase_completion(&b.phase_id, result.success);
         }

@@ -6,7 +6,7 @@ use dynrunner_core::{
     FailedTask, Identifier, PhaseId, ResourceKind, ResourceMap, TaskInfo, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
 use crate::pool::WorkerPool;
 use crate::stats::ProcessingStats;
 
@@ -143,6 +143,18 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// each `process_binaries` call.
     on_phase_start_cb: Option<OnPhaseStart>,
     on_phase_end_cb: Option<OnPhaseEnd>,
+    /// Drain notifications observed by the manager (via
+    /// `pool.poll_drain_transitions`) but not yet surfaced as
+    /// `on_phase_end` because the manager still holds items for that
+    /// phase in a side queue (`failed_tasks`,
+    /// `resource_pressure_tasks`, or `unassigned_tasks`). The pool's
+    /// `drained_pending` is one-shot — once polled it is gone — so the
+    /// manager owns the deferral. Each entry is re-evaluated on the
+    /// next `process_drain_transitions` call: dropped if the phase has
+    /// since reactivated (a `reinject` flipped `Drained → Active`),
+    /// fired if the side queues are now empty for that phase, kept
+    /// otherwise.
+    deferred_drain_notifications: Vec<PhaseId>,
     /// Successful per-task opaque payloads, surfaced for the Python-side
     /// task-specific aggregator. Populated as TaskCompleted events arrive.
     task_payloads: Vec<(TaskInfo<I>, Option<Vec<u8>>)>,
@@ -167,6 +179,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             phase_started: HashSet::new(),
             on_phase_start_cb: None,
             on_phase_end_cb: None,
+            deferred_drain_notifications: Vec::new(),
             task_payloads: Vec::new(),
         }
     }
@@ -221,6 +234,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.stats.errored = 0;
         self.phase_completion_counts.clear();
         self.phase_started.clear();
+        self.deferred_drain_notifications.clear();
         self.on_phase_start_cb = Some(Box::new(on_phase_start));
         self.on_phase_end_cb = Some(Box::new(on_phase_end));
 
@@ -248,11 +262,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         self.run_unassigned_phase(factory).await;
         self.stop_all_workers().await;
 
-        // Surface any drain transitions accumulated during the run
-        // (the drained_pending vec on the pool collects them as phases
-        // empty during scheduling-side phases). Fires `on_phase_end`
-        // for each newly-drained user-visible phase.
-        self.process_drain_transitions();
+        // Surface any drain transitions accumulated during the run.
+        // Mid-run drain processing happens inside the worker loop;
+        // this final flush picks up phases that drained during a
+        // scheduling-phase boundary plus any deferred notifications
+        // that were waiting on side-queue cleanup. End-of-run
+        // semantics are "all retries exhausted": items still resident
+        // in `failed_tasks` / `resource_pressure_tasks` /
+        // `unassigned_tasks` are permanently failed, so deferred
+        // notifications should fire regardless of side-queue
+        // emptiness.
+        self.flush_drain_transitions_final();
 
         // Reset run-scoped state.
         self.pending = None;
@@ -290,8 +310,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     }
 
     /// Bookkeeping for a finished task: bumps the per-phase counter and
-    /// notifies the pool. Drives `on_phase_end` indirectly via the next
-    /// `process_drain_transitions` flush.
+    /// notifies the pool. Drives `on_phase_end` indirectly via the
+    /// `process_drain_transitions` call inside the worker loop (which
+    /// runs immediately after every task event) and the final flush
+    /// at end-of-run.
     pub(super) fn record_phase_completion(&mut self, phase_id: &PhaseId, success: bool) {
         let entry = self.phase_completion_counts.entry(phase_id.clone()).or_insert((0, 0));
         if success {
@@ -308,12 +330,44 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     /// the `on_phase_end` callback for each (with the per-phase counters),
     /// mark the phase done, then fire `on_phase_start` for any phase that
     /// just became active as a consequence.
+    ///
+    /// Safe to call at any point in the run loop: phases whose items
+    /// still live in a manager-owned side queue (`failed_tasks`,
+    /// `resource_pressure_tasks`, `unassigned_tasks`) are deferred —
+    /// firing `mark_phase_done` for them would race with the upcoming
+    /// `pool.reinject` (which only reactivates `Drained → Active`, not
+    /// `Done → Active`). Deferred phases are re-evaluated on every
+    /// subsequent call until either their side queue is empty (fire) or
+    /// a `reinject` reactivates them (drop). Phases that were drained
+    /// and have already been overtaken by a `reinject` (i.e. now
+    /// `Active`) are likewise dropped without firing.
     pub(super) fn process_drain_transitions(&mut self) {
-        let drained = match self.pending.as_mut() {
-            Some(pool) => pool.poll_drain_transitions(),
-            None => return,
-        };
-        for phase_id in drained {
+        if self.pending.is_none() {
+            return;
+        }
+        // Pull any newly-drained phases from the pool and merge into the
+        // manager-side deferral queue. Dedup so a phase that drains
+        // twice in one loop tick fires once.
+        let fresh = self.pool_mut().poll_drain_transitions();
+        self.deferred_drain_notifications.extend(fresh);
+        self.deferred_drain_notifications.sort();
+        self.deferred_drain_notifications.dedup();
+
+        let mut still_deferred = Vec::with_capacity(self.deferred_drain_notifications.len());
+        for phase_id in std::mem::take(&mut self.deferred_drain_notifications) {
+            // A `reinject` since the phase was queued may have flipped
+            // it back to `Active`; drop the stale notification.
+            if self.pool_ref().phase_state(&phase_id) != Some(PhaseState::Drained) {
+                continue;
+            }
+            // Items for this phase still live in a side queue — defer.
+            // The phase will be reinjected at the matching scheduling-
+            // phase boundary; if its workers fail it again the pool
+            // will re-emit the `Drained` transition.
+            if self.phase_has_pending_side_queue_items(&phase_id) {
+                still_deferred.push(phase_id);
+                continue;
+            }
             let (completed, failed) = self
                 .phase_completion_counts
                 .get(&phase_id)
@@ -322,9 +376,60 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             if let Some(cb) = self.on_phase_end_cb.as_mut() {
                 cb(&phase_id, completed, failed);
             }
-            if let Some(pool) = self.pending.as_mut() {
-                pool.mark_phase_done(&phase_id);
+            self.pool_mut().mark_phase_done(&phase_id);
+        }
+        self.deferred_drain_notifications = still_deferred;
+        self.fire_on_phase_start_for_newly_active();
+    }
+
+    /// `true` iff one of the manager's side queues still holds an item
+    /// belonging to `phase_id`. A non-empty side queue means a
+    /// `pool.reinject` is still pending for this phase, so the pool's
+    /// `Drained` transition must not be promoted to `Done` yet.
+    fn phase_has_pending_side_queue_items(&self, phase_id: &PhaseId) -> bool {
+        self.failed_tasks
+            .iter()
+            .any(|t| &t.binary.phase_id == phase_id)
+            || self
+                .resource_pressure_tasks
+                .iter()
+                .any(|t| &t.binary.phase_id == phase_id)
+            || self
+                .unassigned_tasks
+                .iter()
+                .any(|t| &t.phase_id == phase_id)
+    }
+
+    /// End-of-run drain flush. Same shape as `process_drain_transitions`
+    /// but ignores the side-queue deferral predicate: at this point all
+    /// scheduling phases (main → retry → pressure → unassigned) have
+    /// run, so any item still in a side queue is permanently failed
+    /// and the phase should still surface its `on_phase_end`.
+    pub(super) fn flush_drain_transitions_final(&mut self) {
+        if self.pending.is_none() {
+            return;
+        }
+        let fresh = self.pool_mut().poll_drain_transitions();
+        self.deferred_drain_notifications.extend(fresh);
+        self.deferred_drain_notifications.sort();
+        self.deferred_drain_notifications.dedup();
+
+        for phase_id in std::mem::take(&mut self.deferred_drain_notifications) {
+            // A reinject during the run may have reactivated the phase;
+            // those drains are stale and would re-emit later if they
+            // re-drained. After end-of-run they cannot, so drop them.
+            if self.pool_ref().phase_state(&phase_id) != Some(PhaseState::Drained) {
+                continue;
             }
+            let (completed, failed) = self
+                .phase_completion_counts
+                .get(&phase_id)
+                .copied()
+                .unwrap_or((0, 0));
+            if let Some(cb) = self.on_phase_end_cb.as_mut() {
+                cb(&phase_id, completed, failed);
+            }
+            self.pool_mut().mark_phase_done(&phase_id);
         }
         self.fire_on_phase_start_for_newly_active();
     }

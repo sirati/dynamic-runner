@@ -142,6 +142,13 @@ where
     // because the wire format describes the authoritative pending set.
     slurm_pending: Option<PendingPool<I>>,
     slurm_completed: HashSet<String>,
+    /// Phase id of every item that the SLURM-primary has dispatched
+    /// from `slurm_pending` but not yet seen complete. Mirrors the
+    /// pool's in-flight bookkeeping at the per-item granularity so
+    /// `on_item_finished` can be called with the right phase id when
+    /// a TaskComplete / TaskFailed arrives. Keyed by the same task
+    /// hash used in `completed_tasks` / `active_tasks`.
+    slurm_in_flight: HashMap<String, PhaseId>,
 
     // Cached snapshot of the live primary's last `FullTaskList` broadcast.
     // Every secondary keeps the cache up to date so that, on promotion,
@@ -202,6 +209,7 @@ where
             request_backoff: HashMap::new(),
             slurm_pending: None,
             slurm_completed: HashSet::new(),
+            slurm_in_flight: HashMap::new(),
             cached_full_task_list: None,
             slurm_primary_peer_id: None,
         }

@@ -48,6 +48,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                             factory,
                         )
                         .await;
+                        // Per-event drain-transition flush. A finishing
+                        // task may have just emptied its phase's queue
+                        // and zeroed its in-flight count; mid-run firing
+                        // is what unblocks dependents (`Blocked → Active`
+                        // happens inside `mark_phase_done`'s cascade).
+                        // Phases whose items still live in a side queue
+                        // are deferred — see
+                        // `process_drain_transitions`.
+                        self.process_drain_transitions();
                     }
                 }
                 _ = pressure_check_interval.tick() => {

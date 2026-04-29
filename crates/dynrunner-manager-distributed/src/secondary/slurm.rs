@@ -122,6 +122,33 @@ where
         self.slurm_pending.as_ref().map(|p| p.len()).unwrap_or(0)
     }
 
+    /// Record completion of an item the SLURM-primary previously
+    /// dispatched (via `handle_slurm_task_request`). Decrements the
+    /// pool's in-flight counter for that item's phase, then promotes
+    /// any newly-`Drained` phase to `Done` so dependents can become
+    /// `Active`. No-op if the hash wasn't dispatched by this node — a
+    /// peer-completion the SLURM-primary never issued belongs to a
+    /// different in-flight ledger and is silently ignored.
+    pub(super) fn note_slurm_item_completed(&mut self, file_hash: &str) {
+        let phase_id = match self.slurm_in_flight.remove(file_hash) {
+            Some(p) => p,
+            None => return,
+        };
+        if let Some(pool) = self.slurm_pending.as_mut() {
+            pool.on_item_finished(&phase_id);
+            // Drain any phase the completion just emptied. The
+            // SLURM-primary doesn't surface user-visible
+            // `on_phase_end` callbacks (the original primary owns the
+            // run-level lifecycle hooks); marking phases done is
+            // still required so dependent phases can dispatch via
+            // `take_first_match`'s Active-only filter.
+            let drained = pool.poll_drain_transitions();
+            for p in &drained {
+                pool.mark_phase_done(p);
+            }
+        }
+    }
+
     /// Test/inspection helper: whether the pool has zero queued items.
     /// Treats "no pool yet" as empty so resource-loop predicates don't
     /// have to special-case the pre-snapshot state.
@@ -179,6 +206,20 @@ where
 
         if let Some(binary) = assigned {
             let file_hash = task_file_hash(&binary);
+            // The pool's `take_first_match` is a removal-only primitive
+            // — it does not bump in-flight. Pair the dispatch with an
+            // explicit `mark_in_flight` so the phase machine treats
+            // the item as still belonging to the phase until the
+            // cluster reports it finished. `slurm_in_flight` mirrors
+            // the same fact at the per-item level so we can call
+            // `on_item_finished(phase_id)` when TaskComplete /
+            // TaskFailed arrives later.
+            let dispatched_phase = binary.phase_id.clone();
+            if let Some(pool) = self.slurm_pending.as_mut() {
+                pool.mark_in_flight(&dispatched_phase);
+            }
+            self.slurm_in_flight
+                .insert(file_hash.clone(), dispatched_phase);
 
             if requesting_secondary_id == self.config.secondary_id {
                 // Assign directly to local worker (avoid recursive dispatch_message cycle)

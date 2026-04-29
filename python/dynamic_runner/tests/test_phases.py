@@ -24,10 +24,10 @@ Notes
   (the wire protocol carries the relative_path only). We therefore
   encode ``(phase, type, affinity, index)`` into the path so the
   worker can record which item it actually saw.
-* The distributed-runner path is needed for any test that involves
-  cross-phase activation; the local manager only flushes drain
-  transitions at end-of-run, so dependent phases never become Active
-  mid-run there.
+* Cross-phase activation is exercised through the distributed-runner
+  path because that surfaces both the LocalManager's mid-run drain
+  flush and the SLURM-primary's phase-aware dispatch
+  (`PendingPool::take_first_match` honours `phase_state`).
 * ``maturin develop --release`` must have run in this venv. The test
   is ``importorskip``-gated so collection still works otherwise.
 """
@@ -258,10 +258,9 @@ def _run_distributed(
     workers_per_secondary: int = 2,
     max_memory_per_secondary: int = 256 * 1024 * 1024,
 ) -> dict:
-    """In-process distributed primary + N secondaries. Required for tests
-    that exercise multi-phase dependency barriers (the local manager
-    only fires `process_drain_transitions` once at end-of-run, so
-    dependent phases never become Active mid-run there)."""
+    """In-process distributed primary + N secondaries. Used for tests
+    that exercise multi-phase dependency barriers across the full
+    primary → SLURM-primary → secondary dispatch chain."""
     primary_cfg = _rs.PrimaryConfig(num_secondaries=num_secondaries)
     secondary_template = _rs.SecondaryConfig(
         secondary_id="<template>",
@@ -283,19 +282,6 @@ def _run_distributed(
 # ─── scenario 1: 4-phase pipeline with deps ──────────────────────────
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Phase barrier currently not enforced post-SLURM-promotion: "
-        "the in-process distributed primary promotes its single "
-        "secondary to SLURM-primary right after initial assignment, "
-        "and `handle_slurm_task_request` → `PendingPool::take_first_match` "
-        "walks all buckets in BTreeMap order regardless of `phase_state`. "
-        "Flip to `strict=True` once the SLURM-primary path filters by "
-        "Active phases (or the promotion is deferred until the original "
-        "primary's phase machine has caught up)."
-    ),
-)
 def test_phase_dependencies_respected(tmp_path: Path) -> None:
     """Items in a child phase only dispatch after every item of every
     parent phase has finished.

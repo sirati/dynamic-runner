@@ -100,6 +100,12 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// `pool_mut()` / `pool()` accessors expose it after that. `None`
     /// before `run()` is called.
     pub(super) pending: Option<PendingPool<I>>,
+    /// Canonical phase dependency graph for the run, captured at
+    /// `run()` start. Sent to the SLURM-primary alongside the task
+    /// list (`send_full_task_list`) so the promoted secondary can
+    /// rebuild its `PendingPool` with the same phase-state machine the
+    /// primary used. Empty between runs.
+    pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
     pub(super) failed_tasks: HashSet<String>,
     /// Per-phase completion counters fed to `on_phase_end`. Incremented
@@ -143,6 +149,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             total_tasks: 0,
             all_binaries: Vec::new(),
             pending: None,
+            phase_deps: HashMap::new(),
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
             phase_completed: HashMap::new(),
@@ -227,6 +234,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 phase_set.insert(p.clone());
             }
         }
+        // Capture the canonical phase-deps graph for the run before
+        // handing it to the pool — `send_full_task_list` relays it to
+        // the promoted SLURM-primary so the post-promotion pool has
+        // the same dependency machine.
+        self.phase_deps = phase_deps.clone();
         // PendingPool::new wants an iterator yielding owned PhaseIds.
         let pool = PendingPool::new(phase_set.clone(), phase_deps)
             .map_err(|e| format!("PendingPool: {e:?}"))?;

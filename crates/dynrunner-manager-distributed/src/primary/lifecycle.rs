@@ -173,11 +173,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             all_tasks,
             completed_tasks: completed_list,
             pending_tasks: pending_list,
-            // TODO(phase-4b): the primary owns the canonical phase-deps
-            // graph for the run; thread it through here so a promoted
-            // secondary can rebuild a `PendingPool` faithfully. Empty
-            // for now → receivers treat every phase as zero-deps.
-            phase_deps: std::collections::HashMap::new(),
+            // Canonical phase-deps captured at `run()` start. Lets the
+            // promoted SLURM-primary build its post-promotion pool
+            // with the same dependency-machine the primary used —
+            // otherwise every phase looks zero-deps to the new
+            // primary and dependent phases dispatch out of order.
+            phase_deps: self.phase_deps.clone(),
         };
         self.transport.send_to(&slurm_id, msg).await?;
 
