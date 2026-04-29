@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{TaskInfo, Identifier, WorkerId};
+use dynrunner_core::{Identifier, PhaseId, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
 };
-use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::zip_extract::ExtractionCache;
 
@@ -48,6 +48,18 @@ impl Default for SecondaryConfig {
         }
     }
 }
+
+/// Cached `FullTaskList` payload kept on every secondary so that, on
+/// promotion, the new primary can rebuild its `PendingPool` without
+/// asking the (now-dead) original primary for another snapshot.
+///
+/// One alias per concern keeps the secondary struct legible and
+/// lets `populate_slurm_tasks` accept the same shape it caches.
+type CachedTaskListSnapshot<I> = (
+    Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>>,
+    HashSet<String>,
+    HashMap<PhaseId, Vec<PhaseId>>,
+);
 
 /// Certificate info for peer connections, set before `run()`.
 pub struct PeerCertInfo {
@@ -122,19 +134,23 @@ where
     last_request_time: HashMap<WorkerId, Instant>,
     request_backoff: HashMap<WorkerId, Duration>,
 
-    // SLURM-primary state (populated on promotion + full task list)
-    slurm_pending_binaries: Vec<TaskInfo<I>>,
+    // SLURM-primary state (populated on promotion + full task list).
+    // `slurm_pending` is `None` until the secondary first receives a
+    // `FullTaskList` snapshot from the live primary (or, if it gets
+    // promoted before any snapshot, until it observes one as the new
+    // primary). The pool is rebuilt — not patched — on every snapshot,
+    // because the wire format describes the authoritative pending set.
+    slurm_pending: Option<PendingPool<I>>,
     slurm_completed: HashSet<String>,
 
     // Cached snapshot of the live primary's last `FullTaskList` broadcast.
     // Every secondary keeps the cache up to date so that, on promotion,
-    // we can populate `slurm_pending_binaries` immediately without
-    // round-tripping through a fresh `FullTaskList` (which would require
-    // a now-dead primary).
-    cached_full_task_list: Option<(
-        Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>>,
-        HashSet<String>,
-    )>,
+    // we can populate `slurm_pending` immediately without round-tripping
+    // through a fresh `FullTaskList` (which would require a now-dead
+    // primary). Stores the wire-format payload verbatim so the
+    // PendingPool reconstruction logic lives in one place
+    // (`populate_slurm_tasks`).
+    cached_full_task_list: Option<CachedTaskListSnapshot<I>>,
 
     // Identity of the current SLURM-primary peer, if the original primary
     // is dead and an election has resolved. `None` while the original
@@ -184,7 +200,7 @@ where
             pending_peer_messages: Vec::new(),
             last_request_time: HashMap::new(),
             request_backoff: HashMap::new(),
-            slurm_pending_binaries: Vec::new(),
+            slurm_pending: None,
             slurm_completed: HashSet::new(),
             cached_full_task_list: None,
             slurm_primary_peer_id: None,

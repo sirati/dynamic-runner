@@ -3,6 +3,7 @@
 
 use super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::*;
+use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;

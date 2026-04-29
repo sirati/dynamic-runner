@@ -70,7 +70,7 @@ where
     /// after disconnect). The caller is responsible for calling
     pub(super) async fn request_task_for_worker(&mut self, worker_id: WorkerId) -> Result<(), String> {
         // When SLURM-primary, handle task requests locally
-        if self.is_slurm_primary && !self.slurm_pending_binaries.is_empty() {
+        if self.is_slurm_primary && !self.slurm_pending_is_empty() {
             let available_memory = if (worker_id as usize) < self.pool.workers.len() {
                 self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
             } else {
