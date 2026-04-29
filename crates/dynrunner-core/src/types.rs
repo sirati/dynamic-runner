@@ -51,6 +51,118 @@ impl From<String> for ResourceKind {
     }
 }
 
+/// Opaque identifier for one phase declared by a TaskDefinition.
+///
+/// Phases group items that share an ordering barrier; the framework
+/// gates dispatch at phase boundaries based on `PhaseSpec.depends_on`.
+/// `PhaseId` is just a thin newtype around `Arc<str>` so the same
+/// id can be cheaply shared across thousands of items.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct PhaseId(Arc<str>);
+
+impl PhaseId {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PhaseId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for PhaseId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for PhaseId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+/// Opaque identifier for one task type within a phase.
+///
+/// A `TaskTypeSpec` binds a `TypeId` to a worker entry-point and
+/// per-type memory estimator; the framework dispatches items to the
+/// worker matching their `type_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct TypeId(Arc<str>);
+
+impl TypeId {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for TypeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for TypeId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for TypeId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
+/// Opaque identifier for a soft worker-pinning class.
+///
+/// Items sharing an `AffinityId` prefer the same worker so kernel
+/// page-cache reuse is realized; pinning is soft — a worker never
+/// refuses work to stay busy when its bucket is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(transparent)]
+pub struct AffinityId(Arc<str>);
+
+impl AffinityId {
+    pub fn new<S: Into<Arc<str>>>(name: S) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for AffinityId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for AffinityId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for AffinityId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+
 /// A quantity of a specific resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceAmount {
