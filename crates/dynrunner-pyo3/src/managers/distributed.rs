@@ -35,6 +35,11 @@ pub(crate) struct PyDistributedManager {
     estimator: PyMemoryEstimatorBridge,
     completed: u32,
     failed: u32,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// from inside `PrimaryCoordinator::run` (Phase 5B). The
+    /// distributed in-process pipeline drives a primary; secondaries
+    /// don't fire user-visible phase hooks.
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -94,6 +99,7 @@ impl PyDistributedManager {
             estimator: task.estimator,
             completed: 0,
             failed: 0,
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
@@ -119,6 +125,21 @@ impl PyDistributedManager {
         let worker_module = self.worker_module.clone();
         let worker_cmd_args = self.worker_cmd_args.clone();
         let skip_existing = self.skip_existing;
+
+        // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
+        // and dispatch to the Python TaskDefinition's `on_phase_*`
+        // methods. Built before `py.detach` so the closures can capture
+        // ref-bumped `Py<PyAny>` clones.
+        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_start(
+                self.task_definition.clone_ref(py),
+            ),
+        );
+        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_end(
+                self.task_definition.clone_ref(py),
+            ),
+        );
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -243,17 +264,12 @@ impl PyDistributedManager {
                     estimator,
                 );
 
-                // Phase 4b: phase deps + lifecycle hooks. Phase 5B
-                // will replace these no-ops with closures that re-acquire
-                // the GIL and call the Python TaskDefinition's
-                // `on_phase_*` methods.
+                // TODO(phases-5a): replace the empty `phase_deps` with the
+                // dependency graph extracted from
+                // `task_definition.get_phases()`. Phase 5A owns the topology
+                // walk; until it lands, a single-phase run with no deps
+                // preserves pre-pool behaviour.
                 let phase_deps = std::collections::HashMap::new();
-                let on_phase_start: Box<
-                    dyn FnMut(&dynrunner_core::PhaseId) + Send,
-                > = Box::new(|_| {});
-                let on_phase_end: Box<
-                    dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send,
-                > = Box::new(|_, _, _| {});
                 let result = primary
                     .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
                     .await;

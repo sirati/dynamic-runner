@@ -24,6 +24,9 @@ pub(crate) struct PyPrimaryCoordinator {
     // list is moved into `PrimaryCoordinator::queue_stage_file` so the
     // coordinator flushes them once secondary connections are up.
     pending_stage_files: Vec<(String, String, String, String)>,
+    /// Held for the per-phase lifecycle hooks that re-acquire the GIL
+    /// from inside `PrimaryCoordinator::run` (Phase 5B).
+    task_definition: Py<PyAny>,
 }
 
 #[pymethods]
@@ -59,6 +62,7 @@ impl PyPrimaryCoordinator {
             completed: 0,
             failed: 0,
             pending_stage_files: Vec::new(),
+            task_definition: task_definition.clone().unbind(),
         })
     }
 
@@ -91,6 +95,21 @@ impl PyPrimaryCoordinator {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
+
+        // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
+        // and dispatch to the Python TaskDefinition's `on_phase_*`
+        // methods. Each closure owns its own ref-bumped `Py<PyAny>` so
+        // the manager owns the lifetime independent of `self`.
+        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_start(
+                self.task_definition.clone_ref(py),
+            ),
+        );
+        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+            crate::managers::lifecycle::make_on_phase_end(
+                self.task_definition.clone_ref(py),
+            ),
+        );
 
         // Pick a free port for the primary server before spawning secondaries.
         let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
@@ -167,17 +186,12 @@ impl PyPrimaryCoordinator {
                     primary.queue_stage_file(sec_id, hash, src, dest);
                 }
 
-                // Phase 4b: phase deps + lifecycle hooks. Phase 5B
-                // will replace these no-ops with closures that re-acquire
-                // the GIL and call the Python TaskDefinition's
-                // `on_phase_*` methods.
+                // TODO(phases-5a): replace the empty `phase_deps` with the
+                // dependency graph extracted from
+                // `task_definition.get_phases()`. Phase 5A owns the topology
+                // walk; until it lands, a single-phase run with no deps
+                // preserves pre-pool behaviour.
                 let phase_deps = std::collections::HashMap::new();
-                let on_phase_start: Box<
-                    dyn FnMut(&dynrunner_core::PhaseId) + Send,
-                > = Box::new(|_| {});
-                let on_phase_end: Box<
-                    dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send,
-                > = Box::new(|_, _, _| {});
                 let result = primary
                     .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
                     .await;
