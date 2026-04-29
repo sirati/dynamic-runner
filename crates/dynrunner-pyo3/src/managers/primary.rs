@@ -1,6 +1,9 @@
+use std::collections::HashMap;
+
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
@@ -9,11 +12,13 @@ use crate::config::distributed::DistributedConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
 use crate::pytypes::extract_binaries;
+use crate::task_def::LoadedTopology;
 
 #[pyclass(name = "RustPrimaryCoordinator")]
 pub(crate) struct PyPrimaryCoordinator {
     num_secondaries: u32,
     estimator: PyMemoryEstimatorBridge,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     spawn_secondary: Py<PyAny>,
     distributed_config: DistributedConfig,
     completed: u32,
@@ -42,18 +47,12 @@ impl PyPrimaryCoordinator {
         spawn_secondary: Py<PyAny>,
         distributed_config: Option<DistributedConfig>,
     ) -> PyResult<Self> {
-        // TODO(phases-5a): replace this single ("default", "estimate_memory")
-        // tuple with the full set of (TypeId, estimator_attr) pairs extracted
-        // from `task_definition.get_phases()`.
-        let types = vec![(
-            dynrunner_core::TypeId::from("default"),
-            "estimate_memory".to_string(),
-        )];
-        let bridge = PyMemoryEstimatorBridge::from_python(py, task_definition, &types)?;
+        let topology = LoadedTopology::from_python(py, task_definition)?;
 
         Ok(Self {
             num_secondaries,
-            estimator: bridge,
+            estimator: topology.estimator,
+            phase_deps: topology.phase_deps,
             spawn_secondary: spawn_secondary.clone_ref(py),
             distributed_config: distributed_config.unwrap_or_default(),
             completed: 0,
@@ -85,6 +84,7 @@ impl PyPrimaryCoordinator {
 
         let num_secondaries = self.num_secondaries;
         let estimator = self.estimator.clone();
+        let phase_deps = self.phase_deps.clone();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_keepalive = self.distributed_config.keepalive_interval();
@@ -167,11 +167,10 @@ impl PyPrimaryCoordinator {
                     primary.queue_stage_file(sec_id, hash, src, dest);
                 }
 
-                // Phase 4b: phase deps + lifecycle hooks. Phase 5B
-                // will replace these no-ops with closures that re-acquire
-                // the GIL and call the Python TaskDefinition's
-                // `on_phase_*` methods.
-                let phase_deps = std::collections::HashMap::new();
+                // Phase 5A: phase_deps now sourced from
+                // LoadedTopology. The lifecycle closures stay no-op
+                // until Phase 5B wires them to the Python
+                // TaskDefinition's `on_phase_*` methods.
                 let on_phase_start: Box<
                     dyn FnMut(&dynrunner_core::PhaseId) + Send,
                 > = Box::new(|_| {});

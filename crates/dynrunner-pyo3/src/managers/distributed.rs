@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
@@ -15,7 +16,7 @@ use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
-use crate::task_def::LoadedTaskDefinition;
+use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 
 #[pyclass(name = "RustDistributedManager")]
 pub(crate) struct PyDistributedManager {
@@ -29,8 +30,8 @@ pub(crate) struct PyDistributedManager {
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
     distributed_config: DistributedConfig,
-    worker_module: String,
-    worker_cmd_args: Vec<String>,
+    types: TypeRegistry,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
     estimator: PyMemoryEstimatorBridge,
     completed: u32,
@@ -88,8 +89,8 @@ impl PyDistributedManager {
             log_paths: task.log_paths,
             worker_spec,
             distributed_config: distributed_config.unwrap_or_default(),
-            worker_module: task.worker_module,
-            worker_cmd_args: task.worker_cmd_args,
+            types: task.types,
+            phase_deps: task.phase_deps,
             skip_existing,
             estimator: task.estimator,
             completed: 0,
@@ -116,9 +117,19 @@ impl PyDistributedManager {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let worker_spec = self.worker_spec.clone();
-        let worker_module = self.worker_module.clone();
-        let worker_cmd_args = self.worker_cmd_args.clone();
+        // TODO(phase-5a-followup): worker subprocesses currently use the
+        // first type's worker_module + cmd_args; restart-on-type-shift
+        // is not yet implemented. The factory will need a per-type
+        // dispatch path that consults the full TypeRegistry.
+        let first_type = self.types.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "task_definition.get_phases() yielded zero TaskTypeSpec entries",
+            )
+        })?;
+        let worker_module = first_type.worker_module.clone();
+        let worker_cmd_args = first_type.cmd_args.clone();
         let skip_existing = self.skip_existing;
+        let phase_deps = self.phase_deps.clone();
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -243,11 +254,10 @@ impl PyDistributedManager {
                     estimator,
                 );
 
-                // Phase 4b: phase deps + lifecycle hooks. Phase 5B
-                // will replace these no-ops with closures that re-acquire
-                // the GIL and call the Python TaskDefinition's
-                // `on_phase_*` methods.
-                let phase_deps = std::collections::HashMap::new();
+                // Phase 5A: phase_deps now sourced from
+                // LoadedTaskDefinition. The lifecycle closures stay
+                // no-op until Phase 5B wires them to the Python
+                // TaskDefinition's `on_phase_*` methods.
                 let on_phase_start: Box<
                     dyn FnMut(&dynrunner_core::PhaseId) + Send,
                 > = Box::new(|_| {});

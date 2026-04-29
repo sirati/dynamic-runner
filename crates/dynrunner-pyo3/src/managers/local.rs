@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::TaskInfo;
+use dynrunner_core::{PhaseId, TaskInfo};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 
 use crate::config::connection::ConnectionMode;
@@ -14,7 +15,7 @@ use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
 use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
-use crate::task_def::{LoadedTaskDefinition, extract_stage_timeouts};
+use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 use crate::transport::EitherManagerEnd;
 
 /// The main Python-facing local manager class.
@@ -35,11 +36,10 @@ pub(crate) struct PyLocalManager {
     worker_spec: Option<WorkerSpec>,
     scheduler_config: SchedulerConfig,
     phase_status_log_intervals_secs: Vec<f64>,
-    worker_module: String,
-    worker_cmd_args: Vec<String>,
+    types: TypeRegistry,
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
     estimator: PyMemoryEstimatorBridge,
-    stage_timeouts: std::collections::HashMap<String, std::time::Duration>,
     connection_mode: ConnectionMode,
     manual_start_worker: bool,
     stats: Option<ProcessingStats>,
@@ -103,7 +103,6 @@ impl PyLocalManager {
             skip_existing,
             log_paths,
         )?;
-        let stage_timeouts = extract_stage_timeouts(task_definition)?;
 
         // Parse connection mode
         let conn_mode = match connection_mode {
@@ -143,11 +142,10 @@ impl PyLocalManager {
             scheduler_config: scheduler_config.unwrap_or_default(),
             phase_status_log_intervals_secs: phase_status_log_intervals_secs
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
-            worker_module: task.worker_module,
-            worker_cmd_args: task.worker_cmd_args,
+            types: task.types,
+            phase_deps: task.phase_deps,
             skip_existing,
             estimator: task.estimator,
-            stage_timeouts,
             connection_mode: conn_mode,
             manual_start_worker,
             stats: None,
@@ -190,7 +188,11 @@ impl PyLocalManager {
             retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
             memuse_log_path,
-            stage_timeouts: self.stage_timeouts.clone(),
+            // TODO(phase-5a-followup): wire per-type TypeRuntime.timeout
+            // through to the manager-local stage-timeout watchdog. Until
+            // that follow-up lands, the watchdog stays inactive (empty
+            // map) — same effective behaviour as a no-`get_stages` task.
+            stage_timeouts: HashMap::new(),
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(
                 dynrunner_core::ResourceKind::memory(),
                 self.low_memory_threshold,
@@ -203,20 +205,33 @@ impl PyLocalManager {
                 .collect(),
         };
 
+        // TODO(phase-5a-followup): worker subprocesses currently use the
+        // first type's worker_module + cmd_args; restart-on-type-shift
+        // (so each worker is bound to a single TypeId for its lifetime)
+        // is not yet implemented. The subprocess factory should grow a
+        // `spawn_worker(worker_id, type_id)` overload that consults the
+        // full `TypeRegistry` instead of a single string.
+        let first_type = self.types.first().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "task_definition.get_phases() yielded zero TaskTypeSpec entries",
+            )
+        })?;
         let mut factory = SubprocessWorkerFactory {
             python_executable: self.python_executable.clone(),
             source_dir: self.source_dir.clone(),
             output_dir: self.output_dir.clone(),
             log_dir: self.log_dir.clone(),
             log_paths: self.log_paths.clone(),
-            worker_module: self.worker_module.clone(),
-            worker_cmd_args: self.worker_cmd_args.clone(),
+            worker_module: first_type.worker_module.clone(),
+            worker_cmd_args: first_type.cmd_args.clone(),
             skip_existing: self.skip_existing,
             connection_mode: self.connection_mode.clone(),
             manual_start_worker: self.manual_start_worker,
             worker_spec: self.worker_spec.clone(),
             child_processes: Vec::new(),
         };
+
+        let phase_deps = self.phase_deps.clone();
 
         // Run the async manager on a current-thread tokio runtime,
         // releasing the GIL during processing.
@@ -230,15 +245,15 @@ impl PyLocalManager {
             let result = rt.block_on(local.run_until(async {
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, scheduler, estimator);
-                // Phase 4A: pool is wired in but the user-facing
-                // phase-lifecycle hooks remain plumbing-only until the
-                // Python bridge lands in Phase 5B. Pass an empty deps
-                // map and no-op closures so behaviour matches the
-                // pre-pool single-phase default run.
+                // Phase 5A: phase_deps now comes from the
+                // `LoadedTaskDefinition` extraction of get_phases().
+                // The user-facing phase-lifecycle hooks remain
+                // plumbing-only until the Python bridge lands in
+                // Phase 5B — pass no-op closures here.
                 let outcome = manager
                     .process_binaries(
                         rust_binaries,
-                        std::collections::HashMap::new(),
+                        phase_deps,
                         |_phase| {},
                         |_phase, _completed, _failed| {},
                         &mut factory,
