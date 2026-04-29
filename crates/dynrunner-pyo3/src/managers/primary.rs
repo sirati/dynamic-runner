@@ -167,7 +167,20 @@ impl PyPrimaryCoordinator {
                     primary.queue_stage_file(sec_id, hash, src, dest);
                 }
 
-                let result = primary.run(rust_binaries).await;
+                // Phase 4b: phase deps + lifecycle hooks. Phase 5B
+                // will replace these no-ops with closures that re-acquire
+                // the GIL and call the Python TaskDefinition's
+                // `on_phase_*` methods.
+                let phase_deps = std::collections::HashMap::new();
+                let on_phase_start: Box<
+                    dyn FnMut(&dynrunner_core::PhaseId) + Send,
+                > = Box::new(|_| {});
+                let on_phase_end: Box<
+                    dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send,
+                > = Box::new(|_, _, _| {});
+                let result = primary
+                    .run(rust_binaries, phase_deps, on_phase_start, on_phase_end)
+                    .await;
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary coordinator failed");
                 }

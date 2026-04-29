@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use dynrunner_core::{TaskInfo, Identifier, PhaseId, TypeId};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
@@ -65,20 +65,13 @@ where
                     return Ok(());
                 }
 
-                let binary = match resolved_path {
-                    // TODO(phases-4b): wire phase_id/type_id/affinity_id/payload through
-                    // DistributedBinaryInfo so the secondary preserves them.
-                    Some(path) => TaskInfo {
-                        path,
-                        size: binary_info.size,
-                        identifier: binary_info.identifier.clone(),
-                        phase_id: PhaseId::from("default"),
-                        type_id: TypeId::from("default"),
-                        affinity_id: None,
-                        payload: serde_json::Value::Null,
-                    },
-                    None => distributed_to_binary(&binary_info),
-                };
+                // Hydrate from the wire info first (preserves
+                // phase/type/affinity/payload), then override the path
+                // if extraction-cache resolution found a local copy.
+                let mut binary = distributed_to_binary(&binary_info);
+                if let Some(path) = resolved_path {
+                    binary.path = path;
+                }
                 let estimated = self.estimator.estimate(&binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
 

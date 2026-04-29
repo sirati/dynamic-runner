@@ -87,6 +87,61 @@ pub enum PendingPoolError {
     UnknownDependency(PhaseId),
 }
 
+/// Read-only snapshot of a worker's eligible items, produced by
+/// [`PendingPool::view_for_worker`] and consumed by
+/// [`PendingPool::take_from_view`].
+///
+/// The snapshot owns clones of the visible `TaskInfo<I>` plus an
+/// opaque routing table back to the bucket each item came from. The
+/// manager hands `tasks()` (a flat `&[TaskInfo<I>]` slice) to a
+/// `Scheduler` impl so the scheduler picks an index; commit happens
+/// via `take_from_view`. This two-phase split lets the scheduler stay
+/// stateless and the pool stay the single source of truth for
+/// in-flight + soft-pin bookkeeping.
+///
+/// Owned (not borrowing the pool): the borrow checker would otherwise
+/// refuse `pool.take_from_view(view, …)` because `view` would still
+/// hold `&self` while `take_from_view` needs `&mut self`. The clone
+/// cost is bounded by the per-worker view size; for large pools the
+/// scheduler typically inspects only the first few items anyway.
+///
+/// Single-shot: a successful `take_from_view` invalidates remaining
+/// entries (bucket positions shift). Callers build a fresh view per
+/// assignment decision.
+#[derive(Debug)]
+pub struct PoolView<I: Identifier> {
+    /// Worker the view was built for. `take_from_view` propagates this
+    /// down to the bookkeeping path so soft-pin updates hit the right
+    /// `worker_affinity` slot.
+    worker_id: WorkerId,
+    /// `(bucket_key, position-in-bucket-at-view-creation)` for every
+    /// visible item, in the same priority order as `tasks`. Indexed by
+    /// the scheduler's chosen `binary_index`.
+    entries: Vec<(BucketKey, usize)>,
+    /// Owned clones of the visible items. Same length and same indexing
+    /// as `entries`.
+    tasks: Vec<TaskInfo<I>>,
+}
+
+impl<I: Identifier> PoolView<I> {
+    /// The flat slice of visible tasks the scheduler should consider.
+    /// Plugs straight into `Scheduler::assign_initial` / `assign_normal`'s
+    /// `pending: &[TaskInfo<I>]` parameter.
+    pub fn tasks(&self) -> &[TaskInfo<I>] {
+        &self.tasks
+    }
+
+    /// True iff no items are visible to this worker.
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    /// Number of visible items.
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+}
+
 /// Items grouped by `(phase, type, affinity)` plus the phase state
 /// machine. See module-level docs for ownership boundaries.
 #[derive(Debug)]
@@ -248,6 +303,143 @@ impl<I: Identifier> PendingPool<I> {
         let key = self.choose_bucket_for(worker_id)?;
         let item = self.take_from_bucket(&key, worker_id)?;
         Some(item)
+    }
+
+    /// Build a read-only view of the items this worker is allowed to
+    /// see, in soft-pin priority order. Pairs with [`Self::take_from_view`]:
+    /// the manager hands the view's `tasks()` slice to a `Scheduler`
+    /// implementation, then commits the chosen `binary_index` back via
+    /// `take_from_view`. The pool stays unmodified between the two
+    /// calls — there is no "tentative" state.
+    ///
+    /// The visible items follow the same priority as `pop_for_worker`:
+    /// 1. Worker's affine bucket first (Active or Draining phase).
+    /// 2. Unpinned typed buckets in Active phases.
+    /// 3. Free-pool buckets in Active phases.
+    /// 4. Co-pin candidates (typed buckets with other pins) in Active
+    ///    phases.
+    ///
+    /// Within a bucket, items are listed in their FIFO order; across
+    /// buckets, BTreeMap iteration order is used (deterministic for
+    /// tests). The scheduler is free to ignore the ordering and pick
+    /// any visible item by index — soft-pin enforcement happens on
+    /// `take_from_view`.
+    pub fn view_for_worker(&self, worker_id: WorkerId) -> PoolView<I> {
+        let no_aff = no_affinity();
+
+        // Same iteration order as `pop_for_worker`'s fallthrough chain.
+        // Each step appends from the buckets that match its predicate;
+        // buckets already emitted by an earlier step are skipped via
+        // `seen` so we don't double-list the affine bucket.
+        let mut entries: Vec<(BucketKey, usize)> = Vec::new();
+        let mut seen: HashSet<BucketKey> = HashSet::new();
+
+        // Step 1: existing affinity, Active or Draining phase, has items.
+        if let Some(Some(key)) = self.worker_affinity.get(&worker_id) {
+            let phase_ok = matches!(
+                self.phase_state.get(&key.0),
+                Some(PhaseState::Active | PhaseState::Draining)
+            );
+            if phase_ok
+                && let Some(bucket) = self.buckets.get(key)
+                && !bucket.items.is_empty()
+            {
+                for i in 0..bucket.items.len() {
+                    entries.push((key.clone(), i));
+                }
+                seen.insert(key.clone());
+            }
+        }
+
+        // Step 2: unpinned, non-free-pool, Active-phase buckets.
+        for (key, bucket) in &self.buckets {
+            if seen.contains(key) || bucket.items.is_empty() {
+                continue;
+            }
+            if key.2 == no_aff {
+                continue;
+            }
+            if self.phase_state.get(&key.0) != Some(&PhaseState::Active) {
+                continue;
+            }
+            if !bucket.pinned_workers.is_empty() {
+                continue;
+            }
+            for i in 0..bucket.items.len() {
+                entries.push((key.clone(), i));
+            }
+            seen.insert(key.clone());
+        }
+
+        // Step 3: free-pool buckets, Active phase.
+        for (key, bucket) in &self.buckets {
+            if seen.contains(key) || bucket.items.is_empty() {
+                continue;
+            }
+            if key.2 != no_aff {
+                continue;
+            }
+            if self.phase_state.get(&key.0) != Some(&PhaseState::Active) {
+                continue;
+            }
+            for i in 0..bucket.items.len() {
+                entries.push((key.clone(), i));
+            }
+            seen.insert(key.clone());
+        }
+
+        // Step 4: any remaining Active-phase bucket with items (co-pin).
+        for (key, bucket) in &self.buckets {
+            if seen.contains(key) || bucket.items.is_empty() {
+                continue;
+            }
+            if self.phase_state.get(&key.0) != Some(&PhaseState::Active) {
+                continue;
+            }
+            for i in 0..bucket.items.len() {
+                entries.push((key.clone(), i));
+            }
+            seen.insert(key.clone());
+        }
+
+        let tasks: Vec<TaskInfo<I>> = entries
+            .iter()
+            .map(|(key, pos)| {
+                self.buckets
+                    .get(key)
+                    .expect("entry from extant bucket")
+                    .items[*pos]
+                    .clone()
+            })
+            .collect();
+
+        PoolView {
+            worker_id,
+            entries,
+            tasks,
+        }
+    }
+
+    /// Commit the take chosen by the scheduler against `view`.
+    ///
+    /// `view_index` references the `view.tasks()` slice the scheduler
+    /// inspected. The pool resolves the index back to its bucket and
+    /// pops that exact item, applying the same in-flight + soft-pin
+    /// bookkeeping as `pop_for_worker`. Returns `None` if the index
+    /// is out of range.
+    ///
+    /// Note: a `PoolView` is single-shot — after a successful take, the
+    /// remaining view entries are stale (positions shift inside the
+    /// bucket the take came from). Callers building multi-assignment
+    /// loops must re-`view_for_worker` between takes.
+    pub fn take_from_view(
+        &mut self,
+        view: PoolView<I>,
+        view_index: usize,
+    ) -> Option<TaskInfo<I>> {
+        let (key, pos) = view.entries.get(view_index).cloned()?;
+        let worker_id = view.worker_id;
+        self.take_from_bucket_at(&key, pos, worker_id)
     }
 
     /// Notify the pool that an item finished (success or failure).
@@ -466,16 +658,22 @@ impl<I: Identifier> PendingPool<I> {
         None
     }
 
-    /// Pop the front item of `key` for `worker_id`, updating affinity,
-    /// in-flight count, and phase state as required.
-    fn take_from_bucket(
+    /// Pop the item at `pos` of `key` for `worker_id`, updating affinity,
+    /// in-flight count, and phase state as required. Shared core between
+    /// `take_from_bucket` (FIFO front, `pos == 0`) and `take_from_view`
+    /// (scheduler-chosen position).
+    fn take_from_bucket_at(
         &mut self,
         key: &BucketKey,
+        pos: usize,
         worker_id: WorkerId,
     ) -> Option<TaskInfo<I>> {
         let no_aff = no_affinity();
         let bucket = self.buckets.get_mut(key)?;
-        let item = bucket.items.pop_front()?;
+        if pos >= bucket.items.len() {
+            return None;
+        }
+        let item = bucket.items.remove(pos)?;
 
         // Soft-pin update: only typed (non-free-pool) buckets get pinned.
         if key.2 != no_aff {
@@ -484,10 +682,7 @@ impl<I: Identifier> PendingPool<I> {
             }
             self.worker_affinity.insert(worker_id, Some(key.clone()));
         } else {
-            // Free-pool dispatch does not record affinity. If the worker
-            // had affinity to a now-empty (or vanished) bucket, leave
-            // its slot as None or absent — both behave identically in
-            // the choose path.
+            // Free-pool dispatch does not record affinity.
             self.worker_affinity.entry(worker_id).or_insert(None);
         }
 
@@ -510,6 +705,17 @@ impl<I: Identifier> PendingPool<I> {
         }
 
         Some(item)
+    }
+
+    /// Pop the front item of `key` for `worker_id`. Thin wrapper over
+    /// `take_from_bucket_at(key, 0, worker_id)`; FIFO callers
+    /// don't have to thread an explicit `pos`.
+    fn take_from_bucket(
+        &mut self,
+        key: &BucketKey,
+        worker_id: WorkerId,
+    ) -> Option<TaskInfo<I>> {
+        self.take_from_bucket_at(key, 0, worker_id)
     }
 
     /// Inspect a phase to decide if it should transition between

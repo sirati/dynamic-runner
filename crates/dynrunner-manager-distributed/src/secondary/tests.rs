@@ -109,11 +109,7 @@ fn send_task_assignment(
         secondary_id: secondary_id.into(),
         worker_id,
         zip_file: None,
-        binary_info: DistributedBinaryInfo {
-            path: binary.path.to_string_lossy().into_owned(),
-            size: binary.size,
-            identifier: binary.identifier.clone(),
-        },
+        binary_info: DistributedBinaryInfo::from_task_info(binary),
         local_path: binary.path.to_string_lossy().into_owned(),
         file_hash: hash,
     })
@@ -439,6 +435,10 @@ async fn stage_file_then_assign_task_succeeds() {
                                             path: "/nowhere/staged_bin".into(),
                                             size: payload_len,
                                             identifier: TestId("staged_bin".into()),
+                                            phase_id: "default".into(),
+                                            type_id: "default".into(),
+                                            affinity_id: None,
+                                            payload_json: "null".into(),
                                         },
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),

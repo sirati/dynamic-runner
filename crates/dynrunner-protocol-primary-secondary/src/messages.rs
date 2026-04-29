@@ -1,4 +1,4 @@
-use dynrunner_core::ResourceAmount;
+use dynrunner_core::{Identifier, ResourceAmount, TaskInfo};
 use serde::{Deserialize, Serialize};
 
 /// All distributed message types.
@@ -50,6 +50,13 @@ pub struct PeerConnectionInfo {
 /// Generic over the identifier type `I`. The identifier fields are flattened
 /// into the JSON object to maintain backward compatibility with the Python
 /// wire format.
+///
+/// Carries the `(phase_id, type_id, affinity_id, payload_json)` tags so the
+/// receiving secondary can hydrate its in-process `TaskInfo<I>` with the
+/// actual phase/type/affinity from the primary's `PendingPool` rather than
+/// resetting to defaults. `payload_json` is a stringified `serde_json::Value`
+/// — keeping it a `String` on the wire decouples the protocol crate from
+/// the runner's choice of opaque payload representation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
     serialize = "I: Serialize",
@@ -63,6 +70,80 @@ pub struct DistributedBinaryInfo<I> {
     /// identifier as an opaque key (`Arc<str>` Rust-side), so the field
     /// is just `identifier`.
     pub identifier: I,
+    /// Phase tag (`PhaseId` Rust-side). Defaults to `"default"` for
+    /// pre-Phase-4b senders that didn't include the field.
+    #[serde(default = "default_phase_id_string")]
+    pub phase_id: String,
+    /// Type tag (`TypeId` Rust-side). Defaults to `"default"` for
+    /// pre-Phase-4b senders.
+    #[serde(default = "default_type_id_string")]
+    pub type_id: String,
+    /// Optional soft-affinity tag (`AffinityId` Rust-side). `None` means
+    /// the item belongs to the free pool.
+    #[serde(default)]
+    pub affinity_id: Option<String>,
+    /// Opaque per-item payload, stringified JSON. Defaults to JSON
+    /// `null` for pre-Phase-4b senders. The framework never inspects
+    /// the contents — it's pass-through metadata for the worker.
+    #[serde(default = "default_payload_json")]
+    pub payload_json: String,
+}
+
+fn default_phase_id_string() -> String {
+    "default".into()
+}
+
+fn default_type_id_string() -> String {
+    "default".into()
+}
+
+fn default_payload_json() -> String {
+    "null".into()
+}
+
+impl<I: Identifier> DistributedBinaryInfo<I> {
+    /// Build the wire-side info from an in-process `TaskInfo<I>`.
+    ///
+    /// Owns the reverse transformation in [`Self::to_task_info`]; managers
+    /// (primary, secondary, slurm-promoted-secondary) all funnel through
+    /// these two methods so the phase/type/affinity/payload tags stay in
+    /// lockstep across the wire.
+    pub fn from_task_info(task: &TaskInfo<I>) -> Self {
+        Self {
+            path: task.path.to_string_lossy().into_owned(),
+            size: task.size,
+            identifier: task.identifier.clone(),
+            phase_id: task.phase_id.as_str().to_owned(),
+            type_id: task.type_id.as_str().to_owned(),
+            affinity_id: task.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
+            // payload is opaque to the framework — round-trip the JSON
+            // representation verbatim. `to_string` on `serde_json::Value`
+            // is infallible.
+            payload_json: task.payload.to_string(),
+        }
+    }
+
+    /// Hydrate an in-process `TaskInfo<I>` from this wire-side info.
+    ///
+    /// A malformed `payload_json` (shouldn't happen — senders always emit
+    /// valid JSON via `Value::to_string`) decodes as JSON `null` rather
+    /// than failing the dispatch path; the per-item payload is opaque to
+    /// the framework so the worst case is the worker sees an unexpected
+    /// payload.
+    pub fn to_task_info(&self) -> TaskInfo<I> {
+        use dynrunner_core::{AffinityId, PhaseId, TypeId};
+        let payload = serde_json::from_str::<serde_json::Value>(&self.payload_json)
+            .unwrap_or(serde_json::Value::Null);
+        TaskInfo {
+            path: std::path::PathBuf::from(&self.path),
+            size: self.size,
+            identifier: self.identifier.clone(),
+            phase_id: PhaseId::from(self.phase_id.as_str()),
+            type_id: TypeId::from(self.type_id.as_str()),
+            affinity_id: self.affinity_id.as_deref().map(AffinityId::from),
+            payload,
+        }
+    }
 }
 
 /// Zip file with assigned binaries for initial assignment.

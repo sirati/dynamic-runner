@@ -137,7 +137,15 @@ async fn e2e_primary_secondary_over_wss() {
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
-        primary.run(binaries).await.unwrap();
+        primary
+            .run(
+                binaries,
+                std::collections::HashMap::new(),
+                Box::new(|_| {}),
+                Box::new(|_, _, _| {}),
+            )
+            .await
+            .unwrap();
 
         let completed = primary.completed_count();
         let failed = primary.failed_count();
@@ -229,7 +237,15 @@ async fn e2e_primary_secondary_over_quic() {
             .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
             .collect();
 
-        primary.run(binaries).await.unwrap();
+        primary
+            .run(
+                binaries,
+                std::collections::HashMap::new(),
+                Box::new(|_| {}),
+                Box::new(|_, _, _| {}),
+            )
+            .await
+            .unwrap();
 
         let completed = primary.completed_count();
         let failed = primary.failed_count();
