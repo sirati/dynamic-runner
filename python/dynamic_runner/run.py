@@ -198,24 +198,39 @@ def _dispatch_secondary(task, args, logger) -> None:
         logger.error("--secondary-id is required when running in secondary mode")
         return
 
-    in_docker = Path("/app").exists() and Path("/.dockerenv").exists()
+    # True when running inside the SLURM wrapper's podman container.
+    # We detect this by the presence of the bind-mounted network drive
+    # (`/app/src-network`), which the wrapper script in
+    # `packaging/job_manager.py` always mounts read-only alongside
+    # `/app/src-tmp` and `/app/out-tmp`. Checking the bind-mount
+    # directly is more robust than peeking at container-runtime
+    # sentinels (`/.dockerenv` for docker, `/run/.containerenv` for
+    # podman, …) — those vary by runtime, and the question we
+    # actually care about is "did the wrapper set up the
+    # `/app/...` layout I'm about to consume?", not "what runtime
+    # is beneath me?". The previous detection
+    # (`/.dockerenv`-only) silently went False under podman and made
+    # the secondary fall back to `src_network=None`, which left
+    # workers exec'ing the primary's filesystem-view absolute paths
+    # in an infinite recoverable-failure loop.
+    in_wrapper_container = Path("/app/src-network").exists()
 
     # Source-binary staging directories: explicit CLI flags override the
     # container/local defaults. `src_network` is the shared-drive directory
     # the primary writes into; `src_tmp` is this secondary's per-process
     # scratch dir where StageFile copies land.
     src_network = Path(args.src_network) if args.src_network else (
-        Path("/app/src-network") if in_docker else None
+        Path("/app/src-network") if in_wrapper_container else None
     )
 
     if args.src_tmp:
         src_tmp = Path(args.src_tmp)
-    elif in_docker:
+    elif in_wrapper_container:
         src_tmp = Path("/app/src-tmp")
     else:
         temp_dir = Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-"))
         src_tmp = temp_dir / "src-tmp"
-    out_tmp = Path("/app/out-tmp") if in_docker else (
+    out_tmp = Path("/app/out-tmp") if in_wrapper_container else (
         Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-out-"))
     )
 

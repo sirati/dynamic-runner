@@ -40,14 +40,41 @@ where
                     .extraction_cache
                     .resolve_binary(zip_ref, &local_path, &file_hash);
 
-                // When the secondary is configured with a staging
-                // directory (`src_network` set) and resolution failed,
-                // the file is genuinely missing — fail loudly here
-                // instead of silently falling through to the primary's
-                // filesystem-view path (which won't exist on this
-                // secondary either, surfacing only at worker exec
-                // time as a confusing crash).
-                if resolved_path.is_none() && self.config.src_network.is_some() {
+                // Fail loudly when the worker has no plausible way to
+                // open the binary, instead of silently passing
+                // through the primary's absolute path and crashing
+                // at exec time (which the primary then re-enqueues
+                // as Recoverable, producing an infinite
+                // dispatch / re-enqueue loop — observed at ~12ms
+                // cadence for 6 binaries on a misconfigured SLURM
+                // dispatch).
+                //
+                // Two ways the worker can succeed without resolution:
+                //   - the secondary has a staging directory
+                //     (`src_network` set) AND the file landed there;
+                //     covered by `resolved_path.is_some()` above.
+                //   - the secondary shares a filesystem view with the
+                //     primary AND `local_path` is the primary's
+                //     absolute path (the in-process distributed
+                //     manager's mode); for that to be plausible we at
+                //     minimum need `local_path` to be absolute.
+                //
+                // So the failure conditions are:
+                //   `resolved_path.is_none()` AND (
+                //       `src_network.is_some()`             // staging configured but missed
+                //       OR `local_path` is relative          // can't possibly resolve relatively
+                //   )
+                // The second predicate is what catches the
+                // `in_docker` misdetection failure mode: pipeline
+                // sends relative paths in SLURM mode, the secondary
+                // detected `src_network=None` due to a runtime
+                // sentinel mismatch, the old guard missed it, and
+                // workers spun on the primary-filesystem-view
+                // relative path.
+                let local_path_is_relative = std::path::Path::new(&local_path).is_relative();
+                if resolved_path.is_none()
+                    && (self.config.src_network.is_some() || local_path_is_relative)
+                {
                     let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
