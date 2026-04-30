@@ -120,10 +120,24 @@ def run_slurm_pipeline(
     run_id = _make_run_id()
     log.info(f"Run ID: {run_id}")
 
-    # Set up gateway + slurm config
+    # Set up gateway + slurm config.
+    #
+    # The QUIC port and the SSH -R forward have to be configured BEFORE
+    # `gateway.connect()`: SSHGateway.connect() reads `forwarded_ports`
+    # to build its `-R 0.0.0.0:remote:localhost:local` flags, and
+    # `_check_gateway_ports()` (which decides whether to fall back to
+    # reverse-connection mode) short-circuits when `forwarded_ports`
+    # is empty. So a port-pick + setup_port_forwarding has to happen
+    # before connect — otherwise no listener exists on the gateway,
+    # secondaries get "Connection refused" dialing the gateway FQDN,
+    # AND the reverse-connection fallback never fires either.
     log.info("Connecting to gateway...")
     gateway_config = parse_gateway_url(args.gateway)
     gateway = create_gateway(gateway_config)
+
+    primary_quic_port = _pick_free_local_port()
+    gateway.setup_port_forwarding(primary_quic_port, primary_quic_port)
+
     gateway.connect()
 
     slurm_config = _make_slurm_config(args, gateway)
@@ -153,7 +167,6 @@ def run_slurm_pipeline(
     packaging = PodmanPackaging(deployment=deployment)
     job_manager = SlurmJobManager(gateway, slurm_config, packaging, deployment)
 
-    primary_quic_port = _pick_free_local_port()
     cert_dir = Path("/tmp") / f"db-runner-cert-{run_id}"
     cert_dir.mkdir(parents=True, exist_ok=True)
 
