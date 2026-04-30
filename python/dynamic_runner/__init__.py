@@ -2,11 +2,12 @@
 packages (e.g. `dynamic_runner_tokenizer`).
 
 Public surface:
-- `run(task, ...)` — the canonical Python entry point.
+- `run(task, deployment=None, ...)` — the canonical Python entry point.
+- `TaskDeploymentSpec` — task-package deployment metadata required for
+  `--multi-computer slurm|local` modes (image name, secondary module,
+  nix build target).
 - `TaskDefinition`, `PhaseSpec`, `TaskTypeSpec` — Protocol + dataclasses for
   task packages.
-- `make_subprocess_spawn_factory(package_name)` — convenience factory for
-  the `spawn_secondary` callback.
 - `factories.PodmanExecWorkerFactory`, `factories.CgroupResourceMonitor`
   — reference implementations for unusual deployments (containerised
   workers, cgroup-aware resource accounting). Lazy-imported via the
@@ -20,8 +21,8 @@ Public surface:
   form above; reach it as `dynamic_runner._native.TaskInfo` if needed.
 """
 
+from .deployment_spec import TaskDeploymentSpec
 from .run import run
-from .spawn_secondary import make_subprocess_spawn_factory
 from .task_protocol import PhaseSpec, TaskDefinition, TaskTypeSpec
 
 from ._native import (
@@ -51,7 +52,7 @@ from ._native import (
 
 __all__ = [
     "run",
-    "make_subprocess_spawn_factory",
+    "TaskDeploymentSpec",
     "TaskDefinition",
     "PhaseSpec",
     "TaskTypeSpec",

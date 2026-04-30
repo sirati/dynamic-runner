@@ -24,6 +24,7 @@ from pathlib import Path
 
 from .._shared import find_matching_binaries, process_selection_arguments
 
+from ..deployment_spec import TaskDeploymentSpec
 from .gateway import create_gateway, parse_gateway_url
 from .job_manager import SlurmJobManager
 from .podman import PodmanPackaging
@@ -77,6 +78,7 @@ def _make_slurm_config(args: argparse.Namespace) -> SlurmConfig:
 def run_slurm_pipeline(
     task: TaskDefinition,
     args: argparse.Namespace,
+    deployment: TaskDeploymentSpec,
     log: logging.Logger,
 ) -> None:
     """Build the image, transfer it, submit slurm jobs, then run the
@@ -136,8 +138,8 @@ def run_slurm_pipeline(
 
     # Build + transfer images, then submit slurm jobs, then (if reverse
     # mode) wait for tunnels to establish.
-    packaging = PodmanPackaging()
-    job_manager = SlurmJobManager(gateway, slurm_config, packaging)
+    packaging = PodmanPackaging(deployment=deployment)
+    job_manager = SlurmJobManager(gateway, slurm_config, packaging, deployment)
 
     primary_quic_port = _pick_free_local_port()
     cert_dir = Path("/tmp") / f"db-runner-cert-{run_id}"
@@ -147,6 +149,7 @@ def run_slurm_pipeline(
         slurm_config=slurm_config,
         job_manager=job_manager,
         gateway=gateway,
+        deployment=deployment,
         use_reverse_connection=use_reverse_connection,
         run_id=run_id,
     )

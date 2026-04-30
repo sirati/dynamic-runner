@@ -27,11 +27,18 @@ from typing import Any
 
 import pytest
 
+from dynamic_runner import TaskDeploymentSpec
 from dynamic_runner.packaging.podman import (
     DEFAULT_LAYER_CACHE_REL,
     LAYER_CACHE_ENV_VAR,
     LAYER_EXTRACTOR_SCRIPT_REL,
     PodmanPackaging,
+)
+
+
+_TEST_DEPLOYMENT = TaskDeploymentSpec(
+    secondary_module="test_pkg",
+    image_name="test-image",
 )
 
 
@@ -175,7 +182,7 @@ def patched_subprocess(monkeypatch, tmp_path):
 
 
 def test_cold_build_invokes_nix_without_impure(patched_subprocess, tmp_path):
-    pp = PodmanPackaging()
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT)
     pp._build_nix_target(
         local_project_root=patched_subprocess.project_root,
         target=".#dockerImage",
@@ -193,7 +200,7 @@ def test_warm_build_passes_impure_and_env_var(patched_subprocess, tmp_path):
     cache_path = patched_subprocess.project_root / DEFAULT_LAYER_CACHE_REL
     cache_path.write_text(json.dumps([["/nix/store/abc-fake"]]))
 
-    pp = PodmanPackaging()
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT)
     pp._build_nix_target(
         local_project_root=patched_subprocess.project_root,
         target=".#dockerImage",
@@ -210,7 +217,7 @@ def test_cache_is_refreshed_after_successful_build(patched_subprocess, tmp_path)
     cache_path = patched_subprocess.project_root / DEFAULT_LAYER_CACHE_REL
     assert not cache_path.exists()
 
-    pp = PodmanPackaging()
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT)
     pp._build_nix_target(
         local_project_root=patched_subprocess.project_root,
         target=".#dockerImage",

@@ -3,6 +3,7 @@ import secrets
 from pathlib import Path
 from typing import Any
 
+from ..deployment_spec import TaskDeploymentSpec
 from .podman import PodmanImageMetadata
 
 logger = logging.getLogger(__name__)
@@ -11,10 +12,17 @@ logger = logging.getLogger(__name__)
 class SlurmJobManager:
     """Manages SLURM job submission and lifecycle."""
 
-    def __init__(self, gateway: Any, slurm_config: Any, packaging_method: Any):
+    def __init__(
+        self,
+        gateway: Any,
+        slurm_config: Any,
+        packaging_method: Any,
+        deployment: TaskDeploymentSpec,
+    ):
         self.gateway = gateway
         self.slurm_config = slurm_config
         self.packaging = packaging_method
+        self.deployment = deployment
         self.job_ids: list[str] = []
 
     def _normalize_path(self, path: str | Path) -> Path:
@@ -186,7 +194,7 @@ SOCKET_COUNTER=0
 CMD_RELAY_PID=$!
 
 echo "Copying image to local temp directory..."
-LOCAL_IMAGE="$RNDTMP/asm-tokenizer.tar"
+LOCAL_IMAGE="$RNDTMP/{self.deployment.image_tar_basename}"
 cp "{image_path}" "$LOCAL_IMAGE"
 echo "Image copied to: $LOCAL_IMAGE"
 
@@ -220,7 +228,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
     {image_name}:{image_tag} \
-    dynamic_batch --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
+    {self.deployment.secondary_module} --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
         else:
             script += f"""echo "  Gateway: {gateway_host}:{gateway_port}"
 echo "  Mode: Standard (secondary connects to primary via gateway)"
@@ -236,7 +244,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
     {image_name}:{image_tag} \
-    dynamic_batch --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
+    {self.deployment.secondary_module} --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
 
         script += """
 CONTAINER_EXIT_CODE=$?
@@ -298,7 +306,7 @@ echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
 
 echo "Copying image to local /tmp..."
-LOCAL_IMAGE="$RNDTMP/asm-tokenizer.tar"
+LOCAL_IMAGE="$RNDTMP/{self.deployment.image_tar_basename}"
 echo "  Source: {image_path}"
 cp "{image_path}" "$LOCAL_IMAGE"
 echo "  Size: $(du -h "$LOCAL_IMAGE" | cut -f1)"
@@ -312,12 +320,8 @@ echo "Verifying image is loaded..."
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" images | grep {image_name} || echo "WARNING: Image not found in listing"
 echo ""
 
-echo "Testing container execution..."
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm {image_name}:{image_tag} python --version
-echo ""
-
-echo "Testing dynamic_batch module..."
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm {image_name}:{image_tag} dynamic_batch --help | head -5
+echo "Testing secondary entrypoint ({self.deployment.secondary_module} --help)..."
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm {image_name}:{image_tag} {self.deployment.secondary_module} --help | head -5
 echo ""
 
 echo "=================================================="

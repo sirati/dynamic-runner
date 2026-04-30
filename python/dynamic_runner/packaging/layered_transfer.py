@@ -2,11 +2,12 @@
 
 Single concern: minimise bytes-on-the-wire when transferring an updated
 docker-archive tarball to a gateway. The runner doesn't change the
-on-gateway artifact contract — the existing
-`<output_dir>/asm-tokenizer-{base,app}.tar` paths still hold a
-fully-formed `podman load`-compatible tarball after each upload — only
-the bytes physically transferred shrink to the layers and config blobs
-that aren't already present in the gateway's blob cache.
+on-gateway artifact contract — the `<output_dir>/<image_name>.tar`
+path (where `image_name` comes from the consumer's
+:class:`TaskDeploymentSpec`) still holds a fully-formed
+`podman load`-compatible tarball after each upload — only the bytes
+physically transferred shrink to the layers and config blobs that
+aren't already present in the gateway's blob cache.
 
 ## Why this matters
 
@@ -103,7 +104,7 @@ class LayerBlob:
 class ImageBundle:
     """An extracted docker-archive image, ready for layered upload."""
 
-    image_label: str  # e.g. "asm-tokenizer-base.tar.gz" — for logs
+    image_label: str  # consumer-supplied image_name from TaskDeploymentSpec — for logs
     manifest_json_bytes: bytes
     config_blob: LayerBlob
     layer_blobs: tuple[LayerBlob, ...]  # in manifest order

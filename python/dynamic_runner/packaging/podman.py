@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..deployment_spec import TaskDeploymentSpec
 from .layered_transfer import LayeredUploader, UploadStats, make_bundle_from_archive
 
 logger = logging.getLogger(__name__)
@@ -91,20 +92,24 @@ class PodmanImageMetadata:
 
 
 class PodmanPackaging:
-    """Podman-based packaging implementation for SLURM cluster environments."""
+    """Podman-based packaging implementation for SLURM cluster environments.
 
-    IMAGE_NAME = "asm-tokenizer.tar"
-    MARKER_NAME = "asm-tokenizer.sha256"
+    Task-package identity (image name/tag, nix build target, image tar
+    basename, sha256 marker basename) is read from the consumer-supplied
+    :class:`TaskDeploymentSpec`. The framework holds no defaults here —
+    the spec is the single source of truth.
+    """
+
     LAYER_CACHE_SUBDIR = "layer-cache"
 
     def __init__(
         self,
+        deployment: TaskDeploymentSpec,
         *,
         layered_transfer: bool = True,
         layer_cache_path: Path | str | None = None,
     ) -> None:
-        self.image_name = "asm-tokenizer"
-        self.image_tag = "latest"
+        self.deployment = deployment
         # Layered transfer is opt-out (defaults on). Disable for
         # diagnostics / regression bisect by passing False.
         self.layered_transfer = layered_transfer
@@ -113,6 +118,14 @@ class PodmanPackaging:
         # at build time. Pass an explicit path (or False to disable
         # entirely) to override.
         self._layer_cache_path = layer_cache_path
+
+    @property
+    def image_name(self) -> str:
+        return self.deployment.image_name
+
+    @property
+    def image_tag(self) -> str:
+        return self.deployment.image_tag
 
     def _normalize_path(self, path: str | Path) -> Path:
         if isinstance(path, Path):
@@ -289,13 +302,13 @@ class PodmanPackaging:
 
         local_image_path = self._build_nix_target(
             local_project_root=local_project_root,
-            target=".#dockerImage",
+            target=self.deployment.nix_build_target,
             out_link="docker-image-result",
         )
 
         output_dir_path = self._normalize_path(output_dir)
-        remote_path = output_dir_path / self.IMAGE_NAME
-        marker_remote_path = output_dir_path / self.MARKER_NAME
+        remote_path = output_dir_path / self.deployment.image_tar_basename
+        marker_remote_path = output_dir_path / self.deployment.image_marker_basename
         layer_cache_root = output_dir_path / self.LAYER_CACHE_SUBDIR
 
         gateway.create_directory(str(output_dir_path))
@@ -305,7 +318,7 @@ class PodmanPackaging:
             local_image_path,
             remote_path,
             marker_remote_path,
-            label="asm-tokenizer",
+            label=self.deployment.image_name,
             layer_cache_root=layer_cache_root,
         )
 

@@ -1,8 +1,7 @@
 """Thin runner facade: parse argparse, build typed configs, dispatch to Rust.
 
-`run(task, spawn_secondary_factory=None, description="...")` is the new
-canonical entry point. It replaces `dynamic_runner.cli.run`, which becomes a
-deprecated alias for one release.
+`run(task, deployment=None, description="...")` is the canonical Python
+entry point.
 """
 
 from __future__ import annotations
@@ -10,7 +9,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 from ._shared import (
@@ -22,7 +20,9 @@ from ._shared import (
     process_selection_arguments,
 )
 
+from .deployment_spec import TaskDeploymentSpec
 from .logging_setup import setup_logging
+from .spawn_secondary import build_subprocess_spawn
 from .system_resources import parse_cores, parse_memory
 from .task_protocol import TaskDefinition
 
@@ -32,15 +32,17 @@ from .cli import build_arg_parser  # noqa: E402  (defined in same package)
 
 def run(
     task: TaskDefinition,
-    spawn_secondary_factory: Callable[[argparse.Namespace], Callable] | None = None,
+    deployment: TaskDeploymentSpec | None = None,
     description: str = "Dynamic batch processing with memory-aware parallel execution",
 ) -> None:
     """Run the dynamic batch processing CLI.
 
     Args:
         task: Object satisfying the `TaskDefinition` protocol.
-        spawn_secondary_factory: Optional `(args) -> spawn_secondary(...)` factory
-            used by the network-based primary coordinator (multi-computer/local).
+        deployment: Task-package deployment metadata (image name,
+            secondary Python module, nix build target). Required when
+            ``--multi-computer local|slurm`` is used; ignored in
+            single-process and plain-local modes.
         description: Description for the argparse help text.
     """
     logger = setup_logging(sys.argv[1:])
@@ -70,9 +72,15 @@ def run(
         return
 
     if args.multi_computer == "slurm":
-        _dispatch_slurm(task, args, logger)
+        if deployment is None:
+            logger.error("--multi-computer slurm requires `deployment=TaskDeploymentSpec(...)` in run()")
+            return
+        _dispatch_slurm(task, args, deployment, logger)
     elif args.multi_computer == "local":
-        _dispatch_multi_computer_local(task, args, logger, spawn_secondary_factory)
+        if deployment is None:
+            logger.error("--multi-computer local requires `deployment=TaskDeploymentSpec(...)` in run()")
+            return
+        _dispatch_multi_computer_local(task, args, deployment, logger)
     elif args.multi_computer == "single-process":
         _dispatch_single_process(task, args, config, logger)
     else:
@@ -278,7 +286,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     logger.info(f"Failed: {result['failed']}")
 
 
-def _dispatch_multi_computer_local(task, args, logger, spawn_secondary_factory) -> None:
+def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, logger) -> None:
     """Network-based primary that spawns local secondaries via subprocess."""
     import dynamic_runner as _rs
 
@@ -291,10 +299,7 @@ def _dispatch_multi_computer_local(task, args, logger, spawn_secondary_factory) 
     num_secondaries = args.jobs
     logger.info(f"Starting coordinator with {num_secondaries} local secondaries")
 
-    if spawn_secondary_factory is None:
-        logger.error("spawn_secondary_factory is required for multi-computer/local mode")
-        return
-    spawn_secondary = spawn_secondary_factory(args)
+    spawn_secondary = build_subprocess_spawn(deployment, args)
 
     primary_cfg = _rs.PrimaryConfig(num_secondaries=num_secondaries)
     result = _rs.run_primary(primary_cfg, task, spawn_secondary, binaries)
@@ -302,8 +307,8 @@ def _dispatch_multi_computer_local(task, args, logger, spawn_secondary_factory) 
     logger.info(f"Failed: {result['failed']}")
 
 
-def _dispatch_slurm(task, args, logger) -> None:
-    """SLURM distributed mode — packaging is not yet ported to the new flow."""
+def _dispatch_slurm(task, args, deployment: TaskDeploymentSpec, logger) -> None:
+    """SLURM distributed mode — image build, transfer, job submission, then Rust primary."""
     from .packaging import run_slurm_pipeline
 
-    run_slurm_pipeline(task, args, logger)
+    run_slurm_pipeline(task, args, deployment, logger)

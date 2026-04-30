@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..deployment_spec import TaskDeploymentSpec
 from .podman import PodmanImageMetadata
 
 logger = logging.getLogger(__name__)
@@ -42,12 +43,14 @@ class SlurmPreparation:
         slurm_config: Any,
         job_manager: Any,
         gateway: Any,
+        deployment: TaskDeploymentSpec,
         use_reverse_connection: bool = False,
         run_id: str = "default",
     ):
         self.slurm_config = slurm_config
         self.job_manager = job_manager
         self.gateway = gateway
+        self.deployment = deployment
         self.use_reverse_connection = use_reverse_connection
         self.run_id = run_id
 
@@ -98,7 +101,7 @@ class SlurmPreparation:
     async def _prepare_docker_images(self, skip_image_build: bool) -> PodmanImageMetadata:
         """Build and transfer the docker image, or verify existing path."""
         image_dir = Path(self.job_manager._expand_path(self.slurm_config.get_image_dir()))
-        image_path = image_dir / "asm-tokenizer.tar"
+        image_path = image_dir / self.deployment.image_tar_basename
 
         if skip_image_build:
             logger.info("Skipping image build and transfer (--skip-image-build)")
@@ -133,7 +136,7 @@ class SlurmPreparation:
 
         for i in range(num_secondaries):
             secondary_id = f"secondary-{i}"
-            job_name = f"asm-tokenizer-{secondary_id}"
+            job_name = f"{self.deployment.effective_job_name_prefix}-{secondary_id}"
 
             wrapper = self.job_manager.generate_wrapper_script(
                 image_metadata=image_metadata,

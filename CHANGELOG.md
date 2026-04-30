@@ -8,6 +8,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed (BREAKING)
+- **`run()` API**: the optional `spawn_secondary_factory` parameter is
+  gone; replaced with `deployment: TaskDeploymentSpec | None`. The spec
+  carries the secondary Python module name, container image identity
+  (name, tag), the nix build target, and an optional SLURM job-name
+  prefix override. The framework derives the local-subprocess spawn
+  closure from `deployment.secondary_module`, so consumers no longer
+  construct it themselves. `--multi-computer slurm|local` now requires
+  `deployment` and exits early with an actionable error if it is None.
+- **`make_subprocess_spawn_factory` removed** from the public surface.
+  Replace
+  `make_subprocess_spawn_factory("dynrunner.tokenize")` plumbed via
+  `spawn_secondary_factory=` with
+  `TaskDeploymentSpec(secondary_module="dynrunner.tokenize",
+  image_name="<your-image>")` plumbed via `deployment=`.
+
+### Fixed
+- **SLURM wrapper invoked the obsolete `dynamic_batch` module name** at
+  `packaging/job_manager.py:223,239` regardless of which task package
+  was running, so every SLURM secondary crashed at startup with
+  `ModuleNotFoundError`. The module name is now sourced from
+  `TaskDeploymentSpec.secondary_module`.
+- **SLURM test wrapper had two broken commands** at
+  `packaging/job_manager.py:316,320`. With `Entrypoint=["python","-m"]`
+  on the consumer image, `... run image:tag python --version` became
+  `python -m python --version` (ModuleNotFoundError) and
+  `... dynamic_batch --help` became `python -m dynamic_batch --help`
+  (also ModuleNotFoundError); both failed silently because the surrounding
+  `set -e` only fires on tracked exit codes. Replaced with a single
+  positive check: `... run image:tag {secondary_module} --help` through
+  the entrypoint.
+- **Hardcoded `asm-tokenizer` task identity** removed from
+  `packaging/podman.py` (image name, image tag, image tar basename,
+  sha256 marker basename, layered-upload log label, nix build target),
+  `packaging/preparation.py` (image tar basename, SLURM job-name
+  prefix), and `packaging/layered_transfer.py` (docstring). All
+  read from `TaskDeploymentSpec`.
+
+### Added
+- `dynamic_runner.TaskDeploymentSpec`: frozen dataclass capturing the
+  consumer-supplied deployment metadata the SLURM packaging path needs.
+  See `python/dynamic_runner/deployment_spec.py`.
+
+## [0.2.0] - 2026-04-29
+
+### Changed (BREAKING)
 - **`TaskDefinition` Protocol redesign**: first-class phases / task types
   / affinity classes. The old `get_stages` / `Phase` enum /
   `StageDefinition` / `organize_and_sort_items` / `get_worker_module`
@@ -75,6 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - QUIC, Unix-socket, and in-process channel transports.
 - Slurm gateway integration.
 
-[Unreleased]: https://github.com/sirati/dynamic-runner/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/sirati/dynamic-runner/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sirati/dynamic-runner/releases/tag/v0.2.0
 [0.1.1]: https://github.com/sirati/dynamic-runner/releases/tag/v0.1.1
 [0.1.0]: https://github.com/sirati/dynamic-runner/releases/tag/v0.1.0
