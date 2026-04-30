@@ -154,18 +154,27 @@ impl PySecondaryCoordinator {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
-                // Parse the primary URL to get the address.
+                // Resolve the primary URL to a SocketAddr.
                 // Supports formats like "tcp://host:port", "ws://host:port", or "host:port"
+                // where `host` may be either a literal IP address or a DNS name —
+                // SLURM gateways generally hand out the FQDN from `hostname -f`,
+                // so the resolver needs to accept both.
                 let addr_str = primary_url
                     .strip_prefix("tcp://")
                     .or_else(|| primary_url.strip_prefix("ws://"))
                     .or_else(|| primary_url.strip_prefix("wss://"))
                     .unwrap_or(&primary_url);
 
-                let addr: std::net::SocketAddr = match addr_str.parse() {
-                    Ok(a) => a,
+                let addr: std::net::SocketAddr = match tokio::net::lookup_host(addr_str).await {
+                    Ok(mut iter) => match iter.next() {
+                        Some(a) => a,
+                        None => {
+                            tracing::error!(url = %primary_url, "DNS lookup returned no addresses for primary URL");
+                            return;
+                        }
+                    },
                     Err(e) => {
-                        tracing::error!(url = %primary_url, error = %e, "failed to parse primary URL");
+                        tracing::error!(url = %primary_url, error = %e, "failed to resolve primary URL");
                         return;
                     }
                 };

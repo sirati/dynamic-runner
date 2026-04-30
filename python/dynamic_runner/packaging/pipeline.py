@@ -62,12 +62,24 @@ def _validate_slurm_args(args: argparse.Namespace, log: logging.Logger) -> bool:
     return True
 
 
-def _make_slurm_config(args: argparse.Namespace) -> SlurmConfig:
-    root_folder: str | Path = args.slurm_root_folder
-    if not isinstance(root_folder, str) or not root_folder.startswith("~"):
-        root_folder = Path(args.slurm_root_folder)
+def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig:
+    """Build the SlurmConfig with `~` expanded against the gateway's remote home.
+
+    Expanding once at this entry point means every downstream path
+    constructor (`get_image_dir`, `get_log_dir`, …) and every shell
+    command emitted from `job_manager` / `layered_transfer` sees an
+    absolute path. Without this, `shlex.quote("~/...")` single-quotes
+    the path so bash never tilde-expands it, and `mkdir -p` creates a
+    literal `~` directory under `$HOME` while `scp` (which expands `~`
+    server-side) targets the absolute path — the two paths diverge
+    and uploads land in the wrong place.
+    """
+    root = str(args.slurm_root_folder)
+    remote_home = getattr(gateway, "remote_home", None)
+    if root.startswith("~") and remote_home:
+        root = root.replace("~", str(remote_home), 1)
     return SlurmConfig(
-        root_folder=root_folder,
+        root_folder=Path(root),
         image_subfolder=args.slurm_image_subfolder,
         output_subfolder=args.slurm_output_subfolder,
         log_subfolder=args.slurm_log_subfolder,
@@ -114,7 +126,7 @@ def run_slurm_pipeline(
     gateway = create_gateway(gateway_config)
     gateway.connect()
 
-    slurm_config = _make_slurm_config(args)
+    slurm_config = _make_slurm_config(args, gateway)
     try:
         validate_slurm_config(slurm_config, gateway)
     except ValueError:
