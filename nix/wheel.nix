@@ -12,12 +12,17 @@
 # via maturin. The resulting Python module is `dynamic_runner._native`
 # (configured via [tool.maturin] module-name in the root pyproject.toml).
 #
-# The cargoDeps hash below is intentionally a fakeHash placeholder; the
-# first real build will fail with the expected SRI hash, which gets
-# pinned during the calibration step in T1.5.
+# The cargoDeps hash below is the SRI of the vendored Cargo deps. Any
+# Cargo.lock change (added/removed/version-bumped crates, including
+# workspace.package version edits which propagate into per-crate
+# version entries) invalidates it; recalibrate by setting
+#   hash = lib.fakeHash;
+# running `nix build .#dynamic-runner --max-jobs 6 --cores 4`, copying
+# the "got: sha256-..." value from the failure into this field, and
+# only then committing + pushing.
 buildPythonPackage {
   pname = "dynamic-runner";
-  version = "0.1.0";
+  version = "0.3.0";
   pyproject = true;
 
   src = lib.cleanSource ./..;
