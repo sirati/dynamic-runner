@@ -77,7 +77,7 @@ class SlurmPreparation:
         self._submit_slurm_jobs(num_secondaries, primary_quic_port, image_metadata)
 
         if self.use_reverse_connection:
-            await self._setup_ssh_tunnels(num_secondaries)
+            await self._setup_ssh_tunnels(num_secondaries, primary_quic_port)
 
         mode_specific_data = {
             "image_metadata": image_metadata,
@@ -169,9 +169,22 @@ class SlurmPreparation:
 
         return gateway_host
 
-    async def _setup_ssh_tunnels(self, num_secondaries: int) -> None:
-        """Setup SSH ProxyJump tunnels for reverse connections."""
-        logger.info("Setting up SSH ProxyJump tunnels for reverse connections...")
+    async def _setup_ssh_tunnels(self, num_secondaries: int, primary_quic_port: int) -> None:
+        """Setup SSH reverse tunnels (compute → primary via gateway).
+
+        Reverse-connection mode is used when the gateway has
+        ``GatewayPorts no`` so the standard "secondaries dial the
+        gateway" path can't work. Instead each compute node's
+        wrapper picks a free ``TUNNEL_PORT`` locally, the wrapper
+        invokes the secondary with ``--secondary tcp://localhost:$TUNNEL_PORT``,
+        and we set up an SSH ``-R`` from the primary that asks the
+        compute node's sshd to open ``localhost:tunnel_port`` and
+        forward back to ``primary's localhost:primary_quic_port``.
+        That way the secondary's outbound connect to its own
+        ``localhost:tunnel_port`` actually reaches the primary's QUIC
+        coordinator.
+        """
+        logger.info("Setting up SSH reverse tunnels for reverse connections...")
 
         connection_info_dir = f"{self.run_log_dir}/connection_info"
         self.gateway.create_directory(connection_info_dir)
@@ -194,21 +207,25 @@ class SlurmPreparation:
                 if secondary_id in connected:
                     continue
 
-                info_file = f"{connection_info_dir}/{secondary_id}.txt"
+                info_file = f"{connection_info_dir}/{secondary_id}.info"
                 returncode, stdout, _stderr = self.gateway.execute_command(f"cat {info_file}")
 
                 if returncode == 0 and stdout.strip():
                     lines = stdout.strip().split("\n")
                     if len(lines) >= 2:
                         hostname = lines[0].split("=")[1].strip()
-                        port = int(lines[1].split("=")[1].strip())
+                        tunnel_port = int(lines[1].split("=")[1].strip())
 
-                        logger.info("Found connection info for %s: %s:%d", secondary_id, hostname, port)
+                        logger.info("Found connection info for %s: %s:%d", secondary_id, hostname, tunnel_port)
 
-                        local_port = 5001 + i
-                        self._create_ssh_tunnel(secondary_id, hostname, port, local_port)
+                        self._create_ssh_tunnel(
+                            secondary_id,
+                            remote_host=hostname,
+                            tunnel_port=tunnel_port,
+                            primary_quic_port=primary_quic_port,
+                        )
 
-                        self.secondary_port_map[secondary_id] = local_port
+                        self.secondary_port_map[secondary_id] = tunnel_port
                         connected.add(secondary_id)
 
             if len(connected) < num_secondaries:
@@ -216,8 +233,17 @@ class SlurmPreparation:
 
         logger.info("All %d SSH tunnels established", num_secondaries)
 
-    def _create_ssh_tunnel(self, secondary_id: str, remote_host: str, remote_port: int, local_port: int) -> None:
-        """Create an SSH tunnel from primary to secondary via gateway."""
+    def _create_ssh_tunnel(
+        self,
+        secondary_id: str,
+        remote_host: str,
+        tunnel_port: int,
+        primary_quic_port: int,
+    ) -> None:
+        """Create an SSH reverse tunnel from primary back through the gateway
+        to the compute node. Compute node's sshd binds
+        ``localhost:tunnel_port`` and forwards to the primary's
+        ``localhost:primary_quic_port``."""
         gateway_host = self.gateway.host if hasattr(self.gateway, "host") else "localhost"
         gateway_user = self.gateway.user if hasattr(self.gateway, "user") else None
         remote_user = gateway_user or "root"
@@ -228,8 +254,8 @@ class SlurmPreparation:
             "ssh",
             "-J",
             jump_host,
-            "-L",
-            f"{local_port}:localhost:{remote_port}",
+            "-R",
+            f"{tunnel_port}:localhost:{primary_quic_port}",
             f"{remote_user}@{remote_host}",
             "-N",
             "-o",
@@ -239,11 +265,11 @@ class SlurmPreparation:
         ]
 
         logger.info(
-            "Creating SSH tunnel for %s: localhost:%d -> %s:%d",
+            "Creating SSH reverse tunnel for %s: %s:localhost:%d -> primary:localhost:%d",
             secondary_id,
-            local_port,
             remote_host,
-            remote_port,
+            tunnel_port,
+            primary_quic_port,
         )
         logger.debug("SSH command: %s", " ".join(ssh_cmd))
 

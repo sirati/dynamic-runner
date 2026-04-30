@@ -145,7 +145,10 @@ echo "Using QUIC port: $QUIC_PORT"
 
 HOSTNAME=$(hostname -f)
 mkdir -p "{connection_info_dir}"
-echo "{secondary_id},$HOSTNAME,$TUNNEL_PORT" > "{connection_info_dir}/{secondary_id}.info"
+{{
+  echo "hostname=$HOSTNAME"
+  echo "tunnel_port=$TUNNEL_PORT"
+}} > "{connection_info_dir}/{secondary_id}.info"
 echo "Connection info written to: {connection_info_dir}/{secondary_id}.info"
 """
         else:
