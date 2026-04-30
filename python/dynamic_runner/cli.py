@@ -1,14 +1,12 @@
 """argparse setup for the dynamic_runner.
 
 The public surface of this module is `build_arg_parser(description)`,
-called by `dynamic_runner.run.run`. The legacy `run(task, ...)` entry
-point is preserved as a deprecated alias for one release.
+called by `dynamic_runner.run.run`.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
 
 from ._shared import add_selection_arguments
 
@@ -181,23 +179,3 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
-def run(
-    task,
-    spawn_secondary_factory: Callable[[argparse.Namespace], Callable] | None = None,
-    description: str = "Dynamic batch processing with memory-aware parallel execution",
-) -> None:
-    """Deprecated alias for `dynamic_runner.run.run`.
-
-    Kept for one release so that existing
-    `from dynamic_runner.cli import run` callers don't break.
-    """
-    import warnings
-
-    warnings.warn(
-        "dynamic_runner.cli.run is deprecated; import from dynamic_runner.run instead",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    from .run import run as _run
-
-    _run(task, spawn_secondary_factory=spawn_secondary_factory, description=description)

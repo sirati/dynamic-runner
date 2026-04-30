@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closure from `deployment.secondary_module`, so consumers no longer
   construct it themselves. `--multi-computer slurm|local` now requires
   `deployment` and exits early with an actionable error if it is None.
+- **`dynamic_runner.cli.run` deprecated alias removed.** v0.2.0 was its
+  one-release grace window; v0.3.0 drops it. Use
+  `from dynamic_runner import run` (or
+  `from dynamic_runner.run import run`).
 - **`make_subprocess_spawn_factory` removed** from the public surface.
   Replace
   `make_subprocess_spawn_factory("dynrunner.tokenize")` plumbed via
