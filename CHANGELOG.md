@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `nix/wheel.nix` `cargoDeps.hash` was the v0.2.0 value
+  (`MscydA1Kui...`) on v0.3.0 / v0.3.1. The workspace version bump
+  0.1.0 → 0.3.0 in Cargo.lock invalidates the recorded SRI hash even
+  with no transitive-dep changes — flake consumers hit a fixed-output-
+  derivation mismatch. Recalibrated to
+  `sha256-T1d1IprrdayGG+gwnNON2bx+h6mauhH/zkETedHetms=` (verified by
+  two independent local builds).
+
 ### Changed (BREAKING)
 - **`run()` API**: the optional `spawn_secondary_factory` parameter is
   gone; replaced with `deployment: TaskDeploymentSpec | None`. The spec
