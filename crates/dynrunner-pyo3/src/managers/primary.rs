@@ -21,6 +21,15 @@ pub(crate) struct PyPrimaryCoordinator {
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     spawn_secondary: Py<PyAny>,
     distributed_config: DistributedConfig,
+    /// Optional caller-supplied bind port for the network server.
+    /// When `Some`, the primary binds exactly this port; this is what
+    /// the SLURM packaging path needs because it sets up an SSH `-R`
+    /// forward to a port it picked itself, and the Rust side has to
+    /// honour the same number end-to-end. When `None`, we fall back
+    /// to a temp-listener pre-pick + drop + re-bind dance (legacy
+    /// behaviour, retained for in-process / local-multi-computer
+    /// callers that don't tunnel and don't care which port lands).
+    listen_port: Option<u16>,
     completed: u32,
     failed: u32,
     // Pre-`run()` queue of StageFile notifications. The pipeline calls
@@ -42,6 +51,7 @@ impl PyPrimaryCoordinator {
         task_definition,
         spawn_secondary,
         distributed_config = None,
+        listen_port = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -49,6 +59,7 @@ impl PyPrimaryCoordinator {
         task_definition: &Bound<'_, PyAny>,
         spawn_secondary: Py<PyAny>,
         distributed_config: Option<DistributedConfig>,
+        listen_port: Option<u16>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(py, task_definition)?;
 
@@ -58,6 +69,7 @@ impl PyPrimaryCoordinator {
             phase_deps: topology.phase_deps,
             spawn_secondary: spawn_secondary.clone_ref(py),
             distributed_config: distributed_config.unwrap_or_default(),
+            listen_port,
             completed: 0,
             failed: 0,
             pending_stage_files: Vec::new(),
@@ -111,11 +123,25 @@ impl PyPrimaryCoordinator {
             ),
         );
 
-        // Pick a free port for the primary server before spawning secondaries.
-        let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| pyo3::exceptions::PyOSError::new_err(format!("failed to bind: {e}")))?;
-        let port = tmp_listener.local_addr().unwrap().port();
-        drop(tmp_listener);
+        // Resolve the bind port. When the caller (e.g. the SLURM
+        // packaging pipeline) pre-supplied `listen_port`, honour it
+        // exactly — that path has already wired an SSH `-R` forward
+        // to this number and any divergence makes secondaries dial a
+        // port the primary isn't listening on (sshd accepts the relay
+        // bind, then RSTs the relay because nothing's behind it on
+        // our side). When unset, fall back to the legacy temp-bind +
+        // drop + re-bind dance for callers that don't tunnel.
+        let port = match self.listen_port {
+            Some(p) => p,
+            None => {
+                let tmp_listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+                    pyo3::exceptions::PyOSError::new_err(format!("failed to bind: {e}"))
+                })?;
+                let p = tmp_listener.local_addr().unwrap().port();
+                drop(tmp_listener);
+                p
+            }
+        };
 
         let primary_url = format!("tcp://127.0.0.1:{}", port);
 

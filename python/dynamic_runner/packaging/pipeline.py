@@ -264,6 +264,7 @@ def _drive_rust_primary(
         task,
         _slurm_already_spawned,
         distributed_config=None,
+        listen_port=primary_quic_port,
     )
 
     source_root = Path(sel_result.source_dir)
