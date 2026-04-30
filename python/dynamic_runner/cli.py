@@ -143,6 +143,16 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--slurm-notify-email", type=str, help="Email address for SLURM job notifications")
     parser.add_argument(
+        "--slurm-time-limit",
+        type=str,
+        default=None,
+        help=(
+            "Per-secondary SLURM job wallclock limit, in any format sbatch's "
+            "--time accepts (e.g. '1:00:00', '02-12', '120'). Defaults to the "
+            "SlurmConfig.time_limit value (48:00:00) when unset."
+        ),
+    )
+    parser.add_argument(
         "--slurm-image-subfolder",
         type=str,
         default="image_bin",

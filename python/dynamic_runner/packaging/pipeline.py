@@ -78,12 +78,16 @@ def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig
     remote_home = getattr(gateway, "remote_home", None)
     if root.startswith("~") and remote_home:
         root = root.replace("~", str(remote_home), 1)
+    overrides: dict[str, object] = {}
+    if getattr(args, "slurm_time_limit", None):
+        overrides["time_limit"] = args.slurm_time_limit
     return SlurmConfig(
         root_folder=Path(root),
         image_subfolder=args.slurm_image_subfolder,
         output_subfolder=args.slurm_output_subfolder,
         log_subfolder=args.slurm_log_subfolder,
         notify_email=args.slurm_notify_email,
+        **overrides,
     )
 
 
