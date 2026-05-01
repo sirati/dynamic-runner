@@ -71,24 +71,10 @@ where
                 // sentinel mismatch, the old guard missed it, and
                 // workers spun on the primary-filesystem-view
                 // relative path.
-                let local_path_is_relative = std::path::Path::new(&local_path).is_relative();
-                if resolved_path.is_none()
-                    && (self.config.src_network.is_some() || local_path_is_relative)
+                if self
+                    .report_unresolvable_task(worker_id, &file_hash, &local_path, &resolved_path)
+                    .await?
                 {
-                    let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
-                    let msg = DistributedMessage::TaskFailed {
-                        sender_id: self.config.secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        secondary_id: self.config.secondary_id.clone(),
-                        worker_id: wid,
-                        task_hash: file_hash.clone(),
-                        error_type: "NonRecoverable".into(),
-                        error_message: format!(
-                            "file_hash {file_hash} not pre-staged at {local_path}; \
-                             expected StageFile notification first"
-                        ),
-                    };
-                    self.primary_transport.send(msg).await?;
                     return Ok(());
                 }
 
@@ -272,4 +258,57 @@ where
         }
     }
 
+    /// Fail-loud guard for "the worker has no plausible way to open
+    /// this binary". Both `dispatch_message` (operational
+    /// TaskAssignment) and `handle_initial_assignment`
+    /// (InitialAssignment in the setup phase) need the same check —
+    /// without it, a missed-resolution silently passes the primary's
+    /// filesystem-view path through to the worker, which crashes at
+    /// exec time and the primary re-enqueues as Recoverable.
+    ///
+    /// Returns `Ok(true)` when the task is unresolvable: a
+    /// `TaskFailed` NonRecoverable was sent to the primary and the
+    /// caller MUST skip the worker assignment. Returns `Ok(false)`
+    /// when resolution either succeeded or the path can plausibly
+    /// resolve at the worker (in-process distributed mode where
+    /// primary and secondary share a filesystem view); the caller
+    /// should proceed with the assignment.
+    ///
+    /// Two ways the worker can succeed without `resolved_path`:
+    ///   - the secondary has a staging directory (`src_network`
+    ///     set) AND the file landed there — covered by
+    ///     `resolved_path.is_some()`.
+    ///   - the secondary shares a filesystem view with the primary
+    ///     AND `local_path` is the primary's absolute path
+    ///     (in-process distributed mode); for that to be plausible
+    ///     `local_path` must at minimum be absolute.
+    pub(super) async fn report_unresolvable_task(
+        &mut self,
+        worker_id: u32,
+        file_hash: &str,
+        local_path: &str,
+        resolved_path: &Option<std::path::PathBuf>,
+    ) -> Result<bool, String> {
+        let local_path_is_relative = std::path::Path::new(local_path).is_relative();
+        if resolved_path.is_none()
+            && (self.config.src_network.is_some() || local_path_is_relative)
+        {
+            let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
+            let msg = DistributedMessage::TaskFailed {
+                sender_id: self.config.secondary_id.clone(),
+                timestamp: timestamp_now(),
+                secondary_id: self.config.secondary_id.clone(),
+                worker_id: wid,
+                task_hash: file_hash.into(),
+                error_type: "NonRecoverable".into(),
+                error_message: format!(
+                    "file_hash {file_hash} not pre-staged at {local_path}; \
+                     expected StageFile notification first"
+                ),
+            };
+            self.primary_transport.send(msg).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }

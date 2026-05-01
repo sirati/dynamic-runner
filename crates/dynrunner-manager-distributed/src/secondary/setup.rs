@@ -160,6 +160,32 @@ where
                 .extraction_cache
                 .resolve_binary(zip_ref, &local_path, &hash);
 
+            // Same fail-loud guard as the operational dispatch path
+            // (see `dispatch::report_unresolvable_task`). Without
+            // this, a misconfigured secondary or a StageFile-vs-
+            // InitialAssignment race silently passes the primary's
+            // filesystem-view path through to the worker, which fails
+            // at exec time and triggers a Recoverable re-enqueue —
+            // pushing the same task into the operational loop
+            // (where the dispatch.rs guard now correctly fails it
+            // NonRecoverable). Failing fast here makes the two paths
+            // behave consistently and avoids the wasted re-enqueue.
+            match self
+                .report_unresolvable_task(wid, &hash, &local_path, &resolved_path)
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        worker_id = wid,
+                        error = %e,
+                        "failed to send TaskFailed for unresolvable initial-assignment task"
+                    );
+                    continue;
+                }
+            }
+
             // Hydrate from the wire info first (preserves
             // phase/type/affinity/payload), then override the path
             // if extraction-cache resolution found a local copy.
