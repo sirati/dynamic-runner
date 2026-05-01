@@ -221,9 +221,9 @@ pub(crate) fn run_secondary<'py>(
     if let Some(sn) = config.src_network.as_ref() {
         kwargs.set_item("src_network", sn.clone())?;
     }
-    if let Some(st) = config.src_tmp.as_ref() {
-        kwargs.set_item("src_tmp", st.clone())?;
-    }
+    // src_tmp is non-Optional on PySecondaryConfig (always
+    // resolved by `__new__`); pass it through unconditionally.
+    kwargs.set_item("src_tmp", config.src_tmp.clone())?;
 
     let cls = module(py)?.getattr("RustSecondaryCoordinator")?;
     let args = (

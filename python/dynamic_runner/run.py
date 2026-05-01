@@ -185,86 +185,39 @@ def _log_local_result(result: dict, logger) -> None:
 
 
 def _dispatch_secondary(task, args, logger) -> None:
-    """Run as a secondary coordinator (SLURM compute node or local test)."""
-    import tempfile
+    """Run as a secondary coordinator (SLURM compute node or local test).
 
+    Every per-secondary config knob (resource budgets, src_network,
+    src_tmp, output_dir) auto-resolves inside
+    `SecondaryConfig.__new__` — the Python side just forwards
+    user-supplied CLI overrides for `--src-network` / `--src-tmp`
+    and lets Rust handle wrapper-vs-local detection,
+    /proc/meminfo / available_parallelism probing, and tempdir
+    creation.
+    """
     import dynamic_runner as _rs
 
     if not args.secondary_id:
         logger.error("--secondary-id is required when running in secondary mode")
         return
 
-    # True when running inside the SLURM wrapper's podman container.
-    # We detect this by the presence of the bind-mounted network drive
-    # (`/app/src-network`), which the wrapper script in
-    # `packaging/job_manager.py` always mounts read-only alongside
-    # `/app/src-tmp` and `/app/out-tmp`. Checking the bind-mount
-    # directly is more robust than peeking at container-runtime
-    # sentinels (`/.dockerenv` for docker, `/run/.containerenv` for
-    # podman, …) — those vary by runtime, and the question we
-    # actually care about is "did the wrapper set up the
-    # `/app/...` layout I'm about to consume?", not "what runtime
-    # is beneath me?". The previous detection
-    # (`/.dockerenv`-only) silently went False under podman and made
-    # the secondary fall back to `src_network=None`, which left
-    # workers exec'ing the primary's filesystem-view absolute paths
-    # in an infinite recoverable-failure loop.
-    in_wrapper_container = Path("/app/src-network").exists()
-
-    # Source-binary staging directories: explicit CLI flags override the
-    # container/local defaults. `src_network` is the shared-drive directory
-    # the primary writes into; `src_tmp` is this secondary's per-process
-    # scratch dir where StageFile copies land.
-    src_network = Path(args.src_network) if args.src_network else (
-        Path("/app/src-network") if in_wrapper_container else None
-    )
-
-    if args.src_tmp:
-        src_tmp = Path(args.src_tmp)
-    elif in_wrapper_container:
-        src_tmp = Path("/app/src-tmp")
-    else:
-        temp_dir = Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-"))
-        src_tmp = temp_dir / "src-tmp"
-    # Workers write outputs into `output_dir`. In wrapper-container
-    # mode this is `/app/out-network` — the wrapper bind-mounts the
-    # gateway's `<slurm_root>/out` there read-write, so files
-    # survive the per-job `/tmp/asm-XXXX` trap-cleanup that wipes
-    # everything under `/app/out-tmp`. (`/app/out-tmp` exists for
-    # tasks that genuinely want per-job scratch and is intentionally
-    # ephemeral; final outputs belong on `/app/out-network`.)
-    # Outside the wrapper we fall back to a per-secondary temp dir,
-    # matching the in-process distributed mode where the user's
-    # `--output` is reachable on the same filesystem and a separate
-    # consolidation step does the move from temp to final.
-    output_dir = Path("/app/out-network") if in_wrapper_container else (
-        Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-out-"))
-    )
-
-    src_tmp.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"Secondary ID: {args.secondary_id}")
-    logger.info(f"Primary URL: {args.secondary}")
-    logger.info(f"src_network={src_network}, src_tmp={src_tmp}, output_dir={output_dir}")
-
-    # `num_workers` and `max_resources` default to system-detected
-    # values (logical CPUs visible to the process; RAM total from
-    # /proc/meminfo) — done in Rust inside `SecondaryConfig.__new__`
-    # so the Python side has no need for `psutil` just to pass two
-    # integers straight back to Rust.
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
-        src_network=str(src_network) if src_network else None,
-        src_tmp=str(src_tmp),
+        src_network=args.src_network,
+        src_tmp=args.src_tmp,
     )
+
+    logger.info(f"Secondary ID: {cfg.secondary_id}")
+    logger.info(f"Primary URL: {args.secondary}")
+    logger.info(f"src_network={cfg.src_network}, src_tmp={cfg.src_tmp}, output_dir={cfg.output_dir}")
+
     _rs.run_secondary(
         cfg,
         args.secondary,
         task,
         args,
-        str(src_tmp),
-        str(output_dir),
+        str(cfg.src_tmp),
+        str(cfg.output_dir),
         skip_existing=args.skip_existing,
     )
 
