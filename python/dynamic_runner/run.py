@@ -188,7 +188,6 @@ def _dispatch_secondary(task, args, logger) -> None:
     """Run as a secondary coordinator (SLURM compute node or local test)."""
     import tempfile
 
-    import psutil
     import dynamic_runner as _rs
 
     if not args.secondary_id:
@@ -238,13 +237,13 @@ def _dispatch_secondary(task, args, logger) -> None:
     logger.info(f"Primary URL: {args.secondary}")
     logger.info(f"src_network={src_network}, src_tmp={src_tmp}")
 
-    ram_bytes = psutil.virtual_memory().total
-    num_workers = psutil.cpu_count(logical=False) or 4
-
+    # `num_workers` and `max_resources` default to system-detected
+    # values (logical CPUs visible to the process; RAM total from
+    # /proc/meminfo) — done in Rust inside `SecondaryConfig.__new__`
+    # so the Python side has no need for `psutil` just to pass two
+    # integers straight back to Rust.
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
-        num_workers=num_workers,
-        max_resources=_rs.ResourceMap({"memory": ram_bytes}),
         src_network=str(src_network) if src_network else None,
         src_tmp=str(src_tmp),
     )

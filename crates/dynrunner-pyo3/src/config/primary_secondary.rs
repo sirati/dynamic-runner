@@ -76,11 +76,19 @@ pub(crate) struct PySecondaryConfig {
 
 #[pymethods]
 impl PySecondaryConfig {
+    /// Construct a `SecondaryConfig`. `num_workers` and
+    /// `max_resources` default to system-detected values when
+    /// omitted: number of logical CPUs visible to the current
+    /// process (respects cgroup CPU limits, which is what we want
+    /// under SLURM — `--cpus-per-task` is enforced via cgroup) and
+    /// total RAM read from `/proc/meminfo`. The detection is in
+    /// Rust so the Python side doesn't need a `psutil` dependency
+    /// just to read two integers it then hands straight back.
     #[new]
     #[pyo3(signature = (
         secondary_id,
-        num_workers,
-        max_resources,
+        num_workers = None,
+        max_resources = None,
         hostname = "localhost".to_string(),
         src_network = None,
         src_tmp = None,
@@ -88,13 +96,16 @@ impl PySecondaryConfig {
     ))]
     fn new(
         secondary_id: String,
-        num_workers: u32,
-        max_resources: PyResourceMap,
+        num_workers: Option<u32>,
+        max_resources: Option<PyResourceMap>,
         hostname: String,
         src_network: Option<PathBuf>,
         src_tmp: Option<PathBuf>,
         distributed_config: Option<DistributedConfig>,
     ) -> Self {
+        let num_workers = num_workers.unwrap_or_else(detect_num_workers);
+        let max_resources = max_resources
+            .unwrap_or_else(|| PyResourceMap::from_single("memory", detect_total_memory_bytes()));
         Self {
             secondary_id,
             num_workers,
@@ -105,6 +116,41 @@ impl PySecondaryConfig {
             distributed_config: distributed_config.unwrap_or_default(),
         }
     }
+}
+
+/// Number of logical CPUs visible to the current process. Under
+/// cgroup CPU limits (e.g. SLURM `--cpus-per-task`) the kernel
+/// reflects the allocated quota here, which is what we want — we
+/// would over-spawn workers if we used the host's physical core
+/// count instead. Falls back to 4 if the platform can't report it.
+fn detect_num_workers() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(4)
+}
+
+/// Total RAM in bytes, read from `/proc/meminfo` (Linux). The
+/// framework targets Linux SLURM clusters; macOS/Windows would
+/// need a different probe. Returns 0 if `/proc/meminfo` is
+/// unavailable or unparseable, which lets the scheduler treat the
+/// node as having no memory budget — surfaces the misdetection
+/// as immediate scheduling failures rather than silent over-
+/// provisioning.
+fn detect_total_memory_bytes() -> u64 {
+    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            // Format: "MemTotal:       16384000 kB"
+            if let Some(kb_str) = rest.split_whitespace().next() {
+                if let Ok(kb) = kb_str.parse::<u64>() {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    0
 }
 
 impl PySecondaryConfig {
