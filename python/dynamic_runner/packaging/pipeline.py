@@ -22,7 +22,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from .._shared import find_matching_binaries, process_selection_arguments
+from .._shared import process_selection_arguments
 
 from ..deployment_spec import TaskDeploymentSpec
 from .gateway import create_gateway, parse_gateway_url
@@ -110,15 +110,14 @@ def run_slurm_pipeline(
         return
 
     sel_result = process_selection_arguments(args)
-    binaries = find_matching_binaries(
-        sel_result.source_dir,
-        sel_result.platforms,
-        sel_result.compiler,
-        sel_result.compiler_versions,
-        sel_result.opt_levels,
-    )
+    # Item discovery is the task's concern under the post-phases-
+    # redesign Protocol; framework no longer scans. We discover ONCE
+    # here and pass the same list down into `_drive_rust_primary` —
+    # avoids the double-scan that previously could disagree if the
+    # underlying source directory changed mid-run.
+    binaries = list(task.discover_items(sel_result.source_dir, args))
     if not binaries:
-        log.warning("No binaries found to process. Pipeline will run in test/job-submission mode.")
+        log.warning("No items discovered. Pipeline will run in test/job-submission mode.")
 
     num_secondaries = args.jobs
     run_id = _make_run_id()
@@ -195,7 +194,7 @@ def run_slurm_pipeline(
         )
         log.info(f"SLURM jobs submitted; run_id={prep_result.run_id}")
 
-        _drive_rust_primary(task, args, prep_result, primary_quic_port, log)
+        _drive_rust_primary(task, args, prep_result, primary_quic_port, binaries, log)
     finally:
         preparation.cleanup()
         subprocess.run(
@@ -221,9 +220,16 @@ def _drive_rust_primary(
     args: argparse.Namespace,
     prep_result,
     primary_quic_port: int,
+    binaries: list,
     log: logging.Logger,
 ) -> None:
     """Hand the run over to the Rust primary coordinator.
+
+    `binaries` is the already-discovered item list from
+    `run_slurm_pipeline` — passed through rather than re-discovered
+    so both halves see the exact same set (avoids divergence between
+    the count we logged earlier and the count the coordinator
+    actually queues StageFile notifications for).
 
     The SLURM jobs already spawned the secondaries, so the
     `spawn_secondary` callback is a no-op (returns None: Python doesn't
@@ -244,13 +250,6 @@ def _drive_rust_primary(
         return
 
     sel_result = process_selection_arguments(args)
-    binaries = find_matching_binaries(
-        sel_result.source_dir,
-        sel_result.platforms,
-        sel_result.compiler,
-        sel_result.compiler_versions,
-        sel_result.opt_levels,
-    )
 
     def _slurm_already_spawned(_primary_url: str, _secondary_id: str, _quic_port: int):
         # SLURM did the actual spawning; the Rust runner's spawn_secondary

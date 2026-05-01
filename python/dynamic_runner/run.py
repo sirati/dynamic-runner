@@ -13,7 +13,6 @@ from pathlib import Path
 
 from ._shared import (
     filter_existing_outputs,
-    find_matching_binaries,
     format_binary_info,
     normalize_opt_levels,
     print_selection_summary,
@@ -88,7 +87,18 @@ def run(
 
 
 def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) -> list:
-    """Scan, sort, and (optionally) skip-existing-filter binaries."""
+    """Discover items via the task's `discover_items` and apply the
+    framework-level overlays (`--list-files`, `--skip-existing`).
+
+    Item discovery is the task's concern under the post-phases-redesign
+    Protocol — the framework no longer scans the source directory or
+    re-orders the result. The legacy `find_matching_binaries` +
+    `task.organize_and_sort_items` pair is gone (see docs/PHASES.md);
+    consumers fold both responsibilities into `discover_items`.
+    `find_matching_binaries` remains exported from `_shared` as a
+    helper a task can reach for from inside its own
+    `discover_items`, but the framework does not call it directly.
+    """
     logger = logging.getLogger()
 
     display_opt_levels = None
@@ -97,43 +107,30 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
         display_opt_levels = normalized.display_values
     print_selection_summary(config, display_opt_levels)
 
-    logger.info("Scanning for matching binaries...")
-    binaries = find_matching_binaries(
-        config.source_dir,
-        config.platforms,
-        config.compiler,
-        config.compiler_versions,
-        config.opt_levels,
-        config.file_format,
-        config.version_regex,
-        config.opt_regex,
-        config.name_regex,
-        config.exclude_subfolders,
-    )
-    logger.info(f"Found {len(binaries)} matching binaries")
+    logger.info("Discovering items via task.discover_items(...)")
+    binaries = list(task.discover_items(config.source_dir, args))
+    logger.info(f"Discovered {len(binaries)} items")
 
     if not binaries:
         return []
 
     if config.list_files:
-        logger.info("\nMatched files:")
+        logger.info("\nDiscovered items:")
         for binary in binaries:
             logger.info(format_binary_info(binary, config.source_dir))
         return []
 
-    sorted_binaries = task.organize_and_sort_items(binaries)
-
     if args.skip_existing:
-        sorted_binaries, skipped = filter_existing_outputs(
-            sorted_binaries,
+        binaries, skipped = filter_existing_outputs(
+            binaries,
             config.source_dir,
             config.output_dir,
             task.get_output_filename_pattern,
         )
-        logger.info(f"Skipped {skipped} binaries with existing outputs")
-        logger.info(f"Remaining binaries to process: {len(sorted_binaries)}")
+        logger.info(f"Skipped {skipped} items with existing outputs")
+        logger.info(f"Remaining items to process: {len(binaries)}")
 
-    return sorted_binaries
+    return binaries
 
 
 def _dispatch_local(task, args, config, logger) -> None:
