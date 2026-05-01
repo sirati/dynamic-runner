@@ -141,6 +141,16 @@ def run_slurm_pipeline(
     primary_quic_port = _pick_free_local_port()
     gateway.setup_port_forwarding(primary_quic_port, primary_quic_port)
 
+    # Consumer-supplied extra `-R local:gateway` forwards. Same
+    # ControlMaster, same `gateway.connect()` — the framework only
+    # needs to know the (local, gateway) port pairs; what's actually
+    # listening on `localhost:local` and who connects to
+    # `<gateway-host>:gateway` are the consumer's concerns. Avoids
+    # spawning a parallel SSHGateway from consumer code (which
+    # would duplicate auth and fight SIGHUP semantics on shutdown).
+    for local_port, gateway_port in deployment.extra_port_forwards:
+        gateway.setup_port_forwarding(local_port, gateway_port)
+
     gateway.connect()
 
     slurm_config = _make_slurm_config(args, gateway)

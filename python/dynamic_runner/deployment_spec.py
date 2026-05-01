@@ -29,7 +29,7 @@ The single-process and plain-local execution modes ignore
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +59,22 @@ class TaskDeploymentSpec:
     # ``image_name`` (rare). Final job name is
     # ``{prefix}-{secondary_id}``.
     slurm_job_name_prefix: str | None = None
+
+    # Additional `(local_port, gateway_port)` pairs to register on
+    # the framework's connected SSH gateway, on top of the
+    # primary's QUIC port (which the framework forwards
+    # unconditionally). Each entry becomes another
+    # `ssh -R 0.0.0.0:gateway_port:localhost:local_port` flag on
+    # the same ControlMaster, so a service the consumer runs
+    # locally on `localhost:local_port` is reachable from compute
+    # nodes at `<gateway-host>:gateway_port` without a parallel
+    # SSH connection. Use cases: peer-to-peer binary-cache
+    # federation, debug-side ssh-into-container endpoints, etc.
+    # The framework treats the values as opaque port numbers and
+    # makes no other guarantees about what's listening; consumers
+    # are responsible for actually starting the local listener
+    # before secondaries try to connect.
+    extra_port_forwards: tuple[tuple[int, int], ...] = field(default_factory=tuple)
 
     @property
     def effective_job_name_prefix(self) -> str:
