@@ -161,7 +161,7 @@ def run_slurm_pipeline(
 
     # Clean up any leftover SSH tunnels from previous runs.
     subprocess.run(
-        ["pkill", "-u", str(os.getuid()), "-f", "ssh.*-L.*localhost"],
+        ["pkill", "-u", str(os.getuid()), "-f", "ssh.*-R.*localhost"],
         stderr=subprocess.DEVNULL,
     )
 
@@ -198,7 +198,7 @@ def run_slurm_pipeline(
     finally:
         preparation.cleanup()
         subprocess.run(
-            ["pkill", "-u", str(os.getuid()), "-f", "ssh.*-L.*localhost"],
+            ["pkill", "-u", str(os.getuid()), "-f", "ssh.*-R.*localhost"],
             stderr=subprocess.DEVNULL,
         )
         gateway.disconnect()
