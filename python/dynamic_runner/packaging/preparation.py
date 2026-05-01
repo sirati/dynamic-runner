@@ -243,7 +243,21 @@ class SlurmPreparation:
         """Create an SSH reverse tunnel from primary back through the gateway
         to the compute node. Compute node's sshd binds
         ``localhost:tunnel_port`` and forwards to the primary's
-        ``localhost:primary_quic_port``."""
+        ``localhost:primary_quic_port``.
+
+        Also fans out each
+        :attr:`TaskDeploymentSpec.extra_port_forwards` entry as an
+        additional ``-R gateway_port:localhost:local_port`` on the
+        same SSH connection. Under ``GatewayPorts=no`` the
+        master-side ``setup_port_forwarding`` for these entries
+        binds 127.0.0.1 on the gateway and is unreachable from
+        compute; the per-compute fan-out gives each secondary a
+        local ``localhost:gateway_port`` listener that tunnels back
+        to ``primary:localhost:local_port``. Same URL shape as the
+        ``GatewayPorts=on`` direct-bind path, so consumer code
+        (e.g. ssh-debug, harmonia federation) doesn't have to
+        know which path is in effect.
+        """
         gateway_host = self.gateway.host if hasattr(self.gateway, "host") else "localhost"
         gateway_user = self.gateway.user if hasattr(self.gateway, "user") else None
         remote_user = gateway_user or "root"
@@ -256,20 +270,27 @@ class SlurmPreparation:
             jump_host,
             "-R",
             f"{tunnel_port}:localhost:{primary_quic_port}",
-            f"{remote_user}@{remote_host}",
-            "-N",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
         ]
+        for local_port, gateway_port in self.deployment.extra_port_forwards:
+            ssh_cmd.extend(["-R", f"{gateway_port}:localhost:{local_port}"])
+        ssh_cmd.extend(
+            [
+                f"{remote_user}@{remote_host}",
+                "-N",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ]
+        )
 
         logger.info(
-            "Creating SSH reverse tunnel for %s: %s:localhost:%d -> primary:localhost:%d",
+            "Creating SSH reverse tunnel for %s: %s:localhost:%d -> primary:localhost:%d (+ %d extra forwards)",
             secondary_id,
             remote_host,
             tunnel_port,
             primary_quic_port,
+            len(self.deployment.extra_port_forwards),
         )
         logger.debug("SSH command: %s", " ".join(ssh_cmd))
 
