@@ -226,16 +226,27 @@ def _dispatch_secondary(task, args, logger) -> None:
     else:
         temp_dir = Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-"))
         src_tmp = temp_dir / "src-tmp"
-    out_tmp = Path("/app/out-tmp") if in_wrapper_container else (
+    # Workers write outputs into `output_dir`. In wrapper-container
+    # mode this is `/app/out-network` — the wrapper bind-mounts the
+    # gateway's `<slurm_root>/out` there read-write, so files
+    # survive the per-job `/tmp/asm-XXXX` trap-cleanup that wipes
+    # everything under `/app/out-tmp`. (`/app/out-tmp` exists for
+    # tasks that genuinely want per-job scratch and is intentionally
+    # ephemeral; final outputs belong on `/app/out-network`.)
+    # Outside the wrapper we fall back to a per-secondary temp dir,
+    # matching the in-process distributed mode where the user's
+    # `--output` is reachable on the same filesystem and a separate
+    # consolidation step does the move from temp to final.
+    output_dir = Path("/app/out-network") if in_wrapper_container else (
         Path(tempfile.mkdtemp(prefix=f"secondary-{args.secondary_id}-out-"))
     )
 
     src_tmp.mkdir(parents=True, exist_ok=True)
-    out_tmp.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Secondary ID: {args.secondary_id}")
     logger.info(f"Primary URL: {args.secondary}")
-    logger.info(f"src_network={src_network}, src_tmp={src_tmp}")
+    logger.info(f"src_network={src_network}, src_tmp={src_tmp}, output_dir={output_dir}")
 
     # `num_workers` and `max_resources` default to system-detected
     # values (logical CPUs visible to the process; RAM total from
@@ -253,7 +264,7 @@ def _dispatch_secondary(task, args, logger) -> None:
         task,
         args,
         str(src_tmp),
-        str(out_tmp),
+        str(output_dir),
         skip_existing=args.skip_existing,
     )
 
