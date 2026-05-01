@@ -149,7 +149,12 @@ where
         staged_files: Vec<dynrunner_protocol_primary_secondary::StagedFileRecord>,
     ) {
         for record in &staged_files {
-            self.stage_and_register(&record.file_hash, &record.src_path, &record.dest_path);
+            self.stage_and_register(
+                &record.file_hash,
+                &record.content_hash,
+                &record.src_path,
+                &record.dest_path,
+            );
         }
 
         let mut tasks: Vec<(String, String, DistributedBinaryInfo<I>, String)> = Vec::new();

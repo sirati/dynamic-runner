@@ -483,6 +483,7 @@ fn roundtrip_stage_file() {
         timestamp: 4.2,
         secondary_id: "sec-7".into(),
         file_hash: "abcdef0123456789".into(),
+        content_hash: "deadbeef".repeat(8),
         src_path: "rel/to/network/foo.bin".into(),
         dest_path: "scratch/foo.bin".into(),
     };

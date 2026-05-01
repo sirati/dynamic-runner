@@ -179,12 +179,23 @@ pub struct ZipBinaryEntry<I> {
 /// setup: the secondary's `wait_for_setup` loop matches only on
 /// `PeerInfo` / `InitialAssignment` / `TransferComplete` and would
 /// drop a separately-sent `StageFile` arriving in the same window.
-/// Same `(file_hash, src_path, dest_path)` triple as the standalone
-/// message; the per-secondary addressing is implicit from the
-/// enclosing `InitialAssignment.secondary_id`.
+/// Per-secondary addressing is implicit from the enclosing
+/// `InitialAssignment.secondary_id`.
+///
+/// `file_hash` is the task identifier (path/identifier-derived,
+/// matches `TaskAssignment.file_hash` so the
+/// `ExtractionCache` lookup keys line up). `content_hash` is the
+/// SHA256 of the file contents the primary expects the secondary
+/// to land at `src_tmp/<dest_path>` after copying from
+/// `src_network/<src_path>` (or from an absolute `src_path`); the
+/// secondary verifies and rejects a copy whose hash doesn't match.
+/// Decoupling the two means the cache key stays cheap (no file IO
+/// at every `compute_task_hash` site) while the staging path keeps
+/// its integrity check.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StagedFileRecord {
     pub file_hash: String,
+    pub content_hash: String,
     pub src_path: String,
     pub dest_path: String,
 }
@@ -289,15 +300,22 @@ pub enum DistributedMessage<I> {
     /// Per-file staging notification: tells `secondary_id` to copy the
     /// file from `src_path` (relative to the secondary's `src_network`,
     /// or absolute if out-of-band-staged) to `dest_path` (relative to
-    /// `src_tmp`), then hash-verify and register it in the
-    /// ExtractionCache. The runner does NOT transfer file payloads —
+    /// `src_tmp`), then hash-verify against `content_hash` and register
+    /// the resulting local path in the `ExtractionCache` keyed by
+    /// `file_hash`. The runner does NOT transfer file payloads —
     /// the assumption is shared storage; this message just tells the
     /// secondary "the file is now available, copy it locally".
+    /// `file_hash` and `content_hash` are independent: the former is
+    /// the task identifier (path/identifier-derived; the cache lookup
+    /// key that must equal `TaskAssignment.file_hash`), the latter is
+    /// the SHA256 of the file contents (used only for the integrity
+    /// check on the copy).
     StageFile {
         sender_id: String,
         timestamp: f64,
         secondary_id: String,
         file_hash: String,
+        content_hash: String,
         src_path: String,
         dest_path: String,
     },

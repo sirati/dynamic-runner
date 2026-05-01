@@ -384,6 +384,7 @@ async fn notify_stage_file_emits_wire_message() {
             .notify_stage_file(
                 "sec-0",
                 "deadbeefcafebabe".to_string(),
+                "deadbeef".repeat(8),
                 "rel/binary".to_string(),
                 "scratch/binary".to_string(),
             )

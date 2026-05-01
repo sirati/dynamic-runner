@@ -133,8 +133,11 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     // before secondary connections are up). Flushed once the welcome
     // + peer-connect handshake completes — at that point `send_to`
     // can route to a known secondary. Each entry is
-    // (secondary_id, file_hash, src_path, dest_path).
-    pub(super) pending_stage_files: Vec<(String, String, String, String)>,
+    // `(secondary_id, file_hash, content_hash, src_path, dest_path)`
+    // where `file_hash` is the task identifier (cache lookup key)
+    // and `content_hash` is the SHA256 of the file contents (used
+    // by the secondary's staging integrity check).
+    pub(super) pending_stage_files: Vec<(String, String, String, String, String)>,
 }
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
@@ -187,11 +190,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         &mut self,
         secondary_id: String,
         file_hash: String,
+        content_hash: String,
         src_path: String,
         dest_path: String,
     ) {
         self.pending_stage_files
-            .push((secondary_id, file_hash, src_path, dest_path));
+            .push((secondary_id, file_hash, content_hash, src_path, dest_path));
     }
 
     pub fn completed_count(&self) -> usize {

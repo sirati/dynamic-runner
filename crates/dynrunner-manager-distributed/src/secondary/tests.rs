@@ -415,6 +415,7 @@ async fn stage_file_then_assign_task_succeeds() {
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),
                         file_hash: real_hash_clone.clone(),
+                        content_hash: real_hash_clone.clone(),
                         src_path: "staged_bin".into(),
                         dest_path: "staged_bin".into(),
                     })

@@ -31,6 +31,7 @@ where
         &mut self,
         secondary_id: &str,
         file_hash: String,
+        content_hash: String,
         src_path: String,
         dest_path: String,
     ) -> Result<(), String> {
@@ -39,6 +40,7 @@ where
             timestamp: timestamp_now(),
             secondary_id: secondary_id.to_string(),
             file_hash,
+            content_hash,
             src_path,
             dest_path,
         };

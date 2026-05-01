@@ -37,7 +37,11 @@ pub(crate) struct PyPrimaryCoordinator {
     // (before `run()` ever starts the coordinator). On `run()`, this
     // list is moved into `PrimaryCoordinator::queue_stage_file` so the
     // coordinator flushes them once secondary connections are up.
-    pending_stage_files: Vec<(String, String, String, String)>,
+    /// Tuple shape: `(secondary_id, file_hash, content_hash, src_path, dest_path)`.
+    /// `file_hash` is the task identifier for cache lookup;
+    /// `content_hash` is the SHA256 of the file contents that the
+    /// staging integrity check will verify against.
+    pending_stage_files: Vec<(String, String, String, String, String)>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B).
     task_definition: Py<PyAny>,
@@ -80,17 +84,25 @@ impl PyPrimaryCoordinator {
     /// Queue a `StageFile` notification for a secondary. Must be called
     /// BEFORE `run()` (the typical pipeline pattern: stage all files
     /// during packaging, then start the coordinator). The Rust
-    /// coordinator flushes these notifications once the secondary
-    /// handshake completes and before initial task assignment.
+    /// coordinator inlines these records into each secondary's
+    /// `InitialAssignment` so the secondary's `ExtractionCache` is
+    /// primed atomically with processing the per-task assignments.
+    /// `file_hash` is the task identifier (the cache key — must
+    /// match `TaskAssignment.file_hash`); `content_hash` is the
+    /// SHA256 of the source file contents that the secondary will
+    /// verify against after copying. Pipeline.py mints them via
+    /// `_rs.compute_task_hash(binary)` and
+    /// `_rs.compute_file_content_hash(str(binary.path))`.
     fn notify_stage_file(
         &mut self,
         secondary_id: String,
         file_hash: String,
+        content_hash: String,
         src_path: String,
         dest_path: String,
     ) -> PyResult<()> {
         self.pending_stage_files
-            .push((secondary_id, file_hash, src_path, dest_path));
+            .push((secondary_id, file_hash, content_hash, src_path, dest_path));
         Ok(())
     }
 
@@ -208,8 +220,8 @@ impl PyPrimaryCoordinator {
                         estimator,
                     );
 
-                for (sec_id, hash, src, dest) in pending_stage_files {
-                    primary.queue_stage_file(sec_id, hash, src, dest);
+                for (sec_id, file_hash, content_hash, src, dest) in pending_stage_files {
+                    primary.queue_stage_file(sec_id, file_hash, content_hash, src, dest);
                 }
 
                 // phase_deps + lifecycle closures captured from the

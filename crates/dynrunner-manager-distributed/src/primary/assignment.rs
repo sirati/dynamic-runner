@@ -25,7 +25,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // we drain `self.pending_stage_files` once and don't hold
         // overlapping borrows on `self`.
         let mut staged_per_secondary: HashMap<String, Vec<StagedFileRecord>> = HashMap::new();
-        for (secondary_id, file_hash, src_path, dest_path) in
+        for (secondary_id, file_hash, content_hash, src_path, dest_path) in
             std::mem::take(&mut self.pending_stage_files)
         {
             staged_per_secondary
@@ -33,6 +33,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 .or_default()
                 .push(StagedFileRecord {
                     file_hash,
+                    content_hash,
                     src_path,
                     dest_path,
                 });

@@ -26,15 +26,26 @@ pub(super) struct StageOutcome {
     pub(super) dest: PathBuf,
 }
 
-/// Copy `src` → `dest` (creating parent dirs), hash-verify against
-/// `expected_hash`. On any failure returns Err with a human-readable
-/// reason; the caller logs and skips registration.
+/// Copy `src` → `dest` (creating parent dirs), then verify the
+/// destination's SHA256 matches `expected_content_hash`. On any
+/// failure returns Err with a human-readable reason; the caller
+/// logs and skips registration.
+///
+/// `expected_content_hash` is the SHA256 of the file contents (a
+/// 64-char hex string) — the primary computes it once via
+/// `compute_file_hash` at staging-notification time and ships it as
+/// `StageFile.content_hash` / `StagedFileRecord.content_hash`. It's
+/// distinct from the task identifier hash (`file_hash`), which is
+/// path/identifier-derived and used as the `ExtractionCache` lookup
+/// key — those used to be conflated under one field, which always
+/// failed verification (16-char DefaultHasher hex vs 64-char SHA256
+/// hex). The two are now plumbed independently.
 pub(super) fn stage_file(
     src_network: Option<&Path>,
     src_tmp: &Path,
     src_path: &str,
     dest_path: &str,
-    expected_hash: &str,
+    expected_content_hash: &str,
 ) -> Result<StageOutcome, String> {
     let src_p = PathBuf::from(src_path);
     let effective_src = if src_p.is_absolute() {
@@ -61,11 +72,12 @@ pub(super) fn stage_file(
             .map_err(|e| format!("stage_file: mkdir {} failed: {e}", parent.display()))?;
     }
 
-    // If the destination already matches the expected hash, skip the
-    // copy (idempotent — repeated StageFile notifications are cheap).
+    // If the destination already matches the expected content hash,
+    // skip the copy (idempotent — repeated StageFile notifications
+    // are cheap).
     if dest.exists() {
         if let Some(existing_hash) = compute_file_hash(&dest) {
-            if existing_hash == expected_hash {
+            if existing_hash == expected_content_hash {
                 return Ok(StageOutcome { dest });
             }
         }
@@ -85,9 +97,9 @@ pub(super) fn stage_file(
             dest.display()
         )
     })?;
-    if actual != expected_hash {
+    if actual != expected_content_hash {
         return Err(format!(
-            "stage_file: hash mismatch at {}: expected {expected_hash}, got {actual}",
+            "stage_file: content-hash mismatch at {}: expected {expected_content_hash}, got {actual}",
             dest.display()
         ));
     }

@@ -152,6 +152,7 @@ where
             DistributedMessage::StageFile {
                 secondary_id,
                 file_hash,
+                content_hash,
                 src_path,
                 dest_path,
                 ..
@@ -166,7 +167,7 @@ where
                     );
                     return Ok(());
                 }
-                self.stage_and_register(&file_hash, &src_path, &dest_path);
+                self.stage_and_register(&file_hash, &content_hash, &src_path, &dest_path);
                 Ok(())
             }
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
@@ -241,9 +242,17 @@ where
     /// swallowed — the next TaskAssignment for the same hash will
     /// surface as a TaskFailed via `report_unresolvable_task` rather
     /// than wedging the staging path itself.
+    ///
+    /// `file_hash` is the cache lookup key (must match the
+    /// `TaskAssignment.file_hash` the secondary will see later);
+    /// `content_hash` is what `stage_file` verifies against after
+    /// the copy. The two were previously a single `file_hash`
+    /// field — the conflation always made verification mismatch
+    /// (16-char identifier hex vs 64-char content SHA256 hex).
     pub(super) fn stage_and_register(
         &mut self,
         file_hash: &str,
+        content_hash: &str,
         src_path: &str,
         dest_path: &str,
     ) {
@@ -253,7 +262,7 @@ where
             &src_tmp,
             src_path,
             dest_path,
-            file_hash,
+            content_hash,
         ) {
             Ok(outcome) => {
                 self.extraction_cache.register_path(file_hash, outcome.dest);
