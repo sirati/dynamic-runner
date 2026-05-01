@@ -119,13 +119,23 @@ impl PyPrimaryCoordinator {
                 Err(_) => binary.path.to_string_lossy().into_owned(),
             };
             let file_hash = dynrunner_manager_distributed::compute_task_hash(binary);
-            let content_hash = dynrunner_manager_distributed::compute_file_hash(&binary.path)
-                .ok_or_else(|| {
-                    pyo3::exceptions::PyOSError::new_err(format!(
-                        "queue_initial_staging: failed to read {} for content hashing",
-                        binary.path.display()
-                    ))
-                })?;
+            // Sentinel / probe TaskInfos (paths that don't back to a
+            // real file: e.g. `ssh-debug-00` from a long-lived
+            // service task) have nothing to hash. Skip queuing a
+            // StageFile for those — the secondary's `stage_file`
+            // would have failed "source not found" anyway, and
+            // there's no copy to verify. The task itself still
+            // dispatches via the assignment path; consumers that
+            // need real file staging supply real paths.
+            let Some(content_hash) =
+                dynrunner_manager_distributed::compute_file_hash(&binary.path)
+            else {
+                tracing::debug!(
+                    binary = %binary.path.display(),
+                    "queue_initial_staging: no file at path; skipping StageFile (sentinel task)"
+                );
+                continue;
+            };
             for i in 0..self.num_secondaries {
                 self.pending_stage_files.push((
                     format!("secondary-{i}"),

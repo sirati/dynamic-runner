@@ -138,7 +138,8 @@ def run_slurm_pipeline(
     gateway_config = parse_gateway_url(args.gateway)
     gateway = create_gateway(gateway_config)
 
-    primary_quic_port = _pick_free_local_port()
+    import dynamic_runner as _rs
+    primary_quic_port = _rs.pick_free_port()
     gateway.setup_port_forwarding(primary_quic_port, primary_quic_port)
 
     # Consumer-supplied extra `-R local:gateway` forwards. Same
@@ -212,17 +213,6 @@ def run_slurm_pipeline(
             stderr=subprocess.DEVNULL,
         )
         gateway.disconnect()
-
-
-def _pick_free_local_port() -> int:
-    """Bind to port 0 to let the OS pick a free port, then close it. The
-    SLURM jobs will dial back into this number once the Rust runner
-    re-binds it."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("0.0.0.0", 0))
-        return sock.getsockname()[1]
 
 
 def _drive_rust_primary(

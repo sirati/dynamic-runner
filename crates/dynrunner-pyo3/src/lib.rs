@@ -7,6 +7,7 @@ mod managers;
 mod network;
 mod pytypes;
 mod subprocess_factory;
+mod system_resources;
 mod task_def;
 mod transport;
 
@@ -23,6 +24,7 @@ use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFact
 use managers::local::PyLocalManager;
 use managers::primary::PyPrimaryCoordinator;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
+use system_resources::{parse_cores, parse_memory, pick_free_port};
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
 use pytypes::{PyBinaryIdentifier, PyTaskInfo, PyFailedTask, PyProcessingStats};
@@ -65,5 +67,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_secondary, m)?)?;
     m.add_function(wrap_pyfunction!(run_distributed, m)?)?;
     m.add_function(wrap_pyfunction!(compute_task_hash, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_cores, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_memory, m)?)?;
+    m.add_function(wrap_pyfunction!(pick_free_port, m)?)?;
     Ok(())
 }

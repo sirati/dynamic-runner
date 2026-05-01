@@ -22,7 +22,6 @@ from ._shared import (
 from .deployment_spec import TaskDeploymentSpec
 from .logging_setup import setup_logging
 from .spawn_secondary import build_subprocess_spawn
-from .system_resources import parse_cores, parse_memory
 from .task_protocol import TaskDefinition
 
 # Import the parser-builder from the slimmed cli module.
@@ -137,8 +136,8 @@ def _dispatch_local(task, args, config, logger) -> None:
     """Standard in-process local manager."""
     import dynamic_runner as _rs
 
-    num_cores = parse_cores(args.cores)
-    max_memory = parse_memory(args.max_memory)
+    num_cores = _rs.parse_cores(args.cores)
+    max_memory = _rs.parse_memory(args.max_memory)
     logger.info(f"Cores: {num_cores}")
     logger.info(f"Max memory: {max_memory / (1024**3):.2f}GB")
 
@@ -231,8 +230,8 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         logger.info("No binaries to process")
         return
 
-    num_cores = parse_cores(args.cores)
-    max_memory = parse_memory(args.max_memory)
+    num_cores = _rs.parse_cores(args.cores)
+    max_memory = _rs.parse_memory(args.max_memory)
     num_secondaries = args.jobs if args.jobs else 1
     workers_per_secondary = num_cores // num_secondaries if num_secondaries > 0 else num_cores
     ram_per_secondary = max_memory // num_secondaries if num_secondaries > 0 else max_memory

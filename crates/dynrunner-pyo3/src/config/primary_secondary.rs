@@ -229,40 +229,11 @@ fn default_secondary_dir(
     }
 }
 
-/// Number of logical CPUs visible to the current process. Under
-/// cgroup CPU limits (e.g. SLURM `--cpus-per-task`) the kernel
-/// reflects the allocated quota here, which is what we want — we
-/// would over-spawn workers if we used the host's physical core
-/// count instead. Falls back to 4 if the platform can't report it.
-fn detect_num_workers() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(4)
-}
-
-/// Total RAM in bytes, read from `/proc/meminfo` (Linux). The
-/// framework targets Linux SLURM clusters; macOS/Windows would
-/// need a different probe. Returns 0 if `/proc/meminfo` is
-/// unavailable or unparseable, which lets the scheduler treat the
-/// node as having no memory budget — surfaces the misdetection
-/// as immediate scheduling failures rather than silent over-
-/// provisioning.
-fn detect_total_memory_bytes() -> u64 {
-    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
-        return 0;
-    };
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            // Format: "MemTotal:       16384000 kB"
-            if let Some(kb_str) = rest.split_whitespace().next() {
-                if let Ok(kb) = kb_str.parse::<u64>() {
-                    return kb * 1024;
-                }
-            }
-        }
-    }
-    0
-}
+// Resource detection helpers live in `crate::system_resources` —
+// shared with the PyO3-exposed `parse_cores` / `parse_memory` /
+// `pick_free_port` so the framework has one source of truth for
+// "what does this machine look like".
+use crate::system_resources::{detect_logical_cpu_count as detect_num_workers, detect_total_memory_bytes};
 
 impl PySecondaryConfig {
     pub(crate) fn to_rust(&self) -> RustSecondaryConfig {
