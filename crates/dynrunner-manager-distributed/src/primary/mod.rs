@@ -279,13 +279,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // Phase 4: Wait for peer connections (skip for single secondary)
         self.wait_for_peer_connections().await?;
 
-        // Phase 4.5: Flush any queued StageFile notifications. Done
-        // after handshake (so send_to has a target) and before
-        // initial assignment (so the secondary's ExtractionCache is
-        // primed before any TaskAssignment for those hashes).
-        self.flush_pending_stage_files().await?;
-
-        // Phase 5: Initial assignment
+        // Phase 5: Initial assignment.
+        // `perform_initial_assignment` now drains
+        // `self.pending_stage_files` and inlines them into each
+        // recipient's `InitialAssignment.staged_files`, so the
+        // secondary registers them in its ExtractionCache atomically
+        // with processing the per-task assignments. Replaces the
+        // earlier separate `flush_pending_stage_files()` step, which
+        // sent `DistributedMessage::StageFile` messages that
+        // `wait_for_setup` then dropped (its match had no arm for
+        // them), wedging every dispatch.
         self.perform_initial_assignment().await?;
 
         // Phase 6: Send transfer complete

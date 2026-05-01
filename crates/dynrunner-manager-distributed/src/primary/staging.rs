@@ -45,30 +45,4 @@ where
         self.transport.send_to(secondary_id, msg).await
     }
 
-    /// Drain `self.pending_stage_files` and emit each as a StageFile
-    /// wire message via `notify_stage_file`. Logs (but does not
-    /// propagate) per-message send errors so a single dead secondary
-    /// does not abort the whole startup.
-    pub(super) async fn flush_pending_stage_files(&mut self) -> Result<(), String> {
-        let pending = std::mem::take(&mut self.pending_stage_files);
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let count = pending.len();
-        for (secondary_id, file_hash, src_path, dest_path) in pending {
-            if let Err(e) = self
-                .notify_stage_file(&secondary_id, file_hash.clone(), src_path, dest_path)
-                .await
-            {
-                tracing::error!(
-                    secondary_id = %secondary_id,
-                    file_hash = %file_hash,
-                    error = %e,
-                    "failed to flush queued StageFile"
-                );
-            }
-        }
-        tracing::info!(count, "flushed queued StageFile notifications");
-        Ok(())
-    }
 }

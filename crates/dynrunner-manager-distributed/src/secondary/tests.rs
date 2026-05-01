@@ -50,6 +50,7 @@ async fn fake_primary(
             secondary_id: secondary_id.clone(),
             zip_files: vec![],
             workers_ready: vec![],
+            staged_files: vec![],
         })
         .unwrap();
 
@@ -396,6 +397,7 @@ async fn stage_file_then_assign_task_succeeds() {
                         secondary_id: secondary_id_clone.clone(),
                         zip_files: vec![],
                         workers_ready: vec![],
+                        staged_files: vec![],
                     })
                     .unwrap();
                 pri_to_sec_tx

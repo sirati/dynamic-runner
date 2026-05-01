@@ -171,6 +171,24 @@ pub struct ZipBinaryEntry<I> {
     pub hash: String,
 }
 
+/// A pre-staging record carried inline in `InitialAssignment` so the
+/// secondary can register files in its `ExtractionCache`
+/// atomically with processing the assignment. Avoids the
+/// StageFile-vs-InitialAssignment race that the standalone
+/// `DistributedMessage::StageFile` path otherwise opens during
+/// setup: the secondary's `wait_for_setup` loop matches only on
+/// `PeerInfo` / `InitialAssignment` / `TransferComplete` and would
+/// drop a separately-sent `StageFile` arriving in the same window.
+/// Same `(file_hash, src_path, dest_path)` triple as the standalone
+/// message; the per-secondary addressing is implicit from the
+/// enclosing `InitialAssignment.secondary_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StagedFileRecord {
+    pub file_hash: String,
+    pub src_path: String,
+    pub dest_path: String,
+}
+
 /// Wire-format entry in a `FullTaskList` broadcast. Distinct from
 /// `dynrunner_core::TaskInfo` (the in-process content type) — this is the
 /// flat, hash-keyed, file-path-aware shape that primaries and secondaries
@@ -234,6 +252,16 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         zip_files: Vec<ZipFileAssignment<I>>,
         workers_ready: Vec<WorkerReadyInfo>,
+        /// Files the secondary should register in its
+        /// ExtractionCache before processing per-task assignments
+        /// (replaces the separate StageFile messages that previously
+        /// raced this one). Defaults to empty for backward
+        /// compatibility with primaries pre-dating the inline-staging
+        /// fix; the receiver treats the absence as "no inline records,
+        /// fall back to whatever standalone StageFile messages
+        /// arrived earlier".
+        #[serde(default)]
+        staged_files: Vec<StagedFileRecord>,
     },
     TaskRequest {
         sender_id: String,

@@ -248,6 +248,7 @@ fn roundtrip_all_message_types() {
             secondary_id: "s".into(),
             zip_files: vec![],
             workers_ready: vec![],
+            staged_files: vec![],
         },
         DistributedMessage::TaskRequest {
             sender_id: "s".into(),

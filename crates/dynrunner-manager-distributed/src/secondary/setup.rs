@@ -103,10 +103,16 @@ where
                         if let DistributedMessage::InitialAssignment {
                             zip_files,
                             workers_ready,
+                            staged_files,
                             ..
                         } = msg
                         {
-                            self.handle_initial_assignment(zip_files, workers_ready).await;
+                            self.handle_initial_assignment(
+                                zip_files,
+                                workers_ready,
+                                staged_files,
+                            )
+                            .await;
                         }
                         tracing::debug!("received initial assignment");
                     }
@@ -126,12 +132,26 @@ where
         Ok(())
     }
 
-    /// Handle initial assignment from primary.
+    /// Handle initial assignment from primary. `staged_files` carries
+    /// the per-secondary StageFile records that used to ride as
+    /// separate `DistributedMessage::StageFile` messages flushed just
+    /// before this one — those messages would land in
+    /// `wait_for_setup`'s "unexpected message during setup" arm and
+    /// be silently dropped, so the inline form is now the path.
+    /// Register them in the extraction cache BEFORE iterating
+    /// per-task assignments so resolution succeeds for every task in
+    /// this batch instead of every task being routed through the
+    /// fail-loud guard and re-enqueued.
     pub(super) async fn handle_initial_assignment(
         &mut self,
         zip_files: Vec<dynrunner_protocol_primary_secondary::ZipFileAssignment<I>>,
         workers_ready: Vec<dynrunner_protocol_primary_secondary::WorkerReadyInfo>,
+        staged_files: Vec<dynrunner_protocol_primary_secondary::StagedFileRecord>,
     ) {
+        for record in &staged_files {
+            self.stage_and_register(&record.file_hash, &record.src_path, &record.dest_path);
+        }
+
         let mut tasks: Vec<(String, String, DistributedBinaryInfo<I>, String)> = Vec::new();
         for zip_file in &zip_files {
             for entry in &zip_file.binaries {

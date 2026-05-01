@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
-    SecondaryTransport, WorkerReadyInfo, ZipBinaryEntry, ZipFileAssignment,
+    SecondaryTransport, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
+    ZipFileAssignment,
 };
 use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, Scheduler,
@@ -17,6 +18,25 @@ use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
         tracing::info!("performing initial assignment");
+
+        // Group pending StageFile records by recipient so they can
+        // ride inline in each secondary's InitialAssignment. Done up
+        // front (rather than during the per-secondary loop below) so
+        // we drain `self.pending_stage_files` once and don't hold
+        // overlapping borrows on `self`.
+        let mut staged_per_secondary: HashMap<String, Vec<StagedFileRecord>> = HashMap::new();
+        for (secondary_id, file_hash, src_path, dest_path) in
+            std::mem::take(&mut self.pending_stage_files)
+        {
+            staged_per_secondary
+                .entry(secondary_id)
+                .or_default()
+                .push(StagedFileRecord {
+                    file_hash,
+                    src_path,
+                    dest_path,
+                });
+        }
 
         let mut global_worker_id: u32 = 0;
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
@@ -123,12 +143,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 })
                 .collect();
 
+            let staged_files = staged_per_secondary
+                .remove(secondary_id)
+                .unwrap_or_default();
             let msg = DistributedMessage::InitialAssignment {
                 sender_id: self.config.node_id.clone(),
                 timestamp: timestamp_now(),
                 secondary_id: secondary_id.clone(),
                 zip_files,
                 workers_ready,
+                staged_files,
             };
             self.transport.send_to(secondary_id, msg).await?;
         }

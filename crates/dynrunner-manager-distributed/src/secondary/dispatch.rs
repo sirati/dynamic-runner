@@ -166,33 +166,7 @@ where
                     );
                     return Ok(());
                 }
-                let src_tmp = self
-                    .extraction_cache
-                    .tmp_dir()
-                    .to_path_buf();
-                match super::staging::stage_file(
-                    self.config.src_network.as_deref(),
-                    &src_tmp,
-                    &src_path,
-                    &dest_path,
-                    &file_hash,
-                ) {
-                    Ok(outcome) => {
-                        self.extraction_cache
-                            .register_path(&file_hash, outcome.dest);
-                        tracing::info!(
-                            file_hash = %file_hash,
-                            "staged file registered"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            file_hash = %file_hash,
-                            error = %e,
-                            "stage_file failed; the next TaskAssignment for this hash will be reported as TaskFailed"
-                        );
-                    }
-                }
+                self.stage_and_register(&file_hash, &src_path, &dest_path);
                 Ok(())
             }
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
@@ -254,6 +228,46 @@ where
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled message in secondary");
                 Ok(())
+            }
+        }
+    }
+
+    /// Run a `stage_file` copy + register the result in
+    /// `extraction_cache`. Shared between the standalone
+    /// `DistributedMessage::StageFile` arm in `dispatch_message`
+    /// (post-setup re-staging) and the inline `staged_files` records
+    /// of `InitialAssignment` (processed by `handle_initial_assignment`
+    /// before any per-task assignment runs). Failures are logged and
+    /// swallowed — the next TaskAssignment for the same hash will
+    /// surface as a TaskFailed via `report_unresolvable_task` rather
+    /// than wedging the staging path itself.
+    pub(super) fn stage_and_register(
+        &mut self,
+        file_hash: &str,
+        src_path: &str,
+        dest_path: &str,
+    ) {
+        let src_tmp = self.extraction_cache.tmp_dir().to_path_buf();
+        match super::staging::stage_file(
+            self.config.src_network.as_deref(),
+            &src_tmp,
+            src_path,
+            dest_path,
+            file_hash,
+        ) {
+            Ok(outcome) => {
+                self.extraction_cache.register_path(file_hash, outcome.dest);
+                tracing::info!(
+                    file_hash = %file_hash,
+                    "staged file registered"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    file_hash = %file_hash,
+                    error = %e,
+                    "stage_file failed; the next TaskAssignment for this hash will be reported as TaskFailed"
+                );
             }
         }
     }
