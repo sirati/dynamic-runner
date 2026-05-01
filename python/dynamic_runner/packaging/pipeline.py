@@ -280,29 +280,11 @@ def _drive_rust_primary(
         listen_port=primary_quic_port,
     )
 
-    source_root = Path(sel_result.source_dir)
-    for binary in binaries:
-        try:
-            rel = str(Path(binary.path).relative_to(source_root))
-        except ValueError:
-            # Binary lives outside source_root (e.g. absolute path scan).
-            # Fall back to the full path; the secondary's StageFile
-            # handler treats absolute src_path as out-of-band staged.
-            rel = str(binary.path)
-        file_hash = _rs.compute_task_hash(binary)
-        # Content hash: SHA256 of the file the secondary will land at
-        # `<src_tmp>/<rel>` after copying from `<src_network>/<rel>`.
-        # `compute_task_hash` is path/identifier-derived (cache key);
-        # `compute_file_content_hash` reads the file once on the
-        # primary side. Computing here means we hit the local source
-        # tree once per binary — pre-staging step on the user side
-        # has already deposited identical content on the gateway, so
-        # the secondary's verification matches.
-        content_hash = _rs.compute_file_content_hash(str(binary.path))
-        for i in range(prep_result.num_secondaries):
-            sec_id = f"secondary-{i}"
-            coord.notify_stage_file(sec_id, file_hash, content_hash, rel, rel)
-
+    # Bulk-queue StageFile notifications in Rust — one PyO3 crossing
+    # for the whole binary list (instead of 4 per binary), and the
+    # rel-path / task-hash / content-hash computations all happen
+    # in the same loop body without re-acquiring the GIL.
+    coord.queue_initial_staging(binaries, str(sel_result.source_dir))
     log.info(
         "Queued %d StageFile notifications across %d secondaries; starting coordinator",
         len(binaries),

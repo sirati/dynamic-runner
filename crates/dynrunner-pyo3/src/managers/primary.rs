@@ -81,28 +81,61 @@ impl PyPrimaryCoordinator {
         })
     }
 
-    /// Queue a `StageFile` notification for a secondary. Must be called
-    /// BEFORE `run()` (the typical pipeline pattern: stage all files
-    /// during packaging, then start the coordinator). The Rust
-    /// coordinator inlines these records into each secondary's
-    /// `InitialAssignment` so the secondary's `ExtractionCache` is
-    /// primed atomically with processing the per-task assignments.
-    /// `file_hash` is the task identifier (the cache key — must
-    /// match `TaskAssignment.file_hash`); `content_hash` is the
-    /// SHA256 of the source file contents that the secondary will
-    /// verify against after copying. Pipeline.py mints them via
-    /// `_rs.compute_task_hash(binary)` and
-    /// `_rs.compute_file_content_hash(str(binary.path))`.
-    fn notify_stage_file(
+    /// Bulk-queue StageFile notifications for every binary in
+    /// `binaries`, broadcast to all `num_secondaries` configured on
+    /// this coordinator. Replaces the previous per-binary Python
+    /// loop in the SLURM pipeline that called `compute_task_hash`,
+    /// `compute_file_hash`, and `notify_stage_file` separately for
+    /// each binary — the Python side held no state the loop needed,
+    /// the only Python-exclusive piece (relative-path computation)
+    /// is trivially Rust, and bundling avoids 4 PyO3 crossings per
+    /// binary.
+    ///
+    /// `source_root` is the absolute path of the consumer's
+    /// `--source` directory; the per-binary
+    /// `<src_path>` / `<dest_path>` is each binary's path made
+    /// relative to it. Binaries whose `path` doesn't sit under
+    /// `source_root` (e.g. an absolute-path scan that returned
+    /// out-of-tree results) keep their full path — the secondary's
+    /// `stage_file` handler treats absolute `src_path` as an
+    /// out-of-band-staged source rather than a `src_network`
+    /// lookup.
+    ///
+    /// Reads each binary file once on the primary side to compute
+    /// `content_hash` (SHA256). Errors out on the first unreadable
+    /// file rather than silently skipping — a broken local
+    /// `--source` is a configuration bug the consumer wants to
+    /// surface immediately, not a partial dispatch.
+    fn queue_initial_staging(
         &mut self,
-        secondary_id: String,
-        file_hash: String,
-        content_hash: String,
-        src_path: String,
-        dest_path: String,
+        binaries: &Bound<'_, pyo3::types::PyList>,
+        source_root: String,
     ) -> PyResult<()> {
-        self.pending_stage_files
-            .push((secondary_id, file_hash, content_hash, src_path, dest_path));
+        let rust_binaries = crate::pytypes::extract_binaries(binaries)?;
+        let source_root = std::path::PathBuf::from(source_root);
+        for binary in &rust_binaries {
+            let rel = match binary.path.strip_prefix(&source_root) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(_) => binary.path.to_string_lossy().into_owned(),
+            };
+            let file_hash = dynrunner_manager_distributed::compute_task_hash(binary);
+            let content_hash = dynrunner_manager_distributed::compute_file_hash(&binary.path)
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyOSError::new_err(format!(
+                        "queue_initial_staging: failed to read {} for content hashing",
+                        binary.path.display()
+                    ))
+                })?;
+            for i in 0..self.num_secondaries {
+                self.pending_stage_files.push((
+                    format!("secondary-{i}"),
+                    file_hash.clone(),
+                    content_hash.clone(),
+                    rel.clone(),
+                    rel.clone(),
+                ));
+            }
+        }
         Ok(())
     }
 

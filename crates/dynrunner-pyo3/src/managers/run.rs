@@ -36,22 +36,6 @@ pub(crate) fn compute_task_hash(py: Python<'_>, binary: &Bound<'_, PyAny>) -> Py
     Ok(dynrunner_manager_distributed::compute_task_hash(&bin))
 }
 
-/// Compute the SHA256 of a file's contents, returned as 64-char hex.
-/// Used by the SLURM packaging pipeline at staging-notification time
-/// to populate `content_hash` on the StageFile / StagedFileRecord
-/// wire frames so the secondary can verify the staged copy without
-/// the primary's task-identifier hash (which is path/identifier-
-/// derived, not content-derived) being misinterpreted as a content
-/// hash. Returns `None` (raises ValueError on the Python side) when
-/// the file can't be opened.
-#[pyfunction]
-pub(crate) fn compute_file_content_hash(path: &str) -> PyResult<String> {
-    dynrunner_manager_distributed::compute_file_hash(std::path::Path::new(path)).ok_or_else(|| {
-        pyo3::exceptions::PyOSError::new_err(format!(
-            "compute_file_content_hash: failed to read {path}"
-        ))
-    })
-}
 
 fn module<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyModule>> {
     py.import("dynamic_runner")
