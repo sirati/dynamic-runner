@@ -37,7 +37,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err(format!(
-                        "timeout waiting for secondaries: {}/{}",
+                        "timeout waiting for secondaries: {}/{} sent SecondaryWelcome \
+                         (transport-level connection accept happens lazily on first \
+                         message, so 0/N here can mean either no peer ever connected \
+                         OR connections completed handshake but never sent Welcome — \
+                         in the latter case the per-connection accept handler \
+                         should have logged a 'peer connected but did not send \
+                         SecondaryWelcome within Ns; closing as non-conformant' \
+                         line in the transport log; that points at the consumer's \
+                         worker_module not completing the runner protocol's Ready \
+                         handshake)",
                         self.secondaries.len(),
                         expected
                     ));

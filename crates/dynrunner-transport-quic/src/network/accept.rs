@@ -7,6 +7,8 @@
 //! then runs reader + writer tasks over the underlying transport until
 //! the secondary disconnects.
 
+use std::time::Duration;
+
 use dynrunner_core::{Identifier, MessageReceiver};
 use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +19,23 @@ use crate::transport::{QuicConnection, QuicListener};
 use crate::wss::{WssConnection, WssListener};
 
 use super::AcceptedConnection;
+
+/// How long the per-connection handler waits for the peer's first
+/// frame (`SecondaryWelcome`) before dropping the connection as
+/// non-conformant. The transport can't surface the connection to
+/// the coordinator until that first frame arrives — `secondary_id`
+/// is read from `first_msg.sender_id()` — so without a deadline,
+/// a peer that completes the WSS/QUIC handshake but never speaks
+/// the runner protocol leaves the coordinator's
+/// `wait_for_connections` blocked at "0/N" until its much coarser
+/// `connect_timeout` (default 600s) fires with a misleading
+/// "no secondaries connected" message.
+///
+/// 60 seconds is well above any reasonable Welcome-emit cost
+/// (the secondary builds a small JSON message after worker init
+/// completes); the cause of timeouts at this point is structural,
+/// not slow.
+const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// QUIC accept loop.
 pub(super) async fn quic_accept_loop<I: Identifier>(
@@ -71,10 +90,36 @@ async fn handle_new_quic_connection<I: Identifier>(
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedConnection<I>>,
 ) {
-    // Read first message to identify the secondary
-    let first_msg = match MessageReceiver::<DistributedMessage<I>>::recv(&mut conn).await {
-        Some(msg) => msg,
-        None => return,
+    // Read first message to identify the secondary. Bounded by
+    // WELCOME_TIMEOUT so a non-conformant peer (handshake-completes
+    // but never sends Welcome — usually because its worker_module
+    // doesn't complete the runner-protocol Ready handshake and the
+    // secondary hangs in `WorkerPool::wait_for_all_ready`) drops
+    // here instead of pinning the coordinator at "0/N".
+    let first_msg = match tokio::time::timeout(
+        WELCOME_TIMEOUT,
+        MessageReceiver::<DistributedMessage<I>>::recv(&mut conn),
+    )
+    .await
+    {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::error!(
+                timeout_s = WELCOME_TIMEOUT.as_secs(),
+                "QUIC peer connected but did not send SecondaryWelcome \
+                 within {}s; closing as non-conformant. Most likely cause: \
+                 the consumer worker_module on the secondary side does not \
+                 complete the runner protocol's initial Ready handshake on \
+                 stdin/stdout, so the secondary hangs in \
+                 `WorkerPool::wait_for_all_ready` and never reaches \
+                 `send_welcome`. Make sure the worker_module imports the \
+                 framework's worker-protocol library and emits Ready \
+                 before doing any long-running work.",
+                WELCOME_TIMEOUT.as_secs()
+            );
+            return;
+        }
     };
     let secondary_id = first_msg.sender_id().to_string();
 
@@ -161,10 +206,34 @@ async fn handle_new_wss_connection<I: Identifier>(
     incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
     new_conn_tx: mpsc::UnboundedSender<AcceptedConnection<I>>,
 ) {
-    // Read first message to identify the secondary
-    let first_msg = match MessageReceiver::<DistributedMessage<I>>::recv(&mut conn).await {
-        Some(msg) => msg,
-        None => return,
+    // Read first message to identify the secondary. Bounded by
+    // WELCOME_TIMEOUT — see `handle_new_quic_connection`'s matching
+    // block for the rationale (non-conformant worker_module
+    // diagnosis).
+    let first_msg = match tokio::time::timeout(
+        WELCOME_TIMEOUT,
+        MessageReceiver::<DistributedMessage<I>>::recv(&mut conn),
+    )
+    .await
+    {
+        Ok(Some(msg)) => msg,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::error!(
+                timeout_s = WELCOME_TIMEOUT.as_secs(),
+                "WSS peer connected but did not send SecondaryWelcome \
+                 within {}s; closing as non-conformant. Most likely cause: \
+                 the consumer worker_module on the secondary side does not \
+                 complete the runner protocol's initial Ready handshake on \
+                 stdin/stdout, so the secondary hangs in \
+                 `WorkerPool::wait_for_all_ready` and never reaches \
+                 `send_welcome`. Make sure the worker_module imports the \
+                 framework's worker-protocol library and emits Ready \
+                 before doing any long-running work.",
+                WELCOME_TIMEOUT.as_secs()
+            );
+            return;
+        }
     };
     let secondary_id = first_msg.sender_id().to_string();
 
