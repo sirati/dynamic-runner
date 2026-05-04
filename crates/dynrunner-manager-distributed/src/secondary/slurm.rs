@@ -146,6 +146,18 @@ where
     /// `Active`. No-op if the hash wasn't dispatched by this node — a
     /// peer-completion the SLURM-primary never issued belongs to a
     /// different in-flight ledger and is silently ignored.
+    ///
+    /// Mirrors `process_phase_lifecycle` on the local primary side: a
+    /// single `mark_phase_done` may flip a `Blocked` dependent phase
+    /// to `Active`, and that newly-active phase may itself be empty
+    /// (dependency chain `0 → 1 → 2 → 3` with all items in phase 3,
+    /// or any phase whose only item just completed with no follow-up
+    /// items). Loop until no phase is `Drained` and call
+    /// `drain_empty_active_phases` each iteration so the cascade
+    /// continues all the way to the next populated phase. Without
+    /// this loop the SLURM-primary would stop one phase short and
+    /// the next phase's items would sit in the pool with the phase
+    /// still `Blocked`.
     pub(super) fn note_slurm_item_completed(&mut self, file_hash: &str) {
         let phase_id = match self.slurm_in_flight.remove(file_hash) {
             Some(p) => p,
@@ -153,15 +165,18 @@ where
         };
         if let Some(pool) = self.slurm_pending.as_mut() {
             pool.on_item_finished(&phase_id);
-            // Drain any phase the completion just emptied. The
-            // SLURM-primary doesn't surface user-visible
-            // `on_phase_end` callbacks (the original primary owns the
-            // run-level lifecycle hooks); marking phases done is
-            // still required so dependent phases can dispatch via
-            // `take_first_match`'s Active-only filter.
-            let drained = pool.poll_drain_transitions();
-            for p in &drained {
-                pool.mark_phase_done(p);
+            loop {
+                let drained = pool.poll_drain_transitions();
+                if drained.is_empty() {
+                    break;
+                }
+                for p in &drained {
+                    pool.mark_phase_done(p);
+                }
+                // Newly-active dependents may themselves be empty;
+                // re-drain so the next poll_drain_transitions picks
+                // them up and the cascade continues.
+                pool.drain_empty_active_phases();
             }
         }
     }

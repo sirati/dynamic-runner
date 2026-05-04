@@ -161,6 +161,33 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 "task complete"
             );
 
+            // Kickstart dispatch to every idle worker. After
+            // `note_item_completed` runs the phase-lifecycle cascade,
+            // a previously-Blocked phase may have just transitioned
+            // to Active. Workers that have been idle since startup
+            // (because their initial TaskRequest got "no work" when
+            // the new phase wasn't yet active) won't re-poll on their
+            // own — they sent their last TaskRequest already, got
+            // nothing, and are waiting for an unsolicited
+            // TaskAssignment. Without this kickstart, a 2-phase task
+            // graph where phase-N has 1 item and phase-(N+1) has the
+            // rest would stall after the phase-N item finishes —
+            // the originating secondary's worker DOES re-request via
+            // its `request_task_for_worker(0)` in
+            // `processing.rs:193`, but every OTHER secondary's
+            // workers don't. Same kickstart pattern as
+            // `run_retry_passes` uses after re-injection.
+            //
+            // Idempotent: if no phase advanced (the common case for
+            // mid-phase completions where the phase still has queued
+            // work), `dispatch_to_idle_workers` finds the soft-pin
+            // soft-pin order returns the originating worker first and
+            // the kickstart no-ops by definition. If multiple phases
+            // cascaded done in one tick (chain of empty phases →
+            // first populated phase), every newly-active phase's
+            // items are seen.
+            self.dispatch_to_idle_workers().await.ok();
+
             // Belt-and-suspenders: forward to every other secondary
             // so each one's `completed_tasks` cache stays current.
             // The originating secondary already broadcasts
@@ -266,6 +293,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 error = %error_message,
                 "task failed"
             );
+
+            // Same kickstart rationale as `handle_task_complete`:
+            // `note_item_failed` may have just cascaded a phase
+            // through Drained → Done and activated a dependent
+            // phase; idle workers across other secondaries won't
+            // re-poll on their own. Idempotent.
+            self.dispatch_to_idle_workers().await.ok();
 
             // Forward task-terminal outcomes to peer secondaries so
             // their `failed_tasks` / `completed_tasks` caches stay
