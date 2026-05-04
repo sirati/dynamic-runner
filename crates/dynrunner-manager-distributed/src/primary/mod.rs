@@ -35,13 +35,16 @@ pub struct PrimaryConfig {
     pub keepalive_interval: Duration,
     /// Number of missed keepalives that constitute a death (default 3).
     pub keepalive_miss_threshold: u32,
-    /// Pre-staged source mode (`--source-already-staged`): the data is
-    /// bind-mounted into each secondary container at `src_network`
-    /// already; no primary-driven staging or hash verification is
-    /// needed. Propagated to secondaries via `InitialAssignment` so
-    /// each one's `dispatch` skips the extraction-cache hash machinery
-    /// and resolves files directly via `src_network/<local_path>`.
-    pub source_pre_staged: bool,
+    /// Pre-staged source mode (`--source-already-staged`): when set,
+    /// the data is bind-mounted into each secondary container at
+    /// `src_network` from this gateway-side host path. No
+    /// primary-driven staging or hash verification is needed. The
+    /// secondary resolves files directly via `src_network/<rel>`
+    /// where `<rel>` is what the primary computes by stripping this
+    /// prefix from `TaskInfo.path` before sending the wire's
+    /// `local_path` (see `wire_local_path`). `None` outside
+    /// pre-staged mode.
+    pub source_pre_staged_root: Option<std::path::PathBuf>,
 }
 
 impl Default for PrimaryConfig {
@@ -53,7 +56,37 @@ impl Default for PrimaryConfig {
             peer_timeout: Duration::from_secs(300),
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
-            source_pre_staged: false,
+            source_pre_staged_root: None,
+        }
+    }
+}
+
+impl PrimaryConfig {
+    /// Compute the wire-side `local_path` for a TaskInfo. In normal
+    /// mode it's the absolute path verbatim. In pre-staged mode it's
+    /// the absolute path with `source_pre_staged_root` stripped, so
+    /// the secondary's `src_network.join(<wire local_path>)` resolves
+    /// to the in-container bind-mount path. Paths that don't sit
+    /// under the root (consumer misconfiguration) pass through
+    /// unchanged — the secondary's `resolve_pre_staged` then fails
+    /// NonRecoverable with the offending path, surfacing the
+    /// mismatch instead of silently routing the wrong file.
+    pub fn wire_local_path<I: Identifier>(&self, binary: &TaskInfo<I>) -> String {
+        match &self.source_pre_staged_root {
+            None => binary.path.to_string_lossy().into_owned(),
+            Some(root) => match binary.path.strip_prefix(root) {
+                Ok(rel) => rel.to_string_lossy().into_owned(),
+                Err(_) => {
+                    tracing::warn!(
+                        path = %binary.path.display(),
+                        root = %root.display(),
+                        "wire_local_path: TaskInfo path doesn't sit under \
+                         source_pre_staged_root; passing through unchanged \
+                         — secondary will fail NonRecoverable"
+                    );
+                    binary.path.to_string_lossy().into_owned()
+                }
+            },
         }
     }
 }

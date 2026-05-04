@@ -88,7 +88,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                             worker_id,
                             zip_file: None,
                             binary_info: binary_to_distributed(&binary),
-                            local_path: binary.path.to_string_lossy().into_owned(),
+                            local_path: self.config.wire_local_path(&binary),
                             file_hash: compute_task_hash(&binary),
                         };
                         self.transport.send_to(&sec_id, assignment_msg).await?;

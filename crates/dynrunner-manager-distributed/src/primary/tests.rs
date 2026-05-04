@@ -39,7 +39,7 @@ async fn single_secondary_processes_all_tasks() {
             peer_timeout: Duration::from_secs(5),
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
-                    source_pre_staged: false,
+                    source_pre_staged_root: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -85,7 +85,7 @@ async fn two_secondaries_distribute_work() {
             peer_timeout: Duration::from_secs(5),
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
-                    source_pre_staged: false,
+                    source_pre_staged_root: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -202,7 +202,7 @@ async fn e2e_primary_and_secondary_single_node() {
             peer_timeout: Duration::from_secs(10),
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
-                    source_pre_staged: false,
+                    source_pre_staged_root: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -272,7 +272,7 @@ async fn e2e_primary_and_two_secondaries() {
             peer_timeout: Duration::from_secs(10),
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
-                    source_pre_staged: false,
+                    source_pre_staged_root: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -323,7 +323,7 @@ async fn live_distribution_continues_past_initial_batch() {
             peer_timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
-            source_pre_staged: false,
+            source_pre_staged_root: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -374,7 +374,7 @@ async fn notify_stage_file_emits_wire_message() {
             peer_timeout: Duration::from_secs(5),
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
-            source_pre_staged: false,
+            source_pre_staged_root: None,
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, TestId> =

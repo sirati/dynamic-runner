@@ -269,7 +269,7 @@ impl PyDistributedManager {
                     // In-process distributed manager doesn't run the
                     // SLURM packaging pipeline, so pre-staged mode
                     // doesn't apply here.
-                    source_pre_staged: false,
+                    source_pre_staged_root: None,
                 };
 
                 let mut primary = PrimaryCoordinator::new(

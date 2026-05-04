@@ -139,7 +139,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             .map(|binary| {
                 let hash = compute_task_hash(binary);
                 TaskListEntry {
-                    local_path: binary.path.to_string_lossy().into_owned(),
+                    local_path: self.config.wire_local_path(binary),
                     binary_info: binary_to_distributed(binary),
                     hash: hash.clone(),
                     file_path: Some(binary.path.to_string_lossy().into_owned()),

@@ -53,7 +53,7 @@ impl PyPrimaryConfig {
             // Pre-staged mode is plumbed through PyPrimaryCoordinator's
             // own constructor (the SLURM-pipeline path); this config
             // shim defaults to off.
-            source_pre_staged: false,
+            source_pre_staged_root: None,
         }
     }
 }
