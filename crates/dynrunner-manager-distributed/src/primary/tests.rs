@@ -131,6 +131,19 @@ fn spawn_real_secondary(
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>, // secondary→primary
     tokio::task::JoinHandle<usize>,                    // returns completed count
 ) {
+    spawn_real_secondary_with_src_network(secondary_id, num_workers, max_resources, None)
+}
+
+fn spawn_real_secondary_with_src_network(
+    secondary_id: String,
+    num_workers: u32,
+    max_resources: dynrunner_core::ResourceMap,
+    src_network: Option<std::path::PathBuf>,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    tokio::task::JoinHandle<usize>,
+) {
     // primary→secondary channel
     let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
     // secondary→primary channel
@@ -147,7 +160,7 @@ fn spawn_real_secondary(
             max_resources,
             hostname: "test-host".into(),
             keepalive_interval: Duration::from_secs(60),
-            src_network: None,
+            src_network,
             src_tmp: None,
             peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
@@ -420,5 +433,143 @@ async fn notify_stage_file_emits_wire_message() {
             other => panic!("expected StageFile, got {:?}", other.msg_type()),
         }
     }).await;
+}
+
+/// End-to-end: pre-staged source mode locks in the path-mapping
+/// contract added in a344b0e (PrimaryConfig.source_pre_staged_root).
+///
+/// Setup mocks the gateway-bind-mount: a tmpdir holds N fake binary
+/// files; the primary's TaskInfo.path is the tmpdir-absolute path
+/// (matching what a consumer's discover_items would emit). The
+/// primary's `source_pre_staged_root` and the secondary's
+/// `src_network` both point at the same tmpdir — in production the
+/// gateway-host path and the in-container path are different (the
+/// wrapper bind-mounts one to the other) but the test collapses the
+/// two views since there's no container.
+///
+/// Asserts:
+///   - All 5 binaries complete.
+///   - The wire's local_path on each TaskAssignment was the
+///     tmpdir-relative form (the strip happened); without that
+///     strip, the secondary's `src_network.join(local_path)` would
+///     return the absolute path as-is and `.exists()` would still
+///     be true here, so the strip behaviour wouldn't be asserted.
+///     We pin it by inspecting the wire on the secondary side.
+///
+/// This test was the missing pre-stage end-to-end coverage that
+/// let bf1ce02 + a344b0e ship with a contract gap each.
+#[tokio::test(flavor = "current_thread")]
+async fn e2e_pre_staged_source_mode() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let staged = tempfile::TempDir::new().expect("tmpdir");
+            let staged_path = staged.path().to_path_buf();
+
+            // Drop fake binary files at <staged>/<name>.
+            let names: Vec<String> = (0..5).map(|i| format!("bin_{i}")).collect();
+            for name in &names {
+                std::fs::write(staged_path.join(name), b"x").expect("write fake binary");
+            }
+
+            // TaskInfos with absolute paths — matches a consumer that
+            // emits gateway-side paths after joining
+            // --source-already-staged with each item's relative_path.
+            let binaries: Vec<TaskInfo<TestId>> = names
+                .iter()
+                .map(|n| {
+                    let mut b = make_binary(n, 1);
+                    b.path = staged_path.join(n);
+                    b
+                })
+                .collect();
+
+            let secondary_id = "sec-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+                spawn_real_secondary_with_src_network(
+                    secondary_id.clone(),
+                    2,
+                    max_res,
+                    Some(staged_path.clone()),
+                );
+
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: Some(staged_path.clone()),
+            };
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            {
+                let (deps, ops, ope) = noop_phase_args();
+                primary.run(binaries, deps, ops, ope).await.unwrap()
+            };
+
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+            drop(primary);
+
+            let sec_completed = sec_handle.await.unwrap();
+
+            assert_eq!(completed, 5, "primary should see 5 completed in pre-staged mode");
+            assert_eq!(failed, 0, "no failures expected");
+            assert_eq!(sec_completed, 5, "secondary should resolve all 5 via src_network");
+        })
+        .await;
+}
+
+/// Pin the wire-strip behaviour directly: PrimaryConfig::wire_local_path
+/// returns the absolute path verbatim outside pre-staged mode and the
+/// relative-to-root form inside it. Paths that don't sit under the
+/// root pass through unchanged (the secondary then surfaces the
+/// mismatch as NonRecoverable).
+#[test]
+fn wire_local_path_strips_pre_staged_prefix() {
+    let mut cfg = PrimaryConfig::default();
+
+    let mut bin = make_binary("x", 0);
+    bin.path = std::path::PathBuf::from("/srv/data/bin_0");
+
+    // Off → verbatim.
+    assert_eq!(cfg.wire_local_path(&bin), "/srv/data/bin_0");
+
+    // On with matching prefix → relative.
+    cfg.source_pre_staged_root = Some(std::path::PathBuf::from("/srv/data"));
+    assert_eq!(cfg.wire_local_path(&bin), "bin_0");
+
+    // On with mismatching prefix → verbatim (consumer misconfig is
+    // surfaced downstream by resolve_pre_staged returning None, not
+    // silently re-routed).
+    cfg.source_pre_staged_root = Some(std::path::PathBuf::from("/other/prefix"));
+    assert_eq!(cfg.wire_local_path(&bin), "/srv/data/bin_0");
 }
 

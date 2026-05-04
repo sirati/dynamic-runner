@@ -31,3 +31,4 @@ dynrunner-transport-channel = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = "3"
