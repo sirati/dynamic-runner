@@ -242,6 +242,33 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
     }
 }
 
+/// Resolve a Python identifier object to a `RunnerIdentifier`.
+///
+/// Prefers the structured-identifier interface (`obj.identifier_key()` —
+/// any callable that returns a string) and falls back to the explicit
+/// 5-field `BinaryIdentifier` shape (`binary_name`, `platform`, `compiler`,
+/// `version`, `opt_level`).
+pub(crate) fn identifier_from_pyobj(
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<RunnerIdentifier> {
+    if let Ok(key_attr) = obj.getattr("identifier_key") {
+        let key: String = key_attr.call0()?.extract()?;
+        return Ok(Arc::from(key.as_str()));
+    }
+    let binary_name: String = obj.getattr("binary_name")?.extract()?;
+    let platform: String = obj.getattr("platform")?.extract()?;
+    let compiler: String = obj.getattr("compiler")?.extract()?;
+    let version: String = obj.getattr("version")?.extract()?;
+    let opt_level: String = obj.getattr("opt_level")?.extract()?;
+    Ok(join_identifier(
+        &binary_name,
+        &platform,
+        &compiler,
+        &version,
+        &opt_level,
+    ))
+}
+
 pub(crate) fn extract_binaries(
     binaries: &Bound<'_, PyList>,
 ) -> PyResult<Vec<TaskInfo<RunnerIdentifier>>> {
@@ -260,23 +287,7 @@ pub(crate) fn extract_binaries(
             let path: String = path_obj.str()?.to_string();
             let size: u64 = item.getattr("size")?.extract()?;
             let ident = item.getattr("identifier")?;
-
-            // Prefer the structured-identifier interface (`identifier_key()`)
-            // when the Python identifier is a TokenizerIdentifier dataclass
-            // or compatible. Fall back to PyBinaryIdentifier's 5 explicit
-            // fields for backward compat.
-            let identifier: RunnerIdentifier = if let Ok(key_attr) = ident.getattr("identifier_key")
-            {
-                let key: String = key_attr.call0()?.extract()?;
-                Arc::from(key.as_str())
-            } else {
-                let binary_name: String = ident.getattr("binary_name")?.extract()?;
-                let platform: String = ident.getattr("platform")?.extract()?;
-                let compiler: String = ident.getattr("compiler")?.extract()?;
-                let version: String = ident.getattr("version")?.extract()?;
-                let opt_level: String = ident.getattr("opt_level")?.extract()?;
-                join_identifier(&binary_name, &platform, &compiler, &version, &opt_level)
-            };
+            let identifier = identifier_from_pyobj(&ident)?;
 
             // Phase 2A added phase_id / type_id / affinity_id / payload to the
             // Python TaskInfo with safe defaults (empty strings / None / {}).
