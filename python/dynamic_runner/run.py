@@ -210,12 +210,25 @@ def _dispatch_secondary(task, args, logger) -> None:
     logger.info(f"Primary URL: {args.secondary}")
     logger.info(f"src_network={cfg.src_network}, src_tmp={cfg.src_tmp}, output_dir={cfg.output_dir}")
 
+    # Worker's `--source` argument: prefer the bind-mount root
+    # (`src_network`) when it's configured. That's where binaries
+    # actually live in container deployments (the wrapper bind-mounts
+    # either the primary's staged-bins dir, or — in pre-staged mode —
+    # the user-named cluster path under `--source-already-staged`).
+    # Workers that do `binary.path.relative_to(source_dir)` to mirror
+    # the source-corpus structure under the output dir then get the
+    # right relative path; passing `src_tmp` instead would make
+    # `relative_to` fail and the worker fall back to a flat layout.
+    # Outside container mode `src_network` is None and we fall back to
+    # `src_tmp` (per-secondary scratch — the historical default).
+    worker_source_dir = cfg.src_network if cfg.src_network is not None else cfg.src_tmp
+
     _rs.run_secondary(
         cfg,
         args.secondary,
         task,
         args,
-        str(cfg.src_tmp),
+        str(worker_source_dir),
         str(cfg.output_dir),
         skip_existing=args.skip_existing,
     )
