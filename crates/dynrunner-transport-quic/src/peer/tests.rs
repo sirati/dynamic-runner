@@ -54,9 +54,11 @@ async fn two_peers_exchange_messages() {
                 },
             ];
 
-            // Each peer connects to the other
-            peer_a.connect_to_peers(&peers).await;
-            peer_b.connect_to_peers(&peers).await;
+            // Each peer kicks off outgoing dials. Non-blocking — the
+            // actual handshakes run on spawned tasks; the sleep below
+            // gives them time to complete before we drain.
+            peer_a.connect_to_peers(&peers);
+            peer_b.connect_to_peers(&peers);
 
             // Give accept loops time to register incoming connections
             tokio::time::sleep(Duration::from_millis(100)).await;

@@ -65,7 +65,9 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
     }
 
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
-        // Delegate to the inherent method
-        PeerNetwork::connect_to_peers(self, peers).await;
+        // Inherent method spawns per-peer dial tasks and returns
+        // immediately; the trait stays async because other PeerTransport
+        // impls (channel, no-op) keep their async signatures.
+        PeerNetwork::connect_to_peers(self, peers);
     }
 }

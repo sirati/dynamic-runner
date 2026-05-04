@@ -109,12 +109,15 @@ where
                                     .iter()
                                     .filter(|p| p.secondary_id != self.config.secondary_id)
                                     .count();
-                                tracing::info!(peers = peer_count, "received peer list, connecting to peers");
+                                tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
+                                // Non-blocking: spawns per-peer dial tasks
+                                // and returns immediately so the surrounding
+                                // select can keep ticking keepalives.
+                                // Successful dials register through the same
+                                // channel the accept loop uses; unreachable
+                                // peers fail silently in the background and
+                                // never block the secondary's primary-link.
                                 self.peer_transport.connect_to_peers(peers).await;
-                                tracing::info!(
-                                    connected = self.peer_transport.peer_count(),
-                                    "peer connections established"
-                                );
                             }
                         }
                         MessageType::InitialAssignment => {
