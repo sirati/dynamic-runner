@@ -96,6 +96,16 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         help="Port for QUIC server to listen on (0 = let OS pick, default: 0)",
     )
     parser.add_argument(
+        "--disable-peer-overlay",
+        action="store_true",
+        help=(
+            "Disable secondary<->secondary peer mesh. Use on clusters that "
+            "firewall inter-compute-node networking (LMU SLURM, etc.). "
+            "Incompatible with the failover/promote-slurm-primary path: "
+            "with peer overlay off, primary loss = job loss."
+        ),
+    )
+    parser.add_argument(
         "--src-network",
         type=str,
         default=None,

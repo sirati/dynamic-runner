@@ -6,6 +6,6 @@ pub mod wss;
 
 pub use certs::CertPair;
 pub use network::{NetworkClient, NetworkServer};
-pub use peer::{NoPeerTransport, PeerNetwork};
+pub use peer::{EitherPeerTransport, NoPeerTransport, PeerNetwork};
 pub use transport::{QuicConnection, QuicListener};
 pub use wss::{WssConnection, WssListener};

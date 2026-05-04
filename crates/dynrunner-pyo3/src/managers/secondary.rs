@@ -129,6 +129,7 @@ impl PySecondaryCoordinator {
         let dist_connect_retry_delay = self.distributed_config.connect_retry_delay();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
+        let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
         // is not yet implemented. The factory will need a per-type
@@ -238,18 +239,51 @@ impl PySecondaryCoordinator {
                 // never matched anything quinn expected; QUIC dials
                 // failed CN validation on every peer pair and fell
                 // back to WSS, eating the 10s-per-peer timeout budget.
-                let peer_network: dynrunner_transport_quic::PeerNetwork<TokenizerIdentifier> =
-                    dynrunner_transport_quic::PeerNetwork::start(&secondary_id)
-                        .await
-                        .unwrap_or_else(|e| {
-                            tracing::error!(error = %e, "failed to start peer network, using no-op");
-                            // This won't happen in practice since PeerNetwork::start only fails
-                            // on cert generation or bind errors, but we handle it gracefully.
-                            panic!("peer network start failed: {e}");
-                        });
-
-                let peer_cert_pem = peer_network.cert_pem().to_string();
-                let peer_port = peer_network.port();
+                // Pick the peer transport at runtime: real `PeerNetwork`
+                // for normal clusters, `NoPeerTransport` for clusters
+                // that firewall inter-compute-node networking (LMU
+                // SLURM, etc.) where every peer dial would time out
+                // anyway. Selection comes from `DistributedConfig
+                // .disable_peer_overlay` — see the CLI flag's help
+                // text for the failover-incompat caveat. The
+                // `EitherPeerTransport` enum lives one level down in
+                // dynrunner-transport-quic because the `PeerTransport`
+                // trait uses RPIT-in-trait and isn't object-safe;
+                // a sum-type is the only way to pick at runtime.
+                let (peer_network, peer_cert_pem, peer_port): (
+                    dynrunner_transport_quic::EitherPeerTransport<TokenizerIdentifier>,
+                    String,
+                    u16,
+                ) = if dist_disable_peer_overlay {
+                    tracing::info!("peer overlay disabled by config; using NoPeerTransport");
+                    (
+                        dynrunner_transport_quic::EitherPeerTransport::Disabled(
+                            dynrunner_transport_quic::NoPeerTransport,
+                        ),
+                        String::new(),
+                        0,
+                    )
+                } else {
+                    let pn = dynrunner_transport_quic::PeerNetwork::<TokenizerIdentifier>::start(
+                        &secondary_id,
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!(error = %e, "failed to start peer network");
+                        // PeerNetwork::start only fails on cert
+                        // generation or bind errors; treat as fatal —
+                        // there's no useful fallback here that keeps
+                        // peer functionality.
+                        panic!("peer network start failed: {e}");
+                    });
+                    let cert_pem = pn.cert_pem().to_string();
+                    let port = pn.port();
+                    (
+                        dynrunner_transport_quic::EitherPeerTransport::Real(pn),
+                        cert_pem,
+                        port,
+                    )
+                };
 
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),

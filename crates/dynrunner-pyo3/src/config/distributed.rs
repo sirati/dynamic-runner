@@ -17,6 +17,13 @@ pub(crate) struct DistributedConfig {
     peer_timeout_secs: f64,
     keepalive_interval_secs: f64,
     keepalive_miss_threshold: u32,
+    /// When true, the secondary skips starting a `PeerNetwork` and
+    /// uses `NoPeerTransport` instead. Intended for clusters that
+    /// firewall inter-compute-node networking (LMU SLURM and similar)
+    /// where every peer dial would time out anyway. Note: this
+    /// disables the failover/promote-slurm-primary path — with no
+    /// peer mesh, primary loss = job loss.
+    disable_peer_overlay: bool,
 }
 
 impl Default for DistributedConfig {
@@ -27,6 +34,7 @@ impl Default for DistributedConfig {
             peer_timeout_secs: 300.0,
             keepalive_interval_secs: 5.0,
             keepalive_miss_threshold: 3,
+            disable_peer_overlay: false,
         }
     }
 }
@@ -40,6 +48,7 @@ impl DistributedConfig {
         peer_timeout_secs = None,
         keepalive_interval_secs = None,
         keepalive_miss_threshold = None,
+        disable_peer_overlay = None,
     ))]
     fn new(
         connect_timeout_secs: Option<f64>,
@@ -47,6 +56,7 @@ impl DistributedConfig {
         peer_timeout_secs: Option<f64>,
         keepalive_interval_secs: Option<f64>,
         keepalive_miss_threshold: Option<u32>,
+        disable_peer_overlay: Option<bool>,
     ) -> Self {
         let d = DistributedConfig::default();
         Self {
@@ -56,6 +66,7 @@ impl DistributedConfig {
             peer_timeout_secs: peer_timeout_secs.unwrap_or(d.peer_timeout_secs),
             keepalive_interval_secs: keepalive_interval_secs.unwrap_or(d.keepalive_interval_secs),
             keepalive_miss_threshold: keepalive_miss_threshold.unwrap_or(d.keepalive_miss_threshold),
+            disable_peer_overlay: disable_peer_overlay.unwrap_or(d.disable_peer_overlay),
         }
     }
 }
@@ -75,6 +86,9 @@ impl DistributedConfig {
     }
     pub(crate) fn keepalive_miss_threshold(&self) -> u32 {
         self.keepalive_miss_threshold
+    }
+    pub(crate) fn disable_peer_overlay(&self) -> bool {
+        self.disable_peer_overlay
     }
 }
 

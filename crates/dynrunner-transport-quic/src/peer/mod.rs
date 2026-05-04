@@ -19,6 +19,7 @@ use crate::transport::QuicListener;
 use crate::wss::{WssListener, connect_wss};
 
 mod accept;
+mod either;
 mod handler;
 mod no_peer;
 mod transport_impl;
@@ -27,6 +28,7 @@ mod util;
 #[cfg(test)]
 mod tests;
 
+pub use either::EitherPeerTransport;
 pub use no_peer::NoPeerTransport;
 use util::{PeerConnection, parse_cert_pem};
 

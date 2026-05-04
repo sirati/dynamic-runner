@@ -189,10 +189,19 @@ def _dispatch_secondary(task, args, logger) -> None:
         logger.error("--secondary-id is required when running in secondary mode")
         return
 
+    # `--disable-peer-overlay` lives on `DistributedConfig` (the
+    # struct that already owns peer-related tuning). Construct an
+    # explicit DistributedConfig only when the flag deviates from
+    # the default; otherwise let `SecondaryConfig.__new__` install
+    # the stock default.
+    distributed_config = (
+        _rs.DistributedConfig(disable_peer_overlay=True) if args.disable_peer_overlay else None
+    )
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
         src_network=args.src_network,
         src_tmp=args.src_tmp,
+        distributed_config=distributed_config,
     )
 
     logger.info(f"Secondary ID: {cfg.secondary_id}")
