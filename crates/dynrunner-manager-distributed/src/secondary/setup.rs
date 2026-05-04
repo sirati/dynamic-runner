@@ -73,63 +73,85 @@ where
 
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
     /// Dispatches any initial task assignments to local workers.
+    ///
+    /// Sends keepalives to the primary on the same interval used by
+    /// `process_tasks` so the primary's heartbeat-monitor sees fresh
+    /// `last_seen` while this secondary is busy doing peer dials. Peer
+    /// connect-to-peers can take 10s × num_peers in the worst case
+    /// (QUIC timeout cascade); without an in-loop keepalive the
+    /// primary's `keepalive_miss_threshold * keepalive_interval`
+    /// budget elapses before any keepalive ever fires from
+    /// `process_tasks`, and the primary kills the secondary as
+    /// "missed keepalives" before it's even fully connected. The
+    /// keepalive payload's `active_workers=0` is honest here — no
+    /// task is dispatched until peer-setup completes.
     pub(super) async fn wait_for_setup(&mut self) -> Result<(), String> {
         tracing::debug!("waiting for setup messages from primary");
 
         let mut got_peer_info = false;
         let mut got_assignment = false;
         let mut got_transfer = false;
+        let mut keepalive_interval =
+            tokio::time::interval(self.config.keepalive_interval);
 
         while !got_peer_info || !got_assignment || !got_transfer {
-            match self.primary_transport.recv().await {
-                Some(msg) => match msg.msg_type() {
-                    MessageType::PeerInfo => {
-                        got_peer_info = true;
-                        if let DistributedMessage::PeerInfo { peers, .. } = &msg {
-                            let peer_count = peers
-                                .iter()
-                                .filter(|p| p.secondary_id != self.config.secondary_id)
-                                .count();
-                            tracing::info!(peers = peer_count, "received peer list, connecting to peers");
-                            self.peer_transport.connect_to_peers(peers).await;
-                            tracing::info!(
-                                connected = self.peer_transport.peer_count(),
-                                "peer connections established"
-                            );
+            tokio::select! {
+                received = self.primary_transport.recv() => {
+                    let msg = match received {
+                        Some(m) => m,
+                        None => return Err("primary disconnected during setup".into()),
+                    };
+                    match msg.msg_type() {
+                        MessageType::PeerInfo => {
+                            got_peer_info = true;
+                            if let DistributedMessage::PeerInfo { peers, .. } = &msg {
+                                let peer_count = peers
+                                    .iter()
+                                    .filter(|p| p.secondary_id != self.config.secondary_id)
+                                    .count();
+                                tracing::info!(peers = peer_count, "received peer list, connecting to peers");
+                                self.peer_transport.connect_to_peers(peers).await;
+                                tracing::info!(
+                                    connected = self.peer_transport.peer_count(),
+                                    "peer connections established"
+                                );
+                            }
                         }
-                    }
-                    MessageType::InitialAssignment => {
-                        got_assignment = true;
-                        if let DistributedMessage::InitialAssignment {
-                            zip_files,
-                            workers_ready,
-                            staged_files,
-                            pre_staged_mode,
-                            uses_file_based_items,
-                            ..
-                        } = msg
-                        {
-                            self.set_pre_staged_mode(pre_staged_mode);
-                            self.set_uses_file_based_items(uses_file_based_items);
-                            self.handle_initial_assignment(
+                        MessageType::InitialAssignment => {
+                            got_assignment = true;
+                            if let DistributedMessage::InitialAssignment {
                                 zip_files,
                                 workers_ready,
                                 staged_files,
-                            )
-                            .await;
+                                pre_staged_mode,
+                                uses_file_based_items,
+                                ..
+                            } = msg
+                            {
+                                self.set_pre_staged_mode(pre_staged_mode);
+                                self.set_uses_file_based_items(uses_file_based_items);
+                                self.handle_initial_assignment(
+                                    zip_files,
+                                    workers_ready,
+                                    staged_files,
+                                )
+                                .await;
+                            }
+                            tracing::debug!("received initial assignment");
                         }
-                        tracing::debug!("received initial assignment");
+                        MessageType::TransferComplete => {
+                            got_transfer = true;
+                            self.transfer_complete = true;
+                            tracing::debug!("received transfer complete");
+                        }
+                        other => {
+                            tracing::debug!(?other, "unexpected message during setup");
+                        }
                     }
-                    MessageType::TransferComplete => {
-                        got_transfer = true;
-                        self.transfer_complete = true;
-                        tracing::debug!("received transfer complete");
-                    }
-                    other => {
-                        tracing::debug!(?other, "unexpected message during setup");
-                    }
-                },
-                None => return Err("primary disconnected during setup".into()),
+                }
+                _ = keepalive_interval.tick() => {
+                    self.send_keepalive().await;
+                }
             }
         }
 

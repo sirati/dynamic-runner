@@ -224,9 +224,22 @@ impl PySecondaryCoordinator {
                     }
                 };
 
-                // Start peer network for peer-to-peer communication
+                // Start peer network for peer-to-peer communication. The
+                // identity passed to `PeerNetwork::start` is BOTH the
+                // CN baked into this secondary's QUIC certificate AND
+                // the `peer_id` other secondaries will pass to quinn's
+                // `connect(addr, server_name)` to validate that cert.
+                // The primary distributes peer info keyed by
+                // `secondary_id` (the logical id, e.g. "secondary-0")
+                // — so the cert CN must match the logical id, not
+                // the SLURM hostname or any worker count. The previous
+                // value `format!("sec-{}", num_workers)` produced a
+                // CN like "sec-14" (one per cpus_per_task value) that
+                // never matched anything quinn expected; QUIC dials
+                // failed CN validation on every peer pair and fell
+                // back to WSS, eating the 10s-per-peer timeout budget.
                 let peer_network: dynrunner_transport_quic::PeerNetwork<TokenizerIdentifier> =
-                    dynrunner_transport_quic::PeerNetwork::start(&format!("sec-{}", num_workers))
+                    dynrunner_transport_quic::PeerNetwork::start(&secondary_id)
                         .await
                         .unwrap_or_else(|e| {
                             tracing::error!(error = %e, "failed to start peer network, using no-op");
