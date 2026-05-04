@@ -120,6 +120,114 @@ async fn two_secondaries_distribute_work() {
     }).await;
 }
 
+/// Regression: when there are more secondaries than initial-assignable
+/// items, the secondaries that DON'T get any work must still receive an
+/// InitialAssignment message (with empty zip_files / workers_ready /
+/// staged_files). Otherwise their `wait_for_setup` waits forever for
+/// the third gating message and the run stalls until heartbeat declares
+/// them dead. Caught in the field on a 4-secondary run with a single
+/// phase-3 item — three secondaries hung in setup, primary killed them
+/// 15s later, work proceeded only on the lucky 4th.
+///
+/// Setup: 2 real secondaries with workers, 1 binary. Pre-fix only
+/// secondary 0 receives InitialAssignment; secondary 1 hangs in
+/// `wait_for_setup`. Post-fix both reach `process_tasks` and the
+/// run completes.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_batch_secondary_still_reaches_process_tasks() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 2 * 1024 * 1024 * 1024u64)]
+        );
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        let mut sec_handles = Vec::new();
+
+        for i in 0..2u32 {
+            let secondary_id = format!("sec-{i}");
+            let (pri_to_sec_tx, sec_to_pri_rx, handle) =
+                spawn_real_secondary(secondary_id.clone(), 2, max_res.clone());
+            outgoing.insert(secondary_id, pri_to_sec_tx);
+            sec_handles.push(handle);
+
+            let tx = incoming_tx.clone();
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(incoming_tx);
+
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 2,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // ONE binary for TWO secondaries — initial assignment will
+        // dispatch it to whichever secondary's worker the scheduler
+        // picks first; the other gets `assigned=0` and must still
+        // receive a (possibly empty) InitialAssignment to escape
+        // wait_for_setup.
+        let binaries = vec![make_binary("only", 50)];
+
+        // The pre-fix bug doesn't prevent primary.run() from
+        // returning — secondary 0 completes the binary, pool drains,
+        // primary exits. But secondary 1 is wedged in
+        // wait_for_setup and never reaches process_tasks, so its
+        // `completed_count()` would never observe the cluster-wide
+        // forward (the value stays at 0 instead of 1). That
+        // discrepancy is the test signal.
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        let completed = primary.completed_count();
+        let failed = primary.failed_count();
+        drop(primary);
+
+        let mut per_sec_completed = Vec::new();
+        for handle in sec_handles {
+            per_sec_completed.push(handle.await.unwrap());
+        }
+
+        assert_eq!(completed, 1);
+        assert_eq!(failed, 0);
+        // Both secondaries must have reached process_tasks; the
+        // cluster-wide TaskComplete forward registers in each
+        // secondary's `completed_tasks` set. Pre-fix the
+        // empty-batch secondary is stuck in wait_for_setup and its
+        // count stays at 0.
+        for (i, count) in per_sec_completed.iter().enumerate() {
+            assert!(
+                *count >= 1,
+                "secondary {i} should have observed the cluster's 1 \
+                 completion (entered process_tasks); saw {count}"
+            );
+        }
+    }).await;
+}
+
+
 // ── End-to-end tests: real Primary + real Secondary with workers ──
 
 

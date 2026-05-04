@@ -118,19 +118,44 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             }
         }
 
-        // Send initial assignments to each secondary
-        for (secondary_id, assignments) in &assignments_per_secondary {
-            let zip_files = vec![ZipFileAssignment {
-                zip_name: String::new(),
-                binaries: assignments
-                    .iter()
-                    .map(|(_, binary, _)| ZipBinaryEntry {
-                        local_path: self.config.wire_local_path(binary),
-                        binary_info: binary_to_distributed(binary),
-                        hash: compute_task_hash(binary),
-                    })
-                    .collect(),
-            }];
+        // Send InitialAssignment to EVERY connected secondary, even
+        // those that got no initial work — `wait_for_setup` on the
+        // secondary side is gated on PeerInfo + InitialAssignment +
+        // TransferComplete, so omitting InitialAssignment for an
+        // empty-batch secondary leaves it permanently stuck waiting
+        // for a message that never arrives. Symptom: a 4-secondary
+        // run with a single phase-3 item logs `assigned=0 remaining=1`,
+        // primary sends InitialAssignment only to the lucky secondary,
+        // the other 3 hang in wait_for_setup until the heartbeat-
+        // monitor declares them dead 15s later.
+        //
+        // For empty-batch secondaries the payload's zip_files,
+        // workers_ready, and staged_files are all empty vectors — the
+        // secondary just enters process_tasks and starts requesting
+        // work normally. The PrimaryConfig flags
+        // (`pre_staged_mode`, `uses_file_based_items`) still need to
+        // be carried so the secondary's dispatch behaviour matches
+        // the primary's.
+        for secondary_id in &secondary_ids {
+            let empty_assignments: Vec<(u32, TaskInfo<I>, ResourceMap)> = Vec::new();
+            let assignments = assignments_per_secondary
+                .get(secondary_id)
+                .unwrap_or(&empty_assignments);
+            let zip_files = if assignments.is_empty() {
+                Vec::new()
+            } else {
+                vec![ZipFileAssignment {
+                    zip_name: String::new(),
+                    binaries: assignments
+                        .iter()
+                        .map(|(_, binary, _)| ZipBinaryEntry {
+                            local_path: self.config.wire_local_path(binary),
+                            binary_info: binary_to_distributed(binary),
+                            hash: compute_task_hash(binary),
+                        })
+                        .collect(),
+                }]
+            };
 
             let workers_ready: Vec<WorkerReadyInfo> = assignments
                 .iter()
