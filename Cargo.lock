@@ -249,6 +249,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynrunner-discovery"
+version = "0.3.0"
+dependencies = [
+ "dynrunner-gateway",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "dynrunner-gateway"
 version = "0.3.0"
 dependencies = [

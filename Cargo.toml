@@ -13,6 +13,7 @@ members = [
     "crates/dynrunner-manager-local",
     "crates/dynrunner-manager-distributed",
     "crates/dynrunner-gateway",
+    "crates/dynrunner-discovery",
     "crates/dynrunner-slurm",
     "crates/dynrunner-pyo3",
 ]
@@ -60,5 +61,6 @@ dynrunner-worker = { path = "crates/dynrunner-worker" }
 dynrunner-manager-local = { path = "crates/dynrunner-manager-local" }
 dynrunner-manager-distributed = { path = "crates/dynrunner-manager-distributed" }
 dynrunner-gateway = { path = "crates/dynrunner-gateway" }
+dynrunner-discovery = { path = "crates/dynrunner-discovery" }
 dynrunner-slurm = { path = "crates/dynrunner-slurm" }
 dynrunner-pyo3 = { path = "crates/dynrunner-pyo3" }
