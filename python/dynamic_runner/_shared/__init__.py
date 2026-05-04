@@ -18,7 +18,13 @@ from .binary_info import (
     format_size,
     parse_binary_filename,
 )
-from .binary_selector import find_matching_binaries
+from .binary_selector import (
+    SelectionFilters,
+    compile_selection_filters,
+    find_matching_binaries,
+    is_excluded_subfolder,
+    match_filename,
+)
 from .csv_helper import increase_csv_field_size_limit
 from .logging_utils import (
     WarningCounterHandler,
@@ -47,6 +53,10 @@ __all__ = [
     "format_size",
     "parse_binary_filename",
     "find_matching_binaries",
+    "SelectionFilters",
+    "compile_selection_filters",
+    "match_filename",
+    "is_excluded_subfolder",
     "increase_csv_field_size_limit",
     "SelectionConfig",
     "NormalizedOptLevels",
