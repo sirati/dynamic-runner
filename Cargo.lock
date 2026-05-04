@@ -332,6 +332,8 @@ name = "dynrunner-pyo3"
 version = "0.3.0"
 dependencies = [
  "dynrunner-core",
+ "dynrunner-discovery",
+ "dynrunner-gateway",
  "dynrunner-manager-distributed",
  "dynrunner-manager-local",
  "dynrunner-protocol-manager-worker",

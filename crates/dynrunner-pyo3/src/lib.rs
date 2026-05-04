@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod config;
+mod discovery;
 mod estimator;
 mod identifier;
 mod managers;
@@ -70,5 +71,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_cores, m)?)?;
     m.add_function(wrap_pyfunction!(parse_memory, m)?)?;
     m.add_function(wrap_pyfunction!(pick_free_port, m)?)?;
+    m.add_class::<discovery::FolderProxy>()?;
+    m.add_class::<discovery::FileProxy>()?;
+    m.add_function(wrap_pyfunction!(discovery::find_items, m)?)?;
     Ok(())
 }

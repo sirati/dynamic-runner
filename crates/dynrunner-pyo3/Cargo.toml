@@ -26,6 +26,8 @@ dynrunner-transport-quic = { workspace = true }
 dynrunner-protocol-manager-worker = { workspace = true }
 dynrunner-transport-socket = { workspace = true }
 dynrunner-transport-channel = { workspace = true }
+dynrunner-gateway = { workspace = true }
+dynrunner-discovery = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 pyo3 = { workspace = true }
