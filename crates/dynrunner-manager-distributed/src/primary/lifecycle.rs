@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
     SecondaryTransport, TaskListEntry,
@@ -110,6 +110,146 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             }
         }
 
+        Ok(())
+    }
+
+    /// After the main operational loop drains, run up to
+    /// `config.retry_max_passes` retry passes. Each pass takes the
+    /// current `failed_tasks` set, re-injects every matching binary
+    /// from `all_binaries` into the pool (clearing the set), kicks
+    /// dispatch to all currently-idle workers, then runs the
+    /// operational loop again. Tasks that fail on the retry pass
+    /// land back in `failed_tasks` for the next iteration — or stay
+    /// there permanently if the retry budget is exhausted. No-op
+    /// when `failed_tasks` is empty.
+    ///
+    /// The proactive idle-worker dispatch step is required because
+    /// secondaries only send `TaskRequest` after they finish a task;
+    /// after the main pass drains every worker is idle but already
+    /// sent its last TaskRequest (which got `nothing-to-do` because
+    /// the failed task wasn't in the pool yet). Without the
+    /// kickstart the re-injected binaries would sit in the pool
+    /// forever waiting for a TaskRequest that never comes.
+    pub(super) async fn run_retry_passes(&mut self) -> Result<(), String> {
+        for pass_idx in 0..self.config.retry_max_passes {
+            if self.failed_tasks.is_empty() {
+                break;
+            }
+
+            // Snapshot the failed-task hashes, clear the set, then
+            // re-inject each matching binary into the pool. The
+            // `failed_tasks` set tracks "currently considered failed"
+            // — by clearing it here we let the upcoming operational
+            // loop populate it fresh with the (smaller) set of
+            // tasks that fail in THIS retry pass.
+            let to_retry_hashes: HashSet<String> =
+                std::mem::take(&mut self.failed_tasks);
+            let to_retry: Vec<TaskInfo<I>> = self
+                .all_binaries
+                .iter()
+                .filter(|b| to_retry_hashes.contains(&compute_task_hash(b)))
+                .cloned()
+                .collect();
+
+            tracing::info!(
+                pass = pass_idx + 1,
+                count = to_retry.len(),
+                "retry pass: re-injecting failed tasks"
+            );
+
+            for binary in to_retry {
+                // Re-inject preserves phase state (flips Drained/Done
+                // back to Active for this phase) so the operational
+                // loop re-engages with the items.
+                self.pool_mut().reinject(binary);
+            }
+
+            // Proactively dispatch to every idle worker before
+            // entering the operational loop — see method-level
+            // comment for the rationale.
+            self.dispatch_to_idle_workers().await?;
+
+            // The operational loop will dispatch the re-injected
+            // tasks, observe their TaskComplete / TaskFailed
+            // outcomes, and exit when the pool drains again. Tasks
+            // that fail in this pass land in `failed_tasks` for the
+            // next iteration of THIS for-loop.
+            self.operational_loop().await?;
+        }
+
+        if !self.failed_tasks.is_empty() {
+            tracing::warn!(
+                permanent_failures = self.failed_tasks.len(),
+                passes = self.config.retry_max_passes,
+                "retry budget exhausted; tasks permanently failed"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Iterate every idle worker and dispatch a task from the pool
+    /// if one fits. Used by `run_retry_passes` to kickstart dispatch
+    /// after re-injection (workers won't send a fresh TaskRequest on
+    /// their own — see the run_retry_passes comment). Mirrors the
+    /// per-worker logic in `handle_task_request` minus the
+    /// SLURM-primary relay (which is irrelevant for the
+    /// non-promoted-primary at this stage).
+    pub(super) async fn dispatch_to_idle_workers(&mut self) -> Result<(), String> {
+        for worker_idx in 0..self.workers.len() {
+            if !self.workers[worker_idx].is_idle {
+                continue;
+            }
+            let global_wid = self.workers[worker_idx].worker_id;
+            let view = self.cap_filter_view(self.pool().view_for_worker(global_wid));
+            if view.is_empty() {
+                continue;
+            }
+            let worker_info = self.workers[worker_idx].budget_info();
+            let all_infos: Vec<dynrunner_scheduler_api::WorkerBudgetInfo<I>> =
+                self.workers.iter().map(|w| w.budget_info()).collect();
+            let max_res = self.workers[worker_idx].resource_budgets.clone();
+
+            let decision = self.scheduler.assign_normal(
+                &worker_info,
+                &all_infos,
+                view.as_slice(),
+                &max_res,
+                &self.estimator,
+                false,
+            );
+
+            if let dynrunner_scheduler_api::AssignmentDecision::Assign {
+                binary_index,
+                estimated_usage,
+                ..
+            } = decision
+            {
+                let binary = self.pool_mut().take_from_view(view, binary_index);
+                self.reserve_type_slot(&binary.type_id);
+                let sec_id = self.workers[worker_idx].secondary_id.clone();
+                let local_worker_id = self.workers[..worker_idx + 1]
+                    .iter()
+                    .filter(|w| w.secondary_id == sec_id)
+                    .count() as u32
+                    - 1;
+                self.workers[worker_idx].current_task = Some(binary.clone());
+                self.workers[worker_idx].estimated_resources = estimated_usage;
+                self.workers[worker_idx].is_idle = false;
+
+                let assignment_msg = DistributedMessage::TaskAssignment {
+                    sender_id: self.config.node_id.clone(),
+                    timestamp: timestamp_now(),
+                    secondary_id: sec_id.clone(),
+                    worker_id: local_worker_id,
+                    zip_file: None,
+                    binary_info: binary_to_distributed(&binary),
+                    local_path: self.config.wire_local_path(&binary),
+                    file_hash: compute_task_hash(&binary),
+                };
+                self.transport.send_to(&sec_id, assignment_msg).await?;
+            }
+        }
         Ok(())
     }
 

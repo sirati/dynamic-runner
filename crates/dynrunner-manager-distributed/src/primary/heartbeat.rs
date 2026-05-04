@@ -279,6 +279,7 @@ mod tests {
             source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         }
     }
 

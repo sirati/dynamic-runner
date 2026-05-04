@@ -564,14 +564,18 @@ impl<I: Identifier> PendingPool<I> {
     /// Re-inject an item whose previous attempt has already been
     /// finalised via `on_item_finished` (so it is no longer counted as
     /// in-flight). Pushes to the BACK of its bucket and, if the phase
-    /// has reached `Draining` or `Drained`, flips it back to `Active`
-    /// so the newly-injected item is dispatchable. Any pending drained
-    /// notification for the phase is cancelled (the phase is no longer
-    /// drained).
+    /// has progressed past `Active` (`Draining`, `Drained`, or `Done`),
+    /// flips it back to `Active` so the newly-injected item is
+    /// dispatchable. Any pending drained notification for the phase
+    /// is cancelled (the phase is no longer drained).
     ///
     /// This is the right hook for manager-side retry queues that
     /// re-introduce already-finished tasks: the in-flight count is
     /// untouched, only the queue contents and phase state move.
+    /// Reinjecting after `Done` unwinds the phase into `Active`
+    /// without re-firing `on_phase_start` — the manager owns
+    /// lifecycle bookkeeping (phase_started_emitted) and decides
+    /// whether the second-pass dispatch is observable to consumers.
     pub fn reinject(&mut self, item: TaskInfo<I>) {
         let phase_id = item.phase_id.clone();
         let key = (
@@ -587,7 +591,7 @@ impl<I: Identifier> PendingPool<I> {
         let current = self.phase_state.get(&phase_id).copied();
         if matches!(
             current,
-            Some(PhaseState::Draining | PhaseState::Drained)
+            Some(PhaseState::Draining | PhaseState::Drained | PhaseState::Done)
         ) {
             self.phase_state.insert(phase_id.clone(), PhaseState::Active);
             // If it was queued for drain notification, drop that entry —

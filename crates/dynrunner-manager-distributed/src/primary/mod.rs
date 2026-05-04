@@ -69,6 +69,27 @@ pub struct PrimaryConfig {
     /// letting cheap IO-bound phases run at the full `--jobs` width
     /// without rewriting the estimator API.
     pub max_concurrent_per_type: HashMap<dynrunner_core::TypeId, u32>,
+
+    /// Number of retry passes to run after the main operational loop
+    /// drains. Default `1` (one retry pass; matches the local
+    /// manager's `retry_max_attempts` semantics).
+    ///
+    /// Each pass re-injects the tasks that failed in the previous
+    /// pass and runs the operational loop again. A task that fails
+    /// in a pass and fails again in the next stays in `failed_tasks`
+    /// permanently. Set to `0` to disable retries (every Recoverable
+    /// failure is terminal — useful for fail-fast CI).
+    ///
+    /// Why a pass-based retry instead of per-task counter: a worker
+    /// that mis-classifies a permanent error as Recoverable (EROFS,
+    /// missing config, etc.) would otherwise retry the same task
+    /// hundreds of times per second until the SLURM time budget
+    /// expires. The pass-based model bounds the cost to one extra
+    /// dispatch per failed task. Secondary-died-then-requeue
+    /// (handled in `requeue_dead_secondary`) does NOT count as a
+    /// failure — those tasks were never actually failed, just lost
+    /// their worker.
+    pub retry_max_passes: u32,
 }
 
 impl Default for PrimaryConfig {
@@ -83,6 +104,7 @@ impl Default for PrimaryConfig {
             source_pre_staged_root: None,
             uses_file_based_items: true,
             max_concurrent_per_type: HashMap::new(),
+            retry_max_passes: 1,
         }
     }
 }
@@ -427,8 +449,20 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // Phase 8: Send full task list to SLURM-primary
         self.send_full_task_list().await?;
 
-        // Phase 9: Operational loop
+        // Phase 9: Operational loop (main pass)
         self.operational_loop().await?;
+
+        // Phase 10: Retry pass(es). Each Recoverable / NonRecoverable
+        // failure in the main pass terminated its dispatch slot and
+        // landed the task hash in `failed_tasks`. Re-inject those
+        // tasks and run the operational loop again so they get one
+        // more chance — bounded by `config.retry_max_passes` (default
+        // 1). Tasks that fail again stay permanently in
+        // `failed_tasks`. Without this loop a Recoverable failure
+        // either retries forever (the legacy busy-loop bug) or never
+        // retries at all; the pass-based shape gives task-level
+        // retry that matches the local manager's behaviour.
+        self.run_retry_passes().await?;
 
         tracing::info!(
             completed = self.completed_tasks.len(),

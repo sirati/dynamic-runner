@@ -238,32 +238,25 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
-            if error_type == "Recoverable" {
-                // Re-enqueue recoverable failures for assignment to another
-                // worker. Pool's `requeue` decrements in-flight and inserts
-                // at the FRONT of the bucket — same retry semantics as the
-                // pre-pool Vec push, just bucket-aware.
-                if let Some(binary) = recovered_binary {
-                    self.release_type_slot(&binary.type_id);
-                    tracing::info!(
-                        secondary = %secondary_id,
-                        worker_id,
-                        error = %error_message,
-                        "recoverable failure, re-enqueuing task"
-                    );
-                    self.pool_mut().requeue(binary);
-                } else {
-                    // Can't recover — no binary info available
-                    self.failed_tasks.insert(task_hash);
-                }
-            } else {
-                // Non-recoverable: permanently mark as failed and drain
-                // the phase counter so on_phase_end fires correctly.
-                self.failed_tasks.insert(task_hash);
-                if let Some(binary) = recovered_binary {
-                    self.release_type_slot(&binary.type_id);
-                    self.note_item_failed(&binary.phase_id);
-                }
+            // Failure budget: one per task per pass. Recoverable
+            // and NonRecoverable both terminate the dispatch slot
+            // and add to `failed_tasks`. The `run()` pipeline calls
+            // `retry_failed_tasks_pass` after the main operational
+            // loop drains, which re-injects everything in
+            // `failed_tasks` (clearing the set) and runs the loop
+            // again. Up to `config.retry_max_passes` retry passes
+            // (default 1) before failures are permanent.
+            //
+            // Critically NOT counted as a failure: secondary
+            // disconnect → `requeue_dead_secondary` puts the
+            // in-flight task back into the pool via
+            // `pool.requeue` (NOT through this function). The task
+            // never reached `failed_tasks`, so its retry budget
+            // stays untouched.
+            self.failed_tasks.insert(task_hash.clone());
+            if let Some(binary) = recovered_binary {
+                self.release_type_slot(&binary.type_id);
+                self.note_item_failed(&binary.phase_id);
             }
 
             tracing::warn!(
@@ -274,15 +267,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 "task failed"
             );
 
-            // Forward NonRecoverable failures (which terminate the
-            // task) to every other secondary so their `failed_tasks`
-            // / `completed_tasks` cache stays current. Recoverable
-            // failures aren't terminal — the task gets re-enqueued
-            // and a future TaskComplete will arrive.
-            if error_type != "Recoverable" {
-                self.forward_completion_to_secondaries(&msg, &secondary_id)
-                    .await;
-            }
+            // Forward task-terminal outcomes to peer secondaries so
+            // their `failed_tasks` / `completed_tasks` caches stay
+            // current — required for SLURM-promoted-primary handoff
+            // not to re-dispatch a task we just gave up on. Both
+            // Recoverable and NonRecoverable are terminal in the
+            // pass-based retry model: the retry pass re-injects into
+            // the pool by re-running the operational loop, which is
+            // the new "second chance"; an immediate requeue would
+            // recreate the busy-loop bug.
+            self.forward_completion_to_secondaries(&msg, &secondary_id)
+                .await;
         }
     }
 }

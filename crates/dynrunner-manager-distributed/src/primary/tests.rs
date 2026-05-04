@@ -42,6 +42,7 @@ async fn single_secondary_processes_all_tasks() {
                     source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -90,6 +91,7 @@ async fn two_secondaries_distribute_work() {
                     source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -175,6 +177,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             source_pre_staged_root: None,
             uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -224,6 +227,238 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
                  completion (entered process_tasks); saw {count}"
             );
         }
+    }).await;
+}
+
+
+/// Regression: a Recoverable failure in the main pass should NOT
+/// requeue immediately (the legacy busy-loop bug). Instead the task
+/// lands in `failed_tasks`; after the main operational loop drains,
+/// `run_retry_passes` re-injects every failed task and runs the loop
+/// again. A task that succeeds on the retry pass leaves
+/// `failed_tasks` empty at the end of the run.
+///
+/// Setup: 1 secondary, 1 binary. Custom in-line fake fails the
+/// first attempt with `Recoverable` and succeeds the second. Pre-fix
+/// the test would either succeed by busy-loop (Recoverable retried
+/// inline at ~10 retries/sec) or hang. Post-fix the binary is
+/// failed once, retried in pass 1, completes — final state has 1
+/// completion and 0 permanent failures.
+#[tokio::test(flavor = "current_thread")]
+async fn recoverable_failure_succeeds_on_retry_pass() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_binary("only", 50)];
+
+        let (id, rx, tx) = secondary_ends.remove(0);
+        // Custom fake: fail-then-succeed the first task we see.
+        // Tracks per-task attempt count locally; first attempt
+        // → Recoverable TaskFailed; second attempt → TaskComplete.
+        tokio::task::spawn_local(async move {
+            let mut rx = rx;
+            tx.send(DistributedMessage::SecondaryWelcome {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 1024 * 1024 * 1024,
+                }],
+                worker_count: 1,
+                hostname: "test".into(),
+            }).unwrap();
+            tx.send(DistributedMessage::CertExchange {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: "FAKE".into(),
+                ipv4_address: Some("127.0.0.1".into()),
+                ipv6_address: None,
+                quic_port: 5000,
+            }).unwrap();
+
+            let send_request = |tx: &tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+                                id: &str| {
+                tx.send(DistributedMessage::TaskRequest {
+                    sender_id: id.to_string(), timestamp: 0.0,
+                    secondary_id: id.to_string(),
+                    worker_id: 0,
+                    available_resources: vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
+                        amount: 1024 * 1024 * 1024,
+                    }],
+                }).unwrap();
+            };
+
+            let mut attempts: HashMap<String, u32> = HashMap::new();
+            while let Some(msg) = rx.recv().await {
+                let task_hash_opt = match &msg {
+                    DistributedMessage::PeerInfo { .. }
+                    | DistributedMessage::TransferComplete { .. } => continue,
+                    DistributedMessage::InitialAssignment { zip_files, .. } => zip_files
+                        .first()
+                        .and_then(|z| z.binaries.first())
+                        .map(|e| e.hash.clone()),
+                    DistributedMessage::TaskAssignment { file_hash, .. } => {
+                        Some(file_hash.clone())
+                    }
+                    _ => None,
+                };
+                let Some(task_hash) = task_hash_opt else { continue };
+
+                let n = attempts.entry(task_hash.clone()).or_insert(0);
+                *n += 1;
+                if *n == 1 {
+                    tx.send(DistributedMessage::TaskFailed {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        task_hash,
+                        error_type: "Recoverable".into(),
+                        error_message: "synthetic transient error".into(),
+                    }).unwrap();
+                } else {
+                    tx.send(DistributedMessage::TaskComplete {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        task_hash,
+                        result_data: None,
+                    }).unwrap();
+                }
+                // Worker is idle again — request next task. Without
+                // this, primary's pool would hold the re-injected
+                // retry task forever and the operational loop hangs.
+                send_request(&tx, &id);
+            }
+        });
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // Main pass fails (1 failure), retry pass succeeds → final
+        // state: 1 completed, 0 permanent failures.
+        assert_eq!(primary.completed_count(), 1);
+        assert_eq!(primary.failed_count(), 0);
+    }).await;
+}
+
+/// Companion: a task that fails BOTH the main pass and the retry
+/// pass stays permanently in `failed_tasks` — `retry_max_passes=1`
+/// means one retry, no third chance.
+#[tokio::test(flavor = "current_thread")]
+async fn recoverable_failure_twice_becomes_permanent() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_binary("doomed", 50)];
+
+        let (id, rx, tx) = secondary_ends.remove(0);
+        tokio::task::spawn_local(async move {
+            let mut rx = rx;
+            tx.send(DistributedMessage::SecondaryWelcome {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 1024 * 1024 * 1024,
+                }],
+                worker_count: 1,
+                hostname: "test".into(),
+            }).unwrap();
+            tx.send(DistributedMessage::CertExchange {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: "FAKE".into(),
+                ipv4_address: Some("127.0.0.1".into()),
+                ipv6_address: None,
+                quic_port: 5000,
+            }).unwrap();
+            // Fail every attempt — both main and retry pass. Issue a
+            // TaskRequest after each failure so primary's operational
+            // loop has a chance to dispatch the re-injected retry
+            // task; otherwise the pool would sit with the task and
+            // never drain.
+            while let Some(msg) = rx.recv().await {
+                let hash_opt = match &msg {
+                    DistributedMessage::InitialAssignment { zip_files, .. } => zip_files
+                        .first()
+                        .and_then(|z| z.binaries.first())
+                        .map(|e| e.hash.clone()),
+                    DistributedMessage::TaskAssignment { file_hash, .. } => {
+                        Some(file_hash.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(h) = hash_opt {
+                    tx.send(DistributedMessage::TaskFailed {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        task_hash: h,
+                        error_type: "Recoverable".into(),
+                        error_message: "always fails".into(),
+                    }).unwrap();
+                    tx.send(DistributedMessage::TaskRequest {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: 1024 * 1024 * 1024,
+                        }],
+                    }).unwrap();
+                }
+            }
+        });
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // Main pass fails, retry pass fails again → permanent.
+        assert_eq!(primary.completed_count(), 0);
+        assert_eq!(primary.failed_count(), 1);
     }).await;
 }
 
@@ -330,6 +565,7 @@ async fn e2e_primary_and_secondary_single_node() {
                     source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -402,6 +638,7 @@ async fn e2e_primary_and_two_secondaries() {
                     source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -470,6 +707,7 @@ async fn live_distribution_continues_past_initial_batch() {
             source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -523,6 +761,7 @@ async fn notify_stage_file_emits_wire_message() {
             source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, TestId> =
@@ -676,6 +915,7 @@ async fn e2e_pre_staged_source_mode() {
                 source_pre_staged_root: Some(gateway_path.clone()),
                 uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -750,6 +990,7 @@ async fn e2e_uses_file_based_items_false() {
                 source_pre_staged_root: None,
                 uses_file_based_items: false,
                 max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -842,6 +1083,7 @@ async fn e2e_per_type_max_concurrent() {
                 source_pre_staged_root: None,
                 uses_file_based_items: true,
                 max_concurrent_per_type: caps,
+                retry_max_passes: 1,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,

@@ -134,6 +134,7 @@ async fn e2e_primary_secondary_over_wss() {
                     source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -237,6 +238,7 @@ async fn e2e_primary_secondary_over_quic() {
                     source_pre_staged_root: None,
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
         };
 
         let mut primary = PrimaryCoordinator::new(

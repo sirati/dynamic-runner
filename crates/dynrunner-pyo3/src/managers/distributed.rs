@@ -278,6 +278,7 @@ impl PyDistributedManager {
                     source_pre_staged_root: None,
                     uses_file_based_items,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
+                    retry_max_passes: 1,
                 };
 
                 let mut primary = PrimaryCoordinator::new(

@@ -59,6 +59,7 @@ impl PyPrimaryConfig {
             // reads `TaskDefinition.uses_file_based_items`).
             uses_file_based_items: true,
                     max_concurrent_per_type: std::collections::HashMap::new(),
+                    retry_max_passes: 1,
         }
     }
 }
