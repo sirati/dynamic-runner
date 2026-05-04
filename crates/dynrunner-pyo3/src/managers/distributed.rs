@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::PhaseId;
+use dynrunner_core::{PhaseId, TypeId};
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
@@ -33,6 +33,8 @@ pub(crate) struct PyDistributedManager {
     types: TypeRegistry,
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
+    uses_file_based_items: bool,
+    max_concurrent_per_type: HashMap<TypeId, u32>,
     estimator: PyMemoryEstimatorBridge,
     completed: u32,
     failed: u32,
@@ -97,6 +99,8 @@ impl PyDistributedManager {
             types: task.types,
             phase_deps: task.phase_deps,
             skip_existing,
+            uses_file_based_items: task.uses_file_based_items,
+            max_concurrent_per_type: task.max_concurrent_per_type,
             estimator: task.estimator,
             completed: 0,
             failed: 0,
@@ -135,6 +139,8 @@ impl PyDistributedManager {
         let worker_module = first_type.worker_module.clone();
         let worker_cmd_args = first_type.cmd_args.clone();
         let skip_existing = self.skip_existing;
+        let uses_file_based_items = self.uses_file_based_items;
+        let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         let phase_deps = self.phase_deps.clone();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
@@ -270,11 +276,8 @@ impl PyDistributedManager {
                     // SLURM packaging pipeline, so pre-staged mode
                     // doesn't apply here.
                     source_pre_staged_root: None,
-                    // In-process manager uses the historical
-                    // file-based contract — items map to local files
-                    // the workers open.
-                    uses_file_based_items: true,
-                    max_concurrent_per_type: std::collections::HashMap::new(),
+                    uses_file_based_items,
+                    max_concurrent_per_type: max_concurrent_per_type.clone(),
                 };
 
                 let mut primary = PrimaryCoordinator::new(

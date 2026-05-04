@@ -194,6 +194,16 @@ pub(crate) struct LoadedTaskDefinition {
     pub(crate) log_dir: PathBuf,
     pub(crate) log_paths: LogPathConfig,
     pub(crate) python_executable: PathBuf,
+    /// `TaskDefinition.uses_file_based_items` (FR-2). False means
+    /// `TaskInfo.path` is an opaque identifier, not a real filesystem
+    /// path — workers won't open it and the framework skips
+    /// hash-based staging. Defaults to True for old task definitions
+    /// missing the attribute.
+    pub(crate) uses_file_based_items: bool,
+    /// Per-type concurrency caps from `TaskTypeSpec.max_concurrent`
+    /// (FR-1). Carried over from `LoadedTopology` rather than re-parsed
+    /// at every call site that needs to construct a `PrimaryConfig`.
+    pub(crate) max_concurrent_per_type: HashMap<TypeId, u32>,
 }
 
 impl LoadedTaskDefinition {
@@ -207,6 +217,11 @@ impl LoadedTaskDefinition {
         log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
+        let uses_file_based_items: bool = task_definition
+            .getattr("uses_file_based_items")
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or(true);
 
         let source_path = PathBuf::from(source_dir);
         let output_path = PathBuf::from(output_dir);
@@ -270,6 +285,8 @@ impl LoadedTaskDefinition {
             log_dir,
             log_paths,
             python_executable: PathBuf::from(python_executable),
+            uses_file_based_items,
+            max_concurrent_per_type: topology.max_concurrent_per_type,
         })
     }
 }
