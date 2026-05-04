@@ -124,7 +124,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 binaries: assignments
                     .iter()
                     .map(|(_, binary, _)| ZipBinaryEntry {
-                        local_path: binary.path.to_string_lossy().into_owned(),
+                        local_path: self.config.wire_local_path(binary),
                         binary_info: binary_to_distributed(binary),
                         hash: compute_task_hash(binary),
                     })

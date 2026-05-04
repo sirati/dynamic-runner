@@ -470,23 +470,41 @@ async fn e2e_pre_staged_source_mode() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let staged = tempfile::TempDir::new().expect("tmpdir");
-            let staged_path = staged.path().to_path_buf();
+            // Two distinct tmpdirs — `gateway_path` is the host path
+            // the primary's TaskInfo.path's are relative to (the
+            // wrapper's bind-mount source); `container_path` is what
+            // the secondary's `src_network` resolves to (the wrapper's
+            // bind-mount destination). Production has these as
+            // different paths the wrapper bind-mounts together; the
+            // test models them as different tmpdirs with the SAME
+            // file basenames present under each. This setup is the
+            // load-bearing one: if the primary's `wire_local_path`
+            // strip doesn't fire, the wire's local_path is the
+            // gateway-absolute `<gateway>/bin_X`, secondary's
+            // `src_network.join(<absolute>)` returns the
+            // gateway-absolute path verbatim (Path::join rules), and
+            // `<gateway>/bin_X.exists()` is true ONLY if the secondary
+            // can see the gateway-side files — which it can't here.
+            let gateway = tempfile::TempDir::new().expect("gateway tmpdir");
+            let gateway_path = gateway.path().to_path_buf();
+            let container = tempfile::TempDir::new().expect("container tmpdir");
+            let container_path = container.path().to_path_buf();
 
-            // Drop fake binary files at <staged>/<name>.
             let names: Vec<String> = (0..5).map(|i| format!("bin_{i}")).collect();
             for name in &names {
-                std::fs::write(staged_path.join(name), b"x").expect("write fake binary");
+                // Files exist only under the container view (the
+                // gateway path is just a string the primary treats as
+                // an authoritative root for prefix-stripping).
+                std::fs::write(container_path.join(name), b"x")
+                    .expect("write fake binary in container view");
             }
 
-            // TaskInfos with absolute paths — matches a consumer that
-            // emits gateway-side paths after joining
-            // --source-already-staged with each item's relative_path.
+            // TaskInfos with paths under the gateway view.
             let binaries: Vec<TaskInfo<TestId>> = names
                 .iter()
                 .map(|n| {
                     let mut b = make_binary(n, 1);
-                    b.path = staged_path.join(n);
+                    b.path = gateway_path.join(n);
                     b
                 })
                 .collect();
@@ -502,7 +520,7 @@ async fn e2e_pre_staged_source_mode() {
                     secondary_id.clone(),
                     2,
                     max_res,
-                    Some(staged_path.clone()),
+                    Some(container_path.clone()),
                 );
 
             let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
@@ -526,7 +544,7 @@ async fn e2e_pre_staged_source_mode() {
                 peer_timeout: Duration::from_secs(10),
                 keepalive_interval: Duration::from_secs(5),
                 keepalive_miss_threshold: 3,
-                source_pre_staged_root: Some(staged_path.clone()),
+                source_pre_staged_root: Some(gateway_path.clone()),
                 uses_file_based_items: true,
             };
             let mut primary = PrimaryCoordinator::new(
