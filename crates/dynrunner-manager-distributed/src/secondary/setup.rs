@@ -135,12 +135,12 @@ where
                             )
                             .await;
                         }
-                        tracing::debug!("received initial assignment");
+                        tracing::info!("received initial assignment");
                     }
                     MessageType::TransferComplete => {
                         got_transfer = true;
                         self.transfer_complete = true;
-                        tracing::debug!("received transfer complete");
+                        tracing::info!("received transfer complete");
                     }
                     other => {
                         tracing::debug!(?other, "unexpected message during setup");

@@ -388,6 +388,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // by `mark_phase_done` are observed via `process_phase_lifecycle`.
         self.fire_initial_phase_starts();
 
+        // Trivially-empty Active phases (no items at all) need to drain
+        // and cascade Done before initial assignment, otherwise their
+        // `Blocked` dependents — which may hold all the run's actual
+        // work — never become visible to `view_for_worker`. Triggers
+        // `on_phase_end(.., 0, 0)` for each empty phase via the
+        // lifecycle cascade.
+        self.pool_mut().drain_empty_active_phases();
+        self.process_phase_lifecycle();
+
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections().await?;
 
@@ -471,6 +480,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // mark_phase_done may have flipped Blocked → Active for
             // dependents; emit on_phase_start for them.
             self.fire_initial_phase_starts();
+            // Newly-Active dependents may themselves be empty (a phase
+            // chain like 0→1→2→3 with all items in phase 3 cascades
+            // through this branch on every iteration). Re-drain so the
+            // next poll_drain_transitions catches them and the loop
+            // continues; without this the cascade stops one phase
+            // short and items in the final phase never dispatch.
+            self.pool_mut().drain_empty_active_phases();
         }
     }
 

@@ -209,6 +209,73 @@ fn mark_phase_done_activates_dependents() {
     assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Active));
 }
 
+/// Empty `Active` phase transitions to `Drained` after
+/// `drain_empty_active_phases`, and `poll_drain_transitions` reports
+/// it. Without this, an empty phase-0 in a multi-phase chain would
+/// never trigger `mark_phase_done` and dependents would stay
+/// `Blocked` forever.
+#[test]
+fn drain_empty_active_phases_marks_empty_phase_drained() {
+    let mut p = pool_with(&["A", "B"], &[("B", &["A"])]);
+    // No items added — phase A is Active but empty.
+    assert_eq!(p.phase_state(&phase("A")), Some(PhaseState::Active));
+    p.drain_empty_active_phases();
+    assert_eq!(p.phase_state(&phase("A")), Some(PhaseState::Drained));
+    let drained = p.poll_drain_transitions();
+    assert_eq!(drained, vec![phase("A")]);
+}
+
+/// Cascade: phase chain 0→1→2→3 with items only in phase 3 still
+/// needs every empty intermediate phase to drain so view_for_worker
+/// can see the phase-3 items. Mirrors the manager's
+/// `process_phase_lifecycle` loop: drain empties, mark each done,
+/// then re-drain the freshly-Active dependents until the chain
+/// reaches the populated phase.
+#[test]
+fn drain_empty_active_phases_cascades_to_first_populated_phase() {
+    let mut p = pool_with(
+        &["P0", "P1", "P2", "P3"],
+        &[("P1", &["P0"]), ("P2", &["P1"]), ("P3", &["P2"])],
+    );
+    p.extend([t("P3", "T", "", 1)]);
+    // Initial state: only P0 Active (no deps); P1..P3 all Blocked.
+    assert_eq!(p.phase_state(&phase("P0")), Some(PhaseState::Active));
+    assert_eq!(p.phase_state(&phase("P3")), Some(PhaseState::Blocked));
+    // view_for_worker on a fresh worker sees nothing — P3 isn't Active.
+    assert!(p.view_for_worker(1).is_empty());
+
+    // Cascade: drain P0 → mark Done → P1 Active → drain → ... → P3 Active.
+    loop {
+        p.drain_empty_active_phases();
+        let drained = p.poll_drain_transitions();
+        if drained.is_empty() {
+            break;
+        }
+        for ph in &drained {
+            p.mark_phase_done(ph);
+        }
+    }
+
+    assert_eq!(p.phase_state(&phase("P0")), Some(PhaseState::Done));
+    assert_eq!(p.phase_state(&phase("P1")), Some(PhaseState::Done));
+    assert_eq!(p.phase_state(&phase("P2")), Some(PhaseState::Done));
+    assert_eq!(p.phase_state(&phase("P3")), Some(PhaseState::Active));
+    // Now phase-3 item is reachable.
+    assert_eq!(p.view_for_worker(1).len(), 1);
+}
+
+/// `drain_empty_active_phases` must be a no-op when the Active
+/// phase has queued items — wouldn't want to incorrectly drain
+/// an in-use phase.
+#[test]
+fn drain_empty_active_phases_skips_phase_with_items() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t("P", "T", "", 1)]);
+    p.drain_empty_active_phases();
+    assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
+    assert!(p.poll_drain_transitions().is_empty());
+}
+
 /// `view_for_worker` produces the same priority order as `pop_for_worker`
 /// for a fresh worker (no affinity, no pins) — typed buckets first,
 /// free-pool last. The scheduler's chosen index commits via

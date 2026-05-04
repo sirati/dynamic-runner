@@ -873,6 +873,39 @@ impl<I: Identifier> PendingPool<I> {
         None
     }
 
+    /// Mark every currently-`Active` or `Draining` phase that has no
+    /// queued AND no in-flight items as `Drained`, pushing each onto
+    /// `drained_pending` so the manager's `process_phase_lifecycle`
+    /// pass observes them and cascades into `mark_phase_done` plus
+    /// dependent-phase activation. Idempotent.
+    ///
+    /// Why this exists: `maybe_transition_drain` only runs when an
+    /// item is removed from the pool (`take_at`) or finished
+    /// (`on_item_finished`). A phase that started `Active` (because
+    /// it had no upstream deps) but never received any items would
+    /// otherwise stay `Active` forever, holding `Blocked` dependents
+    /// that own the actual work. Multi-phase task definitions where
+    /// every item lives in a non-zero-indexed phase trip this on
+    /// startup; so does any run where `--skip-existing` (or
+    /// equivalent task-side filtering) leaves an early phase
+    /// completely empty.
+    ///
+    /// Callers should invoke this after the initial `extend()` and
+    /// inside the lifecycle cascade in the manager — newly-`Active`
+    /// dependents may themselves be empty and require the same
+    /// transition before the cascade can continue.
+    pub fn drain_empty_active_phases(&mut self) {
+        let candidates: Vec<PhaseId> = self
+            .phase_state
+            .iter()
+            .filter(|(_, s)| matches!(**s, PhaseState::Active | PhaseState::Draining))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for p in &candidates {
+            self.maybe_transition_drain(p);
+        }
+    }
+
     /// Inspect a phase to decide if it should transition between
     /// `Active`, `Draining`, and `Drained`. Idempotent — safe to call
     /// from anywhere a relevant counter changed.
