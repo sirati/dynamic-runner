@@ -102,20 +102,20 @@ impl PyPrimaryCoordinator {
     /// lookup.
     ///
     /// Reads each binary file once on the primary side to compute
-    /// `content_hash` (SHA256). Files that can't be hashed (missing,
-    /// permission-denied, or sentinel paths that don't back to a real
-    /// file — e.g. `ssh-debug-00` from a long-lived service task) are
-    /// skipped with a warning and don't get a StageFile pre-populated.
-    /// The task itself still dispatches via the assignment path.
+    /// `content_hash` (SHA256). Errors out on the first unreadable
+    /// file rather than silently skipping — a broken local
+    /// `--source` (or a TaskInfo emitting relative paths that don't
+    /// resolve against CWD) is a configuration bug the consumer
+    /// wants to surface immediately, not a partial dispatch that
+    /// later fails on the secondary as a confusing "not pre-staged
+    /// at <path>" error with no breadcrumb pointing back to the
+    /// primary's drop.
     ///
-    /// Surfacing the skip at `warn!` rather than failing keeps
-    /// sentinel-style tasks (where the consumer never expected
-    /// staging) working, while making genuine configuration bugs
-    /// (relative paths against the wrong CWD, missing files, etc.)
-    /// visible at the default INFO log level — otherwise the failure
-    /// mode is a confusing downstream "not pre-staged at <path>"
-    /// error from the secondary with no breadcrumb pointing back
-    /// to the primary's silent drop.
+    /// If a future consumer needs sentinel-style TaskInfos that
+    /// intentionally don't back to a real file, the right shape is
+    /// an explicit marker on TaskInfo (e.g. `is_synthetic: bool`)
+    /// so this branch can distinguish "no file by design" from
+    /// "no file by mistake".
     fn queue_initial_staging(
         &mut self,
         binaries: &Bound<'_, pyo3::types::PyList>,
@@ -132,17 +132,16 @@ impl PyPrimaryCoordinator {
             let Some(content_hash) =
                 dynrunner_manager_distributed::compute_file_hash(&binary.path)
             else {
-                tracing::warn!(
-                    binary = %binary.path.display(),
-                    type_id = %binary.type_id,
-                    "queue_initial_staging: file unreadable; skipping StageFile pre-population. \
-                     If this is a synthetic/sentinel task that doesn't back to a real file, the \
-                     warning is benign. Otherwise the source path is wrong (typically a relative \
-                     path resolved against the wrong CWD, a path not under --source, or a file \
-                     missing/permission-denied) — the secondary will subsequently error \
-                     'not pre-staged at <path>' for this item.",
-                );
-                continue;
+                return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
+                    "queue_initial_staging: cannot read {} (type_id={}). \
+                     Typical causes: TaskInfo emits a relative path that doesn't resolve \
+                     against the current working directory; --source points at the wrong tree; \
+                     the file is missing or permission-denied. Aborting before dispatch so the \
+                     misconfiguration surfaces here rather than as a downstream secondary \
+                     'not pre-staged at <path>' error.",
+                    binary.path.display(),
+                    binary.type_id,
+                )));
             };
             for i in 0..self.num_secondaries {
                 self.pending_stage_files.push((
