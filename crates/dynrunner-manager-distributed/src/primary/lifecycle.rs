@@ -42,13 +42,27 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         heartbeat_tick.tick().await;
 
         loop {
-            // Check termination: all tasks accounted for
-            if self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks {
+            // Check termination: all tasks accounted for AND no
+            // worker is mid-dispatch. Both halves of the check are
+            // necessary — counting `completed + failed >= total`
+            // alone would orphan in-flight tasks if the bookkeeping
+            // ever inflates (e.g. a TaskComplete arriving for a task
+            // primary doesn't currently track as in-flight on a
+            // worker — the insert grows the set while the in-flight
+            // ledger stays as-is, so the counter check trips while a
+            // sibling worker is still mid-dispatch and primary tears
+            // down before that sibling's TaskComplete arrives).
+            // Pairing the counter check with `active_workers == 0`
+            // guarantees we only exit when every dispatched
+            // assignment has been reconciled.
+            let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+            if self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
+                && active_workers == 0
+            {
                 tracing::info!("all tasks completed or failed");
                 break;
             }
 
-            let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
             // Drain check: pool's `is_run_complete` returns true iff
             // queued + in-flight is zero AND no phase is Active or
             // Draining. The active-workers guard catches the edge
