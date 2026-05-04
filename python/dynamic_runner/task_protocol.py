@@ -21,6 +21,43 @@ worker dispatch. The task implements four kinds of method:
 4. **Lifecycle hooks** (``on_run_start``, ``on_run_end``,
    ``on_phase_start``, ``on_phase_end``) — let the task set up / tear down
    resources at the right boundaries.
+
+Output durability contract (SLURM dispatch)
+-------------------------------------------
+
+When the framework dispatches in SLURM mode, each secondary container
+sees TWO output bind-mounts:
+
+* ``/app/out-tmp`` — per-secondary scratch on the compute node's local
+  disk. Fast, cleared at job-exit; the framework's worker-side
+  bookkeeping (sockets, in-progress logs) lives here.
+* ``/app/out-network`` — the shared cluster filesystem mount; this is
+  where the framework points the worker's ``--output`` flag (via
+  ``SecondaryConfig`` auto-resolution). Outputs survive job-exit and
+  are visible to other secondaries on the same gateway.
+
+The framework does NOT mediate writes between the two: workers
+write directly to ``/app/out-network`` and the contract is "the
+worker owns crash-safety on its own outputs". A worker that may
+SIGKILL or OOM mid-write should:
+
+1. Write to ``<output_dir>/<name>.partial``
+2. ``os.fsync`` (or platform equivalent) before
+3. ``os.replace(<name>.partial, <name>)`` (POSIX-atomic rename)
+
+Otherwise an interrupted run can leave half-written ``<name>.csv``
+files that subsequent ``--skip-existing`` passes treat as "done"
+and never retry. The framework's ``--skip-existing`` machinery
+checks for the existence of the FINAL filename only; it does not
+inspect file size or content. This is intentional — the cost of
+an integrity check on every output would dwarf the benefit on the
+common case — but it means crash-safety is the consumer's job.
+
+For tasks whose outputs are byte-streams that can be partial-read
+without observable harm (compressed archives with internal
+checksums, append-only logs), the partial-rename pattern is
+optional but still recommended for the ``--skip-existing``
+correctness reason.
 """
 
 from __future__ import annotations

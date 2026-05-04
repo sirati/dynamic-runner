@@ -187,8 +187,18 @@ cp "{image_path}" "$LOCAL_IMAGE"
         ConnectionMode::Reverse { .. } => {
             script.push_str(&format!(
                 r##"
-# Run container - reverse mode (primary tunnels to secondary via gateway)
+# Run container - reverse mode (primary tunnels to secondary via gateway).
+# `--pull=never`: if the local `podman load` was incomplete (image
+# layers missing from the load), podman's default behaviour is to
+# silently fall through to a registry pull and try docker.io —
+# which on most institutional clusters returns "access denied"
+# only after a multi-minute timeout, by which point the
+# dispatcher has already given up with `timeout waiting for
+# secondaries`. `--pull=never` makes that class of incomplete-load
+# fail loud-and-fast with a clear "image not in local storage"
+# error instead.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    --pull=never \
     --network host \
     {volumes} \
     {image_ref} \
@@ -202,8 +212,11 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
         } => {
             script.push_str(&format!(
                 r##"
-# Run container - standard mode (secondary connects to primary via gateway)
+# Run container - standard mode (secondary connects to primary via gateway).
+# `--pull=never`: see the reverse-mode block above for the
+# rationale; same incomplete-load → registry-fallback pitfall.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    --pull=never \
     --network host \
     {volumes} \
     {image_ref} \
