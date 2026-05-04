@@ -186,6 +186,39 @@ where
                 }
                 Ok(())
             }
+            DistributedMessage::TaskComplete {
+                task_hash,
+                ..
+            } => {
+                // The local primary forwards observed TaskCompletes
+                // to every secondary so each one's cached completion
+                // set stays current — matters on local-death-then-
+                // failover, where the elected secondary's
+                // populate_slurm_tasks filters items against
+                // self.completed_tasks (peer broadcast covers the
+                // common case but is best-effort; this primary-side
+                // forward is the reliable backstop). Idempotent:
+                // a forward of our own completion just re-inserts
+                // the hash that's already there.
+                self.completed_tasks.insert(task_hash.clone());
+                self.note_slurm_item_completed(&task_hash);
+                Ok(())
+            }
+            DistributedMessage::TaskFailed {
+                task_hash,
+                error_type,
+                ..
+            } => {
+                // Same forwarding rationale as TaskComplete; only
+                // act on terminal (non-Recoverable) failures since
+                // Recoverable just re-enqueues and a future
+                // TaskComplete will arrive.
+                if error_type != "Recoverable" {
+                    self.completed_tasks.insert(task_hash.clone());
+                    self.note_slurm_item_completed(&task_hash);
+                }
+                Ok(())
+            }
             DistributedMessage::FullTaskList {
                 all_tasks,
                 completed_tasks,

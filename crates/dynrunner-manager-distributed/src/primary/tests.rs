@@ -315,14 +315,29 @@ async fn e2e_primary_and_two_secondaries() {
         // Drop primary to close transport channels, allowing secondaries to exit
         drop(primary);
 
-        let mut total_sec_completed = 0;
+        let mut per_sec_completed = Vec::new();
         for handle in sec_handles {
-            total_sec_completed += handle.await.unwrap();
+            per_sec_completed.push(handle.await.unwrap());
         }
 
         assert_eq!(completed, 10);
         assert_eq!(failed, 0);
-        assert_eq!(total_sec_completed, 10);
+        // After the failover-survivability fix, every secondary's
+        // `completed_tasks` reflects the CLUSTER view (own work +
+        // peer broadcasts + primary-side forwards) so it can serve
+        // as a SLURM-promoted-primary on local-death without
+        // re-dispatching done items. Each secondary therefore sees
+        // all 10 completions, not just its own ~5. Asserting the
+        // cluster-wide invariant directly: every secondary's set
+        // has at least the total — anything less is a missed
+        // forward that would cause a re-dispatch on failover.
+        for (i, count) in per_sec_completed.iter().enumerate() {
+            assert!(
+                *count >= 10,
+                "secondary {i} should have observed all 10 completions \
+                 (cluster-wide view for failover survivability), got {count}"
+            );
+        }
     }).await;
 }
 

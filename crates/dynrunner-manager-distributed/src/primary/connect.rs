@@ -70,8 +70,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             MessageType::SecondaryWelcome => self.handle_welcome(msg),
             MessageType::CertExchange => self.handle_cert_exchange(msg),
             MessageType::TaskRequest => self.handle_task_request(msg).await?,
-            MessageType::TaskComplete => self.handle_task_complete(msg),
-            MessageType::TaskFailed => self.handle_task_failed(msg),
+            MessageType::TaskComplete => self.handle_task_complete(msg).await,
+            MessageType::TaskFailed => self.handle_task_failed(msg).await,
             MessageType::Keepalive => { /* tracked above, no further action */ }
             other => {
                 tracing::debug!(?other, "unhandled message type");

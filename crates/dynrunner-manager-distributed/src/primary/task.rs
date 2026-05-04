@@ -115,15 +115,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         Ok(())
     }
 
-    pub(super) fn handle_task_complete(&mut self, msg: DistributedMessage<I>) {
+    pub(super) async fn handle_task_complete(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::TaskComplete {
             secondary_id,
             worker_id,
             task_hash,
             ..
-        } = msg
+        } = &msg
         {
-            self.completed_tasks.insert(task_hash);
+            let secondary_id = secondary_id.clone();
+            let worker_id = *worker_id;
+            self.completed_tasks.insert(task_hash.clone());
 
             // Mark the specific worker idle using secondary_id + local worker_id.
             // Capture the phase + type of the just-finished item so we
@@ -158,10 +160,54 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 completed = self.completed_tasks.len(),
                 "task complete"
             );
+
+            // Belt-and-suspenders: forward to every other secondary
+            // so each one's `completed_tasks` cache stays current.
+            // The originating secondary already broadcasts
+            // peer-to-peer (processing.rs), but that's best-effort;
+            // a primary-side forward closes the gap if a peer
+            // broadcast was lost. Without this, on local-death-then-
+            // failover, a secondary missing the peer broadcast
+            // would re-dispatch the already-completed task. (Same
+            // failover-survivability invariant as the FullTaskList
+            // broadcast in 04d9012, applied to per-completion
+            // updates.)
+            self.forward_completion_to_secondaries(&msg, &secondary_id)
+                .await;
         }
     }
 
-    pub(super) fn handle_task_failed(&mut self, msg: DistributedMessage<I>) {
+    /// Send `msg` to every connected secondary except the one that
+    /// originated it. Per-secondary failures are logged and continue
+    /// — a missed completion forward just risks a re-dispatch on
+    /// failover, not a run-wide failure.
+    async fn forward_completion_to_secondaries(
+        &mut self,
+        msg: &DistributedMessage<I>,
+        origin_secondary_id: &str,
+    ) {
+        let recipients: Vec<String> = self
+            .secondaries
+            .keys()
+            .filter(|id| id.as_str() != origin_secondary_id)
+            .cloned()
+            .collect();
+        for secondary_id in &recipients {
+            if let Err(e) = self
+                .transport
+                .send_to(secondary_id, msg.clone())
+                .await
+            {
+                tracing::debug!(
+                    secondary = %secondary_id,
+                    error = %e,
+                    "failed to forward task completion; that secondary may re-dispatch on failover"
+                );
+            }
+        }
+    }
+
+    pub(super) async fn handle_task_failed(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::TaskFailed {
             secondary_id,
             worker_id,
@@ -169,8 +215,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             error_type,
             error_message,
             ..
-        } = msg
+        } = &msg
         {
+            let secondary_id = secondary_id.clone();
+            let worker_id = *worker_id;
+            let task_hash = task_hash.clone();
+            let error_type = error_type.clone();
+            let error_message = error_message.clone();
             // Find the specific worker and recover the binary if it's a
             // recoverable error so it can be re-assigned to another worker.
             let mut recovered_binary: Option<TaskInfo<I>> = None;
@@ -222,6 +273,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 error = %error_message,
                 "task failed"
             );
+
+            // Forward NonRecoverable failures (which terminate the
+            // task) to every other secondary so their `failed_tasks`
+            // / `completed_tasks` cache stays current. Recoverable
+            // failures aren't terminal — the task gets re-enqueued
+            // and a future TaskComplete will arrive.
+            if error_type != "Recoverable" {
+                self.forward_completion_to_secondaries(&msg, &secondary_id)
+                    .await;
+            }
         }
     }
 }
