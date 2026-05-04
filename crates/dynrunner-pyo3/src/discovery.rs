@@ -13,7 +13,9 @@ use pyo3::types::PyList;
 
 use dynrunner_core::{PhaseId, RunnerIdentifier, TaskInfo, TypeId};
 use dynrunner_discovery::{FileInfo, FolderInfo, VisitOutcome, Visitor, WalkError, walk};
-use dynrunner_gateway::{Gateway, LocalGateway};
+use dynrunner_gateway::{
+    Filesystem, Gateway, GatewayConfig, LocalGateway, SshGateway, parse_gateway_url,
+};
 
 use crate::pytypes::{PyTaskInfo, identifier_from_pyobj};
 
@@ -181,20 +183,45 @@ fn pytaskinfo_from_mark(
     Ok(PyTaskInfo::from(&task))
 }
 
+/// Run the walker against a backend chosen by `gateway_config`. The
+/// gateway is connected for the duration of the walk and disconnected
+/// afterwards on either success or failure.
+async fn walk_with<F: Filesystem + Gateway>(
+    mut gw: F,
+    root: &str,
+    bridge: &mut PyVisitorBridge,
+) -> Result<Vec<dynrunner_discovery::Marked<Py<PyAny>>>, WalkError<PyErr>> {
+    gw.connect()
+        .await
+        .map_err(|e| WalkError::Fs(dynrunner_gateway::FsError::Other(format!("{e}"))))?;
+    let result = walk(&gw, root, bridge).await;
+    let _ = gw.disconnect().await;
+    result
+}
+
 /// Drive a Rust filesystem walk through the visit() method on
 /// `task_definition`, returning a list of populated `PyTaskInfo`s.
 ///
-/// `root` is interpreted relative to the chosen backend. Currently only
-/// the local filesystem is supported; the SSH backend lands when the
-/// CLI flag wiring does.
+/// `root` is interpreted relative to the chosen backend. The backend is
+/// selected by `gateway_url`:
+///   - `None` or `"local"` — `LocalGateway`
+///   - `"ssh://[user@]host[:port]"` — `SshGateway`
+///
+/// `relative_path` in each returned TaskInfo is relative to `root`.
 #[pyfunction]
-#[pyo3(signature = (task_definition, root))]
+#[pyo3(signature = (task_definition, root, gateway_url=None))]
 pub(crate) fn find_items<'py>(
     py: Python<'py>,
     task_definition: &Bound<'py, PyAny>,
     root: &str,
+    gateway_url: Option<&str>,
 ) -> PyResult<Bound<'py, PyList>> {
     let visit_method = task_definition.getattr("visit")?.unbind();
+
+    let gateway_config = match gateway_url {
+        None => GatewayConfig::Local,
+        Some(url) => parse_gateway_url(url).map_err(pyo3::exceptions::PyValueError::new_err)?,
+    };
 
     let root_owned = root.to_owned();
     let marked = py.detach(|| -> Result<_, WalkError<PyErr>> {
@@ -207,14 +234,15 @@ pub(crate) fn find_items<'py>(
                 )))
             })?;
         rt.block_on(async {
-            let mut gw = LocalGateway::new();
-            gw.connect().await.map_err(|e| {
-                WalkError::Fs(dynrunner_gateway::FsError::Other(format!("{e}")))
-            })?;
             let mut bridge = PyVisitorBridge { visit_method };
-            let r = walk(&gw, &root_owned, &mut bridge).await;
-            let _ = gw.disconnect().await;
-            r
+            match gateway_config {
+                GatewayConfig::Local => {
+                    walk_with(LocalGateway::new(), &root_owned, &mut bridge).await
+                }
+                GatewayConfig::Ssh(cfg) => {
+                    walk_with(SshGateway::new(cfg), &root_owned, &mut bridge).await
+                }
+            }
         })
     })
     .map_err(|e| match e {
