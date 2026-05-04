@@ -207,7 +207,9 @@ def run_slurm_pipeline(
         )
         log.info(f"SLURM jobs submitted; run_id={prep_result.run_id}")
 
-        _drive_rust_primary(task, args, prep_result, primary_quic_port, binaries, log)
+        _drive_rust_primary(
+            task, args, prep_result, primary_quic_port, binaries, slurm_config, log
+        )
     finally:
         preparation.cleanup()
         subprocess.run(
@@ -223,6 +225,7 @@ def _drive_rust_primary(
     prep_result,
     primary_quic_port: int,
     binaries: list,
+    slurm_config: SlurmConfig,
     log: logging.Logger,
 ) -> None:
     """Hand the run over to the Rust primary coordinator.
