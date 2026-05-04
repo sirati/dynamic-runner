@@ -126,6 +126,7 @@ impl PyDistributedManager {
         let dist_connect_timeout = self.distributed_config.connect_timeout();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
+        let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let worker_spec = self.worker_spec.clone();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
@@ -278,7 +279,7 @@ impl PyDistributedManager {
                     source_pre_staged_root: None,
                     uses_file_based_items,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
-                    retry_max_passes: 1,
+                    retry_max_passes: dist_retry_max_passes,
                 };
 
                 let mut primary = PrimaryCoordinator::new(

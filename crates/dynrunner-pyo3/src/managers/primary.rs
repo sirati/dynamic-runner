@@ -210,6 +210,7 @@ impl PyPrimaryCoordinator {
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
+        let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let uses_file_based_items = self.uses_file_based_items;
@@ -308,7 +309,7 @@ impl PyPrimaryCoordinator {
                     source_pre_staged_root,
                     uses_file_based_items,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
-                    retry_max_passes: 1,
+                    retry_max_passes: dist_retry_max_passes,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =

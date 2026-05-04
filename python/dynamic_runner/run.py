@@ -251,7 +251,15 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     logger.info(f"Workers per secondary: {workers_per_secondary}")
     logger.info(f"RAM per secondary: {ram_per_secondary / (1024**3):.2f}GB")
 
-    primary_cfg = _rs.PrimaryConfig(num_secondaries=num_secondaries)
+    distributed_config = None
+    if getattr(args, "retry_max_passes", None) is not None:
+        distributed_config = _rs.DistributedConfig(
+            retry_max_passes=args.retry_max_passes,
+        )
+    primary_cfg = _rs.PrimaryConfig(
+        num_secondaries=num_secondaries,
+        distributed_config=distributed_config,
+    )
     secondary_template = _rs.SecondaryConfig(
         secondary_id="<template>",
         num_workers=workers_per_secondary,
@@ -286,7 +294,15 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
 
     spawn_secondary = build_subprocess_spawn(deployment, args)
 
-    primary_cfg = _rs.PrimaryConfig(num_secondaries=num_secondaries)
+    distributed_config = None
+    if getattr(args, "retry_max_passes", None) is not None:
+        distributed_config = _rs.DistributedConfig(
+            retry_max_passes=args.retry_max_passes,
+        )
+    primary_cfg = _rs.PrimaryConfig(
+        num_secondaries=num_secondaries,
+        distributed_config=distributed_config,
+    )
     result = _rs.run_primary(primary_cfg, task, spawn_secondary, binaries)
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")

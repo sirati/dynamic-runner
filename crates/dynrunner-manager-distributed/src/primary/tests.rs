@@ -462,6 +462,108 @@ async fn recoverable_failure_twice_becomes_permanent() {
     }).await;
 }
 
+/// `retry_max_passes = 0` disables the retry loop entirely: a task
+/// that fails Recoverable in the main pass becomes permanently failed
+/// without a second attempt. Pins the budget knob's lower bound so
+/// consumers that opt into "fail-fast" behaviour (e.g. CI smoke runs
+/// where a single Recoverable signals a real bug rather than a flake)
+/// get the contract they ask for.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_max_passes_zero_disables_retry() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 0,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_binary("doomed", 50)];
+
+        let (id, rx, tx) = secondary_ends.remove(0);
+        // Mirror the structure of `recoverable_failure_twice_becomes_permanent`:
+        // fail every attempt with Recoverable. With retry_max_passes=0
+        // the for-loop in run_retry_passes never iterates, so the
+        // single main-pass failure is final.
+        tokio::task::spawn_local(async move {
+            let mut rx = rx;
+            tx.send(DistributedMessage::SecondaryWelcome {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 1024 * 1024 * 1024,
+                }],
+                worker_count: 1,
+                hostname: "test".into(),
+            }).unwrap();
+            tx.send(DistributedMessage::CertExchange {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: "FAKE".into(),
+                ipv4_address: Some("127.0.0.1".into()),
+                ipv6_address: None,
+                quic_port: 5000,
+            }).unwrap();
+            while let Some(msg) = rx.recv().await {
+                let hash_opt = match &msg {
+                    DistributedMessage::InitialAssignment { zip_files, .. } => zip_files
+                        .first()
+                        .and_then(|z| z.binaries.first())
+                        .map(|e| e.hash.clone()),
+                    DistributedMessage::TaskAssignment { file_hash, .. } => {
+                        Some(file_hash.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(h) = hash_opt {
+                    tx.send(DistributedMessage::TaskFailed {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        task_hash: h,
+                        error_type: "Recoverable".into(),
+                        error_message: "always fails".into(),
+                    }).unwrap();
+                    tx.send(DistributedMessage::TaskRequest {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: 1024 * 1024 * 1024,
+                        }],
+                    }).unwrap();
+                }
+            }
+        });
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // Main pass fails once; retry loop is skipped entirely
+        // because budget is 0 → permanent failure with no retry.
+        assert_eq!(primary.completed_count(), 0);
+        assert_eq!(primary.failed_count(), 1);
+    }).await;
+}
+
 
 // ── End-to-end tests: real Primary + real Secondary with workers ──
 

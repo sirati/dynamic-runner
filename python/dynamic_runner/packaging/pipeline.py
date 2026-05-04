@@ -280,11 +280,16 @@ def _drive_rust_primary(
     # every secondary before the coordinator's run-loop starts assigning
     # work. The coordinator flushes these notifications once secondary
     # connections are established and before TaskAssignment dispatch.
+    distributed_config = None
+    if getattr(args, "retry_max_passes", None) is not None:
+        distributed_config = _rs.DistributedConfig(
+            retry_max_passes=args.retry_max_passes,
+        )
     coord = _rs.RustPrimaryCoordinator(
         prep_result.num_secondaries,
         task,
         _slurm_already_spawned,
-        distributed_config=None,
+        distributed_config=distributed_config,
         listen_port=primary_quic_port,
         source_pre_staged_root=(
             slurm_config.get_srcbins_mount_source()

@@ -172,6 +172,18 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--retry-max-passes",
+        type=int,
+        default=None,
+        help=(
+            "Number of retry passes after the main operational loop drains. "
+            "Default 1: tasks that fail Recoverable in the main pass get one "
+            "more attempt in a retry pass; tasks that fail twice are permanent. "
+            "Set 0 to disable retry (Recoverable failures become terminal "
+            "immediately)."
+        ),
+    )
+    parser.add_argument(
         "--slurm-image-subfolder",
         type=str,
         default="image_bin",
