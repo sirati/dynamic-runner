@@ -74,87 +74,79 @@ where
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
     /// Dispatches any initial task assignments to local workers.
     ///
-    /// Sends keepalives to the primary on the same interval used by
-    /// `process_tasks` so the primary's heartbeat-monitor sees fresh
-    /// `last_seen` while this secondary is busy doing peer dials. Peer
-    /// connect-to-peers can take 10s × num_peers in the worst case
-    /// (QUIC timeout cascade); without an in-loop keepalive the
-    /// primary's `keepalive_miss_threshold * keepalive_interval`
-    /// budget elapses before any keepalive ever fires from
-    /// `process_tasks`, and the primary kills the secondary as
-    /// "missed keepalives" before it's even fully connected. The
-    /// keepalive payload's `active_workers=0` is honest here — no
-    /// task is dispatched until peer-setup completes.
+    /// Plain serial recv loop. The earlier 1cb8cb8 version wrapped this
+    /// in a `tokio::select!` that ALSO drove a keepalive_interval ticker
+    /// — to keep the primary's heartbeat-monitor seeing fresh
+    /// `last_seen` during the multi-second peer-dial cascade in
+    /// `connect_to_peers`. After c9a7808 made `connect_to_peers`
+    /// non-blocking (per-peer dials run as `spawn_local` tasks),
+    /// `wait_for_setup` itself completes in <50ms in normal cases —
+    /// well inside any reasonable
+    /// `keepalive_miss_threshold * keepalive_interval` budget — and
+    /// the in-loop keepalive is no longer load-bearing. Worse, the
+    /// select! shape introduced cancellation hazards: when the tick
+    /// arm fired between iterations it cancelled an in-flight
+    /// `primary_transport.recv()` future, and partially-decoded
+    /// inbound messages could be lost depending on the transport
+    /// impl's cancellation safety. Reverting to the simple await
+    /// removes that hazard. If a future change reintroduces blocking
+    /// inside this function, prefer spawning a separate keepalive-
+    /// emitter task over racing the recv with select.
     pub(super) async fn wait_for_setup(&mut self) -> Result<(), String> {
         tracing::debug!("waiting for setup messages from primary");
 
         let mut got_peer_info = false;
         let mut got_assignment = false;
         let mut got_transfer = false;
-        let mut keepalive_interval =
-            tokio::time::interval(self.config.keepalive_interval);
 
         while !got_peer_info || !got_assignment || !got_transfer {
-            tokio::select! {
-                received = self.primary_transport.recv() => {
-                    let msg = match received {
-                        Some(m) => m,
-                        None => return Err("primary disconnected during setup".into()),
-                    };
-                    match msg.msg_type() {
-                        MessageType::PeerInfo => {
-                            got_peer_info = true;
-                            if let DistributedMessage::PeerInfo { peers, .. } = &msg {
-                                let peer_count = peers
-                                    .iter()
-                                    .filter(|p| p.secondary_id != self.config.secondary_id)
-                                    .count();
-                                tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
-                                // Non-blocking: spawns per-peer dial tasks
-                                // and returns immediately so the surrounding
-                                // select can keep ticking keepalives.
-                                // Successful dials register through the same
-                                // channel the accept loop uses; unreachable
-                                // peers fail silently in the background and
-                                // never block the secondary's primary-link.
-                                self.peer_transport.connect_to_peers(peers).await;
-                            }
+            match self.primary_transport.recv().await {
+                Some(msg) => match msg.msg_type() {
+                    MessageType::PeerInfo => {
+                        got_peer_info = true;
+                        if let DistributedMessage::PeerInfo { peers, .. } = &msg {
+                            let peer_count = peers
+                                .iter()
+                                .filter(|p| p.secondary_id != self.config.secondary_id)
+                                .count();
+                            tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
+                            // Non-blocking: per-peer dials run as
+                            // spawn_local tasks; returns immediately.
+                            self.peer_transport.connect_to_peers(peers).await;
                         }
-                        MessageType::InitialAssignment => {
-                            got_assignment = true;
-                            if let DistributedMessage::InitialAssignment {
+                    }
+                    MessageType::InitialAssignment => {
+                        got_assignment = true;
+                        if let DistributedMessage::InitialAssignment {
+                            zip_files,
+                            workers_ready,
+                            staged_files,
+                            pre_staged_mode,
+                            uses_file_based_items,
+                            ..
+                        } = msg
+                        {
+                            self.set_pre_staged_mode(pre_staged_mode);
+                            self.set_uses_file_based_items(uses_file_based_items);
+                            self.handle_initial_assignment(
                                 zip_files,
                                 workers_ready,
                                 staged_files,
-                                pre_staged_mode,
-                                uses_file_based_items,
-                                ..
-                            } = msg
-                            {
-                                self.set_pre_staged_mode(pre_staged_mode);
-                                self.set_uses_file_based_items(uses_file_based_items);
-                                self.handle_initial_assignment(
-                                    zip_files,
-                                    workers_ready,
-                                    staged_files,
-                                )
-                                .await;
-                            }
-                            tracing::debug!("received initial assignment");
+                            )
+                            .await;
                         }
-                        MessageType::TransferComplete => {
-                            got_transfer = true;
-                            self.transfer_complete = true;
-                            tracing::debug!("received transfer complete");
-                        }
-                        other => {
-                            tracing::debug!(?other, "unexpected message during setup");
-                        }
+                        tracing::debug!("received initial assignment");
                     }
-                }
-                _ = keepalive_interval.tick() => {
-                    self.send_keepalive().await;
-                }
+                    MessageType::TransferComplete => {
+                        got_transfer = true;
+                        self.transfer_complete = true;
+                        tracing::debug!("received transfer complete");
+                    }
+                    other => {
+                        tracing::debug!(?other, "unexpected message during setup");
+                    }
+                },
+                None => return Err("primary disconnected during setup".into()),
             }
         }
 
