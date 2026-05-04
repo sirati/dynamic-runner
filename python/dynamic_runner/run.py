@@ -12,8 +12,6 @@ import sys
 from pathlib import Path
 
 from ._shared import (
-    format_binary_info,
-    normalize_opt_levels,
     print_selection_summary,
     process_selection_arguments,
 )
@@ -88,20 +86,19 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     """Discover items via the task's `discover_items` and apply the
     framework-level overlay `--list-files`.
 
-    Item discovery — including `--skip-existing` filtering — is the
-    task's concern. The framework provides primitives (gateway-aware
-    `_native.find_items`, deployment-correct `args.resolved_output_root`)
-    so a task can compose source-walk + output-walk + filter inside
-    its own `discover_items`, with the same code path whether outputs
-    land locally or on a cluster filesystem.
+    Item discovery — including any corpus-shape filters and any
+    `--skip-existing`-style policy — is the task's concern. The
+    framework provides primitives (gateway-aware `_native.find_items`,
+    deployment-correct `args.resolved_output_root`) so a task can
+    compose source-walk + output-walk + filter inside its own
+    `discover_items`. The framework's `--list-files` overlay just
+    prints the items the task discovered; consumers wanting richer
+    formatting can implement `__str__` on their TaskInfo subclass or
+    print from inside `discover_items` directly.
     """
     logger = logging.getLogger()
 
-    display_opt_levels = None
-    if config.opt_levels:
-        normalized = normalize_opt_levels(config.opt_levels, config.opt_regex)
-        display_opt_levels = normalized.display_values
-    print_selection_summary(config, display_opt_levels)
+    print_selection_summary(config)
 
     args.resolved_output_root = str(config.output_dir)
 
@@ -115,7 +112,7 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     if config.list_files:
         logger.info("\nDiscovered items:")
         for binary in binaries:
-            logger.info(format_binary_info(binary, config.source_dir))
+            logger.info(f"  {binary.path}")
         return []
 
     return binaries

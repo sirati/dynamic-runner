@@ -52,8 +52,7 @@ pytest.importorskip(
 )
 
 import dynamic_runner as _rs  # noqa: E402
-from dynamic_runner._shared import TaskInfo  # noqa: E402
-from dynamic_runner._shared.binary_info import BinaryIdentifier  # noqa: E402
+from dynamic_runner._shared import BinaryIdentifier, TaskInfo  # noqa: E402
 from dynamic_runner.task_protocol import PhaseSpec, TaskTypeSpec  # noqa: E402
 from dynamic_runner.tests._phases_worker import NONE_AFFINITY, PATH_SEP  # noqa: E402
 

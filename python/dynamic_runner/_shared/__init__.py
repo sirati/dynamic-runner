@@ -1,29 +1,24 @@
-"""Shared utilities for binary selection and directory traversal.
+"""Framework-generic shared utilities.
 
-This package contains reusable code for:
-- Parsing binary filenames according to format templates
-- Traversing directories to find matching binaries
-- Filtering binaries based on platform, compiler, version, and optimization level
+The asm-binary specific filename parsing + selection-filter helpers
+that used to live here have been moved out of the framework into
+consumer packages (asm-tokenizer / asm-dataset-nix). The framework
+intentionally owns no opinion on filename formats, platform/compiler
+allowlists, or any other corpus-shape concern — those are task
+responsibilities, surfaced through `TaskDefinition.add_task_arguments`
++ `discover_items`.
+
+What stays here:
+- `TaskInfo` (and the still-coupled `BinaryIdentifier` — decoupling
+  TaskInfo's identifier into a fully generic slot is a separate
+  refactor)
+- `format_size` (plain byte-count formatter; generic)
+- `--source`/`--output`/`--list-files` argparse + path validation
+  (the framework's universal entry-point flags)
+- CSV stdlib `field_size_limit` bump (`csv_helper`)
+- Logging handlers (`logging_utils`)
 """
 
-from .binary_info import (
-    BinaryFilenameFormat,
-    BinaryIdentifier,
-    TaskInfo,
-    FieldRegexes,
-    build_binary_filename_format,
-    build_field_regexes,
-    format_binary_info,
-    format_size,
-    parse_binary_filename,
-)
-from .binary_selector import (
-    SelectionFilters,
-    compile_selection_filters,
-    find_matching_binaries,
-    is_excluded_subfolder,
-    match_filename,
-)
 from .csv_helper import increase_csv_field_size_limit
 from .logging_utils import (
     WarningCounterHandler,
@@ -32,38 +27,28 @@ from .logging_utils import (
     setup_logger,
 )
 from .selection_args import (
-    NormalizedOptLevels,
     SelectionConfig,
     add_selection_arguments,
-    normalize_opt_levels,
     print_selection_summary,
     process_selection_arguments,
+)
+from .task_info import (
+    BinaryIdentifier,
+    TaskInfo,
+    format_size,
 )
 
 __all__ = [
     "TaskInfo",
     "BinaryIdentifier",
-    "BinaryFilenameFormat",
-    "FieldRegexes",
-    "build_binary_filename_format",
-    "build_field_regexes",
-    "format_binary_info",
     "format_size",
-    "parse_binary_filename",
-    "find_matching_binaries",
-    "SelectionFilters",
-    "compile_selection_filters",
-    "match_filename",
-    "is_excluded_subfolder",
     "increase_csv_field_size_limit",
     "SelectionConfig",
-    "NormalizedOptLevels",
     "add_selection_arguments",
     "process_selection_arguments",
-    "normalize_opt_levels",
+    "print_selection_summary",
     "WarningCounterHandler",
     "remove_stream_handlers",
     "setup_file_logger",
     "setup_logger",
-    "print_selection_summary",
 ]
