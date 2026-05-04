@@ -65,7 +65,7 @@ impl PyPrimaryCoordinator {
         distributed_config: Option<DistributedConfig>,
         listen_port: Option<u16>,
     ) -> PyResult<Self> {
-        let topology = LoadedTopology::from_python(py, task_definition)?;
+        let topology = LoadedTopology::from_python(task_definition)?;
 
         Ok(Self {
             num_secondaries,

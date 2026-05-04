@@ -105,10 +105,7 @@ pub(crate) struct LoadedTopology {
 }
 
 impl LoadedTopology {
-    pub(crate) fn from_python(
-        py: Python<'_>,
-        task_definition: &Bound<'_, PyAny>,
-    ) -> PyResult<Self> {
+    pub(crate) fn from_python(task_definition: &Bound<'_, PyAny>) -> PyResult<Self> {
         let phases_obj = task_definition.call_method0("get_phases")?;
         let phases_iter: Vec<Bound<'_, PyAny>> = phases_obj.extract()?;
 
@@ -160,7 +157,7 @@ impl LoadedTopology {
         }
 
         let estimator =
-            PyMemoryEstimatorBridge::from_python(py, task_definition, &estimator_specs)?;
+            PyMemoryEstimatorBridge::from_python(task_definition, &estimator_specs)?;
 
         Ok(Self {
             estimator,
@@ -193,7 +190,7 @@ impl LoadedTaskDefinition {
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
-        let topology = LoadedTopology::from_python(py, task_definition)?;
+        let topology = LoadedTopology::from_python(task_definition)?;
 
         let source_path = PathBuf::from(source_dir);
         let output_path = PathBuf::from(output_dir);
