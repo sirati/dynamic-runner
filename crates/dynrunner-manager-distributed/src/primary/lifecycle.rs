@@ -128,10 +128,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     // ── Phase 8: Send full task list ──
 
     pub(super) async fn send_full_task_list(&mut self) -> Result<(), String> {
-        let slurm_id = match &self.slurm_primary_id {
-            Some(id) => id.clone(),
-            None => return Ok(()),
-        };
+        // Bail out if no SLURM-primary was promoted (Phase 7 no-op
+        // when there are no secondaries yet). Every secondary still
+        // gets the broadcast below — promotion just controls who
+        // gets the pre-designated routing pointer (`slurm_primary_id`).
+        if self.slurm_primary_id.is_none() {
+            return Ok(());
+        }
 
         let all_tasks: Vec<TaskListEntry<I>> = self
             .all_binaries
@@ -180,7 +183,30 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // primary and dependent phases dispatch out of order.
             phase_deps: self.phase_deps.clone(),
         };
-        self.transport.send_to(&slurm_id, msg).await?;
+        // Broadcast to every secondary, not just the pre-designated
+        // SLURM-primary: F2 election picks a secondary on local-death
+        // and that pick may not be the same node `promote_slurm_primary`
+        // picked (the latter uses HashMap iteration order; the former
+        // uses lowest-id-wins). Every secondary needs the cached task
+        // list so any election outcome is survivable. Single-cast
+        // would mean the user-stated invariant — "local can disconnect
+        // once everything is transmitted, and the rest continues" —
+        // only held for `--jobs 1`; broadcasting closes that gap.
+        // SecondaryTransport doesn't have a broadcast primitive, so
+        // we fan out via send_to in a loop. Failures on individual
+        // secondaries are logged and continue — losing the cache on
+        // one secondary just means F2 won't pick that one to promote.
+        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
+        for secondary_id in &secondary_ids {
+            if let Err(e) = self.transport.send_to(secondary_id, msg.clone()).await {
+                tracing::warn!(
+                    secondary = %secondary_id,
+                    error = %e,
+                    "failed to broadcast FullTaskList; that secondary won't be a viable failover target"
+                );
+            }
+        }
+        let slurm_id = self.slurm_primary_id.clone().unwrap();
 
         tracing::info!(
             slurm_primary = %slurm_id,
