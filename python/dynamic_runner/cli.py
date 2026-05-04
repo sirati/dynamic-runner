@@ -153,6 +153,15 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--slurm-partition",
+        type=str,
+        default=None,
+        help=(
+            "SLURM partition to submit jobs against (sbatch --partition). "
+            "Defaults to the SlurmConfig.partition value ('All') when unset."
+        ),
+    )
+    parser.add_argument(
         "--slurm-image-subfolder",
         type=str,
         default="image_bin",

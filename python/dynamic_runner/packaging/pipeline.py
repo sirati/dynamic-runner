@@ -81,6 +81,8 @@ def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig
     overrides: dict[str, object] = {}
     if getattr(args, "slurm_time_limit", None):
         overrides["time_limit"] = args.slurm_time_limit
+    if getattr(args, "slurm_partition", None):
+        overrides["partition"] = args.slurm_partition
     if getattr(args, "source_already_staged", None):
         overrides["prestaged_src_bins_path"] = args.source_already_staged
     return SlurmConfig(
