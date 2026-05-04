@@ -48,29 +48,46 @@ where
         // bucket-internal insertion order, and SLURM-primary dispatch
         // is first-fit-by-memory which benefits from biggest-first
         // packing (same heuristic as the legacy Vec-based path).
-        let mut items: Vec<TaskInfo<I>> = all_tasks
+        // Filter first (immutable self borrow), then resolve in a
+        // separate pass (mutable self borrow via the helper). Doing
+        // both inside one iterator chain trips E0500 because
+        // `resolve_for_dispatch` needs &mut self while the filter
+        // closure still borrows self immutably.
+        let kept: Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>> = all_tasks
             .into_iter()
             .filter(|task| {
                 !completed.contains(&task.hash)
                     && !self.completed_tasks.contains(&task.hash)
                     && !self.active_tasks.contains_key(&task.hash)
             })
-            .map(|task| {
-                let path = task.file_path.as_deref().unwrap_or(&task.local_path);
-                let resolved = self
-                    .extraction_cache
-                    .resolve_binary(None, path, &task.hash);
-                let binary_path = resolved
-                    .unwrap_or_else(|| std::path::PathBuf::from(path));
-
-                // Hydrate phase/type/affinity/payload from the wire.
-                // Single source of truth for wire→TaskInfo lives in
-                // `DistributedBinaryInfo::to_task_info` (Phase 4B).
-                let mut binary = task.binary_info.to_task_info();
-                binary.path = binary_path;
-                binary
-            })
             .collect();
+        let mut items: Vec<TaskInfo<I>> = Vec::with_capacity(kept.len());
+        for task in kept {
+            // Resolve via the three-mode helper (FR-2 opaque /
+            // pre_staged / default). Use `task.local_path` (the
+            // wire-relative form the primary stripped via
+            // wire_local_path) — that's the form the resolver
+            // expects in pre-staged mode. Falling back to
+            // `task.file_path` (the primary's full view path) when
+            // local_path is empty preserves the historical path for
+            // normal mode where they're identical.
+            let resolution_path = if !task.local_path.is_empty() {
+                task.local_path.clone()
+            } else {
+                task.file_path.clone().unwrap_or_default()
+            };
+            let resolved =
+                self.resolve_for_dispatch(None, &resolution_path, &task.hash);
+            let binary_path = resolved
+                .unwrap_or_else(|| std::path::PathBuf::from(&resolution_path));
+
+            // Hydrate phase/type/affinity/payload from the wire.
+            // Single source of truth for wire→TaskInfo lives in
+            // `DistributedBinaryInfo::to_task_info` (Phase 4B).
+            let mut binary = task.binary_info.to_task_info();
+            binary.path = binary_path;
+            items.push(binary);
+        }
         items.sort_by_key(|i| std::cmp::Reverse(i.size));
 
         // Phase set = union of (declared phases via deps map) and
@@ -222,15 +239,43 @@ where
                 .insert(file_hash.clone(), dispatched_phase);
 
             if requesting_secondary_id == self.config.secondary_id {
-                // Assign directly to local worker (avoid recursive dispatch_message cycle)
-                let resolved = self
-                    .extraction_cache
-                    .resolve_binary(None, &binary.path.to_string_lossy(), &file_hash);
+                // Assign directly to local worker (avoid recursive
+                // dispatch_message cycle). Route through the
+                // three-mode helper so pre-staged + uses-not-file-
+                // based modes don't bypass the resolver and ship
+                // unresolvable paths to the worker.
+                //
+                // Resolution-miss policy mirrors the historical
+                // SLURM-primary self-assign behaviour: in
+                // file-based + non-pre-staged mode the absolute
+                // path is the worker's filesystem view (in-process
+                // SLURM secondaries share the gateway's FS), so a
+                // None resolution falls through to passthrough. In
+                // pre-staged mode the absolute path is the
+                // gateway-host view that the container can't see;
+                // None there is a configuration error worth failing
+                // loudly to avoid the misleading worker-level
+                // "Not a valid binary file" buried in angr / ghidra.
+                let resolution_path = binary.path.to_string_lossy().into_owned();
+                let resolved =
+                    self.resolve_for_dispatch(None, &resolution_path, &file_hash);
                 let actual_binary = match resolved {
                     Some(path) => {
                         let mut b = binary.clone();
                         b.path = path;
                         b
+                    }
+                    None if self.pre_staged_mode() => {
+                        tracing::error!(
+                            worker_id,
+                            file_hash = %file_hash,
+                            path = %resolution_path,
+                            "SLURM-primary self-assign in pre-staged mode: \
+                             binary path unresolvable via src_network; \
+                             dropping (likely pre-staged mode misconfiguration \
+                             or stale wire path)"
+                        );
+                        return Ok(());
                     }
                     None => binary.clone(),
                 };

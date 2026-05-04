@@ -258,6 +258,44 @@ where
         self.uses_file_based_items = on;
     }
 
+    /// Single source of truth for "given the wire's `local_path`,
+    /// what's the on-disk path the worker should open?"
+    ///
+    /// Three modes, picked off `uses_file_based_items` +
+    /// `pre_staged_mode`:
+    ///   - `!uses_file_based_items` (FR-2): items aren't files; the
+    ///     wire's `local_path` is an opaque worker identifier;
+    ///     framework does no IO on it.
+    ///   - `pre_staged_mode`: bind-mount under `src_network` is
+    ///     authoritative; `src_network.join(local_path).exists()`
+    ///     yields the on-disk path. No hash verification (no
+    ///     network transfer to dedup; the bind-mount IS the
+    ///     contract).
+    ///   - default: extraction-cache lookup with content-hash
+    ///     verification (the historical path).
+    ///
+    /// Used by every dispatch + assignment site on the secondary
+    /// (operational TaskAssignment in `dispatch.rs`, initial-batch
+    /// in `setup.rs`, SLURM-primary self-assign + repopulate in
+    /// `slurm.rs`). Centralising here means a future fourth mode
+    /// — or a fix to one of the existing three — only changes one
+    /// place.
+    pub(super) fn resolve_for_dispatch(
+        &mut self,
+        zip_ref: Option<&str>,
+        local_path: &str,
+        file_hash: &str,
+    ) -> Option<std::path::PathBuf> {
+        if !self.uses_file_based_items {
+            Some(std::path::PathBuf::from(local_path))
+        } else if self.pre_staged_mode {
+            self.extraction_cache.resolve_pre_staged(local_path)
+        } else {
+            self.extraction_cache
+                .resolve_binary(zip_ref, local_path, file_hash)
+        }
+    }
+
     /// Set certificate info for peer connections. Must be called before `run()`
     /// if peer-to-peer QUIC is enabled.
     pub fn set_peer_cert_info(&mut self, info: PeerCertInfo) {

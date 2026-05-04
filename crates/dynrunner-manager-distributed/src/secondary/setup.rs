@@ -185,16 +185,8 @@ where
             } else {
                 Some(zip_name.as_str())
             };
-            let resolved_path = if !self.uses_file_based_items() {
-                // Items aren't files — pass `local_path` to the
-                // worker as an opaque identifier, no resolution.
-                Some(std::path::PathBuf::from(&local_path))
-            } else if self.pre_staged_mode() {
-                self.extraction_cache.resolve_pre_staged(&local_path)
-            } else {
-                self.extraction_cache
-                    .resolve_binary(zip_ref, &local_path, &hash)
-            };
+            let resolved_path =
+                self.resolve_for_dispatch(zip_ref, &local_path, &hash);
 
             // Same fail-loud guard as the operational dispatch path
             // (see `dispatch::report_unresolvable_task`). Without
