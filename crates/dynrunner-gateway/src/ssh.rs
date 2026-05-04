@@ -391,11 +391,14 @@ impl Filesystem for SshGateway {
         let quoted = shell_quote(&expanded);
 
         // -L follows symlinks for stat: %y reports the target's kind.
+        // It's a global option and MUST appear before the path (POSIX +
+        // GNU) — placed after the path it parses as a predicate and
+        // find exits 1 with "unknown predicate `-L'".
         // %P is the path relative to the find root, which with maxdepth=1
         // is just the entry's basename. \0 separator survives names with
         // newlines/tabs.
         let cmd = format!(
-            "find {quoted} -mindepth 1 -maxdepth 1 -L -printf '%y\\t%s\\t%P\\0'"
+            "find -L {quoted} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%P\\0'"
         );
         let result = self
             .ssh_command(&cmd, None)
