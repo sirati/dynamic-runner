@@ -22,7 +22,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from .._shared import process_selection_arguments
+from .._shared import filter_existing_outputs_remote, process_selection_arguments
 
 from ..deployment_spec import TaskDeploymentSpec
 from .gateway import create_gateway, parse_gateway_url
@@ -194,6 +194,28 @@ def run_slurm_pipeline(
         use_reverse_connection=use_reverse_connection,
         run_id=run_id,
     )
+
+    # `--skip-existing` honoured in SLURM dispatch by inspecting the
+    # gateway's output tree instead of the local cache. Outputs land on
+    # cluster NFS (bind-mounted into the container at /app/out-network)
+    # whether or not the source is pre-staged, so the local check used
+    # by `run.py` would always say "nothing exists" and re-queue every
+    # task. One ssh `find` builds the existence set; per-binary
+    # membership tests after that are in-process.
+    if (
+        binaries
+        and getattr(args, "skip_existing", False)
+        and getattr(task, "uses_file_based_items", True)
+    ):
+        binaries, skipped = filter_existing_outputs_remote(
+            binaries,
+            sel_result.source_dir,
+            gateway,
+            str(slurm_config.get_output_dir()),
+            task.get_output_filename_pattern,
+        )
+        log.info(f"Skipped {skipped} items with existing outputs on gateway")
+        log.info(f"Remaining items to process: {len(binaries)}")
 
     try:
         prep_result = asyncio.run(
