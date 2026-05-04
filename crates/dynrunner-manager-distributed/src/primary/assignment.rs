@@ -161,7 +161,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             self.transport.send_to(secondary_id, msg).await?;
         }
 
-        // Transition all to Operational
+        // Transition all to Operational. At the same moment, reset
+        // each secondary's keepalive clock so the heartbeat-monitor's
+        // first deadline check after operational-loop start measures
+        // "time since the secondary became operational", not "time
+        // since welcome arrived" (which can include 30+s of
+        // container startup + SSH tunnel + handshake on slow
+        // clusters). Without this reset a secondary whose setup
+        // took longer than `keepalive_miss_threshold *
+        // keepalive_interval` would be falsely declared dead on the
+        // first tick, even though its own keepalive sender (which
+        // only spins up post-`wait_for_setup`) was about to start
+        // ticking.
         for secondary_id in &secondary_ids {
             if let Some(state) = self.secondaries.remove(secondary_id) {
                 let new_state = match state {
@@ -172,6 +183,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 };
                 self.secondaries.insert(secondary_id.clone(), new_state);
             }
+            self.seed_keepalive(secondary_id);
         }
 
         let assigned: usize = assignments_per_secondary.values().map(|v| v.len()).sum();

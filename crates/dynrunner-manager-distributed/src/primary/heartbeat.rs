@@ -53,6 +53,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
     /// Inspect every tracked secondary and decide which ones missed too many
     /// keepalives to still be considered alive.
+    ///
+    /// Only secondaries in the Operational state are subject to the
+    /// heartbeat threshold. Pre-Operational states (Handshaking,
+    /// InitialAssigning) are still finishing setup and the secondary's
+    /// own main loop — which sends keepalives — hasn't started yet
+    /// (see `secondary/processing.rs` where `keepalive_interval.tick()`
+    /// fires only post-`wait_for_setup`). Applying the threshold
+    /// during setup falsely declares a slow-to-handshake secondary
+    /// dead at the operational-loop transition: e.g. a SLURM
+    /// secondary that took 38s for container startup + SSH-tunnel
+    /// + handshake gets dropped immediately on the first heartbeat
+    /// tick, despite being healthy and processing tasks.
     pub(super) fn collect_heartbeat_report(&self) -> SecondaryHeartbeatReport {
         let now = Instant::now();
         let deadline = self
@@ -61,7 +73,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             .saturating_mul(self.config.keepalive_miss_threshold);
         let mut dead = Vec::new();
         for (id, last) in &self.secondary_keepalives {
-            if !self.secondaries.contains_key(id) {
+            let state = match self.secondaries.get(id) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !matches!(
+                state,
+                crate::state::SecondaryConnectionState::Operational(_)
+            ) {
                 continue;
             }
             if now.duration_since(*last) > deadline {
@@ -297,18 +316,22 @@ mod tests {
         );
         install_default_pool(&mut primary);
 
-        // Register the secondary at the connection level — the heartbeat
-        // tracker only flags secondaries it knows about.
-        let conn = SecondaryConnection::new("dead-sec".into()).receive_welcome(
-            1,
-            vec![],
-            "host".into(),
-            0,
-            None,
-        );
+        // Register the secondary at the connection level. Drive
+        // through the full handshake → operational state machine
+        // because the heartbeat-monitor only applies the deadline
+        // to Operational secondaries (pre-Operational means setup
+        // is still in progress; the secondary's own keepalive
+        // sender hasn't started yet, so falsely declaring dead
+        // would drop a healthy node mid-setup).
+        let conn = SecondaryConnection::new("dead-sec".into())
+            .receive_welcome(1, vec![], "host".into(), 0, None)
+            .receive_cert_exchange(String::new(), None, None, 0)
+            .begin_peer_discovery()
+            .peers_ready()
+            .assignments_sent();
         primary.secondaries.insert(
             "dead-sec".into(),
-            SecondaryConnectionState::Handshaking(conn),
+            SecondaryConnectionState::Operational(conn),
         );
         primary.seed_keepalive("dead-sec");
 
