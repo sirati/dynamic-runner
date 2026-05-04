@@ -102,10 +102,20 @@ impl PyPrimaryCoordinator {
     /// lookup.
     ///
     /// Reads each binary file once on the primary side to compute
-    /// `content_hash` (SHA256). Errors out on the first unreadable
-    /// file rather than silently skipping — a broken local
-    /// `--source` is a configuration bug the consumer wants to
-    /// surface immediately, not a partial dispatch.
+    /// `content_hash` (SHA256). Files that can't be hashed (missing,
+    /// permission-denied, or sentinel paths that don't back to a real
+    /// file — e.g. `ssh-debug-00` from a long-lived service task) are
+    /// skipped with a warning and don't get a StageFile pre-populated.
+    /// The task itself still dispatches via the assignment path.
+    ///
+    /// Surfacing the skip at `warn!` rather than failing keeps
+    /// sentinel-style tasks (where the consumer never expected
+    /// staging) working, while making genuine configuration bugs
+    /// (relative paths against the wrong CWD, missing files, etc.)
+    /// visible at the default INFO log level — otherwise the failure
+    /// mode is a confusing downstream "not pre-staged at <path>"
+    /// error from the secondary with no breadcrumb pointing back
+    /// to the primary's silent drop.
     fn queue_initial_staging(
         &mut self,
         binaries: &Bound<'_, pyo3::types::PyList>,
@@ -119,20 +129,18 @@ impl PyPrimaryCoordinator {
                 Err(_) => binary.path.to_string_lossy().into_owned(),
             };
             let file_hash = dynrunner_manager_distributed::compute_task_hash(binary);
-            // Sentinel / probe TaskInfos (paths that don't back to a
-            // real file: e.g. `ssh-debug-00` from a long-lived
-            // service task) have nothing to hash. Skip queuing a
-            // StageFile for those — the secondary's `stage_file`
-            // would have failed "source not found" anyway, and
-            // there's no copy to verify. The task itself still
-            // dispatches via the assignment path; consumers that
-            // need real file staging supply real paths.
             let Some(content_hash) =
                 dynrunner_manager_distributed::compute_file_hash(&binary.path)
             else {
-                tracing::debug!(
+                tracing::warn!(
                     binary = %binary.path.display(),
-                    "queue_initial_staging: no file at path; skipping StageFile (sentinel task)"
+                    type_id = %binary.type_id,
+                    "queue_initial_staging: file unreadable; skipping StageFile pre-population. \
+                     If this is a synthetic/sentinel task that doesn't back to a real file, the \
+                     warning is benign. Otherwise the source path is wrong (typically a relative \
+                     path resolved against the wrong CWD, a path not under --source, or a file \
+                     missing/permission-denied) — the secondary will subsequently error \
+                     'not pre-staged at <path>' for this item.",
                 );
                 continue;
             };
