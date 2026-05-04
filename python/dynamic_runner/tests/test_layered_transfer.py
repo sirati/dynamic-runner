@@ -25,6 +25,7 @@ from dynamic_runner.packaging.layered_transfer import (
     ImageBundle,
     LayerBlob,
     LayeredUploader,
+    MissingBlobsError,
     extract_image,
     upload_image_layered,
 )
@@ -333,3 +334,264 @@ def test_force_reassemble_ignores_marker(tmp_path):
         assert out.exists()
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ── Cache-integrity check (post-upload, pre-reassembly) ─────────────
+
+
+def test_reassembly_succeeds_when_all_blobs_present(tmp_path):
+    """Sanity: with a clean cache where every blob exists at the
+    expected size, the new integrity check is a no-op and the upload
+    completes normally. Guards against the check spuriously rejecting
+    healthy cache state."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta", b"gamma"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+    gw = LocalDirGateway(tmp_path / "remote")
+    stats = upload_image_layered(gw, archive, cache, out, image_label="img")
+    assert stats.reassembled is True
+    assert out.exists()
+    assert (Path(str(out)).parent / f"{out.name}.manifest-id").exists()
+
+
+def test_missing_blob_after_upload_raises_and_skips_marker(tmp_path):
+    """Simulate the production failure mode: a `transfer_file` call
+    that reports success but the blob is not actually on the gateway
+    afterwards (interrupted SSH transfer that the client didn't
+    notice, an `mv` that silently dropped the file, etc.). The
+    integrity check must catch this gap before reassembly proceeds:
+    it must raise MissingBlobsError and must NOT overwrite the marker,
+    leave a stale tarball, or leave a .partial file — those are the
+    exact failure modes that drove this fix.
+
+    Note vs. plan: the plan said "unlink the cached blob, then call
+    upload(force_reassemble=True)". With the upload loop re-running
+    `list_present_blobs` and re-uploading anything missing, an unlink
+    alone would just be re-uploaded silently. To genuinely test the
+    integrity-check boundary, we additionally stub `transfer_file` to
+    a no-op for the second `upload()` so the missing blob is "claimed
+    uploaded" but stays absent. This is a more faithful
+    interrupted-upload simulation than the plan's literal phrasing."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta", b"gamma"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+    gw = LocalDirGateway(tmp_path / "remote")
+    upload_image_layered(gw, archive, cache, out, image_label="img-A")
+
+    marker_path = out.with_name(out.name + ".manifest-id")
+    pre_marker = marker_path.read_text()
+    pre_tar_bytes = out.read_bytes()
+
+    bundle, scratch = (
+        extract_image(archive, tmp_path / "scratch-int"),
+        tmp_path / "scratch-int",
+    )
+    try:
+        # Drop one cached blob so the integrity check's "missing"
+        # branch fires.
+        victim = bundle.layer_blobs[1]
+        cached = cache / "blobs/sha256" / victim.digest
+        assert cached.exists()
+        cached.unlink()
+
+        # Stub `transfer_file` so the upload loop's "re-upload missing"
+        # step does NOT actually replace the blob — mimicking a transfer
+        # that returned without delivering bytes (the production bug).
+        gw.transfer_file = lambda local_path, remote_path: None  # type: ignore[assignment]
+
+        uploader = LayeredUploader(gw, cache)
+        with pytest.raises(MissingBlobsError) as excinfo:
+            uploader.upload(bundle, out, force_reassemble=True)
+        assert victim.digest in excinfo.value.missing
+        assert excinfo.value.mismatched == ()
+
+        # Marker must be untouched — that's the whole point of failing
+        # before _write_remote(marker_remote, manifest_id).
+        assert marker_path.read_text() == pre_marker
+        # No half-written reassembly artifact.
+        partial = out.with_name(out.name + ".partial")
+        assert not partial.exists()
+        # Original tarball bytes preserved (mv to final never ran).
+        assert out.read_bytes() == pre_tar_bytes
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_size_mismatched_blob_is_detected(tmp_path):
+    """A cached blob with the right name but wrong size (e.g. a
+    truncated transfer that was renamed past .partial by an external
+    process) must be flagged as mismatched, not silently accepted."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+    gw = LocalDirGateway(tmp_path / "remote")
+    upload_image_layered(gw, archive, cache, out, image_label="img-B")
+
+    bundle, scratch = (
+        extract_image(archive, tmp_path / "scratch-mm"),
+        tmp_path / "scratch-mm",
+    )
+    try:
+        victim = bundle.layer_blobs[0]
+        cached = cache / "blobs/sha256" / victim.digest
+        # Replace bytes with something of a different length.
+        cached.write_bytes(b"x" * (victim.size + 16))
+
+        uploader = LayeredUploader(gw, cache)
+        with pytest.raises(MissingBlobsError) as excinfo:
+            uploader.upload(bundle, out, force_reassemble=True)
+        assert excinfo.value.missing == ()
+        digests = [d for d, _, _ in excinfo.value.mismatched]
+        assert victim.digest in digests
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_zero_byte_blob_is_detected_as_mismatch(tmp_path):
+    """A truncated-to-zero cache file is the most common interruption
+    artifact. The mismatch tuple must record (digest, expected, 0)."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+    gw = LocalDirGateway(tmp_path / "remote")
+    upload_image_layered(gw, archive, cache, out, image_label="img-Z")
+
+    bundle, scratch = (
+        extract_image(archive, tmp_path / "scratch-z"),
+        tmp_path / "scratch-z",
+    )
+    try:
+        victim = bundle.layer_blobs[0]
+        cached = cache / "blobs/sha256" / victim.digest
+        with cached.open("wb"):
+            pass  # truncate to 0
+        assert cached.stat().st_size == 0
+
+        uploader = LayeredUploader(gw, cache)
+        with pytest.raises(MissingBlobsError) as excinfo:
+            uploader.upload(bundle, out, force_reassemble=True)
+        assert (victim.digest, victim.size, 0) in excinfo.value.mismatched
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_verify_helper_with_mocked_gateway_parses_branches(tmp_path):
+    """Direct unit test of the parser branches in `_verify_blobs_present`,
+    independent of any real cache. Exercises (a) all-OK, (b) one
+    size-mismatch, (c) mixed missing + mismatched, (d) implicit miss
+    (digest absent from the gateway reply). A canned `execute_command`
+    return value isolates the parser from the shell."""
+    from unittest.mock import Mock
+
+    d1 = "1" * 64
+    d2 = "2" * 64
+    d3 = "3" * 64
+
+    def _bundle_for(blob_specs):
+        # blob_specs: list[(digest, size)] — first one is treated as config.
+        cfg_d, cfg_s = blob_specs[0]
+        layer_blobs = tuple(
+            LayerBlob(digest=d, local_path=Path("/dev/null"), size=s, kind="layer")
+            for d, s in blob_specs[1:]
+        )
+        return ImageBundle(
+            image_label="mocked",
+            manifest_json_bytes=b"{}",
+            config_blob=LayerBlob(
+                digest=cfg_d, local_path=Path("/dev/null"), size=cfg_s, kind="config"
+            ),
+            layer_blobs=layer_blobs,
+            extracted_root=tmp_path,
+        )
+
+    # (a) all OK — helper returns None silently.
+    gw = Mock()
+    gw.execute_command.return_value = (
+        0,
+        f"OK {d1} 12\nOK {d2} 34\nOK {d3} 56\n",
+        "",
+    )
+    uploader = LayeredUploader(gw, tmp_path / "cache")
+    bundle = _bundle_for([(d1, 12), (d2, 34), (d3, 56)])
+    assert uploader._verify_blobs_present(bundle) is None
+    assert gw.execute_command.call_count == 1
+
+    # (b) one size-mismatch only.
+    gw = Mock()
+    gw.execute_command.return_value = (
+        0,
+        f"OK {d1} 12\nOK {d2} 99\nOK {d3} 56\n",
+        "",
+    )
+    uploader = LayeredUploader(gw, tmp_path / "cache")
+    bundle = _bundle_for([(d1, 12), (d2, 34), (d3, 56)])
+    with pytest.raises(MissingBlobsError) as excinfo:
+        uploader._verify_blobs_present(bundle)
+    assert excinfo.value.missing == ()
+    assert excinfo.value.mismatched == ((d2, 34, 99),)
+
+    # (c) mixed: one MISS line, one mismatch, one OK.
+    gw = Mock()
+    gw.execute_command.return_value = (
+        0,
+        f"OK {d1} 12\nMISS {d2}\nOK {d3} 60\n",
+        "",
+    )
+    uploader = LayeredUploader(gw, tmp_path / "cache")
+    bundle = _bundle_for([(d1, 12), (d2, 34), (d3, 56)])
+    with pytest.raises(MissingBlobsError) as excinfo:
+        uploader._verify_blobs_present(bundle)
+    assert excinfo.value.missing == (d2,)
+    assert excinfo.value.mismatched == ((d3, 56, 60),)
+
+    # (d) implicit miss (digest absent from output entirely) — defensive
+    # path for a malformed gateway reply.
+    gw = Mock()
+    gw.execute_command.return_value = (0, f"OK {d1} 12\nOK {d3} 56\n", "")
+    uploader = LayeredUploader(gw, tmp_path / "cache")
+    bundle = _bundle_for([(d1, 12), (d2, 34), (d3, 56)])
+    with pytest.raises(MissingBlobsError) as excinfo:
+        uploader._verify_blobs_present(bundle)
+    assert excinfo.value.missing == (d2,)
+
+
+def test_first_upload_after_blob_check_added_calls_stat_once(tmp_path):
+    """Regression guard: the integrity check must batch into ONE
+    `execute_command` call, not one per blob. Per-blob round-trips
+    over SSH are exactly the cost the rest of this module avoids."""
+    archive = tmp_path / "img.tar.gz"
+    _build_synthetic_archive(archive, [b"alpha", b"beta", b"gamma", b"delta"])
+
+    cache = tmp_path / "remote/cache"
+    out = tmp_path / "remote/img.tar.gz"
+
+    # Wrap a real LocalDirGateway and count `for d in ... ; do` commands
+    # specifically — the upload path issues many other shell commands
+    # (mkdir, mv, cat marker, ls, tar, ...) that we don't want to
+    # confuse with the stat batch.
+    gw = LocalDirGateway(tmp_path / "remote")
+    real_exec = gw.execute_command
+    stat_batches: list[str] = []
+
+    def counting_exec(command, cwd=None):
+        # The verify helper's command starts with a `for d in <digests>`
+        # loop and contains `stat -c %s`. That signature is unique to
+        # _verify_blobs_present in this module.
+        if command.lstrip().startswith("for d in") and "stat -c %s" in command:
+            stat_batches.append(command)
+        return real_exec(command, cwd=cwd)
+
+    gw.execute_command = counting_exec  # type: ignore[assignment]
+
+    upload_image_layered(gw, archive, cache, out, image_label="img-once")
+    assert len(stat_batches) == 1, (
+        f"expected exactly one batched stat per upload, saw {len(stat_batches)}"
+    )

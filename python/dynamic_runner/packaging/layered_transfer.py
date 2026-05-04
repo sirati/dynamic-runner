@@ -253,6 +253,48 @@ class UploadStats:
         return 1.0 - (self.blobs_uploaded / self.blobs_total)
 
 
+class MissingBlobsError(RuntimeError):
+    """Cache integrity check failed after blob upload, before reassembly.
+
+    Raised from `LayeredUploader._verify_blobs_present` when one or
+    more blobs the manifest references are absent from the gateway
+    cache, or when their on-cache size does not match the locally
+    measured blob size.
+
+    Failure mode this guards: a previous interrupted upload may have
+    left a `<output>.manifest-id` marker referring to digests that
+    have since been pruned (or were never finished landing). Without
+    this check, `upload()` returns success and the SLURM-side
+    `podman load` later fails with "Found incomplete layer ...
+    pulling from registry", surfacing as an opaque dispatch error.
+    """
+
+    def __init__(
+        self,
+        image_label: str,
+        missing: tuple[str, ...],
+        mismatched: tuple[tuple[str, int, int], ...],
+    ):
+        self.image_label = image_label
+        self.missing = missing
+        self.mismatched = mismatched
+        super().__init__(self._format())
+
+    def _format(self) -> str:
+        parts = []
+        if self.missing:
+            parts.append(f"missing: {', '.join(d[:12] for d in self.missing)}")
+        if self.mismatched:
+            parts.append(
+                "size-mismatch: "
+                + ", ".join(
+                    f"{d[:12]} (expected {e}, got {a})"
+                    for d, e, a in self.mismatched
+                )
+            )
+        return f"[{self.image_label}] cache integrity check failed: " + "; ".join(parts)
+
+
 class LayeredUploader:
     """Pushes a single `ImageBundle` to a gateway as a docker-archive
     tarball at `output_path`, sending only blobs not already present
@@ -409,7 +451,16 @@ class LayeredUploader:
         concurrent prune), the tar command fails and the partial
         output is left under .partial, never promoted to the final
         path. Caller can retry.
+
+        Raises:
+            MissingBlobsError: cache integrity check before reassembly
+                found a blob the bundle references is absent or has a
+                size that disagrees with the local blob. Reassembly is
+                aborted before any `<output>.partial` is created and
+                before any `<output>.manifest-id` marker is written,
+                so a subsequent run will see "no marker" and re-upload.
         """
+        self._verify_blobs_present(bundle)
         scratch = f"{output_path}.reassemble.{os.getpid()}"
         manifest_b64 = base64.b64encode(bundle.manifest_json_bytes).decode("ascii")
         config_target = f"{scratch}/{bundle.config_blob.digest}.json"
@@ -466,6 +517,95 @@ class LayeredUploader:
     def _remote_exists(self, remote_path: str | Path) -> bool:
         rc, _, _ = self.gateway.execute_command(f"test -f {shlex.quote(str(remote_path))}")
         return rc == 0
+
+    def _verify_blobs_present(self, bundle: ImageBundle) -> None:
+        """Confirm every blob the bundle references exists on the
+        gateway with the expected size, in one batched stat command.
+
+        Single concern: integrity check between blob upload and
+        reassembly. Re-using `list_present_blobs` would only catch
+        absence, not size mismatch (a truncated `.partial` left over
+        from a crashed transfer that was later renamed by hand, for
+        example). One round-trip via a printf-loop scales to thousands
+        of blobs without the O(N) SSH cost of per-blob `test -f`.
+
+        Raises:
+            MissingBlobsError: at least one blob is absent or has a
+                cached size differing from `LayerBlob.size`.
+        """
+        blob_dir = self._blob_dir()
+        # POSIX-portable size probe: GNU `stat -c %s` works on Linux
+        # gateways; busybox/macOS BSD differ. We stay on `stat -c %s`
+        # because every realistic gateway here is Linux — but we keep
+        # the unparseable-line branch defensive so any divergence
+        # surfaces as "missing" rather than silently passing.
+        blobs = bundle.all_blobs
+        digest_args = " ".join(shlex.quote(b.digest) for b in blobs)
+        cmd = (
+            f"for d in {digest_args}; do "
+            f"  p={shlex.quote(blob_dir)}/$d; "
+            f'  if [ -f "$p" ]; then '
+            f'    printf \'OK %s %s\\n\' "$d" "$(stat -c %s "$p")"; '
+            f"  else "
+            f'    printf \'MISS %s\\n\' "$d"; '
+            f"  fi; "
+            f"done"
+        )
+        _, out, _ = self.gateway.execute_command(cmd)
+
+        # Parse: one line per blob. Treat anything we can't parse as
+        # missing — cheaper than reasoning about partial successes.
+        observed: dict[str, int | None] = {}
+        for raw in out.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if parts[0] == "OK" and len(parts) == 3:
+                digest = parts[1]
+                try:
+                    observed[digest] = int(parts[2])
+                except ValueError:
+                    observed[digest] = None
+            elif parts[0] == "MISS" and len(parts) == 2:
+                observed[parts[1]] = None
+            else:
+                logger.warning(
+                    "[%s] unparseable blob-check line: %r (treating as missing)",
+                    bundle.image_label,
+                    raw,
+                )
+
+        missing: list[str] = []
+        mismatched: list[tuple[str, int, int]] = []
+        for blob in blobs:
+            seen = observed.get(blob.digest, None)
+            if seen is None:
+                missing.append(blob.digest)
+            elif seen != blob.size:
+                mismatched.append((blob.digest, blob.size, seen))
+
+        if missing or mismatched:
+            logger.error(
+                "[%s] cache integrity check failed before reassembly: "
+                "%d missing, %d size-mismatched (missing=%s mismatched=%s)",
+                bundle.image_label,
+                len(missing),
+                len(mismatched),
+                [d[:12] for d in missing],
+                [(d[:12], e, a) for d, e, a in mismatched],
+            )
+            raise MissingBlobsError(
+                image_label=bundle.image_label,
+                missing=tuple(missing),
+                mismatched=tuple(mismatched),
+            )
+
+        logger.debug(
+            "[%s] verified %d blobs present in cache",
+            bundle.image_label,
+            len(blobs),
+        )
 
 
 def _human(n: int) -> str:
