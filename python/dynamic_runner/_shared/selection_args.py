@@ -9,7 +9,7 @@ from pathlib import Path
 class SelectionConfig:
     source_dir: Path
     output_dir: Path
-    platforms: list[str]
+    platforms: list[str] | None
     compiler: str | None
     compiler_versions: list[str] | None
     opt_levels: list[str] | None
@@ -35,7 +35,19 @@ def add_selection_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", type=str, default="./out", help="Output directory for results")
 
     parser.add_argument(
-        "--platform", type=str, nargs="+", default=["x86", "x64"], help="Platforms to process (default: x86 x64)"
+        "--platform",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Platforms to process (e.g., x86 x64 arm32 arm64). If not "
+            "specified, ALL platforms matching the format string are "
+            "processed — same convention as --compiler / "
+            "--compiler-versions / --opt. Pre-2026 default of x86/x64 "
+            "silently dropped arm/mips/etc. binaries from discovery; "
+            "consumers running on multi-arch corpora MUST opt into "
+            "the subset they want explicitly to avoid that footgun."
+        ),
     )
 
     parser.add_argument(
@@ -191,7 +203,7 @@ def print_selection_summary(config: SelectionConfig, display_opt_levels: list[st
     """Print a summary of the selection configuration."""
     print(f"Source directory: {config.source_dir}")
     print(f"Output directory: {config.output_dir}")
-    print(f"Platforms: {config.platforms}")
+    print(f"Platforms: {config.platforms if config.platforms else 'all'}")
     print(f"Compiler: {config.compiler if config.compiler else 'all'}")
     print(f"Compiler versions: {config.compiler_versions if config.compiler_versions else 'all'}")
     print(f"Optimization levels: {display_opt_levels if display_opt_levels else 'all'}")

@@ -21,10 +21,15 @@ class SelectionFilters:
     `compile_selection_filters`, then reuse for every filename via
     `match_filename` and every traversed subdirectory via
     `is_excluded_subfolder`.
+
+    `platforms` and the optional fields use the same "None means
+    everything" convention — see `match_filename` for the gating
+    semantics. None preserves "no allowlist", which is what every
+    other filter axis already meant by default.
     """
 
     binary_format: BinaryFilenameFormat
-    platforms: list[str]
+    platforms: list[str] | None
     compiler: str | None
     compiler_versions: list[str] | None
     normalized_opt_levels: list[str] | None
@@ -117,7 +122,7 @@ def match_filename(filename: str, filters: SelectionFilters) -> BinaryIdentifier
     if not parsed:
         return None
     platform, comp, version, opt, binary_name = parsed
-    if platform not in filters.platforms:
+    if filters.platforms is not None and platform not in filters.platforms:
         return None
     if filters.compiler and comp != filters.compiler:
         return None
@@ -147,7 +152,7 @@ def is_excluded_subfolder(rel_path: str, filters: SelectionFilters) -> bool:
 
 def find_matching_binaries(
     source_dir: Path,
-    platforms: list[str],
+    platforms: list[str] | None,
     compiler: str | None,
     compiler_versions: list[str] | None,
     opt_levels: list[str] | None,
