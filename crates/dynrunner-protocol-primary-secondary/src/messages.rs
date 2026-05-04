@@ -103,6 +103,10 @@ fn default_payload_json() -> String {
     "null".into()
 }
 
+fn default_uses_file_based_items() -> bool {
+    true
+}
+
 impl<I: Identifier> DistributedBinaryInfo<I> {
     /// Build the wire-side info from an in-process `TaskInfo<I>`.
     ///
@@ -287,6 +291,22 @@ pub enum DistributedMessage<I> {
         /// Defaults to false for backward compatibility.
         #[serde(default)]
         pre_staged_mode: bool,
+        /// Whether items dispatched to this secondary are backed by
+        /// real files on the secondary's filesystem. When false
+        /// (`TaskDefinition.uses_file_based_items=False`), the
+        /// framework passes `local_path` to the worker as an opaque
+        /// identifier — no `stat()`, no content hash, no
+        /// extraction-cache resolution. Workers that read their
+        /// payload via JSON/stdin/comm-fd (rather than opening a
+        /// file at TaskInfo.path) declare this so the framework
+        /// doesn't perform load-bearing IO on a path the worker
+        /// never touches.
+        ///
+        /// Defaults to TRUE for backward compatibility (older
+        /// primaries don't send the field; receiver assumes
+        /// file-based, which is the historical contract).
+        #[serde(default = "default_uses_file_based_items")]
+        uses_file_based_items: bool,
     },
     TaskRequest {
         sender_id: String,

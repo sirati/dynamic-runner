@@ -270,10 +270,24 @@ def _drive_rust_primary(
         _slurm_already_spawned,
         distributed_config=None,
         listen_port=primary_quic_port,
-        source_pre_staged=bool(getattr(args, "source_already_staged", None)),
+        source_pre_staged_root=(
+            slurm_config.get_srcbins_mount_source()
+            if getattr(args, "source_already_staged", None)
+            else None
+        ),
     )
 
-    if getattr(args, "source_already_staged", None):
+    if not coord.uses_file_based_items:
+        # FR-2: TaskDefinition.uses_file_based_items=False — items
+        # aren't files (worker reads payload via JSON/comm-fd, not by
+        # opening TaskInfo.path). Framework does no primary-side
+        # staging at all; secondary will pass `local_path` through to
+        # the worker as an opaque identifier.
+        log.info(
+            "TaskDefinition.uses_file_based_items=False; "
+            "skipping primary StageFile pass and starting coordinator"
+        )
+    elif getattr(args, "source_already_staged", None):
         # Pre-staged mode: the wrapper script bind-mounts the user-named
         # host path into each secondary container at /app/src-network.
         # No primary-side staging pass needed — the secondaries already

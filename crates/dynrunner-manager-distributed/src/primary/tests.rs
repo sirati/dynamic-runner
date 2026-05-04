@@ -40,6 +40,7 @@ async fn single_secondary_processes_all_tasks() {
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
                     source_pre_staged_root: None,
+                    uses_file_based_items: true,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -86,6 +87,7 @@ async fn two_secondaries_distribute_work() {
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
                     source_pre_staged_root: None,
+                    uses_file_based_items: true,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -216,6 +218,7 @@ async fn e2e_primary_and_secondary_single_node() {
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
                     source_pre_staged_root: None,
+                    uses_file_based_items: true,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -286,6 +289,7 @@ async fn e2e_primary_and_two_secondaries() {
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
                     source_pre_staged_root: None,
+                    uses_file_based_items: true,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -337,6 +341,7 @@ async fn live_distribution_continues_past_initial_batch() {
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
+                    uses_file_based_items: true,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -388,6 +393,7 @@ async fn notify_stage_file_emits_wire_message() {
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
+                    uses_file_based_items: true,
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, TestId> =
@@ -521,6 +527,7 @@ async fn e2e_pre_staged_source_mode() {
                 keepalive_interval: Duration::from_secs(5),
                 keepalive_miss_threshold: 3,
                 source_pre_staged_root: Some(staged_path.clone()),
+                uses_file_based_items: true,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -543,6 +550,91 @@ async fn e2e_pre_staged_source_mode() {
             assert_eq!(completed, 5, "primary should see 5 completed in pre-staged mode");
             assert_eq!(failed, 0, "no failures expected");
             assert_eq!(sec_completed, 5, "secondary should resolve all 5 via src_network");
+        })
+        .await;
+}
+
+/// End-to-end: `uses_file_based_items=false` (FR-2). The TaskInfo
+/// `path` is an opaque identifier — no real file at that location.
+/// The framework MUST NOT stat/hash/resolve it; the secondary
+/// passes `local_path` through to the worker verbatim. Asserts all
+/// 5 dispatch successfully despite the paths pointing at nowhere.
+///
+/// Without the flag, the same setup (no src_network, no
+/// queue_initial_staging) would hit the unresolvable-task guard
+/// and fail every item NonRecoverable.
+#[tokio::test(flavor = "current_thread")]
+async fn e2e_uses_file_based_items_false() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let secondary_id = "sec-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+
+            let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+                spawn_real_secondary(secondary_id.clone(), 2, max_res);
+
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: false,
+            };
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Items with paths that don't back to anything on disk.
+            // In file-based mode this would fail the dispatch guard;
+            // with uses_file_based_items=false the framework treats
+            // these as opaque identifiers.
+            let binaries: Vec<TaskInfo<TestId>> = (0..5)
+                .map(|i| {
+                    let mut b = make_binary(&format!("opaque_{i}"), 1);
+                    b.path = std::path::PathBuf::from(format!("opaque://manifest-{i}"));
+                    b
+                })
+                .collect();
+
+            {
+                let (deps, ops, ope) = noop_phase_args();
+                primary.run(binaries, deps, ops, ope).await.unwrap()
+            };
+
+            let completed = primary.completed_count();
+            let failed = primary.failed_count();
+            drop(primary);
+
+            let sec_completed = sec_handle.await.unwrap();
+
+            assert_eq!(completed, 5, "primary should see 5 completed");
+            assert_eq!(failed, 0, "no failures expected");
+            assert_eq!(sec_completed, 5, "secondary should pass paths through");
         })
         .await;
 }

@@ -46,6 +46,7 @@ async fn fake_primary(
     to_secondary
         .send(DistributedMessage::InitialAssignment {
             pre_staged_mode: false,
+                    uses_file_based_items: true,
             sender_id: "primary".into(),
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
@@ -402,6 +403,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 pri_to_sec_tx
                     .send(DistributedMessage::InitialAssignment {
                         pre_staged_mode: false,
+                    uses_file_based_items: true,
                         sender_id: "primary".into(),
                         timestamp: 0.0,
                         secondary_id: secondary_id_clone.clone(),

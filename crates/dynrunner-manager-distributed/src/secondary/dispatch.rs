@@ -34,14 +34,21 @@ where
                 local_path,
                 ..
             } => {
-                // Resolve binary path: file-ready or ZIP extraction.
-                // In pre-staged-source mode the bind-mounted
-                // `src_network/<local_path>` is the authoritative
-                // location and the hash machinery (a network-transfer
-                // dedup optimisation) doesn't apply — there's no
-                // transfer to dedup.
+                // Resolve binary path. Three modes:
+                //   - `uses_file_based_items=false` (FR-2): items
+                //     aren't files; pass `local_path` through as an
+                //     opaque identifier, framework does no IO on it.
+                //   - pre-staged-source mode: the bind-mounted
+                //     `src_network/<local_path>` is the authoritative
+                //     location and the hash machinery (a network-
+                //     transfer dedup optimisation) doesn't apply —
+                //     there's no transfer to dedup.
+                //   - default: extraction-cache resolution with hash
+                //     verification.
                 let zip_ref = zip_file.as_deref().filter(|z| !z.is_empty());
-                let resolved_path = if self.pre_staged_mode() {
+                let resolved_path = if !self.uses_file_based_items() {
+                    Some(std::path::PathBuf::from(&local_path))
+                } else if self.pre_staged_mode() {
                     self.extraction_cache.resolve_pre_staged(&local_path)
                 } else {
                     self.extraction_cache

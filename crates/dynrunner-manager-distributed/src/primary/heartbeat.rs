@@ -258,6 +258,7 @@ mod tests {
             keepalive_interval,
             keepalive_miss_threshold: miss_threshold,
             source_pre_staged_root: None,
+                    uses_file_based_items: true,
         }
     }
 

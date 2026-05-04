@@ -52,6 +52,13 @@ pub(crate) struct PyPrimaryCoordinator {
     /// secondaries via `InitialAssignment.pre_staged_mode` so
     /// dispatch skips the hash machinery.
     source_pre_staged_root: Option<std::path::PathBuf>,
+    /// Whether dispatched task items back to real files. Read at
+    /// construction from `TaskDefinition.uses_file_based_items`
+    /// (defaults to True). Propagated to secondaries via
+    /// `InitialAssignment.uses_file_based_items` so dispatch skips
+    /// extraction-cache resolution and treats `local_path` as an
+    /// opaque worker identifier when False.
+    uses_file_based_items: bool,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B).
     task_definition: Py<PyAny>,
@@ -78,6 +85,11 @@ impl PyPrimaryCoordinator {
         source_pre_staged_root: Option<std::path::PathBuf>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
+        let uses_file_based_items: bool = task_definition
+            .getattr("uses_file_based_items")
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or(true);
 
         Ok(Self {
             num_secondaries,
@@ -90,8 +102,19 @@ impl PyPrimaryCoordinator {
             failed: 0,
             pending_stage_files: Vec::new(),
             source_pre_staged_root,
+            uses_file_based_items,
             task_definition: task_definition.clone().unbind(),
         })
+    }
+
+    /// Whether items are file-backed (read at construction from
+    /// `TaskDefinition.uses_file_based_items`; defaults to True).
+    /// Pipeline.py reads this to decide whether to call
+    /// `queue_initial_staging` — when False, no primary-side staging
+    /// happens at all.
+    #[getter]
+    fn uses_file_based_items(&self) -> bool {
+        self.uses_file_based_items
     }
 
     /// Bulk-queue StageFile notifications for every binary in
@@ -183,6 +206,7 @@ impl PyPrimaryCoordinator {
             self.distributed_config.keepalive_miss_threshold();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
+        let uses_file_based_items = self.uses_file_based_items;
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -275,6 +299,7 @@ impl PyPrimaryCoordinator {
                     keepalive_interval: dist_keepalive,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     source_pre_staged_root,
+                    uses_file_based_items,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =

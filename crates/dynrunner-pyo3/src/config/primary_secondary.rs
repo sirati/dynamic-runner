@@ -54,6 +54,10 @@ impl PyPrimaryConfig {
             // own constructor (the SLURM-pipeline path); this config
             // shim defaults to off.
             source_pre_staged_root: None,
+            // File-based items is the historical default; consumers
+            // that opt out do so via PyPrimaryCoordinator (which
+            // reads `TaskDefinition.uses_file_based_items`).
+            uses_file_based_items: true,
         }
     }
 }

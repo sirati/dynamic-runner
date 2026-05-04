@@ -122,6 +122,16 @@ where
     /// can arrive before InitialAssignment.
     pre_staged_mode: bool,
 
+    /// Whether dispatched task items are backed by real files (the
+    /// historical contract). Set from
+    /// `InitialAssignment.uses_file_based_items`. When false, the
+    /// extraction-cache resolution is skipped entirely and the
+    /// wire's `local_path` is passed through to the worker as an
+    /// opaque identifier — no `stat()`, no hash, no `.exists()`
+    /// check. Defaults to TRUE before InitialAssignment lands so
+    /// the historical behaviour remains in place.
+    uses_file_based_items: bool,
+
     // Peer keepalive tracking: peer_id -> last_seen timestamp
     peer_keepalives: HashMap<String, f64>,
 
@@ -221,6 +231,7 @@ where
             cached_full_task_list: None,
             slurm_primary_peer_id: None,
             pre_staged_mode: false,
+            uses_file_based_items: true,
         }
     }
 
@@ -233,6 +244,18 @@ where
 
     pub(super) fn set_pre_staged_mode(&mut self, on: bool) {
         self.pre_staged_mode = on;
+    }
+
+    /// Whether dispatched task items back to real files (default true).
+    /// When false, the worker receives `local_path` as an opaque
+    /// identifier and the framework performs no filesystem
+    /// resolution.
+    pub(super) fn uses_file_based_items(&self) -> bool {
+        self.uses_file_based_items
+    }
+
+    pub(super) fn set_uses_file_based_items(&mut self, on: bool) {
+        self.uses_file_based_items = on;
     }
 
     /// Set certificate info for peer connections. Must be called before `run()`

@@ -105,10 +105,12 @@ where
                             workers_ready,
                             staged_files,
                             pre_staged_mode,
+                            uses_file_based_items,
                             ..
                         } = msg
                         {
                             self.set_pre_staged_mode(pre_staged_mode);
+                            self.set_uses_file_based_items(uses_file_based_items);
                             self.handle_initial_assignment(
                                 zip_files,
                                 workers_ready,
@@ -183,7 +185,11 @@ where
             } else {
                 Some(zip_name.as_str())
             };
-            let resolved_path = if self.pre_staged_mode() {
+            let resolved_path = if !self.uses_file_based_items() {
+                // Items aren't files — pass `local_path` to the
+                // worker as an opaque identifier, no resolution.
+                Some(std::path::PathBuf::from(&local_path))
+            } else if self.pre_staged_mode() {
                 self.extraction_cache.resolve_pre_staged(&local_path)
             } else {
                 self.extraction_cache

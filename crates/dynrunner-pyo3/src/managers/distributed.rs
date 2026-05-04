@@ -270,6 +270,10 @@ impl PyDistributedManager {
                     // SLURM packaging pipeline, so pre-staged mode
                     // doesn't apply here.
                     source_pre_staged_root: None,
+                    // In-process manager uses the historical
+                    // file-based contract — items map to local files
+                    // the workers open.
+                    uses_file_based_items: true,
                 };
 
                 let mut primary = PrimaryCoordinator::new(

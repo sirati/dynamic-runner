@@ -45,6 +45,19 @@ pub struct PrimaryConfig {
     /// `local_path` (see `wire_local_path`). `None` outside
     /// pre-staged mode.
     pub source_pre_staged_root: Option<std::path::PathBuf>,
+    /// Whether the dispatched task items are backed by real files
+    /// on the secondary's filesystem (the historical contract).
+    /// When `false`, the framework passes `local_path` through to
+    /// the worker as an opaque identifier — no `stat()`, no content
+    /// hashing, no extraction-cache resolution. Workers that read
+    /// their payload via JSON/stdin/comm-fd (not by opening a file
+    /// at `TaskInfo.path`) flip this to `false` via
+    /// `TaskDefinition.uses_file_based_items=False` so the framework
+    /// doesn't perform load-bearing IO on a path the worker never
+    /// touches.
+    ///
+    /// `true` outside the opt-out (default).
+    pub uses_file_based_items: bool,
 }
 
 impl Default for PrimaryConfig {
@@ -57,6 +70,7 @@ impl Default for PrimaryConfig {
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
+            uses_file_based_items: true,
         }
     }
 }

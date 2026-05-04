@@ -155,6 +155,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 workers_ready,
                 staged_files,
                 pre_staged_mode: self.config.source_pre_staged_root.is_some(),
+                uses_file_based_items: self.config.uses_file_based_items,
             };
             self.transport.send_to(secondary_id, msg).await?;
         }
