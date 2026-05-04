@@ -35,65 +35,84 @@ impl ExtractionCache {
     }
 
     /// Get a file by hash, checking cache first then trying direct path.
-    pub fn get_file_by_hash(&mut self, file_hash: &str, file_path: Option<&str>) -> Option<PathBuf> {
+    ///
+    /// `expected_content_hash` is optional:
+    ///   - `Some(h)` — verify SHA256 of the candidate matches `h`;
+    ///     reject candidates whose content doesn't. Used in normal
+    ///     mode where the primary computed `h` while staging.
+    ///   - `None` — skip content verification; accept the first
+    ///     candidate that exists. Used in pre-staged-source mode
+    ///     (the bind-mount IS the contract; no transfer happened so
+    ///     there's nothing to dedup).
+    ///
+    /// `lookup_key` is always the cache key (a `compute_task_hash`
+    /// 16-char hex). Even with no content verification, the cache
+    /// hit/miss + register path uses it.
+    pub fn get_file_by_hash(
+        &mut self,
+        lookup_key: &str,
+        file_path: Option<&str>,
+        expected_content_hash: Option<&str>,
+    ) -> Option<PathBuf> {
         // Check cache
-        if let Some(path) = self.extracted.get(file_hash) {
+        if let Some(path) = self.extracted.get(lookup_key) {
             if path.exists() {
                 return Some(path.clone());
             }
             // Cached path no longer exists, remove stale entry
-            self.extracted.remove(file_hash);
+            self.extracted.remove(lookup_key);
         }
+
+        // Returns true iff the candidate's content matches the
+        // expected hash (or no expectation was given).
+        let verify = |path: &Path| -> bool {
+            match expected_content_hash {
+                None => true,
+                Some(expected) => compute_file_hash(path)
+                    .map(|computed| computed == expected)
+                    .unwrap_or(false),
+            }
+        };
 
         if let Some(path_str) = file_path {
             let direct_path = PathBuf::from(path_str);
 
-            // Try absolute path (local/file-ready mode)
-            if direct_path.is_absolute() && direct_path.exists() {
-                if let Some(computed) = compute_file_hash(&direct_path) {
-                    if computed == file_hash {
-                        self.extracted.insert(file_hash.to_string(), direct_path.clone());
-                        return Some(direct_path);
-                    }
-                }
+            // Try absolute path (local/file-ready / pre-staged mode).
+            if direct_path.is_absolute() && direct_path.exists() && verify(&direct_path) {
+                self.extracted
+                    .insert(lookup_key.to_string(), direct_path.clone());
+                return Some(direct_path);
             }
 
             // Try relative to tmp_dir
             let file_name = direct_path.file_name().unwrap_or(direct_path.as_os_str());
             let relative_path = self.tmp_dir.join(file_name);
-            if relative_path.exists() {
-                if let Some(computed) = compute_file_hash(&relative_path) {
-                    if computed == file_hash {
-                        self.extracted.insert(file_hash.to_string(), relative_path.clone());
-                        return Some(relative_path);
-                    }
-                }
+            if relative_path.exists() && verify(&relative_path) {
+                self.extracted
+                    .insert(lookup_key.to_string(), relative_path.clone());
+                return Some(relative_path);
             }
 
-            // Try src_network fallbacks (when configured): the primary may
-            // have placed the file on the shared drive without sending an
-            // explicit StageFile. Try both `src_network/<basename>` and
-            // `src_network/<full local_path>`. Both with hash verification.
+            // Try src_network fallbacks (when configured): the primary
+            // may have placed the file on the shared drive without
+            // sending an explicit StageFile, OR the wrapper bind-mount
+            // exposes the pre-staged data here. Try
+            // `src_network/<basename>` and `src_network/<full local_path>`.
             if let Some(net) = self.src_network.as_ref() {
                 let base_in_net = net.join(file_name);
-                if base_in_net.exists() {
-                    if let Some(computed) = compute_file_hash(&base_in_net) {
-                        if computed == file_hash {
-                            self.extracted
-                                .insert(file_hash.to_string(), base_in_net.clone());
-                            return Some(base_in_net);
-                        }
-                    }
+                if base_in_net.exists() && verify(&base_in_net) {
+                    self.extracted
+                        .insert(lookup_key.to_string(), base_in_net.clone());
+                    return Some(base_in_net);
                 }
                 let full_in_net = net.join(path_str);
-                if full_in_net != base_in_net && full_in_net.exists() {
-                    if let Some(computed) = compute_file_hash(&full_in_net) {
-                        if computed == file_hash {
-                            self.extracted
-                                .insert(file_hash.to_string(), full_in_net.clone());
-                            return Some(full_in_net);
-                        }
-                    }
+                if full_in_net != base_in_net
+                    && full_in_net.exists()
+                    && verify(&full_in_net)
+                {
+                    self.extracted
+                        .insert(lookup_key.to_string(), full_in_net.clone());
+                    return Some(full_in_net);
                 }
             }
         }
@@ -218,39 +237,39 @@ impl ExtractionCache {
         &self.tmp_dir
     }
 
-    /// Resolve a binary's path in pre-staged-source mode: trust that
-    /// `src_network/<local_path>` is the authoritative location and
-    /// just check it exists. No hash verification — the bind-mount IS
-    /// the contract; the hash machinery exists to dedup network
-    /// transfer, and pre-staged mode performs no transfer.
-    ///
-    /// Returns the absolute path on the secondary's filesystem, or
-    /// `None` if `src_network` isn't configured or the file isn't
-    /// present (e.g. user pointed `--source-already-staged` at the
-    /// wrong directory, or items in the discovery list don't actually
-    /// exist on the cluster filesystem).
-    pub fn resolve_pre_staged(&self, local_path: &str) -> Option<PathBuf> {
-        let net = self.src_network.as_ref()?;
-        let p = net.join(local_path);
-        if p.exists() { Some(p) } else { None }
-    }
-
     /// Resolve a binary: try file-ready mode first, then ZIP extraction.
     ///
-    /// If `zip_name` is empty or `None`, uses file-ready mode (direct path).
-    /// Otherwise extracts from ZIP.
+    /// If `zip_name` is empty or `None`, uses file-ready mode (direct
+    /// path). Otherwise extracts from ZIP.
+    ///
+    /// `file_hash` (the cache lookup key, a `compute_task_hash`
+    /// value) is always required. `expected_content_hash` is the
+    /// SHA256 the primary computed at staging time; pass `None` when
+    /// no transfer happened (pre-staged-source mode) so the resolver
+    /// accepts the bind-mounted file by existence alone. The hash
+    /// machinery is a network-transfer-dedup optimisation; with no
+    /// transfer there's nothing to dedup, and demanding a content
+    /// hash that the primary never computed is the same fail-mode
+    /// bf1ce02 / a344b0e were both about.
     pub fn resolve_binary(
         &mut self,
         zip_name: Option<&str>,
         local_path: &str,
         file_hash: &str,
+        expected_content_hash: Option<&str>,
     ) -> Option<PathBuf> {
         // File-ready mode: zip_name is empty or None
         if zip_name.map_or(true, |z| z.is_empty()) {
-            return self.get_file_by_hash(file_hash, Some(local_path));
+            return self.get_file_by_hash(
+                file_hash,
+                Some(local_path),
+                expected_content_hash,
+            );
         }
 
-        // ZIP mode
+        // ZIP mode (always content-verified — extraction touches
+        // the file, hash on extracted content is the integrity
+        // check the cluster relies on).
         self.extract_from_zip(zip_name.unwrap(), local_path, file_hash)
     }
 }
@@ -320,12 +339,16 @@ mod tests {
 
         let mut cache = ExtractionCache::new(tmp, None);
 
-        // Should find by direct path
-        let result = cache.get_file_by_hash(&hash, Some(test_file.to_str().unwrap()));
+        // Should find by direct path (with content verification)
+        let result = cache.get_file_by_hash(
+            &hash,
+            Some(test_file.to_str().unwrap()),
+            Some(&hash),
+        );
         assert!(result.is_some());
 
-        // Should be cached now
-        let result2 = cache.get_file_by_hash(&hash, None);
+        // Should be cached now (no path needed)
+        let result2 = cache.get_file_by_hash(&hash, None, None);
         assert!(result2.is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -388,7 +411,7 @@ mod tests {
         // local_path the primary thinks the file is at — does not exist
         // here; resolution must fall through to src_network/<basename>.
         let primary_view = format!("/nonexistent/dir/{}", basename);
-        let result = cache.resolve_binary(None, &primary_view, &hash);
+        let result = cache.resolve_binary(None, &primary_view, &hash, Some(&hash));
         assert!(result.is_some(), "expected resolution via src_network/<basename>");
         assert_eq!(result.unwrap(), staged);
 
@@ -414,7 +437,7 @@ mod tests {
         let hash = compute_file_hash(&staged).unwrap();
 
         let mut cache = ExtractionCache::new(tmp, Some(net));
-        let result = cache.resolve_binary(None, rel, &hash);
+        let result = cache.resolve_binary(None, rel, &hash, Some(&hash));
         assert!(result.is_some(), "expected resolution via src_network/<full local_path>");
         assert_eq!(result.unwrap(), staged);
 
