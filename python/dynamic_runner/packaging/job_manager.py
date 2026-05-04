@@ -90,7 +90,7 @@ class SlurmJobManager:
         podman_storage = f"{rndtmp}/storage"
         podman_run = f"{rndtmp}/run"
 
-        srcbins_network = self._expand_path(self.slurm_config.get_srcbins_dir())
+        srcbins_network = self._expand_path(self.slurm_config.get_srcbins_mount_source())
         output_network = self._expand_path(self.slurm_config.get_output_dir())
         log_network = self._expand_path(run_log_dir or self.slurm_config.get_log_dir())
 

@@ -16,6 +16,12 @@ class SlurmConfig:
     cpus_per_task: int = 14
     memory_per_node: str = "64G"
     time_limit: str = "48:00:00"
+    # Pre-staged source override. When set, the wrapper script bind-mounts
+    # this host path into the container at /app/src-network instead of
+    # the primary's staging directory (and the primary skips the
+    # queue_initial_staging pass entirely). Absolute paths used as-is;
+    # relative paths resolved against `root_folder`.
+    prestaged_src_bins_path: str | None = None
 
     def get_image_dir(self) -> str:
         """Get full path to image directory"""
@@ -32,6 +38,20 @@ class SlurmConfig:
     def get_srcbins_dir(self) -> str:
         """Get full path to source binaries directory"""
         return f"{self.get_image_dir()}/srcbins"
+
+    def get_srcbins_mount_source(self) -> str:
+        """Path to bind-mount into the container at /app/src-network.
+
+        Returns `prestaged_src_bins_path` (absolute, or resolved against
+        `root_folder` for relative paths) when set; otherwise the
+        primary-staging directory under the image dir.
+        """
+        if self.prestaged_src_bins_path is None:
+            return self.get_srcbins_dir()
+        path = self.prestaged_src_bins_path
+        if path.startswith("/"):
+            return path
+        return f"{self.root_folder}/{path}"
 
 
 def validate_slurm_config(config: SlurmConfig, gateway=None) -> None:

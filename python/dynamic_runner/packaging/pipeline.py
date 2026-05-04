@@ -81,6 +81,8 @@ def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig
     overrides: dict[str, object] = {}
     if getattr(args, "slurm_time_limit", None):
         overrides["time_limit"] = args.slurm_time_limit
+    if getattr(args, "source_already_staged", None):
+        overrides["prestaged_src_bins_path"] = args.source_already_staged
     return SlurmConfig(
         root_folder=Path(root),
         image_subfolder=args.slurm_image_subfolder,
@@ -270,16 +272,27 @@ def _drive_rust_primary(
         listen_port=primary_quic_port,
     )
 
-    # Bulk-queue StageFile notifications in Rust — one PyO3 crossing
-    # for the whole binary list (instead of 4 per binary), and the
-    # rel-path / task-hash / content-hash computations all happen
-    # in the same loop body without re-acquiring the GIL.
-    coord.queue_initial_staging(binaries, str(sel_result.source_dir))
-    log.info(
-        "Queued %d StageFile notifications across %d secondaries; starting coordinator",
-        len(binaries),
-        prep_result.num_secondaries,
-    )
+    if getattr(args, "source_already_staged", None):
+        # Pre-staged mode: the wrapper script bind-mounts the user-named
+        # host path into each secondary container at /app/src-network.
+        # No primary-side staging pass needed — the secondaries already
+        # see the data through the bind mount.
+        log.info(
+            "Pre-staged source mode (--source-already-staged=%s); "
+            "skipping primary StageFile pass and starting coordinator",
+            args.source_already_staged,
+        )
+    else:
+        # Bulk-queue StageFile notifications in Rust — one PyO3 crossing
+        # for the whole binary list (instead of 4 per binary), and the
+        # rel-path / task-hash / content-hash computations all happen
+        # in the same loop body without re-acquiring the GIL.
+        coord.queue_initial_staging(binaries, str(sel_result.source_dir))
+        log.info(
+            "Queued %d StageFile notifications across %d secondaries; starting coordinator",
+            len(binaries),
+            prep_result.num_secondaries,
+        )
     coord.run(binaries)
     log.info(f"Completed: {coord.completed}")
     log.info(f"Failed: {coord.failed}")

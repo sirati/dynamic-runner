@@ -176,6 +176,21 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         help="Submit a test SLURM job to validate Docker image loading (requires --multi-computer slurm)",
     )
     parser.add_argument(
+        "--source-already-staged",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Skip the primary's source-staging pass and bind-mount the named "
+            "directory into each secondary container at /app/src-network. "
+            "PATH is on the cluster filesystem the secondaries see (typically "
+            "the gateway's NFS); absolute paths are used as-is, relative paths "
+            "resolve against --slurm-root-folder. Useful when the source data "
+            "is already laid out on cluster NFS (or on a per-job snapshot a "
+            "sibling tool produced) and re-staging would be wasted bytes."
+        ),
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=1,
