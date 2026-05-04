@@ -153,8 +153,20 @@ def process_selection_arguments(args: argparse.Namespace) -> SelectionConfig:
     source_dir = Path(args.source).resolve()
     output_dir = Path(args.output).resolve()
 
-    if not source_dir.exists():
+    # --source-already-staged means the data lives on the cluster
+    # filesystem (gateway-side), not locally; the local --source path
+    # has no local meaning. Skip the local-exists check so the consumer
+    # doesn't have to pass a placeholder local dir just to clear
+    # validation. The path is still passed through to discover_items —
+    # consumers that want to drive find_items against the staged
+    # location should resolve the gateway path themselves (typically
+    # from args.source_already_staged + the SSH backend).
+    if not source_dir.exists() and not getattr(args, "source_already_staged", None):
         print(f"Error: Source directory does not exist: {source_dir}")
+        print(
+            "Hint: if the source data lives on the gateway / cluster filesystem only, "
+            "pass --source-already-staged <path> and the local --source check is skipped."
+        )
         sys.exit(1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
