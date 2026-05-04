@@ -64,6 +64,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // secondary disconnects while processing a task. The timeout
             // is generous — if no message arrives in 5 minutes and there
             // are in-flight tasks, something is wrong.
+            //
+            // Cancellation safety: `transport.recv` is the mpsc-bridged
+            // `NetworkServer::recv` (cancel-safe — see `MessageReceiver`
+            // doc). The two timer arms (heartbeat tick + 5-min sleep)
+            // are tokio time primitives which are themselves cancel-safe.
             tokio::select! {
                 msg = self.transport.recv() => {
                     match msg {

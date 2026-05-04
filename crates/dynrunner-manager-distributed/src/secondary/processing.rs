@@ -39,6 +39,15 @@ where
             // Workers that need restart after disconnect
             let mut workers_to_restart: Vec<WorkerId> = Vec::new();
 
+            // Cancellation safety note: every awaiting arm here must be
+            // cancel-safe because the periodic ticks (keepalive, oom)
+            // will cancel the in-flight recv/event futures whenever
+            // they fire. `pool.recv_event` is `mpsc::Receiver::recv`
+            // (documented cancel-safe). `primary_transport.recv` and
+            // `peer_transport.recv_peer` go through the per-connection
+            // bridge tasks (see `MessageReceiver` doc) which expose
+            // mpsc receivers underneath. `interval.tick` is itself
+            // cancel-safe per tokio docs.
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {

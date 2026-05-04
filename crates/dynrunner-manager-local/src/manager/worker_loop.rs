@@ -35,7 +35,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 break;
             }
 
-            // Wait for either a worker event or the OOM check timer
+            // Wait for either a worker event or the OOM check timer.
+            //
+            // Cancellation safety: `pool.recv_event` is
+            // `mpsc::Receiver::recv` (cancel-safe). The interval tick
+            // is cancel-safe per tokio docs. Either arm dropping the
+            // other's future is harmless.
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {

@@ -28,6 +28,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 break;
             }
 
+            // Cancellation safety: `transport.recv` goes through the
+            // mpsc bridge in `NetworkServer` (its inner select! is over
+            // two cancel-safe mpsc receivers). `sleep_until` is
+            // one-shot and cancel-safe. If `sleep_until` wins it's
+            // because the deadline expired and we error out anyway —
+            // even on a hypothetical not-cancel-safe transport, the
+            // connection is torn down on the error path.
             tokio::select! {
                 msg = self.transport.recv() => {
                     match msg {
