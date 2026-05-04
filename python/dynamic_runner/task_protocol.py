@@ -16,9 +16,8 @@ worker dispatch. The task implements four kinds of method:
 1. **Topology** (``get_phases``) — declare phases + types once at run start.
 2. **Item discovery** (``discover_items``) — yield items for the run, each
    tagged with its phase / type / affinity.
-3. **Per-type plumbing** (``estimate_memory``, ``build_worker_command_args``,
-   ``get_output_filename_pattern``) — answers questions about a specific
-   item or type.
+3. **Per-type plumbing** (``estimate_memory``, ``build_worker_command_args``)
+   — answers questions about a specific item or type.
 4. **Lifecycle hooks** (``on_run_start``, ``on_run_end``,
    ``on_phase_start``, ``on_phase_end``) — let the task set up / tear down
    resources at the right boundaries.
@@ -126,10 +125,6 @@ class TaskDefinition(Protocol):
         output_dir: Path,
         skip_existing: bool,
     ) -> list[str]: ...
-
-    def get_output_filename_pattern(
-        self, type_id: TypeId, item: TaskInfo
-    ) -> str: ...
 
     # ── Lifecycle hooks ────────────────────────────────────────────────
 

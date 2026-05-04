@@ -12,7 +12,6 @@ import sys
 from pathlib import Path
 
 from ._shared import (
-    filter_existing_outputs,
     format_binary_info,
     normalize_opt_levels,
     print_selection_summary,
@@ -87,16 +86,14 @@ def run(
 
 def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) -> list:
     """Discover items via the task's `discover_items` and apply the
-    framework-level overlays (`--list-files`, `--skip-existing`).
+    framework-level overlay `--list-files`.
 
-    Item discovery is the task's concern under the post-phases-redesign
-    Protocol — the framework no longer scans the source directory or
-    re-orders the result. The legacy `find_matching_binaries` +
-    `task.organize_and_sort_items` pair is gone (see docs/PHASES.md);
-    consumers fold both responsibilities into `discover_items`.
-    `find_matching_binaries` remains exported from `_shared` as a
-    helper a task can reach for from inside its own
-    `discover_items`, but the framework does not call it directly.
+    Item discovery — including `--skip-existing` filtering — is the
+    task's concern. The framework provides primitives (gateway-aware
+    `_native.find_items`, deployment-correct `args.resolved_output_root`)
+    so a task can compose source-walk + output-walk + filter inside
+    its own `discover_items`, with the same code path whether outputs
+    land locally or on a cluster filesystem.
     """
     logger = logging.getLogger()
 
@@ -105,6 +102,8 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
         normalized = normalize_opt_levels(config.opt_levels, config.opt_regex)
         display_opt_levels = normalized.display_values
     print_selection_summary(config, display_opt_levels)
+
+    args.resolved_output_root = str(config.output_dir)
 
     logger.info("Discovering items via task.discover_items(...)")
     binaries = list(task.discover_items(config.source_dir, args))
@@ -118,16 +117,6 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
         for binary in binaries:
             logger.info(format_binary_info(binary, config.source_dir))
         return []
-
-    if args.skip_existing:
-        binaries, skipped = filter_existing_outputs(
-            binaries,
-            config.source_dir,
-            config.output_dir,
-            task.get_output_filename_pattern,
-        )
-        logger.info(f"Skipped {skipped} items with existing outputs")
-        logger.info(f"Remaining items to process: {len(binaries)}")
 
     return binaries
 

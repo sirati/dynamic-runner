@@ -22,7 +22,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from .._shared import filter_existing_outputs_remote, process_selection_arguments
+from .._shared import process_selection_arguments
 
 from ..deployment_spec import TaskDeploymentSpec
 from .gateway import create_gateway, parse_gateway_url
@@ -114,14 +114,6 @@ def run_slurm_pipeline(
         return
 
     sel_result = process_selection_arguments(args)
-    # Item discovery is the task's concern under the post-phases-
-    # redesign Protocol; framework no longer scans. We discover ONCE
-    # here and pass the same list down into `_drive_rust_primary` —
-    # avoids the double-scan that previously could disagree if the
-    # underlying source directory changed mid-run.
-    binaries = list(task.discover_items(sel_result.source_dir, args))
-    if not binaries:
-        log.warning("No items discovered. Pipeline will run in test/job-submission mode.")
 
     num_secondaries = args.jobs
     run_id = _make_run_id()
@@ -165,6 +157,25 @@ def run_slurm_pipeline(
         log.info(f"Creating SLURM root directory: {slurm_config.root_folder}")
         gateway.create_directory(slurm_config.root_folder)
 
+    # Deployment-correct output root surfaced on `args` so a task's
+    # `discover_items` can drive `find_items` against the same path
+    # outputs land at — gateway-absolute here, local-absolute in
+    # `run.py`. Tasks that implement `--skip-existing` walk this
+    # path with `args.gateway` as the URL; the framework owns no
+    # filtering policy, only the path-derivation primitive.
+    args.resolved_output_root = str(slurm_config.get_output_dir())
+
+    # Item discovery is the task's concern under the post-phases-
+    # redesign Protocol; framework no longer scans. Done here, AFTER
+    # `args.resolved_output_root` is set, so a task that wants to
+    # apply skip-existing logic inside `discover_items` (calling
+    # `_native.find_items` against the gateway output tree) has the
+    # path it needs. Discovered ONCE; the same list flows into
+    # `_drive_rust_primary`.
+    binaries = list(task.discover_items(sel_result.source_dir, args))
+    if not binaries:
+        log.warning("No items discovered. Pipeline will run in test/job-submission mode.")
+
     # Reverse-connection mode: when the gateway forbids public port
     # forwarding (GatewayPorts off), we tunnel from primary → each
     # secondary via the gateway instead.
@@ -196,28 +207,6 @@ def run_slurm_pipeline(
         use_reverse_connection=use_reverse_connection,
         run_id=run_id,
     )
-
-    # `--skip-existing` honoured in SLURM dispatch by inspecting the
-    # gateway's output tree instead of the local cache. Outputs land on
-    # cluster NFS (bind-mounted into the container at /app/out-network)
-    # whether or not the source is pre-staged, so the local check used
-    # by `run.py` would always say "nothing exists" and re-queue every
-    # task. One ssh `find` builds the existence set; per-binary
-    # membership tests after that are in-process.
-    if (
-        binaries
-        and getattr(args, "skip_existing", False)
-        and getattr(task, "uses_file_based_items", True)
-    ):
-        binaries, skipped = filter_existing_outputs_remote(
-            binaries,
-            sel_result.source_dir,
-            gateway,
-            str(slurm_config.get_output_dir()),
-            task.get_output_filename_pattern,
-        )
-        log.info(f"Skipped {skipped} items with existing outputs on gateway")
-        log.info(f"Remaining items to process: {len(binaries)}")
 
     try:
         prep_result = asyncio.run(
