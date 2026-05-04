@@ -34,11 +34,19 @@ where
                 local_path,
                 ..
             } => {
-                // Resolve binary path: file-ready or ZIP extraction
+                // Resolve binary path: file-ready or ZIP extraction.
+                // In pre-staged-source mode the bind-mounted
+                // `src_network/<local_path>` is the authoritative
+                // location and the hash machinery (a network-transfer
+                // dedup optimisation) doesn't apply — there's no
+                // transfer to dedup.
                 let zip_ref = zip_file.as_deref().filter(|z| !z.is_empty());
-                let resolved_path = self
-                    .extraction_cache
-                    .resolve_binary(zip_ref, &local_path, &file_hash);
+                let resolved_path = if self.pre_staged_mode() {
+                    self.extraction_cache.resolve_pre_staged(&local_path)
+                } else {
+                    self.extraction_cache
+                        .resolve_binary(zip_ref, &local_path, &file_hash)
+                };
 
                 // Fail loudly when the worker has no plausible way to
                 // open the binary, instead of silently passing

@@ -42,6 +42,12 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `content_hash` is the SHA256 of the file contents that the
     /// staging integrity check will verify against.
     pending_stage_files: Vec<(String, String, String, String, String)>,
+    /// Pre-staged-source mode (`--source-already-staged` on the
+    /// pipeline). Propagated to each secondary via
+    /// `InitialAssignment.pre_staged_mode` so dispatch skips the
+    /// hash machinery and resolves files via `src_network/<rel>`
+    /// directly.
+    source_pre_staged: bool,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B).
     task_definition: Py<PyAny>,
@@ -56,6 +62,7 @@ impl PyPrimaryCoordinator {
         spawn_secondary,
         distributed_config = None,
         listen_port = None,
+        source_pre_staged = false,
     ))]
     fn new(
         py: Python<'_>,
@@ -64,6 +71,7 @@ impl PyPrimaryCoordinator {
         spawn_secondary: Py<PyAny>,
         distributed_config: Option<DistributedConfig>,
         listen_port: Option<u16>,
+        source_pre_staged: bool,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
 
@@ -77,6 +85,7 @@ impl PyPrimaryCoordinator {
             completed: 0,
             failed: 0,
             pending_stage_files: Vec::new(),
+            source_pre_staged,
             task_definition: task_definition.clone().unbind(),
         })
     }
@@ -169,6 +178,7 @@ impl PyPrimaryCoordinator {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
+        let source_pre_staged = self.source_pre_staged;
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -260,6 +270,7 @@ impl PyPrimaryCoordinator {
                     peer_timeout: dist_peer_timeout,
                     keepalive_interval: dist_keepalive,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                    source_pre_staged,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =

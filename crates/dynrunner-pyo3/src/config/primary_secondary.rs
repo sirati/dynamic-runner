@@ -50,6 +50,10 @@ impl PyPrimaryConfig {
             peer_timeout: self.distributed_config.peer_timeout(),
             keepalive_interval: self.distributed_config.keepalive_interval(),
             keepalive_miss_threshold: self.distributed_config.keepalive_miss_threshold(),
+            // Pre-staged mode is plumbed through PyPrimaryCoordinator's
+            // own constructor (the SLURM-pipeline path); this config
+            // shim defaults to off.
+            source_pre_staged: false,
         }
     }
 }

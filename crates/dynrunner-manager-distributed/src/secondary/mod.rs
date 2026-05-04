@@ -114,6 +114,14 @@ where
     // ZIP extraction cache
     extraction_cache: ExtractionCache,
 
+    /// Pre-staged source mode flag — set from the
+    /// `InitialAssignment.pre_staged_mode` the primary sends. When
+    /// true, file resolution skips the extraction-cache hash check
+    /// and trusts `src_network/<local_path>` directly. Off until
+    /// the InitialAssignment lands, which is fine: no TaskAssignment
+    /// can arrive before InitialAssignment.
+    pre_staged_mode: bool,
+
     // Peer keepalive tracking: peer_id -> last_seen timestamp
     peer_keepalives: HashMap<String, f64>,
 
@@ -212,7 +220,19 @@ where
             slurm_in_flight: HashMap::new(),
             cached_full_task_list: None,
             slurm_primary_peer_id: None,
+            pre_staged_mode: false,
         }
+    }
+
+    /// Whether the run is in pre-staged-source mode (set from the
+    /// primary's `InitialAssignment`). Exposed within the secondary
+    /// module so dispatch / setup can pick the right resolution path.
+    pub(super) fn pre_staged_mode(&self) -> bool {
+        self.pre_staged_mode
+    }
+
+    pub(super) fn set_pre_staged_mode(&mut self, on: bool) {
+        self.pre_staged_mode = on;
     }
 
     /// Set certificate info for peer connections. Must be called before `run()`

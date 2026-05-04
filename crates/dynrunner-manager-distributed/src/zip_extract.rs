@@ -218,6 +218,23 @@ impl ExtractionCache {
         &self.tmp_dir
     }
 
+    /// Resolve a binary's path in pre-staged-source mode: trust that
+    /// `src_network/<local_path>` is the authoritative location and
+    /// just check it exists. No hash verification — the bind-mount IS
+    /// the contract; the hash machinery exists to dedup network
+    /// transfer, and pre-staged mode performs no transfer.
+    ///
+    /// Returns the absolute path on the secondary's filesystem, or
+    /// `None` if `src_network` isn't configured or the file isn't
+    /// present (e.g. user pointed `--source-already-staged` at the
+    /// wrong directory, or items in the discovery list don't actually
+    /// exist on the cluster filesystem).
+    pub fn resolve_pre_staged(&self, local_path: &str) -> Option<PathBuf> {
+        let net = self.src_network.as_ref()?;
+        let p = net.join(local_path);
+        if p.exists() { Some(p) } else { None }
+    }
+
     /// Resolve a binary: try file-ready mode first, then ZIP extraction.
     ///
     /// If `zip_name` is empty or `None`, uses file-ready mode (direct path).

@@ -273,6 +273,20 @@ pub enum DistributedMessage<I> {
         /// arrived earlier".
         #[serde(default)]
         staged_files: Vec<StagedFileRecord>,
+        /// Pre-staged source mode: when true, the secondary skips the
+        /// hash-based extraction-cache lookup for incoming
+        /// TaskAssignments and resolves files directly via
+        /// `src_network/<local_path>`. Set by the primary when the
+        /// run was launched with `--source-already-staged`; that
+        /// mode bind-mounts the source data into the container at
+        /// `/app/src-network` (= secondary's `src_network`) and
+        /// skips the StageFile-driven copy + verify pass entirely.
+        /// The hash machinery is a network-transfer dedup
+        /// optimisation; with no transfer there's nothing to
+        /// dedup, and the bind-mount IS the contract.
+        /// Defaults to false for backward compatibility.
+        #[serde(default)]
+        pre_staged_mode: bool,
     },
     TaskRequest {
         sender_id: String,

@@ -257,6 +257,7 @@ mod tests {
             peer_timeout: Duration::from_secs(5),
             keepalive_interval,
             keepalive_miss_threshold: miss_threshold,
+            source_pre_staged: false,
         }
     }
 

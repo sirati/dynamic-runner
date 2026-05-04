@@ -35,6 +35,13 @@ pub struct PrimaryConfig {
     pub keepalive_interval: Duration,
     /// Number of missed keepalives that constitute a death (default 3).
     pub keepalive_miss_threshold: u32,
+    /// Pre-staged source mode (`--source-already-staged`): the data is
+    /// bind-mounted into each secondary container at `src_network`
+    /// already; no primary-driven staging or hash verification is
+    /// needed. Propagated to secondaries via `InitialAssignment` so
+    /// each one's `dispatch` skips the extraction-cache hash machinery
+    /// and resolves files directly via `src_network/<local_path>`.
+    pub source_pre_staged: bool,
 }
 
 impl Default for PrimaryConfig {
@@ -46,6 +53,7 @@ impl Default for PrimaryConfig {
             peer_timeout: Duration::from_secs(300),
             keepalive_interval: Duration::from_secs(5),
             keepalive_miss_threshold: 3,
+            source_pre_staged: false,
         }
     }
 }

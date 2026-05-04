@@ -266,6 +266,10 @@ impl PyDistributedManager {
                     peer_timeout: dist_peer_timeout,
                     keepalive_interval: dist_keepalive,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                    // In-process distributed manager doesn't run the
+                    // SLURM packaging pipeline, so pre-staged mode
+                    // doesn't apply here.
+                    source_pre_staged: false,
                 };
 
                 let mut primary = PrimaryCoordinator::new(

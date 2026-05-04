@@ -154,6 +154,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 zip_files,
                 workers_ready,
                 staged_files,
+                pre_staged_mode: self.config.source_pre_staged,
             };
             self.transport.send_to(secondary_id, msg).await?;
         }

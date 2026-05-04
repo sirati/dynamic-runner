@@ -104,9 +104,11 @@ where
                             zip_files,
                             workers_ready,
                             staged_files,
+                            pre_staged_mode,
                             ..
                         } = msg
                         {
+                            self.set_pre_staged_mode(pre_staged_mode);
                             self.handle_initial_assignment(
                                 zip_files,
                                 workers_ready,
@@ -181,9 +183,12 @@ where
             } else {
                 Some(zip_name.as_str())
             };
-            let resolved_path = self
-                .extraction_cache
-                .resolve_binary(zip_ref, &local_path, &hash);
+            let resolved_path = if self.pre_staged_mode() {
+                self.extraction_cache.resolve_pre_staged(&local_path)
+            } else {
+                self.extraction_cache
+                    .resolve_binary(zip_ref, &local_path, &hash)
+            };
 
             // Same fail-loud guard as the operational dispatch path
             // (see `dispatch::report_unresolvable_task`). Without

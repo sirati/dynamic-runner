@@ -270,6 +270,7 @@ def _drive_rust_primary(
         _slurm_already_spawned,
         distributed_config=None,
         listen_port=primary_quic_port,
+        source_pre_staged=bool(getattr(args, "source_already_staged", None)),
     )
 
     if getattr(args, "source_already_staged", None):

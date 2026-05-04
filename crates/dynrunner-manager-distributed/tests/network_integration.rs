@@ -124,6 +124,7 @@ async fn e2e_primary_secondary_over_wss() {
             peer_timeout: Duration::from_secs(10),
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
+                    source_pre_staged: false,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -224,6 +225,7 @@ async fn e2e_primary_secondary_over_quic() {
             peer_timeout: Duration::from_secs(10),
                     keepalive_interval: Duration::from_secs(5),
                     keepalive_miss_threshold: 3,
+                    source_pre_staged: false,
         };
 
         let mut primary = PrimaryCoordinator::new(

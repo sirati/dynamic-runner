@@ -243,6 +243,7 @@ fn roundtrip_all_message_types() {
             peers: vec![],
         },
         DistributedMessage::InitialAssignment {
+            pre_staged_mode: false,
             sender_id: "p".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),
