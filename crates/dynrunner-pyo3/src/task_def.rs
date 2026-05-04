@@ -101,6 +101,10 @@ struct TypeSpecRaw {
 pub(crate) struct LoadedTopology {
     pub(crate) estimator: PyMemoryEstimatorBridge,
     pub(crate) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Per-type concurrency caps from `TaskTypeSpec.max_concurrent`.
+    /// Absent type → unconstrained. Propagated into
+    /// `PrimaryConfig.max_concurrent_per_type`.
+    pub(crate) max_concurrent_per_type: HashMap<TypeId, u32>,
     raw_types: Vec<TypeSpecRaw>,
 }
 
@@ -113,6 +117,7 @@ impl LoadedTopology {
         let mut seen_type_ids: HashSet<TypeId> = HashSet::new();
         let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
         let mut estimator_specs: Vec<(TypeId, String)> = Vec::new();
+        let mut max_concurrent_per_type: HashMap<TypeId, u32> = HashMap::new();
 
         for phase_spec in &phases_iter {
             let phase_id_str: String = phase_spec.getattr("phase_id")?.extract()?;
@@ -140,6 +145,16 @@ impl LoadedTopology {
                 let reserved_memory_per_worker: u64 =
                     tts.getattr("reserved_memory_per_worker")?.extract()?;
 
+                // Optional per-type concurrency cap. `None` (or
+                // missing attr for old task definitions) → no cap on
+                // this type.
+                if let Ok(mc) = tts.getattr("max_concurrent") {
+                    if !mc.is_none() {
+                        let cap: u32 = mc.extract()?;
+                        max_concurrent_per_type.insert(type_id.clone(), cap);
+                    }
+                }
+
                 if !seen_type_ids.insert(type_id.clone()) {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "duplicate TypeId in get_phases(): {}",
@@ -162,6 +177,7 @@ impl LoadedTopology {
         Ok(Self {
             estimator,
             phase_deps,
+            max_concurrent_per_type,
             raw_types,
         })
     }

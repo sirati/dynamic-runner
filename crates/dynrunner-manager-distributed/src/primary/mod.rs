@@ -58,6 +58,17 @@ pub struct PrimaryConfig {
     ///
     /// `true` outside the opt-out (default).
     pub uses_file_based_items: bool,
+
+    /// Per-type global concurrency caps. When a `TypeId` is present
+    /// with capacity `N`, the scheduler refuses to dispatch more than
+    /// `N` items of that type concurrently across all workers.
+    /// Absent type → unconstrained (the historical behaviour). Set
+    /// from `TaskTypeSpec.max_concurrent` per type.
+    ///
+    /// Use case: cap compile-heavy phases (e.g. `cores/4`) while
+    /// letting cheap IO-bound phases run at the full `--jobs` width
+    /// without rewriting the estimator API.
+    pub max_concurrent_per_type: HashMap<dynrunner_core::TypeId, u32>,
 }
 
 impl Default for PrimaryConfig {
@@ -71,6 +82,7 @@ impl Default for PrimaryConfig {
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
             uses_file_based_items: true,
+            max_concurrent_per_type: HashMap::new(),
         }
     }
 }
@@ -168,6 +180,13 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// `failed_tasks`.
     pub(super) phase_completed: HashMap<PhaseId, u32>,
     pub(super) phase_failed: HashMap<PhaseId, u32>,
+    /// Currently in-flight count per `TypeId`, against
+    /// `config.max_concurrent_per_type`. Incremented on dispatch
+    /// (in both `assign_initial` and `assign_normal` paths),
+    /// decremented on TaskComplete / TaskFailed. Capacity check
+    /// is "current count + 1 <= cap" (next dispatch must fit
+    /// after taking this slot).
+    pub(super) in_flight_per_type: HashMap<dynrunner_core::TypeId, u32>,
     /// Lifecycle hooks. `None` outside the run window or when the
     /// caller didn't supply a hook.
     pub(super) on_phase_start: Option<OnPhaseStart>,
@@ -212,6 +231,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             failed_tasks: HashSet::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
+            in_flight_per_type: HashMap::new(),
             on_phase_start: None,
             on_phase_end: None,
             phase_started_emitted: HashSet::new(),
@@ -235,6 +255,45 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         self.pending
             .as_mut()
             .expect("PendingPool initialised at run() start")
+    }
+
+    /// Drop the worker view down to the per-type-cap-eligible items.
+    /// `None` for an axis means unconstrained; `Some(N)` means at
+    /// most `N` items of that type can be in-flight across all
+    /// workers. Items whose type's capacity is already reached are
+    /// removed from the view so the scheduler never sees them.
+    pub(super) fn cap_filter_view(
+        &self,
+        view: dynrunner_scheduler_api::WorkerView<I>,
+    ) -> dynrunner_scheduler_api::WorkerView<I> {
+        if self.config.max_concurrent_per_type.is_empty() {
+            return view;
+        }
+        let caps = &self.config.max_concurrent_per_type;
+        let in_flight = &self.in_flight_per_type;
+        view.filter(|item| match caps.get(&item.type_id) {
+            None => true,
+            Some(cap) => in_flight.get(&item.type_id).copied().unwrap_or(0) < *cap,
+        })
+    }
+
+    /// Account for a freshly-dispatched item against its type's
+    /// concurrency budget. Paired with `release_type_slot` on
+    /// TaskComplete / TaskFailed.
+    pub(super) fn reserve_type_slot(&mut self, type_id: &dynrunner_core::TypeId) {
+        if !self.config.max_concurrent_per_type.contains_key(type_id) {
+            return;
+        }
+        *self.in_flight_per_type.entry(type_id.clone()).or_insert(0) += 1;
+    }
+
+    pub(super) fn release_type_slot(&mut self, type_id: &dynrunner_core::TypeId) {
+        if !self.config.max_concurrent_per_type.contains_key(type_id) {
+            return;
+        }
+        if let Some(count) = self.in_flight_per_type.get_mut(type_id) {
+            *count = count.saturating_sub(1);
+        }
     }
 
     /// Queue a `StageFile` notification to be sent to `secondary_id`

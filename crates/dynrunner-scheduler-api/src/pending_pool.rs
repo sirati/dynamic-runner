@@ -115,6 +115,32 @@ impl<I: Identifier> WorkerView<I> {
     pub fn worker_id(&self) -> WorkerId {
         self.worker_id
     }
+
+    /// Drop items the predicate returns `false` for, returning a new
+    /// view that keeps the original locators paired with the kept
+    /// items. Use to apply caller-side constraints (per-type
+    /// concurrency caps, per-resource budgets, etc.) without teaching
+    /// the scheduler about them.
+    pub fn filter<F: FnMut(&TaskInfo<I>) -> bool>(self, mut pred: F) -> Self {
+        let WorkerView {
+            items,
+            locators,
+            worker_id,
+        } = self;
+        let mut kept_items = Vec::with_capacity(items.len());
+        let mut kept_locators = Vec::with_capacity(locators.len());
+        for (item, locator) in items.into_iter().zip(locators.into_iter()) {
+            if pred(&item) {
+                kept_items.push(item);
+                kept_locators.push(locator);
+            }
+        }
+        WorkerView {
+            items: kept_items,
+            locators: kept_locators,
+            worker_id,
+        }
+    }
 }
 
 /// Errors validation produces at `PendingPool::new`.

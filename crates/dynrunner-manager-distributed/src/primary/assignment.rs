@@ -77,7 +77,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
             let global_wid = self.workers[worker_idx].worker_id;
-            let view = self.pool().view_for_worker(global_wid);
+            let view = self.cap_filter_view(self.pool().view_for_worker(global_wid));
             if view.is_empty() {
                 continue;
             }
@@ -96,6 +96,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             } = decision
             {
                 let binary = self.pool_mut().take_from_view(view, binary_index);
+                self.reserve_type_slot(&binary.type_id);
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();

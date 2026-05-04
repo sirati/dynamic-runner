@@ -274,6 +274,7 @@ impl PyDistributedManager {
                     // file-based contract — items map to local files
                     // the workers open.
                     uses_file_based_items: true,
+                    max_concurrent_per_type: std::collections::HashMap::new(),
                 };
 
                 let mut primary = PrimaryCoordinator::new(

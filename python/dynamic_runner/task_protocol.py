@@ -63,6 +63,13 @@ class TaskTypeSpec:
     estimator_attr: str = "estimate_memory"
     timeout_seconds: float | None = None
     reserved_memory_per_worker: int = 0
+    # Optional global concurrency cap for items of this type. `None`
+    # means unconstrained — the historical behaviour. When set, the
+    # primary scheduler refuses to dispatch more than `max_concurrent`
+    # items of this type concurrently across all workers; useful for
+    # capping a compile-heavy type at e.g. `cores // 4` while letting
+    # cheap IO-bound types run at the full `--jobs` width.
+    max_concurrent: int | None = None
 
 
 @dataclass(frozen=True)

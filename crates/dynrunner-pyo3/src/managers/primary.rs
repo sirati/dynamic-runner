@@ -59,6 +59,11 @@ pub(crate) struct PyPrimaryCoordinator {
     /// extraction-cache resolution and treats `local_path` as an
     /// opaque worker identifier when False.
     uses_file_based_items: bool,
+    /// Per-type concurrency caps, harvested from each
+    /// `TaskTypeSpec.max_concurrent` at construction. Empty when no
+    /// type declares a cap. Forwarded to `PrimaryConfig` so the
+    /// scheduler refuses to dispatch beyond the cap.
+    max_concurrent_per_type: std::collections::HashMap<dynrunner_core::TypeId, u32>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B).
     task_definition: Py<PyAny>,
@@ -103,6 +108,7 @@ impl PyPrimaryCoordinator {
             pending_stage_files: Vec::new(),
             source_pre_staged_root,
             uses_file_based_items,
+            max_concurrent_per_type: topology.max_concurrent_per_type,
             task_definition: task_definition.clone().unbind(),
         })
     }
@@ -207,6 +213,7 @@ impl PyPrimaryCoordinator {
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let uses_file_based_items = self.uses_file_based_items;
+        let max_concurrent_per_type = self.max_concurrent_per_type.clone();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -300,6 +307,7 @@ impl PyPrimaryCoordinator {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     source_pre_staged_root,
                     uses_file_based_items,
+                    max_concurrent_per_type: max_concurrent_per_type.clone(),
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =

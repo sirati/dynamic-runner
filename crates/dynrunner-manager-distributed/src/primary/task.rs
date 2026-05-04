@@ -53,7 +53,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 // for this worker; the scheduler picks the index, the
                 // pool commits the take.
                 let global_wid = self.workers[idx].worker_id;
-                let view = self.pool().view_for_worker(global_wid);
+                let view = self.cap_filter_view(self.pool().view_for_worker(global_wid));
                 if !view.is_empty() {
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
@@ -76,6 +76,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     } = decision
                     {
                         let binary = self.pool_mut().take_from_view(view, binary_index);
+                        self.reserve_type_slot(&binary.type_id);
                         let sec_id = self.workers[idx].secondary_id.clone();
                         self.workers[idx].current_task = Some(binary.clone());
                         self.workers[idx].estimated_resources = estimated_usage;
@@ -125,15 +126,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             self.completed_tasks.insert(task_hash);
 
             // Mark the specific worker idle using secondary_id + local worker_id.
-            // Capture the phase of the just-finished item so we can fold it
-            // into per-phase counters and run the phase lifecycle cascade.
-            let mut completed_phase: Option<dynrunner_core::PhaseId> = None;
+            // Capture the phase + type of the just-finished item so we
+            // can fold it into per-phase counters, release the
+            // per-type concurrency slot, and run the phase lifecycle
+            // cascade.
+            let mut completed_meta: Option<(dynrunner_core::PhaseId, dynrunner_core::TypeId)> =
+                None;
             let mut local_idx: u32 = 0;
             for w in &mut self.workers {
                 if w.secondary_id == secondary_id {
                     if local_idx == worker_id {
                         if let Some(task) = w.current_task.take() {
-                            completed_phase = Some(task.phase_id.clone());
+                            completed_meta = Some((task.phase_id.clone(), task.type_id.clone()));
                         }
                         w.estimated_resources = ResourceMap::new();
                         w.is_idle = true;
@@ -143,7 +147,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
-            if let Some(phase) = completed_phase {
+            if let Some((phase, type_id)) = completed_meta {
+                self.release_type_slot(&type_id);
                 self.note_item_completed(&phase);
             }
 
@@ -188,6 +193,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 // at the FRONT of the bucket — same retry semantics as the
                 // pre-pool Vec push, just bucket-aware.
                 if let Some(binary) = recovered_binary {
+                    self.release_type_slot(&binary.type_id);
                     tracing::info!(
                         secondary = %secondary_id,
                         worker_id,
@@ -204,6 +210,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 // the phase counter so on_phase_end fires correctly.
                 self.failed_tasks.insert(task_hash);
                 if let Some(binary) = recovered_binary {
+                    self.release_type_slot(&binary.type_id);
                     self.note_item_failed(&binary.phase_id);
                 }
             }
