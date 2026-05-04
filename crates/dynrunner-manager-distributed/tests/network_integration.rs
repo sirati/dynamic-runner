@@ -30,8 +30,15 @@ impl ResourceEstimator<TestId> for FixedEstimator {
 }
 
 fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    // Absolute path (despite no real file backing it) — the integration
+    // test fixtures don't configure src_network, and dispatch.rs's
+    // unresolvable-task guard fail-loud-rejects relative local_paths
+    // when the secondary has no staging dir. Tests that only exercise
+    // the dispatch wire flow (fake worker doesn't actually open the
+    // file) are happy with any absolute path; using `/tmp/<name>`
+    // keeps the fixture trivial and survives that guard.
     TaskInfo {
-        path: std::path::PathBuf::from(name),
+        path: std::path::PathBuf::from(format!("/tmp/{name}")),
         size,
         identifier: TestId { name: name.into() },
         phase_id: PhaseId::from("default"),
