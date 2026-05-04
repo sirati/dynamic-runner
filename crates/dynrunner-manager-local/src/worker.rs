@@ -182,7 +182,18 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             .ok_or_else(|| "worker not in Idle state".to_string())?;
 
         let relative_path = binary.path.to_string_lossy().into_owned();
-        match idle.assign_task(relative_path).await {
+        // Forward the consumer's per-task payload (TaskInfo.payload,
+        // an opaque JSON value) to the worker as a serialised
+        // string. Null payloads ride the legacy single-line wire
+        // path; non-null payloads are wrapped per FR-3 so the
+        // worker can read them without an additional filesystem
+        // hop.
+        let payload = if binary.payload.is_null() {
+            None
+        } else {
+            Some(binary.payload.to_string())
+        };
+        match idle.assign_task(relative_path, payload).await {
             AssignResult::Assigned(processing) => {
                 // Spawn a background task that polls the worker protocol.
                 let worker_id = self.worker_id;

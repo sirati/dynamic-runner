@@ -134,15 +134,13 @@ mod tests {
         let mut runner = unsafe { SocketpairRunnerEnd::from_raw_fd(child_fd).unwrap() };
 
         manager
-            .send(Command::ProcessTask {
-                relative_path: "test/bin".into(),
-            })
+            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None })
             .await
             .unwrap();
 
         let cmd = runner.recv().await.unwrap();
         match cmd {
-            Command::ProcessTask { relative_path } => {
+            Command::ProcessTask { relative_path, .. } => {
                 assert_eq!(relative_path, "test/bin");
             }
             _ => panic!("expected ProcessTask"),
@@ -193,9 +191,7 @@ mod tests {
 
         // Manager sends task
         manager
-            .send(Command::ProcessTask {
-                relative_path: "a/b".into(),
-            })
+            .send(Command::ProcessTask { relative_path: "a/b".into(), payload: None })
             .await
             .unwrap();
 

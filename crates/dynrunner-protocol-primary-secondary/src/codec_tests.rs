@@ -244,6 +244,7 @@ fn roundtrip_all_message_types() {
         },
         DistributedMessage::InitialAssignment {
             pre_staged_mode: false,
+            uses_file_based_items: true,
             sender_id: "p".into(),
             timestamp: 0.0,
             secondary_id: "s".into(),

@@ -71,9 +71,24 @@ pub enum WaitReadyResult<M: ManagerEndpoint> {
 }
 
 impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
-    /// Transition: Idle -> Processing (send ProcessTask command)
-    pub async fn assign_task(mut self, relative_path: String) -> AssignResult<M> {
-        let cmd = Command::ProcessTask { relative_path };
+    /// Transition: Idle -> Processing (send ProcessTask command).
+    ///
+    /// `payload` is the consumer's opaque per-task data forwarded
+    /// from `TaskInfo.payload`; pass `None` for tasks with no
+    /// payload (the wire then collapses to the legacy `<path>\n`
+    /// form). When `Some`, the worker can read it via the
+    /// `payload` field of the parsed `ProcessTask` command and
+    /// skip a per-task filesystem read entirely (the FR-3 use
+    /// case for `uses_file_based_items=False` consumers).
+    pub async fn assign_task(
+        mut self,
+        relative_path: String,
+        payload: Option<String>,
+    ) -> AssignResult<M> {
+        let cmd = Command::ProcessTask {
+            relative_path,
+            payload,
+        };
         match self.transport.send(cmd).await {
             Ok(()) => AssignResult::Assigned(RunnerProtocol {
                 _state: PhantomData,

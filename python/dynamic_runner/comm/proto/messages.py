@@ -1,3 +1,4 @@
+import json
 import pickle
 from dataclasses import dataclass
 from enum import Enum
@@ -27,12 +28,31 @@ class StopCommand(Command):
 
 @dataclass
 class ProcessBinaryCommand(Command):
-    """Command to process a binary file."""
+    """Command to process a binary file.
+
+    `relative_path` is the worker-facing identifier the framework
+    passed through verbatim — for file-based tasks it's a real path
+    the worker opens; for `uses_file_based_items=False` tasks (FR-2)
+    it's an opaque identifier the worker resolves however it wants.
+
+    `payload` is the consumer's per-item data attached to the
+    original `TaskInfo.payload`, serialised as a JSON string. `None`
+    means "the task carries no payload" (legacy wire form). Workers
+    that want the parsed value can `json.loads(cmd.payload)`.
+    """
 
     relative_path: str
+    payload: str | None = None
 
     def serialize(self) -> bytes:
-        return f"{self.relative_path}\n".encode("utf-8")
+        if self.payload is None:
+            return f"{self.relative_path}\n".encode("utf-8")
+        # Wrap path + payload as a JSON object on the new
+        # `task:`-prefixed wire form. `json.dumps` emits a single
+        # line (no newlines) so this is safe to embed in the
+        # line-delimited protocol.
+        wrapper = json.dumps({"path": self.relative_path, "payload": self.payload})
+        return f"task:{wrapper}\n".encode("utf-8")
 
 
 @dataclass
@@ -120,6 +140,20 @@ def parse_command(data: str) -> Command | None:
 
     if data == "stop":
         return StopCommand()
+
+    if data.startswith("task:"):
+        # New wire form (FR-3): `task:<json {path, payload}>`. Falls
+        # back to legacy interpretation if the JSON is malformed
+        # (treat the whole line as a literal path) — defensive,
+        # symmetric with the Rust codec's behaviour.
+        try:
+            wrapper = json.loads(data[len("task:"):])
+            return ProcessBinaryCommand(
+                relative_path=wrapper.get("path", ""),
+                payload=wrapper.get("payload"),
+            )
+        except (json.JSONDecodeError, AttributeError):
+            pass
 
     return ProcessBinaryCommand(relative_path=data)
 

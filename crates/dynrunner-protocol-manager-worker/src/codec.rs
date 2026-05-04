@@ -20,11 +20,33 @@ struct WorkerExceptionWire {
 ///
 /// Format:
 ///   "stop\n"
-///   "<relative_path>\n"
+///   "<relative_path>\n"                          (legacy ProcessTask, no payload)
+///   "task:<json {path, payload}>\n"              (new ProcessTask with payload)
+///
+/// The `task:` prefix routes the new form. Legacy paths starting
+/// with the literal string `task:` would collide; in practice
+/// paths don't, and consumers that need payload-bearing dispatch
+/// opt in via `Some(payload)` knowing they shouldn't emit
+/// `task:`-prefixed paths in the same run.
 pub fn serialize_command(cmd: &Command) -> Vec<u8> {
     match cmd {
         Command::Stop => b"stop\n".to_vec(),
-        Command::ProcessTask { relative_path } => format!("{relative_path}\n").into_bytes(),
+        Command::ProcessTask {
+            relative_path,
+            payload: None,
+        } => format!("{relative_path}\n").into_bytes(),
+        Command::ProcessTask {
+            relative_path,
+            payload: Some(payload),
+        } => {
+            let wrapper = serde_json::json!({
+                "path": relative_path,
+                "payload": payload,
+            });
+            // serde_json compact never emits newlines, so this is
+            // safe to embed in a single line.
+            format!("task:{}\n", wrapper).into_bytes()
+        }
     }
 }
 
@@ -39,8 +61,31 @@ pub fn parse_command(line: &str) -> Option<Command> {
     if line == "stop" {
         return Some(Command::Stop);
     }
+    if let Some(rest) = line.strip_prefix("task:") {
+        // New form: task:<json {path, payload}>. Falls back to
+        // legacy interpretation if the JSON is malformed (treat the
+        // whole line as a literal path) — defensive, since a
+        // legacy emitter that happened to send a `task:`-prefixed
+        // path would otherwise hit a parse error here.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) {
+            let path = value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned();
+            let payload = value
+                .get("payload")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+            return Some(Command::ProcessTask {
+                relative_path: path,
+                payload,
+            });
+        }
+    }
     Some(Command::ProcessTask {
         relative_path: line.to_owned(),
+        payload: None,
     })
 }
 

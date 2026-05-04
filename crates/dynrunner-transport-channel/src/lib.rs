@@ -193,15 +193,13 @@ mod tests {
         let (mut manager, mut runner) = channel_pair();
 
         manager
-            .send(Command::ProcessTask {
-                relative_path: "test/bin".into(),
-            })
+            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None })
             .await
             .unwrap();
 
         let cmd = runner.recv().await.unwrap();
         match cmd {
-            Command::ProcessTask { relative_path } => {
+            Command::ProcessTask { relative_path, .. } => {
                 assert_eq!(relative_path, "test/bin");
             }
             _ => panic!("expected ProcessTask"),
