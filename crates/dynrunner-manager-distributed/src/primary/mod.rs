@@ -270,6 +270,15 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
 
+    /// True after this primary has handed off authority via
+    /// `PromotePrimary`. While demoted, the operational loop runs in
+    /// observer mode: it still receives messages (so completion
+    /// forwards keep `completed_tasks` accurate for the run-done
+    /// counter check), but stops dispatching, stops kickstarting,
+    /// and stops running heartbeat-driven requeue. The promoted
+    /// secondary is the sole authoritative primary thereafter.
+    pub(super) demoted: bool,
+
     // Stage-file notifications queued before `run()` (or during init,
     // before secondary connections are up). Flushed once the welcome
     // + peer-connect handshake completes — at that point `send_to`
@@ -306,6 +315,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             slurm_primary_id: None,
+            demoted: false,
             pending_stage_files: Vec::new(),
         }
     }
