@@ -110,59 +110,67 @@ where
                             // dispatch. Dataset peer reported this
                             // on the dev-box-primary scenario.
                             let peers = self.peer_transport.peer_count();
+
+                            // SLURM-primary path: once this secondary has
+                            // been promoted, the local-machine primary's
+                            // transport closing is BENIGN regardless of peer
+                            // count. The promoted secondary owns the task
+                            // pool authoritatively (per the post-demotion
+                            // contract: `lifecycle.rs` demotes the local
+                            // primary on `PromotePrimary`, after which the
+                            // local side is purely advisory). Two failure
+                            // modes the framework hit before this guard:
+                            //   1. `peers == 0` branch: tokenizer's cohort-5
+                            //      run exited with `completed=19/216` when
+                            //      the local primary went silent ~30min in
+                            //      — the legacy `pending_local` heuristic
+                            //      conditioned termination on WORK STATE
+                            //      (slurm_in_flight / active_tasks /
+                            //      slurm_pending) instead of ROLE STATE
+                            //      and went wrong when those were
+                            //      momentarily empty. Fixed in 5f6a267.
+                            //   2. `peers > 0` branch: dataset's K=2 run
+                            //      had sec-0 (the promoted SLURM-primary)
+                            //      enter "switching to failover detection
+                            //      (election will run via peer mesh ...
+                            //      once a peer is promoted)" — i.e. it
+                            //      tried to elect a primary as if it
+                            //      weren't already the elected one. ~3min
+                            //      later sec-0 itself died with "transport
+                            //      writer task exited" (likely from the
+                            //      bogus self-election state churn) and
+                            //      cascaded its peers into bail. Fixed
+                            //      here, in this commit.
+                            //
+                            // Pull the `is_slurm_primary` check OUT of the
+                            // peer-count branches so BOTH cases benefit:
+                            // a promoted secondary should never re-enter
+                            // election just because its bootstrap-time
+                            // primary went away. Termination is owned by
+                            // the natural terminal conditions
+                            // (total-tasks / fleet-dead-analogue), NOT by
+                            // the local primary's transport state.
+                            if self.is_slurm_primary {
+                                tracing::info!(
+                                    connected_peers = peers,
+                                    in_flight = self.slurm_in_flight.len(),
+                                    active = self.active_tasks.len(),
+                                    pending = self.slurm_pending_len(),
+                                    "local primary disconnected; SLURM-primary continues \
+                                     independently — this node owns the pool, local \
+                                     primary's exit is benign post-promotion (no failover \
+                                     election needed; this node IS the promoted primary)"
+                                );
+                                self.primary_disconnected = true;
+                                // Don't break: keep iterating so worker
+                                // events and any reconnecting peers land.
+                                // Termination is owned by the pool-drained
+                                // / total-tasks checks elsewhere in the
+                                // loop.
+                                continue;
+                            }
+
                             if peers == 0 {
-                                // Once this secondary has been promoted to
-                                // SLURM-primary, the local primary's transport
-                                // closing is a benign event — the SLURM-primary
-                                // owns the task pool authoritatively (per the
-                                // post-demotion contract: `lifecycle.rs` demotes
-                                // the local primary on PromotePrimary, after
-                                // which the local side is purely advisory).
-                                // The previous heuristic — gate the exit on
-                                // `pending_local` (`slurm_in_flight` or
-                                // `active_tasks` or `slurm_pending` non-empty)
-                                // — was a pre-refactor leftover from when the
-                                // local primary held authority. It depends on
-                                // WORK STATE rather than ROLE STATE, and goes
-                                // wrong when the SLURM-primary momentarily
-                                // empties all three (e.g. its initial-batch
-                                // tasks completed, its peers timed out with
-                                // `recovered_in_flight=0` so nothing is
-                                // dispatchable, and `slurm_pending` is full
-                                // of free-pool tasks but indistinguishable
-                                // from "drained" by this guard's view of
-                                // `slurm_pending_is_empty()`). Tokenizer's
-                                // cohort-5 dispatch hit exactly this: the
-                                // SLURM-primary processed 19 of its own
-                                // initial-batch tasks, the local primary went
-                                // silent ~30min in, and the secondary exited
-                                // with `completed=19/216` despite holding
-                                // pool authority.
-                                //
-                                // Post-refactor rule: SLURM-primary's run
-                                // lifetime is bounded by the natural terminal
-                                // conditions (total counter / fleet_dead_timeout
-                                // analogue), NOT by the local primary's
-                                // transport state. Stay alive unconditionally
-                                // when promoted; let pool-level checks decide
-                                // termination.
-                                if self.is_slurm_primary {
-                                    tracing::info!(
-                                        in_flight = self.slurm_in_flight.len(),
-                                        active = self.active_tasks.len(),
-                                        pending = self.slurm_pending_len(),
-                                        "local primary disconnected; SLURM-primary continues \
-                                         independently — this node owns the pool, local \
-                                         primary's exit is benign post-promotion"
-                                    );
-                                    self.primary_disconnected = true;
-                                    // Don't break: keep iterating so
-                                    // worker events and any reconnecting
-                                    // peers land. Termination is owned by
-                                    // the pool-drained / total-tasks checks
-                                    // elsewhere in the loop.
-                                    continue;
-                                }
                                 tracing::info!(
                                     "primary disconnected and no peer mesh; exiting cleanly \
                                      (no failover candidate to take authority)"
