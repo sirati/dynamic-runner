@@ -45,6 +45,19 @@ class SSHGateway:
                 "ControlMaster=auto",
                 "-o",
                 "ControlPersist=yes",
+                # Default-on keepalive on the long-lived master
+                # connection so the underlying TCP socket stays
+                # warm through quiet periods. Same rationale as
+                # the per-secondary reverse tunnel in
+                # preparation.py — an idle ssh socket that's been
+                # NAT-timed-out can sit "established" on both ends
+                # while writes silently fail.
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "TCPKeepAlive=yes",
             ]
         )
 

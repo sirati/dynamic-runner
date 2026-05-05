@@ -281,6 +281,23 @@ class SlurmPreparation:
                 "StrictHostKeyChecking=no",
                 "-o",
                 "UserKnownHostsFile=/dev/null",
+                # Default-on keepalive on long-lived ssh tunnels.
+                # Sends an application-layer probe every 30s and
+                # tolerates 3 missed probes before the local ssh
+                # exits. With these flags the tunnel survives quiet
+                # periods (e.g. NAT idle-timeouts on consumer
+                # routers) without relying on app-layer traffic to
+                # keep the connection warm; without them an idle
+                # tunnel can sit "established" on both ends while
+                # the underlying socket is silently dead. Mirrored
+                # in ssh_gateway.py for the persistent master
+                # connection.
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "TCPKeepAlive=yes",
             ]
         )
 
