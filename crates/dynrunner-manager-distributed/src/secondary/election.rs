@@ -102,12 +102,50 @@ where
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(false);
 
+        // Cascade election trigger: if a SLURM-primary peer was
+        // promoted (slurm_primary_peer_id is set to a peer, not
+        // ourselves) and that peer's keepalives have gone stale,
+        // we need to run a fresh election regardless of whether
+        // the local-machine primary is still alive. Pre-fix, the
+        // election only fired on local-primary silence — so when
+        // a promoted peer like sec-0 died but the local primary
+        // was still streaming keepalives to other secondaries,
+        // those secondaries observed the disconnect, dropped sec-0
+        // from peer_keepalives, and then sat idle forever
+        // because primary_silent stayed false. Dataset's K=2 run
+        // hit exactly this: 4 surviving secondaries with no
+        // SLURM-primary, no election attempt, no logged "SLURM-
+        // primary assigned" lines on any of them.
+        //
+        // A peer is considered the silent SLURM-primary when:
+        //   - slurm_primary_peer_id is set (a promotion happened)
+        //   - the id is NOT ourselves (we'd be Promoted, handled above)
+        //   - its peer_keepalives entry is missing OR its
+        //     timestamp is older than `deadline`
+        let slurm_primary_silent = self
+            .slurm_primary_peer_id
+            .as_ref()
+            .filter(|id| id.as_str() != self.config.secondary_id)
+            .map(|id| {
+                self.peer_keepalives
+                    .get(id)
+                    .map(|t| (timestamp_now() - t) > deadline.as_secs_f64())
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+
+        let need_election = primary_silent || slurm_primary_silent;
+
         match &self.election {
-            ElectionState::Normal if primary_silent => {
+            ElectionState::Normal if need_election => {
                 tracing::warn!(
                     secondary = %self.config.secondary_id,
                     miss_threshold = self.config.keepalive_miss_threshold,
-                    "primary missed keepalives; entering Suspecting"
+                    primary_silent,
+                    slurm_primary_silent,
+                    slurm_primary_peer = ?self.slurm_primary_peer_id,
+                    "primary or SLURM-primary peer missed keepalives; \
+                     entering Suspecting"
                 );
                 self.election = ElectionState::Suspecting {
                     since: Instant::now(),
