@@ -318,6 +318,101 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         Ok(())
     }
 
+    // ── Phase 6.5: Wait for secondary peer-meshes to settle ──
+
+    /// Block on every connected secondary reporting `MeshReady`
+    /// before letting `promote_slurm_primary` fire. The 750µs gap
+    /// between "all secondaries cert-exchanged" and the previous
+    /// promotion call left the SLURM-promoted secondary
+    /// authoritative against a still-forming peer mesh — every
+    /// pre-mesh-formation message went into the void for the
+    /// 30s peer-dial budget. Closing the gap means waiting until
+    /// each secondary has signalled its mesh has settled (mesh
+    /// formed, watchdog elapsed, or no peers were expected for
+    /// single-secondary).
+    ///
+    /// Bounded by `config.mesh_ready_timeout` (default 60s):
+    /// stragglers past the deadline log a warning and the run
+    /// proceeds anyway. A buggy secondary that never emits
+    /// `MeshReady` must not be able to deadlock the entire
+    /// dispatch pipeline; the post-promotion paths are all
+    /// already failure-tolerant against an absent peer.
+    ///
+    /// Cancellation safety: `transport.recv` is the cancel-safe
+    /// mpsc bridge; `sleep_until` is one-shot cancel-safe per
+    /// tokio docs. The `select!` here mirrors the same shape
+    /// `wait_for_connections` uses one phase up.
+    pub(super) async fn wait_for_mesh_ready(&mut self) -> Result<(), String> {
+        // The expected set is the live-secondaries set captured
+        // AT this moment (post-quorum, post-cert-exchange). It is
+        // not `config.num_secondaries` because the connect phase
+        // may have dropped no-show secondaries on its own
+        // timeout — we only wait for who's actually here.
+        let expected: HashSet<String> = self.secondaries.keys().cloned().collect();
+        if expected.is_empty() {
+            tracing::debug!("no secondaries connected; skipping wait_for_mesh_ready");
+            return Ok(());
+        }
+
+        // Fast path: messages may have already arrived before this
+        // step ran (the welcome/cert-exchange/peer-info loop above
+        // is event-driven and a fast secondary can emit MeshReady
+        // before we enter the wait).
+        if expected.is_subset(&self.mesh_ready_secondaries) {
+            tracing::info!(
+                count = expected.len(),
+                "all secondaries reported MeshReady before wait step"
+            );
+            return Ok(());
+        }
+
+        let deadline = tokio::time::Instant::now() + self.config.mesh_ready_timeout;
+        tracing::info!(
+            expected = expected.len(),
+            already_reported = self.mesh_ready_secondaries.len(),
+            timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
+            "waiting for peer-mesh formation across secondary fleet before \
+             promoting SLURM-primary"
+        );
+
+        loop {
+            if expected.is_subset(&self.mesh_ready_secondaries) {
+                tracing::info!(
+                    count = expected.len(),
+                    "all secondaries reported MeshReady; releasing PromotePrimary"
+                );
+                return Ok(());
+            }
+
+            tokio::select! {
+                msg = self.transport.recv() => {
+                    match msg {
+                        Some(m) => self.dispatch_message(m).await?,
+                        None => return Err("transport closed during wait_for_mesh_ready".into()),
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let missing: Vec<String> = expected
+                        .difference(&self.mesh_ready_secondaries)
+                        .cloned()
+                        .collect();
+                    tracing::warn!(
+                        missing = ?missing,
+                        reported = self.mesh_ready_secondaries.len(),
+                        expected = expected.len(),
+                        timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
+                        "mesh-ready timeout: some secondaries never reported \
+                         MeshReady; proceeding with PromotePrimary anyway. The \
+                         SLURM-promoted secondary may briefly route into a \
+                         partially-formed peer mesh until those secondaries \
+                         finish (or fail) their dials."
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // ── Phase 7: Promote SLURM-primary ──
 
     pub(super) async fn promote_slurm_primary(&mut self) -> Result<(), String> {

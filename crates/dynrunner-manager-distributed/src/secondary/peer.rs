@@ -195,7 +195,7 @@ where
     ///
     /// `peer_count()` already calls `drain_new_connections` so this
     /// reads the freshest state.
-    pub(super) fn check_peer_mesh_watchdog(&mut self) {
+    pub(super) async fn check_peer_mesh_watchdog(&mut self) {
         let deadline = match self.peer_mesh_check_at {
             Some(d) => d,
             None => return,
@@ -206,6 +206,10 @@ where
         let connected = self.peer_transport.peer_count();
         if connected > 0 {
             self.peer_mesh_check_at = None;
+            // Mesh formed for the first time — tell the primary so
+            // it can release `PromotePrimary`. Idempotent via
+            // `mesh_ready_sent`.
+            self.report_mesh_ready_if_needed().await;
             return;
         }
         if std::time::Instant::now() < deadline {
@@ -222,6 +226,77 @@ where
              peer-broadcast bookkeeping are degraded."
         );
         self.peer_mesh_check_at = None;
+        // Still report mesh-ready (with peer_count=0): the primary's
+        // wait step shouldn't deadlock just because peer dials never
+        // landed. The run already chose to keep going in degraded
+        // mode (above WARN); the primary now also stops blocking on
+        // `PromotePrimary`.
+        self.report_mesh_ready_if_needed().await;
+    }
+
+    /// Single source of truth for "have we told the primary the
+    /// peer-mesh is settled?". Idempotent: the first call that
+    /// observes a settled state (mesh formed, watchdog elapsed, or
+    /// no peers were ever expected — i.e. single-secondary) emits
+    /// `MeshReady` and flips the one-shot guard so subsequent calls
+    /// are no-ops.
+    ///
+    /// Concern owned here, not at call sites: callers (the keepalive
+    /// tick's `check_peer_mesh_watchdog` and the operational-loop
+    /// entry hook) shouldn't have to know the rules — they just say
+    /// "now's a moment the mesh state may have changed; report if
+    /// anything to report". This keeps the modular boundary clean
+    /// (peer.rs owns peer-mesh status; processing.rs just calls).
+    pub(super) async fn report_mesh_ready_if_needed(&mut self) {
+        if self.mesh_ready_sent {
+            return;
+        }
+        // Three reportable states, all coalesced by this single
+        // helper:
+        //   - peer_dial_count == 0: no peers were expected (single-
+        //     secondary run, or empty PeerInfo). Mesh is trivially
+        //     "ready" the moment we reach the operational loop.
+        //   - peer_count > 0: at least one dial landed; mesh has
+        //     formed (further peers may keep arriving but the
+        //     primary just needs the first non-empty signal).
+        //   - peer_mesh_check_at is None AND peer_dial_count > 0:
+        //     the watchdog has already cleared the deadline (either
+        //     mesh formed, in which case the previous branch fired,
+        //     or it elapsed with zero peers). The fully-failed case
+        //     still reports so the primary doesn't wait the full
+        //     mesh-ready timeout for nothing.
+        let connected = self.peer_transport.peer_count() as u32;
+        let no_peers_expected = self.peer_dial_count == 0;
+        let mesh_formed = connected > 0;
+        let watchdog_done =
+            self.peer_dial_count > 0 && self.peer_mesh_check_at.is_none();
+        if !(no_peers_expected || mesh_formed || watchdog_done) {
+            return;
+        }
+        let msg: DistributedMessage<I> = DistributedMessage::MeshReady {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            peer_count: connected,
+        };
+        if let Err(e) = self.send_to_current_primary(msg).await {
+            // Best-effort: log and flip the flag anyway so we
+            // don't busy-retry on every keepalive tick. The
+            // primary's wait step will time out (warning, not a
+            // hard error — see lifecycle.rs `wait_for_mesh_ready`)
+            // and the run continues.
+            tracing::warn!(
+                error = %e,
+                "failed to send MeshReady to primary; primary will fall back to \
+                 mesh-ready timeout before promoting SLURM-primary"
+            );
+        } else {
+            tracing::debug!(
+                connected,
+                "MeshReady sent to primary"
+            );
+        }
+        self.mesh_ready_sent = true;
     }
 
     /// Check for peer timeouts based on keepalive tracking. When this
