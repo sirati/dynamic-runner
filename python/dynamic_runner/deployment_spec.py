@@ -76,6 +76,32 @@ class TaskDeploymentSpec:
     # before secondaries try to connect.
     extra_port_forwards: tuple[tuple[int, int], ...] = field(default_factory=tuple)
 
+    # Additional flags interpolated into the SLURM wrapper's
+    # ``podman run`` invocation, BEFORE the ``{image_name}:{image_tag}``
+    # argument and AFTER the framework's own flags (``--pull=never``,
+    # ``--network=host``, the auto-derived ``--memory`` cap, the
+    # ``-e PRIMARY_NODE_IPV{4,6}`` env hints, the standard ``-v``
+    # volume mounts). Intended as a consumer-controlled escape hatch
+    # for *workload-dependent* podman flags the framework can't
+    # auto-derive from system state — e.g. ``--pids-limit=16384`` for
+    # a fanout-heavy autotools build that hits Krater rootless
+    # podman's 2048 PID default, ``--ulimit=nofile=...``, extra
+    # ``--cap-add``/``--cap-drop``, etc. Each entry is bash-quoted
+    # via :func:`shlex.quote` when interpolated, so values containing
+    # spaces or shell-metacharacters survive intact.
+    #
+    # Do NOT set ``--memory`` / ``--memory-swap`` here: the wrapper
+    # auto-caps container memory at ``NodeRAM - 2GiB`` (probed at
+    # wrapper-execution time on the compute node), and a duplicate
+    # flag from this hook would conflict / silently override that
+    # cap. Do NOT set ``--network`` here either: the wrapper sets
+    # ``--network=host`` unconditionally for the SLURM case.
+    #
+    # The framework treats every entry as opaque and makes no
+    # validation; misconfigured flags surface as a ``podman run``
+    # error inside the SLURM job, not at submit time.
+    extra_run_args: tuple[str, ...] = field(default_factory=tuple)
+
     @property
     def effective_job_name_prefix(self) -> str:
         """SLURM job name prefix, defaulting to ``image_name``."""
