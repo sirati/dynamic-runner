@@ -101,11 +101,43 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
 }
 
 /// Simulate a secondary that sends welcome + cert, then echoes
-/// assignments as completions.
+/// assignments as completions. Convenience wrapper around
+/// [`fake_secondary_with_addrs`] using the historical
+/// `(ipv4=127.0.0.1, ipv6=None)` defaults — kept so existing tests
+/// don't have to thread address arguments they don't care about.
 pub(super) async fn fake_secondary(
     secondary_id: String,
     num_workers: u32,
     ram_bytes: u64,
+    incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    fake_secondary_with_addrs(
+        secondary_id,
+        num_workers,
+        ram_bytes,
+        Some("127.0.0.1".into()),
+        None,
+        incoming_from_primary,
+        outgoing_to_primary,
+    )
+    .await
+}
+
+/// Like [`fake_secondary`] but parametrised on the `(ipv4, ipv6)` pair
+/// the secondary advertises in its `CertExchange`. Used by tests that
+/// inspect the primary-side `PeerInfo` broadcast: dropping `ipv6` here
+/// at the typestate level was the cause of an empty
+/// happy-eyeballs candidate set for every cross-secondary dial, so
+/// the round-trip through `handle_cert_exchange` →
+/// `SecondaryConnectionState` → `peer_setup` is the load-bearing path
+/// to pin.
+pub(super) async fn fake_secondary_with_addrs(
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    ipv4: Option<String>,
+    ipv6: Option<String>,
     mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) {
@@ -129,8 +161,8 @@ pub(super) async fn fake_secondary(
             timestamp: 0.0,
             secondary_id: secondary_id.clone(),
             public_cert_pem: "FAKE_CERT".into(),
-            ipv4_address: Some("127.0.0.1".into()),
-            ipv6_address: None,
+            ipv4_address: ipv4,
+            ipv6_address: ipv6,
             quic_port: 5000,
         })
         .unwrap();
