@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
@@ -72,6 +72,47 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             if self.pool().is_run_complete() && active_workers == 0 {
                 tracing::info!("pool drained and no active workers");
                 break;
+            }
+
+            // Fleet-dead detection. When every secondary has been
+            // declared dead (via `requeue_dead_secondary`) and the
+            // pool still has pending work, the loop would otherwise
+            // sit forever waiting for events that no living
+            // secondary can send. Track the first moment the fleet
+            // is empty-but-pool-has-work; after
+            // `config.fleet_dead_timeout` of continuous emptiness,
+            // exit cleanly with pending tasks marked failed so the
+            // operator gets a clear failure rather than a silent
+            // idle. Cleared the moment a secondary is present
+            // again (re-handshake / partial fleet survival).
+            //
+            // Tokenizer surfaced this on cohort-3 where SSH-tunnel
+            // blips killed all 5 secondaries at once and the run
+            // sat idle until manually killed.
+            if self.secondaries.is_empty() && !self.pool().is_empty() {
+                let now = Instant::now();
+                let since = *self.fleet_dead_since.get_or_insert(now);
+                let elapsed = now.duration_since(since);
+                if elapsed >= self.config.fleet_dead_timeout {
+                    let pending = self.pool_mut().drain_queued();
+                    tracing::error!(
+                        elapsed_s = elapsed.as_secs_f64(),
+                        timeout_s = self.config.fleet_dead_timeout.as_secs_f64(),
+                        marking_failed = pending.len(),
+                        "fleet-dead timeout: every secondary gone with non-empty pool; \
+                         marking pending tasks failed and exiting operational loop"
+                    );
+                    for binary in pending {
+                        let hash = compute_task_hash(&binary);
+                        self.failed_tasks.insert(hash);
+                    }
+                    break;
+                }
+            } else {
+                // Fleet recovered (or never went empty); clear the
+                // grace-period clock so a subsequent fleet-dead
+                // event measures from its own start, not an old one.
+                self.fleet_dead_since = None;
             }
 
             // Use a timeout on recv to avoid stalling indefinitely if a

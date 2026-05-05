@@ -135,6 +135,7 @@ async fn e2e_primary_secondary_over_wss() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -239,6 +240,7 @@ async fn e2e_primary_secondary_over_quic() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(

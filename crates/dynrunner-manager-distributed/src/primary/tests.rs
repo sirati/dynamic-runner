@@ -43,6 +43,7 @@ async fn single_secondary_processes_all_tasks() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -92,6 +93,7 @@ async fn two_secondaries_distribute_work() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -178,6 +180,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -261,6 +264,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -383,6 +387,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -485,6 +490,7 @@ async fn retry_max_passes_zero_disables_retry() {
             uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 0,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -668,6 +674,7 @@ async fn e2e_primary_and_secondary_single_node() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -741,6 +748,7 @@ async fn e2e_primary_and_two_secondaries() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -810,6 +818,7 @@ async fn live_distribution_continues_past_initial_batch() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -864,6 +873,7 @@ async fn notify_stage_file_emits_wire_message() {
                     uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, TestId> =
@@ -1018,6 +1028,7 @@ async fn e2e_pre_staged_source_mode() {
                 uses_file_based_items: true,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1093,6 +1104,7 @@ async fn e2e_uses_file_based_items_false() {
                 uses_file_based_items: false,
                 max_concurrent_per_type: std::collections::HashMap::new(),
                 retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1186,6 +1198,7 @@ async fn e2e_per_type_max_concurrent() {
                 uses_file_based_items: true,
                 max_concurrent_per_type: caps,
                 retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,

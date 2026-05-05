@@ -90,6 +90,27 @@ pub struct PrimaryConfig {
     /// failure — those tasks were never actually failed, just lost
     /// their worker.
     pub retry_max_passes: u32,
+
+    /// Grace period after every secondary in the fleet has been
+    /// declared dead (via `requeue_dead_secondary`) before the
+    /// operational loop gives up and exits cleanly with the still-
+    /// pending tasks marked failed. Default `30s`.
+    ///
+    /// Without this timer the framework idles forever when
+    /// `surviving_secondaries == 0 && pool not empty` — the
+    /// existing exit conditions (counter-based + pool-drained)
+    /// never trip because no events arrive (no secondaries left
+    /// to send TaskComplete/TaskRequest). Operator pain: have to
+    /// `kill` the primary process by hand. Surfaced in tokenizer's
+    /// cohort-3 runs where SSH-tunnel blips killed all 5
+    /// secondaries simultaneously and the run sat idle for
+    /// minutes before the operator noticed.
+    ///
+    /// Set to `Duration::ZERO` for fail-fast (exit at the moment
+    /// the fleet first goes empty). Set to a long value if a
+    /// re-sbatch path is wired into `spawn_secondary` (none today)
+    /// and you want time for replacement secondaries to come up.
+    pub fleet_dead_timeout: Duration,
 }
 
 impl Default for PrimaryConfig {
@@ -105,6 +126,7 @@ impl Default for PrimaryConfig {
             uses_file_based_items: true,
             max_concurrent_per_type: HashMap::new(),
             retry_max_passes: 1,
+            fleet_dead_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -235,6 +257,16 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// healthy).
     pub(super) backpressured_secondaries: HashMap<String, Instant>,
 
+    /// First moment (operational-loop iteration) where
+    /// `self.secondaries` became empty while the pool still has
+    /// pending work. Cleared whenever a secondary is present
+    /// (handle_welcome reconnect, etc.). After
+    /// `config.fleet_dead_timeout` of continuous emptiness, the
+    /// operational loop exits cleanly with pending tasks moved
+    /// into `failed_tasks`. See `fleet_dead_timeout` docs for the
+    /// rationale.
+    pub(super) fleet_dead_since: Option<Instant>,
+
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
 
@@ -272,6 +304,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
+            fleet_dead_since: None,
             slurm_primary_id: None,
             pending_stage_files: Vec::new(),
         }
