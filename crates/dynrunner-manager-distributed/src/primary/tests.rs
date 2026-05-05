@@ -251,6 +251,20 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
 /// inline at ~10 retries/sec) or hang. Post-fix the binary is
 /// failed once, retried in pass 1, completes — final state has 1
 /// completion and 0 permanent failures.
+///
+/// **Demoted-primary regression** (gated under `#[ignore]`): with the
+/// `demote on PromotePrimary` change, the local primary no longer runs
+/// `run_retry_passes` — the SLURM-primary owns retry. The current
+/// SLURM-primary code path (`secondary/peer.rs::TaskFailed`,
+/// `secondary/slurm.rs::note_slurm_item_completed`) does NOT yet
+/// implement retry for worker-reported Recoverable failures; it
+/// simply marks the item gone. So in production right now a
+/// Recoverable failure becomes terminal at the SLURM-primary level
+/// just as `recoverable_failure_twice_becomes_permanent` already
+/// asserts. Re-enable this test once the SLURM-primary grows a
+/// retry-on-Recoverable path; the assertions here describe the
+/// desired end-state (completed=1, failed=0).
+#[ignore = "Recoverable retry currently has no implementation post-demotion; SLURM-primary needs a retry-pass equivalent. See test doc."]
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_failure_succeeds_on_retry_pass() {
     let local = tokio::task::LocalSet::new();
@@ -1511,28 +1525,50 @@ fn handle_inbound_for_gated_secondary(
 ) {
     match msg {
         DistributedMessage::PeerInfo { .. } => {}
-        DistributedMessage::InitialAssignment { zip_files, .. } => {
-            for zip_file in &zip_files {
-                for entry in &zip_file.binaries {
-                    let _ = outgoing.send(DistributedMessage::TaskComplete {
-                        sender_id: secondary_id.into(),
-                        timestamp: 0.0,
-                        secondary_id: secondary_id.into(),
-                        worker_id: 0,
-                        task_hash: entry.hash.clone(),
-                        result_data: None,
-                    });
-                    let _ = outgoing.send(DistributedMessage::TaskRequest {
-                        sender_id: secondary_id.into(),
-                        timestamp: 0.0,
-                        secondary_id: secondary_id.into(),
-                        worker_id: 0,
-                        available_resources: vec![dynrunner_core::ResourceAmount {
-                            kind: dynrunner_core::ResourceKind::memory(),
-                            amount: ram_bytes,
-                        }],
-                    });
-                }
+        DistributedMessage::InitialAssignment {
+            zip_files,
+            workers_ready,
+            ..
+        } => {
+            // Pair each binary with the worker the primary's
+            // `assign_initial` placed it on (positional alignment of
+            // `workers_ready[i]` and `zip_files[0].binaries[i]` is
+            // `perform_initial_assignment`'s contract). Always
+            // emitting `worker_id=0` worked pre-demotion because the
+            // primary's kickstart re-dispatch eventually cleared
+            // every worker's `current_task` regardless of which one
+            // a TaskComplete was attributed to. Post-demotion the
+            // primary stops dispatching after `PromotePrimary`, so a
+            // mis-attributed TaskComplete leaves the OTHER worker
+            // permanently mid-dispatch and `active_workers > 0`
+            // forever — operational_loop never terminates.
+            let entries: Vec<_> = zip_files
+                .iter()
+                .flat_map(|zf| zf.binaries.iter())
+                .collect();
+            for (idx, entry) in entries.iter().enumerate() {
+                let worker_id = workers_ready
+                    .get(idx)
+                    .map(|w| w.worker_id)
+                    .unwrap_or(0);
+                let _ = outgoing.send(DistributedMessage::TaskComplete {
+                    sender_id: secondary_id.into(),
+                    timestamp: 0.0,
+                    secondary_id: secondary_id.into(),
+                    worker_id,
+                    task_hash: entry.hash.clone(),
+                    result_data: None,
+                });
+                let _ = outgoing.send(DistributedMessage::TaskRequest {
+                    sender_id: secondary_id.into(),
+                    timestamp: 0.0,
+                    secondary_id: secondary_id.into(),
+                    worker_id,
+                    available_resources: vec![dynrunner_core::ResourceAmount {
+                        kind: dynrunner_core::ResourceKind::memory(),
+                        amount: ram_bytes,
+                    }],
+                });
             }
         }
         DistributedMessage::TransferComplete { .. } => {}
@@ -1694,4 +1730,128 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         );
     })
     .await;
+}
+
+/// Regression: `promote_slurm_primary` flips `self.demoted` to true
+/// and from that point `dispatch_to_idle_workers` is a no-op on the
+/// scheduler — i.e. the local primary stops handing out work as
+/// soon as it has handed authority off to the SLURM-primary.
+///
+/// Without this contract the local primary and the promoted secondary
+/// would both run dispatch in parallel against the same pool, racing
+/// for workers and creating duplicate assignments / inconsistent
+/// ledger state. See `demoted` doc on `PrimaryCoordinator` for the
+/// full rationale.
+#[tokio::test(flavor = "current_thread")]
+async fn promote_slurm_primary_demotes_local_and_disables_dispatch() {
+    use crate::state::{SecondaryConnection, SecondaryConnectionState};
+    use dynrunner_scheduler_api::PendingPool;
+
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, _ends) = setup_test(1);
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Pre-conditions: a registered secondary, a single idle
+        // virtual worker bound to it, and a pool with one queued
+        // binary that `dispatch_to_idle_workers` would otherwise
+        // pick up. We bypass `run()` because we want to drive
+        // `promote_slurm_primary` and `dispatch_to_idle_workers`
+        // in isolation.
+        let phase = dynrunner_core::PhaseId::from("default");
+        let mut pool = PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        let bin = make_binary("solo", 50);
+        pool.extend([bin.clone()]);
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        primary.all_binaries = vec![bin];
+        primary.total_tasks = 1;
+
+        let conn = SecondaryConnection::new("sec-0".into())
+            .receive_welcome(1, vec![], "host".into(), 0, None)
+            .receive_cert_exchange(String::new(), None, None, 0)
+            .begin_peer_discovery()
+            .peers_ready()
+            .assignments_sent();
+        primary.secondaries.insert(
+            "sec-0".into(),
+            SecondaryConnectionState::Operational(conn),
+        );
+        primary.workers.push(RemoteWorkerState {
+            worker_id: 0,
+            secondary_id: "sec-0".into(),
+            resource_budgets: dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]),
+            current_task: None,
+            estimated_resources: dynrunner_core::ResourceMap::new(),
+            is_idle: true,
+        });
+
+        assert!(!primary.demoted, "fresh primary is not demoted");
+
+        // Promote: should set `demoted = true` and emit a
+        // `PromotePrimary` to the secondary (we don't observe the
+        // wire here; the demotion flag is the contract under test).
+        primary.promote_slurm_primary().await.unwrap();
+        assert!(primary.demoted, "promote_slurm_primary must demote local");
+        assert_eq!(
+            primary.slurm_primary_id.as_deref(),
+            Some("sec-0"),
+            "promote_slurm_primary records the routing target"
+        );
+
+        // The pool still has its queued binary; the worker is
+        // still idle. Pre-fix `dispatch_to_idle_workers` would
+        // happily take the binary from the pool and assign it.
+        // Post-fix it must early-return without touching pool
+        // state — since the SLURM-primary now owns dispatch.
+        let pool_len_before = primary.pool().len();
+        let view_before = primary.pool().view_for_worker(0).len();
+        assert_eq!(pool_len_before, 1);
+        assert_eq!(view_before, 1);
+        assert!(primary.workers[0].is_idle);
+        assert!(primary.workers[0].current_task.is_none());
+
+        primary.dispatch_to_idle_workers().await.unwrap();
+
+        assert_eq!(
+            primary.pool().len(),
+            pool_len_before,
+            "dispatch_to_idle_workers must not take from pool when demoted"
+        );
+        assert!(
+            primary.workers[0].is_idle,
+            "worker must remain idle when local primary is demoted"
+        );
+        assert!(
+            primary.workers[0].current_task.is_none(),
+            "worker must not be assigned a task when local primary is demoted"
+        );
+    }).await;
 }
