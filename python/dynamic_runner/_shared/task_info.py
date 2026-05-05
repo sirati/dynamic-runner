@@ -35,6 +35,25 @@ class TaskInfo:
     type_id: str = ""
     affinity_id: str | None = None
     payload: dict = field(default_factory=dict)
+    # Optional consumer-supplied task identifier. Other tasks reference
+    # this from their `task_depends_on` to express a "wait for that
+    # task to complete before dispatching me" ordering constraint.
+    # `None` means the task cannot itself be referenced as a
+    # prerequisite (anonymous task); it can still have its own
+    # `task_depends_on` entries pointing at named tasks. Pick stable,
+    # readable ids (e.g. ``"toolchain__aarch64__clang15"``) so
+    # dependent tasks can reference them without re-deriving a hash.
+    task_id: str | None = None
+    # Task ids of prerequisite tasks that must terminate (success or
+    # permanent failure) before this task is eligible for dispatch.
+    # Default `()` means "no per-task ordering constraint; eligibility
+    # is governed solely by the phase state machine". Common use case:
+    # variant builds depending on their corresponding toolchain build,
+    # both in the same phase, lets the scheduler dispatch variants
+    # continuously as toolchains drain instead of barriering on the
+    # whole phase. Validated for unknown ids and cycles at run start;
+    # mismatch fails loud with the offending ids in the error.
+    task_depends_on: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def binary_name(self) -> str:
@@ -70,6 +89,8 @@ class TaskInfo:
             "type_id": self.type_id,
             "affinity_id": self.affinity_id,
             "payload": self.payload,
+            "task_id": self.task_id,
+            "task_depends_on": list(self.task_depends_on),
         }
 
 

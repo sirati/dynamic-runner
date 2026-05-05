@@ -307,6 +307,47 @@ pub struct TaskInfo<I> {
     /// Opaque per-item data passed through to the worker. The framework never
     /// inspects this; consumers can stash JSON-serializable metadata here.
     pub payload: serde_json::Value,
+    /// Optional consumer-supplied task identifier. Other tasks reference
+    /// this id from their `task_depends_on` to express a "wait for that
+    /// task to complete before dispatching me" ordering constraint.
+    /// `None` means the task cannot itself be referenced as a
+    /// prerequisite (anonymous task); it may still have its own
+    /// `task_depends_on` entries pointing at named tasks. Consumers
+    /// SHOULD pick stable, readable ids
+    /// (e.g. `"toolchain__aarch64__clang15"`) so the corresponding
+    /// dependent tasks can reference them without re-deriving a hash.
+    /// Validated for uniqueness across the run at
+    /// `PendingPool::extend` time.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Task ids of prerequisite tasks that must terminate (success
+    /// OR permanent failure) before this task is eligible for
+    /// dispatch. Default `Vec::new()` means "no per-task ordering
+    /// constraint; eligibility is governed solely by the phase
+    /// state machine".
+    ///
+    /// Dependencies are CROSS-PHASE-VALID — a task in a later phase
+    /// can depend on a task in an earlier phase; the phase barrier
+    /// already enforces the earlier phase completes first, so a
+    /// cross-phase entry just becomes a tighter (per-task) constraint.
+    /// The common use case is INTRA-PHASE: e.g. variant builds
+    /// depending on their corresponding toolchain build, with both
+    /// in the same phase, lets the scheduler dispatch variants
+    /// continuously as toolchains drain instead of barriering on
+    /// the whole phase.
+    ///
+    /// Validated at `PendingPool::extend`: every referenced id must
+    /// correspond to a task in the run, otherwise
+    /// `PendingPoolError::UnknownTaskDep` is returned. The dep
+    /// graph is also cycle-checked.
+    ///
+    /// Cascade-failure semantics: when a prerequisite task fails
+    /// permanently (Recoverable retry budget exhausted, or
+    /// NonRecoverable / OOM), every dependent task is marked failed
+    /// transitively with a synthetic upstream-failed error rather
+    /// than waiting forever for a satisfaction that will never come.
+    #[serde(default)]
+    pub task_depends_on: Vec<String>,
 }
 
 pub type TaskInput<I> = TaskInfo<I>;

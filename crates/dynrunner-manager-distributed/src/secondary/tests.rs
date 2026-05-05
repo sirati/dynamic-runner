@@ -137,6 +137,8 @@ fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         type_id: dynrunner_core::TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
+        task_id: None,
+        task_depends_on: vec![],
     }
 }
 
@@ -459,6 +461,8 @@ async fn stage_file_then_assign_task_succeeds() {
                                             type_id: "default".into(),
                                             affinity_id: None,
                                             payload_json: "null".into(),
+                                            task_id: None,
+                                            task_depends_on: vec![],
                                         },
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),
@@ -545,6 +549,8 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
+        task_id: None,
+        task_depends_on: vec![],
     };
     pool.extend(vec![item]);
 

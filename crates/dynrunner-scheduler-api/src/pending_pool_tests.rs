@@ -23,6 +23,8 @@ fn t(phase: &str, ty: &str, affinity: &str, size: u64) -> TaskInfo<()> {
             Some(AffinityId::from(affinity))
         },
         payload: serde_json::Value::Null,
+        task_id: None,
+        task_depends_on: vec![],
     }
 }
 
