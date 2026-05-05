@@ -79,16 +79,23 @@ class TaskDeploymentSpec:
     # Additional flags interpolated into the SLURM wrapper's
     # ``podman run`` invocation, BEFORE the ``{image_name}:{image_tag}``
     # argument and AFTER the framework's own flags (``--pull=never``,
-    # ``--network=host``, the auto-derived ``--memory`` cap, the
-    # ``-e PRIMARY_NODE_IPV{4,6}`` env hints, the standard ``-v``
-    # volume mounts). Intended as a consumer-controlled escape hatch
-    # for *workload-dependent* podman flags the framework can't
-    # auto-derive from system state — e.g. ``--pids-limit=16384`` for
-    # a fanout-heavy autotools build that hits Krater rootless
-    # podman's 2048 PID default, ``--ulimit=nofile=...``, extra
-    # ``--cap-add``/``--cap-drop``, etc. Each entry is bash-quoted
-    # via :func:`shlex.quote` when interpolated, so values containing
+    # ``--network=host``, ``--pids-limit=16384``, the auto-derived
+    # ``--memory`` cap, the ``-e PRIMARY_NODE_IPV{4,6}`` env hints,
+    # the standard ``-v`` volume mounts). Intended as a
+    # consumer-controlled escape hatch for *workload-dependent*
+    # podman flags the framework can't auto-derive from system state
+    # — e.g. ``--ulimit=nofile=...``, extra ``--cap-add``/``--cap-drop``,
+    # ``--shm-size=...``, etc. Each entry is bash-quoted via
+    # :func:`shlex.quote` when interpolated, so values containing
     # spaces or shell-metacharacters survive intact.
+    #
+    # The framework's ``--pids-limit=16384`` default replaces podman
+    # rootless's 2048 cap, which is too tight for compile-heavy
+    # workloads (autotools + parallel gcc/clang fans out hundreds of
+    # transient PIDs per build) and for JVM-heavy ones (Ghidra spawns
+    # native threads that count against ``pids.max``). To override,
+    # pass ``--pids-limit=<N>`` here; podman takes the LAST value when
+    # the flag appears twice, so the consumer-supplied entry wins.
     #
     # Do NOT set ``--memory`` / ``--memory-swap`` here: the wrapper
     # auto-caps container memory at ``NodeRAM - 2GiB`` (probed at
