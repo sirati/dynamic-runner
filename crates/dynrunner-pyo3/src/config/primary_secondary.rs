@@ -264,6 +264,7 @@ impl PySecondaryConfig {
             src_tmp: Some(self.src_tmp.clone()),
             peer_timeout: self.distributed_config.peer_timeout(),
             keepalive_miss_threshold: self.distributed_config.keepalive_miss_threshold(),
+            retry_max_passes: self.distributed_config.retry_max_passes(),
         }
     }
 }

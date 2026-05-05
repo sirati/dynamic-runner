@@ -238,45 +238,83 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
 }
 
 
-/// Regression: a Recoverable failure in the main pass should NOT
-/// requeue immediately (the legacy busy-loop bug). Instead the task
-/// lands in `failed_tasks`; after the main operational loop drains,
-/// `run_retry_passes` re-injects every failed task and runs the loop
-/// again. A task that succeeds on the retry pass leaves
-/// `failed_tasks` empty at the end of the run.
+/// Regression: post-demotion the local primary's `run_retry_passes`
+/// is a no-op (the SLURM-primary owns retry). This test pins the
+/// SLURM-primary side equivalent: a Recoverable failure observed by
+/// the SLURM-primary's own worker should land in
+/// `slurm_primary_failed`, the synchronous drain-check should
+/// re-inject into `slurm_pending` once the in-flight ledger empties,
+/// and the next dispatch cycle should rerun the task. A task that
+/// succeeds on the retry leaves `slurm_primary_failed` empty.
 ///
-/// Setup: 1 secondary, 1 binary. Custom in-line fake fails the
-/// first attempt with `Recoverable` and succeeds the second. Pre-fix
-/// the test would either succeed by busy-loop (Recoverable retried
-/// inline at ~10 retries/sec) or hang. Post-fix the binary is
-/// failed once, retried in pass 1, completes — final state has 1
-/// completion and 0 permanent failures.
+/// Why the assertions probe the SLURM-primary (not the local primary):
+/// the local primary's `operational_loop` exits the moment its
+/// counter check satisfies `completed + failed >= total`, which fires
+/// on the FIRST failure observed via the wire forward — well before
+/// the SLURM-primary's keepalive-tick / synchronous drain-check
+/// delivers the retry success. Once the local primary returns from
+/// `run()`, its `completed_tasks` / `failed_tasks` snapshots are
+/// frozen and don't reflect any later retry outcome. The
+/// SLURM-primary's `completed_tasks` is the post-demotion source of
+/// truth for cluster-wide completion accounting; the local primary's
+/// counters are a forwarding cache that's deliberately stale at this
+/// point.
 ///
-/// **Demoted-primary regression** (gated under `#[ignore]`): with the
-/// `demote on PromotePrimary` change, the local primary no longer runs
-/// `run_retry_passes` — the SLURM-primary owns retry. The current
-/// SLURM-primary code path (`secondary/peer.rs::TaskFailed`,
-/// `secondary/slurm.rs::note_slurm_item_completed`) does NOT yet
-/// implement retry for worker-reported Recoverable failures; it
-/// simply marks the item gone. So in production right now a
-/// Recoverable failure becomes terminal at the SLURM-primary level
-/// just as `recoverable_failure_twice_becomes_permanent` already
-/// asserts. Re-enable this test once the SLURM-primary grows a
-/// retry-on-Recoverable path; the assertions here describe the
-/// desired end-state (completed=1, failed=0).
-#[ignore = "Recoverable retry currently has no implementation post-demotion; SLURM-primary needs a retry-pass equivalent. See test doc."]
+/// Setup: 1 binary "ok" (50 bytes) + 1 binary "flaky" (40 bytes), 1
+/// real secondary, 1 worker. The pool sorts size-DESC so "ok" is
+/// initial-assigned first; "flaky" stays queued and falls into the
+/// SLURM-primary's `slurm_pending` post-promotion. The
+/// `FlakyWorkerFactory` is parameterised to fail "flaky" exactly once
+/// on its first attempt (Recoverable), and to succeed every other
+/// task / subsequent attempt. After the first failure the
+/// SLURM-primary re-injects "flaky" into its own pool and the worker
+/// picks it up again via the steady-state `request_task_for_worker`
+/// path; the second attempt succeeds. End state on the SLURM-primary
+/// side: 2 completions, 0 residual failures, 1 retry pass consumed.
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_failure_succeeds_on_retry_pass() {
+    let _ = tracing_subscriber::fmt::try_init();
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
-        let (transport, mut secondary_ends) = setup_test(1);
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+        );
+        // Quota=1 for "flaky" (relative_path = "/tmp/flaky"): fail
+        // attempt 1 with Recoverable, succeed from attempt 2 onwards.
+        // "ok" is unlisted → quota=0 → succeeds on attempt 1.
+        let mut quotas = HashMap::new();
+        quotas.insert("/tmp/flaky".to_string(), 1u32);
+        let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
+
+        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+            spawn_real_secondary_flaky(
+                "sec-0".into(),
+                /* num_workers = */ 1,
+                max_res,
+                flaky,
+                /* retry_max_passes = */ 1,
+            );
+
+        // Wire the channel pair into the primary's transport.
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
 
         let config = PrimaryConfig {
             node_id: "primary".into(),
             num_secondaries: 1,
-            connect_timeout: Duration::from_secs(5),
-            peer_timeout: Duration::from_secs(5),
-            keepalive_interval: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
             uses_file_based_items: true,
@@ -293,96 +331,170 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             FixedEstimator(100),
         );
 
-        let binaries = vec![make_binary("only", 50)];
-
-        let (id, rx, tx) = secondary_ends.remove(0);
-        // Custom fake: fail-then-succeed the first task we see.
-        // Tracks per-task attempt count locally; first attempt
-        // → Recoverable TaskFailed; second attempt → TaskComplete.
-        tokio::task::spawn_local(async move {
-            let mut rx = rx;
-            tx.send(DistributedMessage::SecondaryWelcome {
-                sender_id: id.clone(), timestamp: 0.0,
-                secondary_id: id.clone(),
-                resources: vec![dynrunner_core::ResourceAmount {
-                    kind: dynrunner_core::ResourceKind::memory(),
-                    amount: 1024 * 1024 * 1024,
-                }],
-                worker_count: 1,
-                hostname: "test".into(),
-            }).unwrap();
-            tx.send(DistributedMessage::CertExchange {
-                sender_id: id.clone(), timestamp: 0.0,
-                secondary_id: id.clone(),
-                public_cert_pem: "FAKE".into(),
-                ipv4_address: Some("127.0.0.1".into()),
-                ipv6_address: None,
-                quic_port: 5000,
-            }).unwrap();
-
-            let send_request = |tx: &tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
-                                id: &str| {
-                tx.send(DistributedMessage::TaskRequest {
-                    sender_id: id.to_string(), timestamp: 0.0,
-                    secondary_id: id.to_string(),
-                    worker_id: 0,
-                    available_resources: vec![dynrunner_core::ResourceAmount {
-                        kind: dynrunner_core::ResourceKind::memory(),
-                        amount: 1024 * 1024 * 1024,
-                    }],
-                }).unwrap();
-            };
-
-            let mut attempts: HashMap<String, u32> = HashMap::new();
-            while let Some(msg) = rx.recv().await {
-                let task_hash_opt = match &msg {
-                    DistributedMessage::PeerInfo { .. }
-                    | DistributedMessage::TransferComplete { .. } => continue,
-                    DistributedMessage::InitialAssignment { zip_files, .. } => zip_files
-                        .first()
-                        .and_then(|z| z.binaries.first())
-                        .map(|e| e.hash.clone()),
-                    DistributedMessage::TaskAssignment { file_hash, .. } => {
-                        Some(file_hash.clone())
-                    }
-                    _ => None,
-                };
-                let Some(task_hash) = task_hash_opt else { continue };
-
-                let n = attempts.entry(task_hash.clone()).or_insert(0);
-                *n += 1;
-                if *n == 1 {
-                    tx.send(DistributedMessage::TaskFailed {
-                        sender_id: id.clone(), timestamp: 0.0,
-                        secondary_id: id.clone(),
-                        worker_id: 0,
-                        task_hash,
-                        error_type: "Recoverable".into(),
-                        error_message: "synthetic transient error".into(),
-                    }).unwrap();
-                } else {
-                    tx.send(DistributedMessage::TaskComplete {
-                        sender_id: id.clone(), timestamp: 0.0,
-                        secondary_id: id.clone(),
-                        worker_id: 0,
-                        task_hash,
-                        result_data: None,
-                    }).unwrap();
-                }
-                // Worker is idle again — request next task. Without
-                // this, primary's pool would hold the re-injected
-                // retry task forever and the operational loop hangs.
-                send_request(&tx, &id);
-            }
-        });
+        // Two binaries: "ok" (50 bytes, sorts first under size-DESC
+        // → initial-assigned to worker 0) and "flaky" (40 bytes,
+        // stays queued → goes to SLURM-primary's `slurm_pending`
+        // post-promotion via FullTaskList).
+        let binaries = vec![
+            make_binary("ok", 50),
+            make_binary("flaky", 40),
+        ];
 
         let (deps, ops, ope) = noop_phase_args();
         primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        // Main pass fails (1 failure), retry pass succeeds → final
-        // state: 1 completed, 0 permanent failures.
-        assert_eq!(primary.completed_count(), 1);
-        assert_eq!(primary.failed_count(), 0);
+        // Drop primary to close the secondary's primary_transport;
+        // the SLURM-primary's `process_tasks` exits on transport
+        // close + zero peers (single-secondary case). By the time
+        // `primary.run()` returns the SLURM-primary has already
+        // observed the retry-success TaskComplete on its own
+        // worker-event channel and incremented its
+        // `completed_tasks` count to 2 — the local primary's exit
+        // happens AFTER the SLURM-primary's bookkeeping is final.
+        drop(primary);
+
+        let (completed, failed_residual, passes_used) =
+            sec_handle.await.unwrap();
+
+        // Both binaries reached terminal success on the
+        // SLURM-primary's view: "ok" succeeded first attempt, "flaky"
+        // succeeded on retry. No residual permanent failures.
+        // Exactly one retry pass was consumed.
+        assert_eq!(completed, 2, "SLURM-primary should report 2 completions");
+        assert_eq!(
+            failed_residual, 0,
+            "SLURM-primary's failed ledger should be empty after retry success"
+        );
+        assert_eq!(
+            passes_used, 1,
+            "exactly one retry pass should have been consumed"
+        );
+    }).await;
+}
+
+/// Companion to `recoverable_failure_succeeds_on_retry_pass`: a task
+/// that fails Recoverably on EVERY attempt (main pass + every retry
+/// pass) ends up permanently in `slurm_primary_failed`, and the
+/// retry budget reaches `config.retry_max_passes`. Pins the
+/// budget-exhaustion side of the SLURM-primary retry pass — without
+/// this guard the drain-check could re-inject in an unbounded loop.
+///
+/// Setup: same shape as the success test (1 binary "ok" + 1 binary
+/// "doomed", 1 worker, 1 secondary). `FlakyWorkerFactory` is told to
+/// fail "doomed" `u32::MAX` times — i.e. always — so both the main
+/// dispatch and the single retry attempt return Recoverable. End
+/// state on the SLURM-primary side: 1 completion ("ok"), 1
+/// permanent failure ("doomed"), 1 retry pass consumed (=
+/// `retry_max_passes`).
+#[tokio::test(flavor = "current_thread")]
+async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+        );
+        // Quota = u32::MAX so "doomed" never succeeds across any
+        // number of attempts. With `retry_max_passes = 1`, the
+        // SLURM-primary tries: main pass (fail #1) → retry pass
+        // (fail #2) → budget exhausted, "doomed" stays in
+        // `slurm_primary_failed`.
+        let mut quotas = HashMap::new();
+        quotas.insert("/tmp/doomed".to_string(), u32::MAX);
+        let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
+
+        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+            spawn_real_secondary_flaky(
+                "sec-0".into(),
+                1,
+                max_res,
+                flaky,
+                /* retry_max_passes = */ 1,
+            );
+
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // "ok" sorts first (size 50 > 40) → initial-assigned →
+        // succeeds. "doomed" stays in pool → reaches SLURM-primary's
+        // `slurm_pending` post-promotion → dispatched via
+        // `handle_slurm_task_request` → fails Recoverably → drain-
+        // check re-injects → fails again → budget exhausted →
+        // permanent.
+        let binaries = vec![
+            make_binary("ok", 50),
+            make_binary("doomed", 40),
+        ];
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // Drop primary so the SLURM-primary's transport closes and
+        // its `process_tasks` exits. By that point the
+        // SLURM-primary has fully consumed its retry budget on
+        // "doomed".
+        drop(primary);
+
+        let (succeeded, failed_residual, passes_used) =
+            sec_handle.await.unwrap();
+
+        // `secondary.completed_count()` is the size of the
+        // `completed_tasks` set, which after the latest fix only
+        // tracks tasks that reached non-Recoverable termination
+        // (success or terminal failure). Recoverable failures —
+        // whether retried-to-success, retried-to-Recoverable-again,
+        // or budget-exhausted-still-Recoverable — stay out of the
+        // set so the SLURM-primary's dispatch retain doesn't filter
+        // them out from a future re-injection. Here "ok" succeeded
+        // and is in the set; "doomed" was Recoverable on every
+        // attempt and isn't.
+        assert_eq!(
+            succeeded, 1,
+            "only the unconditionally-succeeding binary should land in completed_tasks"
+        );
+        // The retry-specific bookkeeping is the assertion that
+        // matters for this regression: "doomed" still sits in the
+        // permanent-failure ledger after the budget was consumed.
+        assert_eq!(
+            failed_residual, 1,
+            "exhausted retry budget should leave 1 entry in slurm_primary_failed"
+        );
+        assert_eq!(
+            passes_used, 1,
+            "retry budget should be fully consumed"
+        );
     }).await;
 }
 
@@ -640,6 +752,7 @@ fn spawn_real_secondary_with_src_network(
             src_tmp: None,
             peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
+            retry_max_passes: 1,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -651,6 +764,73 @@ fn spawn_real_secondary_with_src_network(
         let mut factory = FakeWorkerFactory;
         secondary.run(&mut factory).await.unwrap();
         secondary.completed_count()
+    });
+
+    (pri_to_sec_tx, sec_to_pri_rx, handle)
+}
+
+/// Variant of `spawn_real_secondary` that drives a `FlakyWorkerFactory`
+/// and threads `retry_max_passes` into `SecondaryConfig` so the
+/// SLURM-primary's retry pass is governed by the same knob the live
+/// primary uses. Returns the
+/// `(completed_count, slurm_primary_failed_count, retry_passes_used)`
+/// triple the SLURM-primary side ended up with — that's the assertion
+/// surface for the post-demotion retry tests, since the local primary's
+/// `failed_count()` is a stale forwarding cache once the operational
+/// loop's exit condition fires (see `recoverable_failure_succeeds_on_retry_pass`).
+///
+/// `flaky` is cloned (its `Rc<RefCell<HashMap>>` is shared) so the test
+/// caller can also inspect the per-task attempt counts after the run.
+fn spawn_real_secondary_flaky(
+    secondary_id: String,
+    num_workers: u32,
+    max_resources: dynrunner_core::ResourceMap,
+    flaky: super::test_helpers::FlakyWorkerFactory,
+    retry_max_passes: u32,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    tokio::task::JoinHandle<(usize, usize, u32)>,
+) {
+    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+
+    let handle = tokio::task::spawn_local(async move {
+        let transport = ChannelPrimaryTransportEnd {
+            tx: sec_to_pri_tx,
+            rx: pri_to_sec_rx,
+        };
+        let config = SecondaryConfig {
+            secondary_id,
+            num_workers,
+            max_resources,
+            hostname: "test-host".into(),
+            // Tight keepalive so the keepalive-tick backstop fires
+            // quickly enough that tests don't hit the default 60s
+            // wait if any code path needs the periodic drain-check
+            // (the synchronous one in `note_slurm_item_failed` is
+            // the primary trigger — this is just defensive).
+            keepalive_interval: Duration::from_millis(50),
+            src_network: None,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
+            retry_max_passes,
+        };
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        let mut factory = flaky;
+        secondary.run(&mut factory).await.unwrap();
+        (
+            secondary.completed_count(),
+            secondary.slurm_primary_failed_count_for_test(),
+            secondary.slurm_primary_retry_passes_used_for_test(),
+        )
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)

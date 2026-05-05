@@ -31,6 +31,19 @@ pub struct SecondaryConfig {
     /// suspects primary death and starts the failover election (default 3,
     /// matching the primary's `keepalive_miss_threshold`).
     pub keepalive_miss_threshold: u32,
+    /// Maximum number of retry passes the SLURM-primary runs after the
+    /// main pass drains. Mirrors `PrimaryConfig::retry_max_passes` —
+    /// pre-demotion the local primary owned this; post-demotion the
+    /// promoted secondary owns retry for tasks IT dispatched, so the
+    /// same knob has to live on this side too. Default 1 (so total
+    /// attempts per task = main pass + 1 retry pass = 2). 0 disables
+    /// retry entirely on the SLURM-primary side.
+    ///
+    /// Only consulted when this secondary is acting as SLURM-primary
+    /// (`is_slurm_primary == true`). On non-promoted secondaries the
+    /// field is inert — the live primary's `retry_max_passes` is what
+    /// drives retry while the live primary is still authoritative.
+    pub retry_max_passes: u32,
 }
 
 impl Default for SecondaryConfig {
@@ -45,6 +58,7 @@ impl Default for SecondaryConfig {
             src_tmp: None,
             peer_timeout: Duration::from_secs(120),
             keepalive_miss_threshold: 3,
+            retry_max_passes: 1,
         }
     }
 }
@@ -230,6 +244,44 @@ where
     /// the task isn't silently dropped from the pool).
     slurm_in_flight: HashMap<String, SlurmInFlightItem<I>>,
 
+    /// Per-task ledger of Recoverable failures observed on the SLURM-
+    /// primary path. Mirrors the live primary's `failed_tasks` set, but
+    /// keyed to the secondary that's currently acting as SLURM-primary.
+    /// Populated by `note_slurm_item_failed` whenever a Recoverable
+    /// failure terminates a dispatch slot for a task this node
+    /// dispatched; drained by `slurm_primary_drain_check_and_retry`
+    /// when the main pass quiesces (pool empty + no in-flight + no
+    /// active local tasks) and re-injected into `slurm_pending` via
+    /// `pool.reinject(item)` for one more attempt.
+    ///
+    /// Stores the binary alongside the hash so the re-injection step
+    /// has the full `TaskInfo` to put back into the pool — `slurm_in_flight`
+    /// already kept this shape for rejection-recovery; the failed
+    /// ledger keeps the same shape for retry-injection.
+    ///
+    /// Closes the gap demotion introduced: post-demotion the local
+    /// primary's `run_retry_passes` is a no-op, so without this
+    /// SLURM-primary-side ledger every Recoverable failure became
+    /// terminal at the cluster level.
+    slurm_primary_failed: HashMap<String, TaskInfo<I>>,
+
+    /// Number of retry passes consumed against `config.retry_max_passes`.
+    /// Bumped by `slurm_primary_drain_check_and_retry` once per
+    /// re-injection event. The retry budget is exhausted when this
+    /// counter reaches `retry_max_passes`; subsequent main-pass drains
+    /// with `slurm_primary_failed` non-empty terminate the run with
+    /// the residual entries marked permanently failed.
+    slurm_primary_retry_passes_used: u32,
+
+    /// One-shot guard for the budget-exhausted WARN emitted by
+    /// `slurm_primary_drain_check_and_retry`. The drain-check fires
+    /// every keepalive tick (and synchronously after every
+    /// `note_slurm_item_failed`); without this flag the warning would
+    /// duplicate every tick for the rest of the run. Pure logging
+    /// hygiene — the actual failure count lives in
+    /// `slurm_primary_failed`.
+    exhaustion_warning_emitted: bool,
+
     /// Per-peer backpressure backoff for the SLURM-primary path.
     /// Mirrors `PrimaryCoordinator::backpressured_secondaries` — when
     /// a peer rejects a `TaskAssignment` with the wire signal
@@ -318,6 +370,9 @@ where
             slurm_pending: None,
             slurm_completed: HashSet::new(),
             slurm_in_flight: HashMap::new(),
+            slurm_primary_failed: HashMap::new(),
+            slurm_primary_retry_passes_used: 0,
+            exhaustion_warning_emitted: false,
             slurm_backpressured_peers: HashMap::new(),
             cached_full_task_list: None,
             slurm_primary_peer_id: None,
@@ -414,6 +469,31 @@ where
 
     pub fn completed_count(&self) -> usize {
         self.completed_tasks.len()
+    }
+
+    /// Test-only inspector for the SLURM-primary retry budget
+    /// counter. Lets tests assert that the retry pass actually
+    /// consumed budget (vs. e.g. the success arriving without
+    /// re-injection because the test fixture fixed the worker
+    /// behaviour after one pass anyway). Public-but-test-gated so
+    /// production callers don't depend on this internal counter
+    /// shape.
+    #[cfg(test)]
+    pub fn slurm_primary_retry_passes_used_for_test(&self) -> u32 {
+        self.slurm_primary_retry_passes_used
+    }
+
+    /// Test-only inspector for the SLURM-primary's residual
+    /// failed-task ledger after the retry budget is exhausted. Used
+    /// by the multi-pass-exhaustion regression test to assert that a
+    /// task which fails Recoverably across all permitted passes ends
+    /// up permanently in `slurm_primary_failed`. Counts only
+    /// SLURM-primary-dispatched failures (tasks that went through
+    /// `handle_slurm_task_request`); initial-assignment failures
+    /// observed by the local worker bypass this ledger by design.
+    #[cfg(test)]
+    pub fn slurm_primary_failed_count_for_test(&self) -> usize {
+        self.slurm_primary_failed.len()
     }
 
     /// Run the secondary coordination loop:

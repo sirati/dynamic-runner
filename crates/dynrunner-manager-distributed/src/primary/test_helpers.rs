@@ -100,6 +100,85 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
     }
 }
 
+/// Worker factory that fails the first N Recoverable attempts on each
+/// task whose `relative_path` is in `failure_quotas`, then succeeds.
+/// Tasks not in the map always succeed. Shared state is a single
+/// `Rc<RefCell<HashMap<String, u32>>>` for the per-task attempt
+/// counter so multiple worker subprocesses (when num_workers > 1)
+/// share one ledger.
+///
+/// Single concern: deterministically translate `(task path, attempt#)`
+/// into success-or-Recoverable, regardless of which worker drew the
+/// assignment. Set a quota of `u32::MAX` for "always fails" coverage.
+///
+/// Single-threaded by construction (uses `Rc`/`RefCell`); only safe
+/// inside a `tokio::task::LocalSet`. Pairs with the in-process
+/// channel-transport tests.
+#[derive(Clone)]
+pub(super) struct FlakyWorkerFactory {
+    pub(super) attempts: std::rc::Rc<std::cell::RefCell<HashMap<String, u32>>>,
+    pub(super) failure_quotas: std::rc::Rc<HashMap<String, u32>>,
+}
+
+impl FlakyWorkerFactory {
+    /// Build a factory whose worker fails the first
+    /// `failure_quotas[relative_path]` attempts of each named task,
+    /// succeeding from the (quota+1)-th attempt onwards. Tasks not
+    /// in the map succeed unconditionally.
+    pub(super) fn with_quotas(failure_quotas: HashMap<String, u32>) -> Self {
+        Self {
+            attempts: std::rc::Rc::new(std::cell::RefCell::new(HashMap::new())),
+            failure_quotas: std::rc::Rc::new(failure_quotas),
+        }
+    }
+}
+
+impl WorkerFactory<ChannelManagerEnd> for FlakyWorkerFactory {
+    fn spawn_worker(
+        &mut self,
+        _worker_id: u32,
+    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        let (manager_end, runner_end) = channel_pair();
+        let attempts = self.attempts.clone();
+        let quotas = self.failure_quotas.clone();
+        tokio::task::spawn_local(async move {
+            let mut runner = runner_end;
+            let _ = runner.send(Response::Ready).await;
+            loop {
+                match MessageReceiver::<Command>::recv(&mut runner).await {
+                    Some(Command::Stop) => break,
+                    Some(Command::ProcessTask { relative_path, .. }) => {
+                        // Per-task attempt counter, shared across
+                        // workers via Rc<RefCell>. Increment first
+                        // so attempt #1 is the first worker
+                        // invocation.
+                        let attempt = {
+                            let mut map = attempts.borrow_mut();
+                            let n = map.entry(relative_path.clone()).or_insert(0);
+                            *n += 1;
+                            *n
+                        };
+                        let quota = quotas.get(&relative_path).copied().unwrap_or(0);
+                        let response = if attempt <= quota {
+                            Response::Error {
+                                error_type: dynrunner_core::ErrorType::Recoverable,
+                                message: format!(
+                                    "synthetic recoverable failure on attempt {attempt} (quota: {quota})"
+                                ),
+                            }
+                        } else {
+                            Response::Done { result_data: None }
+                        };
+                        let _ = runner.send(response).await;
+                    }
+                    None => break,
+                }
+            }
+        });
+        Ok((manager_end, None))
+    }
+}
+
 /// Simulate a secondary that sends welcome + cert, then echoes
 /// assignments as completions. Convenience wrapper around
 /// [`fake_secondary_with_addrs`] using the historical

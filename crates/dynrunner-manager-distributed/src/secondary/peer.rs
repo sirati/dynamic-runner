@@ -92,7 +92,24 @@ where
                         );
                     }
                 } else {
-                    self.note_slurm_item_completed(&task_hash);
+                    // Route through the failure-aware decrementer:
+                    // Recoverable failures land in
+                    // `slurm_primary_failed` for the retry pass,
+                    // others just decrement in-flight as before.
+                    self.note_slurm_item_failed(&task_hash, &error_type);
+                    // Synchronous drain-check: if THIS failure was
+                    // the last in-flight item AND the pool is
+                    // empty, immediately re-inject the failed-task
+                    // ledger and re-poll our own workers. Without
+                    // this synchronous trigger the retry waits
+                    // until the next keepalive tick (up to the
+                    // keepalive interval), which races the live
+                    // primary's `operational_loop` exit (which
+                    // fires on `completed + failed >= total` and
+                    // doesn't wait). No-op when there's still
+                    // pending work or no Recoverable failures
+                    // logged.
+                    self.slurm_primary_drain_check_and_retry().await;
                     tracing::debug!(
                         peer = %secondary_id,
                         task_hash,
