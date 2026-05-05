@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo};
@@ -16,9 +15,10 @@ use tokio::sync::mpsc;
 
 use crate::certs::CertPair;
 use crate::transport::QuicListener;
-use crate::wss::{WssListener, connect_wss};
+use crate::wss::WssListener;
 
 mod accept;
+mod dial;
 mod either;
 mod handler;
 mod no_peer;
@@ -30,7 +30,6 @@ mod tests;
 
 pub use either::EitherPeerTransport;
 pub use no_peer::NoPeerTransport;
-use util::{PeerConnection, parse_cert_pem};
 
 /// A peer connection accepted by this node's server.
 pub(super) struct AcceptedPeer<I: Identifier> {
@@ -148,6 +147,14 @@ impl<I: Identifier> PeerNetwork<I> {
     /// 10s timeout, the secondary's keepalive ticker can't fire from
     /// inside the blocked select arm, and the primary declares the
     /// secondary dead before peer-setup returns.
+    ///
+    /// Per-peer dial uses happy-eyeballs: when both `ipv4` and `ipv6`
+    /// are set in [`PeerConnectionInfo`], QUIC and WSS attempts run in
+    /// parallel across both families inside [`dial::dial_peer`] and
+    /// the first connected socket wins. Single-family peers race
+    /// against just the one address (no overhead). Total per-peer
+    /// budget is ≤ 20s, same as the pre-happy-eyeballs sequential
+    /// QUIC-then-WSS shape.
     pub fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
         for peer_info in peers {
             if peer_info.secondary_id == self.peer_id {
@@ -158,73 +165,14 @@ impl<I: Identifier> PeerNetwork<I> {
                 continue; // Already connected (from accept loop)
             }
 
-            let peer_id = peer_info.secondary_id.clone();
-            let addr_str = peer_info
-                .ipv4
-                .as_deref()
-                .unwrap_or("127.0.0.1")
-                .to_string();
-            let port = peer_info.port;
-            let cert_pem = peer_info.cert.clone();
+            let peer_info = peer_info.clone();
             let incoming_tx = self.incoming_tx.clone();
             let new_conn_tx = self.new_conn_tx.clone();
 
             tokio::task::spawn_local(async move {
-                let addr: SocketAddr = match format!("{addr_str}:{port}").parse() {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!(peer = %peer_id, error = %e, "invalid peer address");
-                        return;
-                    }
-                };
-
-                // Parse the peer's certificate PEM to get DER for QUIC verification
-                let peer_cert_der = parse_cert_pem(&cert_pem);
-
-                let timeout = Duration::from_secs(10);
-
-                // Try QUIC first, fall back to WSS
-                let connection_result = if let Some(cert_der) = &peer_cert_der {
-                    match tokio::time::timeout(
-                        timeout,
-                        crate::transport::connect(addr, &peer_id, cert_der),
-                    )
-                    .await
-                    {
-                        Ok(Ok(conn)) => {
-                            tracing::info!(peer = %peer_id, %addr, "connected to peer via QUIC");
-                            Ok(PeerConnection::Quic(conn))
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(peer = %peer_id, error = %e, "QUIC to peer failed, trying WSS");
-                            Err(())
-                        }
-                        Err(_) => {
-                            tracing::warn!(peer = %peer_id, "QUIC to peer timed out, trying WSS");
-                            Err(())
-                        }
-                    }
-                } else {
-                    tracing::warn!(peer = %peer_id, "no valid cert for peer, trying WSS");
-                    Err(())
-                };
-
-                let connection = match connection_result {
-                    Ok(conn) => conn,
-                    Err(()) => match tokio::time::timeout(timeout, connect_wss(addr)).await {
-                        Ok(Ok(conn)) => {
-                            tracing::info!(peer = %peer_id, %addr, "connected to peer via WSS");
-                            PeerConnection::Wss(conn)
-                        }
-                        Ok(Err(e)) => {
-                            tracing::error!(peer = %peer_id, error = %e, "WSS to peer also failed");
-                            return;
-                        }
-                        Err(_) => {
-                            tracing::error!(peer = %peer_id, "WSS to peer timed out");
-                            return;
-                        }
-                    },
+                let peer_id = peer_info.secondary_id.clone();
+                let Some(connection) = dial::dial_peer(&peer_id, &peer_info).await else {
+                    return;
                 };
 
                 let outgoing_tx = handler::spawn_outgoing_handler(

@@ -133,6 +133,14 @@ impl QuicListener {
 }
 
 /// Connect to a QUIC server, trusting the given peer certificate.
+///
+/// The local UDP endpoint is bound to a wildcard address whose family
+/// matches the destination — `0.0.0.0:0` for an IPv4 destination,
+/// `[::]:0` for an IPv6 destination. A v4-only socket cannot send to a
+/// v6 destination (or vice versa), so without family matching this
+/// helper would silently fail every IPv6 dial regardless of network
+/// reachability. This affects the peer dialer's happy-eyeballs path,
+/// where both families may be tried in parallel.
 pub async fn connect(
     addr: SocketAddr,
     server_name: &str,
@@ -140,8 +148,11 @@ pub async fn connect(
 ) -> Result<QuicConnection, String> {
     let client_config = CertPair::client_config_trusting(peer_cert_der)?;
 
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-        .map_err(|e| e.to_string())?;
+    let bind_addr: SocketAddr = match addr {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+        SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+    };
+    let mut endpoint = Endpoint::client(bind_addr).map_err(|e| e.to_string())?;
     endpoint.set_default_client_config(client_config);
 
     let connection = endpoint
