@@ -121,7 +121,13 @@ cleanup() {{
     echo "Cleaning up temporary directory: $RNDTMP"
     rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
 }}
-trap cleanup EXIT
+# Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
+# at time-limit / scancel, SIGHUP by an ssh disconnect, SIGINT by
+# Ctrl+C from interactive jobs. Without these, the trap fires only
+# on graceful exit and SLURM-killed jobs leak /tmp/asm-XXXX dirs
+# until the node's /tmp fills (observed in the field on multi-day
+# clusters). EXIT alone misses every non-graceful termination.
+trap cleanup EXIT TERM HUP INT
 
 PODMAN_STORAGE="{podman_storage}"
 PODMAN_RUN="{podman_run}"
@@ -257,7 +263,17 @@ echo "  Secondary ID: {secondary_id}"
             script += f"""echo "  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)"
 echo ""
 
+# `--pull=never`: if the local `podman load` was incomplete (image
+# layers missing from the load), podman's default behaviour is to
+# silently fall through to a registry pull and try docker.io —
+# which on most institutional clusters returns "access denied"
+# only after a multi-minute timeout, by which point the
+# dispatcher has already given up with `timeout waiting for
+# secondaries`. `--pull=never` makes that class of incomplete-load
+# fail loud-and-fast with a clear "image not in local storage"
+# error instead.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    --pull=never \
     --network host \
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
@@ -276,7 +292,10 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
 echo "  Mode: Standard (secondary connects to primary via gateway)"
 echo ""
 
+# `--pull=never`: see the reverse-mode block above for the
+# rationale; same incomplete-load → registry-fallback pitfall.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+    --pull=never \
     --network host \
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
@@ -338,7 +357,13 @@ cleanup() {{
     echo "Cleaning up temporary directory: $RNDTMP"
     rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
 }}
-trap cleanup EXIT
+# Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
+# at time-limit / scancel, SIGHUP by an ssh disconnect, SIGINT by
+# Ctrl+C from interactive jobs. Without these, the trap fires only
+# on graceful exit and SLURM-killed jobs leak /tmp/asm-XXXX dirs
+# until the node's /tmp fills (observed in the field on multi-day
+# clusters). EXIT alone misses every non-graceful termination.
+trap cleanup EXIT TERM HUP INT
 
 PODMAN_STORAGE="{podman_storage}"
 PODMAN_RUN="{podman_run}"
