@@ -231,13 +231,28 @@ pub(crate) fn run_secondary<'py>(
         config.secondary_id.clone(),
         config.num_workers,
         ram_bytes,
-        source_dir,
-        output_dir,
+        source_dir.clone(),
+        output_dir.clone(),
         task_definition.clone(),
         task_args.clone(),
     );
     let coord = cls.call(args, Some(&kwargs))?;
-    coord.call_method0("run")?;
+
+    // Phase 5B: fire `on_run_start` synchronously under the GIL before
+    // entering the secondary's coordination loop. The secondary, not
+    // the primary, owns the source/output dirs and `task_args` (see
+    // the comment in `run_primary`); this is where the original Phase
+    // 5B design called for `on_run_start` to fire in network/SLURM
+    // mode. Failure aborts the run — consumer setup hasn't completed,
+    // dispatching would race half-built resources.
+    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args)?;
+
+    let run_outcome = coord.call_method0("run");
+
+    // Phase 5B: fire `on_run_end` regardless. Exceptions log and are
+    // swallowed; the coord error (if any) is propagated below.
+    fire_on_run_end(task_definition, run_outcome.is_ok());
+    run_outcome?;
 
     let dict = PyDict::new(py);
     dict.set_item("completed", coord.getattr("completed")?)?;

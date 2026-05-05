@@ -288,3 +288,46 @@ def test_on_run_start_exception_aborts_run(tmp_path: Path) -> None:
     # No phase hooks fired (run aborted before dispatch).
     assert "on_phase_start" not in names, names
     assert "on_phase_end" not in names, names
+
+
+def test_run_secondary_fires_on_run_start_before_connect(tmp_path: Path) -> None:
+    """`run_secondary` must invoke `on_run_start` synchronously before
+    attempting to reach the primary. Pre-fix the secondary code path
+    silently skipped the run-level hooks, so a consumer's setup never
+    ran on SLURM/network secondaries — only the primary's in-process
+    `run_local` / `run_distributed` paths fired them.
+
+    Drives the assertion with a deliberately unresolvable primary URL +
+    short `connect_timeout_secs`: `on_run_start` runs under the GIL in
+    `run_secondary` before `coord.run()` enters the Rust async runtime,
+    so the recorded call must land regardless of whether the connect
+    later succeeds or the resolve/connect path bails.
+    """
+    import dynamic_runner as _rs
+
+    task = _RecordingTask()
+    cfg = _rs.SecondaryConfig(
+        secondary_id="test-secondary-0",
+        num_workers=1,
+        max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
+        distributed_config=_rs.DistributedConfig(connect_timeout_secs=0.1),
+    )
+    args = SimpleNamespace()
+
+    _rs.run_secondary(
+        cfg,
+        # 127.0.0.1:1 resolves but nothing is listening there, so the
+        # WSS connect fails ECONNREFUSED on the first attempt and the
+        # 0.1s `connect_timeout_secs` budget bails the retry loop.
+        # `coord.run()` returns without doing anything operational.
+        "tcp://127.0.0.1:1",
+        task,
+        args,
+        str(tmp_path / "src"),
+        str(tmp_path / "out"),
+    )
+
+    names = _ordered_calls(task)
+    assert names.count("on_run_start") == 1, names
+    assert names.count("on_run_end") == 1, names
+    assert names.index("on_run_start") < names.index("on_run_end"), names
