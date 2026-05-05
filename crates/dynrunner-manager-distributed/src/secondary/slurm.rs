@@ -114,6 +114,19 @@ where
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
                 p.extend(items);
+                // The cluster's already-completed items were filtered
+                // out before `extend`, so a phase whose ONLY items
+                // pre-completed shows up as Active-but-empty here.
+                // Without the cascade, dependent phases stay Blocked
+                // forever (their parent never reaches Drained → Done)
+                // and `handle_slurm_task_request` returns "no tasks"
+                // for every dispatch. Run the same drain cascade
+                // that `note_slurm_item_completed` uses post-dispatch
+                // so the SLURM-primary's view starts in the correct
+                // post-completion state. Symmetric with the regular
+                // primary's `process_phase_lifecycle` call after pool
+                // construction.
+                cascade_drain_done(&mut p);
                 p
             }
             Err(e) => {
@@ -140,6 +153,22 @@ where
             "populated SLURM-primary task list"
         );
     }
+
+    /// Run the phase-lifecycle drain cascade on a pool until quiescent.
+    /// Shared between `populate_slurm_tasks` (catches phases whose
+    /// only items pre-completed elsewhere) and
+    /// `note_slurm_item_completed` (catches phases whose only items
+    /// just finished). Each iteration:
+    ///   1. `drain_empty_active_phases` — moves any Active phase
+    ///      whose `(queued, in_flight) == (0, 0)` to Drained, queues
+    ///      it for `poll_drain_transitions`.
+    ///   2. `poll_drain_transitions` — returns and clears the
+    ///      drained-pending list.
+    ///   3. `mark_phase_done` — flips Drained → Done, may unblock
+    ///      dependent phases (Blocked → Active).
+    /// The loop terminates when no new drains surface (the second
+    /// `drain_empty_active_phases` finds nothing to transition AND
+    /// `poll_drain_transitions` returns empty).
 
     /// Test/inspection helper: number of queued items in the pool.
     /// Returns 0 if the pool isn't initialised yet.
@@ -173,19 +202,7 @@ where
         };
         if let Some(pool) = self.slurm_pending.as_mut() {
             pool.on_item_finished(&phase_id);
-            loop {
-                let drained = pool.poll_drain_transitions();
-                if drained.is_empty() {
-                    break;
-                }
-                for p in &drained {
-                    pool.mark_phase_done(p);
-                }
-                // Newly-active dependents may themselves be empty;
-                // re-drain so the next poll_drain_transitions picks
-                // them up and the cascade continues.
-                pool.drain_empty_active_phases();
-            }
+            cascade_drain_done(pool);
         }
     }
 
@@ -472,4 +489,36 @@ fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
     item.path.hash(&mut h);
     item.identifier.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Run the phase-lifecycle drain cascade on a pool until quiescent.
+/// Shared between `populate_slurm_tasks` (catches phases whose only
+/// items pre-completed elsewhere) and `note_slurm_item_completed`
+/// (catches phases whose only items just finished). Each iteration:
+///   1. `drain_empty_active_phases` — moves any Active phase whose
+///      `(queued, in_flight) == (0, 0)` to Drained, queues it for
+///      `poll_drain_transitions`.
+///   2. `poll_drain_transitions` — returns and clears the
+///      drained-pending list.
+///   3. `mark_phase_done` — flips Drained → Done, may unblock
+///      dependent phases (Blocked → Active).
+/// The loop terminates when no new drains surface (the next
+/// `drain_empty_active_phases` finds nothing to transition AND
+/// `poll_drain_transitions` returns empty).
+///
+/// Free function (rather than impl method) so the lifecycle test
+/// in `tests.rs` can drive it on a hand-built pool without
+/// instantiating a full `SecondaryCoordinator` — single concern,
+/// single dependency on `&mut PendingPool`.
+pub(super) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
+    loop {
+        pool.drain_empty_active_phases();
+        let drained = pool.poll_drain_transitions();
+        if drained.is_empty() {
+            break;
+        }
+        for p in &drained {
+            pool.mark_phase_done(p);
+        }
+    }
 }
