@@ -41,6 +41,11 @@ where
             } => {
                 // Track peer's completed task to avoid duplicate processing
                 self.completed_tasks.insert(task_hash.clone());
+                // A successful TaskComplete from this peer proves it's
+                // healthy — clear any SLURM-primary backpressure
+                // backoff so the next dispatch cycle can re-target it.
+                // Mirrors regular primary's TaskComplete handler.
+                self.clear_slurm_peer_backpressure(&secondary_id);
                 // Drive the SLURM-primary's phase machine: if this
                 // node dispatched the task as SLURM-primary, the
                 // peer's completion message is the only signal the
@@ -56,19 +61,45 @@ where
                 secondary_id,
                 task_hash,
                 error_type,
+                error_message,
                 ..
             } => {
-                // Same SLURM-primary phase-machine bookkeeping as
-                // TaskComplete: the in-flight ledger doesn't care
-                // whether the dispatch ended in success or failure,
-                // only that it's done.
-                self.note_slurm_item_completed(&task_hash);
-                tracing::debug!(
-                    peer = %secondary_id,
-                    task_hash,
-                    error_type,
-                    "peer task failed"
-                );
+                // Two TaskFailed shapes arrive on the SLURM-primary
+                // path:
+                //   1. Backpressure rejection — peer's dispatch.rs
+                //      sends `Recoverable / "No idle worker
+                //      available"` when its worker pool can't accept
+                //      the assignment. The task NEVER ran; the
+                //      binary must be returned to the pool, the
+                //      peer marked backpressured. Drives
+                //      `handle_slurm_peer_rejection` (re-queue +
+                //      backoff). Skipping it would leak the binary
+                //      from `slurm_in_flight` and stall the
+                //      per-phase in_flight counter.
+                //   2. Terminal failure — peer's worker actually ran
+                //      the binary and reported failure (Recoverable
+                //      from the worker, NonRecoverable, OutOfMemory,
+                //      etc.). The phase machine just needs the
+                //      in-flight counter decremented.
+                let is_backpressure = error_type == "Recoverable"
+                    && error_message == "No idle worker available";
+                if is_backpressure {
+                    if let Some(peer) = self.handle_slurm_peer_rejection(&task_hash) {
+                        tracing::debug!(
+                            peer = %peer,
+                            task_hash,
+                            "peer rejected SLURM-primary assignment; re-queued + backpressure backoff applied"
+                        );
+                    }
+                } else {
+                    self.note_slurm_item_completed(&task_hash);
+                    tracing::debug!(
+                        peer = %secondary_id,
+                        task_hash,
+                        error_type,
+                        "peer task failed"
+                    );
+                }
             }
             DistributedMessage::TimeoutDetected {
                 timed_out_secondary_id,

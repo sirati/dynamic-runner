@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -8,9 +9,16 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
-
-use super::SecondaryCoordinator;
+use super::{SecondaryCoordinator, SlurmInFlightItem};
 use super::wire::timestamp_now;
+
+/// Backpressure backoff window applied to a peer that just rejected a
+/// `TaskAssignment` with "No idle worker available". Mirrors the
+/// 500ms window used by the regular primary
+/// (`PrimaryCoordinator::handle_task_failed`); a single constant
+/// keeps the two paths in lockstep so SLURM-promoted runs feel the
+/// same as live-primary runs.
+const SLURM_BACKPRESSURE_WINDOW: Duration = Duration::from_millis(500);
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
@@ -160,7 +168,7 @@ where
     /// still `Blocked`.
     pub(super) fn note_slurm_item_completed(&mut self, file_hash: &str) {
         let phase_id = match self.slurm_in_flight.remove(file_hash) {
-            Some(p) => p,
+            Some(item) => item.phase_id,
             None => return,
         };
         if let Some(pool) = self.slurm_pending.as_mut() {
@@ -220,6 +228,26 @@ where
             return Ok(());
         }
 
+        // Per-peer backpressure backoff (mirrors regular primary's
+        // `is_backpressured`): if this peer recently bounced an
+        // assignment with "No idle worker available", skip the
+        // dispatch entirely. The binary stays in the pool — another
+        // peer's TaskRequest can pick it up in the meantime.
+        // Self-assignments bypass the check because the local
+        // `is_idle_state()` test below is the source of truth for
+        // our own workers; the peer-side backpressure ledger is
+        // populated only by remote rejections.
+        if requesting_secondary_id != self.config.secondary_id
+            && self.is_slurm_peer_backpressured(&requesting_secondary_id)
+        {
+            tracing::trace!(
+                secondary = %requesting_secondary_id,
+                worker_id,
+                "skipping SLURM-primary dispatch: peer is in backpressure backoff"
+            );
+            return Ok(());
+        }
+
         // Find a task that fits the available memory; remove it from
         // the pool so it isn't handed out twice. `take_first_match`
         // walks bucket-key order, FIFO inside each bucket — same
@@ -245,13 +273,21 @@ where
             // cluster reports it finished. `slurm_in_flight` mirrors
             // the same fact at the per-item level so we can call
             // `on_item_finished(phase_id)` when TaskComplete /
-            // TaskFailed arrives later.
+            // TaskFailed arrives later, AND retains the binary +
+            // target so the rejection-recovery path
+            // (`handle_slurm_peer_rejection`) can `pool.requeue` it.
             let dispatched_phase = binary.phase_id.clone();
             if let Some(pool) = self.slurm_pending.as_mut() {
                 pool.mark_in_flight(&dispatched_phase);
             }
-            self.slurm_in_flight
-                .insert(file_hash.clone(), dispatched_phase);
+            self.slurm_in_flight.insert(
+                file_hash.clone(),
+                SlurmInFlightItem {
+                    phase_id: dispatched_phase,
+                    target_secondary_id: requesting_secondary_id.clone(),
+                    binary: binary.clone(),
+                },
+            );
 
             if requesting_secondary_id == self.config.secondary_id {
                 // Assign directly to local worker (avoid recursive
@@ -306,9 +342,40 @@ where
                             self.reset_request_backoff(wid);
                         }
                         Err(e) => {
-                            tracing::error!(worker_id = wid, error = %e, "failed to assign SLURM task locally");
+                            // `assign_task` failed AFTER we already
+                            // moved the binary out of the pool +
+                            // bumped in_flight + recorded
+                            // `slurm_in_flight`. Walk every step
+                            // back so the binary isn't silently
+                            // dropped: `recover_in_flight_to_pool`
+                            // pulls the binary out of `slurm_in_flight`
+                            // and `pool.requeue`s it (decrements
+                            // in_flight + pushes to front of bucket).
+                            // Mirrors the recovery shape of
+                            // `handle_slurm_peer_rejection` below.
+                            tracing::warn!(
+                                worker_id = wid,
+                                error = %e,
+                                "SLURM-primary self-assign failed; re-queuing binary"
+                            );
+                            self.recover_in_flight_to_pool(&file_hash);
                         }
                     }
+                } else {
+                    // `is_idle_state()` flipped between the worker's
+                    // TaskRequest and this dispatch (race after a
+                    // recent kickstart-assignment landed first). Pre-
+                    // fix this branch was missing entirely — the
+                    // binary stayed `slurm_in_flight`-tracked but no
+                    // worker was processing it and no completion
+                    // would ever arrive ⇒ silent task loss + stuck
+                    // phase counter. Recover by undoing the take +
+                    // mark_in_flight via `recover_in_flight_to_pool`.
+                    tracing::warn!(
+                        worker_id = wid,
+                        "SLURM-primary self-assign skipped: worker not idle (race with kickstart); re-queuing binary"
+                    );
+                    self.recover_in_flight_to_pool(&file_hash);
                 }
             } else {
                 // Send TaskAssignment to peer
@@ -338,6 +405,58 @@ where
         }
 
         Ok(())
+    }
+
+    /// Undo a SLURM-primary dispatch that didn't reach a worker
+    /// (self-assign race, peer rejected, peer-side route lost). Removes
+    /// the `slurm_in_flight` entry, re-queues the binary at the front
+    /// of its bucket via `pool.requeue` (which also decrements the
+    /// per-phase in_flight counter), and clears the `active_tasks`
+    /// entry if any was created. No-op if the hash isn't tracked
+    /// (idempotent — peer-broadcast TaskFailed and primary-forwarded
+    /// TaskFailed both arrive on the SLURM-primary, and either may
+    /// race the other).
+    pub(super) fn recover_in_flight_to_pool(&mut self, file_hash: &str) {
+        let item = match self.slurm_in_flight.remove(file_hash) {
+            Some(item) => item,
+            None => return,
+        };
+        // `active_tasks` was inserted only on the self-assign success
+        // path; remove unconditionally to keep its set in sync (no-op
+        // if the hash wasn't there).
+        self.active_tasks.remove(file_hash);
+        if let Some(pool) = self.slurm_pending.as_mut() {
+            pool.requeue(item.binary);
+        }
+    }
+
+    /// Apply the SLURM-primary side of a peer rejection: extract the
+    /// binary back to the pool and put the peer in a backoff window
+    /// so the next `handle_slurm_task_request` from it skips dispatch.
+    /// Returns the `target_secondary_id` that was backpressured (or
+    /// `None` if the hash wasn't in flight, e.g. the peer rejection
+    /// arrived after a successful retry path completed it).
+    pub(super) fn handle_slurm_peer_rejection(&mut self, file_hash: &str) -> Option<String> {
+        let item = self.slurm_in_flight.remove(file_hash)?;
+        let target = item.target_secondary_id.clone();
+        self.active_tasks.remove(file_hash);
+        if let Some(pool) = self.slurm_pending.as_mut() {
+            pool.requeue(item.binary);
+        }
+        self.slurm_backpressured_peers.insert(
+            target.clone(),
+            Instant::now() + SLURM_BACKPRESSURE_WINDOW,
+        );
+        Some(target)
+    }
+
+    /// Clear backpressure backoff for a peer that just reported a
+    /// successful TaskComplete (proves the peer is healthy and
+    /// accepting work). Called from the TaskComplete handlers in
+    /// `dispatch.rs` and `peer.rs`. Mirrors the regular primary's
+    /// backpressure clear on TaskComplete.
+    pub(super) fn clear_slurm_peer_backpressure(&mut self, secondary_id: &str) {
+        self.slurm_backpressured_peers.remove(secondary_id);
     }
 }
 

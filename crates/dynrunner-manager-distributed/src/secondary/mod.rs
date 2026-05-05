@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, PhaseId, WorkerId};
+use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
@@ -60,6 +60,24 @@ type CachedTaskListSnapshot<I> = (
     HashSet<String>,
     HashMap<PhaseId, Vec<PhaseId>>,
 );
+
+/// Per-item bookkeeping for an in-flight SLURM-primary dispatch.
+///
+/// One concern: hold everything the SLURM-primary needs to recover
+/// from a rejection (peer reports "No idle worker available") without
+/// losing the binary. `phase_id` drives the pool's in-flight counter
+/// (see `on_item_finished`); `target_secondary_id` lets the recovery
+/// path mark the right peer as backpressured; `binary` is what we
+/// `pool.requeue` so the next dispatch cycle can retry.
+///
+/// Replaces the original `HashMap<String, PhaseId>` ledger — that
+/// shape only supported the success path (decrement in_flight) and
+/// silently leaked the binary on dispatch-side rejection.
+pub(super) struct SlurmInFlightItem<I: Identifier> {
+    pub(super) phase_id: PhaseId,
+    pub(super) target_secondary_id: String,
+    pub(super) binary: TaskInfo<I>,
+}
 
 /// Certificate info for peer connections, set before `run()`.
 pub struct PeerCertInfo {
@@ -160,13 +178,25 @@ where
     // because the wire format describes the authoritative pending set.
     slurm_pending: Option<PendingPool<I>>,
     slurm_completed: HashSet<String>,
-    /// Phase id of every item that the SLURM-primary has dispatched
-    /// from `slurm_pending` but not yet seen complete. Mirrors the
-    /// pool's in-flight bookkeeping at the per-item granularity so
-    /// `on_item_finished` can be called with the right phase id when
-    /// a TaskComplete / TaskFailed arrives. Keyed by the same task
-    /// hash used in `completed_tasks` / `active_tasks`.
-    slurm_in_flight: HashMap<String, PhaseId>,
+    /// Per-item ledger for every SLURM-primary dispatch that hasn't
+    /// terminated yet. Keyed by the same task hash used in
+    /// `completed_tasks` / `active_tasks`. Stores `phase_id` (drives
+    /// the pool's `on_item_finished` counter), `target_secondary_id`
+    /// (used by the backpressure path to mark the right peer), and
+    /// the full `binary` (used to `pool.requeue` on a rejection so
+    /// the task isn't silently dropped from the pool).
+    slurm_in_flight: HashMap<String, SlurmInFlightItem<I>>,
+
+    /// Per-peer backpressure backoff for the SLURM-primary path.
+    /// Mirrors `PrimaryCoordinator::backpressured_secondaries` — when
+    /// a peer rejects a `TaskAssignment` with the wire signal
+    /// "No idle worker available", record the peer with an expiry
+    /// timestamp; until expiry, `handle_slurm_task_request` skips
+    /// re-dispatching to that peer (binary stays in the pool for
+    /// another candidate). Cleared when the peer reports an actual
+    /// `TaskComplete` (proves it's healthy) or when the backoff
+    /// window expires naturally.
+    slurm_backpressured_peers: HashMap<String, Instant>,
 
     // Cached snapshot of the live primary's last `FullTaskList` broadcast.
     // Every secondary keeps the cache up to date so that, on promotion,
@@ -228,6 +258,7 @@ where
             slurm_pending: None,
             slurm_completed: HashSet::new(),
             slurm_in_flight: HashMap::new(),
+            slurm_backpressured_peers: HashMap::new(),
             cached_full_task_list: None,
             slurm_primary_peer_id: None,
             pre_staged_mode: false,
@@ -301,6 +332,17 @@ where
         };
         self.extraction_cache
             .resolve_binary(zip_ref, local_path, file_hash, expected_content_hash)
+    }
+
+    /// True iff `secondary_id` is currently in the SLURM-primary's
+    /// backpressure backoff window (recently returned "No idle worker
+    /// available"). Used by `handle_slurm_task_request` to skip
+    /// re-dispatching to an unresponsive peer. Mirrors
+    /// `PrimaryCoordinator::is_backpressured`.
+    pub(super) fn is_slurm_peer_backpressured(&self, secondary_id: &str) -> bool {
+        self.slurm_backpressured_peers
+            .get(secondary_id)
+            .is_some_and(|t| Instant::now() < *t)
     }
 
     /// Set certificate info for peer connections. Must be called before `run()`

@@ -149,7 +149,20 @@ where
                         error_type: "Recoverable".into(),
                         error_message: "No idle worker available".into(),
                     };
-                    self.primary_transport.send(msg).await?;
+                    // Send to primary AND broadcast to peers. The
+                    // primary_transport reaches the live primary if it
+                    // exists; the peer broadcast reaches the
+                    // SLURM-promoted peer in failover mode (where
+                    // primary_transport is dead). Without the
+                    // broadcast, in failover mode a backpressure
+                    // rejection has no path back to the SLURM-primary
+                    // — its `slurm_in_flight` ledger leaks the binary
+                    // and the per-phase in_flight counter stalls the
+                    // run. Idempotent under both-paths-deliver: the
+                    // SLURM-primary's `handle_slurm_peer_rejection`
+                    // is hash-keyed and no-ops on the second call.
+                    self.primary_transport.send(msg.clone()).await?;
+                    let _ = self.peer_transport.broadcast(msg).await;
                 }
                 Ok(())
             }
