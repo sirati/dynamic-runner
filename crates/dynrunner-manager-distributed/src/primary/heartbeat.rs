@@ -216,6 +216,48 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         );
         Ok(())
     }
+
+    /// Handle a `SecondaryFatalError` from a secondary that's about to
+    /// exit non-zero. Treat it as a dead-secondary notification: log
+    /// at ERROR with the secondary's reason, then run the standard
+    /// requeue path so any in-flight tasks return to the pool and the
+    /// surviving fleet learns about the death (via `TimeoutDetected`)
+    /// without waiting for the keepalive miss threshold to elapse.
+    ///
+    /// The fatal sender will be terminating its process anyway, so
+    /// the requeue is the right cleanup — there's no recovery to
+    /// attempt on the primary side, just bookkeeping. Uses the most
+    /// recent observed keepalive as `last_keepalive` so the log line
+    /// is meaningful; falls back to `Instant::now()` if the secondary
+    /// never sent a keepalive (handshake-time fault).
+    pub(super) async fn handle_secondary_fatal_error(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        let DistributedMessage::SecondaryFatalError {
+            secondary_id,
+            error,
+            ..
+        } = msg
+        else {
+            return Ok(());
+        };
+        tracing::error!(
+            secondary = %secondary_id,
+            error = %error,
+            "secondary reported fatal error; treating as dead and requeueing in-flight tasks"
+        );
+        let last_keepalive = self
+            .secondary_keepalives
+            .get(&secondary_id)
+            .copied()
+            .unwrap_or_else(Instant::now);
+        let dead = DeadSecondary {
+            secondary_id,
+            last_keepalive,
+        };
+        self.requeue_dead_secondary(dead).await
+    }
 }
 
 #[cfg(test)]
