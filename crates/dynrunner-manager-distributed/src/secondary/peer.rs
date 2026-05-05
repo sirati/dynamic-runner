@@ -42,15 +42,15 @@ where
                 // Track peer's completed task to avoid duplicate processing
                 self.completed_tasks.insert(task_hash.clone());
                 // A successful TaskComplete from this peer proves it's
-                // healthy — clear any SLURM-primary backpressure
+                // healthy — clear any primary backpressure
                 // backoff so the next dispatch cycle can re-target it.
                 // Mirrors regular primary's TaskComplete handler.
-                self.clear_slurm_peer_backpressure(&secondary_id);
-                // Drive the SLURM-primary's phase machine: if this
-                // node dispatched the task as SLURM-primary, the
+                self.clear_primary_peer_backpressure(&secondary_id);
+                // Drive the primary's phase machine: if this
+                // node dispatched the task as primary, the
                 // peer's completion message is the only signal the
                 // pool gets that the item is no longer in flight.
-                self.note_slurm_item_completed(&task_hash);
+                self.note_primary_item_completed(&task_hash);
                 tracing::debug!(
                     peer = %secondary_id,
                     task_hash,
@@ -64,7 +64,7 @@ where
                 error_message,
                 ..
             } => {
-                // Two TaskFailed shapes arrive on the SLURM-primary
+                // Two TaskFailed shapes arrive on the primary
                 // path:
                 //   1. Backpressure rejection — peer's dispatch.rs
                 //      sends `Recoverable / "No idle worker
@@ -72,9 +72,9 @@ where
                 //      the assignment. The task NEVER ran; the
                 //      binary must be returned to the pool, the
                 //      peer marked backpressured. Drives
-                //      `handle_slurm_peer_rejection` (re-queue +
+                //      `handle_primary_peer_rejection` (re-queue +
                 //      backoff). Skipping it would leak the binary
-                //      from `slurm_in_flight` and stall the
+                //      from `primary_in_flight` and stall the
                 //      per-phase in_flight counter.
                 //   2. Terminal failure — peer's worker actually ran
                 //      the binary and reported failure (Recoverable
@@ -84,19 +84,19 @@ where
                 let is_backpressure = error_type == "Recoverable"
                     && error_message == "No idle worker available";
                 if is_backpressure {
-                    if let Some(peer) = self.handle_slurm_peer_rejection(&task_hash) {
+                    if let Some(peer) = self.handle_primary_peer_rejection(&task_hash) {
                         tracing::debug!(
                             peer = %peer,
                             task_hash,
-                            "peer rejected SLURM-primary assignment; re-queued + backpressure backoff applied"
+                            "peer rejected primary assignment; re-queued + backpressure backoff applied"
                         );
                     }
                 } else {
                     // Route through the failure-aware decrementer:
                     // Recoverable failures land in
-                    // `slurm_primary_failed` for the retry pass,
+                    // `primary_failed` for the retry pass,
                     // others just decrement in-flight as before.
-                    self.note_slurm_item_failed(&task_hash, &error_type);
+                    self.note_primary_item_failed(&task_hash, &error_type);
                     // Synchronous drain-check: if THIS failure was
                     // the last in-flight item AND the pool is
                     // empty, immediately re-inject the failed-task
@@ -109,7 +109,7 @@ where
                     // doesn't wait). No-op when there's still
                     // pending work or no Recoverable failures
                     // logged.
-                    self.slurm_primary_drain_check_and_retry().await;
+                    self.primary_drain_check_and_retry().await;
                     tracing::debug!(
                         peer = %secondary_id,
                         task_hash,
@@ -177,7 +177,7 @@ where
                 worker_id,
                 available_resources,
                 ..
-            } if self.is_slurm_primary => {
+            } if self.is_primary => {
                 // Peer routed this to us because we won the election. Same
                 // dispatch path that the live-primary case uses, just
                 // arriving over peer_transport instead of primary_transport.
@@ -187,7 +187,7 @@ where
                     .map(|r| r.amount)
                     .unwrap_or(0);
                 if let Err(e) = self
-                    .handle_slurm_task_request(secondary_id, worker_id, available_memory)
+                    .handle_primary_task_request(secondary_id, worker_id, available_memory)
                     .await
                 {
                     tracing::warn!(error = %e, "post-promotion peer TaskRequest dispatch failed");
@@ -208,9 +208,9 @@ where
     ///
     /// On a confirmed full-mesh failure this is HARD ERROR: the
     /// framework relies on the peer mesh for failover, post-promotion
-    /// routing, and broadcasts. With zero peers, a SLURM-promoted
+    /// routing, and broadcasts. With zero peers, a promoted
     /// node wedges in a tokio busy-poll (dataset peer reported 86%
-    /// CPU + 54k epoll_wait/sec on a stuck SLURM-primary). The
+    /// CPU + 54k epoll_wait/sec on a stuck primary). The
     /// previous warn-and-continue behaviour silently degraded the
     /// run instead of failing fast. We now:
     ///   1. Send a `SecondaryFatalError` to the current primary so
@@ -341,7 +341,7 @@ where
             tracing::warn!(
                 error = %e,
                 "failed to send MeshReady to primary; primary will fall back to \
-                 mesh-ready timeout before promoting SLURM-primary"
+                 mesh-ready timeout before promoting primary"
             );
         } else {
             tracing::debug!(
@@ -353,13 +353,13 @@ where
     }
 
     /// Check for peer timeouts based on keepalive tracking. When this
-    /// secondary is the SLURM-primary, a peer-timeout ALSO recovers
+    /// secondary is the primary, a peer-timeout ALSO recovers
     /// any in-flight tasks dispatched to that peer back into the
-    /// pool — without this, the slurm_in_flight ledger leaks the
+    /// pool — without this, the primary_in_flight ledger leaks the
     /// binary forever (the peer will never report TaskComplete /
     /// TaskFailed because it's gone) and the per-phase in_flight
     /// counter stays positive, blocking phase progression.
-    /// Non-SLURM-primary peers don't have a slurm_in_flight ledger
+    /// Non-primary peers don't have a primary_in_flight ledger
     /// to recover, so the recovery path is a no-op for them.
     pub(super) fn check_peer_timeouts(&mut self) {
         let now = timestamp_now();
@@ -374,13 +374,13 @@ where
 
         for peer_id in timed_out {
             let last_seen = self.peer_keepalives.remove(&peer_id).unwrap_or(0.0);
-            // Recover any tasks the SLURM-primary dispatched to this
-            // peer. Walk slurm_in_flight, collect hashes whose target
+            // Recover any tasks the primary dispatched to this
+            // peer. Walk primary_in_flight, collect hashes whose target
             // matches, then call `recover_in_flight_to_pool` for each
             // (which requeues the binary, decrements in_flight, and
             // clears the ledger entry).
             let recovered: Vec<String> = self
-                .slurm_in_flight
+                .primary_in_flight
                 .iter()
                 .filter(|(_, item)| item.target_secondary_id == peer_id)
                 .map(|(hash, _)| hash.clone())
@@ -391,7 +391,7 @@ where
             }
             // Drop the peer's backpressure entry too — once it's
             // declared dead the backoff is meaningless.
-            self.slurm_backpressured_peers.remove(&peer_id);
+            self.backpressured_secondaries.remove(&peer_id);
             tracing::warn!(
                 peer = %peer_id,
                 last_seen,

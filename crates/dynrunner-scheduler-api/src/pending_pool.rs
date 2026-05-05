@@ -527,7 +527,7 @@ impl<I: Identifier> PendingPool<I> {
     /// Notify the pool that a task has been dispatched outside the
     /// `pop_for_worker` / `take_from_view` path (which already do the
     /// in-flight bookkeeping). Pair with [`on_item_finished`] when the
-    /// task completes. Used by the SLURM-promoted secondary, which
+    /// task completes. Used by the promoted secondary, which
     /// extracts items via [`take_first_match`] (a removal primitive
     /// that does not touch in-flight counters) but needs the phase
     /// machine to observe the dispatch so a `Draining` transition
@@ -715,7 +715,7 @@ impl<I: Identifier> PendingPool<I> {
     /// already handed to a worker is the manager's concern, surfaced
     /// via `release_worker` / `on_item_finished`.
     ///
-    /// Used by callers (e.g. SLURM-primary) to drop items completed
+    /// Used by callers (e.g. primary) to drop items completed
     /// elsewhere in the cluster without disturbing the phase machine.
     pub fn retain<F>(&mut self, mut pred: F)
     where
@@ -739,7 +739,7 @@ impl<I: Identifier> PendingPool<I> {
     ///
     /// Does NOT update in-flight counts or worker affinity — this is
     /// a *removal* primitive, not a *dispatch* primitive. Intended for
-    /// callers (SLURM-promoted primary) that need to extract a task
+    /// callers (promoted primary) that need to extract a task
     /// matching a runtime predicate (e.g. memory-fit) without going
     /// through the soft-pin algorithm `pop_for_worker` implements.
     ///

@@ -179,14 +179,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         self.secondary_keepalives.remove(&secondary_id);
 
         if self
-            .slurm_primary_id
+            .primary_id
             .as_ref()
             .map(|id| id == &secondary_id)
             .unwrap_or(false)
         {
-            // The SLURM-primary just died; clear the pointer so caller can
+            // The primary just died; clear the pointer so caller can
             // promote a survivor before sending another FullTaskList.
-            self.slurm_primary_id = None;
+            self.primary_id = None;
         }
 
         // Notify every surviving secondary so they prune the dead peer.

@@ -41,13 +41,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
             let mut assigned = false;
 
-            // Demoted observer mode: the promoted SLURM-primary is
+            // Demoted observer mode: the promoted primary is
             // the sole authority for assignment. Skip the local-
             // assign branch entirely so the request always falls
-            // through to the SLURM-primary relay below — that way
+            // through to the primary relay below — that way
             // only one primary's pool ever decides what runs where.
             // Without this skip, the local primary would race the
-            // SLURM-primary by assigning from its own (post-handoff
+            // primary by assigning from its own (post-handoff
             // stale) pool view. See `demoted` doc on
             // `PrimaryCoordinator`.
             if let Some(idx) = target_idx
@@ -152,10 +152,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
-            // If no local assignment was made, relay to SLURM-primary
+            // If no local assignment was made, relay to primary
             if !assigned {
-                if let Some(slurm_id) = self.slurm_primary_id.clone() {
-                    self.transport.send_to(&slurm_id, msg).await?;
+                if let Some(pid) = self.primary_id.clone() {
+                    self.transport.send_to(&pid, msg).await?;
                 }
             }
         }
@@ -174,7 +174,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             let worker_id = *worker_id;
             // A TaskComplete supersedes a prior TaskFailed for the
             // same hash. Without this, a forwarded retry-success
-            // from the SLURM-primary would leave the local primary's
+            // from the primary would leave the local primary's
             // `failed_tasks` populated with a hash that was actually
             // retried OK, inflating `failed_count()` reports.
             // Pre-demotion, `run_retry_passes` cleared the entire
@@ -416,7 +416,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
             // Forward task-terminal outcomes to peer secondaries so
             // their `failed_tasks` / `completed_tasks` caches stay
-            // current — required for SLURM-promoted-primary handoff
+            // current — required for promoted-primary handoff
             // not to re-dispatch a task we just gave up on. Both
             // Recoverable and NonRecoverable are terminal in the
             // pass-based retry model: the retry pass re-injects into

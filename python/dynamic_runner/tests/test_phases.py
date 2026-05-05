@@ -26,7 +26,7 @@ Notes
   worker can record which item it actually saw.
 * Cross-phase activation is exercised through the distributed-runner
   path because that surfaces both the LocalManager's mid-run drain
-  flush and the SLURM-primary's phase-aware dispatch
+  flush and the promoted primary's phase-aware dispatch
   (`PendingPool::take_first_match` honours `phase_state`).
 * ``maturin develop --release`` must have run in this venv. The test
   is ``importorskip``-gated so collection still works otherwise.
@@ -259,7 +259,7 @@ def _run_distributed(
 ) -> dict:
     """In-process distributed primary + N secondaries. Used for tests
     that exercise multi-phase dependency barriers across the full
-    primary → SLURM-primary → secondary dispatch chain."""
+    primary → promoted primary → secondary dispatch chain."""
     primary_cfg = _rs.PrimaryConfig(num_secondaries=num_secondaries)
     secondary_template = _rs.SecondaryConfig(
         secondary_id="<template>",

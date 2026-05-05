@@ -245,23 +245,23 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
 
 
 /// Regression: post-demotion the local primary's `run_retry_passes`
-/// is a no-op (the SLURM-primary owns retry). This test pins the
-/// SLURM-primary side equivalent: a Recoverable failure observed by
-/// the SLURM-primary's own worker should land in
-/// `slurm_primary_failed`, the synchronous drain-check should
-/// re-inject into `slurm_pending` once the in-flight ledger empties,
+/// is a no-op (the primary owns retry). This test pins the
+/// primary side equivalent: a Recoverable failure observed by
+/// the primary's own worker should land in
+/// `primary_failed`, the synchronous drain-check should
+/// re-inject into `primary_pending` once the in-flight ledger empties,
 /// and the next dispatch cycle should rerun the task. A task that
-/// succeeds on the retry leaves `slurm_primary_failed` empty.
+/// succeeds on the retry leaves `primary_failed` empty.
 ///
-/// Why the assertions probe the SLURM-primary (not the local primary):
+/// Why the assertions probe the primary (not the local primary):
 /// the local primary's `operational_loop` exits the moment its
 /// counter check satisfies `completed + failed >= total`, which fires
 /// on the FIRST failure observed via the wire forward — well before
-/// the SLURM-primary's keepalive-tick / synchronous drain-check
+/// the primary's keepalive-tick / synchronous drain-check
 /// delivers the retry success. Once the local primary returns from
 /// `run()`, its `completed_tasks` / `failed_tasks` snapshots are
 /// frozen and don't reflect any later retry outcome. The
-/// SLURM-primary's `completed_tasks` is the post-demotion source of
+/// primary's `completed_tasks` is the post-demotion source of
 /// truth for cluster-wide completion accounting; the local primary's
 /// counters are a forwarding cache that's deliberately stale at this
 /// point.
@@ -269,13 +269,13 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
 /// Setup: 1 binary "ok" (50 bytes) + 1 binary "flaky" (40 bytes), 1
 /// real secondary, 1 worker. The pool sorts size-DESC so "ok" is
 /// initial-assigned first; "flaky" stays queued and falls into the
-/// SLURM-primary's `slurm_pending` post-promotion. The
+/// primary's `primary_pending` post-promotion. The
 /// `FlakyWorkerFactory` is parameterised to fail "flaky" exactly once
 /// on its first attempt (Recoverable), and to succeed every other
 /// task / subsequent attempt. After the first failure the
-/// SLURM-primary re-injects "flaky" into its own pool and the worker
+/// primary re-injects "flaky" into its own pool and the worker
 /// picks it up again via the steady-state `request_task_for_worker`
-/// path; the second attempt succeeds. End state on the SLURM-primary
+/// path; the second attempt succeeds. End state on the primary
 /// side: 2 completions, 0 residual failures, 1 retry pass consumed.
 #[tokio::test(flavor = "current_thread")]
 async fn recoverable_failure_succeeds_on_retry_pass() {
@@ -341,7 +341,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
 
         // Two binaries: "ok" (50 bytes, sorts first under size-DESC
         // → initial-assigned to worker 0) and "flaky" (40 bytes,
-        // stays queued → goes to SLURM-primary's `slurm_pending`
+        // stays queued → goes to primary's `primary_pending`
         // post-promotion via FullTaskList).
         let binaries = vec![
             make_binary("ok", 50),
@@ -352,26 +352,26 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
         primary.run(binaries, deps, ops, ope).await.unwrap();
 
         // Drop primary to close the secondary's primary_transport;
-        // the SLURM-primary's `process_tasks` exits on transport
+        // the primary's `process_tasks` exits on transport
         // close + zero peers (single-secondary case). By the time
-        // `primary.run()` returns the SLURM-primary has already
+        // `primary.run()` returns the primary has already
         // observed the retry-success TaskComplete on its own
         // worker-event channel and incremented its
         // `completed_tasks` count to 2 — the local primary's exit
-        // happens AFTER the SLURM-primary's bookkeeping is final.
+        // happens AFTER the primary's bookkeeping is final.
         drop(primary);
 
         let (completed, failed_residual, passes_used) =
             sec_handle.await.unwrap();
 
         // Both binaries reached terminal success on the
-        // SLURM-primary's view: "ok" succeeded first attempt, "flaky"
+        // primary's view: "ok" succeeded first attempt, "flaky"
         // succeeded on retry. No residual permanent failures.
         // Exactly one retry pass was consumed.
-        assert_eq!(completed, 2, "SLURM-primary should report 2 completions");
+        assert_eq!(completed, 2, "primary should report 2 completions");
         assert_eq!(
             failed_residual, 0,
-            "SLURM-primary's failed ledger should be empty after retry success"
+            "primary's failed ledger should be empty after retry success"
         );
         assert_eq!(
             passes_used, 1,
@@ -382,16 +382,16 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
 
 /// Companion to `recoverable_failure_succeeds_on_retry_pass`: a task
 /// that fails Recoverably on EVERY attempt (main pass + every retry
-/// pass) ends up permanently in `slurm_primary_failed`, and the
+/// pass) ends up permanently in `primary_failed`, and the
 /// retry budget reaches `config.retry_max_passes`. Pins the
-/// budget-exhaustion side of the SLURM-primary retry pass — without
+/// budget-exhaustion side of the primary retry pass — without
 /// this guard the drain-check could re-inject in an unbounded loop.
 ///
 /// Setup: same shape as the success test (1 binary "ok" + 1 binary
 /// "doomed", 1 worker, 1 secondary). `FlakyWorkerFactory` is told to
 /// fail "doomed" `u32::MAX` times — i.e. always — so both the main
 /// dispatch and the single retry attempt return Recoverable. End
-/// state on the SLURM-primary side: 1 completion ("ok"), 1
+/// state on the primary side: 1 completion ("ok"), 1
 /// permanent failure ("doomed"), 1 retry pass consumed (=
 /// `retry_max_passes`).
 #[tokio::test(flavor = "current_thread")]
@@ -404,9 +404,9 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         );
         // Quota = u32::MAX so "doomed" never succeeds across any
         // number of attempts. With `retry_max_passes = 1`, the
-        // SLURM-primary tries: main pass (fail #1) → retry pass
+        // primary tries: main pass (fail #1) → retry pass
         // (fail #2) → budget exhausted, "doomed" stays in
-        // `slurm_primary_failed`.
+        // `primary_failed`.
         let mut quotas = HashMap::new();
         quotas.insert("/tmp/doomed".to_string(), u32::MAX);
         let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
@@ -458,9 +458,9 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         );
 
         // "ok" sorts first (size 50 > 40) → initial-assigned →
-        // succeeds. "doomed" stays in pool → reaches SLURM-primary's
-        // `slurm_pending` post-promotion → dispatched via
-        // `handle_slurm_task_request` → fails Recoverably → drain-
+        // succeeds. "doomed" stays in pool → reaches primary's
+        // `primary_pending` post-promotion → dispatched via
+        // `handle_primary_task_request` → fails Recoverably → drain-
         // check re-injects → fails again → budget exhausted →
         // permanent.
         let binaries = vec![
@@ -471,9 +471,9 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         let (deps, ops, ope) = noop_phase_args();
         primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        // Drop primary so the SLURM-primary's transport closes and
+        // Drop primary so the primary's transport closes and
         // its `process_tasks` exits. By that point the
-        // SLURM-primary has fully consumed its retry budget on
+        // primary has fully consumed its retry budget on
         // "doomed".
         drop(primary);
 
@@ -486,7 +486,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         // (success or terminal failure). Recoverable failures —
         // whether retried-to-success, retried-to-Recoverable-again,
         // or budget-exhausted-still-Recoverable — stay out of the
-        // set so the SLURM-primary's dispatch retain doesn't filter
+        // set so the primary's dispatch retain doesn't filter
         // them out from a future re-injection. Here "ok" succeeded
         // and is in the set; "doomed" was Recoverable on every
         // attempt and isn't.
@@ -499,7 +499,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         // permanent-failure ledger after the budget was consumed.
         assert_eq!(
             failed_residual, 1,
-            "exhausted retry budget should leave 1 entry in slurm_primary_failed"
+            "exhausted retry budget should leave 1 entry in primary_failed"
         );
         assert_eq!(
             passes_used, 1,
@@ -785,10 +785,10 @@ fn spawn_real_secondary_with_src_network(
 
 /// Variant of `spawn_real_secondary` that drives a `FlakyWorkerFactory`
 /// and threads `retry_max_passes` into `SecondaryConfig` so the
-/// SLURM-primary's retry pass is governed by the same knob the live
+/// primary's retry pass is governed by the same knob the live
 /// primary uses. Returns the
-/// `(completed_count, slurm_primary_failed_count, retry_passes_used)`
-/// triple the SLURM-primary side ended up with — that's the assertion
+/// `(completed_count, primary_failed_count, retry_passes_used)`
+/// triple the primary side ended up with — that's the assertion
 /// surface for the post-demotion retry tests, since the local primary's
 /// `failed_count()` is a stale forwarding cache once the operational
 /// loop's exit condition fires (see `recoverable_failure_succeeds_on_retry_pass`).
@@ -822,7 +822,7 @@ fn spawn_real_secondary_flaky(
             // Tight keepalive so the keepalive-tick backstop fires
             // quickly enough that tests don't hit the default 60s
             // wait if any code path needs the periodic drain-check
-            // (the synchronous one in `note_slurm_item_failed` is
+            // (the synchronous one in `note_primary_item_failed` is
             // the primary trigger — this is just defensive).
             keepalive_interval: Duration::from_millis(50),
             src_network: None,
@@ -842,8 +842,8 @@ fn spawn_real_secondary_flaky(
         secondary.run(&mut factory).await.unwrap();
         (
             secondary.completed_count(),
-            secondary.slurm_primary_failed_count_for_test(),
-            secondary.slurm_primary_retry_passes_used_for_test(),
+            secondary.primary_failed_count_for_test(),
+            secondary.primary_retry_passes_used_for_test(),
         )
     });
 
@@ -1001,7 +1001,7 @@ async fn e2e_primary_and_two_secondaries() {
         // After the failover-survivability fix, every secondary's
         // `completed_tasks` reflects the CLUSTER view (own work +
         // peer broadcasts + primary-side forwards) so it can serve
-        // as a SLURM-promoted-primary on local-death without
+        // as a promoted-primary on local-death without
         // re-dispatching done items. Each secondary therefore sees
         // all 10 completions, not just its own ~5. Asserting the
         // cluster-wide invariant directly: every secondary's set
@@ -1504,7 +1504,7 @@ fn wire_local_path_strips_pre_staged_prefix() {
 /// Multi-secondary mesh-ready gate: the primary must NOT issue
 /// `PromotePrimary` until every connected secondary has reported
 /// `MeshReady`. Pre-fix the promotion fired ~750µs after cert-
-/// exchange completed; the SLURM-promoted secondary then became
+/// exchange completed; the promoted secondary then became
 /// authoritative against a still-forming peer mesh, and every
 /// pre-mesh-formation peer-broadcast routed into the void for up
 /// to 30s. This test pins the new ordering: wire `PromotePrimary`
@@ -1944,10 +1944,10 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
     .await;
 }
 
-/// Regression: `promote_slurm_primary` flips `self.demoted` to true
+/// Regression: `promote_primary` flips `self.demoted` to true
 /// and from that point `dispatch_to_idle_workers` is a no-op on the
 /// scheduler — i.e. the local primary stops handing out work as
-/// soon as it has handed authority off to the SLURM-primary.
+/// soon as it has handed authority off to the primary.
 ///
 /// Without this contract the local primary and the promoted secondary
 /// would both run dispatch in parallel against the same pool, racing
@@ -1955,7 +1955,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
 /// ledger state. See `demoted` doc on `PrimaryCoordinator` for the
 /// full rationale.
 #[tokio::test(flavor = "current_thread")]
-async fn promote_slurm_primary_demotes_local_and_disables_dispatch() {
+async fn promote_primary_demotes_local_and_disables_dispatch() {
     use crate::state::{SecondaryConnection, SecondaryConnectionState};
     use dynrunner_scheduler_api::PendingPool;
 
@@ -1989,7 +1989,7 @@ async fn promote_slurm_primary_demotes_local_and_disables_dispatch() {
         // virtual worker bound to it, and a pool with one queued
         // binary that `dispatch_to_idle_workers` would otherwise
         // pick up. We bypass `run()` because we want to drive
-        // `promote_slurm_primary` and `dispatch_to_idle_workers`
+        // `promote_primary` and `dispatch_to_idle_workers`
         // in isolation.
         let phase = dynrunner_core::PhaseId::from("default");
         let mut pool = PendingPool::<TestId>::new(
@@ -2032,19 +2032,19 @@ async fn promote_slurm_primary_demotes_local_and_disables_dispatch() {
         // Promote: should set `demoted = true` and emit a
         // `PromotePrimary` to the secondary (we don't observe the
         // wire here; the demotion flag is the contract under test).
-        primary.promote_slurm_primary().await.unwrap();
-        assert!(primary.demoted, "promote_slurm_primary must demote local");
+        primary.promote_primary().await.unwrap();
+        assert!(primary.demoted, "promote_primary must demote local");
         assert_eq!(
-            primary.slurm_primary_id.as_deref(),
+            primary.primary_id.as_deref(),
             Some("sec-0"),
-            "promote_slurm_primary records the routing target"
+            "promote_primary records the routing target"
         );
 
         // The pool still has its queued binary; the worker is
         // still idle. Pre-fix `dispatch_to_idle_workers` would
         // happily take the binary from the pool and assign it.
         // Post-fix it must early-return without touching pool
-        // state — since the SLURM-primary now owns dispatch.
+        // state — since the primary now owns dispatch.
         let pool_len_before = primary.pool().len();
         let view_before = primary.pool().view_for_worker(0).len();
         assert_eq!(pool_len_before, 1);

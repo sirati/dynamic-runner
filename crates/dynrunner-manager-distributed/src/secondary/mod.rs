@@ -31,16 +31,16 @@ pub struct SecondaryConfig {
     /// suspects primary death and starts the failover election (default 3,
     /// matching the primary's `keepalive_miss_threshold`).
     pub keepalive_miss_threshold: u32,
-    /// Maximum number of retry passes the SLURM-primary runs after the
+    /// Maximum number of retry passes the primary runs after the
     /// main pass drains. Mirrors `PrimaryConfig::retry_max_passes` —
     /// pre-demotion the local primary owned this; post-demotion the
     /// promoted secondary owns retry for tasks IT dispatched, so the
     /// same knob has to live on this side too. Default 1 (so total
     /// attempts per task = main pass + 1 retry pass = 2). 0 disables
-    /// retry entirely on the SLURM-primary side.
+    /// retry entirely on the primary side.
     ///
-    /// Only consulted when this secondary is acting as SLURM-primary
-    /// (`is_slurm_primary == true`). On non-promoted secondaries the
+    /// Only consulted when this secondary is acting as primary
+    /// (`is_primary == true`). On non-promoted secondaries the
     /// field is inert — the live primary's `retry_max_passes` is what
     /// drives retry while the live primary is still authoritative.
     pub retry_max_passes: u32,
@@ -68,16 +68,16 @@ impl Default for SecondaryConfig {
 /// asking the (now-dead) original primary for another snapshot.
 ///
 /// One alias per concern keeps the secondary struct legible and
-/// lets `populate_slurm_tasks` accept the same shape it caches.
+/// lets `populate_primary_tasks` accept the same shape it caches.
 type CachedTaskListSnapshot<I> = (
     Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>>,
     HashSet<String>,
     HashMap<PhaseId, Vec<PhaseId>>,
 );
 
-/// Per-item bookkeeping for an in-flight SLURM-primary dispatch.
+/// Per-item bookkeeping for an in-flight primary dispatch.
 ///
-/// One concern: hold everything the SLURM-primary needs to recover
+/// One concern: hold everything the primary needs to recover
 /// from a rejection (peer reports "No idle worker available") without
 /// losing the binary. `phase_id` drives the pool's in-flight counter
 /// (see `on_item_finished`); `target_secondary_id` lets the recovery
@@ -87,7 +87,7 @@ type CachedTaskListSnapshot<I> = (
 /// Replaces the original `HashMap<String, PhaseId>` ledger — that
 /// shape only supported the success path (decrement in_flight) and
 /// silently leaked the binary on dispatch-side rejection.
-pub(super) struct SlurmInFlightItem<I: Identifier> {
+pub(super) struct PrimaryInFlightItem<I: Identifier> {
     pub(super) phase_id: PhaseId,
     pub(super) target_secondary_id: String,
     pub(super) binary: TaskInfo<I>,
@@ -141,7 +141,7 @@ where
 
     // State
     transfer_complete: bool,
-    is_slurm_primary: bool,
+    is_primary: bool,
 
     // ZIP extraction cache
     extraction_cache: ExtractionCache,
@@ -178,11 +178,11 @@ where
     /// arm of `process_tasks`'s `select!` so the persistently-None
     /// future doesn't hot-loop. Once true, we drive failover via the
     /// election state machine and route work via
-    /// `slurm_primary_peer_id` once a peer wins the election.
+    /// `primary_peer_id` once a peer wins the election.
     ///
     /// Pre-fix the recv arm bare-broke the loop on `None` and the
     /// secondary exited cleanly with `completed=0` — losing every
-    /// task the SLURM-primary peer was about to dispatch. Dataset
+    /// task the primary peer was about to dispatch. Dataset
     /// reported this on the dev-box-primary scenario where the local
     /// transport closed at the phase boundary.
     primary_disconnected: bool,
@@ -227,88 +227,88 @@ where
     /// (mesh formed, watchdog elapsed, or no peers to dial).
     mesh_ready_sent: bool,
 
-    // SLURM-primary state (populated on promotion + full task list).
-    // `slurm_pending` is `None` until the secondary first receives a
+    // primary state (populated on promotion + full task list).
+    // `primary_pending` is `None` until the secondary first receives a
     // `FullTaskList` snapshot from the live primary (or, if it gets
     // promoted before any snapshot, until it observes one as the new
     // primary). The pool is rebuilt — not patched — on every snapshot,
     // because the wire format describes the authoritative pending set.
-    slurm_pending: Option<PendingPool<I>>,
-    slurm_completed: HashSet<String>,
-    /// Per-item ledger for every SLURM-primary dispatch that hasn't
+    primary_pending: Option<PendingPool<I>>,
+    primary_completed: HashSet<String>,
+    /// Per-item ledger for every primary dispatch that hasn't
     /// terminated yet. Keyed by the same task hash used in
     /// `completed_tasks` / `active_tasks`. Stores `phase_id` (drives
     /// the pool's `on_item_finished` counter), `target_secondary_id`
     /// (used by the backpressure path to mark the right peer), and
     /// the full `binary` (used to `pool.requeue` on a rejection so
     /// the task isn't silently dropped from the pool).
-    slurm_in_flight: HashMap<String, SlurmInFlightItem<I>>,
+    primary_in_flight: HashMap<String, PrimaryInFlightItem<I>>,
 
-    /// Per-task ledger of Recoverable failures observed on the SLURM-
+    /// Per-task ledger of Recoverable failures observed on the
     /// primary path. Mirrors the live primary's `failed_tasks` set, but
-    /// keyed to the secondary that's currently acting as SLURM-primary.
-    /// Populated by `note_slurm_item_failed` whenever a Recoverable
+    /// keyed to the secondary that's currently acting as primary.
+    /// Populated by `note_primary_item_failed` whenever a Recoverable
     /// failure terminates a dispatch slot for a task this node
-    /// dispatched; drained by `slurm_primary_drain_check_and_retry`
+    /// dispatched; drained by `primary_drain_check_and_retry`
     /// when the main pass quiesces (pool empty + no in-flight + no
-    /// active local tasks) and re-injected into `slurm_pending` via
+    /// active local tasks) and re-injected into `primary_pending` via
     /// `pool.reinject(item)` for one more attempt.
     ///
     /// Stores the binary alongside the hash so the re-injection step
-    /// has the full `TaskInfo` to put back into the pool — `slurm_in_flight`
+    /// has the full `TaskInfo` to put back into the pool — `primary_in_flight`
     /// already kept this shape for rejection-recovery; the failed
     /// ledger keeps the same shape for retry-injection.
     ///
     /// Closes the gap demotion introduced: post-demotion the local
     /// primary's `run_retry_passes` is a no-op, so without this
-    /// SLURM-primary-side ledger every Recoverable failure became
+    /// primary-side ledger every Recoverable failure became
     /// terminal at the cluster level.
-    slurm_primary_failed: HashMap<String, TaskInfo<I>>,
+    primary_failed: HashMap<String, TaskInfo<I>>,
 
     /// Number of retry passes consumed against `config.retry_max_passes`.
-    /// Bumped by `slurm_primary_drain_check_and_retry` once per
+    /// Bumped by `primary_drain_check_and_retry` once per
     /// re-injection event. The retry budget is exhausted when this
     /// counter reaches `retry_max_passes`; subsequent main-pass drains
-    /// with `slurm_primary_failed` non-empty terminate the run with
+    /// with `primary_failed` non-empty terminate the run with
     /// the residual entries marked permanently failed.
-    slurm_primary_retry_passes_used: u32,
+    primary_retry_passes_used: u32,
 
     /// One-shot guard for the budget-exhausted WARN emitted by
-    /// `slurm_primary_drain_check_and_retry`. The drain-check fires
+    /// `primary_drain_check_and_retry`. The drain-check fires
     /// every keepalive tick (and synchronously after every
-    /// `note_slurm_item_failed`); without this flag the warning would
+    /// `note_primary_item_failed`); without this flag the warning would
     /// duplicate every tick for the rest of the run. Pure logging
     /// hygiene — the actual failure count lives in
-    /// `slurm_primary_failed`.
+    /// `primary_failed`.
     exhaustion_warning_emitted: bool,
 
-    /// Per-peer backpressure backoff for the SLURM-primary path.
+    /// Per-peer backpressure backoff for the primary path.
     /// Mirrors `PrimaryCoordinator::backpressured_secondaries` — when
     /// a peer rejects a `TaskAssignment` with the wire signal
     /// "No idle worker available", record the peer with an expiry
-    /// timestamp; until expiry, `handle_slurm_task_request` skips
+    /// timestamp; until expiry, `handle_primary_task_request` skips
     /// re-dispatching to that peer (binary stays in the pool for
     /// another candidate). Cleared when the peer reports an actual
     /// `TaskComplete` (proves it's healthy) or when the backoff
     /// window expires naturally.
-    slurm_backpressured_peers: HashMap<String, Instant>,
+    backpressured_secondaries: HashMap<String, Instant>,
 
     // Cached snapshot of the live primary's last `FullTaskList` broadcast.
     // Every secondary keeps the cache up to date so that, on promotion,
-    // we can populate `slurm_pending` immediately without round-tripping
+    // we can populate `primary_pending` immediately without round-tripping
     // through a fresh `FullTaskList` (which would require a now-dead
     // primary). Stores the wire-format payload verbatim so the
     // PendingPool reconstruction logic lives in one place
-    // (`populate_slurm_tasks`).
+    // (`populate_primary_tasks`).
     cached_full_task_list: Option<CachedTaskListSnapshot<I>>,
 
-    // Identity of the current SLURM-primary peer, if the original primary
+    // Identity of the current primary peer, if the original primary
     // is dead and an election has resolved. `None` while the original
     // primary is alive (TaskRequest goes to `primary_transport`); `Some`
     // while we're voting for or have voted for a candidate (TaskRequest
     // is routed to that peer via `peer_transport`). Cleared whenever a
     // live primary message arrives.
-    slurm_primary_peer_id: Option<String>,
+    primary_peer_id: Option<String>,
 
     /// Set by handlers that detect an unrecoverable local fault (peer
     /// mesh fully failed to form, etc.). The main `process_tasks`
@@ -355,7 +355,7 @@ where
             active_tasks: HashMap::new(),
             completed_tasks: HashSet::new(),
             transfer_complete: false,
-            is_slurm_primary: false,
+            is_primary: false,
             extraction_cache,
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,
@@ -367,15 +367,15 @@ where
             peer_mesh_check_at: None,
             peer_dial_count: 0,
             mesh_ready_sent: false,
-            slurm_pending: None,
-            slurm_completed: HashSet::new(),
-            slurm_in_flight: HashMap::new(),
-            slurm_primary_failed: HashMap::new(),
-            slurm_primary_retry_passes_used: 0,
+            primary_pending: None,
+            primary_completed: HashSet::new(),
+            primary_in_flight: HashMap::new(),
+            primary_failed: HashMap::new(),
+            primary_retry_passes_used: 0,
             exhaustion_warning_emitted: false,
-            slurm_backpressured_peers: HashMap::new(),
+            backpressured_secondaries: HashMap::new(),
             cached_full_task_list: None,
-            slurm_primary_peer_id: None,
+            primary_peer_id: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
             fatal_exit: None,
@@ -425,8 +425,8 @@ where
     ///
     /// Used by every dispatch + assignment site on the secondary
     /// (operational TaskAssignment in `dispatch.rs`, initial-batch
-    /// in `setup.rs`, SLURM-primary self-assign + repopulate in
-    /// `slurm.rs`). Centralising here keeps the option-axis
+    /// in `setup.rs`, primary self-assign + repopulate in
+    /// `primary.rs`). Centralising here keeps the option-axis
     /// (verify-or-not) consistent across sites.
     pub(super) fn resolve_for_dispatch(
         &mut self,
@@ -450,13 +450,13 @@ where
             .resolve_binary(zip_ref, local_path, file_hash, expected_content_hash)
     }
 
-    /// True iff `secondary_id` is currently in the SLURM-primary's
+    /// True iff `secondary_id` is currently in the primary's
     /// backpressure backoff window (recently returned "No idle worker
-    /// available"). Used by `handle_slurm_task_request` to skip
+    /// available"). Used by `handle_primary_task_request` to skip
     /// re-dispatching to an unresponsive peer. Mirrors
     /// `PrimaryCoordinator::is_backpressured`.
-    pub(super) fn is_slurm_peer_backpressured(&self, secondary_id: &str) -> bool {
-        self.slurm_backpressured_peers
+    pub(super) fn is_primary_peer_backpressured(&self, secondary_id: &str) -> bool {
+        self.backpressured_secondaries
             .get(secondary_id)
             .is_some_and(|t| Instant::now() < *t)
     }
@@ -471,7 +471,7 @@ where
         self.completed_tasks.len()
     }
 
-    /// Test-only inspector for the SLURM-primary retry budget
+    /// Test-only inspector for the primary retry budget
     /// counter. Lets tests assert that the retry pass actually
     /// consumed budget (vs. e.g. the success arriving without
     /// re-injection because the test fixture fixed the worker
@@ -479,21 +479,21 @@ where
     /// production callers don't depend on this internal counter
     /// shape.
     #[cfg(test)]
-    pub fn slurm_primary_retry_passes_used_for_test(&self) -> u32 {
-        self.slurm_primary_retry_passes_used
+    pub fn primary_retry_passes_used_for_test(&self) -> u32 {
+        self.primary_retry_passes_used
     }
 
-    /// Test-only inspector for the SLURM-primary's residual
+    /// Test-only inspector for the primary's residual
     /// failed-task ledger after the retry budget is exhausted. Used
     /// by the multi-pass-exhaustion regression test to assert that a
     /// task which fails Recoverably across all permitted passes ends
-    /// up permanently in `slurm_primary_failed`. Counts only
-    /// SLURM-primary-dispatched failures (tasks that went through
-    /// `handle_slurm_task_request`); initial-assignment failures
+    /// up permanently in `primary_failed`. Counts only
+    /// primary-dispatched failures (tasks that went through
+    /// `handle_primary_task_request`); initial-assignment failures
     /// observed by the local worker bypass this ledger by design.
     #[cfg(test)]
-    pub fn slurm_primary_failed_count_for_test(&self) -> usize {
-        self.slurm_primary_failed.len()
+    pub fn primary_failed_count_for_test(&self) -> usize {
+        self.primary_failed.len()
     }
 
     /// Run the secondary coordination loop:
@@ -546,8 +546,8 @@ mod election;
 mod peer;
 mod processing;
 mod resource;
+mod primary;
 mod setup;
-mod slurm;
 mod staging;
 mod wire;
 

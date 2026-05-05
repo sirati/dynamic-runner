@@ -144,7 +144,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
     /// Record a secondary's `MeshReady` report. The
     /// `wait_for_mesh_ready` step blocks on this set covering every
-    /// connected secondary before it lets `promote_slurm_primary`
+    /// connected secondary before it lets `promote_primary`
     /// fire. A stray `MeshReady` after the wait already cleared is
     /// idempotent — the set just stays full and the message is a
     /// no-op.

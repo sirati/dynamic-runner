@@ -69,15 +69,15 @@ where
     /// Returns `Some(worker_id)` if the worker needs to be restarted (e.g.
     /// after disconnect). The caller is responsible for calling
     pub(super) async fn request_task_for_worker(&mut self, worker_id: WorkerId) -> Result<(), String> {
-        // When SLURM-primary, handle task requests locally
-        if self.is_slurm_primary && !self.slurm_pending_is_empty() {
+        // When primary, handle task requests locally
+        if self.is_primary && !self.primary_pending_is_empty() {
             let available_memory = if (worker_id as usize) < self.pool.workers.len() {
                 self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
             } else {
                 self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
             };
             return self
-                .handle_slurm_task_request(
+                .handle_primary_task_request(
                     self.config.secondary_id.clone(),
                     worker_id,
                     available_memory,
@@ -128,7 +128,7 @@ where
     /// Keepalive, TaskRequest, OOM report) follows the same rule. The
     /// rule is dynamic: at run start the local node is primary and we
     /// route via `primary_transport`; after `PromotePrimary` (and
-    /// after election) `slurm_primary_peer_id` names the current
+    /// after election) `primary_peer_id` names the current
     /// primary and we route via `peer_transport.send_to_peer` instead.
     ///
     /// Pre-extraction this routing logic existed inline in exactly one
@@ -144,14 +144,14 @@ where
     /// Setup-phase messages (welcome, cert exchange) deliberately
     /// keep using `primary_transport` directly: at that point there
     /// IS no other primary candidate, and the original transport is
-    /// the only path that exists. Once setup completes and a SLURM
-    /// node may be promoted, all operational messages route through
-    /// here.
+    /// the only path that exists. Once setup completes and a
+    /// secondary may be promoted, all operational messages route
+    /// through here.
     pub(super) async fn send_to_current_primary(
         &mut self,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
-        if let Some(current_primary) = &self.slurm_primary_peer_id {
+        if let Some(current_primary) = &self.primary_peer_id {
             if current_primary != &self.config.secondary_id {
                 let peer = current_primary.clone();
                 return self.peer_transport.send_to_peer(&peer, msg).await;
@@ -160,10 +160,10 @@ where
             // The dispatch handlers expect to consume messages off the
             // transport receivers (primary_transport.recv on secondaries,
             // peer.recv_peer on peers) rather than self-deliver. The
-            // SLURM-primary's own self-dispatch path doesn't go through
-            // this helper (`handle_slurm_task_request` is called
+            // primary's own self-dispatch path doesn't go through
+            // this helper (`handle_primary_task_request` is called
             // directly from `request_task_for_worker` when
-            // `is_slurm_primary && !slurm_pending_is_empty`), so this
+            // `is_primary && !primary_pending_is_empty`), so this
             // branch is hit only by the few odd code paths that don't
             // know whether the primary is local. Falling through to
             // `primary_transport.send` is the historical behaviour and
@@ -186,8 +186,8 @@ where
     /// the in-budget polls — which is precisely the work the kickstart
     /// pattern would have done anyway.
     ///
-    /// Only meaningful for the SLURM-primary failover path (peer
-    /// secondaries' workers don't get kickstarted by the SLURM-primary
+    /// Only meaningful for the primary failover path (peer
+    /// secondaries' workers don't get kickstarted by the primary
     /// when a phase activates) and edge cases on the live-primary path
     /// (a worker that got "no work" between two other workers'
     /// completions and the primary's kickstart targeted only one of

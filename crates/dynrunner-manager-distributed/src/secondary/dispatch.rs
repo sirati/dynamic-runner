@@ -151,10 +151,10 @@ where
                     };
                     // Route to whoever currently holds primary
                     // authority; broadcast to peers as belt-and-
-                    // suspenders so the SLURM-promoted peer's
-                    // `handle_slurm_peer_rejection` always sees the
+                    // suspenders so the promoted peer's
+                    // `handle_primary_peer_rejection` always sees the
                     // bounce even if the unicast loses to a primary
-                    // changeover mid-flight. Idempotent — the SLURM-
+                    // changeover mid-flight. Idempotent — the
                     // primary's recovery path is hash-keyed and
                     // no-ops on the second call.
                     self.send_to_current_primary(msg.clone()).await?;
@@ -184,13 +184,13 @@ where
                 Ok(())
             }
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
-                self.is_slurm_primary = new_primary_id == self.config.secondary_id;
-                if self.is_slurm_primary {
-                    tracing::info!("this secondary has been promoted to SLURM-primary");
+                self.is_primary = new_primary_id == self.config.secondary_id;
+                if self.is_primary {
+                    tracing::info!("this secondary has been promoted to primary");
                 } else {
                     tracing::info!(
                         new_primary = %new_primary_id,
-                        "another secondary promoted to SLURM-primary"
+                        "another secondary promoted to primary"
                     );
                 }
                 Ok(())
@@ -203,14 +203,14 @@ where
                 // to every secondary so each one's cached completion
                 // set stays current — matters on local-death-then-
                 // failover, where the elected secondary's
-                // populate_slurm_tasks filters items against
+                // populate_primary_tasks filters items against
                 // self.completed_tasks (peer broadcast covers the
                 // common case but is best-effort; this primary-side
                 // forward is the reliable backstop). Idempotent:
                 // a forward of our own completion just re-inserts
                 // the hash that's already there.
                 self.completed_tasks.insert(task_hash.clone());
-                self.note_slurm_item_completed(&task_hash);
+                self.note_primary_item_completed(&task_hash);
                 Ok(())
             }
             DistributedMessage::TaskFailed {
@@ -220,23 +220,23 @@ where
             } => {
                 // Same forwarding rationale as TaskComplete; only
                 // act on terminal (non-Recoverable) failures since
-                // Recoverable retry is owned by the SLURM-primary
-                // (see `note_slurm_item_failed`) and a future
+                // Recoverable retry is owned by the primary
+                // (see `note_primary_item_failed`) and a future
                 // TaskComplete or terminal TaskFailed will arrive.
                 if error_type != "Recoverable" {
                     self.completed_tasks.insert(task_hash.clone());
                     // Use the failure-aware variant for symmetry
                     // with the other TaskFailed sites (peer.rs,
                     // processing.rs); for non-Recoverable inputs
-                    // this is identical to `note_slurm_item_completed`
-                    // (no entry added to `slurm_primary_failed`).
-                    self.note_slurm_item_failed(&task_hash, &error_type);
+                    // this is identical to `note_primary_item_completed`
+                    // (no entry added to `primary_failed`).
+                    self.note_primary_item_failed(&task_hash, &error_type);
                     // Drain-check is harmless even when no entry
                     // was added (no-op when ledger is empty); kept
                     // for symmetry with the other TaskFailed sites
                     // so future maintainers don't have to remember
                     // a per-site filter.
-                    self.slurm_primary_drain_check_and_retry().await;
+                    self.primary_drain_check_and_retry().await;
                 }
                 Ok(())
             }
@@ -257,7 +257,7 @@ where
                 );
 
                 // Cache on every secondary: if we get promoted later we
-                // can rebuild the SLURM-primary `PendingPool` from this
+                // can rebuild the primary `PendingPool` from this
                 // snapshot (the live primary may by then be dead, so we
                 // can't ask for it again).
                 self.cached_full_task_list = Some((
@@ -266,8 +266,8 @@ where
                     phase_deps.clone(),
                 ));
 
-                if self.is_slurm_primary {
-                    self.populate_slurm_tasks(all_tasks, completed_set, phase_deps);
+                if self.is_primary {
+                    self.populate_primary_tasks(all_tasks, completed_set, phase_deps);
                 }
                 Ok(())
             }
@@ -276,12 +276,12 @@ where
                 worker_id,
                 available_resources,
                 ..
-            } if self.is_slurm_primary => {
+            } if self.is_primary => {
                 let available_memory = available_resources.iter()
                     .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                     .map(|r| r.amount)
                     .unwrap_or(0);
-                self.handle_slurm_task_request(secondary_id, worker_id, available_memory)
+                self.handle_primary_task_request(secondary_id, worker_id, available_memory)
                     .await
             }
             _ => {
