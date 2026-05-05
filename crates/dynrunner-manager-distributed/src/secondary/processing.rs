@@ -111,43 +111,56 @@ where
                             // on the dev-box-primary scenario.
                             let peers = self.peer_transport.peer_count();
                             if peers == 0 {
-                                // SLURM-primary retry pass may still
-                                // have in-flight work the live
-                                // primary just won't see anymore
-                                // (live primary's `operational_loop`
-                                // exits on `completed + failed >= total`,
-                                // which fires on the FIRST failure
-                                // forward — well before the
-                                // SLURM-primary's drain-check delivers
-                                // the retry result). If we have
-                                // anything still in flight here, stay
-                                // alive so the worker event arrives
-                                // and gets bookkept; THEN exit cleanly
-                                // on the next iteration. Without this
-                                // the SLURM-primary's retry success
-                                // (or final retry failure) is silently
-                                // dropped at the in-flight stage and
-                                // `slurm_primary_failed` ends up
-                                // misreporting the cluster's terminal
-                                // state. Mirrors the local primary's
-                                // pre-demotion behaviour: it stayed
-                                // alive through `run_retry_passes`
-                                // before returning.
-                                let pending_local = !self.slurm_in_flight.is_empty()
-                                    || !self.active_tasks.is_empty()
-                                    || !self.slurm_pending_is_empty();
-                                if self.is_slurm_primary && pending_local {
+                                // Once this secondary has been promoted to
+                                // SLURM-primary, the local primary's transport
+                                // closing is a benign event — the SLURM-primary
+                                // owns the task pool authoritatively (per the
+                                // post-demotion contract: `lifecycle.rs` demotes
+                                // the local primary on PromotePrimary, after
+                                // which the local side is purely advisory).
+                                // The previous heuristic — gate the exit on
+                                // `pending_local` (`slurm_in_flight` or
+                                // `active_tasks` or `slurm_pending` non-empty)
+                                // — was a pre-refactor leftover from when the
+                                // local primary held authority. It depends on
+                                // WORK STATE rather than ROLE STATE, and goes
+                                // wrong when the SLURM-primary momentarily
+                                // empties all three (e.g. its initial-batch
+                                // tasks completed, its peers timed out with
+                                // `recovered_in_flight=0` so nothing is
+                                // dispatchable, and `slurm_pending` is full
+                                // of free-pool tasks but indistinguishable
+                                // from "drained" by this guard's view of
+                                // `slurm_pending_is_empty()`). Tokenizer's
+                                // cohort-5 dispatch hit exactly this: the
+                                // SLURM-primary processed 19 of its own
+                                // initial-batch tasks, the local primary went
+                                // silent ~30min in, and the secondary exited
+                                // with `completed=19/216` despite holding
+                                // pool authority.
+                                //
+                                // Post-refactor rule: SLURM-primary's run
+                                // lifetime is bounded by the natural terminal
+                                // conditions (total counter / fleet_dead_timeout
+                                // analogue), NOT by the local primary's
+                                // transport state. Stay alive unconditionally
+                                // when promoted; let pool-level checks decide
+                                // termination.
+                                if self.is_slurm_primary {
                                     tracing::info!(
                                         in_flight = self.slurm_in_flight.len(),
                                         active = self.active_tasks.len(),
                                         pending = self.slurm_pending_len(),
-                                        "primary disconnected but SLURM-primary retry still has \
-                                         pending work; suppressing transport-close exit until \
-                                         the in-flight ledger drains"
+                                        "local primary disconnected; SLURM-primary continues \
+                                         independently — this node owns the pool, local \
+                                         primary's exit is benign post-promotion"
                                     );
                                     self.primary_disconnected = true;
                                     // Don't break: keep iterating so
-                                    // worker events land.
+                                    // worker events and any reconnecting
+                                    // peers land. Termination is owned by
+                                    // the pool-drained / total-tasks checks
+                                    // elsewhere in the loop.
                                     continue;
                                 }
                                 tracing::info!(
