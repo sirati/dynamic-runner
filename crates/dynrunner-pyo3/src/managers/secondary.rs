@@ -321,11 +321,12 @@ impl PySecondaryCoordinator {
                 );
 
                 // Set peer cert info so the CertExchange message
-                // includes our QUIC details. Both families are detected
-                // off `hostname -I` (see `network::detect_ipv4` /
-                // `detect_ipv6`); the resulting `PeerCertInfo` is what
-                // the `send_cert_exchange` step ships on the wire and
-                // the primary then re-broadcasts via `PeerInfo`. The
+                // includes our QUIC details. Both families are
+                // detected by `network::detect_ipv4` / `detect_ipv6`
+                // (env-var hint first, `hostname -I` fallback); the
+                // resulting `PeerCertInfo` is what the
+                // `send_cert_exchange` step ships on the wire and the
+                // primary then re-broadcasts via `PeerInfo`. The
                 // dialer (peer/dial.rs) consumes both families and
                 // happy-eyeballs-races them, so a host that has only
                 // one family configured is fine — the missing one is
