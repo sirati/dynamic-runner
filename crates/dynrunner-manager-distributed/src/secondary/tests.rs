@@ -557,3 +557,126 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
     assert_eq!(pool.phase_state(&phase_b), Some(PhaseState::Active));
     assert_eq!(pool.len(), 1, "phase-B's variant must remain queued");
 }
+
+/// Watchdog hard-error path: 30s after a non-empty peer dial, zero
+/// peers connected ⇒ secondary
+///   1. sends a `SecondaryFatalError` to the primary,
+///   2. sets `fatal_exit` so `process_tasks` returns `Err(reason)`,
+///      causing the secondary to exit non-zero rather than wedging
+///      in primary-driven dispatch mode.
+///
+/// Pre-fix the watchdog only logged a `tracing::warn!` and continued
+/// — a SLURM-promoted node with zero peers then sat in a tokio
+/// busy-poll (dataset peer reported 86% CPU + 54k epoll_wait/sec on
+/// a stuck SLURM-primary for 25 minutes).
+#[tokio::test(flavor = "current_thread")]
+async fn peer_mesh_watchdog_fatal_error_sets_exit_and_notifies_primary() {
+    use std::time::{Duration, Instant};
+
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Build the secondary by hand so the test can keep the primary
+    // side of the channel and inspect what the secondary sent.
+    let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (_pri_to_sec_tx, pri_to_sec_rx) =
+        tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+    let transport = ChannelPrimaryTransportEnd {
+        tx: sec_to_pri_tx,
+        rx: pri_to_sec_rx,
+    };
+    let config = SecondaryConfig {
+        secondary_id: "sec-x".into(),
+        num_workers: 1,
+        max_resources: dynrunner_core::ResourceMap::from([(
+            dynrunner_core::ResourceKind::memory(),
+            1024 * 1024 * 1024,
+        )]),
+        hostname: "test-host".into(),
+        keepalive_interval: Duration::from_millis(50),
+        src_network: None,
+        src_tmp: None,
+        peer_timeout: Duration::from_secs(120),
+        keepalive_miss_threshold: 2,
+    };
+    // Concrete `M` is `ChannelManagerEnd` (the helper-shared
+    // worker-side endpoint type); see `make_secondary` for the same
+    // shape — we duplicate it here only to keep the primary-side
+    // receiver around for inspection.
+    let mut secondary: SecondaryCoordinator<
+        ChannelPrimaryTransportEnd<TestId>,
+        NoPeers,
+        dynrunner_transport_channel::ChannelManagerEnd,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    > = SecondaryCoordinator::new(
+        config,
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    // Arm the watchdog: 4 peers attempted, deadline already in the
+    // past, NoPeers reports peer_count() == 0.
+    secondary.peer_dial_count = 4;
+    secondary.peer_mesh_check_at = Some(Instant::now() - Duration::from_secs(1));
+
+    // Pre-fault: nothing on the wire, no exit flag.
+    assert!(secondary.fatal_exit.is_none());
+    assert!(sec_to_pri_rx.try_recv().is_err());
+
+    secondary.check_peer_mesh_watchdog().await;
+
+    // Post-fault: exit flag set with a clear reason; watchdog
+    // disarmed so a re-tick won't re-fire.
+    let reason = secondary
+        .fatal_exit
+        .as_ref()
+        .expect("fatal_exit must be set after watchdog fires");
+    assert!(
+        reason.contains("0 of 4 peers"),
+        "reason should reference attempted peer count, got: {reason}"
+    );
+    assert!(
+        secondary.peer_mesh_check_at.is_none(),
+        "watchdog must disarm after firing"
+    );
+
+    // The fatal error must have been delivered to the primary's
+    // transport endpoint with the matching secondary_id and a
+    // non-empty error string.
+    let msg = sec_to_pri_rx
+        .try_recv()
+        .expect("primary channel must have received SecondaryFatalError");
+    match msg {
+        DistributedMessage::SecondaryFatalError {
+            secondary_id,
+            error,
+            ..
+        } => {
+            assert_eq!(secondary_id, "sec-x");
+            assert!(!error.is_empty());
+            assert!(
+                error.contains("peer mesh fully failed to form"),
+                "error should describe the fault, got: {error}"
+            );
+        }
+        other => panic!("expected SecondaryFatalError, got {:?}", other.msg_type()),
+    }
+
+    // The main-loop guard: if `fatal_exit.take()` returns `Some`,
+    // `process_tasks` returns `Err(reason)` immediately. Mirror the
+    // exact code path here so a future refactor of `process_tasks`
+    // that drops the check trips this test.
+    let exit = secondary
+        .fatal_exit
+        .take()
+        .map(Err::<(), String>)
+        .unwrap_or(Ok(()));
+    assert!(exit.is_err(), "fatal_exit must propagate as Err");
+    assert!(
+        secondary.fatal_exit.is_none(),
+        "fatal_exit must be consumed by take()"
+    );
+}

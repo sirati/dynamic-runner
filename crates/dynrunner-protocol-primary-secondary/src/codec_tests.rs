@@ -348,6 +348,12 @@ fn roundtrip_all_message_types() {
             new_primary_id: "s".into(),
             vote_round: 1,
         },
+        DistributedMessage::SecondaryFatalError {
+            sender_id: "s".into(),
+            timestamp: 0.0,
+            secondary_id: "s".into(),
+            error: "peer mesh fully failed to form: 0 of 4 peers reachable; cluster routing impossible".into(),
+        },
     ];
 
     for msg in &messages {

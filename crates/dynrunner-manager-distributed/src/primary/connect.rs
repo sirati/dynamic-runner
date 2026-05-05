@@ -133,6 +133,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             MessageType::TaskComplete => self.handle_task_complete(msg).await,
             MessageType::TaskFailed => self.handle_task_failed(msg).await,
             MessageType::Keepalive => { /* tracked above, no further action */ }
+            MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
