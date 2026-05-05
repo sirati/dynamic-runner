@@ -61,12 +61,36 @@ where
         // both inside one iterator chain trips E0500 because
         // `resolve_for_dispatch` needs &mut self while the filter
         // closure still borrows self immutably.
+        // Walk all_tasks once: build hash → task_id map for the
+        // completed-set translation below, partition into kept-vs-
+        // dropped in a single pass.
+        //
+        // Why we need the map: the wire's `completed` set is keyed
+        // by task_hash; the new pool's `completed_tasks` set is
+        // keyed by task_id. Variants in `kept` may declare
+        // `task_depends_on` against a toolchain task_id whose
+        // task is no longer in `kept` (filtered out as completed).
+        // Without seeding the new pool's `completed_tasks` with
+        // those task_ids, `extend()`'s validation rejects every
+        // variant whose toolchain finished pre-promotion as
+        // `UnknownTaskDep`.
+        let mut completed_task_ids: HashSet<String> = HashSet::new();
         let kept: Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>> = all_tasks
             .into_iter()
-            .filter(|task| {
-                !completed.contains(&task.hash)
-                    && !self.completed_tasks.contains(&task.hash)
-                    && !self.active_tasks.contains_key(&task.hash)
+            .filter_map(|task| {
+                let is_completed = completed.contains(&task.hash)
+                    || self.completed_tasks.contains(&task.hash);
+                let is_active = self.active_tasks.contains_key(&task.hash);
+                if is_completed {
+                    if let Some(id) = &task.binary_info.task_id {
+                        completed_task_ids.insert(id.clone());
+                    }
+                    None
+                } else if is_active {
+                    None
+                } else {
+                    Some(task)
+                }
             })
             .collect();
         let mut items: Vec<TaskInfo<I>> = Vec::with_capacity(kept.len());
@@ -112,6 +136,11 @@ where
 
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
+                // Seed completed task_ids BEFORE extend so that
+                // `task_depends_on` references against pre-promotion
+                // completions resolve as known. See the
+                // `completed_task_ids` doc above for context.
+                p.mark_tasks_completed(completed_task_ids);
                 if let Err(e) = p.extend(items) {
                     tracing::error!(
                         error = %e,

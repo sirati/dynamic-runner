@@ -332,6 +332,24 @@ impl<I: Identifier> PendingPool<I> {
         })
     }
 
+    /// Pre-seed `completed_tasks` with task ids the cluster has
+    /// already finished. Used by the failover-resume path: when a
+    /// promoted secondary rebuilds its `PendingPool` from a
+    /// `FullTaskList` snapshot, the completed prereqs were filtered
+    /// out of the items vec but their ids must still resolve
+    /// `task_depends_on` references in the surviving items. Without
+    /// this, every variant whose toolchain finished pre-promotion
+    /// would land in `extend()` as `UnknownTaskDep` and the new
+    /// primary would degrade to "no pending tasks".
+    ///
+    /// Idempotent. Must be called BEFORE `extend()` for the seeded
+    /// ids to be visible to validation. Calling it later affects
+    /// only future extends and the dependent-walk on subsequent
+    /// `on_item_finished`.
+    pub fn mark_tasks_completed(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.completed_tasks.extend(ids);
+    }
+
     /// Insert items into the pool. Each item is bucketed by
     /// `(phase_id, type_id, affinity_id-or-sentinel)`. Items are
     /// pushed FIFO — caller is responsible for the order it wants
