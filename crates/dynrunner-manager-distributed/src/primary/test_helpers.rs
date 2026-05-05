@@ -135,6 +135,21 @@ pub(super) async fn fake_secondary(
         })
         .unwrap();
 
+    // Mirror the real secondary's behaviour: as soon as the
+    // peer-mesh is settled (or there are no peers — which is the
+    // default for the in-process tests), report MeshReady so the
+    // primary's `wait_for_mesh_ready` step doesn't have to time out
+    // before promoting SLURM-primary. Fired pre-emptively here
+    // because the in-process fake doesn't model peer-dial latency.
+    outgoing_to_primary
+        .send(DistributedMessage::MeshReady {
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            peer_count: 0,
+        })
+        .unwrap();
+
     while let Some(msg) = incoming_from_primary.recv().await {
         match msg {
             DistributedMessage::PeerInfo { .. } => {}

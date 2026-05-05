@@ -643,27 +643,41 @@ async fn peer_mesh_watchdog_fatal_error_sets_exit_and_notifies_primary() {
         "watchdog must disarm after firing"
     );
 
-    // The fatal error must have been delivered to the primary's
-    // transport endpoint with the matching secondary_id and a
-    // non-empty error string.
-    let msg = sec_to_pri_rx
-        .try_recv()
-        .expect("primary channel must have received SecondaryFatalError");
-    match msg {
-        DistributedMessage::SecondaryFatalError {
-            secondary_id,
-            error,
-            ..
-        } => {
-            assert_eq!(secondary_id, "sec-x");
-            assert!(!error.is_empty());
-            assert!(
-                error.contains("peer mesh fully failed to form"),
-                "error should describe the fault, got: {error}"
-            );
+    // The watchdog now sends BOTH MeshReady (peer_count=0, so the
+    // primary's wait_for_mesh_ready step doesn't deadlock waiting on
+    // a secondary that's about to die) AND SecondaryFatalError, in
+    // that order. Drain both off the channel and verify each.
+    let mut saw_mesh_ready = false;
+    let mut saw_fatal = false;
+    while let Ok(msg) = sec_to_pri_rx.try_recv() {
+        match msg {
+            DistributedMessage::MeshReady {
+                secondary_id,
+                peer_count,
+                ..
+            } => {
+                assert_eq!(secondary_id, "sec-x");
+                assert_eq!(peer_count, 0, "watchdog-fire path always reports zero peers");
+                saw_mesh_ready = true;
+            }
+            DistributedMessage::SecondaryFatalError {
+                secondary_id,
+                error,
+                ..
+            } => {
+                assert_eq!(secondary_id, "sec-x");
+                assert!(!error.is_empty());
+                assert!(
+                    error.contains("peer mesh fully failed to form"),
+                    "error should describe the fault, got: {error}"
+                );
+                saw_fatal = true;
+            }
+            other => panic!("unexpected message on primary channel: {:?}", other.msg_type()),
         }
-        other => panic!("expected SecondaryFatalError, got {:?}", other.msg_type()),
     }
+    assert!(saw_mesh_ready, "MeshReady (peer_count=0) must be sent before fatal exit");
+    assert!(saw_fatal, "SecondaryFatalError must be sent");
 
     // The main-loop guard: if `fatal_exit.take()` returns `Some`,
     // `process_tasks` returns `Err(reason)` immediately. Mirror the

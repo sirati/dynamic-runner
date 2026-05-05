@@ -44,6 +44,7 @@ async fn single_secondary_processes_all_tasks() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -94,6 +95,7 @@ async fn two_secondaries_distribute_work() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -181,6 +183,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -265,6 +268,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -388,6 +392,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -491,6 +496,7 @@ async fn retry_max_passes_zero_disables_retry() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 0,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -675,6 +681,7 @@ async fn e2e_primary_and_secondary_single_node() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -749,6 +756,7 @@ async fn e2e_primary_and_two_secondaries() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -819,6 +827,7 @@ async fn live_distribution_continues_past_initial_batch() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -874,6 +883,7 @@ async fn notify_stage_file_emits_wire_message() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, TestId> =
@@ -1029,6 +1039,7 @@ async fn e2e_pre_staged_source_mode() {
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1105,6 +1116,7 @@ async fn e2e_uses_file_based_items_false() {
                 max_concurrent_per_type: std::collections::HashMap::new(),
                 retry_max_passes: 1,
                 fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1199,6 +1211,7 @@ async fn e2e_per_type_max_concurrent() {
                 max_concurrent_per_type: caps,
                 retry_max_passes: 1,
                 fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1265,3 +1278,283 @@ fn wire_local_path_strips_pre_staged_prefix() {
     assert_eq!(cfg.wire_local_path(&bin), "/srv/data/bin_0");
 }
 
+/// Multi-secondary mesh-ready gate: the primary must NOT issue
+/// `PromotePrimary` until every connected secondary has reported
+/// `MeshReady`. Pre-fix the promotion fired ~750µs after cert-
+/// exchange completed; the SLURM-promoted secondary then became
+/// authoritative against a still-forming peer mesh, and every
+/// pre-mesh-formation peer-broadcast routed into the void for up
+/// to 30s. This test pins the new ordering: wire `PromotePrimary`
+/// arrives at every fake secondary AFTER all of them have sent
+/// their own `MeshReady`. Implementation uses a per-secondary
+/// `tokio::sync::oneshot` to gate the MeshReady send so the test
+/// can drive the order deterministically.
+#[tokio::test(flavor = "current_thread")]
+async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            const N_SECONDARIES: u32 = 3;
+            let (transport, secondary_ends) = setup_test(N_SECONDARIES);
+
+            // Per-secondary oneshot triggers. Test drives them in
+            // order to enforce: the primary doesn't fire
+            // PromotePrimary until ALL three have flipped.
+            let mut mesh_triggers: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+            // Per-secondary observation: did this secondary see
+            // PromotePrimary BEFORE it was allowed to send
+            // MeshReady? (true = bug present)
+            let mut promote_seen_pre_mesh_observers: Vec<
+                tokio::sync::oneshot::Receiver<bool>,
+            > = Vec::new();
+
+            for (id, rx, tx) in secondary_ends {
+                let (mesh_tx, mesh_rx) = tokio::sync::oneshot::channel::<()>();
+                let (obs_tx, obs_rx) = tokio::sync::oneshot::channel::<bool>();
+                mesh_triggers.push(mesh_tx);
+                promote_seen_pre_mesh_observers.push(obs_rx);
+                tokio::task::spawn_local(gated_mesh_secondary(
+                    id,
+                    2,
+                    1024 * 1024 * 1024,
+                    rx,
+                    tx,
+                    mesh_rx,
+                    obs_tx,
+                ));
+            }
+
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: N_SECONDARIES,
+                connect_timeout: Duration::from_secs(5),
+                peer_timeout: Duration::from_secs(5),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                // Generous timeout so the test can fire triggers
+                // sequentially without racing the deadline.
+                mesh_ready_timeout: std::time::Duration::from_secs(10),
+            };
+
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..6)
+                .map(|i| make_binary(&format!("bin_{i}"), 100))
+                .collect();
+
+            // Drive the primary's coordination pipeline on a child
+            // task so the test body can release MeshReady triggers
+            // in sequence and observe the gate.
+            let primary_handle = tokio::task::spawn_local(async move {
+                let (deps, ops, ope) = noop_phase_args();
+                primary.run(binaries, deps, ops, ope).await.unwrap();
+                primary.completed_count()
+            });
+
+            // Release MeshReady triggers one at a time. Between
+            // each release, yield enough times for the primary's
+            // wait loop to observe the freshly-arrived
+            // MeshReady. The primary must NOT have advanced past
+            // `wait_for_mesh_ready` until all three triggers have
+            // fired — otherwise the per-secondary "did I see
+            // PromotePrimary before being allowed to MeshReady?"
+            // observer would have reported true for some of them.
+            for trigger in mesh_triggers {
+                trigger.send(()).expect("trigger send");
+                // Yield repeatedly so the primary task gets a
+                // chance to dequeue & process the MeshReady. A
+                // single `yield_now` isn't enough on a
+                // current_thread runtime when the primary is
+                // mid-message, so spam it.
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            // Collect the per-secondary observations. None of
+            // them should have seen PromotePrimary before being
+            // allowed to send MeshReady.
+            for (i, obs) in promote_seen_pre_mesh_observers.into_iter().enumerate() {
+                let saw = obs.await.expect("observer recv");
+                assert!(
+                    !saw,
+                    "secondary {i} observed PromotePrimary BEFORE its own \
+                     MeshReady was allowed to send — primary's \
+                     wait_for_mesh_ready step is not gating PromotePrimary"
+                );
+            }
+
+            let completed = primary_handle.await.unwrap();
+            assert_eq!(completed, 6, "all 6 tasks should complete");
+        })
+        .await;
+}
+
+/// Fake secondary that defers `MeshReady` until the test fires
+/// `mesh_trigger`. Reports via `observer` whether it saw
+/// `PromotePrimary` arrive before its `MeshReady` was permitted to
+/// send (true = bug). Otherwise behaves like `fake_secondary`.
+async fn gated_mesh_secondary(
+    secondary_id: String,
+    num_workers: u32,
+    ram_bytes: u64,
+    mut incoming_from_primary: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    outgoing_to_primary: tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    mesh_trigger: tokio::sync::oneshot::Receiver<()>,
+    observer: tokio::sync::oneshot::Sender<bool>,
+) {
+    use dynrunner_protocol_primary_secondary::MessageType;
+
+    outgoing_to_primary
+        .send(DistributedMessage::SecondaryWelcome {
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: ram_bytes,
+            }],
+            worker_count: num_workers,
+            hostname: "test-host".into(),
+        })
+        .unwrap();
+
+    outgoing_to_primary
+        .send(DistributedMessage::CertExchange {
+            sender_id: secondary_id.clone(),
+            timestamp: 0.0,
+            secondary_id: secondary_id.clone(),
+            public_cert_pem: "FAKE_CERT".into(),
+            ipv4_address: Some("127.0.0.1".into()),
+            ipv6_address: None,
+            quic_port: 5000,
+        })
+        .unwrap();
+
+    // Race: receive the trigger to send MeshReady against
+    // observing PromotePrimary on the inbound path. If
+    // PromotePrimary arrives first, the gate failed.
+    let mut mesh_trigger_opt = Some(mesh_trigger);
+    let mut observer_opt = Some(observer);
+    let mut mesh_sent = false;
+    let mut promote_seen_pre_mesh = false;
+
+    loop {
+        // While we're still pre-MeshReady, race the trigger
+        // against an inbound PromotePrimary. After MeshReady has
+        // been sent, the trigger arm is removed and we fall back
+        // to a normal recv loop.
+        if !mesh_sent {
+            let trigger = mesh_trigger_opt.as_mut().unwrap();
+            tokio::select! {
+                _ = trigger => {
+                    outgoing_to_primary
+                        .send(DistributedMessage::MeshReady {
+                            sender_id: secondary_id.clone(),
+                            timestamp: 0.0,
+                            secondary_id: secondary_id.clone(),
+                            peer_count: 0,
+                        })
+                        .unwrap();
+                    mesh_sent = true;
+                    mesh_trigger_opt = None;
+                    if let Some(obs) = observer_opt.take() {
+                        let _ = obs.send(promote_seen_pre_mesh);
+                    }
+                }
+                msg = incoming_from_primary.recv() => match msg {
+                    Some(m) => {
+                        if matches!(m.msg_type(), MessageType::PromotePrimary) {
+                            promote_seen_pre_mesh = true;
+                        }
+                        handle_inbound_for_gated_secondary(
+                            &secondary_id,
+                            &outgoing_to_primary,
+                            ram_bytes,
+                            m,
+                        );
+                    }
+                    None => break,
+                },
+            }
+        } else {
+            match incoming_from_primary.recv().await {
+                Some(m) => handle_inbound_for_gated_secondary(
+                    &secondary_id,
+                    &outgoing_to_primary,
+                    ram_bytes,
+                    m,
+                ),
+                None => break,
+            }
+        }
+    }
+}
+
+fn handle_inbound_for_gated_secondary(
+    secondary_id: &str,
+    outgoing: &tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    ram_bytes: u64,
+    msg: DistributedMessage<TestId>,
+) {
+    match msg {
+        DistributedMessage::PeerInfo { .. } => {}
+        DistributedMessage::InitialAssignment { zip_files, .. } => {
+            for zip_file in &zip_files {
+                for entry in &zip_file.binaries {
+                    let _ = outgoing.send(DistributedMessage::TaskComplete {
+                        sender_id: secondary_id.into(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.into(),
+                        worker_id: 0,
+                        task_hash: entry.hash.clone(),
+                        result_data: None,
+                    });
+                    let _ = outgoing.send(DistributedMessage::TaskRequest {
+                        sender_id: secondary_id.into(),
+                        timestamp: 0.0,
+                        secondary_id: secondary_id.into(),
+                        worker_id: 0,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: ram_bytes,
+                        }],
+                    });
+                }
+            }
+        }
+        DistributedMessage::TransferComplete { .. } => {}
+        DistributedMessage::TaskAssignment { file_hash, .. } => {
+            let _ = outgoing.send(DistributedMessage::TaskComplete {
+                sender_id: secondary_id.into(),
+                timestamp: 0.0,
+                secondary_id: secondary_id.into(),
+                worker_id: 0,
+                task_hash: file_hash,
+                result_data: None,
+            });
+            let _ = outgoing.send(DistributedMessage::TaskRequest {
+                sender_id: secondary_id.into(),
+                timestamp: 0.0,
+                secondary_id: secondary_id.into(),
+                worker_id: 0,
+                available_resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: ram_bytes,
+                }],
+            });
+        }
+        _ => {}
+    }
+}

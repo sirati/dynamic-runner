@@ -19,6 +19,7 @@ pub enum MessageType {
     StageFile,
     PromotePrimary,
     FullTaskList,
+    MeshReady,
     // Secondary <-> Secondary (peer-to-peer)
     TaskComplete,
     TaskFailed,
@@ -363,6 +364,25 @@ pub enum DistributedMessage<I> {
         timestamp: f64,
         new_primary_id: String,
     },
+    /// Secondary -> Primary: "my peer-mesh has finished forming
+    /// (or was empty / fully failed to form)". Emitted once per
+    /// secondary, after `connect_to_peers` has either landed at
+    /// least one peer connection or the per-secondary peer-mesh
+    /// watchdog has elapsed; for single-secondary runs (no peers
+    /// to dial) it fires immediately at operational-loop entry.
+    /// The primary defers `PromotePrimary` until every secondary
+    /// has reported, so the SLURM-promoted secondary never
+    /// becomes authoritative against an empty peer mesh — closing
+    /// the 750µs ↔ 30s gap where pre-mesh-formation messages
+    /// would be sent into a void. `peer_count` carries the
+    /// observed peer-connection count at signal time (0 in the
+    /// single-secondary or fully-failed cases).
+    MeshReady {
+        sender_id: String,
+        timestamp: f64,
+        secondary_id: String,
+        peer_count: u32,
+    },
     FullTaskList {
         sender_id: String,
         timestamp: f64,
@@ -468,6 +488,7 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { sender_id, .. }
             | Self::PromotePrimary { sender_id, .. }
             | Self::FullTaskList { sender_id, .. }
+            | Self::MeshReady { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
             | Self::TaskFailed { sender_id, .. }
             | Self::Keepalive { sender_id, .. }
@@ -493,6 +514,7 @@ impl<I> DistributedMessage<I> {
             | Self::StageFile { timestamp, .. }
             | Self::PromotePrimary { timestamp, .. }
             | Self::FullTaskList { timestamp, .. }
+            | Self::MeshReady { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
             | Self::TaskFailed { timestamp, .. }
             | Self::Keepalive { timestamp, .. }
@@ -518,6 +540,7 @@ impl<I> DistributedMessage<I> {
             Self::StageFile { .. } => MessageType::StageFile,
             Self::PromotePrimary { .. } => MessageType::PromotePrimary,
             Self::FullTaskList { .. } => MessageType::FullTaskList,
+            Self::MeshReady { .. } => MessageType::MeshReady,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
             Self::TaskFailed { .. } => MessageType::TaskFailed,
             Self::Keepalive { .. } => MessageType::Keepalive,

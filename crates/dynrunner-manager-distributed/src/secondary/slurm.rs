@@ -71,29 +71,28 @@ where
             .collect();
         let mut items: Vec<TaskInfo<I>> = Vec::with_capacity(kept.len());
         for task in kept {
-            // Resolve via the three-mode helper (FR-2 opaque /
-            // pre_staged / default). Use `task.local_path` (the
-            // wire-relative form the primary stripped via
-            // wire_local_path) — that's the form the resolver
-            // expects in pre-staged mode. Falling back to
-            // `task.file_path` (the primary's full view path) when
-            // local_path is empty preserves the historical path for
-            // normal mode where they're identical.
-            let resolution_path = if !task.local_path.is_empty() {
-                task.local_path.clone()
-            } else {
-                task.file_path.clone().unwrap_or_default()
-            };
-            let resolved =
-                self.resolve_for_dispatch(None, &resolution_path, &task.hash);
-            let binary_path = resolved
-                .unwrap_or_else(|| std::path::PathBuf::from(&resolution_path));
-
             // Hydrate phase/type/affinity/payload from the wire.
             // Single source of truth for wire→TaskInfo lives in
             // `DistributedBinaryInfo::to_task_info` (Phase 4B).
-            let mut binary = task.binary_info.to_task_info();
-            binary.path = binary_path;
+            //
+            // Keep `binary.path` AS-IS from the wire (i.e. the
+            // primary's view path). The resolver runs lazily at
+            // dispatch time (`handle_slurm_task_request` calls
+            // `resolve_for_dispatch` on the binary it just took
+            // from the pool) — same end result for the worker,
+            // but the in-pool `task_file_hash(&binary)` matches
+            // the primary's `compute_task_hash` because both now
+            // hash the wire path. Without this, pre-staged mode
+            // diverges: primary hashes the gateway-absolute path,
+            // slurm hashes the secondary-resolved container path,
+            // `completed_tasks` can't dedupe across paths, and
+            // any race that lets both paths dispatch the same
+            // logical task (live primary's kickstart-TaskAssignment
+            // racing the SLURM-primary's self-dispatch) doubles
+            // the per-task completion record. Surfaced when the
+            // mesh-ready wait pushed the dispatch ordering close
+            // enough for the race to fire reliably.
+            let binary = task.binary_info.to_task_info();
             items.push(binary);
         }
         items.sort_by_key(|i| std::cmp::Reverse(i.size));
