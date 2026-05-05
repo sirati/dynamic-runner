@@ -53,12 +53,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     // secondaries; pre-fix the all-or-nothing
                     // handshake meant a 5-job dispatch dies if 1 job
                     // fails. With quorum, we drop the missing
-                    // secondaries from `num_secondaries` (so initial
-                    // assignment + worker-budget accounting reflect
-                    // the actual fleet) and continue with N-K
-                    // healthy secondaries. Failover requires N>=1;
-                    // if zero connected, that's still a dispatch
-                    // failure.
+                    // secondaries from `num_secondaries` AND from
+                    // `self.secondaries` (so initial assignment +
+                    // worker-budget accounting reflect the actual
+                    // fleet, AND `peer_setup` doesn't try to send
+                    // PeerInfo to a half-handshaked secondary whose
+                    // wire connection's writer task already
+                    // exited — that surfaces as "channel closed"
+                    // on the send_to and bubbles up as a
+                    // primary-coordinator-failure). Failover
+                    // requires N>=1; zero connected is still a
+                    // hard error.
                     if cert_done == 0 {
                         return Err(format!(
                             "timeout waiting for secondaries: 0/{expected} sent \
@@ -74,6 +79,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                              Ready handshake)"
                         ));
                     }
+                    // Drop secondaries that are present in the registry
+                    // but didn't make it to cert-exchanged (Handshaking
+                    // or earlier). They're stale entries — peer_setup
+                    // and downstream phases must NOT iterate over them.
+                    let to_drop: Vec<String> = self.secondaries
+                        .iter()
+                        .filter(|(_, s)| !s.is_at_least_cert_exchanged())
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in &to_drop {
+                        self.secondaries.remove(id);
+                    }
                     let missing: Vec<String> = (0..expected)
                         .map(|i| format!("secondary-{i}"))
                         .filter(|sid| !self.secondaries.contains_key(sid))
@@ -81,11 +98,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     tracing::warn!(
                         connected = cert_done,
                         expected,
-                        missing = ?missing,
+                        dropped_partial = ?to_drop,
+                        missing_no_welcome = ?missing
+                            .iter()
+                            .filter(|id| !to_drop.contains(id))
+                            .collect::<Vec<_>>(),
                         "connect_timeout reached with partial fleet; proceeding \
-                         with quorum — missing secondaries are dropped from this \
-                         dispatch (the run continues at reduced parallelism, but \
-                         tasks are not lost)"
+                         with quorum — missing/partial secondaries are dropped \
+                         from this dispatch (run continues at reduced parallelism, \
+                         no tasks lost)"
                     );
                     self.config.num_secondaries = cert_done as u32;
                     break;
