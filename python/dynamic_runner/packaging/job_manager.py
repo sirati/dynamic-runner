@@ -132,6 +132,24 @@ echo "Podman storage: $PODMAN_STORAGE"
 echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
+
+# Cap container memory at NodeRAM - 2GiB so a runaway worker hits a
+# graceful container-OOM (just kills the worker process) instead of a
+# host kernel-OOM that wedges the cgroup and leaves zombie SLURM jobs
+# stuck COMPLETING. Probed at wrapper-execution time on the compute
+# node — node RAM is not known at submit time and may differ from the
+# primary. --memory-swap is set equal to --memory so podman cannot
+# silently swap-thrash under memory pressure. Falls back to no cap on
+# absurdly small nodes (<2GiB MemTotal, implausible on cluster).
+MEM_BYTES=$(awk '/MemTotal:/{{val = $2*1024 - 2*1024*1024*1024; if (val > 0) print val; else print ""}}' /proc/meminfo)
+if [ -n "${{MEM_BYTES}}" ]; then
+    MEM_FLAGS="--memory=${{MEM_BYTES}} --memory-swap=${{MEM_BYTES}}"
+    echo "Container memory cap: ${{MEM_BYTES}} bytes (NodeRAM - 2GiB)"
+else
+    MEM_FLAGS=""
+    echo "Container memory cap: disabled (MemTotal probe yielded non-positive headroom)"
+fi
+echo ""
 """
 
         if reverse_connection:
@@ -223,6 +241,7 @@ echo ""
 
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --network host \
+    ${{MEM_FLAGS}} \
     -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
@@ -239,6 +258,7 @@ echo ""
 
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --network host \
+    ${{MEM_FLAGS}} \
     -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
