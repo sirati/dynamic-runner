@@ -137,4 +137,26 @@ where
         self.last_request_time.remove(&worker_id);
     }
 
+    /// Periodic safety-net wakeup: walk every idle worker and call
+    /// `request_task_for_worker`. The per-worker exponential backoff
+    /// (`request_backoff`, doubling from 1s to a 60s cap) suppresses
+    /// requests within the backoff window, so the only fan-out cost is
+    /// the in-budget polls — which is precisely the work the kickstart
+    /// pattern would have done anyway.
+    ///
+    /// Only meaningful for the SLURM-primary failover path (peer
+    /// secondaries' workers don't get kickstarted by the SLURM-primary
+    /// when a phase activates) and edge cases on the live-primary path
+    /// (a worker that got "no work" between two other workers'
+    /// completions and the primary's kickstart targeted only one of
+    /// them). Regular live-primary runs see most polls suppressed by
+    /// the backoff because the kickstart already covers the path.
+    pub(super) async fn repoll_idle_workers(&mut self) {
+        let n = self.pool.workers.len();
+        for wid in 0..n {
+            if self.pool.workers[wid].is_idle_state() {
+                let _ = self.request_task_for_worker(wid as WorkerId).await;
+            }
+        }
+    }
 }

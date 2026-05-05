@@ -77,6 +77,23 @@ where
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog();
+                    // Re-poll any worker that's been idle since its
+                    // last unsatisfied request. The per-worker rate
+                    // limit (`request_backoff` doubles on each
+                    // empty-response, capped at 60s) keeps this
+                    // cheap; without the periodic call, an idle
+                    // worker that got "no work" once sits forever
+                    // because the only other re-poll trigger is its
+                    // OWN task completion (processing.rs:193) and an
+                    // idle worker by definition has no task to
+                    // complete. Most-load case: regular primary fires
+                    // `dispatch_to_idle_workers` after every other
+                    // worker's TaskComplete to push assignments,
+                    // which mostly shadows this — but the SLURM-
+                    // primary path doesn't track per-peer worker
+                    // idleness, so the periodic re-poll is the
+                    // failover-safe wakeup.
+                    self.repoll_idle_workers().await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
                         let _ = self.peer_transport.broadcast(msg).await;
