@@ -176,7 +176,7 @@ where
         Ok(())
     }
 
-    /// Send keepalive to both primary and all peers.
+    /// Send keepalive to the current primary and broadcast to peers.
     pub(super) async fn send_keepalive(&mut self) {
         let active_count = self
             .pool.workers
@@ -189,9 +189,11 @@ where
             secondary_id: self.config.secondary_id.clone(),
             active_workers: active_count,
         };
-        // Send to primary
-        let _ = self.primary_transport.send(msg.clone()).await;
-        // Broadcast to peers
+        // Send to whoever is currently primary (local at run start;
+        // the SLURM-promoted peer after PromotePrimary).
+        let _ = self.send_to_current_primary(msg.clone()).await;
+        // Broadcast to peers (including the primary if it's a peer —
+        // duplicate but idempotent).
         let _ = self.peer_transport.broadcast(msg).await;
     }
 
@@ -228,7 +230,8 @@ where
                     self.note_slurm_item_completed(&hash);
 
                     if result.success {
-                        // Report completion to primary
+                        // Report completion to the current primary
+                        // (whichever node currently holds authority).
                         let msg = DistributedMessage::TaskComplete {
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
@@ -237,11 +240,10 @@ where
                             task_hash: hash.clone(),
                             result_data: None,
                         };
-                        self.primary_transport.send(msg.clone()).await?;
-                        // Broadcast to peers
+                        self.send_to_current_primary(msg.clone()).await?;
                         let _ = self.peer_transport.broadcast(msg).await;
                     } else {
-                        // Report error to primary
+                        // Report error to the current primary.
                         let msg = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),
                             timestamp: timestamp_now(),
@@ -256,8 +258,7 @@ where
                                 .error_message
                                 .unwrap_or_else(|| "Unknown error".into()),
                         };
-                        self.primary_transport.send(msg.clone()).await?;
-                        // Broadcast to peers
+                        self.send_to_current_primary(msg.clone()).await?;
                         let _ = self.peer_transport.broadcast(msg).await;
                     }
 
@@ -310,8 +311,7 @@ where
                             .error_message
                             .unwrap_or_else(|| "Worker disconnected".into()),
                     };
-                    let _ = self.primary_transport.send(msg.clone()).await;
-                    // Broadcast failure to peers
+                    let _ = self.send_to_current_primary(msg.clone()).await;
                     let _ = self.peer_transport.broadcast(msg).await;
                 }
 

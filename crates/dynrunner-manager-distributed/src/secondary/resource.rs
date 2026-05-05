@@ -49,7 +49,7 @@ where
                         error_type: "OutOfMemory".into(),
                         error_message: reason,
                     };
-                    let _ = self.primary_transport.send(msg.clone()).await;
+                    let _ = self.send_to_current_primary(msg.clone()).await;
                     let _ = self.peer_transport.broadcast(msg).await;
                 }
 
@@ -117,16 +117,58 @@ where
         let next_backoff = (backoff * 2).min(Self::MAX_BACKOFF);
         self.request_backoff.insert(worker_id, next_backoff);
 
-        // If the original primary is dead and an election has named a new
-        // SLURM-primary peer, route the request there over the peer
-        // transport instead of the (likely dead) primary_transport.
-        if let Some(new_primary) = &self.slurm_primary_peer_id {
-            if new_primary != &self.config.secondary_id {
-                let peer = new_primary.clone();
+        self.send_to_current_primary(msg).await
+    }
+
+    /// Send `msg` to the node currently holding primary authority,
+    /// whichever it is.
+    ///
+    /// One concern: hide the routing decision behind a single boundary
+    /// so every "send to primary" call site (TaskComplete, TaskFailed,
+    /// Keepalive, TaskRequest, OOM report) follows the same rule. The
+    /// rule is dynamic: at run start the local node is primary and we
+    /// route via `primary_transport`; after `PromotePrimary` (and
+    /// after election) `slurm_primary_peer_id` names the current
+    /// primary and we route via `peer_transport.send_to_peer` instead.
+    ///
+    /// Pre-extraction this routing logic existed inline in exactly one
+    /// place (`request_task_for_worker`); every other operational
+    /// "send to primary" went directly to `primary_transport.send`,
+    /// which after promotion points at a peer that is no longer the
+    /// authoritative primary. That mismatch is the
+    /// `primary_connection-points-at-local` class of bug — completion
+    /// reports, failure reports, and keepalives all routed to the
+    /// wrong endpoint after promotion. Centralising the decision
+    /// makes the right routing automatic at every call site.
+    ///
+    /// Setup-phase messages (welcome, cert exchange) deliberately
+    /// keep using `primary_transport` directly: at that point there
+    /// IS no other primary candidate, and the original transport is
+    /// the only path that exists. Once setup completes and a SLURM
+    /// node may be promoted, all operational messages route through
+    /// here.
+    pub(super) async fn send_to_current_primary(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        if let Some(current_primary) = &self.slurm_primary_peer_id {
+            if current_primary != &self.config.secondary_id {
+                let peer = current_primary.clone();
                 return self.peer_transport.send_to_peer(&peer, msg).await;
             }
-            // new_primary == us means is_slurm_primary should already be true
-            // and the local-handle path above handled the request.
+            // We are the current primary — message addressed to ourselves.
+            // The dispatch handlers expect to consume messages off the
+            // transport receivers (primary_transport.recv on secondaries,
+            // peer.recv_peer on peers) rather than self-deliver. The
+            // SLURM-primary's own self-dispatch path doesn't go through
+            // this helper (`handle_slurm_task_request` is called
+            // directly from `request_task_for_worker` when
+            // `is_slurm_primary && !slurm_pending_is_empty`), so this
+            // branch is hit only by the few odd code paths that don't
+            // know whether the primary is local. Falling through to
+            // `primary_transport.send` is the historical behaviour and
+            // a no-op when the peer is the same node — primary_transport
+            // is local-loopback in that case anyway.
         }
         self.primary_transport.send(msg).await
     }
