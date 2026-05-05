@@ -2,7 +2,8 @@
 //! `super::test_helpers`; this file holds the test scenarios.
 
 use super::test_helpers::{
-    fake_secondary, make_binary, setup_test, FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
+    fake_secondary, fake_secondary_with_addrs, make_binary, setup_test, FakeWorkerFactory,
+    FixedEstimator, NoPeers, TestId,
 };
 use super::*;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
@@ -1265,3 +1266,137 @@ fn wire_local_path_strips_pre_staged_prefix() {
     assert_eq!(cfg.wire_local_path(&bin), "/srv/data/bin_0");
 }
 
+/// End-to-end pin for the "peer ipv4/ipv6 addresses reach the dialer"
+/// plumbing: spin up a primary against two channel-transport
+/// secondaries, have each advertise BOTH families in CertExchange, and
+/// inspect the `PeerInfo` broadcast that lands at one of them. The
+/// peers vector must carry the OTHER secondary's ipv4 AND ipv6 — pre-
+/// fix `peer_setup::send_peer_lists` hardcoded `ipv6: None`, which
+/// produced empty happy-eyeballs candidate sets on dual-stack hosts
+/// where ipv4 was administratively blocked between compute nodes.
+///
+/// The test snoops `PeerInfo` by intercepting the second secondary's
+/// inbound channel: a forwarder task drains the channel, copies any
+/// `PeerInfo` into a `oneshot` for assertion, then forwards every
+/// message to the real fake-secondary task so the lifecycle
+/// (PeerInfo → InitialAssignment → TaskAssignment → TaskComplete)
+/// completes and `primary.run` returns.
+#[tokio::test(flavor = "current_thread")]
+async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(2);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 2,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_binary("a", 50)];
+
+        // Two secondaries, each advertising a distinct ipv4 + ipv6.
+        // sec-0 → (10.0.0.1, 2001:db8::1)
+        // sec-1 → (10.0.0.2, 2001:db8::2)
+        // The assertion below pulls the PeerInfo sec-1 receives and
+        // looks up sec-0's entry — that's the entry whose addresses
+        // were in flight through `handle_cert_exchange` →
+        // `SecondaryConnectionState` → `send_peer_lists`.
+        let addrs: Vec<(String, String)> = vec![
+            ("10.0.0.1".into(), "2001:db8::1".into()),
+            ("10.0.0.2".into(), "2001:db8::2".into()),
+        ];
+
+        // Snoop the second secondary's primary→secondary channel: a
+        // forwarder task copies any `PeerInfo` into a oneshot before
+        // re-forwarding every message to the actual fake-secondary
+        // task. Without the forward step, the fake never sees
+        // InitialAssignment / TransferComplete and `primary.run`
+        // hangs on `wait_for_peer_connections` budgeting → timeout.
+        let (peer_info_tx, peer_info_rx) = tokio::sync::oneshot::channel();
+        let mut peer_info_tx = Some(peer_info_tx);
+
+        // Pull sec-1 out first so we can wrap its inbound channel.
+        // `secondary_ends` is ordered sec-0, sec-1.
+        let (sec1_id, sec1_inbound, sec1_outbound) = secondary_ends.remove(1);
+        let (sec0_id, sec0_inbound, sec0_outbound) = secondary_ends.remove(0);
+
+        // sec-0: vanilla fake_secondary_with_addrs.
+        let (sec0_ipv4, sec0_ipv6) = addrs[0].clone();
+        tokio::task::spawn_local(fake_secondary_with_addrs(
+            sec0_id.clone(),
+            1,
+            1024 * 1024 * 1024,
+            Some(sec0_ipv4),
+            Some(sec0_ipv6),
+            sec0_inbound,
+            sec0_outbound,
+        ));
+
+        // sec-1: forwarder + fake.
+        let (sec1_inner_tx, sec1_inner_rx) = tokio_mpsc::unbounded_channel();
+        let (sec1_ipv4, sec1_ipv6) = addrs[1].clone();
+        tokio::task::spawn_local(fake_secondary_with_addrs(
+            sec1_id.clone(),
+            1,
+            1024 * 1024 * 1024,
+            Some(sec1_ipv4),
+            Some(sec1_ipv6),
+            sec1_inner_rx,
+            sec1_outbound,
+        ));
+
+        tokio::task::spawn_local(async move {
+            let mut rx = sec1_inbound;
+            while let Some(msg) = rx.recv().await {
+                if let DistributedMessage::PeerInfo { peers, .. } = &msg {
+                    if let Some(tx) = peer_info_tx.take() {
+                        let _ = tx.send(peers.clone());
+                    }
+                }
+                if sec1_inner_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        let peers = peer_info_rx.await.expect("PeerInfo never delivered");
+
+        let sec0_peer = peers
+            .iter()
+            .find(|p| p.secondary_id == "sec-0")
+            .expect("sec-0 missing from PeerInfo");
+        assert_eq!(
+            sec0_peer.ipv4.as_deref(),
+            Some("10.0.0.1"),
+            "primary dropped ipv4 from peer broadcast"
+        );
+        assert_eq!(
+            sec0_peer.ipv6.as_deref(),
+            Some("2001:db8::1"),
+            "primary dropped ipv6 from peer broadcast — happy-eyeballs \
+             dialer would race only ipv4 candidates and fail on \
+             clusters where ipv4 is administratively blocked between \
+             compute nodes"
+        );
+    })
+    .await;
+}

@@ -263,6 +263,18 @@ impl SecondaryConnectionState {
         }
     }
 
+    pub fn ipv6(&self) -> Option<&str> {
+        match self {
+            Self::AwaitingWelcome(c) => c.ipv6.as_deref(),
+            Self::Handshaking(c) => c.ipv6.as_deref(),
+            Self::CertExchanging(c) => c.ipv6.as_deref(),
+            Self::PeerDiscovery(c) => c.ipv6.as_deref(),
+            Self::InitialAssigning(c) => c.ipv6.as_deref(),
+            Self::Operational(c) => c.ipv6.as_deref(),
+            Self::ShuttingDown(c) => c.ipv6.as_deref(),
+        }
+    }
+
     pub fn quic_port(&self) -> u16 {
         match self {
             Self::AwaitingWelcome(c) => c.quic_port,
@@ -323,10 +335,23 @@ mod tests {
         );
         assert_eq!(conn.num_workers, 4);
 
-        let conn = conn.receive_cert_exchange("CERT".into(), Some("10.0.0.1".into()), None, 5001);
+        let conn = conn.receive_cert_exchange(
+            "CERT".into(),
+            Some("10.0.0.1".into()),
+            Some("2001:db8::1".into()),
+            5001,
+        );
         assert_eq!(conn.quic_port, 5001);
+        // Both address families round-trip the typestate transition
+        // unchanged — the dialer needs both to populate its
+        // happy-eyeballs candidate set. Regression test for the
+        // primary-side ipv6-drop bug fixed alongside this assertion.
+        assert_eq!(conn.ipv4.as_deref(), Some("10.0.0.1"));
+        assert_eq!(conn.ipv6.as_deref(), Some("2001:db8::1"));
 
         let conn = conn.begin_peer_discovery();
+        assert_eq!(conn.ipv4.as_deref(), Some("10.0.0.1"));
+        assert_eq!(conn.ipv6.as_deref(), Some("2001:db8::1"));
         let conn = conn.peers_ready();
         let conn = conn.assignments_sent();
         let _conn = conn.begin_shutdown();
@@ -339,5 +364,56 @@ mod tests {
         assert_eq!(state.id(), "sec-1");
         assert_eq!(state.num_workers(), 0);
         assert!(!state.is_operational());
+    }
+
+    #[test]
+    fn runtime_enum_ipv6_getter_traverses_states() {
+        // Build a connection that has both ipv4 and ipv6 set, then
+        // walk it through every state-machine variant and confirm the
+        // `ipv6()` accessor returns the value at each step. Pin
+        // alongside `ipv4()` so a future drift between the two
+        // accessors becomes a test failure.
+        let conn = SecondaryConnection::new("sec-2".into());
+        let conn = conn.receive_welcome(
+            1,
+            vec![],
+            "h".into(),
+            5000,
+            None,
+        );
+        let conn = conn.receive_cert_exchange(
+            "CERT".into(),
+            Some("10.0.0.2".into()),
+            Some("2001:db8::2".into()),
+            5000,
+        );
+
+        let state = SecondaryConnectionState::CertExchanging(conn);
+        assert_eq!(state.ipv4(), Some("10.0.0.2"));
+        assert_eq!(state.ipv6(), Some("2001:db8::2"));
+
+        // Step into PeerDiscovery / InitialAssigning / Operational /
+        // ShuttingDown and confirm both getters keep returning the
+        // original values.
+        let SecondaryConnectionState::CertExchanging(c) = state else {
+            unreachable!();
+        };
+        let state = SecondaryConnectionState::PeerDiscovery(c.begin_peer_discovery());
+        assert_eq!(state.ipv6(), Some("2001:db8::2"));
+        let SecondaryConnectionState::PeerDiscovery(c) = state else {
+            unreachable!();
+        };
+        let state = SecondaryConnectionState::InitialAssigning(c.peers_ready());
+        assert_eq!(state.ipv6(), Some("2001:db8::2"));
+        let SecondaryConnectionState::InitialAssigning(c) = state else {
+            unreachable!();
+        };
+        let state = SecondaryConnectionState::Operational(c.assignments_sent());
+        assert_eq!(state.ipv6(), Some("2001:db8::2"));
+        let SecondaryConnectionState::Operational(c) = state else {
+            unreachable!();
+        };
+        let state = SecondaryConnectionState::ShuttingDown(c.begin_shutdown());
+        assert_eq!(state.ipv6(), Some("2001:db8::2"));
     }
 }
