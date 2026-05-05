@@ -162,12 +162,25 @@ SOCKET_COUNTER=0
 }} &
 CMD_RELAY_PID=$!
 
-# Copy Docker image to local /tmp for faster loading
+# Copy Docker image to local /tmp for faster loading.
 LOCAL_IMAGE="$RNDTMP/{image_name}-docker.tar"
 cp "{image_path}" "$LOCAL_IMAGE"
 
-# Load Docker image with Podman
-{load_command}
+# Load Docker image with Podman. The cp above can land a corrupt
+# tarball on flaky local FS / transient I/O — we've observed
+# `gzip: invalid checksum` on 1-of-N nodes with a known-good
+# gateway tarball. Without retry, that one node's failure cascades
+# into the whole dispatch timing out at `connect_timeout` (10
+# minutes default) waiting for the now-dead secondary. Retry once
+# with a fresh cp — if a transit-corruption flake repeats twice
+# the underlying issue is usually deeper than transient and
+# should fail loud, but a single retry catches the common case.
+if ! {load_command}; then
+    echo "podman load failed; re-copying image and retrying once" >&2
+    rm -f "$LOCAL_IMAGE"
+    cp "{image_path}" "$LOCAL_IMAGE"
+    {load_command}
+fi
 "##,
         image_name = cfg.image_name,
         image_path = cfg.image_path,

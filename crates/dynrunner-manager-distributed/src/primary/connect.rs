@@ -43,20 +43,52 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    return Err(format!(
-                        "timeout waiting for secondaries: {}/{} sent SecondaryWelcome \
-                         (transport-level connection accept happens lazily on first \
-                         message, so 0/N here can mean either no peer ever connected \
-                         OR connections completed handshake but never sent Welcome — \
-                         in the latter case the per-connection accept handler \
-                         should have logged a 'peer connected but did not send \
-                         SecondaryWelcome within Ns; closing as non-conformant' \
-                         line in the transport log; that points at the consumer's \
-                         worker_module not completing the runner protocol's Ready \
-                         handshake)",
-                        self.secondaries.len(),
-                        expected
-                    ));
+                    // Quorum-on-timeout: if at least one secondary has
+                    // completed cert-exchange, proceed with what we
+                    // have rather than failing the entire dispatch.
+                    // Real-world flakes (cp corruption from gateway →
+                    // compute-node /tmp, podman-load races, /tmp full
+                    // killing the wrapper, single-node SLURM
+                    // scheduling glitches) routinely take down 1-of-N
+                    // secondaries; pre-fix the all-or-nothing
+                    // handshake meant a 5-job dispatch dies if 1 job
+                    // fails. With quorum, we drop the missing
+                    // secondaries from `num_secondaries` (so initial
+                    // assignment + worker-budget accounting reflect
+                    // the actual fleet) and continue with N-K
+                    // healthy secondaries. Failover requires N>=1;
+                    // if zero connected, that's still a dispatch
+                    // failure.
+                    if cert_done == 0 {
+                        return Err(format!(
+                            "timeout waiting for secondaries: 0/{expected} sent \
+                             SecondaryWelcome (transport-level connection accept \
+                             happens lazily on first message, so 0/N here can mean \
+                             either no peer ever connected OR connections completed \
+                             handshake but never sent Welcome — in the latter case \
+                             the per-connection accept handler should have logged a \
+                             'peer connected but did not send SecondaryWelcome \
+                             within Ns; closing as non-conformant' line in the \
+                             transport log; that points at the consumer's \
+                             worker_module not completing the runner protocol's \
+                             Ready handshake)"
+                        ));
+                    }
+                    let missing: Vec<String> = (0..expected)
+                        .map(|i| format!("secondary-{i}"))
+                        .filter(|sid| !self.secondaries.contains_key(sid))
+                        .collect();
+                    tracing::warn!(
+                        connected = cert_done,
+                        expected,
+                        missing = ?missing,
+                        "connect_timeout reached with partial fleet; proceeding \
+                         with quorum — missing secondaries are dropped from this \
+                         dispatch (the run continues at reduced parallelism, but \
+                         tasks are not lost)"
+                    );
+                    self.config.num_secondaries = cert_done as u32;
+                    break;
                 }
             }
         }
