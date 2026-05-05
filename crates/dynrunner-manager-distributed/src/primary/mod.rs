@@ -222,6 +222,19 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     // Per-secondary last-keepalive tracking for failover detection (F1).
     pub(super) secondary_keepalives: HashMap<String, Instant>,
 
+    /// Per-secondary backoff timestamps. When a secondary returns
+    /// "No idle worker available" Recoverable (its dispatch.rs
+    /// `is_idle_state()` check found every worker non-idle —
+    /// either real saturation or a stuck-pool state-sync issue),
+    /// primary records the secondary as backpressured with an
+    /// expiry timestamp; until expiry, `dispatch_to_idle_workers`
+    /// and `handle_task_request` skip workers belonging to that
+    /// secondary so the kickstart amplifier doesn't spin tasks
+    /// against an unresponsive node. Cleared on the next
+    /// successful TaskComplete from that secondary (proves it's
+    /// healthy).
+    pub(super) backpressured_secondaries: HashMap<String, Instant>,
+
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
 
@@ -258,9 +271,21 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             on_phase_end: None,
             phase_started_emitted: HashSet::new(),
             secondary_keepalives: HashMap::new(),
+            backpressured_secondaries: HashMap::new(),
             slurm_primary_id: None,
             pending_stage_files: Vec::new(),
         }
+    }
+
+    /// True iff `secondary_id` is currently in backpressure backoff
+    /// (recently returned "No idle worker available" and the backoff
+    /// hasn't expired). Used by both the kickstart and the
+    /// TaskRequest path to skip dispatch onto unresponsive
+    /// secondaries.
+    pub(super) fn is_backpressured(&self, secondary_id: &str) -> bool {
+        self.backpressured_secondaries
+            .get(secondary_id)
+            .is_some_and(|t| Instant::now() < *t)
     }
 
     /// Borrow the pending pool. Panics if called before `run()` has

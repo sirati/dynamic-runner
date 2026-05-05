@@ -1,4 +1,6 @@
 
+use std::time::Instant;
+
 use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage,
@@ -60,6 +62,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                         worker_id,
                         "stale TaskRequest after kickstart-dispatch; skipping"
                     );
+                    return Ok(());
+                }
+                // Backpressure guard: if the secondary is in backoff
+                // (recently returned "No idle worker available"),
+                // skip dispatch to its workers. The TaskRequest may
+                // be for a worker that's actually idle, but since
+                // we're not 100% confident the secondary's pool will
+                // accept new work right now, defer until the backoff
+                // window expires (cleared on the next successful
+                // TaskComplete from this secondary, or when the
+                // 500ms backoff naturally elapses).
+                if self.is_backpressured(secondary_id) {
                     return Ok(());
                 }
                 // Mark worker idle
@@ -148,6 +162,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             let secondary_id = secondary_id.clone();
             let worker_id = *worker_id;
             self.completed_tasks.insert(task_hash.clone());
+
+            // A successful TaskComplete from this secondary proves
+            // it's healthy — clear any backpressure backoff. The
+            // backoff window is short (500ms by default) so this
+            // matters mostly for high-throughput runs where one
+            // completion lands while a previous backpressure-window
+            // is still active.
+            self.backpressured_secondaries.remove(&secondary_id);
 
             // Mark the specific worker idle using secondary_id + local worker_id.
             // Capture the phase + type of the just-finished item so we
@@ -285,6 +307,52 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     }
                     local_idx += 1;
                 }
+            }
+
+            // Backpressure detection: secondary's dispatch.rs sends
+            // this exact error_message when its `is_idle_state()`
+            // check finds every worker non-idle for an inbound
+            // TaskAssignment. That's NOT a task failure — the worker
+            // never ran the binary; the secondary just couldn't place
+            // it. Treat it as a transient backoff signal:
+            //   1. Re-queue the binary into the pool (don't lose it).
+            //   2. Skip the failed_tasks insert — preserves the
+            //      retry budget for actual failures.
+            //   3. Mark the secondary as backpressured for a short
+            //      window — the kickstart and TaskRequest paths
+            //      both consult `is_backpressured()` and skip
+            //      dispatch to that secondary's workers until the
+            //      window expires or a successful TaskComplete from
+            //      that secondary clears the flag.
+            //   4. Skip the kickstart at the bottom of this function
+            //      — the kickstart's whole point is "another worker
+            //      may now be idle"; on backpressure, the failing
+            //      secondary's workers are precisely what we DON'T
+            //      want to re-target.
+            // Without this: a single broken secondary (every
+            // assignment to it bouncing as backpressure) consumes
+            // the entire retry budget while the kickstart amplifier
+            // keeps cycling work back to it. Tokenizer hit this on
+            // a 1791-task cohort: 3128 errors all on one secondary,
+            // 1511 permanent failures.
+            let is_backpressure = error_message == "No idle worker available";
+            if is_backpressure {
+                let backoff_ms = 500;
+                self.backpressured_secondaries.insert(
+                    secondary_id.clone(),
+                    Instant::now() + std::time::Duration::from_millis(backoff_ms),
+                );
+                tracing::debug!(
+                    secondary = %secondary_id,
+                    worker_id,
+                    backoff_ms,
+                    "secondary returned backpressure; re-queuing task and applying backoff"
+                );
+                if let Some(binary) = recovered_binary {
+                    self.release_type_slot(&binary.type_id);
+                    self.pool_mut().requeue(binary);
+                }
+                return;
             }
 
             // Failure budget: one per task per pass. Recoverable

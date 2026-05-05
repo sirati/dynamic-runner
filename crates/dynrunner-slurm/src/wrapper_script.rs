@@ -72,7 +72,13 @@ mkdir -p "{socket_dir}"
 cleanup() {{
     rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
 }}
-trap cleanup EXIT
+# Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
+# at time-limit / scancel, SIGHUP by an ssh disconnect, SIGINT by
+# Ctrl+C from interactive jobs. Without these, the trap fires only
+# on graceful exit and SLURM-killed jobs leak /tmp/asm-XXXX dirs
+# until the node's /tmp fills (observed in the field on multi-day
+# clusters). EXIT alone misses every non-graceful termination.
+trap cleanup EXIT TERM HUP INT
 
 # Setup Podman environment for SLURM
 PODMAN_STORAGE="{podman_storage}"

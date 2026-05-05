@@ -214,6 +214,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             if !self.workers[worker_idx].is_idle {
                 continue;
             }
+            // Skip workers belonging to a secondary that's currently
+            // in backpressure backoff — see
+            // `backpressured_secondaries` doc on `PrimaryCoordinator`.
+            // Without this, the kickstart would re-target the same
+            // unresponsive secondary in a tight loop, which is
+            // exactly the failure storm 07ae301-followup is
+            // designed to break.
+            if self.is_backpressured(&self.workers[worker_idx].secondary_id) {
+                continue;
+            }
             let global_wid = self.workers[worker_idx].worker_id;
             let view = self.cap_filter_view(self.pool().view_for_worker(global_wid));
             if view.is_empty() {
