@@ -143,12 +143,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     // re-dispatched twice (once from each primary's
                     // pool view) — duplicating work and racing on
                     // ledger state. We still send keepalives so peers
-                    // know we're alive, but skip the requeue.
+                    // know we're alive, but skip the requeue path.
+                    //
+                    // `process_heartbeat_tick` runs the per-tick
+                    // mass-death-aware death evaluator: resolve any
+                    // already-deferred secondaries (recovery or grace
+                    // expiry), then categorise newly-dead ones as
+                    // either correlated (defer) or independent
+                    // (requeue). See `process_heartbeat_tick` for
+                    // detail and `PrimaryConfig.mass_death_grace` for
+                    // the disable knob.
                     if !self.demoted {
-                        let report = self.collect_heartbeat_report();
-                        for dead in report.dead {
-                            self.requeue_dead_secondary(dead).await?;
-                        }
+                        self.process_heartbeat_tick().await?;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {

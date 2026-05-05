@@ -129,6 +129,44 @@ pub struct PrimaryConfig {
     /// secondary's mesh signalling can't deadlock the entire
     /// dispatch).
     pub mesh_ready_timeout: Duration,
+
+    /// Mass-death grace window: when ALL currently-connected
+    /// secondaries appear in the dead list at the same heartbeat
+    /// tick (and there are at least `mass_death_min_count` of them),
+    /// infer a *correlated* cause — gateway-side SSH tunnel
+    /// collapse, network partition, or similar single-point-of-
+    /// failure — rather than per-secondary failures, and DEFER the
+    /// requeue for this duration to give the network a chance to
+    /// recover. Secondaries whose keepalives resume during the
+    /// grace are silently un-deferred (the fleet is back). Only
+    /// after the grace expires without recovery do we fall through
+    /// to the standard `requeue_dead_secondary` death sequence.
+    ///
+    /// Without this, a transient ~15-30s SSH tunnel blip causes the
+    /// primary to declare every secondary dead, requeue every in-
+    /// flight task (often hundreds), exhaust the retry budget on
+    /// the next pass (the secondaries reconnect in time but the
+    /// damage is done), and surface the entire wave as
+    /// `permanent_failures` — observed in tokenizer's cohort-5 z3
+    /// dispatch where 197 in-flight tasks were lost to a 15-second
+    /// tunnel hiccup despite the secondaries themselves being
+    /// healthy.
+    ///
+    /// Set to `Duration::ZERO` to disable (revert to legacy
+    /// behaviour where every dead secondary is requeued
+    /// immediately, regardless of correlation). Default `60s` —
+    /// covers the typical SSH ControlMaster reconnect window
+    /// (`ServerAliveInterval=30` × 2) plus slack.
+    pub mass_death_grace: Duration,
+
+    /// Minimum number of simultaneous deaths required to trigger
+    /// mass-death detection. Single-secondary runs and small
+    /// fleets shouldn't bias toward "treat as correlated" — the
+    /// signal is meaningful only when several secondaries are
+    /// affected at once. A run with `< mass_death_min_count`
+    /// connected secondaries always falls through to the standard
+    /// per-secondary requeue path. Default `2`.
+    pub mass_death_min_count: u32,
 }
 
 impl Default for PrimaryConfig {
@@ -146,6 +184,8 @@ impl Default for PrimaryConfig {
             retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
             mesh_ready_timeout: Duration::from_secs(60),
+            mass_death_grace: Duration::from_secs(60),
+            mass_death_min_count: 2,
         }
     }
 }
@@ -178,6 +218,26 @@ impl PrimaryConfig {
             },
         }
     }
+}
+
+/// Per-secondary state for a deferred mass-death event. Recorded
+/// when a correlated mass-death is detected; each subsequent
+/// heartbeat tick consults it to decide whether the secondary has
+/// recovered (its keepalive timestamp advanced past the
+/// defer-moment one) or the grace window has expired (escalate to
+/// actual death). See `PrimaryConfig.mass_death_grace`.
+#[derive(Debug, Clone)]
+pub(super) struct PendingMassDeath {
+    /// Wall-clock instant when we deferred this secondary. Compared
+    /// against `mass_death_grace` to decide whether grace has
+    /// expired without recovery.
+    pub(super) deferred_at: Instant,
+    /// The secondary's `last_keepalive` value at the moment we
+    /// deferred. The recovery test is "current keepalive
+    /// timestamp > this value" — recovered means a new keepalive
+    /// arrived AFTER we deferred, not just that the old one is
+    /// still around.
+    pub(super) last_keepalive_at_defer: Instant,
 }
 
 /// Virtual worker tracked by the authoritative primary for each remote worker.
@@ -296,6 +356,17 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// `wait_for_mesh_ready`.
     pub(super) mesh_ready_secondaries: HashSet<String>,
 
+    /// Secondaries currently in mass-death deferred state. Populated
+    /// by the heartbeat tick when a correlated mass-death event is
+    /// detected (every connected secondary appears dead at the
+    /// same tick). Each entry's value records the moment we
+    /// deferred plus the keepalive timestamp seen at that moment;
+    /// each subsequent tick checks whether the live keepalive has
+    /// advanced past the defer-time keepalive (= secondary
+    /// recovered) or the `mass_death_grace` window has elapsed
+    /// (= escalate to actual death via `requeue_dead_secondary`).
+    pub(super) pending_mass_death: HashMap<String, PendingMassDeath>,
+
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
 
@@ -344,6 +415,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
+            pending_mass_death: HashMap::new(),
             slurm_primary_id: None,
             demoted: false,
             pending_stage_files: Vec::new(),

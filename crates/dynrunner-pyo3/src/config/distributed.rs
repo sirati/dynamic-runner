@@ -26,6 +26,20 @@ pub(crate) struct DistributedConfig {
     keepalive_interval_secs: f64,
     keepalive_miss_threshold: u32,
     retry_max_passes: u32,
+    /// Mass-death detection grace window in seconds. When ALL
+    /// currently-connected secondaries appear in the dead list at
+    /// the same heartbeat tick (correlated cause — gateway-side SSH
+    /// tunnel collapse or similar single-point-of-failure), the
+    /// primary defers requeue for this duration before declaring
+    /// actual death. Set to 0 to disable. Defaults to 60s — covers
+    /// the typical SSH ControlMaster reconnect window plus slack.
+    /// See `PrimaryConfig.mass_death_grace` (Rust) for the full
+    /// rationale.
+    mass_death_grace_secs: f64,
+    /// Minimum number of simultaneous deaths required to trigger
+    /// mass-death detection. Default 2 — keeps singleton runs from
+    /// biasing toward correlated inference.
+    mass_death_min_count: u32,
     /// When true, the secondary skips starting a `PeerNetwork` and
     /// uses `NoPeerTransport` instead. Intended for clusters that
     /// firewall inter-compute-node networking (LMU SLURM and similar)
@@ -44,6 +58,8 @@ impl Default for DistributedConfig {
             keepalive_interval_secs: 5.0,
             keepalive_miss_threshold: 3,
             retry_max_passes: 1,
+            mass_death_grace_secs: 60.0,
+            mass_death_min_count: 2,
             disable_peer_overlay: false,
         }
     }
@@ -59,6 +75,8 @@ impl DistributedConfig {
         keepalive_interval_secs = None,
         keepalive_miss_threshold = None,
         retry_max_passes = None,
+        mass_death_grace_secs = None,
+        mass_death_min_count = None,
         disable_peer_overlay = None,
     ))]
     fn new(
@@ -68,6 +86,8 @@ impl DistributedConfig {
         keepalive_interval_secs: Option<f64>,
         keepalive_miss_threshold: Option<u32>,
         retry_max_passes: Option<u32>,
+        mass_death_grace_secs: Option<f64>,
+        mass_death_min_count: Option<u32>,
         disable_peer_overlay: Option<bool>,
     ) -> Self {
         let d = DistributedConfig::default();
@@ -79,6 +99,8 @@ impl DistributedConfig {
             keepalive_interval_secs: keepalive_interval_secs.unwrap_or(d.keepalive_interval_secs),
             keepalive_miss_threshold: keepalive_miss_threshold.unwrap_or(d.keepalive_miss_threshold),
             retry_max_passes: retry_max_passes.unwrap_or(d.retry_max_passes),
+            mass_death_grace_secs: mass_death_grace_secs.unwrap_or(d.mass_death_grace_secs),
+            mass_death_min_count: mass_death_min_count.unwrap_or(d.mass_death_min_count),
             disable_peer_overlay: disable_peer_overlay.unwrap_or(d.disable_peer_overlay),
         }
     }
@@ -102,6 +124,12 @@ impl DistributedConfig {
     }
     pub(crate) fn retry_max_passes(&self) -> u32 {
         self.retry_max_passes
+    }
+    pub(crate) fn mass_death_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.mass_death_grace_secs)
+    }
+    pub(crate) fn mass_death_min_count(&self) -> u32 {
+        self.mass_death_min_count
     }
     pub(crate) fn disable_peer_overlay(&self) -> bool {
         self.disable_peer_overlay
