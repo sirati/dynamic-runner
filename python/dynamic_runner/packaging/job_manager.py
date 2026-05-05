@@ -150,6 +150,24 @@ else
     echo "Container memory cap: disabled (MemTotal probe yielded non-positive headroom)"
 fi
 echo ""
+
+# Resolve the compute node's peer-routable IPs so the secondary
+# advertises addresses other cluster nodes can actually dial. The
+# container runs with `--network host` so it shares this node's
+# network namespace, but `hostname -I` in there still returns
+# *every* configured non-loopback address — and on Krater-class
+# nodes the first one is often a CNI bridge / podman-internal
+# subnet (10.x.x.x) that's not routed off-host. Resolving the
+# node's FQDN through NSS picks the canonical cluster address that
+# slurmd, ssh, and DNS all agree on. Empty values are tolerated by
+# the Rust env-hint reader (see network::detect_ipv4); a probe
+# failure simply falls back to the legacy `hostname -I` first-token.
+SLURM_NODE_NAME="${{SLURMD_NODENAME:-$(hostname -f)}}"
+PRIMARY_NODE_IPV4=$(getent ahostsv4 "$SLURM_NODE_NAME" 2>/dev/null | awk '{{print $1; exit}}')
+PRIMARY_NODE_IPV6=$(getent ahostsv6 "$SLURM_NODE_NAME" 2>/dev/null | awk '$1 ~ /:/ {{print $1; exit}}')
+echo "Peer-routable IPv4: ${{PRIMARY_NODE_IPV4:-<unresolved, will fall back to hostname -I>}}"
+echo "Peer-routable IPv6: ${{PRIMARY_NODE_IPV6:-<unresolved, will fall back to hostname -I or skip>}}"
+echo ""
 """
 
         if reverse_connection:
@@ -242,6 +260,8 @@ echo ""
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --network host \
     ${{MEM_FLAGS}} \
+    -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
+    -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
     -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
@@ -259,6 +279,8 @@ echo ""
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --network host \
     ${{MEM_FLAGS}} \
+    -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
+    -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
     -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
