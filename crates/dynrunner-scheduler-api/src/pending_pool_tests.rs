@@ -637,6 +637,24 @@ fn task_deps_unblocked_lands_at_bucket_front() {
 }
 
 #[test]
+fn task_deps_seeded_completed_id_resolves_unknown_dep() {
+    // Failover-resume regression: a promoted secondary rebuilds its
+    // pool from a wire snapshot that has dropped pre-completed items
+    // from the items vec. Surviving items that declared
+    // `task_depends_on` against those completions used to fail
+    // `extend()` with `UnknownTaskDep`. `mark_tasks_completed`
+    // seeds the completion set so validation resolves.
+    let mut p = pool_with(&["P"], &[]);
+    p.mark_tasks_completed(["toolchain".to_string()]);
+    p.extend([t_with_id("P", "T", "", 1, "variant", &["toolchain"])])
+        .expect("variant resolves against pre-seeded toolchain completion");
+    // Variant is dispatchable immediately because its only dep is
+    // already considered complete.
+    let item = p.pop_for_worker(1).expect("variant ready");
+    assert_eq!(item.task_id.as_deref(), Some("variant"));
+}
+
+#[test]
 fn task_deps_cascade_fail_on_permanent_prereq_failure() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([
