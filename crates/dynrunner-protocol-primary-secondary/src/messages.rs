@@ -95,6 +95,15 @@ pub struct DistributedBinaryInfo<I> {
     /// the contents — it's pass-through metadata for the worker.
     #[serde(default = "default_payload_json")]
     pub payload_json: String,
+    /// Optional consumer-supplied task id (see `TaskInfo::task_id`).
+    /// Defaults to `None` for pre-task-deps senders so the wire
+    /// stays backward-compatible.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Task ids of prerequisites (see `TaskInfo::task_depends_on`).
+    /// Defaults to empty for pre-task-deps senders.
+    #[serde(default)]
+    pub task_depends_on: Vec<String>,
 }
 
 fn default_phase_id_string() -> String {
@@ -132,6 +141,8 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // representation verbatim. `to_string` on `serde_json::Value`
             // is infallible.
             payload_json: task.payload.to_string(),
+            task_id: task.task_id.clone(),
+            task_depends_on: task.task_depends_on.clone(),
         }
     }
 
@@ -154,6 +165,8 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             type_id: TypeId::from(self.type_id.as_str()),
             affinity_id: self.affinity_id.as_deref().map(AffinityId::from),
             payload,
+            task_id: self.task_id.clone(),
+            task_depends_on: self.task_depends_on.clone(),
         }
     }
 }

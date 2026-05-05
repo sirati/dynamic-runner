@@ -107,6 +107,10 @@ pub(crate) struct PyTaskInfo {
     /// `payload` is a JSON-serializable dict; we json.dumps on extraction.
     #[pyo3(get)]
     payload_json: String,
+    #[pyo3(get)]
+    task_id: Option<String>,
+    #[pyo3(get)]
+    task_depends_on: Vec<String>,
 }
 
 #[pymethods]
@@ -120,6 +124,8 @@ impl PyTaskInfo {
         type_id = String::new(),
         affinity_id = None,
         payload_json = "null".to_string(),
+        task_id = None,
+        task_depends_on = Vec::new(),
     ))]
     fn new(
         path: String,
@@ -129,6 +135,8 @@ impl PyTaskInfo {
         type_id: String,
         affinity_id: Option<String>,
         payload_json: String,
+        task_id: Option<String>,
+        task_depends_on: Vec<String>,
     ) -> Self {
         Self {
             path,
@@ -138,6 +146,8 @@ impl PyTaskInfo {
             type_id,
             affinity_id,
             payload_json,
+            task_id,
+            task_depends_on,
         }
     }
 }
@@ -165,6 +175,8 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             type_id,
             affinity_id,
             payload,
+            task_id: py.task_id.clone(),
+            task_depends_on: py.task_depends_on.clone(),
         }
     }
 }
@@ -187,6 +199,8 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             type_id: bi.type_id.as_str().to_owned(),
             affinity_id: bi.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
             payload_json: serde_json::to_string(&bi.payload).unwrap_or_else(|_| "null".into()),
+            task_id: bi.task_id.clone(),
+            task_depends_on: bi.task_depends_on.clone(),
         }
     }
 }
@@ -239,6 +253,8 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         type_id: task.type_id.as_str().to_owned(),
         affinity_id: task.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
         payload_json: serde_json::to_string(&task.payload).unwrap_or_else(|_| "null".into()),
+        task_id: task.task_id.clone(),
+        task_depends_on: task.task_depends_on.clone(),
     }
 }
 
@@ -327,6 +343,19 @@ pub(crate) fn extract_binaries(
                 _ => serde_json::Value::Null,
             };
 
+            // Optional task-level dependency fields. Both default
+            // to "absent / empty" so existing consumers without
+            // these attributes (or with None) parse cleanly.
+            let task_id: Option<String> = item
+                .getattr("task_id")
+                .ok()
+                .and_then(|v| v.extract::<Option<String>>().ok().flatten());
+            let task_depends_on: Vec<String> = item
+                .getattr("task_depends_on")
+                .ok()
+                .and_then(|v| v.extract::<Vec<String>>().ok())
+                .unwrap_or_default();
+
             Ok(TaskInfo {
                 path: PathBuf::from(path),
                 size,
@@ -335,6 +364,8 @@ pub(crate) fn extract_binaries(
                 type_id,
                 affinity_id,
                 payload,
+                task_id,
+                task_depends_on,
             })
         })
         .collect()

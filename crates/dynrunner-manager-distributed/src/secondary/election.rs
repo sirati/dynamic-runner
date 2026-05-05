@@ -489,6 +489,8 @@ mod tests {
                     type_id: "default".into(),
                     affinity_id: None,
                     payload_json: "null".into(),
+                    task_id: None,
+                    task_depends_on: vec![],
                 },
                 hash: "hash_bin1".into(),
                 file_path: None,

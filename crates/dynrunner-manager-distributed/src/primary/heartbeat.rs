@@ -512,6 +512,8 @@ mod tests {
             type_id: TypeId::from("default"),
             affinity_id: None,
             payload: serde_json::Value::Null,
+            task_id: None,
+            task_depends_on: vec![],
         };
         primary.workers.push(RemoteWorkerState {
             worker_id: 0,
@@ -605,6 +607,8 @@ mod tests {
                 type_id: TypeId::from("default"),
                 affinity_id: None,
                 payload: serde_json::Value::Null,
+                task_id: None,
+                task_depends_on: vec![],
             }),
             estimated_resources: ResourceMap::new(),
             is_idle: false,

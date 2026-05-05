@@ -89,6 +89,8 @@ fn task_info_generic() {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
+        task_id: None,
+        task_depends_on: vec![],
     };
     assert_eq!(bi.size, 1024);
     assert_eq!(bi.identifier.0, "test-binary");
@@ -104,6 +106,8 @@ fn task_info_serde_roundtrip_with_phase_fields() {
         type_id: TypeId::from("tokenize"),
         affinity_id: Some(AffinityId::from("shard-7")),
         payload: serde_json::json!({"k": "v", "n": 42}),
+        task_id: None,
+        task_depends_on: vec![],
     };
     let json = serde_json::to_string(&bi).unwrap();
     let parsed: TaskInfo<TestId> = serde_json::from_str(&json).unwrap();
