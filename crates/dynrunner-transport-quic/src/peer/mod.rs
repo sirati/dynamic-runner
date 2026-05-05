@@ -165,6 +165,45 @@ impl<I: Identifier> PeerNetwork<I> {
                 continue; // Already connected (from accept loop)
             }
 
+            // Lower-id-dials: only the secondary whose id sorts
+            // lexicographically lower than the peer's initiates the
+            // dial; the higher-id node relies on its accept loop to
+            // receive the inbound connection.
+            //
+            // Without this asymmetry, both sides race to dial each
+            // other on `connect_to_peers`. Each side then sees TWO
+            // candidate connections to the same peer in its
+            // `new_conn_rx` queue — one from its own outbound dial,
+            // one accepted from the peer's outbound dial. The
+            // existing `drain_new_connections` dedup keeps whichever
+            // arrives first and DROPS the duplicate's
+            // `AcceptedPeer.outgoing_tx`. Dropping that sender
+            // tears down the duplicate's WSS pipe via the
+            // writer/reader cleanup chain — which is the SAME WSS
+            // pipe the OTHER side may have chosen to KEEP. The peer
+            // then sees its kept-connection's writer die, and its
+            // `connections[us]` becomes a dead `outgoing_tx`. The
+            // failure surfaces as "peer disconnected during
+            // broadcast" warns at the next keepalive tick, on what
+            // is otherwise a healthy fleet — both consumer teams
+            // hit this on Krater (tokenizer cohort-5 dispatch lost
+            // its entire peer mesh ~10s after promotion; dataset's
+            // 8-secondary K=2 run had 3-of-8 secondaries lose all
+            // peers and sit idle while the others were saturated).
+            //
+            // Lower-id-dials makes the connection asymmetric and
+            // eliminates the duplicate scenario: there is at most
+            // one WSS pipe per pair. The accept loop on the
+            // higher-id side handles the inbound dial as before.
+            if self.peer_id.as_str() > peer_info.secondary_id.as_str() {
+                tracing::debug!(
+                    self_id = %self.peer_id,
+                    peer = %peer_info.secondary_id,
+                    "skipping dial: peer has lower id, expecting them to initiate"
+                );
+                continue;
+            }
+
             let peer_info = peer_info.clone();
             let incoming_tx = self.incoming_tx.clone();
             let new_conn_tx = self.new_conn_tx.clone();
