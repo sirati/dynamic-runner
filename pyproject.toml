@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name            = "dynamic_runner"
-version         = "0.3.0"
+version         = "0.4.0"
 description     = "Multi-process / multi-host Python task runner backed by a Rust workspace."
 readme          = "README.md"
 license         = { text = "Apache-2.0" }

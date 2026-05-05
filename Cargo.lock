@@ -241,7 +241,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dynrunner-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-discovery"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-gateway",
  "thiserror 2.0.18",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-gateway"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-manager-distributed"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-manager-local",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-manager-local"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-protocol-manager-worker",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-protocol-manager-worker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dynrunner-core",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-protocol-primary-secondary"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "serde",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-pyo3"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-discovery",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-scheduler"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-scheduler-api",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-scheduler-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "serde_json",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-slurm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-gateway",
  "serde",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-transport-channel"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-protocol-manager-worker",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-transport-quic"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "dynrunner-core",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-transport-socket"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-protocol-manager-worker",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "dynrunner-worker"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-protocol-manager-worker",
