@@ -224,7 +224,15 @@ where
         self.peer_mesh_check_at = None;
     }
 
-    /// Check for peer timeouts based on keepalive tracking.
+    /// Check for peer timeouts based on keepalive tracking. When this
+    /// secondary is the SLURM-primary, a peer-timeout ALSO recovers
+    /// any in-flight tasks dispatched to that peer back into the
+    /// pool — without this, the slurm_in_flight ledger leaks the
+    /// binary forever (the peer will never report TaskComplete /
+    /// TaskFailed because it's gone) and the per-phase in_flight
+    /// counter stays positive, blocking phase progression.
+    /// Non-SLURM-primary peers don't have a slurm_in_flight ledger
+    /// to recover, so the recovery path is a no-op for them.
     pub(super) fn check_peer_timeouts(&mut self) {
         let now = timestamp_now();
         let timeout_secs = self.config.peer_timeout.as_secs_f64();
@@ -238,11 +246,30 @@ where
 
         for peer_id in timed_out {
             let last_seen = self.peer_keepalives.remove(&peer_id).unwrap_or(0.0);
+            // Recover any tasks the SLURM-primary dispatched to this
+            // peer. Walk slurm_in_flight, collect hashes whose target
+            // matches, then call `recover_in_flight_to_pool` for each
+            // (which requeues the binary, decrements in_flight, and
+            // clears the ledger entry).
+            let recovered: Vec<String> = self
+                .slurm_in_flight
+                .iter()
+                .filter(|(_, item)| item.target_secondary_id == peer_id)
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            let recovered_count = recovered.len();
+            for hash in recovered {
+                self.recover_in_flight_to_pool(&hash);
+            }
+            // Drop the peer's backpressure entry too — once it's
+            // declared dead the backoff is meaningless.
+            self.slurm_backpressured_peers.remove(&peer_id);
             tracing::warn!(
                 peer = %peer_id,
                 last_seen,
                 elapsed = now - last_seen,
-                "peer timeout detected"
+                recovered_in_flight = recovered_count,
+                "peer timeout detected; recovered in-flight tasks dispatched to it"
             );
         }
     }
