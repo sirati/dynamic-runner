@@ -79,7 +79,7 @@ fn extend_distributes_items_into_buckets() {
         t("P", "T1", "alpha", 20),
         t("P", "T1", "beta", 30),
         t("P", "T2", "", 40),
-    ]);
+    ]).expect("valid extend");
     // Total queued: 4
     assert_eq!(p.len(), 4);
     // Distinct buckets in iteration order (BTreeMap by key):
@@ -105,7 +105,7 @@ fn pop_honors_affinity_until_bucket_drains() {
         t("P", "T", "beta", 6),
         t("P", "T", "beta", 7),
         t("P", "T", "beta", 8),
-    ]);
+    ]).expect("valid extend");
     // Worker A claims one bucket. BTreeMap key order makes "alpha" < "beta",
     // so worker 1 picks alpha first.
     let first = p.pop_for_worker(1).expect("first");
@@ -124,7 +124,7 @@ fn affinity_clears_when_bucket_drains_then_pulls_other_bucket() {
         t("P", "T", "alpha", 1),
         t("P", "T", "alpha", 2),
         t("P", "T", "beta", 5),
-    ]);
+    ]).expect("valid extend");
     let _ = p.pop_for_worker(1).unwrap(); // alpha #1 (claim)
     let _ = p.pop_for_worker(1).unwrap(); // alpha #2 (drain alpha)
     let next = p.pop_for_worker(1).expect("from beta now");
@@ -137,7 +137,7 @@ fn free_pool_served_only_after_typed_buckets_but_never_starved() {
     p.extend([
         t("P", "T", "", 9),       // free-pool item
         t("P", "T", "alpha", 10), // typed
-    ]);
+    ]).expect("valid extend");
     // Step 2 prefers typed over free pool — worker 1 gets alpha first.
     let first = p.pop_for_worker(1).unwrap();
     assert_eq!(first.affinity_id.as_ref().unwrap().as_str(), "alpha");
@@ -149,11 +149,11 @@ fn free_pool_served_only_after_typed_buckets_but_never_starved() {
 #[test]
 fn on_item_finished_drains_phase() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "alpha", 1)]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
     let _ = p.pop_for_worker(1).unwrap();
     // Phase is Draining now (queue empty, in_flight = 1).
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Draining));
-    p.on_item_finished(&phase("P"));
+    p.on_item_finished(&phase("P"), None);
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Drained));
     assert_eq!(p.in_flight(&phase("P")), 0);
 }
@@ -161,7 +161,7 @@ fn on_item_finished_drains_phase() {
 #[test]
 fn requeue_inserts_at_front_and_flips_draining_back_to_active() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "alpha", 1)]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
     let item = p.pop_for_worker(1).unwrap();
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Draining));
     p.requeue(item);
@@ -178,7 +178,7 @@ fn release_worker_unpins_only_if_last_pin() {
         t("P", "T", "alpha", 1),
         t("P", "T", "alpha", 2),
         t("P", "T", "alpha", 3),
-    ]);
+    ]).expect("valid extend");
     // Worker 1 claims alpha. Worker 2 also picks (co-pin via step 4 after
     // the only typed bucket is already pinned).
     let _ = p.pop_for_worker(1).unwrap();
@@ -193,9 +193,9 @@ fn release_worker_unpins_only_if_last_pin() {
 #[test]
 fn poll_drain_transitions_is_one_shot() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "alpha", 1)]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
     let _ = p.pop_for_worker(1).unwrap();
-    p.on_item_finished(&phase("P"));
+    p.on_item_finished(&phase("P"), None);
     let first = p.poll_drain_transitions();
     assert_eq!(first, vec![phase("P")]);
     let second = p.poll_drain_transitions();
@@ -239,7 +239,7 @@ fn drain_empty_active_phases_cascades_to_first_populated_phase() {
         &["P0", "P1", "P2", "P3"],
         &[("P1", &["P0"]), ("P2", &["P1"]), ("P3", &["P2"])],
     );
-    p.extend([t("P3", "T", "", 1)]);
+    p.extend([t("P3", "T", "", 1)]).expect("valid extend");
     // Initial state: only P0 Active (no deps); P1..P3 all Blocked.
     assert_eq!(p.phase_state(&phase("P0")), Some(PhaseState::Active));
     assert_eq!(p.phase_state(&phase("P3")), Some(PhaseState::Blocked));
@@ -272,7 +272,7 @@ fn drain_empty_active_phases_cascades_to_first_populated_phase() {
 #[test]
 fn drain_empty_active_phases_skips_phase_with_items() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "", 1)]);
+    p.extend([t("P", "T", "", 1)]).expect("valid extend");
     p.drain_empty_active_phases();
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
     assert!(p.poll_drain_transitions().is_empty());
@@ -288,7 +288,7 @@ fn view_for_worker_orders_typed_then_free_pool() {
     p.extend([
         t("P", "T", "", 9),       // free-pool item
         t("P", "T", "alpha", 10), // typed
-    ]);
+    ]).expect("valid extend");
     let view = p.view_for_worker(1);
     assert_eq!(view.len(), 2);
     // First entry is from the typed bucket (step 2 wins over step 3).
@@ -306,7 +306,7 @@ fn take_from_view_commits_chosen_index() {
         t("P", "T", "alpha", 1),
         t("P", "T", "alpha", 2),
         t("P", "T", "beta", 3),
-    ]);
+    ]).expect("valid extend");
     // Worker 1 sees both typed buckets.
     let view = p.view_for_worker(1);
     // Find the beta entry (BTreeMap key order: alpha < beta).
@@ -334,9 +334,9 @@ fn view_for_worker_empty_pool() {
 #[test]
 fn reinject_revives_drained_phase_to_active() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "alpha", 1)]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
     let item = p.pop_for_worker(1).unwrap();
-    p.on_item_finished(&phase("P"));
+    p.on_item_finished(&phase("P"), None);
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Drained));
     p.reinject(item);
     assert_eq!(p.phase_state(&phase("P")), Some(PhaseState::Active));
@@ -354,7 +354,7 @@ fn drain_queued_empties_buckets_without_touching_inflight() {
         t("P", "T", "alpha", 1),
         t("P", "T", "beta", 2),
         t("P", "T", "", 3),
-    ]);
+    ]).expect("valid extend");
     // Take one to bump in-flight.
     let _ = p.pop_for_worker(1).unwrap();
     let in_flight_before = p.in_flight(&phase("P"));
@@ -376,7 +376,7 @@ fn view_for_worker_orders_pinned_then_typed_then_free_then_copin() {
         t("P", "T", "beta", 3),
         // free pool
         t("P", "T", "", 4),
-    ]);
+    ]).expect("valid extend");
 
     // First, worker 1 grabs alpha (Step 2). After this, the view for
     // worker 1 should put alpha first (Step 1: pinned), then beta
@@ -395,7 +395,7 @@ fn view_for_worker_skips_blocked_phases() {
     p.extend([
         t("A", "T", "", 1),
         t("B", "T", "", 2),
-    ]);
+    ]).expect("valid extend");
     let view = p.view_for_worker(1);
     // Only A's item is visible; B is Blocked.
     assert_eq!(view.len(), 1);
@@ -408,7 +408,7 @@ fn take_from_view_removes_chosen_item_and_records_affinity() {
     p.extend([
         t("P", "T", "alpha", 1),
         t("P", "T", "beta", 2),
-    ]);
+    ]).expect("valid extend");
     let view = p.view_for_worker(1);
     // View order: alpha (BTreeMap "alpha" < "beta") then beta. Pick beta
     // to verify non-zero index removal.
@@ -429,7 +429,7 @@ fn take_from_view_removes_chosen_item_and_records_affinity() {
 #[test]
 fn take_from_view_increments_in_flight_and_drains_phase() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "alpha", 1)]);
+    p.extend([t("P", "T", "alpha", 1)]).expect("valid extend");
     let view = p.view_for_worker(1);
     assert_eq!(view.len(), 1);
     let _ = p.take_from_view(view, 0);
@@ -442,7 +442,7 @@ fn view_for_worker_empty_when_no_eligible_items() {
     let mut p = pool_with(&["P"], &[]);
     let view = p.view_for_worker(0);
     assert!(view.is_empty());
-    p.extend([t("P", "T", "", 1)]);
+    p.extend([t("P", "T", "", 1)]).expect("valid extend");
     let view = p.view_for_worker(0);
     assert_eq!(view.len(), 1);
 }
@@ -455,7 +455,7 @@ fn retain_drops_unmatched_items_across_buckets() {
         t("P", "T1", "alpha", 20),
         t("P", "T2", "beta", 30),
         t("P", "T2", "", 40),
-    ]);
+    ]).expect("valid extend");
     assert_eq!(p.len(), 4);
     p.retain(|item| item.size >= 25);
     // BTreeMap key order: (P, T2, "") sorts before (P, T2, "beta") because
@@ -472,7 +472,7 @@ fn take_first_match_removes_and_returns_first_hit() {
         t("P", "T", "alpha", 10),
         t("P", "T", "alpha", 20),
         t("P", "T", "beta", 30),
-    ]);
+    ]).expect("valid extend");
     let taken = p.take_first_match(|i| i.size >= 15).expect("hit");
     assert_eq!(taken.size, 20);
     let rest: Vec<u64> = p.iter().map(|i| i.size).collect();
@@ -482,7 +482,7 @@ fn take_first_match_removes_and_returns_first_hit() {
 #[test]
 fn take_first_match_returns_none_when_no_match() {
     let mut p = pool_with(&["P"], &[]);
-    p.extend([t("P", "T", "alpha", 10)]);
+    p.extend([t("P", "T", "alpha", 10)]).expect("valid extend");
     assert!(p.take_first_match(|i| i.size > 100).is_none());
     assert_eq!(p.len(), 1);
 }
@@ -493,7 +493,7 @@ fn take_first_match_empties_bucket_clears_pin_state() {
     p.extend([
         t("P", "T", "alpha", 10),
         t("P", "T", "beta", 30),
-    ]);
+    ]).expect("valid extend");
     // Worker 1 claims alpha bucket via normal dispatch.
     let _ = p.pop_for_worker(1).unwrap();
     // alpha is now drained-by-dispatch; take a beta item via predicate.
@@ -514,7 +514,7 @@ fn take_first_match_skips_blocked_phases() {
     // Two phases A, B with B depending on A. A has no items but B has one.
     // B is Blocked because A hasn't been marked Done.
     let mut p = pool_with(&["A", "B"], &[("B", &["A"])]);
-    p.extend([t("B", "T", "alpha", 1)]);
+    p.extend([t("B", "T", "alpha", 1)]).expect("valid extend");
     assert_eq!(p.phase_state(&phase("B")), Some(PhaseState::Blocked));
     let got = p.take_first_match(|_| true);
     assert!(got.is_none(), "Blocked phase B's item must not dispatch");
@@ -539,4 +539,121 @@ fn activation_cascade_through_chain() {
     assert_eq!(p.phase_state(&phase("C")), Some(PhaseState::Blocked));
     p.mark_phase_done(&phase("B"));
     assert_eq!(p.phase_state(&phase("C")), Some(PhaseState::Active));
+}
+
+// ── Task-level dependencies (task_id + task_depends_on) ──
+
+/// Test fixture variant carrying a task_id and (optional) deps.
+fn t_with_id(
+    phase: &str,
+    ty: &str,
+    affinity: &str,
+    size: u64,
+    id: &str,
+    deps: &[&str],
+) -> TaskInfo<()> {
+    let mut item = t(phase, ty, affinity, size);
+    item.task_id = Some(id.to_string());
+    item.task_depends_on = deps.iter().map(|d| d.to_string()).collect();
+    item
+}
+
+#[test]
+fn task_deps_unknown_id_fails_extend() {
+    let mut p = pool_with(&["P"], &[]);
+    let res = p.extend([t_with_id("P", "T", "", 1, "child", &["nope"])]);
+    match res {
+        Err(PendingPoolError::UnknownTaskDep { task, referenced_by }) => {
+            assert_eq!(task, "nope");
+            assert_eq!(referenced_by, "child");
+        }
+        other => panic!("expected UnknownTaskDep, got {:?}", other),
+    }
+}
+
+#[test]
+fn task_deps_cycle_fails_extend() {
+    let mut p = pool_with(&["P"], &[]);
+    let res = p.extend([
+        t_with_id("P", "T", "", 1, "a", &["b"]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ]);
+    assert!(matches!(res, Err(PendingPoolError::TaskDepCycle(_))));
+}
+
+#[test]
+fn task_deps_duplicate_id_fails_extend() {
+    let mut p = pool_with(&["P"], &[]);
+    let res = p.extend([
+        t_with_id("P", "T", "", 1, "dup", &[]),
+        t_with_id("P", "T", "", 1, "dup", &[]),
+    ]);
+    assert!(matches!(res, Err(PendingPoolError::DuplicateTaskId(_))));
+}
+
+#[test]
+fn task_deps_blocked_until_dep_completes() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ])
+    .expect("valid extend");
+    // Bucket iteration only sees A; B is in the blocked map.
+    let queued_ids: Vec<_> = p
+        .iter()
+        .map(|i| i.task_id.clone().unwrap())
+        .collect();
+    assert_eq!(queued_ids, vec!["a".to_string()]);
+    let first = p.pop_for_worker(1).expect("a is dispatchable");
+    assert_eq!(first.task_id.as_deref(), Some("a"));
+    // No more queued items; B still blocked, phase still has work.
+    assert!(p.pop_for_worker(1).is_none());
+    p.on_item_finished(&phase("P"), Some("a"));
+    // Now B is unblocked.
+    let second = p.pop_for_worker(1).expect("b unblocked");
+    assert_eq!(second.task_id.as_deref(), Some("b"));
+}
+
+#[test]
+fn task_deps_unblocked_lands_at_bucket_front() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "alpha", 1, "a", &[]),
+        t_with_id("P", "T", "alpha", 1, "b", &["a"]),
+        t_with_id("P", "T", "alpha", 1, "c", &[]),
+    ])
+    .expect("valid extend");
+    // A is dispatched first (it's in front of C; B is blocked).
+    let a = p.pop_for_worker(1).expect("a");
+    assert_eq!(a.task_id.as_deref(), Some("a"));
+    // Finish A → B unblocks and lands at the FRONT of the bucket,
+    // ahead of C which has been queued behind A all along.
+    p.on_item_finished(&phase("P"), Some("a"));
+    let next = p.pop_for_worker(1).expect("b before c");
+    assert_eq!(next.task_id.as_deref(), Some("b"));
+    let last = p.pop_for_worker(1).expect("c last");
+    assert_eq!(last.task_id.as_deref(), Some("c"));
+}
+
+#[test]
+fn task_deps_cascade_fail_on_permanent_prereq_failure() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+        t_with_id("P", "T", "", 1, "c", &["b"]),
+    ])
+    .expect("valid extend");
+    let a = p.pop_for_worker(1).expect("a");
+    assert_eq!(a.task_id.as_deref(), Some("a"));
+    let cascaded = p.on_item_failed_permanent(&phase("P"), "a");
+    let mut cascaded_ids: Vec<_> = cascaded
+        .iter()
+        .map(|i| i.task_id.clone().unwrap())
+        .collect();
+    cascaded_ids.sort();
+    assert_eq!(cascaded_ids, vec!["b".to_string(), "c".to_string()]);
+    // No queued items remain — B and C never made it into a bucket.
+    assert!(p.pop_for_worker(1).is_none());
 }

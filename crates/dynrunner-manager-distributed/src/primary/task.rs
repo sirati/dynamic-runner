@@ -199,14 +199,21 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // can fold it into per-phase counters, release the
             // per-type concurrency slot, and run the phase lifecycle
             // cascade.
-            let mut completed_meta: Option<(dynrunner_core::PhaseId, dynrunner_core::TypeId)> =
-                None;
+            let mut completed_meta: Option<(
+                dynrunner_core::PhaseId,
+                dynrunner_core::TypeId,
+                Option<String>,
+            )> = None;
             let mut local_idx: u32 = 0;
             for w in &mut self.workers {
                 if w.secondary_id == secondary_id {
                     if local_idx == worker_id {
                         if let Some(task) = w.current_task.take() {
-                            completed_meta = Some((task.phase_id.clone(), task.type_id.clone()));
+                            completed_meta = Some((
+                                task.phase_id.clone(),
+                                task.type_id.clone(),
+                                task.task_id.clone(),
+                            ));
                         }
                         w.estimated_resources = ResourceMap::new();
                         w.is_idle = true;
@@ -216,9 +223,9 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
-            if let Some((phase, type_id)) = completed_meta {
+            if let Some((phase, type_id, task_id)) = completed_meta {
                 self.release_type_slot(&type_id);
-                self.note_item_completed(&phase);
+                self.note_item_completed(&phase, task_id.as_deref());
             }
 
             tracing::debug!(
@@ -396,7 +403,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             self.failed_tasks.insert(task_hash.clone());
             if let Some(binary) = recovered_binary {
                 self.release_type_slot(&binary.type_id);
-                self.note_item_failed(&binary.phase_id);
+                self.note_item_failed(&binary.phase_id, binary.task_id.as_deref());
             }
 
             tracing::warn!(
