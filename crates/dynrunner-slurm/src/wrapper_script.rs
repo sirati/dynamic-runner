@@ -86,6 +86,21 @@ PODMAN_RUN="{podman_run}"
 mkdir -p "$PODMAN_STORAGE" "$PODMAN_RUN"
 chmod 700 "$PODMAN_STORAGE" "$PODMAN_RUN"
 export XDG_RUNTIME_DIR="$PODMAN_RUN"
+
+# Resolve the compute node's peer-routable IPs so the secondary
+# advertises addresses other cluster nodes can actually dial. The
+# container runs with `--network host` so it shares this node's
+# network namespace, but `hostname -I` in there still returns
+# *every* configured non-loopback address — and on Krater-class
+# nodes the first one is often a CNI bridge / podman-internal
+# subnet (10.x.x.x) that's not routed off-host. Resolving the
+# node's FQDN through NSS picks the canonical cluster address that
+# slurmd, ssh, and DNS all agree on. Empty values are tolerated by
+# the Rust env-hint reader (see network::detect_ipv4); a probe
+# failure simply falls back to the legacy `hostname -I` first-token.
+SLURM_NODE_NAME="${{SLURMD_NODENAME:-$(hostname -f)}}"
+PRIMARY_NODE_IPV4=$(getent ahostsv4 "$SLURM_NODE_NAME" 2>/dev/null | awk '{{print $1; exit}}')
+PRIMARY_NODE_IPV6=$(getent ahostsv6 "$SLURM_NODE_NAME" 2>/dev/null | awk '$1 ~ /:/ {{print $1; exit}}')
 "##
     );
 
@@ -198,6 +213,15 @@ fi
     -v "{socket_dir}:/app/sockets""#
     );
 
+    // Env-var hints (common to both modes). The host-IP probe earlier
+    // in the script populates these shell vars; podman forwards them
+    // into the container where `network::detect_ipv{4,6}` consumes
+    // them in preference to `hostname -I`. Empty values are tolerated
+    // by the reader (see network.rs) so a probe miss falls back to
+    // legacy detection without poisoning the chain.
+    let env_flags = r#"-e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
+    -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6""#;
+
     let image_ref = format!("{}:{}", cfg.image_name, cfg.image_tag);
     let sid = cfg.secondary_id;
     let container_command = cfg.container_command;
@@ -219,6 +243,7 @@ fi
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --pull=never \
     --network host \
+    {env_flags} \
     {volumes} \
     {image_ref} \
     {container_command} --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {sid} --secondary-quic-port $QUIC_PORT
@@ -237,6 +262,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --pull=never \
     --network host \
+    {env_flags} \
     {volumes} \
     {image_ref} \
     {container_command} --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {sid} --secondary-quic-port $QUIC_PORT
@@ -302,6 +328,13 @@ mod tests {
         assert!(!script.contains("TUNNEL_PORT"));
         assert!(script.contains("test-app-docker.tar"));
         assert!(script.contains("dynamic_batch_tokenizer --secondary"));
+        // Host-IP probe + env plumbing (the bug fix this guards):
+        // without these the container's `hostname -I` advertises a
+        // non-routable bridge IP and peers can't dial it.
+        assert!(script.contains("getent ahostsv4"));
+        assert!(script.contains("PRIMARY_NODE_IPV4="));
+        assert!(script.contains("-e PRIMARY_NODE_IPV4="));
+        assert!(script.contains("-e PRIMARY_NODE_IPV6="));
     }
 
     #[test]
