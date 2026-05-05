@@ -1,5 +1,6 @@
 import logging
 import secrets
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,17 @@ class SlurmJobManager:
 
         image_name = self.packaging.get_image_name()
         image_tag = self.packaging.get_image_tag()
+
+        # Bash-quote each consumer-supplied flag so values containing
+        # spaces or shell-metacharacters survive intact, then render as
+        # one continuation line per arg so the resulting `podman run`
+        # block keeps the same readable shape regardless of how many
+        # flags the consumer passes. Empty tuple → empty string, which
+        # collapses cleanly between the env+volume block and the
+        # image-tag line.
+        extra_run_args_block = "".join(
+            f"    {shlex.quote(arg)} \\\n" for arg in self.deployment.extra_run_args
+        )
 
         script = f"""#!/bin/bash
 set -e
@@ -285,7 +297,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{output_network}:/app/out-network" \
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
-    {image_name}:{image_tag} \
+{extra_run_args_block}    {image_name}:{image_tag} \
     {self.deployment.secondary_module} --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
         else:
             script += f"""echo "  Gateway: {gateway_host}:{gateway_port}"
@@ -307,7 +319,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     -v "{output_network}:/app/out-network" \
     -v "{log_network}:/app/log-network" \
     -v "{socket_dir}:/app/sockets" \
-    {image_name}:{image_tag} \
+{extra_run_args_block}    {image_name}:{image_tag} \
     {self.deployment.secondary_module} --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
 
         script += """
