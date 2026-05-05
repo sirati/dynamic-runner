@@ -153,20 +153,23 @@ class SlurmPreparation:
         logger.info("All %d jobs submitted", num_secondaries)
 
     def _determine_gateway_host(self) -> str:
-        """Determine the hostname that compute nodes should use to reach the gateway."""
+        """Determine the hostname that compute nodes should use to reach the gateway.
+
+        The user-given ``self.gateway.host`` is used verbatim. We do NOT
+        substitute it with ``hostname -f`` from the gateway: when the
+        configured host is a load-balancer alias (e.g. ``remote.cip.ifi.lmu.de``),
+        ``hostname -f`` resolves on the gateway side to whichever specific
+        node the LB landed us on (e.g. ``benitoit.cip.ifi.lmu.de``), which
+        compute nodes may not be able to reach (different routing, different
+        cert) — the LB alias is the only stable name. If a caller wants a
+        specific node's FQDN they pass it as ``gateway.host`` themselves.
+        """
         if hasattr(self.gateway, "host") and self.gateway.host:
-            logger.info("Detecting gateway hostname for compute nodes...")
-            returncode, stdout, _stderr = self.gateway.execute_command("hostname -f")
-            if returncode == 0 and stdout.strip():
-                gateway_host = stdout.strip()
-                logger.info("Using gateway FQDN: %s", gateway_host)
-            else:
-                gateway_host = self.gateway.host
-                logger.warning("Could not detect gateway FQDN, using SSH host: %s", gateway_host)
+            gateway_host = self.gateway.host
+            logger.info("Using gateway hostname (as configured by user): %s", gateway_host)
         else:
             gateway_host = "localhost"
             logger.info("Using local gateway host: %s", gateway_host)
-
         return gateway_host
 
     async def _setup_ssh_tunnels(self, num_secondaries: int, primary_quic_port: int) -> None:
@@ -281,6 +284,18 @@ class SlurmPreparation:
                 "StrictHostKeyChecking=no",
                 "-o",
                 "UserKnownHostsFile=/dev/null",
+                # Fail fast if the remote -R forward can't be set up
+                # (e.g. tunnel_port already bound on the compute node,
+                # remote sshd refusing port forwarding). Without this
+                # flag ssh stays alive even when the forward request
+                # fails, leaving us with a "running" PID but a broken
+                # tunnel — the secondary then hits Connection refused
+                # on localhost:tunnel_port and the dispatch eventually
+                # dies on the SecondaryWelcome handshake timeout. With
+                # this flag ssh exits, and the post-Popen verification
+                # below sees the non-None poll() and aborts.
+                "-o",
+                "ExitOnForwardFailure=yes",
                 # Default-on keepalive on long-lived ssh tunnels.
                 # Sends an application-layer probe every 30s and
                 # tolerates 3 missed probes before the local ssh
@@ -318,7 +333,37 @@ class SlurmPreparation:
             stdin=subprocess.DEVNULL,
         )
         self.ssh_tunnels.append(proc)
-        logger.info("SSH tunnel created for %s (PID: %s)", secondary_id, proc.pid)
+
+        # Verify ssh actually stayed alive long enough to establish the
+        # forward. ssh -N -R never exits on its own, so a clean exit
+        # within a few seconds means setup failed: jump-host (-J) couldn't
+        # reach the gateway, the gateway-side sshd refused, the remote -R
+        # request collided with an existing listener (caught by
+        # ExitOnForwardFailure=yes above), or auth failed.
+        #
+        # Idiom: wait(timeout=3) raises TimeoutExpired if the process is
+        # STILL alive after 3s — which is the success case for a
+        # long-running -N tunnel. A clean return from wait() means ssh
+        # already died and we have an exit code + captured stderr to
+        # surface.
+        try:
+            returncode = proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            logger.info("SSH tunnel established for %s (PID: %s)", secondary_id, proc.pid)
+            return
+
+        stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+        logger.error(
+            "SSH tunnel for %s exited within 3s (rc=%s) — forward not established. stderr: %s",
+            secondary_id,
+            returncode,
+            stderr_text,
+        )
+        raise RuntimeError(
+            f"SSH reverse tunnel for {secondary_id} failed to establish "
+            f"(ssh exited rc={returncode}): {stderr_text}"
+        )
 
     async def _async_sleep(self, seconds: float) -> None:
         import asyncio
