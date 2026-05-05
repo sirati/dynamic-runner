@@ -22,14 +22,14 @@
 # only then committing + pushing.
 buildPythonPackage {
   pname = "dynamic-runner";
-  version = "0.3.0";
+  version = "0.4.0";
   pyproject = true;
 
   src = lib.cleanSource ./..;
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     src = lib.cleanSource ./..;
-    hash = "sha256-0CRVvbfMJDEqGu422tqKirjh/HsDTB6wJDs91gX1je4=";
+    hash = "sha256-e6zBvDdoFv0jKSIOHVIoQVgWddfXtVm0BsGacCPfH38=";
   };
 
   nativeBuildInputs = [
