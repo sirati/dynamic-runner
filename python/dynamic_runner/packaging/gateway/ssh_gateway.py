@@ -45,21 +45,6 @@ class SSHGateway:
                 "ControlMaster=auto",
                 "-o",
                 "ControlPersist=yes",
-                # Keepalive flags on the long-lived master connection.
-                # If the master dies (NAT timeout, packet drop, wifi
-                # blip on a laptop primary), every -R forward riding
-                # on it also dies and every secondary on the cluster
-                # side starts missing primary keepalives. Same
-                # rationale as the per-secondary reverse tunnel in
-                # `preparation.py::_create_ssh_reverse_tunnel`.
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "TCPKeepAlive=yes",
-                "-o",
-                "ExitOnForwardFailure=yes",
             ]
         )
 

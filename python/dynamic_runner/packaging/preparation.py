@@ -281,48 +281,6 @@ class SlurmPreparation:
                 "StrictHostKeyChecking=no",
                 "-o",
                 "UserKnownHostsFile=/dev/null",
-                # Keepalive flags — without these the long-lived
-                # reverse-tunnel silently dies on a brief NAT
-                # timeout / packet drop / wifi blip and every
-                # secondary on the other end starts missing primary
-                # keepalives. The framework's heartbeat then
-                # declares the secondary dead and re-queues its
-                # in-flight tasks; for a run with a flaky home
-                # uplink (a common laptop-primary scenario) the
-                # attrition cascades and the run loses N-1
-                # secondaries before the SLURM-primary failover
-                # path even gets a chance to absorb the load.
-                #
-                # ServerAliveInterval=30 — probe every 30s so NAT
-                # entries (typical home-router idle timeout 60-600s)
-                # stay live. 30s is well within the floor.
-                #
-                # ServerAliveCountMax=3 — 3 missed probes (90s
-                # cumulative) → ssh exits cleanly. Pairs with
-                # ExitOnForwardFailure so the dispatcher gets an
-                # exit code instead of a zombie tunnel that shows
-                # forward established while the underlying transport
-                # is dead.
-                #
-                # ExitOnForwardFailure=yes — if the -R setup ever
-                # fails (collision on tunnel_port, gateway sshd
-                # rejects, etc.) ssh exits immediately rather than
-                # holding the connection open with a broken
-                # forward.
-                #
-                # TCPKeepAlive=yes — application-level signal to
-                # enable SO_KEEPALIVE on the underlying socket;
-                # belt-and-suspenders with ServerAliveInterval to
-                # catch half-closed connections that ServerAlive
-                # would also catch.
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "ExitOnForwardFailure=yes",
-                "-o",
-                "TCPKeepAlive=yes",
             ]
         )
 
