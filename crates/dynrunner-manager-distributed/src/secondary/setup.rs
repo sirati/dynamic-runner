@@ -1,4 +1,6 @@
 
+use std::time::Instant;
+
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
@@ -113,6 +115,19 @@ where
                             // Non-blocking: per-peer dials run as
                             // spawn_local tasks; returns immediately.
                             self.peer_transport.connect_to_peers(peers).await;
+                            // Arm the peer-mesh watchdog. 30s = 10s
+                            // QUIC timeout + 10s WSS fallback timeout
+                            // + 10s slack for the accept side to
+                            // finish handshakes that completed near
+                            // the deadline. After this point a 0-peer
+                            // count means "the cluster blocks
+                            // peer-direct connectivity" rather than
+                            // "the dials are still in flight".
+                            if peer_count > 0 {
+                                self.peer_dial_count = peer_count as u32;
+                                self.peer_mesh_check_at =
+                                    Some(Instant::now() + std::time::Duration::from_secs(30));
+                            }
                         }
                     }
                     MessageType::InitialAssignment => {

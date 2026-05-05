@@ -170,6 +170,27 @@ where
     last_request_time: HashMap<WorkerId, Instant>,
     request_backoff: HashMap<WorkerId, Duration>,
 
+    /// One-shot watchdog deadline for "did the peer mesh form?".
+    /// Set to `now + 30s` when `wait_for_setup` kicks off the per-peer
+    /// dials with at least one peer in the list; cleared on first
+    /// keepalive tick after the deadline passes (after the watchdog
+    /// has logged its result). `None` means either we haven't reached
+    /// the dial step yet, the peer list was empty (single-secondary
+    /// runs), or the watchdog has already fired.
+    ///
+    /// Without this, the per-peer "QUIC to peer X timed out, trying
+    /// WSS" / "WSS to peer X also failed" lines are scattered across
+    /// the log with no single signal that the secondary is now
+    /// running primary-only — operators have to grep + count to
+    /// realise. Cohort 4 (tokenizer) hit exactly this: 5 secondaries,
+    /// each printed 4 dial-failure lines, and silence after that;
+    /// the actual "0 peers connected ⇒ degraded" state was implied.
+    peer_mesh_check_at: Option<Instant>,
+    /// Number of peers we asked the transport to dial. Used by the
+    /// watchdog to phrase the WARN ("0 of N peers reachable") and to
+    /// suppress the watchdog when peers is empty (single-secondary).
+    peer_dial_count: u32,
+
     // SLURM-primary state (populated on promotion + full task list).
     // `slurm_pending` is `None` until the secondary first receives a
     // `FullTaskList` snapshot from the live primary (or, if it gets
@@ -255,6 +276,8 @@ where
             pending_peer_messages: Vec::new(),
             last_request_time: HashMap::new(),
             request_backoff: HashMap::new(),
+            peer_mesh_check_at: None,
+            peer_dial_count: 0,
             slurm_pending: None,
             slurm_completed: HashSet::new(),
             slurm_in_flight: HashMap::new(),

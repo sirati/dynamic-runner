@@ -76,6 +76,7 @@ where
                 _ = keepalive_interval.tick() => {
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
+                    self.check_peer_mesh_watchdog();
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
                         let _ = self.peer_transport.broadcast(msg).await;

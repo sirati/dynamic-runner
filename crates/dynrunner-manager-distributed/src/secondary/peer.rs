@@ -182,6 +182,48 @@ where
         }
     }
 
+    /// One-shot diagnostic: 30s after `connect_to_peers` fired, log
+    /// once if the cluster blocks peer-direct connectivity (every
+    /// dial timed out / refused). Without the explicit signal,
+    /// operators have to scan the per-peer dial-failure lines and
+    /// count to realise the secondary has degraded to primary-only
+    /// dispatch — a trap tokenizer hit on cohort 4. Self-healing if
+    /// the mesh forms before the deadline (`peer_count() > 0`
+    /// suppresses the WARN) or partially forms after the deadline
+    /// (any incoming peer connection clears `peer_mesh_check_at`,
+    /// no degraded log).
+    ///
+    /// `peer_count()` already calls `drain_new_connections` so this
+    /// reads the freshest state.
+    pub(super) fn check_peer_mesh_watchdog(&mut self) {
+        let deadline = match self.peer_mesh_check_at {
+            Some(d) => d,
+            None => return,
+        };
+        // peer_count drains new connections internally; calling it
+        // BEFORE the deadline check lets a fresh connection clear
+        // the watchdog without firing the WARN.
+        let connected = self.peer_transport.peer_count();
+        if connected > 0 {
+            self.peer_mesh_check_at = None;
+            return;
+        }
+        if std::time::Instant::now() < deadline {
+            return;
+        }
+        tracing::warn!(
+            attempted = self.peer_dial_count,
+            connected = 0,
+            "peer mesh fully failed to form after 30s; secondary will operate in \
+             primary-driven dispatch mode (no peer-mesh broadcast of TaskComplete \
+             / TaskFailed, no SLURM-primary failover possible). Common cause: \
+             cluster firewall / NAT blocks compute-node ↔ compute-node TCP/UDP. \
+             Run still functions for the live-primary case; only failover and \
+             peer-broadcast bookkeeping are degraded."
+        );
+        self.peer_mesh_check_at = None;
+    }
+
     /// Check for peer timeouts based on keepalive tracking.
     pub(super) fn check_peer_timeouts(&mut self) {
         let now = timestamp_now();
