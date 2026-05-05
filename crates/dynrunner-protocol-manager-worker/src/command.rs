@@ -34,12 +34,27 @@ pub enum Response {
         error_type: ErrorType,
         message: String,
     },
-    /// Unhandled exception in the worker (formerly `PickledError`).
-    /// Carries plain strings: no Python objects are deserialised.
+    /// Worker reported an exception with full type + message +
+    /// traceback (formerly `PickledError`). Carries plain strings —
+    /// no Python objects are deserialised.
+    ///
+    /// `error_type` is optional for wire backwards compatibility. The
+    /// historical wire form (a worker-process-internal exception with
+    /// no category) maps to `None`, which the runner treats as
+    /// `NonRecoverable` (worker process is presumed corrupt → restart
+    /// signal). Consumers that catch user-task exceptions and want
+    /// to surface the traceback WITHOUT triggering a restart now set
+    /// `error_type = Some(ErrorType::Recoverable)`; the runner then
+    /// treats the failure exactly like a `Response::Error` of the
+    /// same category, except `error_message` is enriched with the
+    /// formatted traceback (`"{exception_type}: {message}\n{traceback}"`).
+    /// `Some(NonRecoverable)` is identical to `None`; `Some(Oom)`
+    /// behaves like `Response::Error { error_type: Oom, .. }`.
     WorkerException {
         exception_type: String,
         message: String,
         traceback: String,
+        error_type: Option<ErrorType>,
     },
     PhaseUpdate {
         phase_name: String,

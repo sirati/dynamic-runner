@@ -5,15 +5,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, Response};
 
-/// Wire payload for `Response::WorkerException` — three plain strings.
-/// Encoded as base64-JSON to keep the line-delimited text format intact even
+/// Wire payload for `Response::WorkerException`. Encoded as
+/// base64-JSON to keep the line-delimited text format intact even
 /// when tracebacks contain newlines or `:` characters.
+///
+/// `error_type` is the optional restart-or-not category. Omitted on
+/// the wire (the legacy shape — every WorkerException meant
+/// "worker is dead, restart it") deserialises to `None`. Newer
+/// senders set the wire value to `"recoverable"`, `"non_recoverable"`,
+/// or `"oom"` to control how the runner classifies the failure.
 #[derive(Debug, Serialize, Deserialize)]
 struct WorkerExceptionWire {
     #[serde(rename = "type")]
     exception_type: String,
     message: String,
     traceback: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_type: Option<String>,
 }
 
 /// Serialize a command to bytes (line-delimited text, backward-compatible with Python).
@@ -115,11 +123,13 @@ pub fn serialize_response(resp: &Response) -> Vec<u8> {
             exception_type,
             message,
             traceback,
+            error_type,
         } => {
             let wire = WorkerExceptionWire {
                 exception_type: exception_type.clone(),
                 message: message.clone(),
                 traceback: traceback.clone(),
+                error_type: error_type.as_ref().map(|t| t.wire_value().to_string()),
             };
             let json = serde_json::to_string(&wire)
                 .unwrap_or_else(|_| "{\"type\":\"\",\"message\":\"\",\"traceback\":\"\"}".into());
@@ -160,13 +170,20 @@ pub fn parse_response(line: &str) -> Option<Response> {
         });
     }
     if let Some(rest) = line.strip_prefix("error:exception:") {
-        // New shape: base64-JSON {type, message, traceback}.
+        // Modern shape: base64-JSON {type, message, traceback,
+        // error_type?}. Backwards compatible: senders that omit
+        // `error_type` parse to `None`, which the runner treats as
+        // NonRecoverable (legacy "worker is dead" semantic).
         if let Ok(json_bytes) = BASE64.decode(rest.as_bytes()) {
             if let Ok(wire) = serde_json::from_slice::<WorkerExceptionWire>(&json_bytes) {
                 return Some(Response::WorkerException {
                     exception_type: wire.exception_type,
                     message: wire.message,
                     traceback: wire.traceback,
+                    error_type: wire
+                        .error_type
+                        .as_deref()
+                        .and_then(ErrorType::from_wire),
                 });
             }
         }
@@ -174,6 +191,7 @@ pub fn parse_response(line: &str) -> Option<Response> {
             exception_type: "MalformedException".to_owned(),
             message: rest.to_owned(),
             traceback: String::new(),
+            error_type: None,
         });
     }
     if let Some(rest) = line.strip_prefix("error:pickle:") {
@@ -184,6 +202,7 @@ pub fn parse_response(line: &str) -> Option<Response> {
             exception_type: "LegacyPickledException".to_owned(),
             message: rest.to_owned(),
             traceback: String::new(),
+            error_type: None,
         });
     }
     if let Some(rest) = line.strip_prefix("error:") {

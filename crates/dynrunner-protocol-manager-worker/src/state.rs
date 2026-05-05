@@ -184,16 +184,40 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
                     exception_type,
                     message,
                     traceback,
+                    error_type,
                 } => {
-                    PollResult::Disconnected {
-                        result: TaskResult::error(
-                            ErrorType::NonRecoverable,
-                            format!("{exception_type}: {message}\n{traceback}"),
-                        ),
-                        protocol: RunnerProtocol {
-                            _state: PhantomData,
-                            transport: self.transport,
-                        },
+                    // `error_type` controls restart-vs-recover. Legacy
+                    // wire (no field set) defaults to NonRecoverable
+                    // — matches the original "worker process is
+                    // corrupt, restart it" semantic. Newer senders
+                    // can set Recoverable to attach a traceback to a
+                    // user-task failure WITHOUT killing the worker
+                    // (the formatted body still contains
+                    // exception_type + message + traceback so the
+                    // consumer's WARN log shows the full stack).
+                    let category = error_type.unwrap_or(ErrorType::NonRecoverable);
+                    let needs_restart = category == ErrorType::NonRecoverable;
+                    let result = TaskResult::error(
+                        category,
+                        format!("{exception_type}: {message}\n{traceback}"),
+                    );
+                    if needs_restart {
+                        PollResult::Disconnected {
+                            result,
+                            protocol: RunnerProtocol {
+                                _state: PhantomData,
+                                transport: self.transport,
+                            },
+                        }
+                    } else {
+                        PollResult::Completed {
+                            result,
+                            result_data: None,
+                            protocol: RunnerProtocol {
+                                _state: PhantomData,
+                                transport: self.transport,
+                            },
+                        }
                     }
                 }
                 Response::PhaseUpdate { phase_name } => {

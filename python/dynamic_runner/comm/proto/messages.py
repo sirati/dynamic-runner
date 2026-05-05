@@ -1,7 +1,9 @@
+import base64
 import json
 import pickle
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class ErrorType(Enum):
@@ -89,7 +91,14 @@ class ErrorResponse(Response):
 
 @dataclass
 class PickledErrorResponse(Response):
-    """Response with pickled error information including traceback."""
+    """Response with pickled error information including traceback.
+
+    Legacy form. Prefer ``WorkerExceptionResponse`` for new code:
+    pickle round-trips opaquely on the Rust runner (which doesn't
+    deserialise Python objects), so traceback fidelity is lost on the
+    wire. The runner currently surfaces this as a generic
+    ``LegacyPickledException`` with the pickle bytes as message.
+    """
 
     exception_type: str
     exception_message: str
@@ -103,6 +112,57 @@ class PickledErrorResponse(Response):
         }
         pickled_data = pickle.dumps(error_info)
         return f"error:pickle:{pickled_data.decode('latin-1')}\n".encode("utf-8")
+
+
+@dataclass
+class WorkerExceptionResponse(Response):
+    """Response with full exception details (type + message + traceback).
+
+    Wire-compatible with the Rust runner's modern ``error:exception:``
+    shape: a base64-encoded JSON object that survives newlines and
+    colons in tracebacks. Use this instead of ``ErrorResponse`` when
+    you want a Python traceback to reach the framework's WARN log
+    without losing fidelity to the line-delimited transport.
+
+    ``error_type`` controls the runner's restart-vs-recover decision:
+
+    * ``None`` (the default) — runner treats this as
+      ``NON_RECOVERABLE`` and restarts the worker process. This
+      matches the historical "an unhandled exception in the worker
+      means the worker is corrupt" semantic.
+    * ``ErrorType.RECOVERABLE`` — runner treats the failure as a
+      recoverable task error AND keeps the worker alive. This is the
+      shape consumers want for user-task exceptions
+      (``IndexError`` mid-task, KeyError on a single item, etc.) where
+      the worker process itself is fine but the specific task should
+      be retried. The runner concatenates
+      ``f"{exception_type}: {message}\\n{traceback}"`` into the
+      ``TaskFailed.error_message`` field so framework-side WARN logs
+      surface the full stack — useful when downstream cleanup
+      (e.g. SLURM wrapper trap) wipes worker-local log files before
+      they can be inspected.
+    * ``ErrorType.NON_RECOVERABLE`` — explicit form of the default;
+      worker is restarted.
+    * ``ErrorType.OUT_OF_MEMORY`` — categorise as OOM; the runner
+      surfaces it with the same OOM bookkeeping as
+      ``ErrorResponse(error_type=OUT_OF_MEMORY, ...)``.
+    """
+
+    exception_type: str
+    exception_message: str
+    traceback_str: str
+    error_type: Optional[ErrorType] = None
+
+    def serialize(self) -> bytes:
+        wire = {
+            "type": self.exception_type,
+            "message": self.exception_message,
+            "traceback": self.traceback_str,
+        }
+        if self.error_type is not None:
+            wire["error_type"] = self.error_type.value
+        encoded = base64.b64encode(json.dumps(wire).encode("utf-8")).decode("ascii")
+        return f"error:exception:{encoded}\n".encode("utf-8")
 
 
 @dataclass
@@ -183,6 +243,28 @@ def parse_response(data: str) -> Response | None:
     if data.startswith("phase:"):
         phase_name = data.split(":", 1)[1]
         return PhaseUpdateResponse(phase_name=phase_name)
+
+    if data.startswith("error:exception:"):
+        # Modern shape mirroring the Rust runner's ``error:exception:``
+        # wire form. JSON is the source of truth; any deserialisation
+        # failure falls through to a generic error response so a
+        # malformed line doesn't crash the parser.
+        try:
+            json_bytes = base64.b64decode(data[len("error:exception:"):])
+            wire = json.loads(json_bytes.decode("utf-8"))
+            err_type_str = wire.get("error_type")
+            err_type = ErrorType(err_type_str) if err_type_str else None
+            return WorkerExceptionResponse(
+                exception_type=wire.get("type", "Unknown"),
+                exception_message=wire.get("message", ""),
+                traceback_str=wire.get("traceback", ""),
+                error_type=err_type,
+            )
+        except Exception:
+            return ErrorResponse(
+                error_type=ErrorType.RECOVERABLE,
+                error_message="Failed to decode exception response",
+            )
 
     if data.startswith("error:pickle:"):
         try:

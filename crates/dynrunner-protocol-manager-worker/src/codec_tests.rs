@@ -176,6 +176,7 @@ fn worker_exception_roundtrip() {
         exception_type: "ValueError".into(),
         message: "thing went wrong: detail".into(),
         traceback: "Traceback (most recent call last):\n  File ...".into(),
+        error_type: None,
     };
     let bytes = serialize_response(&resp);
     let line = std::str::from_utf8(&bytes).unwrap();
@@ -185,10 +186,43 @@ fn worker_exception_roundtrip() {
             exception_type,
             message,
             traceback,
+            error_type,
         } => {
             assert_eq!(exception_type, "ValueError");
             assert_eq!(message, "thing went wrong: detail");
             assert_eq!(traceback, "Traceback (most recent call last):\n  File ...");
+            assert!(error_type.is_none());
+        }
+        _ => panic!("expected WorkerException"),
+    }
+}
+
+#[test]
+fn worker_exception_recoverable_roundtrip() {
+    // Sender (consumer worker that wants to surface a traceback for a
+    // user-task IndexError without forcing a worker restart) sets
+    // error_type=Recoverable; runner must echo it back through the
+    // wire so state.rs can route to PollResult::Completed instead of
+    // Disconnected.
+    let resp = Response::WorkerException {
+        exception_type: "IndexError".into(),
+        message: "list index out of range".into(),
+        traceback: "Traceback (most recent call last):\n  File 'w.py', line 42\n    x[10]\nIndexError: list index out of range".into(),
+        error_type: Some(ErrorType::Recoverable),
+    };
+    let bytes = serialize_response(&resp);
+    let line = std::str::from_utf8(&bytes).unwrap();
+    let parsed = parse_response(line).unwrap();
+    match parsed {
+        Response::WorkerException {
+            exception_type,
+            traceback,
+            error_type,
+            ..
+        } => {
+            assert_eq!(exception_type, "IndexError");
+            assert!(traceback.contains("IndexError: list index out of range"));
+            assert_eq!(error_type, Some(ErrorType::Recoverable));
         }
         _ => panic!("expected WorkerException"),
     }

@@ -10,6 +10,7 @@ from .messages import (
     ReadyResponse,
     Response,
     StopCommand,
+    WorkerExceptionResponse,
     parse_command,
     parse_response,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "DoneResponse",
     "ErrorResponse",
     "PickledErrorResponse",
+    "WorkerExceptionResponse",
     "PhaseUpdateResponse",
     "KeepaliveResponse",
     "ReadyResponse",
