@@ -10,9 +10,13 @@ use pyo3::prelude::*;
 /// `keepalive_miss_threshold` is read by the failover voting code (Phase 2);
 /// configurable now so callers don't have to revisit when failover lands.
 ///
-/// `retry_max_passes` is a primary-only knob (secondaries don't retry on
-/// their own); kept here so consumers configure it through the same single
-/// struct that flows into PrimaryConfig/SecondaryConfig wrappers.
+/// `retry_max_passes` governs both the live primary's `run_retry_passes`
+/// and (post-demotion) the SLURM-promoted secondary's
+/// `slurm_primary_drain_check_and_retry`. The live primary owns retry
+/// while it's authoritative; once it sends `PromotePrimary` and demotes,
+/// the SLURM-primary takes over retry for tasks IT dispatched. Same knob
+/// drives both sides so the cluster-level retry budget stays consistent
+/// across the handover.
 #[pyclass(name = "DistributedConfig", get_all, set_all, from_py_object)]
 #[derive(Clone, Debug)]
 pub(crate) struct DistributedConfig {

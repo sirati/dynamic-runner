@@ -223,6 +223,7 @@ impl PyDistributedManager {
                             src_tmp: None,
                             peer_timeout: dist_peer_timeout,
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                            retry_max_passes: dist_retry_max_passes,
                         };
 
                         let estimator = sec_estimator;

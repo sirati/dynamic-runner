@@ -111,6 +111,45 @@ where
                             // on the dev-box-primary scenario.
                             let peers = self.peer_transport.peer_count();
                             if peers == 0 {
+                                // SLURM-primary retry pass may still
+                                // have in-flight work the live
+                                // primary just won't see anymore
+                                // (live primary's `operational_loop`
+                                // exits on `completed + failed >= total`,
+                                // which fires on the FIRST failure
+                                // forward — well before the
+                                // SLURM-primary's drain-check delivers
+                                // the retry result). If we have
+                                // anything still in flight here, stay
+                                // alive so the worker event arrives
+                                // and gets bookkept; THEN exit cleanly
+                                // on the next iteration. Without this
+                                // the SLURM-primary's retry success
+                                // (or final retry failure) is silently
+                                // dropped at the in-flight stage and
+                                // `slurm_primary_failed` ends up
+                                // misreporting the cluster's terminal
+                                // state. Mirrors the local primary's
+                                // pre-demotion behaviour: it stayed
+                                // alive through `run_retry_passes`
+                                // before returning.
+                                let pending_local = !self.slurm_in_flight.is_empty()
+                                    || !self.active_tasks.is_empty()
+                                    || !self.slurm_pending_is_empty();
+                                if self.is_slurm_primary && pending_local {
+                                    tracing::info!(
+                                        in_flight = self.slurm_in_flight.len(),
+                                        active = self.active_tasks.len(),
+                                        pending = self.slurm_pending_len(),
+                                        "primary disconnected but SLURM-primary retry still has \
+                                         pending work; suppressing transport-close exit until \
+                                         the in-flight ledger drains"
+                                    );
+                                    self.primary_disconnected = true;
+                                    // Don't break: keep iterating so
+                                    // worker events land.
+                                    continue;
+                                }
                                 tracing::info!(
                                     "primary disconnected and no peer mesh; exiting cleanly \
                                      (no failover candidate to take authority)"
@@ -142,6 +181,18 @@ where
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog().await;
+                    // SLURM-primary retry pass. When this node is
+                    // acting as SLURM-primary and the main pass has
+                    // drained with Recoverable failures still
+                    // pending, re-inject them into `slurm_pending`
+                    // and bump the pass counter (no-op for
+                    // non-promoted secondaries or when the budget
+                    // is exhausted). Runs BEFORE `repoll_idle_workers`
+                    // so re-injected items are seen by the same
+                    // tick's re-poll without waiting for the next
+                    // keepalive cycle. Mirrors the local primary's
+                    // `run_retry_passes` — see slurm.rs.
+                    self.slurm_primary_drain_check_and_retry().await;
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (`request_backoff` doubles on each
@@ -186,6 +237,32 @@ where
             if let Some(reason) = self.fatal_exit.take() {
                 tracing::error!(reason = %reason, "secondary exiting with fatal error");
                 return Err(reason);
+            }
+
+            // SLURM-primary drain-down exit: when the live primary
+            // disconnected (we suppressed the eager break above) and
+            // every per-task ledger on this node has settled — pool
+            // empty, in-flight empty, no active local tasks, retry
+            // budget exhausted (`slurm_primary_failed` empty or
+            // budget consumed) — the run is genuinely done. Break
+            // here so `run()` returns and the process exits cleanly.
+            // No-op while the live primary is alive (which is the
+            // common case) since `primary_disconnected` is false.
+            if self.primary_disconnected
+                && self.is_slurm_primary
+                && self.peer_transport.peer_count() == 0
+                && self.slurm_in_flight.is_empty()
+                && self.active_tasks.is_empty()
+                && self.slurm_pending_is_empty()
+                && (self.slurm_primary_failed.is_empty()
+                    || self.slurm_primary_retry_passes_used
+                        >= self.config.retry_max_passes)
+            {
+                tracing::info!(
+                    permanent_failures = self.slurm_primary_failed.len(),
+                    "SLURM-primary drained after live-primary disconnect; exiting"
+                );
+                break;
             }
 
             // Restart any workers that disconnected
@@ -246,15 +323,39 @@ where
 
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
-                    self.completed_tasks.insert(hash.clone());
-                    // Drive the SLURM-primary's phase machine if this
-                    // node is acting as one and dispatched the task —
-                    // a no-op otherwise. Mid-run firing is what
-                    // unblocks chained phases in the SLURM-primary
-                    // pool.
-                    self.note_slurm_item_completed(&hash);
+                    // `completed_tasks` is the "saw it terminate" set;
+                    // the SLURM-primary's dispatch path uses it to
+                    // avoid redispatching tasks the cluster has
+                    // already finished. For Recoverable failures we
+                    // intend to retry, so the hash must NOT land here
+                    // — otherwise `handle_slurm_task_request` would
+                    // filter the re-injected binary out via its
+                    // `completed_tasks` retain, and retry silently
+                    // becomes a no-op. Mirrors the pre-existing
+                    // dispatch.rs::TaskFailed forward and peer.rs::
+                    // TaskFailed wire paths, both of which already
+                    // skip `completed_tasks` insertion for
+                    // Recoverable. The terminal-failure / success
+                    // branches still insert below.
+                    let recoverable_failure = !result.success
+                        && result
+                            .error_type
+                            .as_ref()
+                            .is_some_and(|e| matches!(
+                                e,
+                                dynrunner_core::ErrorType::Recoverable
+                            ));
+                    if !recoverable_failure {
+                        self.completed_tasks.insert(hash.clone());
+                    }
 
                     if result.success {
+                        // Drive the SLURM-primary's phase machine if
+                        // this node is acting as one and dispatched
+                        // the task — a no-op otherwise. Mid-run
+                        // firing is what unblocks chained phases in
+                        // the SLURM-primary pool.
+                        self.note_slurm_item_completed(&hash);
                         // Report completion to the current primary
                         // (whichever node currently holds authority).
                         let msg = DistributedMessage::TaskComplete {
@@ -268,6 +369,24 @@ where
                         self.send_to_current_primary(msg.clone()).await?;
                         let _ = self.peer_transport.broadcast(msg).await;
                     } else {
+                        // Compute the wire-format error_type once so
+                        // the SLURM-primary failure ledger and the
+                        // outbound TaskFailed agree on the string.
+                        let error_type = result
+                            .error_type
+                            .map(|e| format!("{:?}", e))
+                            .unwrap_or_else(|| "Unknown".into());
+                        // Failure-aware variant: Recoverable failures
+                        // land in `slurm_primary_failed` for the
+                        // retry pass. Phase-machine in-flight
+                        // bookkeeping is identical to the success
+                        // case (decrement + cascade).
+                        self.note_slurm_item_failed(&hash, &error_type);
+                        // Synchronous drain-check (see peer.rs for
+                        // rationale): immediately re-inject if this
+                        // was the last in-flight task and there's
+                        // retry budget left.
+                        self.slurm_primary_drain_check_and_retry().await;
                         // Report error to the current primary.
                         let msg = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),
@@ -275,10 +394,7 @@ where
                             secondary_id: self.config.secondary_id.clone(),
                             worker_id,
                             task_hash: hash.clone(),
-                            error_type: result
-                                .error_type
-                                .map(|e| format!("{:?}", e))
-                                .unwrap_or_else(|| "Unknown".into()),
+                            error_type,
                             error_message: result
                                 .error_message
                                 .unwrap_or_else(|| "Unknown error".into()),

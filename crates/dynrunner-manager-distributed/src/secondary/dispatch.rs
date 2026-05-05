@@ -220,11 +220,23 @@ where
             } => {
                 // Same forwarding rationale as TaskComplete; only
                 // act on terminal (non-Recoverable) failures since
-                // Recoverable just re-enqueues and a future
-                // TaskComplete will arrive.
+                // Recoverable retry is owned by the SLURM-primary
+                // (see `note_slurm_item_failed`) and a future
+                // TaskComplete or terminal TaskFailed will arrive.
                 if error_type != "Recoverable" {
                     self.completed_tasks.insert(task_hash.clone());
-                    self.note_slurm_item_completed(&task_hash);
+                    // Use the failure-aware variant for symmetry
+                    // with the other TaskFailed sites (peer.rs,
+                    // processing.rs); for non-Recoverable inputs
+                    // this is identical to `note_slurm_item_completed`
+                    // (no entry added to `slurm_primary_failed`).
+                    self.note_slurm_item_failed(&task_hash, &error_type);
+                    // Drain-check is harmless even when no entry
+                    // was added (no-op when ledger is empty); kept
+                    // for symmetry with the other TaskFailed sites
+                    // so future maintainers don't have to remember
+                    // a per-site filter.
+                    self.slurm_primary_drain_check_and_retry().await;
                 }
                 Ok(())
             }

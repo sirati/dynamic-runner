@@ -199,10 +199,149 @@ where
             Some(item) => item.phase_id,
             None => return,
         };
+        // Symmetric with retry: a successful completion supersedes any
+        // earlier Recoverable failure recorded against the same hash.
+        // Without this, a task that fails Recoverably (lands in
+        // `slurm_primary_failed`) and then succeeds on a subsequent
+        // attempt mid-pass — possible when the operational loop re-
+        // dispatches before our drain-check fires — would still
+        // trigger a pointless retry pass. Mirrors the live primary's
+        // `failed_tasks.remove` in `handle_task_complete`.
+        self.slurm_primary_failed.remove(file_hash);
         if let Some(pool) = self.slurm_pending.as_mut() {
             pool.on_item_finished(&phase_id);
             cascade_drain_done(pool);
         }
+    }
+
+    /// Sibling to `note_slurm_item_completed` for the failure path.
+    /// Decrements the pool's in-flight counter for the item's phase
+    /// (same as completion — phase machine doesn't distinguish
+    /// success vs failure for in-flight bookkeeping). For Recoverable
+    /// failures of tasks THIS secondary dispatched as SLURM-primary
+    /// via `handle_slurm_task_request`, also stash the binary in
+    /// `slurm_primary_failed` so `slurm_primary_drain_check_and_retry`
+    /// can re-inject it after the main pass drains. Non-Recoverable
+    /// / OutOfMemory / Unknown failures bypass the ledger — they're
+    /// terminal at the worker level and retry would likely fail
+    /// again the same way.
+    ///
+    /// Tasks not in `slurm_in_flight` (i.e. not dispatched by this
+    /// secondary as SLURM-primary — e.g. peer-completion forwards
+    /// for tasks dispatched elsewhere, or initial-assignment failures
+    /// from the live-primary's pre-promotion authority) bypass both
+    /// the ledger and the pool decrement: those tasks were never on
+    /// this pool's books to begin with. Mirrors `note_slurm_item_completed`'s
+    /// silent-skip behaviour for unknown hashes.
+    ///
+    /// Called from every wire-arrival site that observes a TaskFailed
+    /// for a SLURM-primary-dispatched task: peer.rs (peer transport),
+    /// processing.rs (own worker event), dispatch.rs (live-primary
+    /// forward, no-op for Recoverable). The Recoverable filter is
+    /// inside this function so the callers don't have to special-case
+    /// the retry path.
+    pub(super) fn note_slurm_item_failed(&mut self, file_hash: &str, error_type: &str) {
+        let item = match self.slurm_in_flight.remove(file_hash) {
+            Some(item) => item,
+            None => return,
+        };
+        let phase_id = item.phase_id.clone();
+        if error_type == "Recoverable" {
+            // Stash for the retry pass. Idempotent — the same hash
+            // appearing twice (e.g. after re-injection fails again)
+            // overwrites with the same binary, which is harmless.
+            self.slurm_primary_failed
+                .insert(file_hash.to_string(), item.binary);
+        }
+        if let Some(pool) = self.slurm_pending.as_mut() {
+            pool.on_item_finished(&phase_id);
+            cascade_drain_done(pool);
+        }
+    }
+
+    /// Slurm-primary-side equivalent of the local primary's
+    /// `run_retry_passes`. Called once per keepalive tick from
+    /// `process_tasks`. When the main pass has drained for THIS
+    /// SLURM-primary's view (pool empty, no items in flight, no local
+    /// active tasks) AND there are Recoverable failures pending in
+    /// `slurm_primary_failed` AND the retry budget hasn't been
+    /// exhausted, take a snapshot of the failed binaries, clear the
+    /// ledger, re-inject each into `slurm_pending` via
+    /// `pool.reinject`, bump the pass counter, and kick our own idle
+    /// workers via `repoll_idle_workers` so the operational loop
+    /// re-engages with the just-injected items.
+    ///
+    /// Why "drain-check" rather than a phase-explicit "main pass" /
+    /// "retry pass" boundary: the SLURM-primary's `process_tasks` loop
+    /// has no notion of pass boundaries — it's a single select! that
+    /// runs until shutdown. The drain-check fires whenever the loop
+    /// is observably idle and there's leftover retry work, which is
+    /// the same trigger condition the local primary's two-phase
+    /// `operational_loop` → `run_retry_passes` design used (drain →
+    /// re-inject → re-run). Repeated firing is gated by the budget
+    /// counter: once `retry_passes_used == retry_max_passes`, the
+    /// next drain-check leaves `slurm_primary_failed` populated and
+    /// the run wraps up via the normal exit conditions.
+    ///
+    /// Peer secondaries' workers don't need a kickstart from here:
+    /// they re-poll on their own keepalive tick via
+    /// `repoll_idle_workers` (with backoff) so any peer worker that
+    /// got "no work" before the re-injection will see new work on its
+    /// next request. Only the SLURM-primary's own workers need an
+    /// immediate kick — they're the ones whose `request_task_for_worker`
+    /// short-circuits through `handle_slurm_task_request` directly.
+    pub(super) async fn slurm_primary_drain_check_and_retry(&mut self) {
+        if !self.is_slurm_primary {
+            return;
+        }
+        if self.slurm_primary_failed.is_empty() {
+            return;
+        }
+        if !self.slurm_pending_is_empty()
+            || !self.slurm_in_flight.is_empty()
+            || !self.active_tasks.is_empty()
+        {
+            return;
+        }
+        if self.slurm_primary_retry_passes_used >= self.config.retry_max_passes {
+            // Budget exhausted: the residual entries are permanent
+            // failures. Keep them in the ledger so test fixtures (and
+            // future operator-visible probes) can count permanent
+            // failures from the SLURM-primary's perspective; the
+            // log-spam guard is `exhaustion_warning_emitted` so we
+            // emit the warning once per run rather than every drain
+            // check.
+            if !self.exhaustion_warning_emitted {
+                tracing::warn!(
+                    permanent_failures = self.slurm_primary_failed.len(),
+                    passes = self.config.retry_max_passes,
+                    "SLURM-primary retry budget exhausted; failed tasks are permanent"
+                );
+                self.exhaustion_warning_emitted = true;
+            }
+            return;
+        }
+
+        let to_retry: Vec<TaskInfo<I>> =
+            std::mem::take(&mut self.slurm_primary_failed)
+                .into_values()
+                .collect();
+        let pass = self.slurm_primary_retry_passes_used + 1;
+        tracing::info!(
+            pass,
+            count = to_retry.len(),
+            "SLURM-primary retry pass: re-injecting failed tasks"
+        );
+        if let Some(pool) = self.slurm_pending.as_mut() {
+            for binary in to_retry {
+                pool.reinject(binary);
+            }
+        }
+        self.slurm_primary_retry_passes_used += 1;
+
+        // Kick our own idle workers — see method-level doc. Peer
+        // workers self-recover on their next keepalive-driven repoll.
+        self.repoll_idle_workers().await;
     }
 
     /// Test/inspection helper: whether the pool has zero queued items.
