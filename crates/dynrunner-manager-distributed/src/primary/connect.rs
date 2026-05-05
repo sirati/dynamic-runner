@@ -132,12 +132,35 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             MessageType::TaskRequest => self.handle_task_request(msg).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg).await,
             MessageType::TaskFailed => self.handle_task_failed(msg).await,
+            MessageType::MeshReady => self.handle_mesh_ready(msg),
             MessageType::Keepalive => { /* tracked above, no further action */ }
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }
         }
         Ok(())
+    }
+
+    /// Record a secondary's `MeshReady` report. The
+    /// `wait_for_mesh_ready` step blocks on this set covering every
+    /// connected secondary before it lets `promote_slurm_primary`
+    /// fire. A stray `MeshReady` after the wait already cleared is
+    /// idempotent — the set just stays full and the message is a
+    /// no-op.
+    pub(super) fn handle_mesh_ready(&mut self, msg: DistributedMessage<I>) {
+        if let DistributedMessage::MeshReady {
+            secondary_id,
+            peer_count,
+            ..
+        } = msg
+        {
+            tracing::debug!(
+                secondary = %secondary_id,
+                peer_count,
+                "secondary reports mesh ready"
+            );
+            self.mesh_ready_secondaries.insert(secondary_id);
+        }
     }
 
     pub(super) fn handle_welcome(&mut self, msg: DistributedMessage<I>) {

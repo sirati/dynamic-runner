@@ -28,6 +28,17 @@ where
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
         let mut oom_interval = tokio::time::interval(Duration::from_millis(100));
 
+        // Tell the primary the peer-mesh has settled so it can release
+        // `PromotePrimary`. For the single-secondary / no-peers case
+        // (`peer_dial_count == 0`) this is the only place the signal
+        // gets emitted — `check_peer_mesh_watchdog` has nothing to do
+        // (no deadline armed) and would never fire MeshReady.
+        // For the multi-secondary case, this is racy with the keepalive
+        // tick's watchdog call: whichever observes a settled state
+        // first wins, the other becomes a no-op via `mesh_ready_sent`.
+        // peer.rs owns the decision; we just call.
+        self.report_mesh_ready_if_needed().await;
+
         // Request tasks only for workers that didn't get initial assignments
         for i in 0..self.pool.workers.len() {
             if self.pool.workers[i].is_idle_state() {
@@ -130,7 +141,7 @@ where
                 _ = keepalive_interval.tick() => {
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
-                    self.check_peer_mesh_watchdog();
+                    self.check_peer_mesh_watchdog().await;
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (`request_backoff` doubles on each
