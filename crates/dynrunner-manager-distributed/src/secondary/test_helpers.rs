@@ -101,6 +101,7 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         src_tmp: None,
         peer_timeout: Duration::from_secs(120),
         keepalive_miss_threshold: 2,
+        retry_max_passes: 1,
     }
 }
 

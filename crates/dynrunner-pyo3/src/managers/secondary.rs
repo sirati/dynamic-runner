@@ -129,6 +129,7 @@ impl PySecondaryCoordinator {
         let dist_connect_retry_delay = self.distributed_config.connect_retry_delay();
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
+        let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
@@ -295,6 +296,7 @@ impl PySecondaryCoordinator {
                     src_tmp: cfg_src_tmp,
                     peer_timeout: dist_peer_timeout,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                    retry_max_passes: dist_retry_max_passes,
                 };
 
                 let mut factory = SubprocessWorkerFactory {

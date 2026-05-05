@@ -164,6 +164,7 @@ async fn secondary_with_real_workers_processes_tasks() {
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
             };
 
             let binaries = vec![
@@ -222,6 +223,7 @@ async fn secondary_multi_worker_processes_tasks() {
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..6)
@@ -286,6 +288,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 src_tmp: None,
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..15)
@@ -376,6 +379,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 src_tmp: Some(src_tmp.clone()),
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
             };
 
             let secondary_id_clone = config.secondary_id.clone();
@@ -597,6 +601,7 @@ async fn peer_mesh_watchdog_fatal_error_sets_exit_and_notifies_primary() {
         src_tmp: None,
         peer_timeout: Duration::from_secs(120),
         keepalive_miss_threshold: 2,
+        retry_max_passes: 1,
     };
     // Concrete `M` is `ChannelManagerEnd` (the helper-shared
     // worker-side endpoint type); see `make_secondary` for the same
