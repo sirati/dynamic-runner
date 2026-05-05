@@ -136,9 +136,19 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
                 _ = heartbeat_tick.tick() => {
                     self.broadcast_primary_keepalive().await;
-                    let report = self.collect_heartbeat_report();
-                    for dead in report.dead {
-                        self.requeue_dead_secondary(dead).await?;
+                    // Demoted observer mode: the promoted SLURM-
+                    // primary owns dead-secondary detection and the
+                    // associated requeue. If the local primary also
+                    // requeued, the same in-flight task would be
+                    // re-dispatched twice (once from each primary's
+                    // pool view) — duplicating work and racing on
+                    // ledger state. We still send keepalives so peers
+                    // know we're alive, but skip the requeue.
+                    if !self.demoted {
+                        let report = self.collect_heartbeat_report();
+                        for dead in report.dead {
+                            self.requeue_dead_secondary(dead).await?;
+                        }
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
@@ -186,6 +196,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// kickstart the re-injected binaries would sit in the pool
     /// forever waiting for a TaskRequest that never comes.
     pub(super) async fn run_retry_passes(&mut self) -> Result<(), String> {
+        // Demoted observer mode: the promoted SLURM-primary owns
+        // retry orchestration. The local primary's `failed_tasks`
+        // set still receives forwarded outcomes (so the run-done
+        // counter check trips when everything is accounted for),
+        // but re-injecting tasks into the local pool and
+        // dispatching them would create the very parallel-dispatch
+        // race demotion is meant to eliminate. See `demoted` doc
+        // on `PrimaryCoordinator`.
+        if self.demoted {
+            return Ok(());
+        }
         for pass_idx in 0..self.config.retry_max_passes {
             if self.failed_tasks.is_empty() {
                 break;
@@ -251,6 +272,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// SLURM-primary relay (which is irrelevant for the
     /// non-promoted-primary at this stage).
     pub(super) async fn dispatch_to_idle_workers(&mut self) -> Result<(), String> {
+        // Demoted observer mode: the promoted SLURM-primary is the
+        // sole authority for dispatch. Returning here covers every
+        // call site (kickstart from handle_task_complete /
+        // handle_task_failed, plus the retry-pass kickstart) without
+        // sprinkling `if !self.demoted` across the message-handling
+        // code. See `demoted` doc on `PrimaryCoordinator`.
+        if self.demoted {
+            return Ok(());
+        }
         for worker_idx in 0..self.workers.len() {
             if !self.workers[worker_idx].is_idle {
                 continue;
@@ -426,6 +456,24 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 new_primary_id: first_id.clone(),
             };
             self.transport.send_to(&first_id, msg).await?;
+
+            // Hand-off complete: the local primary stops being
+            // authoritative the moment `PromotePrimary` is on the
+            // wire. We stay alive (transport open, message loop
+            // still runs) so completion forwards keep
+            // `completed_tasks` accurate for the run-done counter
+            // check in `operational_loop`, but we no longer
+            // dispatch, kickstart, or drive heartbeat-based
+            // requeue — the promoted secondary owns all of that.
+            // Without this, the local primary and the promoted
+            // secondary both act as primaries simultaneously and
+            // their parallel dispatch paths race for the same
+            // workers. See `demoted` doc on `PrimaryCoordinator`.
+            self.demoted = true;
+            tracing::info!(
+                slurm_primary = %first_id,
+                "local primary demoted to observer; promoted secondary is sole authoritative primary"
+            );
         }
         Ok(())
     }
