@@ -552,7 +552,7 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
         task_id: None,
         task_depends_on: vec![],
     };
-    pool.extend(vec![item]);
+    pool.extend(vec![item]).expect("valid extend");
 
     // Pre-cascade: phase-A is Active (no deps, default), phase-B is
     // Blocked (waits for phase-A).

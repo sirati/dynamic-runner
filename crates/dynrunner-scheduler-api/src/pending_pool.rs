@@ -143,13 +143,31 @@ impl<I: Identifier> WorkerView<I> {
     }
 }
 
-/// Errors validation produces at `PendingPool::new`.
+/// Errors produced by `PendingPool::new` (phase-graph validation) and
+/// `PendingPool::extend` (per-task dependency validation).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PendingPoolError {
     #[error("phase dependency cycle detected starting at {0}")]
     DependencyCycle(PhaseId),
     #[error("phase {0} declared as a dependency but not in the phase set")]
     UnknownDependency(PhaseId),
+    /// Two `TaskInfo`s share the same `task_id`. Both already-known
+    /// (in pool / completed / failed) and within-batch collisions
+    /// surface as this variant.
+    #[error("duplicate task_id `{0}` in pool")]
+    DuplicateTaskId(String),
+    /// A task's `task_depends_on` references an id that does not match
+    /// any existing, queued, blocked, completed, or failed task.
+    #[error("task `{referenced_by}` depends on unknown task `{task}`")]
+    UnknownTaskDep {
+        task: String,
+        referenced_by: String,
+    },
+    /// A `task_depends_on` graph cycle was detected on extend. The
+    /// `Vec` is a deterministic walk of the offending cycle (smallest
+    /// task_id first, then DFS).
+    #[error("task dependency cycle: {0:?}")]
+    TaskDepCycle(Vec<String>),
 }
 
 /// Items grouped by `(phase, type, affinity)` plus the phase state
@@ -171,6 +189,41 @@ pub struct PendingPool<I: Identifier> {
     /// the phase makes a fresh trip through the state machine
     /// (which does not happen in the standard lifecycle).
     drained_pending: Vec<PhaseId>,
+
+    // ---- task-level dependency tracking (intra-phase, cross-phase) ----
+    /// `task_id → set of unresolved prereq task_ids`. An empty set is
+    /// never represented here (the entry is removed and the task moves
+    /// from `blocked` into a bucket). Tasks with no `task_id` or
+    /// no `task_depends_on` are not represented at all.
+    task_deps: HashMap<String, HashSet<String>>,
+    /// Items waiting for at least one unresolved prereq. They live
+    /// here instead of in any bucket and are invisible to
+    /// `view_for_worker` / `take_first_match`. On final-prereq
+    /// resolution an item moves to the FRONT of its bucket (matching
+    /// `requeue` semantics).
+    blocked: HashMap<String, TaskInfo<I>>,
+    /// Reverse index: `dep_task_id → list of dependent task_ids`.
+    /// Lets `on_item_finished` and `on_item_failed_permanent` walk
+    /// dependents in O(deps_per_task) instead of an O(N) scan of
+    /// the whole `task_deps` map.
+    dependents_of: HashMap<String, Vec<String>>,
+    /// Task ids the pool has observed completing successfully via
+    /// `on_item_finished(phase, Some(id))`. Used at `extend` time to
+    /// pre-resolve deps already satisfied earlier in the run, and to
+    /// reject duplicate `task_id`s reusing a finished one.
+    completed_tasks: HashSet<String>,
+    /// Task ids the pool has observed failing permanently via
+    /// `on_item_failed_permanent` (or, at extend time, items whose
+    /// `task_depends_on` references an already-failed task — those
+    /// cascade-fail before reaching a bucket). Used by the cascade
+    /// walk and by extend-time validation.
+    failed_tasks: HashSet<String>,
+    /// Per-phase count of items currently sitting in `blocked` (not
+    /// yet dispatched, waiting on unresolved prereqs). Mirrors
+    /// `in_flight_per_phase` so `maybe_transition_drain` correctly
+    /// distinguishes "phase truly empty" from "phase has blocked
+    /// items waiting for unresolved prereqs in another phase".
+    blocked_per_phase: HashMap<PhaseId, u32>,
 }
 
 impl<I: Identifier> PendingPool<I> {
@@ -270,6 +323,12 @@ impl<I: Identifier> PendingPool<I> {
             in_flight_per_phase,
             worker_affinity: HashMap::new(),
             drained_pending: Vec::new(),
+            task_deps: HashMap::new(),
+            blocked: HashMap::new(),
+            dependents_of: HashMap::new(),
+            completed_tasks: HashSet::new(),
+            failed_tasks: HashSet::new(),
+            blocked_per_phase: HashMap::new(),
         })
     }
 
@@ -277,19 +336,264 @@ impl<I: Identifier> PendingPool<I> {
     /// `(phase_id, type_id, affinity_id-or-sentinel)`. Items are
     /// pushed FIFO — caller is responsible for the order it wants
     /// dispatched (typically size-DESC).
-    pub fn extend(&mut self, items: impl IntoIterator<Item = TaskInfo<I>>) {
-        for item in items {
-            let key = (
-                item.phase_id.clone(),
-                item.type_id.clone(),
-                affinity_key(&item),
-            );
+    ///
+    /// Validates `task_id` uniqueness and `task_depends_on`
+    /// well-formedness:
+    /// * `DuplicateTaskId` — a new item's `task_id` collides with
+    ///   another in the same batch, or with an existing
+    ///   queued / blocked / completed / failed task.
+    /// * `UnknownTaskDep` — a `task_depends_on` entry references an id
+    ///   that is not present in the union of (existing pool tasks,
+    ///   batch tasks, completed tasks, failed tasks).
+    /// * `TaskDepCycle` — the union dep graph (existing blocked entries
+    ///   + new batch) contains a cycle.
+    ///
+    /// On error the pool is unchanged (atomic validate-then-commit).
+    /// Items whose every `task_depends_on` entry is already in
+    /// `completed_tasks` are pre-resolved and pushed straight into
+    /// their bucket. Items whose deps include a `failed_tasks` entry
+    /// cascade-fail at extend time: their id is recorded in
+    /// `failed_tasks` and the `TaskInfo` is dropped — same semantics
+    /// as `on_item_failed_permanent`'s cascade.
+    pub fn extend(
+        &mut self,
+        items: impl IntoIterator<Item = TaskInfo<I>>,
+    ) -> Result<(), PendingPoolError> {
+        let new_items: Vec<TaskInfo<I>> = items.into_iter().collect();
+
+        // ---------- 1. Validate duplicate task_ids ----------
+        // Duplicate within batch.
+        let mut seen_in_batch: HashSet<&str> = HashSet::new();
+        for item in &new_items {
+            if let Some(id) = item.task_id.as_deref() {
+                if !seen_in_batch.insert(id) {
+                    return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
+                }
+            }
+        }
+        // Duplicate against existing state.
+        let existing_ids = self.collect_known_task_ids();
+        for item in &new_items {
+            if let Some(id) = item.task_id.as_deref()
+                && existing_ids.contains(id)
+            {
+                return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
+            }
+        }
+
+        // ---------- 2. Validate every dep references a known id ----------
+        // Known = existing pool tasks ∪ batch tasks ∪ completed ∪ failed.
+        let mut known: HashSet<String> = existing_ids;
+        for item in &new_items {
+            if let Some(id) = item.task_id.as_deref() {
+                known.insert(id.to_string());
+            }
+        }
+        for item in &new_items {
+            let referenced_by = match item.task_id.as_deref() {
+                Some(id) => id.to_string(),
+                // Anonymous task with deps: validation still applies, but
+                // we have no id to report; use the path as a best-effort
+                // identifier so the error message is debuggable.
+                None => item.path.display().to_string(),
+            };
+            for dep in &item.task_depends_on {
+                if !known.contains(dep) {
+                    return Err(PendingPoolError::UnknownTaskDep {
+                        task: dep.clone(),
+                        referenced_by,
+                    });
+                }
+            }
+        }
+
+        // ---------- 3. Cycle check (Kahn's on the union graph) ----------
+        // Nodes: union of (existing blocked task_ids, batch task_ids).
+        // Edges: dep → dependent. Already-completed deps are pre-resolved
+        // and excluded; already-failed deps will cascade-fail (no edge).
+        // Within-batch items contribute their full task_depends_on; existing
+        // blocked items contribute their current `task_deps[id]` set
+        // (which already excludes resolved/completed entries by construction).
+        let mut indegree: HashMap<String, usize> = HashMap::new();
+        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        let pre_resolved = |dep: &str| {
+            self.completed_tasks.contains(dep) || self.failed_tasks.contains(dep)
+        };
+        // Existing blocked nodes.
+        for (id, deps) in &self.task_deps {
+            indegree.entry(id.clone()).or_insert(0);
+            for dep in deps {
+                if pre_resolved(dep) {
+                    continue;
+                }
+                *indegree.entry(id.clone()).or_insert(0) += 1;
+                children_of
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(id.clone());
+                indegree.entry(dep.clone()).or_insert(0);
+            }
+        }
+        // New batch nodes.
+        for item in &new_items {
+            let id = match item.task_id.as_deref() {
+                Some(s) => s.to_string(),
+                None => continue, // anonymous tasks aren't graph nodes
+            };
+            indegree.entry(id.clone()).or_insert(0);
+            for dep in &item.task_depends_on {
+                if pre_resolved(dep) {
+                    continue;
+                }
+                *indegree.entry(id.clone()).or_insert(0) += 1;
+                children_of
+                    .entry(dep.clone())
+                    .or_default()
+                    .push(id.clone());
+                indegree.entry(dep.clone()).or_insert(0);
+            }
+        }
+        // Kahn's: drain zero-indegree, decrement children, count.
+        let mut queue: VecDeque<String> = indegree
+            .iter()
+            .filter_map(|(id, &d)| if d == 0 { Some(id.clone()) } else { None })
+            .collect();
+        // Deterministic order: lowest id first.
+        let mut queue_vec: Vec<String> = queue.drain(..).collect();
+        queue_vec.sort();
+        queue.extend(queue_vec);
+        let mut visited = 0usize;
+        let mut residual = indegree.clone();
+        while let Some(p) = queue.pop_front() {
+            visited += 1;
+            if let Some(children) = children_of.get(&p) {
+                let mut newly_zero = Vec::new();
+                for child in children {
+                    let entry = residual.get_mut(child).expect("child in indegree map");
+                    *entry -= 1;
+                    if *entry == 0 {
+                        newly_zero.push(child.clone());
+                    }
+                }
+                newly_zero.sort();
+                queue.extend(newly_zero);
+            }
+        }
+        if visited != residual.len() {
+            // Pick the lowest-id node with non-zero residual indegree as
+            // the cycle start; report the SCC walk reachable from it.
+            let mut start: Vec<String> = residual
+                .iter()
+                .filter_map(|(id, &d)| if d != 0 { Some(id.clone()) } else { None })
+                .collect();
+            start.sort();
+            let mut cycle_walk: Vec<String> = Vec::new();
+            let mut visited_walk: HashSet<String> = HashSet::new();
+            if let Some(first) = start.first() {
+                let mut cur = first.clone();
+                while visited_walk.insert(cur.clone()) {
+                    cycle_walk.push(cur.clone());
+                    let next = children_of
+                        .get(&cur)
+                        .and_then(|cs| {
+                            // Pick the smallest still-unresolved child to
+                            // make the walk deterministic.
+                            cs.iter()
+                                .filter(|c| residual.get(*c).copied().unwrap_or(0) != 0)
+                                .min()
+                                .cloned()
+                        });
+                    match next {
+                        Some(n) => cur = n,
+                        None => break,
+                    }
+                }
+            }
+            return Err(PendingPoolError::TaskDepCycle(cycle_walk));
+        }
+
+        // ---------- 4. Commit: insert each item into bucket OR blocked ----------
+        for item in new_items {
+            self.commit_item(item);
+        }
+        Ok(())
+    }
+
+    /// Commit one validated item: pre-resolve `task_depends_on` against
+    /// `completed_tasks` / `failed_tasks`; route to bucket, blocked,
+    /// or cascaded-fail accordingly.
+    fn commit_item(&mut self, item: TaskInfo<I>) {
+        // Cascade-fail at extend time: if any prereq is already in
+        // `failed_tasks`, this item is itself a cascaded failure.
+        let any_failed_dep = item
+            .task_depends_on
+            .iter()
+            .any(|d| self.failed_tasks.contains(d));
+        if any_failed_dep {
+            if let Some(id) = item.task_id.as_deref() {
+                self.failed_tasks.insert(id.to_string());
+            }
+            // Drop the TaskInfo — extend-time cascade does not surface
+            // it (the consumer hasn't given us a place to land it
+            // because it specified a hard prereq that's already failed).
+            return;
+        }
+
+        // Compute unresolved prereqs (ones not yet in `completed_tasks`).
+        let unresolved: HashSet<String> = item
+            .task_depends_on
+            .iter()
+            .filter(|d| !self.completed_tasks.contains(d.as_str()))
+            .cloned()
+            .collect();
+
+        let task_id = item.task_id.clone();
+        let phase_id = item.phase_id.clone();
+        if unresolved.is_empty() || task_id.is_none() {
+            // Ready (or anonymous): straight into the bucket.
+            let key = (phase_id, item.type_id.clone(), affinity_key(&item));
             self.buckets
                 .entry(key)
                 .or_insert_with(Bucket::new)
                 .items
                 .push_back(item);
+            return;
         }
+        // Blocked: register in the dep maps and counters, NOT in any bucket.
+        let id = task_id.expect("checked above");
+        for dep in &unresolved {
+            self.dependents_of
+                .entry(dep.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        self.task_deps.insert(id.clone(), unresolved);
+        *self.blocked_per_phase.entry(phase_id).or_insert(0) += 1;
+        self.blocked.insert(id, item);
+    }
+
+    /// Return the union of every task_id the pool currently knows
+    /// about (queued in any bucket, blocked waiting on prereqs,
+    /// completed, or failed). Used by `extend`'s duplicate-id check.
+    fn collect_known_task_ids(&self) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        for bucket in self.buckets.values() {
+            for item in &bucket.items {
+                if let Some(id) = item.task_id.as_deref() {
+                    out.insert(id.to_string());
+                }
+            }
+        }
+        for id in self.blocked.keys() {
+            out.insert(id.clone());
+        }
+        for id in &self.completed_tasks {
+            out.insert(id.clone());
+        }
+        for id in &self.failed_tasks {
+            out.insert(id.clone());
+        }
+        out
     }
 
     /// Return the next item this worker should process, or `None`.
@@ -514,14 +818,152 @@ impl<I: Identifier> PendingPool<I> {
     }
 
 
-    /// Notify the pool that an item finished (success or failure).
-    /// Decrements in-flight count; may transition the phase
-    /// `Draining → Drained` (queued for `poll_drain_transitions`).
-    pub fn on_item_finished(&mut self, phase_id: &PhaseId) {
+    /// Notify the pool that an item completed successfully (or that
+    /// the caller wants the in-flight count decremented without
+    /// recording a per-task completion — pass `task_id = None`).
+    ///
+    /// * Decrements `in_flight_per_phase` and may transition the phase
+    ///   `Draining → Drained`.
+    /// * If `task_id` is `Some(id)`: marks that task as completed and
+    ///   walks `dependents_of[id]`. Any dependent whose final
+    ///   unresolved prereq this resolves moves from `blocked` to the
+    ///   FRONT of its bucket (matching `requeue` semantics so freshly
+    ///   unblocked tasks dispatch ahead of newly-extended items in the
+    ///   same bucket). Dependent phases that had been `Draining` due
+    ///   to all queued items being blocked elsewhere flip back to
+    ///   `Active`.
+    ///
+    /// Pass `None` for transient failures (Recoverable retry pending):
+    /// the in-flight count drops so the phase machine progresses, but
+    /// no per-task completion is recorded — dependents stay blocked
+    /// until either a successful retry calls this method with
+    /// `Some(id)` or a permanent-fail cascade is invoked via
+    /// `on_item_failed_permanent`.
+    pub fn on_item_finished(&mut self, phase_id: &PhaseId, task_id: Option<&str>) {
         if let Some(c) = self.in_flight_per_phase.get_mut(phase_id) {
             *c = c.saturating_sub(1);
         }
+        if let Some(id) = task_id {
+            self.completed_tasks.insert(id.to_string());
+            // Walk dependents and possibly unblock them. Collect ids
+            // first to avoid borrowing `self.dependents_of` while we
+            // mutate `self.blocked` / `self.task_deps`.
+            let dependents = self
+                .dependents_of
+                .remove(id)
+                .unwrap_or_default();
+            for dep_id in dependents {
+                let still_blocked = if let Some(remaining) =
+                    self.task_deps.get_mut(&dep_id)
+                {
+                    remaining.remove(id);
+                    !remaining.is_empty()
+                } else {
+                    // Already unblocked / not present — defensive no-op.
+                    continue;
+                };
+                if still_blocked {
+                    continue;
+                }
+                self.task_deps.remove(&dep_id);
+                let item = match self.blocked.remove(&dep_id) {
+                    Some(it) => it,
+                    None => continue,
+                };
+                let dep_phase = item.phase_id.clone();
+                if let Some(c) = self.blocked_per_phase.get_mut(&dep_phase) {
+                    *c = c.saturating_sub(1);
+                }
+                let key = (
+                    item.phase_id.clone(),
+                    item.type_id.clone(),
+                    affinity_key(&item),
+                );
+                self.buckets
+                    .entry(key)
+                    .or_insert_with(Bucket::new)
+                    .items
+                    .push_front(item);
+                // Unblocking grew this phase's queue: if it was
+                // `Draining` only because everything was blocked, flip
+                // it back to `Active`. Mirrors `requeue` behaviour.
+                if self.phase_state.get(&dep_phase) == Some(&PhaseState::Draining) {
+                    self.phase_state.insert(dep_phase.clone(), PhaseState::Active);
+                }
+                // A drained-pending entry for this phase is now stale —
+                // the phase is no longer drained.
+                self.drained_pending.retain(|p| p != &dep_phase);
+            }
+        }
         self.maybe_transition_drain(phase_id);
+    }
+
+    /// Notify the pool that a task has terminated PERMANENTLY (e.g.
+    /// retry budget exhausted or a NonRecoverable error). Cascades
+    /// the failure to every transitive dependent so dependents that
+    /// can never succeed do not sit in `blocked` forever.
+    ///
+    /// Returns the `TaskInfo` of every cascaded dependent so the
+    /// caller can update its own per-task ledgers (failed-tasks set,
+    /// metrics, observability hooks). The caller's own task whose
+    /// failure triggered this is NOT in the returned vec — it has
+    /// already been removed from in-flight via the normal task-event
+    /// path; this method just records its id and walks the cascade.
+    ///
+    /// Side effects:
+    /// * `task_id` and every cascaded dependent id are added to
+    ///   `failed_tasks`.
+    /// * `in_flight_per_phase[phase_id]` is decremented by one (the
+    ///   originating task was in-flight).
+    /// * Cascaded dependents are removed from `blocked` and their
+    ///   `blocked_per_phase` entries decremented.
+    /// * Drain transitions fire for every phase whose blocked-set
+    ///   was reduced (the originating phase plus every distinct
+    ///   cascaded phase).
+    pub fn on_item_failed_permanent(
+        &mut self,
+        phase_id: &PhaseId,
+        task_id: &str,
+    ) -> Vec<TaskInfo<I>> {
+        if let Some(c) = self.in_flight_per_phase.get_mut(phase_id) {
+            *c = c.saturating_sub(1);
+        }
+        self.failed_tasks.insert(task_id.to_string());
+
+        let mut cascaded: Vec<TaskInfo<I>> = Vec::new();
+        let mut affected_phases: HashSet<PhaseId> = HashSet::new();
+        affected_phases.insert(phase_id.clone());
+
+        // BFS over `dependents_of`. Every dependent we reach is
+        // unreachable for any successful path — it cannot satisfy its
+        // dep on a permanently-failed prereq. Cascade-fail it.
+        let mut frontier: VecDeque<String> = VecDeque::new();
+        frontier.push_back(task_id.to_string());
+        while let Some(failed_id) = frontier.pop_front() {
+            let dependents = self.dependents_of.remove(&failed_id).unwrap_or_default();
+            for dep_id in dependents {
+                if !self.failed_tasks.insert(dep_id.clone()) {
+                    // Already cascaded via a different path — its
+                    // blocked entry is gone too; skip.
+                    continue;
+                }
+                self.task_deps.remove(&dep_id);
+                if let Some(item) = self.blocked.remove(&dep_id) {
+                    let dep_phase = item.phase_id.clone();
+                    if let Some(c) = self.blocked_per_phase.get_mut(&dep_phase) {
+                        *c = c.saturating_sub(1);
+                    }
+                    affected_phases.insert(dep_phase);
+                    cascaded.push(item);
+                }
+                frontier.push_back(dep_id);
+            }
+        }
+
+        for ph in &affected_phases {
+            self.maybe_transition_drain(ph);
+        }
+        cascaded
     }
 
     /// Notify the pool that a task has been dispatched outside the
@@ -686,7 +1128,10 @@ impl<I: Identifier> PendingPool<I> {
             .any(|s| matches!(s, PhaseState::Active | PhaseState::Draining))
     }
 
-    /// Total items remaining: queued + in-flight, all phases.
+    /// Total items remaining: queued + in-flight + blocked, all phases.
+    /// Blocked items are part of the run's outstanding work even though
+    /// they're not in any bucket — they will become queued once their
+    /// task-level prereqs resolve.
     pub fn len(&self) -> usize {
         let queued: usize = self.buckets.values().map(|b| b.items.len()).sum();
         let in_flight: usize = self
@@ -694,7 +1139,8 @@ impl<I: Identifier> PendingPool<I> {
             .values()
             .map(|c| *c as usize)
             .sum();
-        queued + in_flight
+        let blocked: usize = self.blocked.len();
+        queued + in_flight + blocked
     }
 
     /// True iff `len() == 0`.
@@ -913,6 +1359,13 @@ impl<I: Identifier> PendingPool<I> {
     /// Inspect a phase to decide if it should transition between
     /// `Active`, `Draining`, and `Drained`. Idempotent — safe to call
     /// from anywhere a relevant counter changed.
+    ///
+    /// A phase is `Drained` only when ALL three of `queued`,
+    /// `in_flight`, AND `blocked_per_phase` are zero — a non-zero
+    /// blocked count means the phase still has items waiting on
+    /// unresolved task-level prereqs (typically in another phase) and
+    /// must not be considered done. `Draining` covers the case where
+    /// the queue is empty but in-flight or blocked items remain.
     fn maybe_transition_drain(&mut self, phase_id: &PhaseId) {
         let current = match self.phase_state.get(phase_id).copied() {
             Some(s) => s,
@@ -924,11 +1377,16 @@ impl<I: Identifier> PendingPool<I> {
         }
         let queued = self.queued_count(phase_id);
         let in_flight = self.in_flight(phase_id);
+        let blocked = self
+            .blocked_per_phase
+            .get(phase_id)
+            .copied()
+            .unwrap_or(0);
 
-        let next = match (queued, in_flight) {
-            (0, 0) => PhaseState::Drained,
-            (0, _) => PhaseState::Draining,
-            (_, _) => PhaseState::Active,
+        let next = match (queued, in_flight, blocked) {
+            (0, 0, 0) => PhaseState::Drained,
+            (0, _, _) => PhaseState::Draining,
+            (_, _, _) => PhaseState::Active,
         };
         if next != current {
             self.phase_state.insert(phase_id.clone(), next);

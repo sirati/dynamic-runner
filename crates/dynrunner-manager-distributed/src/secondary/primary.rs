@@ -112,7 +112,14 @@ where
 
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
-                p.extend(items);
+                if let Err(e) = p.extend(items) {
+                    tracing::error!(
+                        error = %e,
+                        "post-promotion: invalid task graph in FullTaskList; primary will start with no pending tasks"
+                    );
+                    self.primary_pending = None;
+                    return;
+                }
                 // The cluster's already-completed items were filtered
                 // out before `extend`, so a phase whose ONLY items
                 // pre-completed shows up as Active-but-empty here.
@@ -195,8 +202,8 @@ where
     /// the next phase's items would sit in the pool with the phase
     /// still `Blocked`.
     pub(super) fn note_primary_item_completed(&mut self, file_hash: &str) {
-        let phase_id = match self.primary_in_flight.remove(file_hash) {
-            Some(item) => item.phase_id,
+        let (phase_id, task_id) = match self.primary_in_flight.remove(file_hash) {
+            Some(item) => (item.phase_id, item.binary.task_id),
             None => return,
         };
         // Symmetric with retry: a successful completion supersedes any
@@ -209,7 +216,7 @@ where
         // `failed_tasks.remove` in `handle_task_complete`.
         self.primary_failed.remove(file_hash);
         if let Some(pool) = self.primary_pending.as_mut() {
-            pool.on_item_finished(&phase_id);
+            pool.on_item_finished(&phase_id, task_id.as_deref());
             cascade_drain_done(pool);
         }
     }
@@ -246,6 +253,7 @@ where
             None => return,
         };
         let phase_id = item.phase_id.clone();
+        let task_id = item.binary.task_id.clone();
         if error_type == "Recoverable" {
             // Stash for the retry pass. Idempotent — the same hash
             // appearing twice (e.g. after re-injection fails again)
@@ -254,7 +262,7 @@ where
                 .insert(file_hash.to_string(), item.binary);
         }
         if let Some(pool) = self.primary_pending.as_mut() {
-            pool.on_item_finished(&phase_id);
+            pool.on_item_finished(&phase_id, task_id.as_deref());
             cascade_drain_done(pool);
         }
     }

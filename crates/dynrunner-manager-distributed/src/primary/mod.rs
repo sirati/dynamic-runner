@@ -570,7 +570,9 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         sorted.sort_by_key(|b| std::cmp::Reverse(b.size));
         self.all_binaries = sorted.clone();
         self.total_tasks = sorted.len();
-        self.pool_mut().extend(sorted);
+        self.pool_mut()
+            .extend(sorted)
+            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))?;
 
         let total = self.total_tasks;
         tracing::info!(total, num_secondaries = self.config.num_secondaries, "primary starting");
@@ -714,16 +716,39 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// and the failover path: increments per-phase counters and runs
     /// the lifecycle cascade. Decoupled so the call sites stay focused
     /// on their wire-message logic.
-    pub(super) fn note_item_completed(&mut self, phase_id: &PhaseId) {
+    ///
+    /// `task_id` carries the per-task identifier so the pool can resolve
+    /// `task_depends_on` edges. Pass `Some(id)` for successful
+    /// completions; transient failures should call `note_item_failed`
+    /// instead (which suppresses the dep-resolution side-effect).
+    pub(super) fn note_item_completed(
+        &mut self,
+        phase_id: &PhaseId,
+        task_id: Option<&str>,
+    ) {
         *self.phase_completed.entry(phase_id.clone()).or_insert(0) += 1;
-        self.pool_mut().on_item_finished(phase_id);
+        self.pool_mut().on_item_finished(phase_id, task_id);
         self.process_phase_lifecycle();
     }
 
     /// Per-failure bookkeeping. Same shape as `note_item_completed`.
-    pub(super) fn note_item_failed(&mut self, phase_id: &PhaseId) {
+    ///
+    /// `task_id` is accepted for symmetry with the success path but is
+    /// NOT forwarded to the pool's per-task completion ledger:
+    /// recoverable failures land in `failed_tasks` and may be
+    /// reinjected on a later retry pass, so dependents must remain
+    /// blocked until the task either succeeds (→ `note_item_completed`
+    /// with `Some(id)`) or is declared permanently failed
+    /// (→ `pool.on_item_failed_permanent`, owned by the retry-budget
+    /// exhaustion path). Param kept so future callers can route via a
+    /// uniform helper without a signature change.
+    pub(super) fn note_item_failed(
+        &mut self,
+        phase_id: &PhaseId,
+        _task_id: Option<&str>,
+    ) {
         *self.phase_failed.entry(phase_id.clone()).or_insert(0) += 1;
-        self.pool_mut().on_item_finished(phase_id);
+        self.pool_mut().on_item_finished(phase_id, None);
         self.process_phase_lifecycle();
     }
 }

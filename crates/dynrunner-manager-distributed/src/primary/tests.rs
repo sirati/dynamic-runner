@@ -1998,7 +1998,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
         )
         .expect("default-phase pool");
         let bin = make_binary("solo", 50);
-        pool.extend([bin.clone()]);
+        pool.extend([bin.clone()]).expect("valid extend");
         primary.pending = Some(pool);
         primary.phase_completed.insert(phase.clone(), 0);
         primary.phase_failed.insert(phase, 0);

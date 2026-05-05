@@ -234,7 +234,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // (deferred when the item lands in a side queue; see
         // `LocalManager::process_drain_transitions`).
         if let Some(b) = binary {
-            self.record_phase_completion(&b.phase_id, result.success);
+            self.record_phase_completion(&b.phase_id, result.success, b.task_id.as_deref());
         }
         if result.success {
             self.stats.completed += 1;

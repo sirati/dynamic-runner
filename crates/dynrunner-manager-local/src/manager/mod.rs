@@ -241,7 +241,9 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let pool = PendingPool::new(phase_ids, phase_deps)
             .map_err(|e| e.to_string())?;
         self.pending = Some(pool);
-        self.pool_mut().extend(binaries);
+        self.pool_mut()
+            .extend(binaries)
+            .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))?;
 
         // Fire on_phase_start for any phase that started life Active.
         self.fire_on_phase_start_for_newly_active();
@@ -314,7 +316,20 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     /// `process_drain_transitions` call inside the worker loop (which
     /// runs immediately after every task event) and the final flush
     /// at end-of-run.
-    pub(super) fn record_phase_completion(&mut self, phase_id: &PhaseId, success: bool) {
+    ///
+    /// `task_id` carries the per-task identifier so the pool can resolve
+    /// `task_depends_on` edges; pass `None` for transient/recoverable
+    /// failures (the binary will be reinjected later — dependents must
+    /// not unblock yet) and `Some(id)` for successful completions. The
+    /// permanent-failure cascade is owned by the retry-budget exhaustion
+    /// path, which calls `on_item_failed_permanent` directly rather
+    /// than going through this helper.
+    pub(super) fn record_phase_completion(
+        &mut self,
+        phase_id: &PhaseId,
+        success: bool,
+        task_id: Option<&str>,
+    ) {
         let entry = self.phase_completion_counts.entry(phase_id.clone()).or_insert((0, 0));
         if success {
             entry.0 += 1;
@@ -322,7 +337,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             entry.1 += 1;
         }
         if let Some(pool) = self.pending.as_mut() {
-            pool.on_item_finished(phase_id);
+            // Only forward the task_id on success — recording a per-task
+            // completion against a not-yet-permanently-failed task
+            // would prematurely unblock its dependents.
+            let id_for_pool = if success { task_id } else { None };
+            pool.on_item_finished(phase_id, id_for_pool);
         }
     }
 

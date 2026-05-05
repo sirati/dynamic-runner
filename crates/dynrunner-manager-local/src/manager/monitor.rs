@@ -130,7 +130,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         // This happens even during OOM phase (matching Python).
                         // Mark the task finished from the pool's perspective so
                         // its phase can drain; bump the failed counter.
-                        self.record_phase_completion(&binary.phase_id, false);
+                        self.record_phase_completion(
+                            &binary.phase_id,
+                            false,
+                            binary.task_id.as_deref(),
+                        );
                         self.resource_pressure_tasks.push(FailedTask {
                             binary,
                             error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
@@ -150,7 +154,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         // Python's behavior where _handle_oom_killed_task is
                         // skipped. The task was in-flight; finalise it so the
                         // phase can drain.
-                        self.record_phase_completion(&binary.phase_id, false);
+                        self.record_phase_completion(
+                            &binary.phase_id,
+                            false,
+                            binary.task_id.as_deref(),
+                        );
                     }
                 }
             }
