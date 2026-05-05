@@ -132,6 +132,15 @@ pub(super) async fn fake_secondary(
 /// the round-trip through `handle_cert_exchange` →
 /// `SecondaryConnectionState` → `peer_setup` is the load-bearing path
 /// to pin.
+///
+/// Also stands in for the secondary-side SLURM-primary post-handoff:
+/// the real local primary now demotes itself the moment it sends
+/// `PromotePrimary` and stops dispatching, so the fake — when promoted
+/// via `PromotePrimary { new_primary_id == self }` — drains the
+/// `FullTaskList.pending_tasks` payload by emitting `TaskComplete` for
+/// each entry. Without that drain, tests that rely on more binaries
+/// than fit in the initial assignment would hang waiting for
+/// completions that no longer come from the local primary.
 pub(super) async fn fake_secondary_with_addrs(
     secondary_id: String,
     num_workers: u32,
@@ -182,39 +191,92 @@ pub(super) async fn fake_secondary_with_addrs(
         })
         .unwrap();
 
+    // Track whether this fake is the secondary-side SLURM-primary
+    // (set by `PromotePrimary` if `new_primary_id` matches our id).
+    // Only the SLURM-primary drains the post-handoff `pending_tasks`
+    // list from `FullTaskList`; non-promoted secondaries ignore it
+    // (in production they only consult their cache for failover).
+    let mut is_slurm_primary = false;
     while let Some(msg) = incoming_from_primary.recv().await {
         match msg {
             DistributedMessage::PeerInfo { .. } => {}
-            DistributedMessage::InitialAssignment { zip_files, .. } => {
-                for zip_file in &zip_files {
-                    for entry in &zip_file.binaries {
+            DistributedMessage::PromotePrimary { new_primary_id, .. } => {
+                if new_primary_id == secondary_id {
+                    is_slurm_primary = true;
+                }
+            }
+            DistributedMessage::InitialAssignment {
+                zip_files,
+                workers_ready,
+                ..
+            } => {
+                // Pair each binary with the worker that the primary's
+                // `assign_initial` placed it on. `workers_ready[i]`
+                // and `zip_files[0].binaries[i]` are positionally
+                // aligned in `perform_initial_assignment`. Without
+                // this pairing every TaskComplete would carry
+                // `worker_id=0`, which after demotion is no longer
+                // self-healed by the heartbeat-driven requeue and
+                // leaves later workers permanently mid-dispatch.
+                let entries: Vec<_> = zip_files
+                    .iter()
+                    .flat_map(|zf| zf.binaries.iter())
+                    .collect();
+                for (idx, entry) in entries.iter().enumerate() {
+                    let worker_id = workers_ready
+                        .get(idx)
+                        .map(|w| w.worker_id)
+                        .unwrap_or(0);
+                    outgoing_to_primary
+                        .send(DistributedMessage::TaskComplete {
+                            sender_id: secondary_id.clone(),
+                            timestamp: 0.0,
+                            secondary_id: secondary_id.clone(),
+                            worker_id,
+                            task_hash: entry.hash.clone(),
+                            result_data: None,
+                        })
+                        .unwrap();
+
+                    outgoing_to_primary
+                        .send(DistributedMessage::TaskRequest {
+                            sender_id: secondary_id.clone(),
+                            timestamp: 0.0,
+                            secondary_id: secondary_id.clone(),
+                            worker_id,
+                            available_resources: vec![dynrunner_core::ResourceAmount {
+                                kind: dynrunner_core::ResourceKind::memory(),
+                                amount: ram_bytes,
+                            }],
+                        })
+                        .unwrap();
+                }
+            }
+            DistributedMessage::TransferComplete { .. } => {}
+            // Stand in for the secondary-side SLURM-primary: when
+            // the real primary broadcasts `FullTaskList`, every task
+            // that wasn't already in-flight (`pending_tasks`) is the
+            // SLURM-primary's responsibility. The real
+            // SecondaryCoordinator drains those via its
+            // `slurm_pending` self-dispatch path; the fake
+            // short-circuits and emits TaskComplete for each so the
+            // counter-check exit can fire.
+            DistributedMessage::FullTaskList { pending_tasks, .. } => {
+                if is_slurm_primary {
+                    for task_hash in pending_tasks {
                         outgoing_to_primary
                             .send(DistributedMessage::TaskComplete {
                                 sender_id: secondary_id.clone(),
                                 timestamp: 0.0,
                                 secondary_id: secondary_id.clone(),
                                 worker_id: 0,
-                                task_hash: entry.hash.clone(),
+                                task_hash,
                                 result_data: None,
-                            })
-                            .unwrap();
-
-                        outgoing_to_primary
-                            .send(DistributedMessage::TaskRequest {
-                                sender_id: secondary_id.clone(),
-                                timestamp: 0.0,
-                                secondary_id: secondary_id.clone(),
-                                worker_id: 0,
-                                available_resources: vec![dynrunner_core::ResourceAmount {
-                                    kind: dynrunner_core::ResourceKind::memory(),
-                                    amount: ram_bytes,
-                                }],
                             })
                             .unwrap();
                     }
                 }
             }
-            DistributedMessage::TransferComplete { .. } => {}
             DistributedMessage::TaskAssignment { file_hash, .. } => {
                 outgoing_to_primary
                     .send(DistributedMessage::TaskComplete {
