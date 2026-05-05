@@ -287,6 +287,7 @@ echo ""
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --pull=never \
     --network host \
+    --pids-limit=16384 \
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
@@ -309,6 +310,7 @@ echo ""
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
     --pull=never \
     --network host \
+    --pids-limit=16384 \
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \

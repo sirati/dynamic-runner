@@ -190,10 +190,12 @@ def test_wrapper_omits_extra_run_args_when_default(
     reverse_connection: bool,
 ) -> None:
     """With the default ``extra_run_args=()`` the rendered wrapper
-    must not gain any extra flags between the env/volume block and
-    the image-tag argument. Exact-string check on a few flag tokens
-    we know consumers use as the canonical examples; their absence
-    proves the empty-tuple path is a true no-op."""
+    must not inject any *consumer*-supplied flags between the
+    env/volume block and the image-tag argument. ``--pids-limit`` is
+    NOT probed here — it became a framework default (see
+    :func:`test_wrapper_emits_default_pids_limit`); ``--ulimit``,
+    ``--cap-add``, and ``--shm-size`` remain pure consumer-side and
+    must be absent on the empty-tuple path."""
     manager = _build_manager(tmp_path, extra_run_args=())
     wrapper = manager.generate_wrapper_script(
         image_metadata=image_metadata,
@@ -206,13 +208,79 @@ def test_wrapper_omits_extra_run_args_when_default(
     invocations = _extract_podman_run_invocations(wrapper)
     assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
     for inv in invocations:
-        assert "--pids-limit" not in inv, (
-            "default `extra_run_args=()` must not inject any flags into the "
-            "podman-run line; found `--pids-limit` in:\n" + inv
+        for consumer_only_flag in ("--ulimit", "--cap-add", "--shm-size"):
+            assert consumer_only_flag not in inv, (
+                f"default `extra_run_args=()` must not inject {consumer_only_flag!r} "
+                f"into the podman-run line; found in:\n" + inv
+            )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_emits_default_pids_limit(
+    tmp_path: Path,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """Every rendered ``podman run`` invocation must carry the
+    framework default ``--pids-limit=16384``, with or without
+    consumer-supplied ``extra_run_args``. Rationale: podman rootless
+    defaults to 2048 PIDs, which is too tight for both compile-heavy
+    fanout (autotools + parallel gcc/clang) and JVM-heavy workloads
+    (Ghidra spawns native threads counted against ``pids.max``). Both
+    consumer teams hit this; making it the framework default saves
+    every consumer from rediscovering it. Override path is documented
+    on ``TaskDeploymentSpec.extra_run_args``."""
+    manager = _build_manager(tmp_path, extra_run_args=())
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    invocations = _extract_podman_run_invocations(wrapper)
+    assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
+    for i, inv in enumerate(invocations):
+        assert "--pids-limit=16384" in inv, (
+            f"`podman run` invocation #{i} is missing the framework default "
+            "`--pids-limit=16384` flag. Invocation:\n" + inv
         )
-        assert "--ulimit" not in inv, (
-            "default `extra_run_args=()` must not inject any flags into the "
-            "podman-run line; found `--ulimit` in:\n" + inv
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_consumer_pids_limit_overrides_default(
+    tmp_path: Path,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """A consumer that supplies ``--pids-limit=N`` via
+    ``extra_run_args`` gets BOTH the framework default
+    ``--pids-limit=16384`` AND their own value rendered into the
+    invocation. podman applies the LAST occurrence of a flag, so the
+    consumer's entry wins. The test asserts both appear and the
+    consumer's value lands AFTER the default — the order podman uses
+    to pick the effective value."""
+    consumer_value = "--pids-limit=65536"
+    manager = _build_manager(tmp_path, extra_run_args=(consumer_value,))
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    invocations = _extract_podman_run_invocations(wrapper)
+    assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
+    for i, inv in enumerate(invocations):
+        default_idx = inv.index("--pids-limit=16384")
+        consumer_idx = inv.index(consumer_value)
+        assert default_idx < consumer_idx, (
+            f"`podman run` invocation #{i}: consumer-supplied {consumer_value!r} "
+            "must appear AFTER the framework default `--pids-limit=16384` so "
+            "podman's last-wins parsing applies the consumer's value. "
+            "Invocation:\n" + inv
         )
 
 
@@ -227,14 +295,11 @@ def test_wrapper_injects_extra_run_args_before_image_tag(
     ``{image_name}:{image_tag}`` argument and AFTER the framework's
     own flags. Both connection branches receive the same injection.
 
-    The pids-limit case is the dataset peer's concrete trigger:
-    Krater rootless podman defaults to 2048 PIDs, which a 64-way
-    autotools fanout (nmap-style builds) blows through during
-    parallel ``./configure`` + sub-``make`` spawn storms. The
-    framework can't auto-derive this from system probe (it's a
-    workload property, not a host property), so the consumer is
-    the right party to supply it."""
-    extra = ("--pids-limit=16384", "--ulimit=nofile=65536")
+    Uses ``--ulimit`` and ``--shm-size`` as the canonical
+    consumer-only flags (``--pids-limit`` is now a framework default;
+    its override-and-last-wins behaviour is exercised by
+    :func:`test_wrapper_consumer_pids_limit_overrides_default`)."""
+    extra = ("--ulimit=nofile=65536", "--shm-size=2g")
     manager = _build_manager(tmp_path, extra_run_args=extra)
     wrapper = manager.generate_wrapper_script(
         image_metadata=image_metadata,
