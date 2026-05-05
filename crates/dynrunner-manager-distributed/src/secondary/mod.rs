@@ -249,6 +249,19 @@ where
     // is routed to that peer via `peer_transport`). Cleared whenever a
     // live primary message arrives.
     slurm_primary_peer_id: Option<String>,
+
+    /// Set by handlers that detect an unrecoverable local fault (peer
+    /// mesh fully failed to form, etc.). The main `process_tasks`
+    /// loop checks this once per iteration AFTER the deferred-message
+    /// flush; if `Some`, the loop returns `Err(reason)` and the
+    /// secondary's `run()` propagates that out so the process exits
+    /// non-zero.
+    ///
+    /// One-concern wiring: handlers (e.g. the peer-mesh watchdog)
+    /// only WRITE this; the main loop only READS. Avoids `break`
+    /// from inside a sub-handler — every flag-setter stays cancel-
+    /// safe and the loop owns its own exit condition.
+    pub(super) fatal_exit: Option<String>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -301,6 +314,7 @@ where
             slurm_primary_peer_id: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
+            fatal_exit: None,
         }
     }
 

@@ -130,7 +130,7 @@ where
                 _ = keepalive_interval.tick() => {
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
-                    self.check_peer_mesh_watchdog();
+                    self.check_peer_mesh_watchdog().await;
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (`request_backoff` doubles on each
@@ -161,6 +161,20 @@ where
             // Flush any deferred peer messages
             for (peer_id, msg) in std::mem::take(&mut self.pending_peer_messages) {
                 let _ = self.peer_transport.send_to_peer(&peer_id, msg).await;
+            }
+
+            // Hard-error exit path: a sub-handler (e.g. the peer-mesh
+            // watchdog) detected an unrecoverable fault, queued the
+            // notification to the primary, and asked us to exit. The
+            // notification is already on the wire by this point (the
+            // handler awaited the send before setting the flag); we
+            // just need to break out of the loop with the reason as
+            // the Err so `run()` propagates it and the process exits
+            // non-zero. Loop owns its own exit; sub-handlers never
+            // call `break` directly.
+            if let Some(reason) = self.fatal_exit.take() {
+                tracing::error!(reason = %reason, "secondary exiting with fatal error");
+                return Err(reason);
             }
 
             // Restart any workers that disconnected

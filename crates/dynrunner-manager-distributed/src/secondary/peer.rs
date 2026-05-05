@@ -182,27 +182,39 @@ where
         }
     }
 
-    /// One-shot diagnostic: 30s after `connect_to_peers` fired, log
-    /// once if the cluster blocks peer-direct connectivity (every
-    /// dial timed out / refused). Without the explicit signal,
-    /// operators have to scan the per-peer dial-failure lines and
-    /// count to realise the secondary has degraded to primary-only
-    /// dispatch — a trap tokenizer hit on cohort 4. Self-healing if
-    /// the mesh forms before the deadline (`peer_count() > 0`
-    /// suppresses the WARN) or partially forms after the deadline
-    /// (any incoming peer connection clears `peer_mesh_check_at`,
-    /// no degraded log).
+    /// One-shot watchdog: 30s after `connect_to_peers` fired with a
+    /// non-empty peer list, declare full mesh failure if zero peers
+    /// connected. Self-healing if the mesh forms before the deadline
+    /// (`peer_count() > 0` suppresses the fault) or partially forms
+    /// after the deadline (any incoming peer connection clears
+    /// `peer_mesh_check_at`, no fault).
+    ///
+    /// On a confirmed full-mesh failure this is HARD ERROR: the
+    /// framework relies on the peer mesh for failover, post-promotion
+    /// routing, and broadcasts. With zero peers, a SLURM-promoted
+    /// node wedges in a tokio busy-poll (dataset peer reported 86%
+    /// CPU + 54k epoll_wait/sec on a stuck SLURM-primary). The
+    /// previous warn-and-continue behaviour silently degraded the
+    /// run instead of failing fast. We now:
+    ///   1. Send a `SecondaryFatalError` to the current primary so
+    ///      it can drop us from the routable set + requeue any
+    ///      in-flight tasks immediately (instead of waiting for the
+    ///      keepalive miss threshold).
+    ///   2. Set `self.fatal_exit` to a human-readable reason. The
+    ///      main loop in `process_tasks` checks this after the
+    ///      select! body and returns `Err(reason)`, so the secondary
+    ///      process exits non-zero.
     ///
     /// `peer_count()` already calls `drain_new_connections` so this
     /// reads the freshest state.
-    pub(super) fn check_peer_mesh_watchdog(&mut self) {
+    pub(super) async fn check_peer_mesh_watchdog(&mut self) {
         let deadline = match self.peer_mesh_check_at {
             Some(d) => d,
             None => return,
         };
         // peer_count drains new connections internally; calling it
         // BEFORE the deadline check lets a fresh connection clear
-        // the watchdog without firing the WARN.
+        // the watchdog without firing the fault.
         let connected = self.peer_transport.peer_count();
         if connected > 0 {
             self.peer_mesh_check_at = None;
@@ -211,17 +223,39 @@ where
         if std::time::Instant::now() < deadline {
             return;
         }
-        tracing::warn!(
+        // Latch the watchdog off first so we never re-fire even if
+        // the fatal-error send takes a few ticks to flush.
+        self.peer_mesh_check_at = None;
+
+        let error = format!(
+            "peer mesh fully failed to form: 0 of {} peers reachable; \
+             cluster routing impossible",
+            self.peer_dial_count
+        );
+        tracing::error!(
             attempted = self.peer_dial_count,
             connected = 0,
-            "peer mesh fully failed to form after 30s; secondary will operate in \
-             primary-driven dispatch mode (no peer-mesh broadcast of TaskComplete \
-             / TaskFailed, no SLURM-primary failover possible). Common cause: \
-             cluster firewall / NAT blocks compute-node ↔ compute-node TCP/UDP. \
-             Run still functions for the live-primary case; only failover and \
-             peer-broadcast bookkeeping are degraded."
+            "{error}; reporting fatal error to primary and exiting"
         );
-        self.peer_mesh_check_at = None;
+
+        let fatal = DistributedMessage::<I>::SecondaryFatalError {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            error: error.clone(),
+        };
+        // Best-effort: even if the send fails (primary already gone,
+        // transport closed, ...) we still want to exit. Logging the
+        // send-side error is enough — the operator will see both the
+        // fault line above AND the send failure if any.
+        if let Err(e) = self.send_to_current_primary(fatal).await {
+            tracing::warn!(
+                error = %e,
+                "failed to deliver SecondaryFatalError to primary; exiting anyway"
+            );
+        }
+
+        self.fatal_exit = Some(error);
     }
 
     /// Check for peer timeouts based on keepalive tracking. When this
