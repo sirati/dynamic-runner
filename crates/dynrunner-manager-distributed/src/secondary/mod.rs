@@ -159,6 +159,20 @@ where
     // falsely declared dead.
     primary_last_seen: Option<Instant>,
 
+    /// Sticky flag for "the primary's transport returned None on
+    /// `recv()`". Used as the `if` guard on the `primary_transport.recv`
+    /// arm of `process_tasks`'s `select!` so the persistently-None
+    /// future doesn't hot-loop. Once true, we drive failover via the
+    /// election state machine and route work via
+    /// `slurm_primary_peer_id` once a peer wins the election.
+    ///
+    /// Pre-fix the recv arm bare-broke the loop on `None` and the
+    /// secondary exited cleanly with `completed=0` — losing every
+    /// task the SLURM-primary peer was about to dispatch. Dataset
+    /// reported this on the dev-box-primary scenario where the local
+    /// transport closed at the phase boundary.
+    primary_disconnected: bool,
+
     // Failover election state (F2). Defaults to Normal until the primary
     // misses keepalives.
     election: election::ElectionState,
@@ -272,6 +286,7 @@ where
             extraction_cache,
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,
+            primary_disconnected: false,
             election: election::ElectionState::Normal,
             pending_peer_messages: Vec::new(),
             last_request_time: HashMap::new(),

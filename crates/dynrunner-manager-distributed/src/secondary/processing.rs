@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -57,14 +57,68 @@ where
                         }
                     }
                 }
-                msg = self.primary_transport.recv() => {
+                msg = self.primary_transport.recv(), if !self.primary_disconnected => {
                     match msg {
                         Some(m) => {
                             self.dispatch_message(m).await?;
                         }
                         None => {
-                            tracing::info!("primary disconnected");
-                            break;
+                            // Primary's transport closed. Two
+                            // distinct cases:
+                            //
+                            // 1. Single-secondary / no-peer-mesh
+                            //    runs (the test fixture drops
+                            //    primary explicitly to signal
+                            //    shutdown; production single-jobs
+                            //    runs do the same when the local
+                            //    primary's run() returns). There's
+                            //    no failover candidate, so exit
+                            //    cleanly to preserve the historical
+                            //    "primary close = end of run"
+                            //    contract.
+                            //
+                            // 2. Multi-secondary failover. The peer
+                            //    mesh is alive, an election can
+                            //    pick a SLURM-primary, and dispatch
+                            //    can keep flowing. Backdating
+                            //    `primary_last_seen` past the miss
+                            //    threshold makes the next keepalive
+                            //    tick's `run_election_tick` enter
+                            //    Suspecting immediately. The
+                            //    `primary_disconnected` guard above
+                            //    suppresses this arm on subsequent
+                            //    iterations so the persistently-None
+                            //    recv future doesn't hot-loop.
+                            //
+                            // Pre-fix this arm bare-broke the loop
+                            // for both cases and the secondary
+                            // exited cleanly with completed=0 the
+                            // moment the local primary's transport
+                            // closed — losing every task the
+                            // SLURM-primary peer was about to
+                            // dispatch. Dataset peer reported this
+                            // on the dev-box-primary scenario.
+                            let peers = self.peer_transport.peer_count();
+                            if peers == 0 {
+                                tracing::info!(
+                                    "primary disconnected and no peer mesh; exiting cleanly \
+                                     (no failover candidate to take authority)"
+                                );
+                                break;
+                            }
+                            tracing::warn!(
+                                connected_peers = peers,
+                                "primary transport closed; switching to failover detection \
+                                 (election will run via peer mesh; further dispatch routes \
+                                 through slurm_primary_peer_id once a peer is promoted)"
+                            );
+                            self.primary_disconnected = true;
+                            let backdate = self
+                                .config
+                                .keepalive_interval
+                                .saturating_mul(self.config.keepalive_miss_threshold + 1);
+                            self.primary_last_seen =
+                                Some(Instant::now().checked_sub(backdate).unwrap_or_else(Instant::now));
                         }
                     }
                 }
