@@ -41,7 +41,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
             let mut assigned = false;
 
-            if let Some(idx) = target_idx {
+            // Demoted observer mode: the promoted SLURM-primary is
+            // the sole authority for assignment. Skip the local-
+            // assign branch entirely so the request always falls
+            // through to the SLURM-primary relay below — that way
+            // only one primary's pool ever decides what runs where.
+            // Without this skip, the local primary would race the
+            // SLURM-primary by assigning from its own (post-handoff
+            // stale) pool view. See `demoted` doc on
+            // `PrimaryCoordinator`.
+            if let Some(idx) = target_idx
+                && !self.demoted
+            {
                 // Stale TaskRequest guard: if primary's view says this
                 // worker is already mid-dispatch (current_task =
                 // Some(_)), the kickstart in `handle_task_complete` /
@@ -161,6 +172,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         {
             let secondary_id = secondary_id.clone();
             let worker_id = *worker_id;
+            // A TaskComplete supersedes a prior TaskFailed for the
+            // same hash. Without this, a forwarded retry-success
+            // from the SLURM-primary would leave the local primary's
+            // `failed_tasks` populated with a hash that was actually
+            // retried OK, inflating `failed_count()` reports.
+            // Pre-demotion, `run_retry_passes` cleared the entire
+            // `failed_tasks` set at the start of a retry pass and
+            // added back only the tasks that failed AGAIN; once the
+            // local primary stops running retry passes, the per-hash
+            // remove here keeps the same invariant: a hash sits in
+            // exactly one of {completed, failed}.
+            self.failed_tasks.remove(task_hash);
             self.completed_tasks.insert(task_hash.clone());
 
             // A successful TaskComplete from this secondary proves
