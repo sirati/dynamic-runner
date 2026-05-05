@@ -1,5 +1,20 @@
 use crate::config::SlurmConfig;
 
+// NOTE (parity gap): the Python wrapper generator in
+// `dynamic_runner.packaging.job_manager.SlurmJobManager.generate_wrapper_script`
+// is the production code path used by every SLURM dispatch today; this
+// Rust generator is exported but unused. The Python side has been
+// extended with a `TaskDeploymentSpec.extra_run_args: tuple[str, ...]`
+// hook that interpolates consumer-supplied flags (e.g.
+// `--pids-limit=16384`) into the `podman run` invocation BEFORE the
+// `{image_name}:{image_tag}` argument. This Rust template intentionally
+// does NOT mirror that hook yet — the consumer-facing API crosses
+// only through the Python `TaskDeploymentSpec`, so adding it here would
+// be dead code until the production path migrates. If/when this
+// generator is wired into production, mirror the field on
+// `WrapperScriptConfig` and inject it at the same position in both
+// `Standard` and `Reverse` arms below.
+
 /// Configuration for generating a SLURM wrapper script.
 pub struct WrapperScriptConfig<'a> {
     pub slurm_config: &'a SlurmConfig,
