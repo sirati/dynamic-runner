@@ -12,7 +12,7 @@ use crate::config::log_paths::LogPathConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
-use crate::network::{detect_ipv4, gethostname};
+use crate::network::{detect_ipv4, detect_ipv6, gethostname};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 
@@ -320,12 +320,21 @@ impl PySecondaryCoordinator {
                     estimator,
                 );
 
-                // Set peer cert info so the CertExchange message includes our QUIC details
+                // Set peer cert info so the CertExchange message
+                // includes our QUIC details. Both families are detected
+                // off `hostname -I` (see `network::detect_ipv4` /
+                // `detect_ipv6`); the resulting `PeerCertInfo` is what
+                // the `send_cert_exchange` step ships on the wire and
+                // the primary then re-broadcasts via `PeerInfo`. The
+                // dialer (peer/dial.rs) consumes both families and
+                // happy-eyeballs-races them, so a host that has only
+                // one family configured is fine — the missing one is
+                // simply absent from the candidate set.
                 secondary.set_peer_cert_info(
                     dynrunner_manager_distributed::PeerCertInfo {
                         public_cert_pem: peer_cert_pem,
                         ipv4_address: Some(detect_ipv4(None)),
-                        ipv6_address: None,
+                        ipv6_address: detect_ipv6(None),
                         quic_port: peer_port,
                     },
                 );

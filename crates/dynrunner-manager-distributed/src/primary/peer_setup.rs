@@ -17,6 +17,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
         tracing::info!("sending peer lists");
 
+        // Both address families travel from the originating
+        // secondary's `CertExchange` (see `secondary::setup::
+        // send_cert_exchange`) through `primary::connect::
+        // handle_cert_exchange` which stashes them on the typestate
+        // (`state::SecondaryConnection::receive_cert_exchange`). Read
+        // both back here so the broadcast `PeerInfo` carries every
+        // candidate the per-peer happy-eyeballs dialer can race —
+        // dropping `ipv6` here was the cause of the empty-candidate-
+        // set bug that surfaced as "WSS race to peer failed across
+        // all addresses; attempted=N connected=0" on the consumer
+        // side after the dialer was made dual-family-aware.
         let peers: Vec<PeerConnectionInfo> = self
             .secondaries
             .values()
@@ -24,7 +35,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 secondary_id: s.id().to_string(),
                 cert: s.cert_pem().unwrap_or("").to_string(),
                 ipv4: s.ipv4().map(|s| s.to_string()),
-                ipv6: None,
+                ipv6: s.ipv6().map(|s| s.to_string()),
                 port: s.quic_port(),
             })
             .collect();
