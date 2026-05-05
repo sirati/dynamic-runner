@@ -40,6 +40,28 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             let mut assigned = false;
 
             if let Some(idx) = target_idx {
+                // Stale TaskRequest guard: if primary's view says this
+                // worker is already mid-dispatch (current_task =
+                // Some(_)), the kickstart in `handle_task_complete` /
+                // `handle_task_failed` has just sent a TaskAssignment
+                // to the same worker. The TaskRequest in our hand was
+                // sent by the secondary BEFORE that kickstart-
+                // assignment arrived. Honouring it would dispatch a
+                // SECOND assignment to a worker that's about to be
+                // busy with the first, secondary then bounces the
+                // second with "No idle worker available" — every such
+                // bounce becomes a Recoverable failure that consumes
+                // a retry budget. Skip silently; the worker will
+                // process the kickstart-assignment and send a fresh
+                // TaskRequest after that one terminates.
+                if self.workers[idx].current_task.is_some() {
+                    tracing::trace!(
+                        secondary = %secondary_id,
+                        worker_id,
+                        "stale TaskRequest after kickstart-dispatch; skipping"
+                    );
+                    return Ok(());
+                }
                 // Mark worker idle
                 self.workers[idx].current_task = None;
                 self.workers[idx].estimated_resources = ResourceMap::new();
