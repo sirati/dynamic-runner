@@ -204,6 +204,14 @@ where
     /// watchdog to phrase the WARN ("0 of N peers reachable") and to
     /// suppress the watchdog when peers is empty (single-secondary).
     peer_dial_count: u32,
+    /// One-shot guard: have we already emitted `MeshReady` to the
+    /// primary? The primary defers `PromotePrimary` until every
+    /// secondary has reported, so duplicate sends would over-count
+    /// (harmless on the receiving end today, but the contract is
+    /// "exactly once per secondary"). Toggled true the first time
+    /// `report_mesh_ready_if_needed` decides the mesh has settled
+    /// (mesh formed, watchdog elapsed, or no peers to dial).
+    mesh_ready_sent: bool,
 
     // SLURM-primary state (populated on promotion + full task list).
     // `slurm_pending` is `None` until the secondary first receives a
@@ -306,6 +314,7 @@ where
             request_backoff: HashMap::new(),
             peer_mesh_check_at: None,
             peer_dial_count: 0,
+            mesh_ready_sent: false,
             slurm_pending: None,
             slurm_completed: HashSet::new(),
             slurm_in_flight: HashMap::new(),

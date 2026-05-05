@@ -111,6 +111,24 @@ pub struct PrimaryConfig {
     /// re-sbatch path is wired into `spawn_secondary` (none today)
     /// and you want time for replacement secondaries to come up.
     pub fleet_dead_timeout: Duration,
+
+    /// Maximum time to wait for every connected secondary to send
+    /// `MeshReady` before issuing `PromotePrimary`. Secondaries
+    /// emit `MeshReady` once their peer-mesh has settled (mesh
+    /// formed, watchdog elapsed, or no peers were expected for
+    /// single-secondary runs). Without the wait, the primary
+    /// previously fired `PromotePrimary` ~750µs after every
+    /// secondary completed cert-exchange — that left the SLURM-
+    /// promoted secondary "authoritative" against an empty peer
+    /// mesh for the full per-peer dial budget (10s QUIC + 10s
+    /// WSS), with every pre-mesh-formation message routed into
+    /// the void. Default `60s` — comfortably larger than the
+    /// secondary-side 30s peer-mesh watchdog plus a slack for
+    /// scheduling jitter. Stragglers past this deadline log a
+    /// warning and the run proceeds anyway (so a bug in one
+    /// secondary's mesh signalling can't deadlock the entire
+    /// dispatch).
+    pub mesh_ready_timeout: Duration,
 }
 
 impl Default for PrimaryConfig {
@@ -127,6 +145,7 @@ impl Default for PrimaryConfig {
             max_concurrent_per_type: HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
+            mesh_ready_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -267,6 +286,16 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// rationale.
     pub(super) fleet_dead_since: Option<Instant>,
 
+    /// Set of secondary ids that have reported `MeshReady`. The
+    /// primary's `wait_for_mesh_ready` step blocks on this set
+    /// growing to the connected-secondaries set before it issues
+    /// `PromotePrimary` — without that wait, the SLURM-promoted
+    /// secondary becomes authoritative against a still-forming
+    /// peer mesh and every pre-mesh-formation message goes
+    /// nowhere. Recorded by `handle_mesh_ready`; consumed by
+    /// `wait_for_mesh_ready`.
+    pub(super) mesh_ready_secondaries: HashSet<String>,
+
     // SLURM-primary promotion
     pub(super) slurm_primary_id: Option<String>,
 
@@ -305,6 +334,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             secondary_keepalives: HashMap::new(),
             backpressured_secondaries: HashMap::new(),
             fleet_dead_since: None,
+            mesh_ready_secondaries: HashSet::new(),
             slurm_primary_id: None,
             pending_stage_files: Vec::new(),
         }
@@ -500,6 +530,22 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
         // Phase 6: Send transfer complete
         self.send_transfer_complete().await?;
+
+        // Phase 6.5: Wait for every connected secondary to report
+        // its peer-mesh has settled before promoting one of them
+        // to SLURM-primary. Pre-fix `PromotePrimary` fired ~750µs
+        // after cert-exchange completed — the SLURM-promoted
+        // secondary then became authoritative against a still-
+        // forming peer mesh (per-peer dial budget: 10s QUIC + 10s
+        // WSS) and every pre-mesh-formation peer-broadcast routed
+        // into the void for the duration. Holding the promotion
+        // until every secondary signals `MeshReady` (mesh formed,
+        // watchdog elapsed, or single-secondary instant) is the
+        // event-driven equivalent of "wait until the mesh is
+        // real". Bounded by `config.mesh_ready_timeout` (warning
+        // + proceed on straggler, never deadlock — a buggy
+        // secondary's silence must not stall the run).
+        self.wait_for_mesh_ready().await?;
 
         // Phase 7: Promote SLURM-primary
         self.promote_slurm_primary().await?;

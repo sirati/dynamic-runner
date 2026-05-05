@@ -281,6 +281,7 @@ impl PyDistributedManager {
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
                     retry_max_passes: dist_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
+                    mesh_ready_timeout: std::time::Duration::from_secs(60),
                 };
 
                 let mut primary = PrimaryCoordinator::new(
