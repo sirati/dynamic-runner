@@ -211,6 +211,8 @@ impl PyPrimaryCoordinator {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
+        let dist_mass_death_grace = self.distributed_config.mass_death_grace();
+        let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let uses_file_based_items = self.uses_file_based_items;
@@ -312,6 +314,8 @@ impl PyPrimaryCoordinator {
                     retry_max_passes: dist_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
                     mesh_ready_timeout: std::time::Duration::from_secs(60),
+                    mass_death_grace: dist_mass_death_grace,
+                    mass_death_min_count: dist_mass_death_min_count,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =

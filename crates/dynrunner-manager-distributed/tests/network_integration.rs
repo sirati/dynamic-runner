@@ -138,6 +138,8 @@ async fn e2e_primary_secondary_over_wss() {
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(60),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -245,6 +247,8 @@ async fn e2e_primary_secondary_over_quic() {
             retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(60),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
         };
 
         let mut primary = PrimaryCoordinator::new(
