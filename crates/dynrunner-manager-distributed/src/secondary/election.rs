@@ -81,7 +81,7 @@ where
         self.primary_last_seen = Some(Instant::now());
         if !matches!(self.election, ElectionState::Promoted) {
             self.election = ElectionState::Normal;
-            self.slurm_primary_peer_id = None;
+            self.primary_peer_id = None;
         }
     }
 
@@ -102,8 +102,8 @@ where
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(false);
 
-        // Cascade election trigger: if a SLURM-primary peer was
-        // promoted (slurm_primary_peer_id is set to a peer, not
+        // Cascade election trigger: if a primary peer was
+        // promoted (primary_peer_id is set to a peer, not
         // ourselves) and that peer's keepalives have gone stale,
         // we need to run a fresh election regardless of whether
         // the local-machine primary is still alive. Pre-fix, the
@@ -114,16 +114,16 @@ where
         // from peer_keepalives, and then sat idle forever
         // because primary_silent stayed false. Dataset's K=2 run
         // hit exactly this: 4 surviving secondaries with no
-        // SLURM-primary, no election attempt, no logged "SLURM-
-        // primary assigned" lines on any of them.
+        // primary, no election attempt, no logged "primary
+        // assigned" lines on any of them.
         //
-        // A peer is considered the silent SLURM-primary when:
-        //   - slurm_primary_peer_id is set (a promotion happened)
+        // A peer is considered the silent primary when:
+        //   - primary_peer_id is set (a promotion happened)
         //   - the id is NOT ourselves (we'd be Promoted, handled above)
         //   - its peer_keepalives entry is missing OR its
         //     timestamp is older than `deadline`
-        let slurm_primary_silent = self
-            .slurm_primary_peer_id
+        let primary_peer_silent = self
+            .primary_peer_id
             .as_ref()
             .filter(|id| id.as_str() != self.config.secondary_id)
             .map(|id| {
@@ -134,7 +134,7 @@ where
             })
             .unwrap_or(false);
 
-        let need_election = primary_silent || slurm_primary_silent;
+        let need_election = primary_silent || primary_peer_silent;
 
         match &self.election {
             ElectionState::Normal if need_election => {
@@ -142,9 +142,9 @@ where
                     secondary = %self.config.secondary_id,
                     miss_threshold = self.config.keepalive_miss_threshold,
                     primary_silent,
-                    slurm_primary_silent,
-                    slurm_primary_peer = ?self.slurm_primary_peer_id,
-                    "primary or SLURM-primary peer missed keepalives; \
+                    primary_peer_silent,
+                    primary_peer = ?self.primary_peer_id,
+                    "primary or primary peer missed keepalives; \
                      entering Suspecting"
                 );
                 self.election = ElectionState::Suspecting {
@@ -200,7 +200,7 @@ where
                         confirms: HashSet::from([self.config.secondary_id.clone()]),
                         started: Instant::now(),
                     };
-                    self.slurm_primary_peer_id = Some(self.config.secondary_id.clone());
+                    self.primary_peer_id = Some(self.config.secondary_id.clone());
                     actions.broadcast.push(DistributedMessage::PromotionVote {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -209,7 +209,7 @@ where
                     });
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
-                    self.slurm_primary_peer_id = Some(candidate.clone());
+                    self.primary_peer_id = Some(candidate.clone());
                     self.election = ElectionState::Voting { round, candidate };
                 }
             }
@@ -293,7 +293,7 @@ where
                 round,
                 candidate: candidate.clone(),
             };
-            self.slurm_primary_peer_id = Some(candidate.clone());
+            self.primary_peer_id = Some(candidate.clone());
         }
         Some(DistributedMessage::PromotionConfirm {
             sender_id: self.config.secondary_id.clone(),
@@ -331,19 +331,19 @@ where
         if promoted {
             tracing::info!(round, "won election — taking over as primary");
             self.election = ElectionState::Promoted;
-            self.is_slurm_primary = true;
-            self.populate_slurm_from_cache();
+            self.is_primary = true;
+            self.populate_primary_from_cache();
         }
         promoted
     }
 
-    /// On promotion, hydrate `slurm_pending` from whatever the most
+    /// On promotion, hydrate `primary_pending` from whatever the most
     /// recent live primary broadcast in `FullTaskList`. If no broadcast
     /// was ever observed (e.g. the election fired before the primary
     /// even sent one), the new primary starts with an empty pending
     /// pool — peers will still request work and the primary will
     /// reply "no tasks available", which is the safe degrade.
-    pub(super) fn populate_slurm_from_cache(&mut self) {
+    pub(super) fn populate_primary_from_cache(&mut self) {
         if let Some((all_tasks, completed, phase_deps)) =
             self.cached_full_task_list.take()
         {
@@ -351,9 +351,9 @@ where
                 total = all_tasks.len(),
                 completed = completed.len(),
                 phases = phase_deps.len(),
-                "post-promotion: hydrating SLURM-primary pending pool from cached FullTaskList"
+                "post-promotion: hydrating primary pending pool from cached FullTaskList"
             );
-            self.populate_slurm_tasks(all_tasks, completed, phase_deps);
+            self.populate_primary_tasks(all_tasks, completed, phase_deps);
         } else {
             tracing::warn!(
                 "post-promotion: no cached FullTaskList; new primary starts with empty pending pool"
@@ -500,11 +500,11 @@ mod tests {
         assert!(matches!(sec.election, ElectionState::Promoted));
     }
 
-    /// Once promoted, a secondary's `slurm_pending` pool is hydrated
+    /// Once promoted, a secondary's `primary_pending` pool is hydrated
     /// from the cached `FullTaskList` it observed earlier from the live
     /// primary. Validates the post-promotion takeover wiring (#34).
     #[tokio::test(flavor = "current_thread")]
-    async fn promotion_hydrates_slurm_tasks_from_cache() {
+    async fn promotion_hydrates_primary_tasks_from_cache() {
         use dynrunner_core::ResourceMap;
         use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, TaskListEntry};
         use std::collections::{HashMap, HashSet};
@@ -545,14 +545,14 @@ mod tests {
             confirms: HashSet::from(["sec-a".to_string()]),
             started: std::time::Instant::now(),
         };
-        sec.is_slurm_primary = false; // not yet
+        sec.is_primary = false; // not yet
         let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
         assert!(promoted, "majority confirm should promote");
 
         assert!(matches!(sec.election, ElectionState::Promoted));
-        assert!(sec.is_slurm_primary, "promotion sets is_slurm_primary");
+        assert!(sec.is_primary, "promotion sets is_primary");
         assert_eq!(
-            sec.slurm_pending_len(),
+            sec.primary_pending_len(),
             1,
             "cache should have hydrated one pending binary into the pool"
         );
@@ -569,7 +569,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn primary_recovery_clears_routing_target() {
         let mut sec = make_secondary(election_config("sec-a"));
-        sec.slurm_primary_peer_id = Some("sec-c".into());
+        sec.primary_peer_id = Some("sec-c".into());
         sec.election = ElectionState::Voting {
             round: 1,
             candidate: "sec-c".into(),
@@ -577,7 +577,7 @@ mod tests {
         sec.record_primary_message();
         assert!(matches!(sec.election, ElectionState::Normal));
         assert!(
-            sec.slurm_primary_peer_id.is_none(),
+            sec.primary_peer_id.is_none(),
             "live primary message should clear the routing target"
         );
     }
@@ -589,12 +589,12 @@ mod tests {
     async fn promoted_state_survives_late_primary_message() {
         let mut sec = make_secondary(election_config("sec-a"));
         sec.election = ElectionState::Promoted;
-        sec.is_slurm_primary = true;
-        sec.slurm_primary_peer_id = Some("sec-a".into());
+        sec.is_primary = true;
+        sec.primary_peer_id = Some("sec-a".into());
 
         sec.record_primary_message();
         assert!(matches!(sec.election, ElectionState::Promoted));
-        assert!(sec.is_slurm_primary);
+        assert!(sec.is_primary);
     }
 
     /// Scenario (d): two peers detect primary death simultaneously and both

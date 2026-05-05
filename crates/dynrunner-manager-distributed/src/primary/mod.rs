@@ -118,7 +118,7 @@ pub struct PrimaryConfig {
     /// formed, watchdog elapsed, or no peers were expected for
     /// single-secondary runs). Without the wait, the primary
     /// previously fired `PromotePrimary` ~750µs after every
-    /// secondary completed cert-exchange — that left the SLURM-
+    /// secondary completed cert-exchange — that left the
     /// promoted secondary "authoritative" against an empty peer
     /// mesh for the full per-peer dial budget (10s QUIC + 10s
     /// WSS), with every pre-mesh-formation message routed into
@@ -291,7 +291,7 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// before `run()` is called.
     pub(super) pending: Option<PendingPool<I>>,
     /// Canonical phase dependency graph for the run, captured at
-    /// `run()` start. Sent to the SLURM-primary alongside the task
+    /// `run()` start. Sent to the primary alongside the task
     /// list (`send_full_task_list`) so the promoted secondary can
     /// rebuild its `PendingPool` with the same phase-state machine the
     /// primary used. Empty between runs.
@@ -349,7 +349,7 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// Set of secondary ids that have reported `MeshReady`. The
     /// primary's `wait_for_mesh_ready` step blocks on this set
     /// growing to the connected-secondaries set before it issues
-    /// `PromotePrimary` — without that wait, the SLURM-promoted
+    /// `PromotePrimary` — without that wait, the promoted
     /// secondary becomes authoritative against a still-forming
     /// peer mesh and every pre-mesh-formation message goes
     /// nowhere. Recorded by `handle_mesh_ready`; consumed by
@@ -367,8 +367,8 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// (= escalate to actual death via `requeue_dead_secondary`).
     pub(super) pending_mass_death: HashMap<String, PendingMassDeath>,
 
-    // SLURM-primary promotion
-    pub(super) slurm_primary_id: Option<String>,
+    // primary promotion
+    pub(super) primary_id: Option<String>,
 
     /// True after this primary has handed off authority via
     /// `PromotePrimary`. While demoted, the operational loop runs in
@@ -416,7 +416,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             fleet_dead_since: None,
             mesh_ready_secondaries: HashSet::new(),
             pending_mass_death: HashMap::new(),
-            slurm_primary_id: None,
+            primary_id: None,
             demoted: false,
             pending_stage_files: Vec::new(),
         }
@@ -546,7 +546,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         }
         // Capture the canonical phase-deps graph for the run before
         // handing it to the pool — `send_full_task_list` relays it to
-        // the promoted SLURM-primary so the post-promotion pool has
+        // the promoted primary so the post-promotion pool has
         // the same dependency machine.
         self.phase_deps = phase_deps.clone();
         // PendingPool::new wants an iterator yielding owned PhaseIds.
@@ -615,8 +615,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
         // Phase 6.5: Wait for every connected secondary to report
         // its peer-mesh has settled before promoting one of them
-        // to SLURM-primary. Pre-fix `PromotePrimary` fired ~750µs
-        // after cert-exchange completed — the SLURM-promoted
+        // to primary. Pre-fix `PromotePrimary` fired ~750µs
+        // after cert-exchange completed — the promoted
         // secondary then became authoritative against a still-
         // forming peer mesh (per-peer dial budget: 10s QUIC + 10s
         // WSS) and every pre-mesh-formation peer-broadcast routed
@@ -629,10 +629,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // secondary's silence must not stall the run).
         self.wait_for_mesh_ready().await?;
 
-        // Phase 7: Promote SLURM-primary
-        self.promote_slurm_primary().await?;
+        // Phase 7: Promote primary
+        self.promote_primary().await?;
 
-        // Phase 8: Send full task list to SLURM-primary
+        // Phase 8: Send full task list to primary
         self.send_full_task_list().await?;
 
         // Phase 9: Operational loop (main pass)

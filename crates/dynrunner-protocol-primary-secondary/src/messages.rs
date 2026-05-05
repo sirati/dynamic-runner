@@ -126,7 +126,7 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
     /// Build the wire-side info from an in-process `TaskInfo<I>`.
     ///
     /// Owns the reverse transformation in [`Self::to_task_info`]; managers
-    /// (primary, secondary, slurm-promoted-secondary) all funnel through
+    /// (primary, secondary, promoted-secondary) all funnel through
     /// these two methods so the phase/type/affinity/payload tags stay in
     /// lockstep across the wire.
     pub fn from_task_info(task: &TaskInfo<I>) -> Self {
@@ -236,7 +236,7 @@ pub struct TaskListEntry<I> {
     pub local_path: String,
     pub binary_info: DistributedBinaryInfo<I>,
     pub hash: String,
-    /// Original file path for resolution on SLURM-primary.
+    /// Original file path for resolution on primary.
     #[serde(default)]
     pub file_path: Option<String>,
 }
@@ -384,7 +384,7 @@ pub enum DistributedMessage<I> {
     /// watchdog has elapsed; for single-secondary runs (no peers
     /// to dial) it fires immediately at operational-loop entry.
     /// The primary defers `PromotePrimary` until every secondary
-    /// has reported, so the SLURM-promoted secondary never
+    /// has reported, so the promoted secondary never
     /// becomes authoritative against an empty peer mesh — closing
     /// the 750µs ↔ 30s gap where pre-mesh-formation messages
     /// would be sent into a void. `peer_count` carries the

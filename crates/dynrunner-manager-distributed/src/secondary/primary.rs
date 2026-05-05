@@ -9,16 +9,16 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
-use super::{SecondaryCoordinator, SlurmInFlightItem};
+use super::{SecondaryCoordinator, PrimaryInFlightItem};
 use super::wire::timestamp_now;
 
 /// Backpressure backoff window applied to a peer that just rejected a
 /// `TaskAssignment` with "No idle worker available". Mirrors the
 /// 500ms window used by the regular primary
 /// (`PrimaryCoordinator::handle_task_failed`); a single constant
-/// keeps the two paths in lockstep so SLURM-promoted runs feel the
+/// keeps the two paths in lockstep so promoted runs feel the
 /// same as live-primary runs.
-const SLURM_BACKPRESSURE_WINDOW: Duration = Duration::from_millis(500);
+const PRIMARY_BACKPRESSURE_WINDOW: Duration = Duration::from_millis(500);
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
@@ -29,7 +29,7 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// Build a fresh `PendingPool` for the SLURM-primary view from a
+    /// Build a fresh `PendingPool` for the primary view from a
     /// `FullTaskList` snapshot.
     ///
     /// One concern: turn the wire-format snapshot (`TaskListEntry`s +
@@ -42,18 +42,18 @@ where
     /// authoritative source, and a partial patch would risk
     /// double-counting in-flight items the new primary can't observe
     /// from outside.
-    pub(super) fn populate_slurm_tasks(
+    pub(super) fn populate_primary_tasks(
         &mut self,
         all_tasks: Vec<TaskListEntry<I>>,
         completed: HashSet<String>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     ) {
-        self.slurm_completed = completed.clone();
+        self.primary_completed = completed.clone();
 
         // Materialise items from the wire snapshot, skipping anything
         // the cluster (or this node) has already completed / has in
         // flight locally. Sort size-DESC up-front: the pool preserves
-        // bucket-internal insertion order, and SLURM-primary dispatch
+        // bucket-internal insertion order, and primary dispatch
         // is first-fit-by-memory which benefits from biggest-first
         // packing (same heuristic as the legacy Vec-based path).
         // Filter first (immutable self borrow), then resolve in a
@@ -77,18 +77,18 @@ where
             //
             // Keep `binary.path` AS-IS from the wire (i.e. the
             // primary's view path). The resolver runs lazily at
-            // dispatch time (`handle_slurm_task_request` calls
+            // dispatch time (`handle_primary_task_request` calls
             // `resolve_for_dispatch` on the binary it just took
             // from the pool) — same end result for the worker,
             // but the in-pool `task_file_hash(&binary)` matches
             // the primary's `compute_task_hash` because both now
             // hash the wire path. Without this, pre-staged mode
-            // diverges: primary hashes the gateway-absolute path,
-            // slurm hashes the secondary-resolved container path,
+            // diverges: live primary hashes the gateway-absolute path,
+            // promoted primary hashes the secondary-resolved container path,
             // `completed_tasks` can't dedupe across paths, and
             // any race that lets both paths dispatch the same
             // logical task (live primary's kickstart-TaskAssignment
-            // racing the SLURM-primary's self-dispatch) doubles
+            // racing the primary's self-dispatch) doubles
             // the per-task completion record. Surfaced when the
             // mesh-ready wait pushed the dispatch ordering close
             // enough for the race to fire reliably.
@@ -118,10 +118,10 @@ where
                 // pre-completed shows up as Active-but-empty here.
                 // Without the cascade, dependent phases stay Blocked
                 // forever (their parent never reaches Drained → Done)
-                // and `handle_slurm_task_request` returns "no tasks"
+                // and `handle_primary_task_request` returns "no tasks"
                 // for every dispatch. Run the same drain cascade
-                // that `note_slurm_item_completed` uses post-dispatch
-                // so the SLURM-primary's view starts in the correct
+                // that `note_primary_item_completed` uses post-dispatch
+                // so the primary's view starts in the correct
                 // post-completion state. Symmetric with the regular
                 // primary's `process_phase_lifecycle` call after pool
                 // construction.
@@ -131,32 +131,32 @@ where
             Err(e) => {
                 // The wire format should never deliver an inconsistent
                 // graph, but if it does we degrade safely: an empty
-                // pool causes the SLURM-primary to reply "no tasks" to
+                // pool causes the primary to reply "no tasks" to
                 // every request, which lets the run wind down rather
                 // than crashing the new primary.
                 tracing::error!(
                     error = %e,
-                    "post-promotion: invalid phase graph in FullTaskList; SLURM-primary will start with no pending tasks"
+                    "post-promotion: invalid phase graph in FullTaskList; primary will start with no pending tasks"
                 );
-                self.slurm_pending = None;
+                self.primary_pending = None;
                 return;
             }
         };
 
         let pending_count = pool.len();
-        self.slurm_pending = Some(pool);
+        self.primary_pending = Some(pool);
 
         tracing::info!(
             pending = pending_count,
-            completed = self.slurm_completed.len(),
-            "populated SLURM-primary task list"
+            completed = self.primary_completed.len(),
+            "populated primary task list"
         );
     }
 
     /// Run the phase-lifecycle drain cascade on a pool until quiescent.
-    /// Shared between `populate_slurm_tasks` (catches phases whose
+    /// Shared between `populate_primary_tasks` (catches phases whose
     /// only items pre-completed elsewhere) and
-    /// `note_slurm_item_completed` (catches phases whose only items
+    /// `note_primary_item_completed` (catches phases whose only items
     /// just finished). Each iteration:
     ///   1. `drain_empty_active_phases` — moves any Active phase
     ///      whose `(queued, in_flight) == (0, 0)` to Drained, queues
@@ -171,16 +171,16 @@ where
 
     /// Test/inspection helper: number of queued items in the pool.
     /// Returns 0 if the pool isn't initialised yet.
-    pub(super) fn slurm_pending_len(&self) -> usize {
-        self.slurm_pending.as_ref().map(|p| p.len()).unwrap_or(0)
+    pub(super) fn primary_pending_len(&self) -> usize {
+        self.primary_pending.as_ref().map(|p| p.len()).unwrap_or(0)
     }
 
-    /// Record completion of an item the SLURM-primary previously
-    /// dispatched (via `handle_slurm_task_request`). Decrements the
+    /// Record completion of an item the primary previously
+    /// dispatched (via `handle_primary_task_request`). Decrements the
     /// pool's in-flight counter for that item's phase, then promotes
     /// any newly-`Drained` phase to `Done` so dependents can become
     /// `Active`. No-op if the hash wasn't dispatched by this node — a
-    /// peer-completion the SLURM-primary never issued belongs to a
+    /// peer-completion the primary never issued belongs to a
     /// different in-flight ledger and is silently ignored.
     ///
     /// Mirrors `process_phase_lifecycle` on the local primary side: a
@@ -191,57 +191,57 @@ where
     /// items). Loop until no phase is `Drained` and call
     /// `drain_empty_active_phases` each iteration so the cascade
     /// continues all the way to the next populated phase. Without
-    /// this loop the SLURM-primary would stop one phase short and
+    /// this loop the primary would stop one phase short and
     /// the next phase's items would sit in the pool with the phase
     /// still `Blocked`.
-    pub(super) fn note_slurm_item_completed(&mut self, file_hash: &str) {
-        let phase_id = match self.slurm_in_flight.remove(file_hash) {
+    pub(super) fn note_primary_item_completed(&mut self, file_hash: &str) {
+        let phase_id = match self.primary_in_flight.remove(file_hash) {
             Some(item) => item.phase_id,
             None => return,
         };
         // Symmetric with retry: a successful completion supersedes any
         // earlier Recoverable failure recorded against the same hash.
         // Without this, a task that fails Recoverably (lands in
-        // `slurm_primary_failed`) and then succeeds on a subsequent
+        // `primary_failed`) and then succeeds on a subsequent
         // attempt mid-pass — possible when the operational loop re-
         // dispatches before our drain-check fires — would still
         // trigger a pointless retry pass. Mirrors the live primary's
         // `failed_tasks.remove` in `handle_task_complete`.
-        self.slurm_primary_failed.remove(file_hash);
-        if let Some(pool) = self.slurm_pending.as_mut() {
+        self.primary_failed.remove(file_hash);
+        if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id);
             cascade_drain_done(pool);
         }
     }
 
-    /// Sibling to `note_slurm_item_completed` for the failure path.
+    /// Sibling to `note_primary_item_completed` for the failure path.
     /// Decrements the pool's in-flight counter for the item's phase
     /// (same as completion — phase machine doesn't distinguish
     /// success vs failure for in-flight bookkeeping). For Recoverable
-    /// failures of tasks THIS secondary dispatched as SLURM-primary
-    /// via `handle_slurm_task_request`, also stash the binary in
-    /// `slurm_primary_failed` so `slurm_primary_drain_check_and_retry`
+    /// failures of tasks THIS secondary dispatched as primary
+    /// via `handle_primary_task_request`, also stash the binary in
+    /// `primary_failed` so `primary_drain_check_and_retry`
     /// can re-inject it after the main pass drains. Non-Recoverable
     /// / OutOfMemory / Unknown failures bypass the ledger — they're
     /// terminal at the worker level and retry would likely fail
     /// again the same way.
     ///
-    /// Tasks not in `slurm_in_flight` (i.e. not dispatched by this
-    /// secondary as SLURM-primary — e.g. peer-completion forwards
+    /// Tasks not in `primary_in_flight` (i.e. not dispatched by this
+    /// secondary as primary — e.g. peer-completion forwards
     /// for tasks dispatched elsewhere, or initial-assignment failures
     /// from the live-primary's pre-promotion authority) bypass both
     /// the ledger and the pool decrement: those tasks were never on
-    /// this pool's books to begin with. Mirrors `note_slurm_item_completed`'s
+    /// this pool's books to begin with. Mirrors `note_primary_item_completed`'s
     /// silent-skip behaviour for unknown hashes.
     ///
     /// Called from every wire-arrival site that observes a TaskFailed
-    /// for a SLURM-primary-dispatched task: peer.rs (peer transport),
+    /// for a primary-dispatched task: peer.rs (peer transport),
     /// processing.rs (own worker event), dispatch.rs (live-primary
     /// forward, no-op for Recoverable). The Recoverable filter is
     /// inside this function so the callers don't have to special-case
     /// the retry path.
-    pub(super) fn note_slurm_item_failed(&mut self, file_hash: &str, error_type: &str) {
-        let item = match self.slurm_in_flight.remove(file_hash) {
+    pub(super) fn note_primary_item_failed(&mut self, file_hash: &str, error_type: &str) {
+        let item = match self.primary_in_flight.remove(file_hash) {
             Some(item) => item,
             None => return,
         };
@@ -250,29 +250,29 @@ where
             // Stash for the retry pass. Idempotent — the same hash
             // appearing twice (e.g. after re-injection fails again)
             // overwrites with the same binary, which is harmless.
-            self.slurm_primary_failed
+            self.primary_failed
                 .insert(file_hash.to_string(), item.binary);
         }
-        if let Some(pool) = self.slurm_pending.as_mut() {
+        if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id);
             cascade_drain_done(pool);
         }
     }
 
-    /// Slurm-primary-side equivalent of the local primary's
+    /// Primary-side equivalent of the local primary's
     /// `run_retry_passes`. Called once per keepalive tick from
     /// `process_tasks`. When the main pass has drained for THIS
-    /// SLURM-primary's view (pool empty, no items in flight, no local
+    /// primary's view (pool empty, no items in flight, no local
     /// active tasks) AND there are Recoverable failures pending in
-    /// `slurm_primary_failed` AND the retry budget hasn't been
+    /// `primary_failed` AND the retry budget hasn't been
     /// exhausted, take a snapshot of the failed binaries, clear the
-    /// ledger, re-inject each into `slurm_pending` via
+    /// ledger, re-inject each into `primary_pending` via
     /// `pool.reinject`, bump the pass counter, and kick our own idle
     /// workers via `repoll_idle_workers` so the operational loop
     /// re-engages with the just-injected items.
     ///
     /// Why "drain-check" rather than a phase-explicit "main pass" /
-    /// "retry pass" boundary: the SLURM-primary's `process_tasks` loop
+    /// "retry pass" boundary: the primary's `process_tasks` loop
     /// has no notion of pass boundaries — it's a single select! that
     /// runs until shutdown. The drain-check fires whenever the loop
     /// is observably idle and there's leftover retry work, which is
@@ -280,42 +280,42 @@ where
     /// `operational_loop` → `run_retry_passes` design used (drain →
     /// re-inject → re-run). Repeated firing is gated by the budget
     /// counter: once `retry_passes_used == retry_max_passes`, the
-    /// next drain-check leaves `slurm_primary_failed` populated and
+    /// next drain-check leaves `primary_failed` populated and
     /// the run wraps up via the normal exit conditions.
     ///
     /// Peer secondaries' workers don't need a kickstart from here:
     /// they re-poll on their own keepalive tick via
     /// `repoll_idle_workers` (with backoff) so any peer worker that
     /// got "no work" before the re-injection will see new work on its
-    /// next request. Only the SLURM-primary's own workers need an
+    /// next request. Only the primary's own workers need an
     /// immediate kick — they're the ones whose `request_task_for_worker`
-    /// short-circuits through `handle_slurm_task_request` directly.
-    pub(super) async fn slurm_primary_drain_check_and_retry(&mut self) {
-        if !self.is_slurm_primary {
+    /// short-circuits through `handle_primary_task_request` directly.
+    pub(super) async fn primary_drain_check_and_retry(&mut self) {
+        if !self.is_primary {
             return;
         }
-        if self.slurm_primary_failed.is_empty() {
+        if self.primary_failed.is_empty() {
             return;
         }
-        if !self.slurm_pending_is_empty()
-            || !self.slurm_in_flight.is_empty()
+        if !self.primary_pending_is_empty()
+            || !self.primary_in_flight.is_empty()
             || !self.active_tasks.is_empty()
         {
             return;
         }
-        if self.slurm_primary_retry_passes_used >= self.config.retry_max_passes {
+        if self.primary_retry_passes_used >= self.config.retry_max_passes {
             // Budget exhausted: the residual entries are permanent
             // failures. Keep them in the ledger so test fixtures (and
             // future operator-visible probes) can count permanent
-            // failures from the SLURM-primary's perspective; the
+            // failures from the primary's perspective; the
             // log-spam guard is `exhaustion_warning_emitted` so we
             // emit the warning once per run rather than every drain
             // check.
             if !self.exhaustion_warning_emitted {
                 tracing::warn!(
-                    permanent_failures = self.slurm_primary_failed.len(),
+                    permanent_failures = self.primary_failed.len(),
                     passes = self.config.retry_max_passes,
-                    "SLURM-primary retry budget exhausted; failed tasks are permanent"
+                    "primary retry budget exhausted; failed tasks are permanent"
                 );
                 self.exhaustion_warning_emitted = true;
             }
@@ -323,21 +323,21 @@ where
         }
 
         let to_retry: Vec<TaskInfo<I>> =
-            std::mem::take(&mut self.slurm_primary_failed)
+            std::mem::take(&mut self.primary_failed)
                 .into_values()
                 .collect();
-        let pass = self.slurm_primary_retry_passes_used + 1;
+        let pass = self.primary_retry_passes_used + 1;
         tracing::info!(
             pass,
             count = to_retry.len(),
-            "SLURM-primary retry pass: re-injecting failed tasks"
+            "primary retry pass: re-injecting failed tasks"
         );
-        if let Some(pool) = self.slurm_pending.as_mut() {
+        if let Some(pool) = self.primary_pending.as_mut() {
             for binary in to_retry {
                 pool.reinject(binary);
             }
         }
-        self.slurm_primary_retry_passes_used += 1;
+        self.primary_retry_passes_used += 1;
 
         // Kick our own idle workers — see method-level doc. Peer
         // workers self-recover on their next keepalive-driven repoll.
@@ -347,26 +347,26 @@ where
     /// Test/inspection helper: whether the pool has zero queued items.
     /// Treats "no pool yet" as empty so resource-loop predicates don't
     /// have to special-case the pre-snapshot state.
-    pub(super) fn slurm_pending_is_empty(&self) -> bool {
-        self.slurm_pending
+    pub(super) fn primary_pending_is_empty(&self) -> bool {
+        self.primary_pending
             .as_ref()
             .map(|p| p.is_empty())
             .unwrap_or(true)
     }
 
-    /// Handle a task request from a peer when acting as SLURM-primary.
+    /// Handle a task request from a peer when acting as primary.
     /// Finds a suitable task and sends a TaskAssignment back.
-    pub(super) async fn handle_slurm_task_request(
+    pub(super) async fn handle_primary_task_request(
         &mut self,
         requesting_secondary_id: String,
         worker_id: WorkerId,
         available_memory: u64,
     ) -> Result<(), String> {
-        if self.slurm_pending_is_empty() {
+        if self.primary_pending_is_empty() {
             tracing::debug!(
                 secondary = %requesting_secondary_id,
                 worker_id,
-                "no pending tasks for SLURM-primary assignment"
+                "no pending tasks for primary assignment"
             );
             return Ok(());
         }
@@ -375,11 +375,11 @@ where
         // computed from path+identifier exactly the way the dispatch
         // path does so the same key space matches both sides.
         let completed_tasks = self.completed_tasks.clone();
-        if let Some(pool) = self.slurm_pending.as_mut() {
+        if let Some(pool) = self.primary_pending.as_mut() {
             pool.retain(|item| !completed_tasks.contains(&task_file_hash(item)));
         }
 
-        if self.slurm_pending_is_empty() {
+        if self.primary_pending_is_empty() {
             return Ok(());
         }
 
@@ -393,12 +393,12 @@ where
         // our own workers; the peer-side backpressure ledger is
         // populated only by remote rejections.
         if requesting_secondary_id != self.config.secondary_id
-            && self.is_slurm_peer_backpressured(&requesting_secondary_id)
+            && self.is_primary_peer_backpressured(&requesting_secondary_id)
         {
             tracing::trace!(
                 secondary = %requesting_secondary_id,
                 worker_id,
-                "skipping SLURM-primary dispatch: peer is in backpressure backoff"
+                "skipping primary dispatch: peer is in backpressure backoff"
             );
             return Ok(());
         }
@@ -410,7 +410,7 @@ where
         let estimator = self.estimator.clone();
         let kind_memory = dynrunner_core::ResourceKind::memory();
         let assigned = self
-            .slurm_pending
+            .primary_pending
             .as_mut()
             .and_then(|pool| {
                 pool.take_first_match(|item| {
@@ -425,19 +425,19 @@ where
             // — it does not bump in-flight. Pair the dispatch with an
             // explicit `mark_in_flight` so the phase machine treats
             // the item as still belonging to the phase until the
-            // cluster reports it finished. `slurm_in_flight` mirrors
+            // cluster reports it finished. `primary_in_flight` mirrors
             // the same fact at the per-item level so we can call
             // `on_item_finished(phase_id)` when TaskComplete /
             // TaskFailed arrives later, AND retains the binary +
             // target so the rejection-recovery path
-            // (`handle_slurm_peer_rejection`) can `pool.requeue` it.
+            // (`handle_primary_peer_rejection`) can `pool.requeue` it.
             let dispatched_phase = binary.phase_id.clone();
-            if let Some(pool) = self.slurm_pending.as_mut() {
+            if let Some(pool) = self.primary_pending.as_mut() {
                 pool.mark_in_flight(&dispatched_phase);
             }
-            self.slurm_in_flight.insert(
+            self.primary_in_flight.insert(
                 file_hash.clone(),
-                SlurmInFlightItem {
+                PrimaryInFlightItem {
                     phase_id: dispatched_phase,
                     target_secondary_id: requesting_secondary_id.clone(),
                     binary: binary.clone(),
@@ -452,7 +452,7 @@ where
                 // unresolvable paths to the worker.
                 //
                 // Resolution-miss policy mirrors the historical
-                // SLURM-primary self-assign behaviour: in
+                // primary self-assign behaviour: in
                 // file-based + non-pre-staged mode the absolute
                 // path is the worker's filesystem view (in-process
                 // SLURM secondaries share the gateway's FS), so a
@@ -476,7 +476,7 @@ where
                             worker_id,
                             file_hash = %file_hash,
                             path = %resolution_path,
-                            "SLURM-primary self-assign in pre-staged mode: \
+                            "primary self-assign in pre-staged mode: \
                              binary path unresolvable via src_network; \
                              dropping (likely pre-staged mode misconfiguration \
                              or stale wire path)"
@@ -500,18 +500,18 @@ where
                             // `assign_task` failed AFTER we already
                             // moved the binary out of the pool +
                             // bumped in_flight + recorded
-                            // `slurm_in_flight`. Walk every step
+                            // `primary_in_flight`. Walk every step
                             // back so the binary isn't silently
                             // dropped: `recover_in_flight_to_pool`
-                            // pulls the binary out of `slurm_in_flight`
+                            // pulls the binary out of `primary_in_flight`
                             // and `pool.requeue`s it (decrements
                             // in_flight + pushes to front of bucket).
                             // Mirrors the recovery shape of
-                            // `handle_slurm_peer_rejection` below.
+                            // `handle_primary_peer_rejection` below.
                             tracing::warn!(
                                 worker_id = wid,
                                 error = %e,
-                                "SLURM-primary self-assign failed; re-queuing binary"
+                                "primary self-assign failed; re-queuing binary"
                             );
                             self.recover_in_flight_to_pool(&file_hash);
                         }
@@ -521,14 +521,14 @@ where
                     // TaskRequest and this dispatch (race after a
                     // recent kickstart-assignment landed first). Pre-
                     // fix this branch was missing entirely — the
-                    // binary stayed `slurm_in_flight`-tracked but no
+                    // binary stayed `primary_in_flight`-tracked but no
                     // worker was processing it and no completion
                     // would ever arrive ⇒ silent task loss + stuck
                     // phase counter. Recover by undoing the take +
                     // mark_in_flight via `recover_in_flight_to_pool`.
                     tracing::warn!(
                         worker_id = wid,
-                        "SLURM-primary self-assign skipped: worker not idle (race with kickstart); re-queuing binary"
+                        "primary self-assign skipped: worker not idle (race with kickstart); re-queuing binary"
                     );
                     self.recover_in_flight_to_pool(&file_hash);
                 }
@@ -554,25 +554,25 @@ where
                 secondary = %requesting_secondary_id,
                 worker_id,
                 binary = ?binary.identifier,
-                remaining = self.slurm_pending_len(),
-                "SLURM-primary assigned task"
+                remaining = self.primary_pending_len(),
+                "primary assigned task"
             );
         }
 
         Ok(())
     }
 
-    /// Undo a SLURM-primary dispatch that didn't reach a worker
+    /// Undo a primary dispatch that didn't reach a worker
     /// (self-assign race, peer rejected, peer-side route lost). Removes
-    /// the `slurm_in_flight` entry, re-queues the binary at the front
+    /// the `primary_in_flight` entry, re-queues the binary at the front
     /// of its bucket via `pool.requeue` (which also decrements the
     /// per-phase in_flight counter), and clears the `active_tasks`
     /// entry if any was created. No-op if the hash isn't tracked
     /// (idempotent — peer-broadcast TaskFailed and primary-forwarded
-    /// TaskFailed both arrive on the SLURM-primary, and either may
+    /// TaskFailed both arrive on the primary, and either may
     /// race the other).
     pub(super) fn recover_in_flight_to_pool(&mut self, file_hash: &str) {
-        let item = match self.slurm_in_flight.remove(file_hash) {
+        let item = match self.primary_in_flight.remove(file_hash) {
             Some(item) => item,
             None => return,
         };
@@ -580,27 +580,27 @@ where
         // path; remove unconditionally to keep its set in sync (no-op
         // if the hash wasn't there).
         self.active_tasks.remove(file_hash);
-        if let Some(pool) = self.slurm_pending.as_mut() {
+        if let Some(pool) = self.primary_pending.as_mut() {
             pool.requeue(item.binary);
         }
     }
 
-    /// Apply the SLURM-primary side of a peer rejection: extract the
+    /// Apply the primary side of a peer rejection: extract the
     /// binary back to the pool and put the peer in a backoff window
-    /// so the next `handle_slurm_task_request` from it skips dispatch.
+    /// so the next `handle_primary_task_request` from it skips dispatch.
     /// Returns the `target_secondary_id` that was backpressured (or
     /// `None` if the hash wasn't in flight, e.g. the peer rejection
     /// arrived after a successful retry path completed it).
-    pub(super) fn handle_slurm_peer_rejection(&mut self, file_hash: &str) -> Option<String> {
-        let item = self.slurm_in_flight.remove(file_hash)?;
+    pub(super) fn handle_primary_peer_rejection(&mut self, file_hash: &str) -> Option<String> {
+        let item = self.primary_in_flight.remove(file_hash)?;
         let target = item.target_secondary_id.clone();
         self.active_tasks.remove(file_hash);
-        if let Some(pool) = self.slurm_pending.as_mut() {
+        if let Some(pool) = self.primary_pending.as_mut() {
             pool.requeue(item.binary);
         }
-        self.slurm_backpressured_peers.insert(
+        self.backpressured_secondaries.insert(
             target.clone(),
-            Instant::now() + SLURM_BACKPRESSURE_WINDOW,
+            Instant::now() + PRIMARY_BACKPRESSURE_WINDOW,
         );
         Some(target)
     }
@@ -610,14 +610,14 @@ where
     /// accepting work). Called from the TaskComplete handlers in
     /// `dispatch.rs` and `peer.rs`. Mirrors the regular primary's
     /// backpressure clear on TaskComplete.
-    pub(super) fn clear_slurm_peer_backpressure(&mut self, secondary_id: &str) {
-        self.slurm_backpressured_peers.remove(secondary_id);
+    pub(super) fn clear_primary_peer_backpressure(&mut self, secondary_id: &str) {
+        self.backpressured_secondaries.remove(secondary_id);
     }
 }
 
 /// Stable hash of a `TaskInfo`'s path+identifier, matching the wire
 /// `file_hash` shape used elsewhere in the secondary. Pulled out as a
-/// free function so SLURM-primary's "drop completed-elsewhere" filter
+/// free function so primary's "drop completed-elsewhere" filter
 /// and the assignment path agree on the key space without duplicating
 /// the hashing recipe.
 fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
@@ -630,8 +630,8 @@ fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
 }
 
 /// Run the phase-lifecycle drain cascade on a pool until quiescent.
-/// Shared between `populate_slurm_tasks` (catches phases whose only
-/// items pre-completed elsewhere) and `note_slurm_item_completed`
+/// Shared between `populate_primary_tasks` (catches phases whose only
+/// items pre-completed elsewhere) and `note_primary_item_completed`
 /// (catches phases whose only items just finished). Each iteration:
 ///   1. `drain_empty_active_phases` — moves any Active phase whose
 ///      `(queued, in_flight) == (0, 0)` to Drained, queues it for

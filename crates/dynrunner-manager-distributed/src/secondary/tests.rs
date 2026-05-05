@@ -507,11 +507,11 @@ async fn stage_file_then_assign_task_succeeds() {
         .await;
 }
 
-/// Regression: a SLURM-promoted secondary's `populate_slurm_tasks`
+/// Regression: a promoted secondary's `populate_primary_tasks`
 /// must transition phases whose ONLY items are pre-completed
 /// elsewhere from Active to Done at construction time. Without the
-/// cascade in `slurm.rs`, dependent phases stay Blocked forever and
-/// the SLURM-primary hands out "no tasks" to every request — even
+/// cascade in `primary.rs`, dependent phases stay Blocked forever and
+/// the primary hands out "no tasks" to every request — even
 /// though the dependents have queued items.
 ///
 /// Scenario mirrors dataset-peer's stuck-dispatch bug from
@@ -559,7 +559,7 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
     assert_eq!(pool.phase_state(&phase_a), Some(PhaseState::Active));
     assert_eq!(pool.phase_state(&phase_b), Some(PhaseState::Blocked));
 
-    super::slurm::cascade_drain_done(&mut pool);
+    super::primary::cascade_drain_done(&mut pool);
 
     // Post-cascade: phase-A is Done (0 queued, 0 in_flight ⇒ Drained
     // ⇒ Done) and phase-B is Active (parent is Done).
@@ -576,9 +576,9 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
 ///      in primary-driven dispatch mode.
 ///
 /// Pre-fix the watchdog only logged a `tracing::warn!` and continued
-/// — a SLURM-promoted node with zero peers then sat in a tokio
+/// — a promoted node with zero peers then sat in a tokio
 /// busy-poll (dataset peer reported 86% CPU + 54k epoll_wait/sec on
-/// a stuck SLURM-primary for 25 minutes).
+/// a stuck primary for 25 minutes).
 #[tokio::test(flavor = "current_thread")]
 async fn peer_mesh_watchdog_fatal_error_sets_exit_and_notifies_primary() {
     use std::time::{Duration, Instant};

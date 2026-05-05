@@ -214,7 +214,7 @@ pub(super) async fn fake_secondary(
 /// `SecondaryConnectionState` → `peer_setup` is the load-bearing path
 /// to pin.
 ///
-/// Also stands in for the secondary-side SLURM-primary post-handoff:
+/// Also stands in for the secondary-side primary post-handoff:
 /// the real local primary now demotes itself the moment it sends
 /// `PromotePrimary` and stops dispatching, so the fake — when promoted
 /// via `PromotePrimary { new_primary_id == self }` — drains the
@@ -261,7 +261,7 @@ pub(super) async fn fake_secondary_with_addrs(
     // peer-mesh is settled (or there are no peers — which is the
     // default for the in-process tests), report MeshReady so the
     // primary's `wait_for_mesh_ready` step doesn't have to time out
-    // before promoting SLURM-primary. Fired pre-emptively here
+    // before promoting primary. Fired pre-emptively here
     // because the in-process fake doesn't model peer-dial latency.
     outgoing_to_primary
         .send(DistributedMessage::MeshReady {
@@ -272,18 +272,18 @@ pub(super) async fn fake_secondary_with_addrs(
         })
         .unwrap();
 
-    // Track whether this fake is the secondary-side SLURM-primary
+    // Track whether this fake is the secondary-side primary
     // (set by `PromotePrimary` if `new_primary_id` matches our id).
-    // Only the SLURM-primary drains the post-handoff `pending_tasks`
+    // Only the primary drains the post-handoff `pending_tasks`
     // list from `FullTaskList`; non-promoted secondaries ignore it
     // (in production they only consult their cache for failover).
-    let mut is_slurm_primary = false;
+    let mut is_primary = false;
     while let Some(msg) = incoming_from_primary.recv().await {
         match msg {
             DistributedMessage::PeerInfo { .. } => {}
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
                 if new_primary_id == secondary_id {
-                    is_slurm_primary = true;
+                    is_primary = true;
                 }
             }
             DistributedMessage::InitialAssignment {
@@ -334,16 +334,16 @@ pub(super) async fn fake_secondary_with_addrs(
                 }
             }
             DistributedMessage::TransferComplete { .. } => {}
-            // Stand in for the secondary-side SLURM-primary: when
+            // Stand in for the secondary-side primary: when
             // the real primary broadcasts `FullTaskList`, every task
             // that wasn't already in-flight (`pending_tasks`) is the
-            // SLURM-primary's responsibility. The real
+            // primary's responsibility. The real
             // SecondaryCoordinator drains those via its
-            // `slurm_pending` self-dispatch path; the fake
+            // `primary_pending` self-dispatch path; the fake
             // short-circuits and emits TaskComplete for each so the
             // counter-check exit can fire.
             DistributedMessage::FullTaskList { pending_tasks, .. } => {
-                if is_slurm_primary {
+                if is_primary {
                     for task_hash in pending_tasks {
                         outgoing_to_primary
                             .send(DistributedMessage::TaskComplete {

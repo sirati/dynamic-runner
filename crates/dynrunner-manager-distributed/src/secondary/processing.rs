@@ -90,7 +90,7 @@ where
                             //
                             // 2. Multi-secondary failover. The peer
                             //    mesh is alive, an election can
-                            //    pick a SLURM-primary, and dispatch
+                            //    pick a primary, and dispatch
                             //    can keep flowing. Backdating
                             //    `primary_last_seen` past the miss
                             //    threshold makes the next keepalive
@@ -106,12 +106,12 @@ where
                             // exited cleanly with completed=0 the
                             // moment the local primary's transport
                             // closed — losing every task the
-                            // SLURM-primary peer was about to
+                            // primary peer was about to
                             // dispatch. Dataset peer reported this
                             // on the dev-box-primary scenario.
                             let peers = self.peer_transport.peer_count();
 
-                            // SLURM-primary path: once this secondary has
+                            // primary path: once this secondary has
                             // been promoted, the local-machine primary's
                             // transport closing is BENIGN regardless of peer
                             // count. The promoted secondary owns the task
@@ -125,12 +125,12 @@ where
                             //      the local primary went silent ~30min in
                             //      — the legacy `pending_local` heuristic
                             //      conditioned termination on WORK STATE
-                            //      (slurm_in_flight / active_tasks /
-                            //      slurm_pending) instead of ROLE STATE
+                            //      (primary_in_flight / active_tasks /
+                            //      primary_pending) instead of ROLE STATE
                             //      and went wrong when those were
                             //      momentarily empty. Fixed in 5f6a267.
                             //   2. `peers > 0` branch: dataset's K=2 run
-                            //      had sec-0 (the promoted SLURM-primary)
+                            //      had sec-0 (the promoted primary)
                             //      enter "switching to failover detection
                             //      (election will run via peer mesh ...
                             //      once a peer is promoted)" — i.e. it
@@ -142,7 +142,7 @@ where
                             //      cascaded its peers into bail. Fixed
                             //      here, in this commit.
                             //
-                            // Pull the `is_slurm_primary` check OUT of the
+                            // Pull the `is_primary` check OUT of the
                             // peer-count branches so BOTH cases benefit:
                             // a promoted secondary should never re-enter
                             // election just because its bootstrap-time
@@ -150,13 +150,13 @@ where
                             // the natural terminal conditions
                             // (total-tasks / fleet-dead-analogue), NOT by
                             // the local primary's transport state.
-                            if self.is_slurm_primary {
+                            if self.is_primary {
                                 tracing::info!(
                                     connected_peers = peers,
-                                    in_flight = self.slurm_in_flight.len(),
+                                    in_flight = self.primary_in_flight.len(),
                                     active = self.active_tasks.len(),
-                                    pending = self.slurm_pending_len(),
-                                    "local primary disconnected; SLURM-primary continues \
+                                    pending = self.primary_pending_len(),
+                                    "local primary disconnected; primary continues \
                                      independently — this node owns the pool, local \
                                      primary's exit is benign post-promotion (no failover \
                                      election needed; this node IS the promoted primary)"
@@ -181,7 +181,7 @@ where
                                 connected_peers = peers,
                                 "primary transport closed; switching to failover detection \
                                  (election will run via peer mesh; further dispatch routes \
-                                 through slurm_primary_peer_id once a peer is promoted)"
+                                 through primary_peer_id once a peer is promoted)"
                             );
                             self.primary_disconnected = true;
                             let backdate = self
@@ -202,18 +202,18 @@ where
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog().await;
-                    // SLURM-primary retry pass. When this node is
-                    // acting as SLURM-primary and the main pass has
+                    // primary retry pass. When this node is
+                    // acting as primary and the main pass has
                     // drained with Recoverable failures still
-                    // pending, re-inject them into `slurm_pending`
+                    // pending, re-inject them into `primary_pending`
                     // and bump the pass counter (no-op for
                     // non-promoted secondaries or when the budget
                     // is exhausted). Runs BEFORE `repoll_idle_workers`
                     // so re-injected items are seen by the same
                     // tick's re-poll without waiting for the next
                     // keepalive cycle. Mirrors the local primary's
-                    // `run_retry_passes` — see slurm.rs.
-                    self.slurm_primary_drain_check_and_retry().await;
+                    // `run_retry_passes` — see primary.rs.
+                    self.primary_drain_check_and_retry().await;
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (`request_backoff` doubles on each
@@ -226,7 +226,7 @@ where
                     // complete. Most-load case: regular primary fires
                     // `dispatch_to_idle_workers` after every other
                     // worker's TaskComplete to push assignments,
-                    // which mostly shadows this — but the SLURM-
+                    // which mostly shadows this — but the
                     // primary path doesn't track per-peer worker
                     // idleness, so the periodic re-poll is the
                     // failover-safe wakeup.
@@ -260,28 +260,28 @@ where
                 return Err(reason);
             }
 
-            // SLURM-primary drain-down exit: when the live primary
+            // primary drain-down exit: when the live primary
             // disconnected (we suppressed the eager break above) and
             // every per-task ledger on this node has settled — pool
             // empty, in-flight empty, no active local tasks, retry
-            // budget exhausted (`slurm_primary_failed` empty or
+            // budget exhausted (`primary_failed` empty or
             // budget consumed) — the run is genuinely done. Break
             // here so `run()` returns and the process exits cleanly.
             // No-op while the live primary is alive (which is the
             // common case) since `primary_disconnected` is false.
             if self.primary_disconnected
-                && self.is_slurm_primary
+                && self.is_primary
                 && self.peer_transport.peer_count() == 0
-                && self.slurm_in_flight.is_empty()
+                && self.primary_in_flight.is_empty()
                 && self.active_tasks.is_empty()
-                && self.slurm_pending_is_empty()
-                && (self.slurm_primary_failed.is_empty()
-                    || self.slurm_primary_retry_passes_used
+                && self.primary_pending_is_empty()
+                && (self.primary_failed.is_empty()
+                    || self.primary_retry_passes_used
                         >= self.config.retry_max_passes)
             {
                 tracing::info!(
-                    permanent_failures = self.slurm_primary_failed.len(),
-                    "SLURM-primary drained after live-primary disconnect; exiting"
+                    permanent_failures = self.primary_failed.len(),
+                    "primary drained after live-primary disconnect; exiting"
                 );
                 break;
             }
@@ -313,7 +313,7 @@ where
             active_workers: active_count,
         };
         // Send to whoever is currently primary (local at run start;
-        // the SLURM-promoted peer after PromotePrimary).
+        // the promoted peer after PromotePrimary).
         let _ = self.send_to_current_primary(msg.clone()).await;
         // Broadcast to peers (including the primary if it's a peer —
         // duplicate but idempotent).
@@ -345,11 +345,11 @@ where
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
                     // `completed_tasks` is the "saw it terminate" set;
-                    // the SLURM-primary's dispatch path uses it to
+                    // the primary's dispatch path uses it to
                     // avoid redispatching tasks the cluster has
                     // already finished. For Recoverable failures we
                     // intend to retry, so the hash must NOT land here
-                    // — otherwise `handle_slurm_task_request` would
+                    // — otherwise `handle_primary_task_request` would
                     // filter the re-injected binary out via its
                     // `completed_tasks` retain, and retry silently
                     // becomes a no-op. Mirrors the pre-existing
@@ -371,12 +371,12 @@ where
                     }
 
                     if result.success {
-                        // Drive the SLURM-primary's phase machine if
+                        // Drive the primary's phase machine if
                         // this node is acting as one and dispatched
                         // the task — a no-op otherwise. Mid-run
                         // firing is what unblocks chained phases in
-                        // the SLURM-primary pool.
-                        self.note_slurm_item_completed(&hash);
+                        // the primary pool.
+                        self.note_primary_item_completed(&hash);
                         // Report completion to the current primary
                         // (whichever node currently holds authority).
                         let msg = DistributedMessage::TaskComplete {
@@ -391,23 +391,23 @@ where
                         let _ = self.peer_transport.broadcast(msg).await;
                     } else {
                         // Compute the wire-format error_type once so
-                        // the SLURM-primary failure ledger and the
+                        // the primary failure ledger and the
                         // outbound TaskFailed agree on the string.
                         let error_type = result
                             .error_type
                             .map(|e| format!("{:?}", e))
                             .unwrap_or_else(|| "Unknown".into());
                         // Failure-aware variant: Recoverable failures
-                        // land in `slurm_primary_failed` for the
+                        // land in `primary_failed` for the
                         // retry pass. Phase-machine in-flight
                         // bookkeeping is identical to the success
                         // case (decrement + cascade).
-                        self.note_slurm_item_failed(&hash, &error_type);
+                        self.note_primary_item_failed(&hash, &error_type);
                         // Synchronous drain-check (see peer.rs for
                         // rationale): immediately re-inject if this
                         // was the last in-flight task and there's
                         // retry budget left.
-                        self.slurm_primary_drain_check_and_retry().await;
+                        self.primary_drain_check_and_retry().await;
                         // Report error to the current primary.
                         let msg = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),

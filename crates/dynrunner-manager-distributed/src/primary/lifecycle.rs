@@ -136,7 +136,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
                 _ = heartbeat_tick.tick() => {
                     self.broadcast_primary_keepalive().await;
-                    // Demoted observer mode: the promoted SLURM-
+                    // Demoted observer mode: the promoted
                     // primary owns dead-secondary detection and the
                     // associated requeue. If the local primary also
                     // requeued, the same in-flight task would be
@@ -202,7 +202,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// kickstart the re-injected binaries would sit in the pool
     /// forever waiting for a TaskRequest that never comes.
     pub(super) async fn run_retry_passes(&mut self) -> Result<(), String> {
-        // Demoted observer mode: the promoted SLURM-primary owns
+        // Demoted observer mode: the promoted primary owns
         // retry orchestration. The local primary's `failed_tasks`
         // set still receives forwarded outcomes (so the run-done
         // counter check trips when everything is accounted for),
@@ -275,10 +275,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// after re-injection (workers won't send a fresh TaskRequest on
     /// their own — see the run_retry_passes comment). Mirrors the
     /// per-worker logic in `handle_task_request` minus the
-    /// SLURM-primary relay (which is irrelevant for the
+    /// primary relay (which is irrelevant for the
     /// non-promoted-primary at this stage).
     pub(super) async fn dispatch_to_idle_workers(&mut self) -> Result<(), String> {
-        // Demoted observer mode: the promoted SLURM-primary is the
+        // Demoted observer mode: the promoted primary is the
         // sole authority for dispatch. Returning here covers every
         // call site (kickstart from handle_task_complete /
         // handle_task_failed, plus the retry-pass kickstart) without
@@ -357,9 +357,9 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     // ── Phase 6.5: Wait for secondary peer-meshes to settle ──
 
     /// Block on every connected secondary reporting `MeshReady`
-    /// before letting `promote_slurm_primary` fire. The 750µs gap
+    /// before letting `promote_primary` fire. The 750µs gap
     /// between "all secondaries cert-exchanged" and the previous
-    /// promotion call left the SLURM-promoted secondary
+    /// promotion call left the promoted secondary
     /// authoritative against a still-forming peer mesh — every
     /// pre-mesh-formation message went into the void for the
     /// 30s peer-dial budget. Closing the gap means waiting until
@@ -408,7 +408,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             already_reported = self.mesh_ready_secondaries.len(),
             timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
             "waiting for peer-mesh formation across secondary fleet before \
-             promoting SLURM-primary"
+             promoting primary"
         );
 
         loop {
@@ -439,7 +439,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                         timeout_s = self.config.mesh_ready_timeout.as_secs_f64(),
                         "mesh-ready timeout: some secondaries never reported \
                          MeshReady; proceeding with PromotePrimary anyway. The \
-                         SLURM-promoted secondary may briefly route into a \
+                         promoted secondary may briefly route into a \
                          partially-formed peer mesh until those secondaries \
                          finish (or fail) their dials."
                     );
@@ -449,12 +449,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         }
     }
 
-    // ── Phase 7: Promote SLURM-primary ──
+    // ── Phase 7: Promote primary ──
 
-    pub(super) async fn promote_slurm_primary(&mut self) -> Result<(), String> {
+    pub(super) async fn promote_primary(&mut self) -> Result<(), String> {
         if let Some(first_id) = self.secondaries.keys().next().cloned() {
-            self.slurm_primary_id = Some(first_id.clone());
-            tracing::info!(slurm_primary = %first_id, "promoting secondary to SLURM-primary");
+            self.primary_id = Some(first_id.clone());
+            tracing::info!(primary = %first_id, "promoting secondary to primary");
 
             let msg = DistributedMessage::<I>::PromotePrimary {
                 sender_id: self.config.node_id.clone(),
@@ -477,7 +477,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // workers. See `demoted` doc on `PrimaryCoordinator`.
             self.demoted = true;
             tracing::info!(
-                slurm_primary = %first_id,
+                primary = %first_id,
                 "local primary demoted to observer; promoted secondary is sole authoritative primary"
             );
         }
@@ -487,11 +487,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     // ── Phase 8: Send full task list ──
 
     pub(super) async fn send_full_task_list(&mut self) -> Result<(), String> {
-        // Bail out if no SLURM-primary was promoted (Phase 7 no-op
+        // Bail out if no primary was promoted (Phase 7 no-op
         // when there are no secondaries yet). Every secondary still
         // gets the broadcast below — promotion just controls who
-        // gets the pre-designated routing pointer (`slurm_primary_id`).
-        if self.slurm_primary_id.is_none() {
+        // gets the pre-designated routing pointer (`primary_id`).
+        if self.primary_id.is_none() {
             return Ok(());
         }
 
@@ -510,7 +510,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             .collect();
 
         // Include both completed tasks and currently in-flight tasks as "completed"
-        // so the SLURM-primary doesn't re-assign tasks that are already being processed
+        // so the primary doesn't re-assign tasks that are already being processed
         let active_hashes: HashSet<String> = self
             .workers
             .iter()
@@ -536,15 +536,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             completed_tasks: completed_list,
             pending_tasks: pending_list,
             // Canonical phase-deps captured at `run()` start. Lets the
-            // promoted SLURM-primary build its post-promotion pool
+            // promoted primary build its post-promotion pool
             // with the same dependency-machine the primary used —
             // otherwise every phase looks zero-deps to the new
             // primary and dependent phases dispatch out of order.
             phase_deps: self.phase_deps.clone(),
         };
         // Broadcast to every secondary, not just the pre-designated
-        // SLURM-primary: F2 election picks a secondary on local-death
-        // and that pick may not be the same node `promote_slurm_primary`
+        // primary: F2 election picks a secondary on local-death
+        // and that pick may not be the same node `promote_primary`
         // picked (the latter uses HashMap iteration order; the former
         // uses lowest-id-wins). Every secondary needs the cached task
         // list so any election outcome is survivable. Single-cast
@@ -565,10 +565,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 );
             }
         }
-        let slurm_id = self.slurm_primary_id.clone().unwrap();
+        let pid = self.primary_id.clone().unwrap();
 
         tracing::info!(
-            slurm_primary = %slurm_id,
+            primary = %pid,
             total = self.all_binaries.len(),
             "sent full task list"
         );
