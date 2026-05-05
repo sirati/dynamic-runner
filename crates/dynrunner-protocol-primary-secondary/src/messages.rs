@@ -28,6 +28,11 @@ pub enum MessageType {
     TimeoutResponse,
     PromotionVote,
     PromotionConfirm,
+    /// Secondary signalling an unrecoverable local fault (e.g. peer
+    /// mesh fully failed to form). Sent once, immediately before the
+    /// secondary process exits non-zero. Primary treats the sender as
+    /// dead and runs the standard requeue path.
+    SecondaryFatalError,
 }
 
 /// Worker readiness information.
@@ -434,6 +439,19 @@ pub enum DistributedMessage<I> {
         new_primary_id: String,
         vote_round: u32,
     },
+    /// Secondary -> Primary unrecoverable-fault notification. The
+    /// secondary sets this just before exiting non-zero, so the
+    /// primary can drop it from the routable set + requeue any
+    /// in-flight tasks rather than waiting on the keepalive miss
+    /// threshold. `error` is a free-form human-readable description
+    /// of the fault (e.g. "peer mesh fully failed to form: 0 of N
+    /// peers reachable; cluster routing impossible").
+    SecondaryFatalError {
+        sender_id: String,
+        timestamp: f64,
+        secondary_id: String,
+        error: String,
+    },
 }
 
 impl<I> DistributedMessage<I> {
@@ -457,7 +475,8 @@ impl<I> DistributedMessage<I> {
             | Self::TimeoutQuery { sender_id, .. }
             | Self::TimeoutResponse { sender_id, .. }
             | Self::PromotionVote { sender_id, .. }
-            | Self::PromotionConfirm { sender_id, .. } => sender_id,
+            | Self::PromotionConfirm { sender_id, .. }
+            | Self::SecondaryFatalError { sender_id, .. } => sender_id,
         }
     }
 
@@ -481,7 +500,8 @@ impl<I> DistributedMessage<I> {
             | Self::TimeoutQuery { timestamp, .. }
             | Self::TimeoutResponse { timestamp, .. }
             | Self::PromotionVote { timestamp, .. }
-            | Self::PromotionConfirm { timestamp, .. } => *timestamp,
+            | Self::PromotionConfirm { timestamp, .. }
+            | Self::SecondaryFatalError { timestamp, .. } => *timestamp,
         }
     }
 
@@ -506,6 +526,7 @@ impl<I> DistributedMessage<I> {
             Self::TimeoutResponse { .. } => MessageType::TimeoutResponse,
             Self::PromotionVote { .. } => MessageType::PromotionVote,
             Self::PromotionConfirm { .. } => MessageType::PromotionConfirm,
+            Self::SecondaryFatalError { .. } => MessageType::SecondaryFatalError,
         }
     }
 }
