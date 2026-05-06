@@ -55,15 +55,24 @@ pub(super) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) ->
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn send_transfer_complete(&mut self) -> Result<(), String> {
-        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        for secondary_id in secondary_ids {
-            let msg = DistributedMessage::TransferComplete {
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                total_files: 0,
-                total_bytes: 0,
-            };
-            self.transport.send_to(&secondary_id, msg).await?;
+        let msg = DistributedMessage::TransferComplete {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            total_files: 0,
+            total_bytes: 0,
+        };
+        if let Err(failures) = self.transport.broadcast(msg).await {
+            for (secondary_id, error) in &failures {
+                tracing::warn!(
+                    secondary = %secondary_id,
+                    error = %error,
+                    "TransferComplete delivery failed"
+                );
+            }
+            return Err(format!(
+                "TransferComplete broadcast failed for {} secondaries",
+                failures.len()
+            ));
         }
         tracing::info!("transfer complete sent to all secondaries");
         Ok(())
@@ -605,16 +614,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // would mean the user-stated invariant — "local can disconnect
         // once everything is transmitted, and the rest continues" —
         // only held for `--jobs 1`; broadcasting closes that gap.
-        // SecondaryTransport doesn't have a broadcast primitive, so
-        // we fan out via send_to in a loop. Failures on individual
-        // secondaries are logged and continue — losing the cache on
-        // one secondary just means F2 won't pick that one to promote.
-        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        for secondary_id in &secondary_ids {
-            if let Err(e) = self.transport.send_to(secondary_id, msg.clone()).await {
+        // Failures on individual secondaries are logged and continue —
+        // losing the cache on one secondary just means F2 won't pick
+        // that one to promote.
+        if let Err(failures) = self.transport.broadcast(msg).await {
+            for (secondary_id, error) in &failures {
                 tracing::warn!(
                     secondary = %secondary_id,
-                    error = %e,
+                    error = %error,
                     "failed to broadcast FullTaskList; that secondary won't be a viable failover target"
                 );
             }

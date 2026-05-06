@@ -99,8 +99,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// failover election. Called from the operational loop on the same
     /// cadence as `collect_heartbeat_report`.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
-        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        if secondary_ids.is_empty() {
+        if self.secondaries.is_empty() {
             return;
         }
         let msg = DistributedMessage::<I>::Keepalive {
@@ -109,11 +108,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             secondary_id: self.config.node_id.clone(),
             active_workers: self.workers.iter().filter(|w| !w.is_idle).count() as u32,
         };
-        for secondary_id in secondary_ids {
-            if let Err(e) = self.transport.send_to(&secondary_id, msg.clone()).await {
+        if let Err(failures) = self.transport.broadcast(msg).await {
+            // Keepalive failures are debug-level: a secondary mid-disconnect
+            // generates one of these per tick until the heartbeat-monitor
+            // declares it dead. Surfacing each at warn would spam the log on
+            // an already-handled state transition.
+            for (secondary_id, error) in &failures {
                 tracing::debug!(
                     secondary = %secondary_id,
-                    error = %e,
+                    error = %error,
                     "primary keepalive delivery failed"
                 );
             }
@@ -190,6 +193,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         }
 
         // Notify every surviving secondary so they prune the dead peer.
+        // Not a broadcast: the dead secondary was just removed from
+        // `self.secondaries` and we want to skip it explicitly. The
+        // transport's own connection map may still hold a (about-to-die)
+        // sender for the dead one until its wire-level handler exits,
+        // and broadcasting would deliver a self-referential TimeoutDetected
+        // if the heartbeat-monitor's call was a false positive. Iterating
+        // the post-removal survivors avoids that race.
         let timeout_msg = DistributedMessage::<I>::TimeoutDetected {
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),

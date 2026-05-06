@@ -80,6 +80,23 @@ impl<I: Identifier> SecondaryTransport<I> for ChannelSecondaryTransportEnd<I> {
         }
         Ok(())
     }
+
+    async fn broadcast(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), Vec<(String, String)>> {
+        let mut errors = Vec::new();
+        for (secondary_id, tx) in &self.outgoing {
+            if let Err(e) = tx.send(msg.clone()) {
+                errors.push((secondary_id.clone(), e.to_string()));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 /// Channel-based transport for the secondary side of distributed coordination.

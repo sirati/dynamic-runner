@@ -15,6 +15,20 @@ pub trait SecondaryTransport<I: Identifier>:
         secondary_id: &str,
         msg: DistributedMessage<I>,
     ) -> impl std::future::Future<Output = Result<(), String>>;
+
+    /// Broadcast a message to every connected secondary.
+    ///
+    /// Implementations must drain pending new connections before iterating so a
+    /// secondary whose handshake completed since the last poll is not silently
+    /// skipped. Per-peer failures are returned as `(secondary_id, error)`
+    /// pairs; the broadcast itself succeeds (`Ok(())`) when every peer's
+    /// outgoing channel accepted the message. Callers choose the log severity
+    /// for partial failures (e.g. `debug` for high-cadence keepalives, `warn`
+    /// for low-cadence control messages).
+    fn broadcast(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> impl std::future::Future<Output = Result<(), Vec<(String, String)>>>;
 }
 
 /// Transport trait for the secondary side: send to / receive from the primary.
