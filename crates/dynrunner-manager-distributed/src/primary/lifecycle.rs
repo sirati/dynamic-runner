@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
@@ -11,8 +11,47 @@ use dynrunner_scheduler_api::{
 };
 
 
-use super::PrimaryCoordinator;
+use super::{PrimaryCoordinator, RemoteWorkerState};
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
+
+/// Order idle worker indices for a single dispatch tick, biasing
+/// toward secondaries with fewer currently-running tasks. Stable
+/// tie-break by `worker_id` so equal-loaded secondaries fall through
+/// to the existing iteration order.
+///
+/// Pre-fix the flat `0..workers.len()` scan iterated workers grouped
+/// by secondary (the order initial-assignment populates them), giving
+/// the first-iterated secondary's idle workers systematic priority
+/// when both sides had idle capacity. Tail-of-phase dispatches —
+/// where the pool has fewer items than there are idle workers — then
+/// concentrated remaining work on the already-loaded secondary
+/// instead of spreading across the fleet.
+pub(super) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) -> Vec<usize> {
+    let mut load_per_secondary: HashMap<&str, usize> = HashMap::new();
+    for w in workers {
+        if w.current_task.is_some() {
+            *load_per_secondary
+                .entry(w.secondary_id.as_str())
+                .or_default() += 1;
+        }
+    }
+    let mut idle: Vec<usize> = workers
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.is_idle)
+        .map(|(i, _)| i)
+        .collect();
+    idle.sort_by_key(|&i| {
+        (
+            load_per_secondary
+                .get(workers[i].secondary_id.as_str())
+                .copied()
+                .unwrap_or(0),
+            workers[i].worker_id,
+        )
+    });
+    idle
+}
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub(super) async fn send_transfer_complete(&mut self) -> Result<(), String> {
@@ -287,17 +326,21 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         if self.demoted {
             return Ok(());
         }
-        for worker_idx in 0..self.workers.len() {
-            if !self.workers[worker_idx].is_idle {
-                continue;
-            }
+        // Visit idle workers in load-aware order so a secondary with
+        // many in-flight tasks doesn't keep winning tail-of-phase
+        // dispatches against an idler peer. `dispatch_order` filters
+        // to idle and sorts by (busy-workers-on-secondary, worker_id).
+        let order = dispatch_order(&self.workers);
+        for worker_idx in order {
             // Skip workers belonging to a secondary that's currently
             // in backpressure backoff — see
             // `backpressured_secondaries` doc on `PrimaryCoordinator`.
             // Without this, the kickstart would re-target the same
             // unresponsive secondary in a tight loop, which is
             // exactly the failure storm 07ae301-followup is
-            // designed to break.
+            // designed to break. Re-checked inline (not pre-filtered
+            // in `dispatch_order`) so a backpressure window that
+            // opens mid-tick takes effect immediately.
             if self.is_backpressured(&self.workers[worker_idx].secondary_id) {
                 continue;
             }
