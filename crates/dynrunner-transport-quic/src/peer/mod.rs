@@ -86,6 +86,15 @@ pub struct PeerNetwork<I: Identifier> {
     /// originator. Forwarders never allocate — they preserve the
     /// originator's id.
     pub(super) next_relay_id: u64,
+    /// Cross-relay blacklist of forwarders that recently bounced a
+    /// relay back. Keyed by `(target, forwarder)`: a forwarder F
+    /// that failed to deliver to target T1 is NOT also blacklisted
+    /// for target T2 — the partition that broke F→T1 may not affect
+    /// F→T2. Entries expire after `BLACKLIST_TTL` (2 min) so a
+    /// direct link re-established in the meantime gets re-tried
+    /// rather than shadowed forever.
+    pub(super) failed_forwarders:
+        HashMap<(String, String), std::time::Instant>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -136,6 +145,7 @@ impl<I: Identifier> PeerNetwork<I> {
             route_state: HashMap::new(),
             outgoing_relays: HashMap::new(),
             next_relay_id: 0,
+            failed_forwarders: HashMap::new(),
         })
     }
 
