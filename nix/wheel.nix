@@ -29,7 +29,7 @@ buildPythonPackage {
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     src = lib.cleanSource ./..;
-    hash = "sha256-e6zBvDdoFv0jKSIOHVIoQVgWddfXtVm0BsGacCPfH38=";
+    hash = "sha256-ljkPI8SRLmoZONAG91yWM3PHCJ3HKIBpvhPzTcgR25A=";
   };
 
   nativeBuildInputs = [
