@@ -338,6 +338,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 self.workers[worker_idx].estimated_resources = estimated_usage;
                 self.workers[worker_idx].is_idle = false;
 
+                let task_hash = compute_task_hash(&binary);
                 let assignment_msg = DistributedMessage::TaskAssignment {
                     sender_id: self.config.node_id.clone(),
                     timestamp: timestamp_now(),
@@ -346,9 +347,19 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     zip_file: None,
                     binary_info: binary_to_distributed(&binary),
                     local_path: self.config.wire_local_path(&binary),
-                    file_hash: compute_task_hash(&binary),
+                    file_hash: task_hash.clone(),
                 };
                 self.transport.send_to(&sec_id, assignment_msg).await?;
+
+                tracing::info!(
+                    secondary = %sec_id,
+                    worker_id = local_worker_id,
+                    task_id = ?binary.task_id,
+                    phase = %binary.phase_id,
+                    task_type = %binary.type_id,
+                    task_hash = %task_hash,
+                    "task assigned"
+                );
             }
         }
         Ok(())

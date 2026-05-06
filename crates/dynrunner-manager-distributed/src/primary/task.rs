@@ -129,6 +129,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                         self.workers[idx].estimated_resources = estimated_usage;
                         self.workers[idx].is_idle = false;
 
+                        let task_hash = compute_task_hash(&binary);
                         let assignment_msg = DistributedMessage::TaskAssignment {
                             sender_id: self.config.node_id.clone(),
                             timestamp: timestamp_now(),
@@ -137,14 +138,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                             zip_file: None,
                             binary_info: binary_to_distributed(&binary),
                             local_path: self.config.wire_local_path(&binary),
-                            file_hash: compute_task_hash(&binary),
+                            file_hash: task_hash.clone(),
                         };
                         self.transport.send_to(&sec_id, assignment_msg).await?;
 
-                        tracing::debug!(
+                        tracing::info!(
                             secondary = %sec_id,
                             worker_id,
-                            binary = ?binary.identifier,
+                            task_id = ?binary.task_id,
+                            phase = %binary.phase_id,
+                            task_type = %binary.type_id,
+                            task_hash = %task_hash,
                             "task assigned"
                         );
                         assigned = true;
@@ -223,17 +227,21 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
+            tracing::info!(
+                secondary = %secondary_id,
+                worker_id,
+                task_id = ?completed_meta.as_ref().and_then(|(_, _, t)| t.as_deref()),
+                phase = ?completed_meta.as_ref().map(|(p, _, _)| p.to_string()),
+                task_type = ?completed_meta.as_ref().map(|(_, t, _)| t.to_string()),
+                task_hash = %task_hash,
+                completed = self.completed_tasks.len(),
+                "task complete"
+            );
+
             if let Some((phase, type_id, task_id)) = completed_meta {
                 self.release_type_slot(&type_id);
                 self.note_item_completed(&phase, task_id.as_deref());
             }
-
-            tracing::debug!(
-                secondary = %secondary_id,
-                worker_id,
-                completed = self.completed_tasks.len(),
-                "task complete"
-            );
 
             // Kickstart dispatch to every idle worker. After
             // `note_item_completed` runs the phase-lifecycle cascade,
@@ -401,18 +409,23 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // never reached `failed_tasks`, so its retry budget
             // stays untouched.
             self.failed_tasks.insert(task_hash.clone());
-            if let Some(binary) = recovered_binary {
-                self.release_type_slot(&binary.type_id);
-                self.note_item_failed(&binary.phase_id, binary.task_id.as_deref());
-            }
 
             tracing::warn!(
                 secondary = %secondary_id,
                 worker_id,
+                task_id = ?recovered_binary.as_ref().and_then(|b| b.task_id.as_deref()),
+                phase = ?recovered_binary.as_ref().map(|b| b.phase_id.to_string()),
+                task_type = ?recovered_binary.as_ref().map(|b| b.type_id.to_string()),
+                task_hash = %task_hash,
                 error_type = %error_type,
                 error = %error_message,
                 "task failed"
             );
+
+            if let Some(binary) = recovered_binary {
+                self.release_type_slot(&binary.type_id);
+                self.note_item_failed(&binary.phase_id, binary.task_id.as_deref());
+            }
 
             // Same kickstart rationale as `handle_task_complete`:
             // `note_item_failed` may have just cascaded a phase

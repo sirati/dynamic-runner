@@ -458,6 +458,7 @@ where
 
         if let Some(binary) = assigned {
             let file_hash = task_file_hash(&binary);
+            let log_task_hash = file_hash.clone();
             // The pool's `take_first_match` is a removal-only primitive
             // — it does not bump in-flight. Pair the dispatch with an
             // explicit `mark_in_flight` so the phase machine treats
@@ -590,7 +591,10 @@ where
             tracing::info!(
                 secondary = %requesting_secondary_id,
                 worker_id,
-                binary = ?binary.identifier,
+                task_id = ?binary.task_id,
+                phase = %binary.phase_id,
+                task_type = %binary.type_id,
+                task_hash = %log_task_hash,
                 remaining = self.primary_pending_len(),
                 "primary assigned task"
             );

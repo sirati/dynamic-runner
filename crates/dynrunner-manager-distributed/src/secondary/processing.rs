@@ -341,6 +341,7 @@ where
                     .iter()
                     .find(|&(_, &wid)| wid == worker_id)
                     .map(|(hash, _)| hash.clone());
+                let log_task_hash = file_hash.clone();
 
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
@@ -429,8 +430,12 @@ where
                 }
 
                 tracing::info!(
+                    secondary = %self.config.secondary_id,
                     worker_id,
-                    binary = ?binary.as_ref().map(|b| &b.identifier),
+                    task_id = ?binary.as_ref().and_then(|b| b.task_id.as_deref()),
+                    phase = ?binary.as_ref().map(|b| b.phase_id.to_string()),
+                    task_type = ?binary.as_ref().map(|b| b.type_id.to_string()),
+                    task_hash = ?log_task_hash,
                     success = result.success,
                     "task completed"
                 );
