@@ -2069,3 +2069,79 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
         );
     }).await;
 }
+
+// ── Backlog L2: load-aware dispatch ordering ──
+
+fn make_remote_worker(
+    worker_id: u32,
+    secondary_id: &str,
+    busy: bool,
+) -> RemoteWorkerState<TestId> {
+    RemoteWorkerState {
+        worker_id,
+        secondary_id: secondary_id.into(),
+        resource_budgets: dynrunner_core::ResourceMap::new(),
+        current_task: if busy { Some(make_binary("placeholder", 0)) } else { None },
+        estimated_resources: dynrunner_core::ResourceMap::new(),
+        is_idle: !busy,
+    }
+}
+
+#[test]
+fn dispatch_order_equal_load_preserves_worker_id_order() {
+    let workers = vec![
+        make_remote_worker(0, "A", false),
+        make_remote_worker(1, "A", false),
+        make_remote_worker(2, "B", false),
+        make_remote_worker(3, "B", false),
+    ];
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert_eq!(order, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn dispatch_order_prefers_less_loaded_secondary() {
+    // A has 2 busy + 2 idle (load 2). B has 0 busy + 2 idle (load 0).
+    // B's idle workers must come before A's even though A's worker_ids
+    // are lower — the pre-fix iteration order would have given A first
+    // dibs on tail-of-phase items.
+    let workers = vec![
+        make_remote_worker(0, "A", true),
+        make_remote_worker(1, "A", true),
+        make_remote_worker(2, "A", false),
+        make_remote_worker(3, "A", false),
+        make_remote_worker(4, "B", false),
+        make_remote_worker(5, "B", false),
+    ];
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert_eq!(order, vec![4, 5, 2, 3]);
+}
+
+#[test]
+fn dispatch_order_excludes_busy_workers() {
+    let workers = vec![
+        make_remote_worker(0, "A", true),
+        make_remote_worker(1, "A", false),
+        make_remote_worker(2, "B", true),
+        make_remote_worker(3, "B", false),
+    ];
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert_eq!(order, vec![1, 3]);
+}
+
+#[test]
+fn dispatch_order_empty_workers() {
+    let workers: Vec<RemoteWorkerState<TestId>> = vec![];
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert!(order.is_empty());
+}
+
+#[test]
+fn dispatch_order_no_idle_workers() {
+    let workers = vec![
+        make_remote_worker(0, "A", true),
+        make_remote_worker(1, "B", true),
+    ];
+    let order = super::lifecycle::dispatch_order(&workers);
+    assert!(order.is_empty());
+}
