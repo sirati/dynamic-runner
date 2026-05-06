@@ -6,7 +6,8 @@
 //! consumes [`RouteDecision`] and [`BackoffDecision`] and applies
 //! them via the per-peer mpsc channels.
 
-use std::time::{Duration, SystemTime};
+use std::collections::HashSet;
+use std::time::{Duration, Instant, SystemTime};
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
@@ -22,6 +23,13 @@ use super::PeerNetwork;
 /// than the 30s peer-keepalive miss threshold so a dead-letter
 /// state doesn't outlive the peer it was waiting on.
 const RELAY_STATE_TTL: Duration = Duration::from_secs(20);
+
+/// How long a per-target forwarder failure stays in the blacklist
+/// before subsequent relays will retry that forwarder again. Picked
+/// long enough that we don't hammer a confirmed-dead path on every
+/// outbound message, but short enough that a re-established direct
+/// link recovers without a whole-process restart.
+const BLACKLIST_TTL: Duration = Duration::from_secs(120);
 
 fn timestamp_secs() -> f64 {
     std::time::SystemTime::now()
@@ -47,6 +55,37 @@ fn prune_stale<I>(
     });
 }
 
+/// Drop blacklist entries older than `BLACKLIST_TTL`. Cheap O(N) on
+/// the active blacklist; called inline on each send/recv so a
+/// recovered direct link gets re-tried as soon as the next relay
+/// crosses this transport.
+fn prune_blacklist(
+    failed_forwarders: &mut std::collections::HashMap<(String, String), Instant>,
+) {
+    let now = Instant::now();
+    failed_forwarders
+        .retain(|_, t| now.duration_since(*t) < BLACKLIST_TTL);
+}
+
+/// Build the per-target blacklist for a routing decision: the set
+/// of forwarder peer ids whose `(target, peer)` entry exists and is
+/// still within the TTL. Caller passes this into the routing
+/// helpers so steady-state `Direct` checks remain unaffected (the
+/// target itself is never blacklisted).
+fn blacklist_for(
+    failed_forwarders: &std::collections::HashMap<(String, String), Instant>,
+    target: &str,
+) -> HashSet<String> {
+    let now = Instant::now();
+    failed_forwarders
+        .iter()
+        .filter(|((t, _), ts)| {
+            t == target && now.duration_since(**ts) < BLACKLIST_TTL
+        })
+        .map(|((_, peer), _)| peer.clone())
+        .collect()
+}
+
 impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         self.drain_new_connections();
@@ -70,8 +109,10 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
     ) -> Result<(), String> {
         self.drain_new_connections();
         prune_stale(&mut self.outgoing_relays);
+        prune_blacklist(&mut self.failed_forwarders);
         let now = timestamp_secs();
         let relay_id = self.next_relay_id;
+        let blacklist = blacklist_for(&self.failed_forwarders, peer_id);
         let decision = route_send(
             &self.connections,
             &self.peer_id,
@@ -79,6 +120,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
             relay_id,
             msg,
             now,
+            &blacklist,
         );
         match decision {
             RouteDecision::Direct(direct) => {
@@ -143,6 +185,11 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             if target_id == self.peer_id {
                                 return Some(*inner);
                             }
+                            prune_blacklist(&mut self.failed_forwarders);
+                            let blacklist = blacklist_for(
+                                &self.failed_forwarders,
+                                &target_id,
+                            );
                             let decision = forward_step(
                                 &self.connections,
                                 &self.peer_id,
@@ -152,6 +199,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                                 timestamp,
                                 &sender_id,
                                 inner,
+                                &blacklist,
                             );
                             self.apply_forward_decision(
                                 decision,
@@ -332,8 +380,9 @@ impl<I: Identifier> PeerNetwork<I> {
     }
 
     /// Handle an inbound `RelayBackoff` for `(original_sender,
-    /// relay_id)`: look up our state, ask the routing helper what
-    /// to do, and apply.
+    /// relay_id)`: look up our state, record the failed forwarder
+    /// in the per-target blacklist for future relays, ask the
+    /// routing helper what to do, and apply.
     fn handle_inbound_backoff(
         &mut self,
         original_sender: String,
@@ -349,6 +398,14 @@ impl<I: Identifier> PeerNetwork<I> {
                 return;
             }
         };
+        // Record per-target so subsequent relays don't keep paying
+        // the same dead-end. Keyed by (target, forwarder) so the
+        // failure of `failed_via` to deliver to `state.target`
+        // doesn't blacklist it for any other destination.
+        self.failed_forwarders
+            .insert((state.target.clone(), failed_via.clone()), Instant::now());
+        prune_blacklist(&mut self.failed_forwarders);
+        let blacklist = blacklist_for(&self.failed_forwarders, &state.target);
         let now = timestamp_secs();
         let decision = handle_backoff(
             state,
@@ -357,6 +414,7 @@ impl<I: Identifier> PeerNetwork<I> {
             relay_id,
             &failed_via,
             now,
+            &blacklist,
         );
         match decision {
             BackoffDecision::Retry { via, wrapped } => {
