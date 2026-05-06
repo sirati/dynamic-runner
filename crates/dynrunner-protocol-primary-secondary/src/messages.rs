@@ -39,6 +39,10 @@ pub enum MessageType {
     /// observes this variant; `PeerTransport::recv_peer` unwraps it
     /// or forwards it transparently.
     RelayMessage,
+    /// Wire-only signal from a forwarder back to its predecessor:
+    /// "I couldn't forward your relay; mark me tried and pick
+    /// another." Identified by `(original_sender, relay_id)`.
+    RelayBackoff,
 }
 
 /// Worker readiness information.
@@ -496,15 +500,16 @@ pub enum DistributedMessage<I> {
     /// or appends itself to `path` and forwards to another non-`path`
     /// peer if not.
     ///
-    /// `path` records every peer the message has visited (sender plus
-    /// each forwarder, in order). Loop prevention: a forwarder MUST
-    /// pick a candidate that is not in `path`, not the target itself,
-    /// and not its own id. If no such candidate exists, the relay is
-    /// dropped with a warn — multi-hop backtracking ("ask previous to
-    /// choose another peer") would need a stateful round-trip
-    /// protocol and is intentionally deferred to a follow-up; the
-    /// path field is the wire shape the future protocol will plug
-    /// into without another schema bump.
+    /// `path` records every peer the message has visited (originator
+    /// plus each forwarder, in order). Loop prevention: a forwarder
+    /// MUST pick a candidate that is not in `path`, not the target
+    /// itself, and not its own id. If no such candidate exists, the
+    /// forwarder sends a [`RelayBackoff`] back to its predecessor
+    /// (the last entry in `path` from its view) so the predecessor
+    /// can mark this forwarder tried and pick another candidate.
+    /// `relay_id` is the originator's monotonic counter; the
+    /// cluster-wide key is `(sender_id, relay_id)` so collisions
+    /// between independent originators are impossible.
     ///
     /// Application code never observes `Relay` — `recv_peer` strips
     /// the envelope before delivery.
@@ -512,8 +517,23 @@ pub enum DistributedMessage<I> {
         sender_id: String,
         timestamp: f64,
         target_id: String,
+        relay_id: u64,
         path: Vec<String>,
         inner: Box<DistributedMessage<I>>,
+    },
+    /// Wire-only signal from a forwarder back to its predecessor in
+    /// the relay path: "I (`sender_id`) could not forward
+    /// `relay_id` — mark me tried and try another peer."
+    /// Predecessor looks up its `outgoing_relays[(orig_sender,
+    /// relay_id)]` state, removes `sender_id` from candidates, and
+    /// either retries with the next-lowest-id reachable peer or
+    /// propagates the backoff one step further back. The originator
+    /// drops the relay with a warn when its own candidates exhaust.
+    RelayBackoff {
+        sender_id: String,
+        timestamp: f64,
+        original_sender: String,
+        relay_id: u64,
     },
 }
 
@@ -541,7 +561,8 @@ impl<I> DistributedMessage<I> {
             | Self::PromotionVote { sender_id, .. }
             | Self::PromotionConfirm { sender_id, .. }
             | Self::SecondaryFatalError { sender_id, .. }
-            | Self::Relay { sender_id, .. } => sender_id,
+            | Self::Relay { sender_id, .. }
+            | Self::RelayBackoff { sender_id, .. } => sender_id,
         }
     }
 
@@ -568,7 +589,8 @@ impl<I> DistributedMessage<I> {
             | Self::PromotionVote { timestamp, .. }
             | Self::PromotionConfirm { timestamp, .. }
             | Self::SecondaryFatalError { timestamp, .. }
-            | Self::Relay { timestamp, .. } => *timestamp,
+            | Self::Relay { timestamp, .. }
+            | Self::RelayBackoff { timestamp, .. } => *timestamp,
         }
     }
 
@@ -596,6 +618,7 @@ impl<I> DistributedMessage<I> {
             Self::PromotionConfirm { .. } => MessageType::PromotionConfirm,
             Self::SecondaryFatalError { .. } => MessageType::SecondaryFatalError,
             Self::Relay { .. } => MessageType::RelayMessage,
+            Self::RelayBackoff { .. } => MessageType::RelayBackoff,
         }
     }
 }

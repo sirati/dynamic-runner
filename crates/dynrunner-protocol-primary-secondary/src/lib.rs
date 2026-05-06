@@ -5,5 +5,8 @@ pub mod transport;
 
 pub use messages::*;
 pub use codec::{serialize_message, deserialize_message, decode_frame};
-pub use relay::{observe_transition, pick_relay, route_send, RouteDecision, RouteState};
+pub use relay::{
+    forward_step, handle_backoff, observe_transition, pick_relay, route_send, BackoffDecision,
+    OutgoingRelay, RouteDecision, RouteState,
+};
 pub use transport::{PeerTransport, PrimaryTransport, SecondaryTransport};
