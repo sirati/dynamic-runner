@@ -597,6 +597,54 @@ mod tests {
         assert!(sec.is_primary);
     }
 
+    /// Regression: pre-designated primary's election state stays
+    /// Promoted even when the local-machine primary's keepalives go
+    /// silent. Pre-fix the `PromotePrimary` handler set
+    /// `is_primary=true` but left `election=Normal`, so the
+    /// keepalive-tick path's `if Promoted return` early-return did
+    /// nothing for the pre-designated primary — the local primary's
+    /// transport going silent post-promotion (its observer-mode
+    /// demotion) drove the SLURM-primary itself into Suspecting and
+    /// then Candidate, dropping its in-flight ledger via a self-re-
+    /// promotion cascade. Surfaced in tokenizer's v6 trace.
+    ///
+    /// Drives the real `dispatch_message` PromotePrimary arm so the
+    /// test would fail without the dispatch.rs fix that syncs
+    /// `election` with `is_primary`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_designated_primary_ignores_silent_local_primary() {
+        let mut sec = make_secondary(election_config("sec-a"));
+        // Pre-promotion: Normal state, is_primary defaults false.
+        assert!(matches!(sec.election, ElectionState::Normal));
+        assert!(!sec.is_primary);
+
+        // Receive PromotePrimary naming this node — exercises the
+        // dispatch.rs handler that must set both fields in lockstep.
+        let promote = DistributedMessage::PromotePrimary {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "sec-a".into(),
+        };
+        sec.dispatch_message(promote)
+            .await
+            .expect("PromotePrimary handler succeeds");
+        assert!(sec.is_primary);
+        assert!(matches!(sec.election, ElectionState::Promoted));
+
+        // Local primary stops sending keepalives — its observer-mode
+        // demotion is benign post-promotion.
+        sec.primary_last_seen = Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(60),
+        );
+
+        // Pre-fix this would have entered Suspecting and started a
+        // self-re-promotion cascade. Post-fix the early-return fires.
+        let actions = sec.run_election_tick();
+        assert!(actions.broadcast.is_empty());
+        assert!(matches!(sec.election, ElectionState::Promoted));
+        assert!(sec.is_primary);
+    }
+
     /// Scenario (d): two peers detect primary death simultaneously and both
     /// would-be-candidates start voting. The lowest-id rule + quorum
     /// resolves to a single winner; the higher-id peer defers to Voting

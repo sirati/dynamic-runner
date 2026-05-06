@@ -9,6 +9,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
 use super::SecondaryCoordinator;
+use super::election::ElectionState;
 use super::wire::{distributed_to_binary, timestamp_now};
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -186,6 +187,22 @@ where
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
                 self.is_primary = new_primary_id == self.config.secondary_id;
                 if self.is_primary {
+                    // Sync the election state machine with the role
+                    // change so `run_election_tick`'s
+                    // `if Promoted return` early-return guards this
+                    // node too. Pre-fix the pre-designated primary
+                    // had `is_primary=true` but `election=Normal`,
+                    // so the keepalive-tick path entered Suspecting
+                    // the moment local-primary keepalives went
+                    // silent (which is benign post-promotion: the
+                    // local primary has demoted itself per
+                    // `lifecycle.rs`'s observer-mode contract).
+                    // Self-suspect cascaded into self-re-promotion,
+                    // hydrated the new pool from a stale
+                    // initial-assignment-time snapshot, and dropped
+                    // every in-flight task. Surfaced in tokenizer's
+                    // v6 trace.
+                    self.election = ElectionState::Promoted;
                     tracing::info!("this secondary has been promoted to primary");
                 } else {
                     tracing::info!(
