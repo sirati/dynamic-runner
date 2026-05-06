@@ -7,6 +7,7 @@ use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
 
+use crate::cluster_state::ClusterState;
 use crate::state::SecondaryConnectionState;
 
 /// Per-phase lifecycle hook invoked by the coordinator when a phase
@@ -388,6 +389,14 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     // and `content_hash` is the SHA256 of the file contents (used
     // by the secondary's staging integrity check).
     pub(super) pending_stage_files: Vec<(String, String, String, String, String)>,
+
+    /// Replicated cluster ledger. The primary originates `TaskAdded`,
+    /// `TaskCompleted`, `TaskFailed`, and (post-Phase-L) `TaskAssigned`
+    /// mutations; each one is applied locally and broadcast so every
+    /// secondary's mirror converges to the same view. CRDT semantics
+    /// (idempotent under repetition + reorder within the per-task
+    /// happens-before constraint) live in `cluster_state.rs`.
+    pub(super) cluster_state: ClusterState<I>,
 }
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
@@ -419,6 +428,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             primary_id: None,
             demoted: false,
             pending_stage_files: Vec::new(),
+            cluster_state: ClusterState::new(),
         }
     }
 
@@ -516,6 +526,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         self.secondaries.len()
     }
 
+    /// Test-only inspector for the primary's replicated cluster
+    /// ledger. Returns the per-state counts so tests can assert
+    /// convergence with secondaries' mirrors.
+    #[cfg(test)]
+    pub fn cluster_state_counts_for_test(&self) -> crate::cluster_state::StateCounts {
+        self.cluster_state.counts()
+    }
+
     /// Run the full coordination pipeline.
     ///
     /// `phase_deps` declares the per-phase `depends_on` graph. Items in
@@ -599,6 +617,14 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
         // Phase 4: Wait for peer connections (skip for single secondary)
         self.wait_for_peer_connections().await?;
+
+        // Phase 4.5: Seed the replicated cluster ledger with `TaskAdded`
+        // for every binary in the run. Every secondary applies the
+        // batch and now mirrors the same `Pending` set the primary
+        // sees, so subsequent CRDT broadcasts (TaskCompleted, TaskFailed,
+        // and post-Phase-L TaskAssigned) compose against a coherent
+        // baseline on every node.
+        self.seed_cluster_state().await;
 
         // Phase 5: Initial assignment.
         // `perform_initial_assignment` now drains

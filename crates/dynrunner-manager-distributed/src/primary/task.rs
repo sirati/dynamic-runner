@@ -1,9 +1,9 @@
 
 use std::time::Instant;
 
-use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
+use dynrunner_core::{ErrorType, TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage,
+    ClusterMutation, DistributedMessage,
     SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
@@ -189,6 +189,16 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // exactly one of {completed, failed}.
             self.failed_tasks.remove(task_hash);
             self.completed_tasks.insert(task_hash.clone());
+            // Replicated-ledger update: every node mirrors the
+            // post-completion state by applying this mutation. CRDT
+            // semantics make duplicate applies (e.g. on a re-broadcast
+            // for a task already terminal locally) a NoOp.
+            self.apply_and_broadcast_cluster_mutations(vec![
+                ClusterMutation::TaskCompleted {
+                    hash: task_hash.clone(),
+                },
+            ])
+            .await;
 
             // A successful TaskComplete from this secondary proves
             // it's healthy — clear any backpressure backoff. The
@@ -409,6 +419,25 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // never reached `failed_tasks`, so its retry budget
             // stays untouched.
             self.failed_tasks.insert(task_hash.clone());
+            // Replicated-ledger update: every node mirrors the
+            // post-failure state. The wire `error_type` is a legacy
+            // string convention (Phase D round-trips ErrorType through
+            // the wire format properly); for the CRDT we map known
+            // tokens onto the enum and fall back to NonRecoverable for
+            // anything we don't recognise so the mutation still
+            // converges to a terminal Failed.
+            let kind = match error_type.as_str() {
+                "Recoverable" => ErrorType::Recoverable,
+                _ => ErrorType::NonRecoverable,
+            };
+            self.apply_and_broadcast_cluster_mutations(vec![
+                ClusterMutation::TaskFailed {
+                    hash: task_hash.clone(),
+                    kind,
+                    error: error_message.clone(),
+                },
+            ])
+            .await;
 
             tracing::warn!(
                 secondary = %secondary_id,

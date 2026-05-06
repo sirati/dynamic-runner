@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use dynrunner_core::{Identifier, PhaseId, ResourceAmount, TaskInfo};
 use serde::{Deserialize, Serialize};
 
+use crate::cluster_mutation::ClusterMutation;
+
 /// All distributed message types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +36,13 @@ pub enum MessageType {
     /// secondary process exits non-zero. Primary treats the sender as
     /// dead and runs the standard requeue path.
     SecondaryFatalError,
+    /// Replicated cluster-state mutation. Carries one or more
+    /// `ClusterMutation`s (TaskAdded / TaskAssigned / TaskCompleted /
+    /// TaskFailed / PrimaryChanged) for receivers to apply against
+    /// their local `ClusterState`. See
+    /// `dynrunner_manager_distributed::cluster_state` for the CRDT
+    /// semantics; this variant is purely the wire envelope.
+    ClusterMutation,
     /// Wire-only envelope: peer-to-peer relay when the direct A↔B
     /// link is unreachable but A↔C↔B is. The application layer never
     /// observes this variant; `PeerTransport::recv_peer` unwraps it
@@ -494,6 +503,18 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         error: String,
     },
+    /// Replicated cluster-state mutations. Receivers apply each
+    /// mutation in order against their local
+    /// `dynrunner_manager_distributed::cluster_state::ClusterState`.
+    /// Carrying a `Vec` instead of a single mutation lets the
+    /// originator batch the bulk-load case (thousands of `TaskAdded`
+    /// at run start) into one wire message; single-mutation events
+    /// (one `TaskAssigned` per dispatch) use a one-element vec.
+    ClusterMutation {
+        sender_id: String,
+        timestamp: f64,
+        mutations: Vec<ClusterMutation<I>>,
+    },
     /// Wire-only relay envelope. A peer that can't reach `target_id`
     /// directly wraps the message in this variant and sends it to a
     /// reachable forwarder; the forwarder unwraps if it's the target,
@@ -561,6 +582,7 @@ impl<I> DistributedMessage<I> {
             | Self::PromotionVote { sender_id, .. }
             | Self::PromotionConfirm { sender_id, .. }
             | Self::SecondaryFatalError { sender_id, .. }
+            | Self::ClusterMutation { sender_id, .. }
             | Self::Relay { sender_id, .. }
             | Self::RelayBackoff { sender_id, .. } => sender_id,
         }
@@ -589,6 +611,7 @@ impl<I> DistributedMessage<I> {
             | Self::PromotionVote { timestamp, .. }
             | Self::PromotionConfirm { timestamp, .. }
             | Self::SecondaryFatalError { timestamp, .. }
+            | Self::ClusterMutation { timestamp, .. }
             | Self::Relay { timestamp, .. }
             | Self::RelayBackoff { timestamp, .. } => *timestamp,
         }
@@ -617,6 +640,7 @@ impl<I> DistributedMessage<I> {
             Self::PromotionVote { .. } => MessageType::PromotionVote,
             Self::PromotionConfirm { .. } => MessageType::PromotionConfirm,
             Self::SecondaryFatalError { .. } => MessageType::SecondaryFatalError,
+            Self::ClusterMutation { .. } => MessageType::ClusterMutation,
             Self::Relay { .. } => MessageType::RelayMessage,
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
         }

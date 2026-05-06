@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage,
+    ClusterMutation, DistributedMessage,
     SecondaryTransport, TaskListEntry,
 };
 use dynrunner_scheduler_api::{
@@ -54,6 +54,60 @@ pub(super) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) ->
 }
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+    /// Apply each mutation locally and broadcast the same batch so every
+    /// secondary mirrors the change. Per-secondary delivery failures are
+    /// logged at warn — the CRDT is idempotent, so a missed mutation is
+    /// recoverable from the next snapshot RPC (Phase B); we never block
+    /// dispatch on universal delivery.
+    pub(super) async fn apply_and_broadcast_cluster_mutations(
+        &mut self,
+        mutations: Vec<ClusterMutation<I>>,
+    ) {
+        if mutations.is_empty() {
+            return;
+        }
+        for m in &mutations {
+            self.cluster_state.apply(m.clone());
+        }
+        let msg = DistributedMessage::ClusterMutation {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            mutations,
+        };
+        if let Err(failures) = self.transport.broadcast(msg).await {
+            for (secondary_id, error) in &failures {
+                tracing::warn!(
+                    secondary = %secondary_id,
+                    error = %error,
+                    "ClusterMutation broadcast delivery failed"
+                );
+            }
+        }
+    }
+
+    /// Phase-S: seed the replicated cluster ledger with the run's task
+    /// graph. Emits one `TaskAdded` per binary in `all_binaries`; the
+    /// originator-side `apply_and_broadcast_cluster_mutations` applies
+    /// locally and ships the batch to every secondary.
+    ///
+    /// Called once at run start, after every secondary has connected
+    /// (so `transport.broadcast` reaches the full fleet) and before
+    /// `perform_initial_assignment` runs (so the originator's mirror
+    /// is non-empty when the first dispatch happens).
+    pub(super) async fn seed_cluster_state(&mut self) {
+        let mutations: Vec<ClusterMutation<I>> = self
+            .all_binaries
+            .iter()
+            .map(|b| ClusterMutation::TaskAdded {
+                hash: compute_task_hash(b),
+                task: b.clone(),
+            })
+            .collect();
+        let count = mutations.len();
+        self.apply_and_broadcast_cluster_mutations(mutations).await;
+        tracing::info!(tasks = count, "seeded cluster ledger");
+    }
+
     pub(super) async fn send_transfer_complete(&mut self) -> Result<(), String> {
         let msg = DistributedMessage::TransferComplete {
             sender_id: self.config.node_id.clone(),
