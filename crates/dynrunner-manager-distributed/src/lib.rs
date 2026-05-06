@@ -1,3 +1,4 @@
+pub mod cluster_state;
 pub mod state;
 pub mod message_router;
 pub mod primary;
@@ -15,3 +16,4 @@ pub use state::{
     InitialAssigning, Operational, ShuttingDown, SecondaryConnectionState,
 };
 pub use message_router::{MessageRouter, RoutedMessage};
+pub use cluster_state::{ApplyOutcome, ClusterState, StateCounts, TaskState};

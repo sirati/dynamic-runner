@@ -11,6 +11,7 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
+use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
 
 /// Configuration for the secondary coordinator.
@@ -322,6 +323,13 @@ where
     /// from inside a sub-handler — every flag-setter stays cancel-
     /// safe and the loop owns its own exit condition.
     pub(super) fatal_exit: Option<String>,
+
+    /// Replicated mirror of the cluster ledger. Maintained by applying
+    /// every `DistributedMessage::ClusterMutation` the primary
+    /// broadcasts. Read-only on this node — only the originator may
+    /// produce mutations (Phase L will move the originator-side logic
+    /// onto whichever node currently holds the primary role).
+    pub(super) cluster_state: ClusterState<I>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -379,6 +387,7 @@ where
             pre_staged_mode: false,
             uses_file_based_items: true,
             fatal_exit: None,
+            cluster_state: ClusterState::new(),
         }
     }
 
@@ -494,6 +503,15 @@ where
     #[cfg(test)]
     pub fn primary_failed_count_for_test(&self) -> usize {
         self.primary_failed.len()
+    }
+
+    /// Test-only inspector for the replicated cluster ledger this
+    /// secondary maintains by applying primary-broadcast
+    /// `ClusterMutation`s. Returns the per-state counts so tests can
+    /// assert convergence with the primary's view.
+    #[cfg(test)]
+    pub fn cluster_state_counts_for_test(&self) -> crate::cluster_state::StateCounts {
+        self.cluster_state.counts()
     }
 
     /// Run the secondary coordination loop:

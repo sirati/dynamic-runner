@@ -157,6 +157,18 @@ where
                         self.transfer_complete = true;
                         tracing::info!("received transfer complete");
                     }
+                    MessageType::ClusterMutation => {
+                        // Setup-phase ClusterMutation broadcasts (e.g.
+                        // the primary's `seed_cluster_state` TaskAdded
+                        // batch fired between Phase 4 and Phase 5)
+                        // must update the local mirror or the
+                        // post-setup view starts out incomplete. CRDT
+                        // semantics make this idempotent against any
+                        // re-applied mutation post-setup.
+                        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                            self.apply_cluster_mutations(mutations);
+                        }
+                    }
                     other => {
                         tracing::debug!(?other, "unexpected message during setup");
                     }

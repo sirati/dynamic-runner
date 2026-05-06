@@ -1148,6 +1148,128 @@ async fn notify_stage_file_emits_wire_message() {
     }).await;
 }
 
+/// Phase S — replicated cluster ledger convergence: after a real
+/// primary + secondary run completes, the secondary's mirror
+/// `ClusterState` must reflect the same `Completed` count the primary
+/// observed. Pins that:
+///   - the post-`wait_for_peer_connections` `TaskAdded` batch reached
+///     the secondary,
+///   - per-completion `ClusterMutation::TaskCompleted` broadcasts were
+///     applied to the secondary's mirror,
+///   - the originator-side `apply_and_broadcast_cluster_mutations`
+///     applied locally so the primary's own ledger converges.
+#[tokio::test(flavor = "current_thread")]
+async fn cluster_state_converges_on_primary_and_secondary() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let secondary_id = "sec-0".to_string();
+            let max_res = dynrunner_core::ResourceMap::from([(
+                dynrunner_core::ResourceKind::memory(),
+                1024 * 1024 * 1024u64,
+            )]);
+
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+
+            let sec_handle = tokio::task::spawn_local(async move {
+                let transport = ChannelPrimaryTransportEnd {
+                    tx: sec_to_pri_tx,
+                    rx: pri_to_sec_rx,
+                };
+                let config = SecondaryConfig {
+                    secondary_id: "sec-0".into(),
+                    num_workers: 2,
+                    max_resources: max_res,
+                    hostname: "test-host".into(),
+                    keepalive_interval: Duration::from_secs(60),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                    keepalive_miss_threshold: 3,
+                    retry_max_passes: 1,
+                };
+                let mut secondary = SecondaryCoordinator::new(
+                    config,
+                    transport,
+                    NoPeers,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let mut factory = FakeWorkerFactory;
+                secondary.run(&mut factory).await.unwrap();
+                (
+                    secondary.completed_count(),
+                    secondary.cluster_state_counts_for_test(),
+                )
+            });
+
+            let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+            let mut outgoing = HashMap::new();
+            outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if incoming_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let config = PrimaryConfig {
+                node_id: "primary".into(),
+                num_secondaries: 1,
+                connect_timeout: Duration::from_secs(10),
+                peer_timeout: Duration::from_secs(10),
+                keepalive_interval: Duration::from_secs(5),
+                keepalive_miss_threshold: 3,
+                source_pre_staged_root: None,
+                uses_file_based_items: true,
+                max_concurrent_per_type: std::collections::HashMap::new(),
+                retry_max_passes: 1,
+                fleet_dead_timeout: std::time::Duration::from_secs(30),
+                mesh_ready_timeout: std::time::Duration::from_secs(5),
+                mass_death_grace: std::time::Duration::ZERO,
+                mass_death_min_count: 2,
+            };
+            let mut primary = PrimaryCoordinator::new(
+                config,
+                transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries: Vec<TaskInfo<TestId>> = (0..5)
+                .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+                .collect();
+
+            let (deps, ops, ope) = noop_phase_args();
+            primary.run(binaries, deps, ops, ope).await.unwrap();
+
+            let primary_counts = primary.cluster_state_counts_for_test();
+            assert_eq!(
+                primary_counts.completed, 5,
+                "primary's own cluster_state should reflect all 5 completions"
+            );
+            assert_eq!(primary_counts.pending, 0);
+
+            drop(primary);
+
+            let (sec_completed, sec_counts) = sec_handle.await.unwrap();
+            assert_eq!(sec_completed, 5);
+            assert_eq!(
+                sec_counts.completed, 5,
+                "secondary's mirror should converge to 5 Completed via \
+                 TaskAdded + TaskCompleted broadcasts"
+            );
+            assert_eq!(sec_counts.pending, 0);
+        })
+        .await;
+}
+
 /// End-to-end: pre-staged source mode locks in the path-mapping
 /// contract added in a344b0e (PrimaryConfig.source_pre_staged_root).
 ///

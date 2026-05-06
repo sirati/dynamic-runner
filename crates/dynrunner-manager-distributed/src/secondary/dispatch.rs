@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport, PrimaryTransport,
+    ClusterMutation, DistributedMessage, PeerTransport, PrimaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -313,6 +313,10 @@ where
                 }
                 Ok(())
             }
+            DistributedMessage::ClusterMutation { mutations, .. } => {
+                self.apply_cluster_mutations(mutations);
+                Ok(())
+            }
             DistributedMessage::TaskRequest {
                 secondary_id,
                 worker_id,
@@ -331,6 +335,24 @@ where
                 Ok(())
             }
         }
+    }
+
+    /// Apply a batch of `ClusterMutation`s against the local mirror.
+    /// Shared between the operational `dispatch_message` arm and
+    /// `wait_for_setup`'s receive loop — both sites observe the same
+    /// wire variant and must apply with identical semantics. CRDT
+    /// idempotency makes repeated apply safe (duplicates and
+    /// late-after-terminal arrivals NoOp by precondition).
+    pub(super) fn apply_cluster_mutations(&mut self, mutations: Vec<ClusterMutation<I>>) {
+        let count = mutations.len();
+        for m in mutations {
+            self.cluster_state.apply(m);
+        }
+        tracing::debug!(
+            secondary = %self.config.secondary_id,
+            applied = count,
+            "applied cluster mutations"
+        );
     }
 
     /// Run a `stage_file` copy + register the result in
