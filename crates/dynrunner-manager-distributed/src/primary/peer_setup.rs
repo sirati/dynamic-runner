@@ -41,13 +41,23 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             .collect();
 
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        for secondary_id in &secondary_ids {
-            let msg = DistributedMessage::PeerInfo {
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                peers: peers.clone(),
-            };
-            self.transport.send_to(secondary_id, msg).await?;
+        let msg = DistributedMessage::PeerInfo {
+            sender_id: self.config.node_id.clone(),
+            timestamp: timestamp_now(),
+            peers,
+        };
+        if let Err(failures) = self.transport.broadcast(msg).await {
+            for (secondary_id, error) in &failures {
+                tracing::warn!(
+                    secondary = %secondary_id,
+                    error = %error,
+                    "PeerInfo delivery failed"
+                );
+            }
+            return Err(format!(
+                "PeerInfo broadcast failed for {} secondaries",
+                failures.len()
+            ));
         }
 
         // Transition all from CertExchanging -> PeerDiscovery

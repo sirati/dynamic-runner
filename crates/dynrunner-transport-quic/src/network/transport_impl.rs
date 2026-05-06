@@ -45,4 +45,22 @@ impl<I: Identifier> SecondaryTransport<I> for NetworkServer<I> {
             Err(format!("no connection for secondary '{secondary_id}'"))
         }
     }
+
+    async fn broadcast(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), Vec<(String, String)>> {
+        self.drain_new_connections();
+        let mut errors = Vec::new();
+        for (secondary_id, tx) in &self.connections {
+            if let Err(e) = tx.send(msg.clone()) {
+                errors.push((secondary_id.clone(), e.to_string()));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
