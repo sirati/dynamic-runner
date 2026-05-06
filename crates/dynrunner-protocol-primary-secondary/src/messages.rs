@@ -34,6 +34,11 @@ pub enum MessageType {
     /// secondary process exits non-zero. Primary treats the sender as
     /// dead and runs the standard requeue path.
     SecondaryFatalError,
+    /// Wire-only envelope: peer-to-peer relay when the direct A↔B
+    /// link is unreachable but A↔C↔B is. The application layer never
+    /// observes this variant; `PeerTransport::recv_peer` unwraps it
+    /// or forwards it transparently.
+    RelayMessage,
 }
 
 /// Worker readiness information.
@@ -485,6 +490,31 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         error: String,
     },
+    /// Wire-only relay envelope. A peer that can't reach `target_id`
+    /// directly wraps the message in this variant and sends it to a
+    /// reachable forwarder; the forwarder unwraps if it's the target,
+    /// or appends itself to `path` and forwards to another non-`path`
+    /// peer if not.
+    ///
+    /// `path` records every peer the message has visited (sender plus
+    /// each forwarder, in order). Loop prevention: a forwarder MUST
+    /// pick a candidate that is not in `path`, not the target itself,
+    /// and not its own id. If no such candidate exists, the relay is
+    /// dropped with a warn — multi-hop backtracking ("ask previous to
+    /// choose another peer") would need a stateful round-trip
+    /// protocol and is intentionally deferred to a follow-up; the
+    /// path field is the wire shape the future protocol will plug
+    /// into without another schema bump.
+    ///
+    /// Application code never observes `Relay` — `recv_peer` strips
+    /// the envelope before delivery.
+    Relay {
+        sender_id: String,
+        timestamp: f64,
+        target_id: String,
+        path: Vec<String>,
+        inner: Box<DistributedMessage<I>>,
+    },
 }
 
 impl<I> DistributedMessage<I> {
@@ -510,7 +540,8 @@ impl<I> DistributedMessage<I> {
             | Self::TimeoutResponse { sender_id, .. }
             | Self::PromotionVote { sender_id, .. }
             | Self::PromotionConfirm { sender_id, .. }
-            | Self::SecondaryFatalError { sender_id, .. } => sender_id,
+            | Self::SecondaryFatalError { sender_id, .. }
+            | Self::Relay { sender_id, .. } => sender_id,
         }
     }
 
@@ -536,7 +567,8 @@ impl<I> DistributedMessage<I> {
             | Self::TimeoutResponse { timestamp, .. }
             | Self::PromotionVote { timestamp, .. }
             | Self::PromotionConfirm { timestamp, .. }
-            | Self::SecondaryFatalError { timestamp, .. } => *timestamp,
+            | Self::SecondaryFatalError { timestamp, .. }
+            | Self::Relay { timestamp, .. } => *timestamp,
         }
     }
 
@@ -563,6 +595,7 @@ impl<I> DistributedMessage<I> {
             Self::PromotionVote { .. } => MessageType::PromotionVote,
             Self::PromotionConfirm { .. } => MessageType::PromotionConfirm,
             Self::SecondaryFatalError { .. } => MessageType::SecondaryFatalError,
+            Self::Relay { .. } => MessageType::RelayMessage,
         }
     }
 }

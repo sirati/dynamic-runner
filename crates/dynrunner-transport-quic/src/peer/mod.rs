@@ -63,6 +63,12 @@ pub struct PeerNetwork<I: Identifier> {
     /// have to await per-peer dials and miss tokio::select! tick
     /// budgets while connect_to_peers drains.
     new_conn_tx: mpsc::UnboundedSender<AcceptedPeer<I>>,
+    /// Per-target route observation: drives the only logging on the
+    /// relay path (direct→relay, relay→relay, relay→direct). Updated
+    /// inside `send_to_peer` via
+    /// [`dynrunner_protocol_primary_secondary::observe_transition`].
+    pub(super) route_state:
+        HashMap<String, dynrunner_protocol_primary_secondary::RouteState>,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -110,6 +116,7 @@ impl<I: Identifier> PeerNetwork<I> {
             incoming_tx,
             new_conn_rx,
             new_conn_tx,
+            route_state: HashMap::new(),
         })
     }
 
