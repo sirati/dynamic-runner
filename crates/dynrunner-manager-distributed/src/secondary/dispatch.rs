@@ -186,6 +186,27 @@ where
             }
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
                 self.is_primary = new_primary_id == self.config.secondary_id;
+                // Point send_to_current_primary at the new primary
+                // for ALL nodes (the new primary itself, and every
+                // other secondary). Without this, non-primary nodes
+                // kept routing operational messages via
+                // `primary_transport` (the local-machine primary).
+                // The local primary's `handle_task_request` then
+                // relayed TaskRequests onward to `primary_id` (the
+                // SLURM-primary), so dispatch worked as long as the
+                // local primary's transport stayed up. When the local
+                // primary's transport closed (laptop suspend, SSH
+                // tunnel idle close — the tokenizer/dataset trigger),
+                // the relay vanished, TaskRequests never reached the
+                // SLURM-primary, and workers idled forever. After
+                // this fix, secondaries route directly via the peer
+                // mesh and don't depend on the local primary's
+                // transport being alive. `send_to_current_primary`
+                // already handles the self-loopback case
+                // (`current_primary == self`) by falling through to
+                // `primary_transport`, so setting the field
+                // unconditionally is correct for both branches.
+                self.primary_peer_id = Some(new_primary_id.clone());
                 if self.is_primary {
                     // Sync the election state machine with the role
                     // change so `run_election_tick`'s
