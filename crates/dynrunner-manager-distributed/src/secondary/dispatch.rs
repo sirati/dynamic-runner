@@ -107,13 +107,17 @@ where
                 let worker = &mut self.pool.workers[target_wid as usize];
                 if worker.is_idle_state() {
                     let estimated_mb = estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
+                    let log_task_hash = file_hash.clone();
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
                             self.reset_request_backoff(target_wid);
                             tracing::info!(
                                 worker_id = target_wid,
-                                binary = ?binary_info.identifier,
+                                task_id = ?binary_info.task_id,
+                                phase = %binary_info.phase_id,
+                                task_type = %binary_info.type_id,
+                                task_hash = %log_task_hash,
                                 estimated_mb,
                                 "assigned task from primary"
                             );
