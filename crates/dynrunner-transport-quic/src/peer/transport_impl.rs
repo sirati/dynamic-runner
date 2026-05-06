@@ -1,19 +1,50 @@
 //! `PeerTransport` impl for `PeerNetwork`. The inherent methods stay in
 //! `mod.rs` so this file is purely the trait-glue layer.
+//!
+//! Routing decisions live in
+//! [`dynrunner_protocol_primary_secondary::relay`]: this file
+//! consumes [`RouteDecision`] and [`BackoffDecision`] and applies
+//! them via the per-peer mpsc channels.
+
+use std::time::{Duration, SystemTime};
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    observe_transition, route_send, DistributedMessage, PeerConnectionInfo, PeerTransport,
-    RouteDecision,
+    forward_step, handle_backoff, observe_transition, route_send, BackoffDecision,
+    DistributedMessage, OutgoingRelay, PeerConnectionInfo, PeerTransport, RouteDecision,
 };
 
 use super::PeerNetwork;
+
+/// How long an outgoing-relay state entry survives without an update
+/// before the periodic sweep prunes it. Picked larger than any
+/// realistic forwarding round-trip across a multi-hop mesh; smaller
+/// than the 30s peer-keepalive miss threshold so a dead-letter
+/// state doesn't outlive the peer it was waiting on.
+const RELAY_STATE_TTL: Duration = Duration::from_secs(20);
 
 fn timestamp_secs() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Drop entries from `outgoing_relays` whose `last_used_at` is older
+/// than `RELAY_STATE_TTL`. Cheap (O(N)) and called inline on every
+/// send/receive so memory growth tracks live relay activity.
+fn prune_stale<I>(
+    outgoing_relays: &mut std::collections::HashMap<
+        (String, u64),
+        OutgoingRelay<I>,
+    >,
+) {
+    let now = SystemTime::now();
+    outgoing_relays.retain(|_, st| {
+        now.duration_since(st.last_used_at)
+            .map(|d| d <= RELAY_STATE_TTL)
+            .unwrap_or(true)
+    });
 }
 
 impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
@@ -38,8 +69,17 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         self.drain_new_connections();
+        prune_stale(&mut self.outgoing_relays);
         let now = timestamp_secs();
-        let decision = route_send(&self.connections, &self.peer_id, peer_id, msg, now);
+        let relay_id = self.next_relay_id;
+        let decision = route_send(
+            &self.connections,
+            &self.peer_id,
+            peer_id,
+            relay_id,
+            msg,
+            now,
+        );
         match decision {
             RouteDecision::Direct(direct) => {
                 let send_res = self
@@ -56,7 +96,11 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                 observe_transition(&mut self.route_state, peer_id, peer_id);
                 Ok(())
             }
-            RouteDecision::Relay { via, wrapped } => {
+            RouteDecision::Relay {
+                via,
+                wrapped,
+                bookkeeping,
+            } => {
                 let send_res = self
                     .connections
                     .get(&via)
@@ -68,6 +112,9 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                         "relay forwarder '{via}' connection closed during send to '{peer_id}'"
                     ));
                 }
+                self.next_relay_id = self.next_relay_id.wrapping_add(1);
+                self.outgoing_relays
+                    .insert((self.peer_id.clone(), relay_id), bookkeeping);
                 observe_transition(&mut self.route_state, peer_id, &via);
                 Ok(())
             }
@@ -84,65 +131,52 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                 msg = self.incoming_rx.recv() => {
                     self.drain_new_connections();
                     let msg = msg?;
-                    if let DistributedMessage::Relay {
-                        sender_id,
-                        timestamp,
-                        target_id,
-                        path,
-                        inner,
-                    } = msg
-                    {
-                        if target_id == self.peer_id {
-                            return Some(*inner);
-                        }
-                        // Forward via path-aware exclusion. Drop with
-                        // a warn if no candidate exists — backtracking
-                        // ("ask previous to choose another") is a
-                        // separate stateful protocol left for follow-up.
-                        match dynrunner_protocol_primary_secondary::relay::forward_step(
-                            &self.connections,
-                            &self.peer_id,
-                            &target_id,
-                            &path,
+                    match msg {
+                        DistributedMessage::Relay {
+                            sender_id,
                             timestamp,
-                            &sender_id,
+                            target_id,
+                            relay_id,
+                            path,
                             inner,
-                        ) {
-                            Some((next, forwarded)) => {
-                                let send_res = self
-                                    .connections
-                                    .get(&next)
-                                    .map(|tx| tx.send(forwarded));
-                                match send_res {
-                                    Some(Ok(())) => {}
-                                    Some(Err(_)) => {
-                                        self.connections.remove(&next);
-                                        tracing::warn!(
-                                            target = %target_id,
-                                            next = %next,
-                                            "relay forward failed: forwarder connection closed"
-                                        );
-                                    }
-                                    None => {
-                                        tracing::warn!(
-                                            target = %target_id,
-                                            next = %next,
-                                            "relay forward target unexpectedly missing"
-                                        );
-                                    }
-                                }
+                        } => {
+                            if target_id == self.peer_id {
+                                return Some(*inner);
                             }
-                            None => {
-                                tracing::warn!(
-                                    target = %target_id,
-                                    path = ?path,
-                                    "dropping relay: no forwarder candidate outside path"
-                                );
-                            }
+                            let decision = forward_step(
+                                &self.connections,
+                                &self.peer_id,
+                                &target_id,
+                                relay_id,
+                                &path,
+                                timestamp,
+                                &sender_id,
+                                inner,
+                            );
+                            self.apply_forward_decision(
+                                decision,
+                                sender_id,
+                                relay_id,
+                                target_id,
+                                path,
+                            );
+                            continue;
                         }
-                        continue;
+                        DistributedMessage::RelayBackoff {
+                            sender_id: failed_via,
+                            timestamp: _,
+                            original_sender,
+                            relay_id,
+                        } => {
+                            self.handle_inbound_backoff(
+                                original_sender,
+                                relay_id,
+                                failed_via,
+                            );
+                            continue;
+                        }
+                        other => return Some(other),
                     }
-                    return Some(msg);
                 }
                 accepted = self.new_conn_rx.recv() => {
                     if let Some(accepted) = accepted {
@@ -158,27 +192,33 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
 
     fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
         self.drain_new_connections();
-        let msg = self.incoming_rx.try_recv().ok()?;
-        // Synchronous unwrap for relay-targeting-self only; deferred
-        // forwarding requires the full async path in `recv_peer`. A
-        // misrouted relay arriving via try_recv falls through unwrapped
-        // to the caller, who will see an unexpected `Relay` variant —
-        // the swallow-with-warn below mirrors the same dead-end
-        // handling on a synchronous best-effort path.
-        if let DistributedMessage::Relay {
-            target_id, inner, ..
-        } = msg
-        {
-            if target_id == self.peer_id {
-                return Some(*inner);
+        loop {
+            let msg = self.incoming_rx.try_recv().ok()?;
+            match msg {
+                DistributedMessage::Relay {
+                    target_id, inner, ..
+                } if target_id == self.peer_id => return Some(*inner),
+                DistributedMessage::Relay { target_id, .. } => {
+                    // Forwarding requires the async path so we can
+                    // await the per-peer mpsc send (and queue a
+                    // RelayBackoff if we have no candidate). Drop
+                    // here with a warn — `try_recv_peer` is a
+                    // best-effort fast path that the secondary code
+                    // doesn't currently use for relay forwarding.
+                    tracing::warn!(
+                        target = %target_id,
+                        "try_recv_peer dropped relay: cannot forward synchronously, use recv_peer"
+                    );
+                    continue;
+                }
+                DistributedMessage::RelayBackoff { .. } => {
+                    // Same reason: backoff handling needs the async
+                    // path so we can re-send via mpsc.
+                    continue;
+                }
+                other => return Some(other),
             }
-            tracing::warn!(
-                target = %target_id,
-                "try_recv_peer dropped relay: cannot forward synchronously, use recv_peer"
-            );
-            return None;
         }
-        Some(msg)
     }
 
     fn peer_count(&self) -> usize {
@@ -190,5 +230,174 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // immediately; the trait stays async because other PeerTransport
         // impls (channel, no-op) keep their async signatures.
         PeerNetwork::connect_to_peers(self, peers);
+    }
+}
+
+impl<I: Identifier> PeerNetwork<I> {
+    /// Apply the forward-step decision: deliver direct, send a
+    /// new Relay envelope (recording bookkeeping for backoff), or
+    /// send a `RelayBackoff` to our predecessor on dead-end.
+    fn apply_forward_decision(
+        &mut self,
+        decision: RouteDecision<I>,
+        sender_id: String,
+        relay_id: u64,
+        target_id: String,
+        path: Vec<String>,
+    ) {
+        match decision {
+            RouteDecision::Direct(inner_unwrapped) => {
+                let send_res = self
+                    .connections
+                    .get(&target_id)
+                    .map(|tx| tx.send(inner_unwrapped));
+                match send_res {
+                    Some(Ok(())) => {}
+                    Some(Err(_)) => {
+                        self.connections.remove(&target_id);
+                        tracing::warn!(
+                            target = %target_id,
+                            "relay forward failed: target connection closed"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            target = %target_id,
+                            "relay forward target unexpectedly missing"
+                        );
+                    }
+                }
+            }
+            RouteDecision::Relay {
+                via,
+                wrapped,
+                bookkeeping,
+            } => {
+                let send_res = self.connections.get(&via).map(|tx| tx.send(wrapped));
+                match send_res {
+                    Some(Ok(())) => {
+                        self.outgoing_relays
+                            .insert((sender_id.clone(), relay_id), bookkeeping);
+                    }
+                    Some(Err(_)) => {
+                        self.connections.remove(&via);
+                        tracing::warn!(
+                            target = %target_id,
+                            next = %via,
+                            "relay forward failed: forwarder connection closed"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            target = %target_id,
+                            next = %via,
+                            "relay forward target unexpectedly missing"
+                        );
+                    }
+                }
+            }
+            RouteDecision::NoRoute => {
+                // Send RelayBackoff to predecessor (last entry in
+                // path from our view).
+                if let Some(predecessor) = path.last() {
+                    let backoff = DistributedMessage::RelayBackoff {
+                        sender_id: self.peer_id.clone(),
+                        timestamp: timestamp_secs(),
+                        original_sender: sender_id.clone(),
+                        relay_id,
+                    };
+                    if let Some(tx) = self.connections.get(predecessor) {
+                        if tx.send(backoff).is_err() {
+                            tracing::warn!(
+                                target = %target_id,
+                                predecessor = %predecessor,
+                                "relay backoff send failed: predecessor connection closed"
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            target = %target_id,
+                            predecessor = %predecessor,
+                            "relay backoff send failed: predecessor not in connections"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        target = %target_id,
+                        "dropping relay: empty path on dead-end (no predecessor to back off to)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle an inbound `RelayBackoff` for `(original_sender,
+    /// relay_id)`: look up our state, ask the routing helper what
+    /// to do, and apply.
+    fn handle_inbound_backoff(
+        &mut self,
+        original_sender: String,
+        relay_id: u64,
+        failed_via: String,
+    ) {
+        let key = (original_sender.clone(), relay_id);
+        let state = match self.outgoing_relays.get_mut(&key) {
+            Some(s) => s,
+            None => {
+                // Stale or duplicate backoff — our state was already
+                // pruned (TTL) or we never had this relay. Silent.
+                return;
+            }
+        };
+        let now = timestamp_secs();
+        let decision = handle_backoff(
+            state,
+            &self.connections,
+            &self.peer_id,
+            relay_id,
+            &failed_via,
+            now,
+        );
+        match decision {
+            BackoffDecision::Retry { via, wrapped } => {
+                let send_res = self.connections.get(&via).map(|tx| tx.send(wrapped));
+                match send_res {
+                    Some(Ok(())) => {}
+                    Some(Err(_)) | None => {
+                        self.connections.remove(&via);
+                        tracing::warn!(
+                            target = %state.target,
+                            next = %via,
+                            "relay retry send failed; further retries will fire on next backoff"
+                        );
+                    }
+                }
+            }
+            BackoffDecision::PropagateBackoff { to, msg } => {
+                let target_for_log = state.target.clone();
+                let send_res = self.connections.get(&to).map(|tx| tx.send(msg));
+                self.outgoing_relays.remove(&key);
+                match send_res {
+                    Some(Ok(())) => {}
+                    Some(Err(_)) | None => {
+                        tracing::warn!(
+                            target = %target_for_log,
+                            predecessor = %to,
+                            "relay backoff propagation failed: predecessor connection closed"
+                        );
+                    }
+                }
+            }
+            BackoffDecision::Drop => {
+                let target_for_log = state.target.clone();
+                self.outgoing_relays.remove(&key);
+                tracing::warn!(
+                    target = %target_for_log,
+                    relay_id,
+                    original_sender = %original_sender,
+                    "relay dropped: all paths exhausted at originator"
+                );
+            }
+        }
     }
 }
