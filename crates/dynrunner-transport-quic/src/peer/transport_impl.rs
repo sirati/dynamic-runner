@@ -39,8 +39,7 @@ fn timestamp_secs() -> f64 {
 }
 
 /// Drop entries from `outgoing_relays` whose `last_used_at` is older
-/// than `RELAY_STATE_TTL`. Cheap (O(N)) and called inline on every
-/// send/receive so memory growth tracks live relay activity.
+/// than `RELAY_STATE_TTL`. Cheap (O(N)).
 fn prune_stale<I>(
     outgoing_relays: &mut std::collections::HashMap<
         (String, u64),
@@ -55,10 +54,8 @@ fn prune_stale<I>(
     });
 }
 
-/// Drop blacklist entries older than `BLACKLIST_TTL`. Cheap O(N) on
-/// the active blacklist; called inline on each send/recv so a
-/// recovered direct link gets re-tried as soon as the next relay
-/// crosses this transport.
+/// Drop blacklist entries older than `BLACKLIST_TTL` so a recovered
+/// direct link gets re-tried.
 fn prune_blacklist(
     failed_forwarders: &mut std::collections::HashMap<(String, String), Instant>,
 ) {
@@ -86,9 +83,26 @@ fn blacklist_for(
         .collect()
 }
 
+impl<I: Identifier> PeerNetwork<I> {
+    /// Single-call TTL sweep: prunes both `outgoing_relays` (entries
+    /// whose forwarding round-trip exceeded `RELAY_STATE_TTL`) and
+    /// `failed_forwarders` (per-target blacklist entries past
+    /// `BLACKLIST_TTL`). Called from every public entry point on the
+    /// transport so memory is bounded by the union of recent activity
+    /// regardless of which side of the duplex was last touched —
+    /// pre-fix only `send_to_peer` pruned `outgoing_relays`, so a
+    /// node that only *forwarded* (never *originated* sends) grew
+    /// the relay map without bound.
+    fn prune_relay_state(&mut self) {
+        prune_stale(&mut self.outgoing_relays);
+        prune_blacklist(&mut self.failed_forwarders);
+    }
+}
+
 impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         self.drain_new_connections();
+        self.prune_relay_state();
         let mut errors = Vec::new();
         for (peer_id, tx) in &self.connections {
             if tx.send(msg.clone()).is_err() {
@@ -108,8 +122,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
         self.drain_new_connections();
-        prune_stale(&mut self.outgoing_relays);
-        prune_blacklist(&mut self.failed_forwarders);
+        self.prune_relay_state();
         let now = timestamp_secs();
         let relay_id = self.next_relay_id;
         let blacklist = blacklist_for(&self.failed_forwarders, peer_id);
@@ -168,10 +181,12 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
 
     async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
         self.drain_new_connections();
+        self.prune_relay_state();
         loop {
             tokio::select! {
                 msg = self.incoming_rx.recv() => {
                     self.drain_new_connections();
+                    self.prune_relay_state();
                     let msg = msg?;
                     match msg {
                         DistributedMessage::Relay {
@@ -185,7 +200,9 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             if target_id == self.peer_id {
                                 return Some(*inner);
                             }
-                            prune_blacklist(&mut self.failed_forwarders);
+                            // No inline prune: `recv_peer`'s top-of-loop
+                            // `prune_relay_state` already swept both
+                            // maps before we landed on this branch.
                             let blacklist = blacklist_for(
                                 &self.failed_forwarders,
                                 &target_id,
@@ -240,6 +257,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
 
     fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
         self.drain_new_connections();
+        self.prune_relay_state();
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
             match msg {
@@ -404,7 +422,10 @@ impl<I: Identifier> PeerNetwork<I> {
         // doesn't blacklist it for any other destination.
         self.failed_forwarders
             .insert((state.target.clone(), failed_via.clone()), Instant::now());
-        prune_blacklist(&mut self.failed_forwarders);
+        // No inline prune: `recv_peer`'s top-of-loop sweep already
+        // ran before we entered the RelayBackoff branch that landed
+        // us here, and the entry we just inserted carries `now()` so
+        // it's the freshest in the map.
         let blacklist = blacklist_for(&self.failed_forwarders, &state.target);
         let now = timestamp_secs();
         let decision = handle_backoff(
