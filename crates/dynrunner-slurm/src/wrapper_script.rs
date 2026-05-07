@@ -66,7 +66,7 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
         .unwrap_or_else(|| cfg.slurm_config.log_path());
 
     let mut script = format!(
-        r##"#!/bin/bash
+        r##"#!/usr/bin/env bash
 set -e
 
 echo "=================================================="
