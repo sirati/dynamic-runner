@@ -114,6 +114,12 @@ class Task:
     timeout boundary. Calls are no-ops when the task was constructed
     outside the runtime loop (no ``_emit`` hook wired) so unit-test
     handlers can construct ``Task`` directly without side-effects.
+
+    ``publish()`` / ``publish_all()`` atomically deliver staged files
+    to their destination. See ``dynamic_runner.worker.publish`` for
+    the full contract and env-var configuration. These methods are
+    process-state, not task-state — they work whether or not
+    ``_emit`` is wired, so unit-test handlers can call them directly.
     """
 
     relative_path: str
@@ -128,6 +134,14 @@ class Task:
     def set_phase(self, phase_name: str) -> None:
         if self._emit is not None:
             self._emit(PhaseUpdateResponse(phase_name=phase_name))
+
+    def publish(self, src, dst=None) -> None:
+        from .publish import publish as _publish
+        _publish(src, dst)
+
+    def publish_all(self, *srcs) -> None:
+        from .publish import publish_all as _publish_all
+        _publish_all(*srcs)
 
 
 @dataclass
