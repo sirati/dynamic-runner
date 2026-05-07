@@ -26,7 +26,6 @@ pub(crate) struct PyDistributedManager {
     ram_per_secondary: u64,
     source_dir: PathBuf,
     output_dir: PathBuf,
-    log_dir: PathBuf,
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
     distributed_config: DistributedConfig,
@@ -92,7 +91,6 @@ impl PyDistributedManager {
             ram_per_secondary,
             source_dir: task.source_path,
             output_dir: task.output_path,
-            log_dir: task.log_dir,
             log_paths: task.log_paths,
             worker_spec,
             distributed_config: distributed_config.unwrap_or_default(),
@@ -119,8 +117,27 @@ impl PyDistributedManager {
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
-        let log_dir = self.log_dir.clone();
         let log_paths = self.log_paths.clone();
+
+        // Pre-compute per-secondary log directories under the GIL —
+        // `resolve_log_dir` calls into Python's `datetime` module —
+        // before detaching for the tokio runtime. Each secondary gets
+        // its own `{timestamp}/{secondary_id}` subdirectory so the
+        // default `worker_<id>.log` filename never collides across
+        // secondaries on a shared mount, and `create_dir_all` errors
+        // surface here at run start rather than as silent log loss.
+        let mut sec_log_dirs: Vec<(String, PathBuf)> =
+            Vec::with_capacity(num_secondaries as usize);
+        for i in 0..num_secondaries {
+            let sid = format!("sec-{i}");
+            let dir = log_paths.resolve_log_dir(py, &output_dir, &sid)?;
+            std::fs::create_dir_all(&dir).map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "failed to create log directory {dir:?} for {sid}: {e}"
+                ))
+            })?;
+            sec_log_dirs.push((sid, dir));
+        }
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
@@ -179,9 +196,7 @@ impl PyDistributedManager {
                 let mut sec_handles = Vec::new();
                 let mut all_child_processes: Vec<Option<std::process::Child>> = Vec::new();
 
-                for i in 0..num_secondaries {
-                    let secondary_id = format!("sec-{i}");
-
+                for (secondary_id, sec_log) in sec_log_dirs.into_iter() {
                     // primary→secondary channel
                     let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
                     // secondary→primary channel
@@ -204,7 +219,6 @@ impl PyDistributedManager {
                     let sec_worker_spec = worker_spec.clone();
                     let sec_source = source_dir.clone();
                     let sec_output = output_dir.clone();
-                    let sec_log = log_dir.clone();
                     let sec_log_paths = log_paths.clone();
                     let sec_worker_module = worker_module.clone();
                     let sec_worker_args = worker_cmd_args.clone();

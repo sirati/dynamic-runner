@@ -95,6 +95,23 @@ class SlurmJobManager:
         output_network = self._expand_path(self.slurm_config.get_output_dir())
         log_network = self._expand_path(run_log_dir or self.slurm_config.get_log_dir())
 
+        # Optional third mount: framework-provided control-plane
+        # filesystem (manifests, peer substituters, etc). Bound only
+        # when the consumer set ``dynrunner_network_dir`` on their
+        # ``TaskDeploymentSpec`` — see the field doc for why we don't
+        # silently fall back to ``log-network``.
+        dynrunner_network_host = (
+            self._expand_path(self.deployment.dynrunner_network_dir)
+            if self.deployment.dynrunner_network_dir
+            else None
+        )
+        if dynrunner_network_host:
+            dynrunner_volume_block = f'    -v "{dynrunner_network_host}:/app/dynrunner-network" \\\n'
+            dynrunner_env_block = '    -e DYNRUNNER_NETWORK="/app/dynrunner-network" \\\n'
+        else:
+            dynrunner_volume_block = ""
+            dynrunner_env_block = ""
+
         image_path = self._expand_path(image_metadata.remote_path)
 
         socket_dir = f"{rndtmp}/sockets"
@@ -267,6 +284,7 @@ echo "    {log_tmp} -> /app/log-tmp"
 echo "    {srcbins_network} -> /app/src-network (ro)"
 echo "    {output_network} -> /app/out-network"
 echo "    {log_network} -> /app/log-network"
+{f'echo "    {dynrunner_network_host} -> /app/dynrunner-network"' if dynrunner_network_host else 'true'}
 echo "    {socket_dir} -> /app/sockets"
 echo "  Secondary ID: {secondary_id}"
 """
@@ -291,13 +309,13 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
-    -v "{src_tmp}:/app/src-tmp" \
+{dynrunner_env_block}    -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
     -v "{srcbins_network}:/app/src-network:ro" \
     -v "{output_network}:/app/out-network" \
     -v "{log_network}:/app/log-network" \
-    -v "{socket_dir}:/app/sockets" \
+{dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_name}:{image_tag} \
     {self.deployment.secondary_module} --secondary tcp://localhost:$TUNNEL_PORT --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
         else:
@@ -314,13 +332,13 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
-    -v "{src_tmp}:/app/src-tmp" \
+{dynrunner_env_block}    -v "{src_tmp}:/app/src-tmp" \
     -v "{out_tmp}:/app/out-tmp" \
     -v "{log_tmp}:/app/log-tmp" \
     -v "{srcbins_network}:/app/src-network:ro" \
     -v "{output_network}:/app/out-network" \
     -v "{log_network}:/app/log-network" \
-    -v "{socket_dir}:/app/sockets" \
+{dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_name}:{image_tag} \
     {self.deployment.secondary_module} --secondary tcp://{gateway_host}:{gateway_port} --secondary-id {secondary_id} --secondary-quic-port $QUIC_PORT"""
 

@@ -5,10 +5,14 @@ use pyo3::prelude::*;
 
 /// Path-naming policy for log files, sockets, and the per-run log directory.
 ///
-/// Templates accept simple `{worker_id}` and `{timestamp}` placeholders.
-/// Defaults preserve the legacy layout:
-/// `<output>/logs/<%Y%m%d_%H%M%S>/worker_<id>.log` and
-/// `worker_<id>.sock` inside the named-socket directory.
+/// Templates accept `{worker_id}`, `{timestamp}`, and `{secondary_id}`
+/// placeholders. The default layout puts every secondary's logs into
+/// its own `{timestamp}/{secondary_id}/` subdirectory under the
+/// log-mount root, so per-secondary uniqueness lives at the directory
+/// level rather than in the filename. The "logs/" prefix that older
+/// shapes carried only made sense when logs lived inside the output
+/// dir; with the dedicated log-network mount it would just nest one
+/// layer too deep.
 #[pyclass(name = "LogPathConfig", get_all, set_all, from_py_object)]
 #[derive(Clone, Debug)]
 pub(crate) struct LogPathConfig {
@@ -21,7 +25,7 @@ pub(crate) struct LogPathConfig {
 impl Default for LogPathConfig {
     fn default() -> Self {
         Self {
-            log_dir_template: "logs/{timestamp}".into(),
+            log_dir_template: "{timestamp}/{secondary_id}".into(),
             worker_log_pattern: "worker_{worker_id}.log".into(),
             socket_path_pattern: "worker_{worker_id}.sock".into(),
             timestamp_fmt: "%Y%m%d_%H%M%S".into(),
@@ -70,14 +74,29 @@ impl LogPathConfig {
     }
 
     /// Build the per-run log directory under `output_dir` from the template
-    /// using the current timestamp. The template may include `{timestamp}`.
-    pub(crate) fn resolve_log_dir(&self, py: Python<'_>, output_dir: &Path) -> PyResult<PathBuf> {
+    /// using the current timestamp and the caller-supplied `secondary_id`.
+    /// The template may include `{timestamp}` and `{secondary_id}`.
+    ///
+    /// Single-process mode is not a special case: the runner allocates
+    /// itself a synthetic `secondary_id` (hostname or `"local"`) at
+    /// startup and feeds it through the same template, yielding a real
+    /// path that never collides with another node's logs on a shared
+    /// mount. There is no empty-placeholder branch.
+    pub(crate) fn resolve_log_dir(
+        &self,
+        py: Python<'_>,
+        output_dir: &Path,
+        secondary_id: &str,
+    ) -> PyResult<PathBuf> {
         let datetime_mod = py.import("datetime")?;
         let now = datetime_mod.getattr("datetime")?.call_method0("now")?;
         let timestamp: String = now
             .call_method1("strftime", (self.timestamp_fmt.as_str(),))?
             .extract()?;
-        let rendered = self.log_dir_template.replace("{timestamp}", &timestamp);
+        let rendered = self
+            .log_dir_template
+            .replace("{timestamp}", &timestamp)
+            .replace("{secondary_id}", secondary_id);
         let path = PathBuf::from(rendered);
         Ok(if path.is_absolute() {
             path

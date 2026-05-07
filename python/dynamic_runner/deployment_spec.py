@@ -60,6 +60,24 @@ class TaskDeploymentSpec:
     # ``{prefix}-{secondary_id}``.
     slurm_job_name_prefix: str | None = None
 
+    # Host path for the framework's filesystem-based control-plane
+    # mount. When set, the SLURM wrapper bind-mounts this directory
+    # into the container at ``/app/dynrunner-network`` and exports
+    # ``DYNRUNNER_NETWORK=/app/dynrunner-network`` to the worker
+    # process. Use this for any file the framework or task code
+    # needs to share between primary and secondaries that is
+    # *neither* a build output (``out-network``) *nor* a log file
+    # (``log-network``) — typical examples are nix manifests and
+    # peer-substituters lists. The framework writes nothing here on
+    # its own; sub-layout is the consumer's concern.
+    #
+    # When ``None`` (default) no third bind is added and
+    # ``DYNRUNNER_NETWORK`` is unset. Consumers that need it must
+    # detect the unset env var and fail fast — silently writing to
+    # ``log-network`` or ``out-network`` is what produced the
+    # mount-conflation bug this field exists to fix.
+    dynrunner_network_dir: str | None = None
+
     # Additional `(local_port, gateway_port)` pairs to register on
     # the framework's connected SSH gateway, on top of the
     # primary's QUIC port (which the framework forwards

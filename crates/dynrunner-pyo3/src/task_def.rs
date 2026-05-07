@@ -185,13 +185,20 @@ impl LoadedTopology {
 
 /// Resolved fields pulled out of a Python `task_definition` instance, plus the
 /// per-run paths the runner derives from it.
+///
+/// Per-secondary log-dir resolution is *not* baked in here: the
+/// in-process distributed manager runs N secondaries from one
+/// `LoadedTaskDefinition`, each with its own `secondary_id`, and a
+/// single eager `log_dir` would force them to share a directory and
+/// collide their `worker_*.log` filenames. Each manager calls
+/// `log_paths.resolve_log_dir(py, &output_path, &secondary_id)` itself
+/// once it knows which secondary the directory belongs to.
 pub(crate) struct LoadedTaskDefinition {
     pub(crate) estimator: PyMemoryEstimatorBridge,
     pub(crate) types: TypeRegistry,
     pub(crate) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(crate) source_path: PathBuf,
     pub(crate) output_path: PathBuf,
-    pub(crate) log_dir: PathBuf,
     pub(crate) log_paths: LogPathConfig,
     pub(crate) python_executable: PathBuf,
     /// `TaskDefinition.uses_file_based_items` (FR-2). False means
@@ -216,6 +223,9 @@ impl LoadedTaskDefinition {
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
+        // Note: `py` is still required for `sys.executable` lookup
+        // below, even though log-dir resolution moved out to the
+        // managers (each manager owns its own `secondary_id`).
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
             .getattr("uses_file_based_items")
@@ -270,8 +280,6 @@ impl LoadedTaskDefinition {
         }
 
         let log_paths = log_paths.unwrap_or_default();
-        let log_dir = log_paths.resolve_log_dir(py, &output_path)?;
-        std::fs::create_dir_all(&log_dir).ok();
 
         let sys = py.import("sys")?;
         let python_executable: String = sys.getattr("executable")?.extract()?;
@@ -282,7 +290,6 @@ impl LoadedTaskDefinition {
             phase_deps: topology.phase_deps,
             source_path,
             output_path,
-            log_dir,
             log_paths,
             python_executable: PathBuf::from(python_executable),
             uses_file_based_items,
