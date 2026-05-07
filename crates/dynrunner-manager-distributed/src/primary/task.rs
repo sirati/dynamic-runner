@@ -288,9 +288,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // broadcast was lost. Without this, on local-death-then-
             // failover, a secondary missing the peer broadcast
             // would re-dispatch the already-completed task. (Same
-            // failover-survivability invariant as the FullTaskList
-            // broadcast in 04d9012, applied to per-completion
-            // updates.)
+            // failover-survivability invariant the FullTaskList
+            // broadcast used to enforce in 04d9012, now achieved
+            // continuously via per-completion ClusterMutation
+            // broadcasts.)
             self.forward_completion_to_secondaries(&msg, &secondary_id)
                 .await;
         }

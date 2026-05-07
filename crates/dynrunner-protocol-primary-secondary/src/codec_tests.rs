@@ -294,13 +294,14 @@ fn roundtrip_all_message_types() {
             new_primary_id: "s".into(),
             epoch: 1,
         },
-        DistributedMessage::FullTaskList {
+        DistributedMessage::RequestClusterSnapshot {
+            sender_id: "s".into(),
+            timestamp: 0.0,
+        },
+        DistributedMessage::ClusterSnapshot {
             sender_id: "p".into(),
             timestamp: 0.0,
-            all_tasks: vec![],
-            completed_tasks: vec![],
-            pending_tasks: vec![],
-            phase_deps: std::collections::HashMap::new(),
+            snapshot_json: "{}".into(),
         },
         DistributedMessage::TaskComplete {
             sender_id: "s".into(),

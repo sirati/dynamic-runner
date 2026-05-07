@@ -187,8 +187,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             .map(|id| id == &secondary_id)
             .unwrap_or(false)
         {
-            // The primary just died; clear the pointer so caller can
-            // promote a survivor before sending another FullTaskList.
+            // The primary just died; clear the pointer so the caller
+            // can promote a survivor. State transfer is no longer
+            // needed at promotion — every secondary's continuously-
+            // replicated `cluster_state` mirror already holds the
+            // ledger.
             self.primary_id = None;
         }
 

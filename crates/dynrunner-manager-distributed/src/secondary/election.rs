@@ -372,33 +372,16 @@ where
             tracing::info!(round, "won election — taking over as primary");
             self.election = ElectionState::Promoted;
             self.is_primary = true;
-            self.populate_primary_from_cache();
+            // Hydrate `primary_pending` from the continuously-replicated
+            // `cluster_state`. Pre-Phase-B promotion drained a cached
+            // `FullTaskList` snapshot — a consume-once data path with
+            // its own race conditions (no broadcast observed yet ⇒
+            // empty new primary). Post-Phase-B every node has been
+            // mirroring the ledger from run start, so the new primary
+            // simply reads its own already-current state.
+            self.populate_primary_from_cluster_state();
         }
         promoted
-    }
-
-    /// On promotion, hydrate `primary_pending` from whatever the most
-    /// recent live primary broadcast in `FullTaskList`. If no broadcast
-    /// was ever observed (e.g. the election fired before the primary
-    /// even sent one), the new primary starts with an empty pending
-    /// pool — peers will still request work and the primary will
-    /// reply "no tasks available", which is the safe degrade.
-    pub(super) fn populate_primary_from_cache(&mut self) {
-        if let Some((all_tasks, completed, phase_deps)) =
-            self.cached_full_task_list.take()
-        {
-            tracing::info!(
-                total = all_tasks.len(),
-                completed = completed.len(),
-                phases = phase_deps.len(),
-                "post-promotion: hydrating primary pending pool from cached FullTaskList"
-            );
-            self.populate_primary_tasks(all_tasks, completed, phase_deps);
-        } else {
-            tracing::warn!(
-                "post-promotion: no cached FullTaskList; new primary starts with empty pending pool"
-            );
-        }
     }
 
     /// Whether the secondary has been elected primary in this run.
@@ -541,41 +524,42 @@ mod tests {
     }
 
     /// Once promoted, a secondary's `primary_pending` pool is hydrated
-    /// from the cached `FullTaskList` it observed earlier from the live
-    /// primary. Validates the post-promotion takeover wiring (#34).
+    /// from its replicated `cluster_state` mirror. Validates the
+    /// post-promotion takeover wiring (originally #34, post-Phase-B
+    /// re-grounded onto the CRDT-replicated ledger).
     #[tokio::test(flavor = "current_thread")]
-    async fn promotion_hydrates_primary_tasks_from_cache() {
-        use dynrunner_core::ResourceMap;
-        use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, TaskListEntry};
-        use std::collections::{HashMap, HashSet};
+    async fn promotion_hydrates_primary_tasks_from_cluster_state() {
+        use dynrunner_core::{PhaseId, TaskInfo, TypeId};
+        use dynrunner_protocol_primary_secondary::ClusterMutation;
+        use std::collections::HashSet;
+        use std::path::PathBuf;
 
         let mut sec = make_secondary(election_config("sec-a"));
         sec.peer_keepalives.insert("sec-b".into(), 0.0);
 
-        // Pre-seed the cache as if the live primary had broadcast
-        // FullTaskList earlier in the run. Empty phase-deps map means
-        // the (synthesised) "default" phase has zero parents and the
-        // pool is immediately Active.
-        sec.cached_full_task_list = Some((
-            vec![TaskListEntry {
-                local_path: "bin1".into(),
-                binary_info: DistributedBinaryInfo {
-                    path: "bin1".into(),
-                    size: 100,
-                    identifier: super::super::test_helpers::TestId("bin1".into()),
-                    phase_id: "default".into(),
-                    type_id: "default".into(),
-                    affinity_id: None,
-                    payload_json: "null".into(),
-                    task_id: None,
-                    task_depends_on: vec![],
-                },
-                hash: "hash_bin1".into(),
-                file_path: None,
-            }],
-            HashSet::new(),
-            HashMap::new(),
-        ));
+        // Pre-seed cluster_state as if the live primary's
+        // `seed_cluster_state` broadcast had already arrived: one
+        // `TaskAdded` plus an empty phase_deps map so the
+        // (synthesised) "default" phase has zero parents and the pool
+        // is immediately Active.
+        let task: TaskInfo<super::super::test_helpers::TestId> = TaskInfo {
+            path: PathBuf::from("/tmp/bin1"),
+            size: 100,
+            identifier: super::super::test_helpers::TestId("bin1".into()),
+            phase_id: PhaseId::from("default"),
+            type_id: TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: None,
+            task_depends_on: vec![],
+        };
+        sec.cluster_state.apply(ClusterMutation::PhaseDepsSet {
+            deps: std::collections::HashMap::new(),
+        });
+        sec.cluster_state.apply(ClusterMutation::TaskAdded {
+            hash: "hash_bin1".into(),
+            task,
+        });
 
         // Simulate the candidate path: become candidate, then receive
         // confirm to flip to Promoted. peer_count=1, quorum=2, so we need
@@ -594,13 +578,8 @@ mod tests {
         assert_eq!(
             sec.primary_pending_len(),
             1,
-            "cache should have hydrated one pending binary into the pool"
+            "cluster_state should have hydrated one pending binary into the pool"
         );
-        assert!(
-            sec.cached_full_task_list.is_none(),
-            "cache is consumed on hydration"
-        );
-        let _ = ResourceMap::new(); // silence unused import on some configs
     }
 
     /// `record_primary_message` resets election state and clears any

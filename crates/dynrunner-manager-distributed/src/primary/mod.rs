@@ -292,10 +292,12 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// before `run()` is called.
     pub(super) pending: Option<PendingPool<I>>,
     /// Canonical phase dependency graph for the run, captured at
-    /// `run()` start. Sent to the primary alongside the task
-    /// list (`send_full_task_list`) so the promoted secondary can
-    /// rebuild its `PendingPool` with the same phase-state machine the
-    /// primary used. Empty between runs.
+    /// `run()` start. Broadcast as `ClusterMutation::PhaseDepsSet`
+    /// from `seed_cluster_state` so every node's `cluster_state.phase_deps`
+    /// mirrors the same map; the post-promotion hydration on a
+    /// secondary then reads it from there to rebuild its `PendingPool`
+    /// with the same phase-state machine the primary used. Empty
+    /// between runs.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
     pub(super) failed_tasks: HashSet<String>,
@@ -563,9 +565,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             }
         }
         // Capture the canonical phase-deps graph for the run before
-        // handing it to the pool — `send_full_task_list` relays it to
-        // the promoted primary so the post-promotion pool has
-        // the same dependency machine.
+        // handing it to the pool. `seed_cluster_state` will then
+        // broadcast it as `ClusterMutation::PhaseDepsSet` so every
+        // secondary's `cluster_state.phase_deps` mirrors the same
+        // map — the post-promotion hydration consults it to rebuild
+        // a `PendingPool` with the same dependency machine.
         self.phase_deps = phase_deps.clone();
         // PendingPool::new wants an iterator yielding owned PhaseIds.
         let pool = PendingPool::new(phase_set.clone(), phase_deps)
@@ -660,14 +664,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // Promote primary (atomic role-flip). The chosen secondary's
         // role-change is broadcast to every node; each node's
         // `cluster_state` mirror applies `PrimaryChanged` and each
-        // node's `primary_link` re-routes operational sends.
+        // node's `primary_link` re-routes operational sends. Post-
+        // Phase-B the promoted secondary draws its pending pool
+        // straight from `cluster_state` — no separate state-transfer
+        // wire path. The continuously-replicated ledger (seeded by
+        // `seed_cluster_state` and maintained by ClusterMutation
+        // broadcasts) is the only source of truth.
         self.promote_primary().await?;
-
-        // Ship the legacy `FullTaskList` snapshot. Phase B will
-        // replace this with the snapshot RPC; until then it remains
-        // the reliable post-promotion ledger source for nodes whose
-        // CRDT mirror missed earlier broadcasts.
-        self.send_full_task_list().await?;
 
         // Operational loop (main pass).
         self.operational_loop().await?;

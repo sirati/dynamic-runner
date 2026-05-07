@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-
-use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceAmount, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, ResourceAmount, TaskInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_mutation::ClusterMutation;
@@ -20,7 +18,15 @@ pub enum MessageType {
     TransferComplete,
     StageFile,
     PromotePrimary,
-    FullTaskList,
+    /// Late-joiner / reconnecting node asks any connected peer for a
+    /// full snapshot of the current `ClusterState`. Replaces the
+    /// pre-Phase-B `FullTaskList` broadcast — under continuously-
+    /// replicated state, the only legitimate "ship the full ledger"
+    /// path is on demand from a node that's missing it.
+    RequestClusterSnapshot,
+    /// Response to `RequestClusterSnapshot`: a full `ClusterStateSnapshot`
+    /// the receiver merges into its local mirror via `ClusterState::restore`.
+    ClusterSnapshot,
     MeshReady,
     // Secondary <-> Secondary (peer-to-peer)
     TaskComplete,
@@ -241,24 +247,6 @@ pub struct StagedFileRecord {
     pub dest_path: String,
 }
 
-/// Wire-format entry in a `FullTaskList` broadcast. Distinct from
-/// `dynrunner_core::TaskInfo` (the in-process content type) — this is the
-/// flat, hash-keyed, file-path-aware shape that primaries and secondaries
-/// exchange over the network.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "I: Serialize",
-    deserialize = "I: for<'a> Deserialize<'a>",
-))]
-pub struct TaskListEntry<I> {
-    pub local_path: String,
-    pub binary_info: DistributedBinaryInfo<I>,
-    pub hash: String,
-    /// Original file path for resolution on primary.
-    #[serde(default)]
-    pub file_path: Option<String>,
-}
-
 /// The typed message enum. Each variant carries exactly the payload
 /// from the Python protocol, with `sender_id` and `timestamp` common fields.
 ///
@@ -422,22 +410,31 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         peer_count: u32,
     },
-    FullTaskList {
+    /// Late-joiner / reconnecting node asks any connected peer for a
+    /// full snapshot of the current `ClusterState`. Any peer can
+    /// respond — state is replicated, so any responder suffices. The
+    /// originator targets a specific peer via the unicast transport;
+    /// no broadcast (one snapshot is enough).
+    RequestClusterSnapshot {
         sender_id: String,
         timestamp: f64,
-        all_tasks: Vec<TaskListEntry<I>>,
-        completed_tasks: Vec<String>,
-        #[serde(default)]
-        pending_tasks: Vec<String>,
-        /// Run-level phase dependency graph: `child -> [parents]`.
-        /// Travels alongside the task list so a promoted secondary can
-        /// rebuild a `PendingPool` with the same phase machine the live
-        /// primary used. Defaults to an empty map for backward
-        /// compatibility with primaries that pre-date the dep wiring;
-        /// the receiver treats every phase as having zero deps in
-        /// that case.
-        #[serde(default)]
-        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    },
+    /// Response carrying a full `ClusterStateSnapshot` the receiver
+    /// merges into its local mirror via `ClusterState::restore`. The
+    /// CRDT-merge semantics make the merge idempotent, safe under
+    /// concurrent live broadcasts, and resilient to dropped /
+    /// duplicate snapshots.
+    ///
+    /// `snapshot_json` carries the snapshot serialized as JSON (the
+    /// same encoding `ClusterStateSnapshot<I>` uses through serde).
+    /// Wire-side erasure of the generic `I` parameter keeps the
+    /// envelope concrete for routing while preserving exact-roundtrip
+    /// semantics on the receiver, which decodes back into
+    /// `ClusterStateSnapshot<I>` once `I` is known in context.
+    ClusterSnapshot {
+        sender_id: String,
+        timestamp: f64,
+        snapshot_json: String,
     },
     TaskComplete {
         sender_id: String,
@@ -579,7 +576,8 @@ impl<I> DistributedMessage<I> {
             | Self::TransferComplete { sender_id, .. }
             | Self::StageFile { sender_id, .. }
             | Self::PromotePrimary { sender_id, .. }
-            | Self::FullTaskList { sender_id, .. }
+            | Self::RequestClusterSnapshot { sender_id, .. }
+            | Self::ClusterSnapshot { sender_id, .. }
             | Self::MeshReady { sender_id, .. }
             | Self::TaskComplete { sender_id, .. }
             | Self::TaskFailed { sender_id, .. }
@@ -608,7 +606,8 @@ impl<I> DistributedMessage<I> {
             | Self::TransferComplete { timestamp, .. }
             | Self::StageFile { timestamp, .. }
             | Self::PromotePrimary { timestamp, .. }
-            | Self::FullTaskList { timestamp, .. }
+            | Self::RequestClusterSnapshot { timestamp, .. }
+            | Self::ClusterSnapshot { timestamp, .. }
             | Self::MeshReady { timestamp, .. }
             | Self::TaskComplete { timestamp, .. }
             | Self::TaskFailed { timestamp, .. }
@@ -637,7 +636,8 @@ impl<I> DistributedMessage<I> {
             Self::TransferComplete { .. } => MessageType::TransferComplete,
             Self::StageFile { .. } => MessageType::StageFile,
             Self::PromotePrimary { .. } => MessageType::PromotePrimary,
-            Self::FullTaskList { .. } => MessageType::FullTaskList,
+            Self::RequestClusterSnapshot { .. } => MessageType::RequestClusterSnapshot,
+            Self::ClusterSnapshot { .. } => MessageType::ClusterSnapshot,
             Self::MeshReady { .. } => MessageType::MeshReady,
             Self::TaskComplete { .. } => MessageType::TaskComplete,
             Self::TaskFailed { .. } => MessageType::TaskFailed,

@@ -1,14 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, PeerTransport, PrimaryTransport,
-    TaskListEntry,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
+use crate::cluster_state::TaskState;
 use super::{SecondaryCoordinator, PrimaryInFlightItem};
 use super::wire::timestamp_now;
 
@@ -29,97 +29,61 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// Build a fresh `PendingPool` for the primary view from a
-    /// `FullTaskList` snapshot.
+    /// Build a fresh `PendingPool` for the primary view from the
+    /// replicated `cluster_state` ledger.
     ///
-    /// One concern: turn the wire-format snapshot (`TaskListEntry`s +
-    /// completed-hash set + phase-deps map) into a `PendingPool`,
-    /// dropping items that the cluster has already finished. The
-    /// scheduler's soft-pin / phase machine inside the pool then
-    /// governs dispatch; this function does no scheduling itself.
+    /// One concern: turn the in-memory CRDT ledger into a fresh
+    /// `PendingPool` for post-promotion dispatch. The lattice
+    /// (Pending / InFlight / Completed / Failed) is iterated once;
+    /// only `Pending` entries enter the pool, terminal entries
+    /// contribute their `task_id` to the dep-resolution seed, and
+    /// `InFlight` entries are skipped (the originating dispatcher
+    /// owns them; the post-promotion primary picks them up only on
+    /// requeue via the heartbeat-driven dead-secondary handler, not
+    /// from the initial pool seed).
     ///
-    /// The pool is rebuilt on every call: the wire snapshot is the
+    /// The pool is rebuilt on every call: the cluster ledger is the
     /// authoritative source, and a partial patch would risk
     /// double-counting in-flight items the new primary can't observe
     /// from outside.
-    pub(super) fn populate_primary_tasks(
-        &mut self,
-        all_tasks: Vec<TaskListEntry<I>>,
-        completed: HashSet<String>,
-        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
-    ) {
-        self.primary_completed = completed.clone();
-
-        // Materialise items from the wire snapshot, skipping anything
-        // the cluster (or this node) has already completed / has in
-        // flight locally. Sort size-DESC up-front: the pool preserves
-        // bucket-internal insertion order, and primary dispatch
-        // is first-fit-by-memory which benefits from biggest-first
-        // packing (same heuristic as the legacy Vec-based path).
-        // Filter first (immutable self borrow), then resolve in a
-        // separate pass (mutable self borrow via the helper). Doing
-        // both inside one iterator chain trips E0500 because
-        // `resolve_for_dispatch` needs &mut self while the filter
-        // closure still borrows self immutably.
-        // Walk all_tasks once: build hash → task_id map for the
-        // completed-set translation below, partition into kept-vs-
-        // dropped in a single pass.
-        //
-        // Why we need the map: the wire's `completed` set is keyed
-        // by task_hash; the new pool's `completed_tasks` set is
-        // keyed by task_id. Variants in `kept` may declare
-        // `task_depends_on` against a toolchain task_id whose
-        // task is no longer in `kept` (filtered out as completed).
-        // Without seeding the new pool's `completed_tasks` with
-        // those task_ids, `extend()`'s validation rejects every
-        // variant whose toolchain finished pre-promotion as
-        // `UnknownTaskDep`.
+    ///
+    /// Why we seed completed task_ids: the new pool's `completed_tasks`
+    /// set is keyed by task_id. Variants in the `Pending` set may
+    /// declare `task_depends_on` against a toolchain task_id whose
+    /// task is no longer pending (already terminal). Without seeding
+    /// the new pool's `completed_tasks` with those task_ids,
+    /// `extend()`'s validation rejects every variant whose toolchain
+    /// finished pre-promotion as `UnknownTaskDep`.
+    pub(super) fn populate_primary_from_cluster_state(&mut self) {
         let mut completed_task_ids: HashSet<String> = HashSet::new();
-        let kept: Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>> = all_tasks
-            .into_iter()
-            .filter_map(|task| {
-                let is_completed = completed.contains(&task.hash)
-                    || self.completed_tasks.contains(&task.hash);
-                let is_active = self.active_tasks.contains_key(&task.hash);
-                if is_completed {
-                    if let Some(id) = &task.binary_info.task_id {
+        let mut primary_completed: HashSet<String> = HashSet::new();
+        let mut items: Vec<TaskInfo<I>> = Vec::new();
+
+        for (hash, state) in self.cluster_state.tasks_iter() {
+            match state {
+                TaskState::Completed { task } | TaskState::Failed { task, .. } => {
+                    primary_completed.insert(hash.clone());
+                    if let Some(id) = &task.task_id {
                         completed_task_ids.insert(id.clone());
                     }
-                    None
-                } else if is_active {
-                    None
-                } else {
-                    Some(task)
                 }
-            })
-            .collect();
-        let mut items: Vec<TaskInfo<I>> = Vec::with_capacity(kept.len());
-        for task in kept {
-            // Hydrate phase/type/affinity/payload from the wire.
-            // Single source of truth for wire→TaskInfo lives in
-            // `DistributedBinaryInfo::to_task_info` (Phase 4B).
-            //
-            // Keep `binary.path` AS-IS from the wire (i.e. the
-            // primary's view path). The resolver runs lazily at
-            // dispatch time (`handle_primary_task_request` calls
-            // `resolve_for_dispatch` on the binary it just took
-            // from the pool) — same end result for the worker,
-            // but the in-pool `task_file_hash(&binary)` matches
-            // the primary's `compute_task_hash` because both now
-            // hash the wire path. Without this, pre-staged mode
-            // diverges: live primary hashes the gateway-absolute path,
-            // promoted primary hashes the secondary-resolved container path,
-            // `completed_tasks` can't dedupe across paths, and
-            // any race that lets both paths dispatch the same
-            // logical task (live primary's kickstart-TaskAssignment
-            // racing the primary's self-dispatch) doubles
-            // the per-task completion record. Surfaced when the
-            // mesh-ready wait pushed the dispatch ordering close
-            // enough for the race to fire reliably.
-            let binary = task.binary_info.to_task_info();
-            items.push(binary);
+                TaskState::Pending { task } => {
+                    if !self.active_tasks.contains_key(hash) {
+                        items.push(task.clone());
+                    }
+                }
+                TaskState::InFlight { .. } => {
+                    // Owned by the dispatcher that issued the
+                    // assignment; the post-promotion primary does
+                    // not seed in-flight items into its own pool.
+                }
+            }
         }
+
+        self.primary_completed = primary_completed;
         items.sort_by_key(|i| std::cmp::Reverse(i.size));
+
+        let phase_deps = self.cluster_state.phase_deps().clone();
 
         // Phase set = union of (declared phases via deps map) and
         // (phases observed in the items). Both directions are needed:
@@ -136,43 +100,22 @@ where
 
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
-                // Seed completed task_ids BEFORE extend so that
-                // `task_depends_on` references against pre-promotion
-                // completions resolve as known. See the
-                // `completed_task_ids` doc above for context.
                 p.mark_tasks_completed(completed_task_ids);
                 if let Err(e) = p.extend(items) {
                     tracing::error!(
                         error = %e,
-                        "post-promotion: invalid task graph in FullTaskList; primary will start with no pending tasks"
+                        "post-promotion: invalid task graph in cluster_state; primary will start with no pending tasks"
                     );
                     self.primary_pending = None;
                     return;
                 }
-                // The cluster's already-completed items were filtered
-                // out before `extend`, so a phase whose ONLY items
-                // pre-completed shows up as Active-but-empty here.
-                // Without the cascade, dependent phases stay Blocked
-                // forever (their parent never reaches Drained → Done)
-                // and `handle_primary_task_request` returns "no tasks"
-                // for every dispatch. Run the same drain cascade
-                // that `note_primary_item_completed` uses post-dispatch
-                // so the primary's view starts in the correct
-                // post-completion state. Symmetric with the regular
-                // primary's `process_phase_lifecycle` call after pool
-                // construction.
                 cascade_drain_done(&mut p);
                 p
             }
             Err(e) => {
-                // The wire format should never deliver an inconsistent
-                // graph, but if it does we degrade safely: an empty
-                // pool causes the primary to reply "no tasks" to
-                // every request, which lets the run wind down rather
-                // than crashing the new primary.
                 tracing::error!(
                     error = %e,
-                    "post-promotion: invalid phase graph in FullTaskList; primary will start with no pending tasks"
+                    "post-promotion: invalid phase graph in cluster_state; primary will start with no pending tasks"
                 );
                 self.primary_pending = None;
                 return;
@@ -190,8 +133,8 @@ where
     }
 
     /// Run the phase-lifecycle drain cascade on a pool until quiescent.
-    /// Shared between `populate_primary_tasks` (catches phases whose
-    /// only items pre-completed elsewhere) and
+    /// Shared between `populate_primary_from_cluster_state` (catches
+    /// phases whose only items pre-completed elsewhere) and
     /// `note_primary_item_completed` (catches phases whose only items
     /// just finished). Each iteration:
     ///   1. `drain_empty_active_phases` — moves any Active phase
@@ -675,8 +618,8 @@ fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
 }
 
 /// Run the phase-lifecycle drain cascade on a pool until quiescent.
-/// Shared between `populate_primary_tasks` (catches phases whose only
-/// items pre-completed elsewhere) and `note_primary_item_completed`
+/// Shared between `populate_primary_from_cluster_state` (catches phases
+/// whose only items pre-completed elsewhere) and `note_primary_item_completed`
 /// (catches phases whose only items just finished). Each iteration:
 ///   1. `drain_empty_active_phases` — moves any Active phase whose
 ///      `(queued, in_flight) == (0, 0)` to Drained, queues it for

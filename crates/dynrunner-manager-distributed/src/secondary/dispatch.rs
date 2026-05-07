@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
@@ -7,7 +5,7 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-
+use crate::cluster_state::ClusterStateSnapshot;
 use super::SecondaryCoordinator;
 use super::election::ElectionState;
 use super::wire::{distributed_to_binary, timestamp_now};
@@ -210,6 +208,8 @@ where
                     );
                     return Ok(());
                 }
+                let became_primary =
+                    new_primary_id == self.config.secondary_id && !self.is_primary;
                 self.is_primary = new_primary_id == self.config.secondary_id;
                 // `on_primary_changed` updates the routing target AND
                 // resets per-worker backoff so idle workers fire a
@@ -221,6 +221,19 @@ where
                 // target moved, leaving the new primary's local
                 // workers silent for the residual window.
                 self.primary_link.on_primary_changed(new_primary_id.clone());
+                if became_primary {
+                    // Atomic role-flip on continuously-replicated
+                    // state: the new primary's pending pool is
+                    // hydrated from `cluster_state` directly, no
+                    // wire round-trip. Pre-Phase-B this happened
+                    // either via FullTaskList arrival (race-prone:
+                    // the trace at `feb1052` showed dispatch silence
+                    // for 1.6s because PromotePrimary preceded the
+                    // payload) or via a cached snapshot
+                    // (`populate_primary_from_cache`, which had its
+                    // own consume-once footgun).
+                    self.populate_primary_from_cluster_state();
+                }
                 if self.is_primary {
                     // Sync the election state machine with the role
                     // change so `run_election_tick`'s
@@ -253,15 +266,16 @@ where
                 ..
             } => {
                 // The local primary forwards observed TaskCompletes
-                // to every secondary so each one's cached completion
+                // to every secondary so each one's `completed_tasks`
                 // set stays current — matters on local-death-then-
                 // failover, where the elected secondary's
-                // populate_primary_tasks filters items against
-                // self.completed_tasks (peer broadcast covers the
-                // common case but is best-effort; this primary-side
-                // forward is the reliable backstop). Idempotent:
-                // a forward of our own completion just re-inserts
-                // the hash that's already there.
+                // `populate_primary_from_cluster_state` consults
+                // `self.completed_tasks` to rebuild the primary view.
+                // (Peer broadcast covers the common case but is
+                // best-effort; this primary-side forward is the
+                // reliable backstop.) Idempotent: a forward of our
+                // own completion just re-inserts the hash that's
+                // already there.
                 self.completed_tasks.insert(task_hash.clone());
                 self.note_primary_item_completed(&task_hash);
                 Ok(())
@@ -293,34 +307,63 @@ where
                 }
                 Ok(())
             }
-            DistributedMessage::FullTaskList {
-                all_tasks,
-                completed_tasks,
-                pending_tasks,
-                phase_deps,
-                ..
-            } => {
-                let completed_set: HashSet<String> = completed_tasks.into_iter().collect();
-                tracing::info!(
-                    total = all_tasks.len(),
-                    completed = completed_set.len(),
-                    pending = pending_tasks.len(),
-                    phases = phase_deps.len(),
-                    "received full task list"
-                );
-
-                // Cache on every secondary: if we get promoted later we
-                // can rebuild the primary `PendingPool` from this
-                // snapshot (the live primary may by then be dead, so we
-                // can't ask for it again).
-                self.cached_full_task_list = Some((
-                    all_tasks.clone(),
-                    completed_set.clone(),
-                    phase_deps.clone(),
-                ));
-
-                if self.is_primary {
-                    self.populate_primary_tasks(all_tasks, completed_set, phase_deps);
+            DistributedMessage::RequestClusterSnapshot { sender_id, .. } => {
+                // Any peer can answer — `cluster_state` is replicated,
+                // so any responder's snapshot is a valid bootstrap
+                // payload. The merge semantics on the receiver
+                // (`ClusterState::restore`) reconcile partial /
+                // overlapping snapshots, so a duplicate response from
+                // multiple peers is harmless.
+                //
+                // Wire-side `snapshot_json` carries the snapshot
+                // serialized via serde_json so the protocol envelope
+                // stays free of the manager-distributed crate's
+                // `ClusterStateSnapshot<I>` (which is the right-side
+                // dependency direction; the protocol crate must not
+                // depend on the manager crate).
+                let snapshot = self.cluster_state.snapshot();
+                let snapshot_json = serde_json::to_string(&snapshot)
+                    .map_err(|e| format!("snapshot serialization: {e}"))?;
+                let response = DistributedMessage::ClusterSnapshot {
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    snapshot_json,
+                };
+                if let Err(e) = self
+                    .peer_transport
+                    .send_to_peer(&sender_id, response)
+                    .await
+                {
+                    tracing::warn!(
+                        target = %sender_id,
+                        error = %e,
+                        "failed to deliver ClusterSnapshot response"
+                    );
+                }
+                Ok(())
+            }
+            DistributedMessage::ClusterSnapshot { snapshot_json, .. } => {
+                // Lattice-merge into the local mirror via
+                // `ClusterState::restore`. Idempotent on duplicates
+                // and safe under concurrent live broadcasts (joiner
+                // may have already applied mutations the snapshot also
+                // contains; the merge keeps the strictly stronger of
+                // each).
+                match serde_json::from_str::<ClusterStateSnapshot<I>>(&snapshot_json) {
+                    Ok(snap) => {
+                        self.cluster_state.restore(snap);
+                        if self.is_primary {
+                            // The post-bootstrap primary rebuilds its
+                            // pending pool from the merged ledger.
+                            self.populate_primary_from_cluster_state();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "failed to deserialize ClusterSnapshot payload"
+                        );
+                    }
                 }
                 Ok(())
             }

@@ -507,7 +507,7 @@ async fn stage_file_then_assign_task_succeeds() {
         .await;
 }
 
-/// Regression: a promoted secondary's `populate_primary_tasks`
+/// Regression: a promoted secondary's `populate_primary_from_cluster_state`
 /// must transition phases whose ONLY items are pre-completed
 /// elsewhere from Active to Done at construction time. Without the
 /// cascade in `primary.rs`, dependent phases stay Blocked forever and
