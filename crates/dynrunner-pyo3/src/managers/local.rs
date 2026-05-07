@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -37,6 +38,13 @@ pub(crate) struct PyLocalManager {
     worker_spec: Option<WorkerSpec>,
     scheduler_config: SchedulerConfig,
     phase_status_log_intervals_secs: Vec<f64>,
+    /// Per-phase keepalive watchdog. The map key is the phase name as
+    /// reported by `Task.set_phase(...)`; the value is the maximum
+    /// silence (no keepalive / phase update) tolerated before the
+    /// manager kills and restarts the worker. Empty disables the
+    /// watchdog entirely (current default). Forwarded verbatim into
+    /// `LocalManagerConfig.stage_timeouts`.
+    stage_timeouts_secs: HashMap<String, f64>,
     types: TypeRegistry,
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
@@ -78,6 +86,7 @@ impl PyLocalManager {
         low_memory_threshold = None,
         scheduler_config = None,
         phase_status_log_intervals_secs = None,
+        stage_timeouts_secs = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -100,6 +109,7 @@ impl PyLocalManager {
         low_memory_threshold: Option<u64>,
         scheduler_config: Option<SchedulerConfig>,
         phase_status_log_intervals_secs: Option<Vec<f64>>,
+        stage_timeouts_secs: Option<HashMap<String, f64>>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -173,6 +183,7 @@ impl PyLocalManager {
             scheduler_config: scheduler_config.unwrap_or_default(),
             phase_status_log_intervals_secs: phase_status_log_intervals_secs
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
+            stage_timeouts_secs: stage_timeouts_secs.unwrap_or_default(),
             types: task.types,
             phase_deps: task.phase_deps,
             skip_existing,
@@ -220,11 +231,18 @@ impl PyLocalManager {
             retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
             memuse_log_path,
-            // TODO(phase-5a-followup): wire per-type TypeRuntime.timeout
-            // through to the manager-local stage-timeout watchdog. Until
-            // that follow-up lands, the watchdog stays inactive (empty
-            // map) — same effective behaviour as a no-`get_stages` task.
-            stage_timeouts: HashMap::new(),
+            // Phase keys here are the raw strings the worker reports via
+            // `Task.set_phase(...)` — the watchdog matches on those, not
+            // on `PhaseId` from `get_phases()`. Per-type
+            // `TaskTypeSpec.timeout_seconds` is a separate forward-looking
+            // field that requires worker→type tracking to enforce; until
+            // that follow-up lands, callers wanting timeout enforcement
+            // pass `stage_timeouts_secs` on `LocalManagerConfig`.
+            stage_timeouts: self
+                .stage_timeouts_secs
+                .iter()
+                .map(|(k, v)| (k.clone(), Duration::from_secs_f64(*v)))
+                .collect(),
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(
                 dynrunner_core::ResourceKind::memory(),
                 self.low_memory_threshold,
