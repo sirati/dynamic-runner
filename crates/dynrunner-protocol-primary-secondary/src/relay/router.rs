@@ -503,6 +503,19 @@ impl<I: Identifier> Router<I> {
         }
     }
 
+    /// Inspect the per-peer route observation map.
+    ///
+    /// Exposed for cross-crate tests (`dynrunner-transport-channel`'s
+    /// `tests/mesh_partition.rs`) so partition / heal scenarios can
+    /// assert on `last_observed_relay_at` directly without round-
+    /// tripping through `SendOutcome`. Not part of the stable public
+    /// API — production callers should never inspect routing state;
+    /// the audit phase may move this behind a `test-utils` feature
+    /// gate if the surface area becomes problematic.
+    pub fn route_state(&self) -> &HashMap<String, PeerRouteState> {
+        &self.route_state
+    }
+
     // ── private helpers ──
 
     /// Observe a Direct outcome for `target`. Updates `route_state`

@@ -1,11 +1,33 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport, SecondaryTransport,
+    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport, Router,
+    SecondaryTransport, SendOutcome,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
 use tokio::sync::mpsc;
+
+/// Unix-epoch wall-clock seconds for the wire-side `Clocks::wire`
+/// envelope timestamp. Local-clock TTL/cooldown decisions inside Router
+/// use the monotonic `Instant::now()` carried alongside it.
+fn timestamp_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Snapshot the `Clocks` pair Router consumes — kept centralised so
+/// every entry point stays in lockstep with the QUIC transport's
+/// equivalent helper (cf. `transport-quic/src/peer/transport_impl.rs`).
+fn now_clocks() -> Clocks {
+    Clocks {
+        now: Instant::now(),
+        wire: timestamp_secs(),
+    }
+}
 
 // ── Manager ↔ Runner channel transport ──
 
@@ -121,13 +143,34 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for ChannelPrimaryTra
 
 // ── Peer-to-peer channel transport (for multi-secondary in-process tests) ──
 
-/// Channel-based PeerTransport. Each instance owns one inbox (mpsc receiver)
-/// and a dictionary of outboxes (mpsc senders), one per remote peer.
-/// `broadcast` clones the message and fans it out to every outbox; the
-/// inbox receives whatever other peers sent to *this* secondary.
+/// Channel-based [`PeerTransport`]. Each instance owns one inbox
+/// (mpsc receiver), a dictionary of outboxes (mpsc senders, one per
+/// directly-reachable peer), and a [`Router`] that owns ALL routing
+/// decisions — direct vs relay, blacklist, redial-cooldown gate.
+/// Adjacency is set up by [`peer_mesh`] (all-to-all) or
+/// [`peer_mesh_with_adjacency`] (caller-supplied undirected links);
+/// tests simulate partitions by mutating `outgoing` through
+/// [`ChannelPeerTransport::disconnect_from`] /
+/// [`ChannelPeerTransport::connect_to`].
+///
+/// `last_outcome` exposes the most recent `Router::send_to_peer`
+/// outcome for test assertions (the channel transport doesn't dial,
+/// so the redial signal is observable here rather than producing
+/// background work). It is `pub` deliberately — tests assert against
+/// it directly instead of bypassing the [`PeerTransport`] trait, per
+/// the "abstractions the test path circumvents are wrong" rule.
 pub struct ChannelPeerTransport<I: Identifier> {
     incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
     outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
+    /// Peer-mesh routing dispatcher. Owns ALL routing state (in-flight
+    /// relays, blacklist, per-peer route observation, monotonic
+    /// relay-id counter). The transport itself never inspects routing
+    /// state.
+    pub router: Router<I>,
+    /// Most recent `Router::send_to_peer` outcome — exposed for test
+    /// assertions per `M5` of the relay-routing plan. Not part of the
+    /// stable public API; production callers should ignore it.
+    pub last_outcome: Option<SendOutcome>,
 }
 
 impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
@@ -144,18 +187,52 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         peer_id: &str,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
-        if let Some(tx) = self.outgoing.get(peer_id) {
-            tx.send(msg).map_err(|e| e.to_string())?;
+        let clocks = now_clocks();
+        self.router.prune(clocks.now);
+        let outcome = self
+            .router
+            .send_to_peer(peer_id, msg, &mut self.outgoing, clocks)
+            .map_err(|e| e.to_string())?;
+        self.last_outcome = Some(outcome.clone());
+        // Channel transport does not dial — partition heal in tests is
+        // manual via `connect_to`. The redial signal carried inside
+        // `SendOutcome::Relayed` is observable through `last_outcome`
+        // for assertions; nothing else acts on it here.
+        match outcome {
+            SendOutcome::NoRoute => Err(format!(
+                "no route to peer '{peer_id}': direct unreachable and no forwarder available"
+            )),
+            SendOutcome::Direct | SendOutcome::Relayed { .. } => Ok(()),
         }
-        Ok(())
     }
 
     async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
-        self.incoming_rx.recv().await
+        let mut clocks = now_clocks();
+        self.router.prune(clocks.now);
+        loop {
+            let msg = self.incoming_rx.recv().await?;
+            clocks = now_clocks();
+            self.router.prune(clocks.now);
+            match self
+                .router
+                .process_inbound(msg, &mut self.outgoing, clocks)
+            {
+                InboundOutcome::Deliver { msg, .. } => return Some(msg),
+                InboundOutcome::Handled { .. } => continue,
+            }
+        }
     }
 
     fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
-        self.incoming_rx.try_recv().ok()
+        let clocks = now_clocks();
+        self.router.prune(clocks.now);
+        loop {
+            let msg = self.incoming_rx.try_recv().ok()?;
+            match self.router.process_inbound_sync(msg, clocks) {
+                InboundOutcome::Deliver { msg, .. } => return Some(msg),
+                InboundOutcome::Handled { .. } => continue,
+            }
+        }
     }
 
     fn peer_count(&self) -> usize {
@@ -163,14 +240,77 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
     }
 
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {
-        // No-op: peers are pre-wired via `peer_mesh`.
+        // No-op: peers are pre-wired via `peer_mesh` /
+        // `peer_mesh_with_adjacency`. Test drivers simulate partition
+        // heal via `connect_to` directly.
     }
 }
 
+impl<I: Identifier> ChannelPeerTransport<I> {
+    /// Remove a peer's outbox so a subsequent send finds no direct
+    /// channel — the Router will then route via relay (or no-route)
+    /// just as if the underlying network link had broken. Used by
+    /// partition tests; idempotent on already-disconnected peers.
+    pub fn disconnect_from(&mut self, peer_id: &str) {
+        self.outgoing.remove(peer_id);
+    }
+
+    /// Re-add a peer's outbox so a subsequent send can again take the
+    /// direct path — used by partition-heal tests. Overwrites any
+    /// existing entry.
+    pub fn connect_to(
+        &mut self,
+        peer_id: String,
+        sender: mpsc::UnboundedSender<DistributedMessage<I>>,
+    ) {
+        self.outgoing.insert(peer_id, sender);
+    }
+}
+
+/// Build the full set of unordered pairs `(a, b)` where `a < b` in
+/// input order, given a peer-id list. The shared subroutine behind
+/// the all-to-all [`peer_mesh`] adjacency.
+fn all_undirected_pairs(ids: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(ids.len() * ids.len().saturating_sub(1) / 2);
+    for (i, a) in ids.iter().enumerate() {
+        for b in &ids[i + 1..] {
+            out.push((a.clone(), b.clone()));
+        }
+    }
+    out
+}
+
 /// Wire up an all-to-all peer mesh for the given ids and return one
-/// `ChannelPeerTransport` per id, in input order. Each transport's
-/// `outgoing` map contains every other peer's inbox sender.
+/// [`ChannelPeerTransport`] per id, in input order. Each transport's
+/// outbox map contains every other peer's inbox sender.
+///
+/// Delegates to [`peer_mesh_with_adjacency`] with the full set of
+/// unordered pairs so a single adjacency wiring path serves both
+/// fully-connected and partial-mesh test fixtures.
 pub fn peer_mesh<I: Identifier>(peer_ids: &[String]) -> Vec<ChannelPeerTransport<I>> {
+    let links = all_undirected_pairs(peer_ids);
+    peer_mesh_with_adjacency(peer_ids, &links)
+}
+
+/// Wire up a partial peer mesh defined by an explicit adjacency list
+/// and return one [`ChannelPeerTransport`] per id, in `peer_ids`
+/// input order. Each `(a, b)` link is **undirected**: a's outbox gains
+/// b's sender AND b's outbox gains a's sender.
+///
+/// # Panics
+///
+/// - Panics if a link references an id not present in `peer_ids` —
+///   silently dropping it would half-wire a partition the test
+///   thought was symmetric.
+/// - Panics if the same unordered pair appears more than once
+///   (including the directed-style `(a, b) + (b, a)` form). A
+///   misconfigured fixture that accidentally lists a link twice would
+///   half-wire a partition test exactly the way a real bug would, so
+///   we refuse to construct the mesh rather than mask the typo.
+pub fn peer_mesh_with_adjacency<I: Identifier>(
+    peer_ids: &[String],
+    links: &[(String, String)],
+) -> Vec<ChannelPeerTransport<I>> {
     // Allocate inbox + outbox-sender for each peer.
     let mut inboxes: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>> = HashMap::new();
     let mut receivers: HashMap<String, mpsc::UnboundedReceiver<DistributedMessage<I>>> =
@@ -181,21 +321,59 @@ pub fn peer_mesh<I: Identifier>(peer_ids: &[String]) -> Vec<ChannelPeerTransport
         receivers.insert(id.clone(), rx);
     }
 
+    // Build the per-peer outgoing tables from the undirected adjacency
+    // list. We key by the canonical (lo, hi) ordering so a duplicate
+    // — whether listed twice in the same direction or once each
+    // direction — surfaces as a panic rather than silent re-insert.
+    let mut outgoing: HashMap<String, HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>> =
+        peer_ids
+            .iter()
+            .map(|id| (id.clone(), HashMap::new()))
+            .collect();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    for (a, b) in links {
+        assert!(a != b, "peer_mesh_with_adjacency: self-link '{a}' is not allowed");
+        assert!(
+            inboxes.contains_key(a),
+            "peer_mesh_with_adjacency: link references unknown peer '{a}'"
+        );
+        assert!(
+            inboxes.contains_key(b),
+            "peer_mesh_with_adjacency: link references unknown peer '{b}'"
+        );
+        let canonical = if a <= b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        assert!(
+            seen.insert(canonical.clone()),
+            "peer_mesh_with_adjacency: duplicate link {canonical:?} (adjacency is undirected; \
+             list each unordered pair at most once)"
+        );
+        outgoing
+            .get_mut(a)
+            .expect("peer table allocated above")
+            .insert(b.clone(), inboxes[b].clone());
+        outgoing
+            .get_mut(b)
+            .expect("peer table allocated above")
+            .insert(a.clone(), inboxes[a].clone());
+    }
+
     let mut transports = Vec::with_capacity(peer_ids.len());
     for id in peer_ids {
         let incoming_rx = receivers
             .remove(id)
             .expect("inbox was inserted above for every id");
-        let mut outgoing = HashMap::new();
-        for other in peer_ids {
-            if other == id {
-                continue;
-            }
-            outgoing.insert(other.clone(), inboxes[other].clone());
-        }
+        let outgoing_for_peer = outgoing
+            .remove(id)
+            .expect("outgoing table allocated for every id");
         transports.push(ChannelPeerTransport {
             incoming_rx,
-            outgoing,
+            outgoing: outgoing_for_peer,
+            router: Router::new(id.clone()),
+            last_outcome: None,
         });
     }
     transports
