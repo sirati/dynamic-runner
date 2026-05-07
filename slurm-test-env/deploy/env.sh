@@ -76,9 +76,9 @@ worker_tmp_dir()        { printf '%s/%s' "$WORKER_TMP_BASE" "$(worker_hostname "
 #     home/  (= $HOME_SHARE)       the simulated shared drive seen as /home
 #     uid.lock                     flock target during user provisioning
 #
-# After `down.sh`, the only thing left under $STATE_DIR is $HOME_SHARE —
-# the simulated /home is what the operator will want to inspect for test
-# output. `down.sh --purge` deletes $HOME_SHARE too.
+# `down.sh` leaves $STATE_DIR in place; the simulated /home is what the
+# operator will want to inspect for test output, and re-creating it is a
+# deliberate manual step (rm -rf under `podman unshare` if needed).
 
 : "${STATE_BASE_DIR:=${HOME}/.local/state/slurm-test-env}"
 STATE_DIR="${STATE_BASE_DIR}/${INSTANCE_ID}"
