@@ -64,6 +64,17 @@ pub const REDIAL_COOLDOWN: Duration = Duration::from_secs(30);
 /// which crate the code lives in.
 pub const RELAY_LOG_TARGET: &str = "dynrunner_relay";
 
+/// Log-message constants for the relay-path events that integration
+/// tests pin against (silent-reconnect coverage, originator-drop
+/// coverage). Exposed so tests can match the literal production
+/// string instead of carrying a substring copy that would silently
+/// drift on rephrase. Other relay-path log messages stay inline —
+/// extract here only when a test needs to assert exact content.
+pub const MSG_RELAY_ENGAGED: &str =
+    "peer relay engaged: direct link unreachable, forwarding via peer";
+pub const MSG_DIRECT_RESTORED: &str = "peer direct link restored";
+pub const MSG_DROPPED_AT_ORIGINATOR: &str = "relay dropped: all paths exhausted at originator";
+
 /// Per-call clock snapshot. `now` is the monotonic clock used for
 /// TTL/cooldown arithmetic; `wire` is the unix-epoch wall-clock value
 /// embedded in outgoing wire envelopes for cross-machine correlation.
@@ -542,7 +553,7 @@ impl<I: Identifier> Router<I> {
                     target: RELAY_LOG_TARGET,
                     target_peer = %target,
                     from = %forwarder,
-                    "peer direct link restored"
+                    "{MSG_DIRECT_RESTORED}"
                 );
             }
         }
@@ -584,7 +595,7 @@ impl<I: Identifier> Router<I> {
                     target: RELAY_LOG_TARGET,
                     target_peer = %target,
                     relay = %forwarder,
-                    "peer relay engaged: direct link unreachable, forwarding via peer"
+                    "{MSG_RELAY_ENGAGED}"
                 );
             }
             Some(RouteVia::Relay { forwarder: old }) if old != forwarder => {
@@ -835,7 +846,7 @@ impl<I: Identifier> Router<I> {
                     target_peer = %target_for_log,
                     relay_id,
                     original_sender = %original_sender,
-                    "relay dropped: all paths exhausted at originator"
+                    "{MSG_DROPPED_AT_ORIGINATOR}"
                 );
             }
         }
