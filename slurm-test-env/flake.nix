@@ -4,10 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    nixos-generators = {
-      url = "github:nix-community/nixos-generators";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
@@ -15,26 +11,32 @@
       self,
       nixpkgs,
       flake-utils,
-      nixos-generators,
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # OCI tarball produced from a NixOS module set. The result is a
-        # single tarball file; the deploy script handles podman load + tag
-        # extraction.
+        # NixOS rootfs tarball at <out>/tarball/nixos-system-*.tar.xz,
+        # produced by the in-tree `virtualisation/docker-image.nix` module
+        # (upstreamed from nixos-generators in NixOS 25.05). The deploy
+        # script imports it via `podman import` — it is NOT a layered OCI
+        # image; see deploy/up.sh::locate_tarball.
         mkImage =
           extraModules:
-          nixos-generators.nixosGenerate {
+          (nixpkgs.lib.nixosSystem {
             inherit system;
-            format = "docker";
             modules = [
+              (
+                { modulesPath, ... }:
+                {
+                  imports = [ "${modulesPath}/virtualisation/docker-image.nix" ];
+                }
+              )
               ./modules/common.nix
               ./modules/slurm-cluster.nix
             ] ++ extraModules;
-          };
+          }).config.system.build.tarball;
 
         gatewayImage = mkImage [ ./modules/gateway.nix ];
         workerImage = mkImage [ ./modules/worker.nix ];

@@ -52,10 +52,10 @@ resolve_image() {
     "${SCRIPT_DIR}/..#${attr}"
 }
 
-# nixos-generators' `format = "docker"` produces a flat NixOS tarball at
-# `<out>/tarball/nixos-system-*.tar.xz` (NOT an OCI layered image). It must
-# be loaded via `podman import` and started with `/init` as the entrypoint;
-# `podman load` would not work here.
+# nixpkgs' `virtualisation/docker-image.nix` produces a flat NixOS tarball
+# at `<out>/tarball/nixos-system-*.tar.xz` (NOT an OCI layered image). It
+# must be loaded via `podman import` and started with `/init` as the
+# entrypoint; `podman load` would not work here.
 locate_tarball() {
   local out_dir="$1"
   if [[ -f "$out_dir" ]]; then
