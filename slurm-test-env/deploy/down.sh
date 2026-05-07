@@ -85,6 +85,17 @@ remove_image "$WORKER_IMAGE_TAG"
 
 rm -f -- "${STATE_DIR}/uid.lock"
 
+# --- Per-worker /tmp scratch -------------------------------------------------
+#
+# Bind-mounted into each worker at /tmp by up.sh. Always wiped on down —
+# /tmp scratch is by definition ephemeral. `podman unshare` is required
+# because nested rootless podman writes files owned by mapped subuids the
+# host operator can't unlink directly.
+
+if [[ -d "$WORKER_TMP_BASE" ]]; then
+  podman unshare rm -rf -- "$WORKER_TMP_BASE"
+fi
+
 # --- Optional state wipe -----------------------------------------------------
 
 if (( purge )); then
