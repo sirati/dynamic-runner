@@ -83,6 +83,8 @@ def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig
         overrides["time_limit"] = args.slurm_time_limit
     if getattr(args, "slurm_partition", None):
         overrides["partition"] = args.slurm_partition
+    if getattr(args, "slurm_cpus_per_task", None):
+        overrides["cpus_per_task"] = args.slurm_cpus_per_task
     if getattr(args, "source_already_staged", None):
         overrides["prestaged_src_bins_path"] = args.source_already_staged
     return SlurmConfig(
