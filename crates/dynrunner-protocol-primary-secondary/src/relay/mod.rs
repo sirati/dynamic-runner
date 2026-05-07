@@ -55,7 +55,8 @@ pub mod testing;
 pub use channel::OutboundChannel;
 pub use router::{
     Clocks, InboundOutcome, PeerRouteState, RouteVia, Router, RoutingError, SendOutcome,
-    REDIAL_COOLDOWN, RELAY_LOG_TARGET,
+    MSG_DIRECT_RESTORED, MSG_DROPPED_AT_ORIGINATOR, MSG_RELAY_ENGAGED, REDIAL_COOLDOWN,
+    RELAY_LOG_TARGET,
 };
 
 use std::collections::{HashMap, HashSet};
