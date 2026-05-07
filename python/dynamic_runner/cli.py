@@ -172,6 +172,15 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--slurm-cpus-per-task",
+        type=int,
+        default=None,
+        help=(
+            "Per-secondary SLURM cpus-per-task (sbatch --cpus-per-task). "
+            "Defaults to the SlurmConfig.cpus_per_task value (14) when unset."
+        ),
+    )
+    parser.add_argument(
         "--retry-max-passes",
         type=int,
         default=None,
