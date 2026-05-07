@@ -67,8 +67,7 @@
   #      that the host can already see through.
   #   2. Files written by a cluster user's nested rootless podman map
   #      to the same host subuid on every container's view of the
-  #      shared mounts, so /home / /app/out-* stay coherent across
-  #      nodes.
+  #      shared /home, so user state stays coherent across nodes.
   #
   # SUB_UID_COUNT=0 disables useradd's auto-subuid: provision-user.sh
   # writes the entries directly, and auto-allocation would otherwise

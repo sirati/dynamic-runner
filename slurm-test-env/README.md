@@ -32,12 +32,14 @@ It's a slurm cluster reachable via ssh:
 ssh -p 2222 <username>@localhost
 ```
 
-Shared `/home`, `/app/out-tmp`, `/app/out-network` are bind-mounted on
-every node; the host paths are printed by `up.sh`.
+Shared `/home` is bind-mounted on every node; the host path is printed
+by `up.sh`. Each container additionally has its own writable `/tmp`
+(per-container, not shared).
 
 ## Tear down
 
 ```sh
-INSTANCE_ID=<same-tag> ./deploy/down.sh           # keep simulated /home
-INSTANCE_ID=<same-tag> ./deploy/down.sh --purge   # also wipe it
+INSTANCE_ID=<same-tag> ./deploy/down.sh
 ```
+
+The simulated `/home` is preserved on the host for post-test inspection.

@@ -78,12 +78,12 @@ worker_tar="$(locate_tarball "$worker_out")"
 
 # --- Shared host-side mount points -------------------------------------------
 #
-# /home (simulated network drive) plus the two publish-path roots that
-# the worker runtime writes to: /app/out-tmp (per-job scratch) and
-# /app/out-network (cross-job results). All three live under $STATE_DIR
-# and survive `down.sh`, get wiped by `down.sh --purge`.
+# Only /home is shared across the cluster — the simulated network drive
+# every container sees at /home. Each container also gets its own
+# writable /tmp (gateway via --tmpfs, workers via per-container host
+# bind-mount, see below); nothing else is shared between containers.
 
-mkdir -p "$HOME_SHARE" "$OUT_TMP_SHARE" "$OUT_NETWORK_SHARE"
+mkdir -p "$HOME_SHARE"
 
 # --- Network -----------------------------------------------------------------
 #
@@ -136,8 +136,6 @@ common_flags=(
   --privileged
   --entrypoint /init
   -v "${HOME_SHARE}:/home:rw"
-  -v "${OUT_TMP_SHARE}:/app/out-tmp:rw"
-  -v "${OUT_NETWORK_SHARE}:/app/out-network:rw"
 )
 
 # --- Run gateway -------------------------------------------------------------
