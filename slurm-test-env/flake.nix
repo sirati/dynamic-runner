@@ -47,19 +47,25 @@
         } ''
           mkdir -p $out/bin $out/share/slurm-test-env
 
-          install -m 0644 ${./deploy/env.sh}            $out/share/slurm-test-env/env.sh
-          install -m 0755 ${./deploy/up.sh}             $out/bin/slurm-test-env-up
-          install -m 0755 ${./deploy/down.sh}           $out/bin/slurm-test-env-down
+          install -m 0644 ${./deploy/env.sh}             $out/share/slurm-test-env/env.sh
+          install -m 0755 ${./deploy/up.sh}              $out/bin/slurm-test-env-up
+          install -m 0755 ${./deploy/down.sh}            $out/bin/slurm-test-env-down
           install -m 0755 ${./scripts/provision-user.sh} $out/bin/slurm-test-env-provision-user
+          install -m 0755 ${./scripts/smoke-test.sh}     $out/bin/slurm-test-env-smoke-test
 
+          # PATH wrapping: include the system deps each script needs, plus
+          # $out/bin itself so e.g. smoke-test can call the wrapped
+          # provision-user (and any future sibling) by short name.
           for bin in $out/bin/*; do
             wrapProgram "$bin" \
               --set SLURM_TEST_ENV_GATEWAY_IMAGE ${gatewayImage} \
               --set SLURM_TEST_ENV_WORKER_IMAGE  ${workerImage} \
               --set SLURM_TEST_ENV_ENV_FILE      $out/share/slurm-test-env/env.sh \
+              --prefix PATH : "$out/bin" \
               --prefix PATH : ${
                 pkgs.lib.makeBinPath [
                   pkgs.podman
+                  pkgs.openssh
                   pkgs.coreutils
                   pkgs.gawk
                   pkgs.gnused
@@ -91,6 +97,10 @@
           provision-user = {
             type = "app";
             program = "${deploy}/bin/slurm-test-env-provision-user";
+          };
+          smoke-test = {
+            type = "app";
+            program = "${deploy}/bin/slurm-test-env-smoke-test";
           };
         };
       }
