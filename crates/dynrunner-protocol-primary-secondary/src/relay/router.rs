@@ -384,29 +384,26 @@ impl<I: Identifier> Router<I> {
                 if target_id == self.self_id {
                     // Receiver-side observation: the original sender
                     // is reaching us via relay, so we have an active
-                    // relay relationship with them. Bump the
-                    // cooldown gate state against `sender_id` (the
-                    // wire envelope's sender_id is the originator,
-                    // not the immediate predecessor — see
-                    // route_send/forward_step in relay/mod.rs which
-                    // preserve sender_id end-to-end).
+                    // relay relationship with them. Bump the cooldown
+                    // gate against `sender_id` (the wire envelope's
+                    // sender_id is the originator, not the immediate
+                    // predecessor — see route_send/forward_step which
+                    // preserve sender_id end-to-end), and emit
+                    // redial_target if the gate trips.
                     //
-                    // The "forwarder" we record on `route_state` is
-                    // the *immediate* peer the relay arrived from,
-                    // i.e. `path.last()`. If `path` is empty (the
-                    // originator was a direct neighbor sending us a
-                    // Relay envelope where target=us — degenerate
-                    // case the existing wire shape doesn't actually
-                    // produce, since route_send would have picked
-                    // RouteDecision::Direct), fall back to
-                    // `sender_id` so the transition log carries a
-                    // meaningful via.
-                    let immediate = path
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| sender_id.clone());
+                    // We do NOT touch `route_state[sender_id].via`:
+                    // `via` represents OUR outbound route to the peer,
+                    // which is only knowable from our send-side
+                    // experience. Their→us being broken does not
+                    // imply ours→them is broken (asymmetric
+                    // partition); overwriting `via` here would
+                    // produce a spurious direct→relay warn the next
+                    // time we send to them while our direct link
+                    // still works. The path argument is unused for
+                    // the same reason.
+                    let _ = path;
                     let redial_target =
-                        self.observe_relay(&sender_id, &immediate, clocks.now);
+                        self.observe_relay_recv(&sender_id, clocks.now);
                     return InboundOutcome::Deliver {
                         msg: *inner,
                         redial_target,
@@ -603,6 +600,40 @@ impl<I: Identifier> Router<I> {
             target.to_string(),
             PeerRouteState {
                 via: new_via,
+                last_observed_relay_at: Some(now),
+            },
+        );
+        redial_target
+    }
+
+    /// Receiver-side relay observation: a `Relay` envelope addressed
+    /// to us arrived from `peer`. Bumps `last_observed_relay_at[peer]`
+    /// and applies the redial-cooldown gate, but does NOT touch
+    /// `route_state[peer].via` — `via` is OUR outbound route, only
+    /// knowable from our send-side experience. Their→us being broken
+    /// does not imply ours→them is broken (asymmetric partitions are
+    /// possible in principle), so this path stays silent on logging
+    /// and lets the next outgoing send observe the true outbound route.
+    fn observe_relay_recv(&mut self, peer: &str, now: Instant) -> Option<String> {
+        let prev = self.route_state.get(peer).cloned();
+        let prev_observed = prev.as_ref().and_then(|s| s.last_observed_relay_at);
+        let trip = match prev_observed {
+            None => true,
+            Some(t) => now.duration_since(t) >= REDIAL_COOLDOWN,
+        };
+        let redial_target = if trip {
+            Some(peer.to_string())
+        } else {
+            None
+        };
+        let via = prev
+            .as_ref()
+            .map(|s| s.via.clone())
+            .unwrap_or(RouteVia::Direct);
+        self.route_state.insert(
+            peer.to_string(),
+            PeerRouteState {
+                via,
                 last_observed_relay_at: Some(now),
             },
         );
@@ -1086,6 +1117,50 @@ mod tests {
         );
         // No outbound dispatch — we delivered, didn't forward.
         assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn process_inbound_relay_for_self_preserves_existing_direct_via() {
+        // A1.M1 regression: receiver-side relay observation must NOT
+        // overwrite route_state[sender].via if we already observed a
+        // Direct route to the sender. Asymmetric partitions are
+        // possible in principle (their→us broken, ours→them works);
+        // the next outbound send must NOT log a spurious
+        // direct→relay warn.
+        let log = new_log::<()>();
+        let mut conns = conns_with_log(&["b", "d"], &log);
+        let mut router = Router::<()>::new("a".into());
+        // Establish a Direct route to d via a real send.
+        let _ = router
+            .send_to_peer("d", keepalive("a"), &mut conns, clocks_at(Instant::now(), 1.0))
+            .unwrap();
+        match &router.route_state.get("d").expect("route_state for d").via {
+            RouteVia::Direct => {}
+            other => panic!("expected Direct, got {other:?}"),
+        }
+        // Now d sends a relay envelope addressed to us via b.
+        let inbound = DistributedMessage::Relay {
+            sender_id: "d".into(),
+            timestamp: 1.0,
+            target_id: "a".into(),
+            relay_id: 3,
+            path: vec!["d".into(), "b".into()],
+            inner: Box::new(keepalive("d")),
+        };
+        let _ = router.process_inbound(inbound, &mut conns, clocks_at(Instant::now(), 2.0));
+        // via must remain Direct: their inbound being relayed says
+        // nothing about our outbound.
+        match &router.route_state.get("d").expect("route_state for d").via {
+            RouteVia::Direct => {}
+            other => panic!(
+                "via should remain Direct after recv-relay-for-self, got {other:?}"
+            ),
+        }
+        assert!(router
+            .route_state
+            .get("d")
+            .and_then(|s| s.last_observed_relay_at)
+            .is_some());
     }
 
     #[test]

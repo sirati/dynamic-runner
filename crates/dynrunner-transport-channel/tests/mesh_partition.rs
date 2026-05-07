@@ -591,9 +591,12 @@ async fn receiver_side_relay_observation_triggers_redial() {
         }
         other => panic!("expected Deliver with redial=d: {other:?}"),
     }
-    // Route-state assertion: D's entry has via=Relay{forwarder=B}
-    // (the immediate predecessor on `path`) and
-    // last_observed_relay_at == now.
+    // Route-state assertion: D's entry has last_observed_relay_at
+    // bumped, but `via` is NOT overwritten — receiver-side
+    // observation says nothing about OUR outbound route to D, so
+    // `via` remains the default (Direct) until our next outgoing
+    // send overwrites it accurately. This guards against the
+    // A1.M1 spurious-direct→relay-warn bug.
     let route_state = router.route_state();
     let d_state = route_state
         .get("d")
@@ -605,9 +608,8 @@ async fn receiver_side_relay_observation_triggers_redial() {
     );
     assert_eq!(
         d_state.via,
-        RouteVia::Relay {
-            forwarder: "b".to_string(),
-        },
-        "forwarder recorded as immediate predecessor (path.last())"
+        RouteVia::Direct,
+        "via is NOT overwritten by receiver-side observation \
+         (their inbound being relayed says nothing about our outbound)"
     );
 }
