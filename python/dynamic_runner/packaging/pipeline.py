@@ -228,6 +228,25 @@ def run_slurm_pipeline(
         )
         log.info(f"SLURM jobs submitted; run_id={prep_result.run_id}")
 
+        # Push the consumer's local --source tree to the gateway's
+        # srcbins dir so the wrapper's RO bind-mount into /app/src-network
+        # is actually populated. Without this the StageFile pipeline
+        # (default mode) issues "the file is at src_network/<rel>"
+        # records pointing at an empty directory and every task fails
+        # NonRecoverable. Skipped when the consumer pre-staged
+        # (--source-already-staged) or the task is non-file-based.
+        # Runs after SLURM submit so secondaries are already starting;
+        # the primary's InitialAssignment (which secondaries process
+        # via stage_file) isn't sent until coord.run() reaches its
+        # peer-mesh-ready gate, so a slow upload just delays dispatch
+        # rather than racing the secondary.
+        if (
+            binaries
+            and getattr(task, "uses_file_based_items", True)
+            and not getattr(args, "source_already_staged", None)
+        ):
+            job_manager.upload_source_binaries(binaries, sel_result.source_dir)
+
         _drive_rust_primary(
             task, args, prep_result, primary_quic_port, binaries, slurm_config, log
         )
