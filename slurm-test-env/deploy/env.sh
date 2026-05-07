@@ -66,6 +66,7 @@ WORKER_IMAGE_TAG="slurm-test-env-${INSTANCE_ID}-worker:latest"
 
 worker_hostname()       { printf '%s%s' "$WORKER_HOSTNAME_PREFIX" "$1"; }
 worker_container_name() { printf '%s%s-%s' "$WORKER_HOSTNAME_PREFIX" "$1" "$INSTANCE_ID"; }
+worker_tmp_dir()        { printf '%s/%s' "$WORKER_TMP_BASE" "$(worker_hostname "$1")"; }
 
 # --- Host-side filesystem layout --------------------------------------------
 #
@@ -92,6 +93,13 @@ HOME_SHARE="${STATE_DIR}/home"
 # level by the runtime.
 OUT_TMP_SHARE="${STATE_DIR}/out-tmp"
 OUT_NETWORK_SHARE="${STATE_DIR}/out-network"
+
+# Per-worker /tmp lives on the host's real /tmp instead of an in-container
+# tmpfs: image tarballs (multi-GB) and other worker scratch can otherwise
+# blow a tmpfs's size cap. The base dir is per-instance so concurrent
+# clusters don't share scratch; per-worker subdirs are created in up.sh
+# and removed wholesale in down.sh.
+: "${WORKER_TMP_BASE:=${TMPDIR:-/tmp}/slurm-test-env-${INSTANCE_ID}}"
 
 # --- Host SSH port ----------------------------------------------------------
 #

@@ -164,16 +164,23 @@ podman run -d \
 # --- Run workers -------------------------------------------------------------
 
 printf 'Starting %d worker(s)...\n' "$WORKER_COUNT"
+mkdir -p "$WORKER_TMP_BASE"
 for i in $(seq 1 "$WORKER_COUNT"); do
   c_name="$(worker_container_name "$i")"
   h_name="$(worker_hostname "$i")"
+  w_tmp="$(worker_tmp_dir "$i")"
+  mkdir -p "$w_tmp"
+  # /tmp expects world-writable + sticky bit so any uid inside the
+  # container (root, slurm users, nested-podman subuids) can write —
+  # matches the semantics of the tmpfs this replaces.
+  chmod 1777 "$w_tmp"
   podman run -d \
     --name "$c_name" \
     --hostname "$h_name" \
     --network-alias "$h_name" \
     --memory "$WORKER_MEMORY" \
     --cpus "$WORKER_CPUS" \
-    --tmpfs "/tmp:rw,nosuid,size=1g" \
+    -v "${w_tmp}:/tmp:rw" \
     "${common_flags[@]}" \
     "$WORKER_IMAGE_TAG" >/dev/null
 done

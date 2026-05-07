@@ -15,4 +15,9 @@
     enable = true;
     dockerCompat = false;
   };
+
+  # Workers receive a host-side bind mount at /tmp from up.sh (so the host's
+  # disk, not a small in-container tmpfs, holds large image tarballs and
+  # other scratch). Letting NixOS mount tmpfs over it would mask the bind.
+  boot.tmp.useTmpfs = false;
 }

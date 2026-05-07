@@ -16,8 +16,10 @@
 
   time.timeZone = lib.mkDefault "UTC";
 
-  # /tmp on tmpfs (per requirement: writable, ephemeral).
-  boot.tmp.useTmpfs = true;
+  # /tmp on tmpfs (per requirement: writable, ephemeral). Per-role modules
+  # may override (e.g. workers bind-mount a host dir at /tmp instead, so
+  # large image tarballs don't blow the tmpfs size cap).
+  boot.tmp.useTmpfs = lib.mkDefault true;
 
   # SSH policy:
   #   - Root login disabled. The cluster operator does not ssh to root anywhere.
