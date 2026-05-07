@@ -74,8 +74,12 @@ pub(crate) fn run_local<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
 ) -> PyResult<Py<PyAny>> {
+    // The legacy positional `max_memory` is kept for back-compat with
+    // direct `RustLocalManager(...)` callers; the typed-config path
+    // bypasses its single-key-memory shape via the `max_resources` and
+    // `low_resource_thresholds` kwargs which the legacy class accepts and
+    // prefers when present. No flattening here.
     let max_memory = config.max_resources.inner.get("memory").copied().unwrap_or(0);
-    let low_memory_threshold = config.low_resource_thresholds.inner.get("memory").copied();
 
     let kwargs = PyDict::new(py);
     kwargs.set_item("skip_existing", skip_existing)?;
@@ -96,9 +100,11 @@ pub(crate) fn run_local<'py>(
     if let Some(ws) = worker_spec {
         kwargs.set_item("worker_spec", ws)?;
     }
-    if let Some(t) = low_memory_threshold {
-        kwargs.set_item("low_memory_threshold", t)?;
-    }
+    kwargs.set_item("max_resources", config.max_resources.clone())?;
+    kwargs.set_item(
+        "low_resource_thresholds",
+        config.low_resource_thresholds.clone(),
+    )?;
     kwargs.set_item("scheduler_config", config.scheduler_config.clone())?;
     kwargs.set_item(
         "phase_status_log_intervals_secs",
@@ -209,6 +215,9 @@ pub(crate) fn run_secondary<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
 ) -> PyResult<Py<PyAny>> {
+    // Legacy positional `ram_bytes` retained for back-compat; the typed
+    // path passes the full multi-resource map via the `max_resources`
+    // kwarg, which the legacy class prefers when present.
     let ram_bytes = config.max_resources.inner.get("memory").copied().unwrap_or(0);
     let kwargs = PyDict::new(py);
     kwargs.set_item("skip_existing", skip_existing)?;
@@ -219,6 +228,7 @@ pub(crate) fn run_secondary<'py>(
         kwargs.set_item("worker_spec", ws)?;
     }
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
+    kwargs.set_item("max_resources", config.max_resources.clone())?;
     if let Some(sn) = config.src_network.as_ref() {
         kwargs.set_item("src_network", sn.clone())?;
     }
@@ -290,6 +300,10 @@ pub(crate) fn run_distributed<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
 ) -> PyResult<Py<PyAny>> {
+    // Legacy positional `ram_per_secondary` retained for back-compat; the
+    // typed path passes the full multi-resource map via the
+    // `max_resources_per_secondary` kwarg, which the legacy class prefers
+    // when present.
     let ram_per_secondary = secondary_template
         .max_resources
         .inner
@@ -307,6 +321,10 @@ pub(crate) fn run_distributed<'py>(
     kwargs.set_item(
         "distributed_config",
         primary_config.distributed_config.clone(),
+    )?;
+    kwargs.set_item(
+        "max_resources_per_secondary",
+        secondary_template.max_resources.clone(),
     )?;
 
     let cls = module(py)?.getattr("RustDistributedManager")?;

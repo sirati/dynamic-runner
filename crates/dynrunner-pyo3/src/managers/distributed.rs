@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{PhaseId, TypeId};
+use dynrunner_core::{PhaseId, ResourceKind, ResourceMap, TypeId};
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
@@ -12,6 +12,7 @@ use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTr
 use crate::config::connection::ConnectionMode;
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
+use crate::config::resources::PyResourceMap;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::pytypes::extract_binaries;
@@ -23,7 +24,7 @@ pub(crate) struct PyDistributedManager {
     python_executable: PathBuf,
     num_secondaries: u32,
     num_workers_per_secondary: u32,
-    ram_per_secondary: u64,
+    max_resources_per_secondary: ResourceMap,
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_paths: LogPathConfig,
@@ -59,6 +60,7 @@ impl PyDistributedManager {
         log_paths = None,
         worker_spec = None,
         distributed_config = None,
+        max_resources_per_secondary = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -73,6 +75,7 @@ impl PyDistributedManager {
         log_paths: Option<LogPathConfig>,
         worker_spec: Option<WorkerSpec>,
         distributed_config: Option<DistributedConfig>,
+        max_resources_per_secondary: Option<PyResourceMap>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -84,11 +87,20 @@ impl PyDistributedManager {
             log_paths,
         )?;
 
+        // Boundary normalization: typed `max_resources_per_secondary`
+        // ResourceMap wins; fall back to a single-key memory map built
+        // from the legacy scalar `ram_per_secondary` if no map given.
+        let max_resources_per_secondary = max_resources_per_secondary
+            .map(|m| m.to_rust())
+            .unwrap_or_else(|| {
+                ResourceMap::from([(ResourceKind::memory(), ram_per_secondary)])
+            });
+
         Ok(Self {
             python_executable: task.python_executable,
             num_secondaries,
             num_workers_per_secondary,
-            ram_per_secondary,
+            max_resources_per_secondary,
             source_dir: task.source_path,
             output_dir: task.output_path,
             log_paths: task.log_paths,
@@ -112,7 +124,7 @@ impl PyDistributedManager {
 
         let num_secondaries = self.num_secondaries;
         let num_workers = self.num_workers_per_secondary;
-        let ram = self.ram_per_secondary;
+        let max_resources_per_secondary = self.max_resources_per_secondary.clone();
         let estimator = self.estimator.clone();
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
@@ -223,6 +235,7 @@ impl PyDistributedManager {
                     let sec_worker_module = worker_module.clone();
                     let sec_worker_args = worker_cmd_args.clone();
                     let sec_estimator = estimator.clone();
+                    let sec_max_resources = max_resources_per_secondary.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -232,7 +245,7 @@ impl PyDistributedManager {
                         let config = SecondaryConfig {
                             secondary_id,
                             num_workers,
-                            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram)]),
+                            max_resources: sec_max_resources,
                             hostname: "localhost".into(),
                             keepalive_interval: dist_keepalive,
                             src_network: None,

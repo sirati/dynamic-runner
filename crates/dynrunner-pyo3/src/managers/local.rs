@@ -5,11 +5,12 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{PhaseId, TaskInfo};
+use dynrunner_core::{PhaseId, ResourceKind, ResourceMap, TaskInfo};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 
 use crate::config::connection::ConnectionMode;
 use crate::config::log_paths::LogPathConfig;
+use crate::config::resources::PyResourceMap;
 use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
@@ -25,8 +26,8 @@ use crate::transport::EitherManagerEnd;
 pub(crate) struct PyLocalManager {
     python_executable: PathBuf,
     num_workers: u32,
-    max_memory: u64,
-    low_memory_threshold: u64,
+    max_resources: ResourceMap,
+    low_resource_thresholds: ResourceMap,
     always_restart_worker: bool,
     restart_predicate: Option<Py<PyAny>>,
     retry_max_attempts: u32,
@@ -87,6 +88,8 @@ impl PyLocalManager {
         scheduler_config = None,
         phase_status_log_intervals_secs = None,
         stage_timeouts_secs = None,
+        max_resources = None,
+        low_resource_thresholds = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -110,6 +113,8 @@ impl PyLocalManager {
         scheduler_config: Option<SchedulerConfig>,
         phase_status_log_intervals_secs: Option<Vec<f64>>,
         stage_timeouts_secs: Option<HashMap<String, f64>>,
+        max_resources: Option<PyResourceMap>,
+        low_resource_thresholds: Option<PyResourceMap>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -166,11 +171,27 @@ impl PyLocalManager {
             }
         };
 
+        // Normalize the resource budget at the boundary: callers may pass a
+        // typed `max_resources` ResourceMap (preferred) or just the legacy
+        // scalar `max_memory: u64` (single-key memory). When both are
+        // given, the typed map wins. Same shape for `low_resource_thresholds`.
+        let max_resources = max_resources.map(|m| m.to_rust()).unwrap_or_else(|| {
+            ResourceMap::from([(ResourceKind::memory(), max_memory)])
+        });
+        let low_resource_thresholds = low_resource_thresholds
+            .map(|m| m.to_rust())
+            .unwrap_or_else(|| {
+                ResourceMap::from([(
+                    ResourceKind::memory(),
+                    low_memory_threshold.unwrap_or(300 * 1024 * 1024),
+                )])
+            });
+
         Ok(Self {
             python_executable: task.python_executable,
             num_workers,
-            max_memory,
-            low_memory_threshold: low_memory_threshold.unwrap_or(300 * 1024 * 1024),
+            max_resources,
+            low_resource_thresholds,
             always_restart_worker,
             restart_predicate,
             retry_max_attempts,
@@ -225,7 +246,7 @@ impl PyLocalManager {
 
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
-            max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), self.max_memory)]),
+            max_resources: self.max_resources.clone(),
             always_restart_worker: self.always_restart_worker,
             restart_predicate,
             retry_max_attempts: self.retry_max_attempts,
@@ -243,10 +264,7 @@ impl PyLocalManager {
                 .iter()
                 .map(|(k, v)| (k.clone(), Duration::from_secs_f64(*v)))
                 .collect(),
-            low_resource_thresholds: dynrunner_core::ResourceMap::from([(
-                dynrunner_core::ResourceKind::memory(),
-                self.low_memory_threshold,
-            )]),
+            low_resource_thresholds: self.low_resource_thresholds.clone(),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: self
                 .phase_status_log_intervals_secs
