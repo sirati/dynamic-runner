@@ -394,6 +394,14 @@ pub enum DistributedMessage<I> {
         sender_id: String,
         timestamp: f64,
         new_primary_id: String,
+        /// Monotonic epoch for the role-flip. Receivers feed this
+        /// into the replicated `ClusterState::PrimaryChanged`
+        /// mutation, which is last-writer-wins on (epoch,
+        /// primary_id). Higher epochs strictly win, matching the
+        /// election protocol's tiebreaker semantics: a partition
+        /// that re-elects with a higher epoch supersedes the
+        /// previous identity unconditionally.
+        epoch: u64,
     },
     /// Secondary -> Primary: "my peer-mesh has finished forming
     /// (or was empty / fully failed to form)". Emitted once per

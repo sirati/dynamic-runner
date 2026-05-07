@@ -566,19 +566,54 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         }
     }
 
-    // ── Phase 7: Promote primary ──
+    // ── Promote primary (atomic role-flip) ──
 
     pub(super) async fn promote_primary(&mut self) -> Result<(), String> {
         if let Some(first_id) = self.secondaries.keys().next().cloned() {
             self.primary_id = Some(first_id.clone());
-            tracing::info!(primary = %first_id, "promoting secondary to primary");
+            // Monotonic per-promotion epoch carried on the wire and
+            // fed into `ClusterState::PrimaryChanged`'s last-writer-
+            // wins resolver. Starting from the local mirror's current
+            // epoch + 1 is sufficient at the bootstrap promotion
+            // (epoch starts at 0 cluster-wide); the failover election
+            // protocol's own `round` will supersede this when it
+            // re-elects.
+            let new_epoch = self.cluster_state.primary_epoch() + 1;
+            tracing::info!(primary = %first_id, epoch = new_epoch, "promoting secondary to primary");
+
+            // Apply locally so the originator's mirror flips atomically
+            // with the broadcast, not after the broadcast round-trips
+            // back to us. Lower-epoch races no-op against the higher
+            // epoch we just installed.
+            self.cluster_state.apply(ClusterMutation::PrimaryChanged {
+                new: first_id.clone(),
+                epoch: new_epoch,
+            });
 
             let msg = DistributedMessage::<I>::PromotePrimary {
                 sender_id: self.config.node_id.clone(),
                 timestamp: timestamp_now(),
                 new_primary_id: first_id.clone(),
+                epoch: new_epoch,
             };
-            self.transport.send_to(&first_id, msg).await?;
+            // Broadcast to every secondary, not unicast to the elected
+            // node: every secondary needs the role-change to update
+            // its `primary_link` routing target and clear its per-
+            // worker backoff so idle workers re-issue at the new
+            // primary on their next tick (otherwise the new primary's
+            // peers stay quiet for one stale-window). The pre-Phase-P
+            // unicast was Bug 2 in the trace at `feb1052` — only the
+            // elected node logged the role change because only it
+            // received the message.
+            if let Err(failures) = self.transport.broadcast(msg).await {
+                for (secondary_id, error) in &failures {
+                    tracing::warn!(
+                        secondary = %secondary_id,
+                        error = %error,
+                        "PromotePrimary broadcast delivery failed"
+                    );
+                }
+            }
 
             // Hand-off complete: the local primary stops being
             // authoritative the moment `PromotePrimary` is on the
@@ -601,11 +636,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         Ok(())
     }
 
-    // ── Phase 8: Send full task list ──
+    // ── Send full task list (legacy snapshot until Phase B) ──
 
     pub(super) async fn send_full_task_list(&mut self) -> Result<(), String> {
-        // Bail out if no primary was promoted (Phase 7 no-op
-        // when there are no secondaries yet). Every secondary still
+        // Bail out if no primary was promoted (`promote_primary`
+        // is a no-op when there are no secondaries yet). Every
+        // secondary still
         // gets the broadcast below — promotion just controls who
         // gets the pre-designated routing pointer (`primary_id`).
         if self.primary_id.is_none() {

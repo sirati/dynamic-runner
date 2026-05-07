@@ -662,6 +662,7 @@ mod tests {
             sender_id: "primary".into(),
             timestamp: 0.0,
             new_primary_id: "sec-a".into(),
+            epoch: 1,
         };
         sec.dispatch_message(promote)
             .await
@@ -706,6 +707,7 @@ mod tests {
             sender_id: "primary".into(),
             timestamp: 0.0,
             new_primary_id: "sec-a".into(),
+            epoch: 1,
         };
         sec.dispatch_message(promote)
             .await
@@ -725,6 +727,72 @@ mod tests {
         assert!(actions.broadcast.is_empty());
         assert!(matches!(sec.election, ElectionState::Promoted));
         assert!(sec.is_primary);
+    }
+
+    /// Phase P: PromotePrimary clears any per-worker backoff accrued
+    /// against the previous primary. Without this, idle workers sit
+    /// through a stale window before re-issuing at the new primary,
+    /// reproducing the dispatch-silence symptom from the trace at
+    /// `feb1052`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promote_primary_clears_per_worker_backoff() {
+        let mut sec = make_secondary(election_config("sec-b"));
+        // Simulate per-worker backoff accrued against the old primary.
+        sec.primary_link.note_request_sent(0);
+        sec.primary_link.note_request_sent(1);
+        assert!(!sec.primary_link.should_request_now(0));
+        assert!(!sec.primary_link.should_request_now(1));
+
+        let promote = DistributedMessage::PromotePrimary {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "sec-a".into(),
+            epoch: 1,
+        };
+        sec.dispatch_message(promote)
+            .await
+            .expect("PromotePrimary handler succeeds");
+
+        // Both workers can fire a fresh request immediately at the
+        // new primary.
+        assert!(sec.primary_link.should_request_now(0));
+        assert!(sec.primary_link.should_request_now(1));
+    }
+
+    /// Phase P: PromotePrimary feeds (epoch, primary) into the
+    /// replicated `cluster_state`, where last-writer-wins on
+    /// `(epoch, primary_id)` makes a stale lower-epoch broadcast a
+    /// no-op against an already-installed higher-epoch promotion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promote_primary_applies_primary_changed_with_epoch() {
+        let mut sec = make_secondary(election_config("sec-b"));
+
+        let high = DistributedMessage::PromotePrimary {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "sec-c".into(),
+            epoch: 5,
+        };
+        sec.dispatch_message(high).await.unwrap();
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
+        assert_eq!(sec.cluster_state.primary_epoch(), 5);
+        assert_eq!(sec.primary_link.current_primary(), Some("sec-c"));
+
+        // A late lower-epoch broadcast must not clobber the higher
+        // epoch already installed.
+        let stale = DistributedMessage::PromotePrimary {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "sec-a".into(),
+            epoch: 2,
+        };
+        sec.dispatch_message(stale).await.unwrap();
+        assert_eq!(
+            sec.cluster_state.current_primary(),
+            Some("sec-c"),
+            "stale lower-epoch PromotePrimary must not supersede higher epoch"
+        );
+        assert_eq!(sec.cluster_state.primary_epoch(), 5);
     }
 
     /// Scenario (d): two peers detect primary death simultaneously and both
