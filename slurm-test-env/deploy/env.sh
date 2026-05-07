@@ -1,0 +1,126 @@
+# shellcheck shell=bash
+# Deploy-time configuration for slurm-test-env.
+#
+# Sourced by up.sh, down.sh, and scripts/provision-user.sh. Override any
+# value by exporting it before invocation:
+#
+#   INSTANCE_ID=ci-job-42 SSH_PORT=2299 ./deploy/up.sh
+#
+# Two concurrent clusters MUST differ on:
+#   - INSTANCE_ID  (suffix on container names, podman network, image tags,
+#                   state dir — i.e. every globally-scoped resource)
+#   - SSH_PORT     (host TCP listen port)
+# Everything else can stay at defaults.
+
+# --- Instance identity (REQUIRED) -------------------------------------------
+#
+# The instance id is the suffix on every globally-scoped name. Cluster-
+# internal names (hostnames, network aliases, slurm.conf entries) stay
+# stable across instances — those live inside each instance's own podman
+# network namespace and never collide there.
+#
+# This is intentionally not given a default value: silently sharing an id
+# between concurrent test runs would corrupt their shared /home and
+# scramble UIDs. The operator must pick one explicitly.
+
+if [[ -z "${INSTANCE_ID:-}" ]]; then
+  cat >&2 <<'EOF'
+INSTANCE_ID is not set.
+
+This identifier scopes every globally-visible resource (podman containers,
+network, image tags, host state dir) so that multiple slurm-test-env
+clusters can run concurrently on the same host without colliding. Pick any
+short alphanumeric tag — it is local to your host:
+
+  INSTANCE_ID=alpha SSH_PORT=2222 ./up.sh
+  INSTANCE_ID=beta  SSH_PORT=2322 ./up.sh
+EOF
+  return 1 2>/dev/null || exit 1
+fi
+
+if [[ ! "$INSTANCE_ID" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  printf 'Invalid INSTANCE_ID %q (must match [a-zA-Z0-9_-]+).\n' "$INSTANCE_ID" >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+# --- Cluster shape -----------------------------------------------------------
+
+: "${WORKER_COUNT:=4}"
+
+# Cluster-internal names. Match the slurm.conf NodeName/ControlMachine
+# entries baked into modules/slurm-cluster.nix; do NOT change without
+# rebuilding the images.
+GATEWAY_HOSTNAME="slurm-gateway"
+WORKER_HOSTNAME_PREFIX="slurm-worker"
+
+# Globally-scoped names — all carry the INSTANCE_ID suffix so concurrent
+# instances do not collide on the host's podman engine.
+GATEWAY_NAME="${GATEWAY_HOSTNAME}-${INSTANCE_ID}"
+NETWORK="slurm-test-net-${INSTANCE_ID}"
+GATEWAY_IMAGE_TAG="slurm-test-env-${INSTANCE_ID}-gateway:latest"
+WORKER_IMAGE_TAG="slurm-test-env-${INSTANCE_ID}-worker:latest"
+
+# Naming helpers consumed by up/down/provision scripts. Defined here so
+# the naming scheme has exactly one source of truth — adding e.g. a port
+# offset, a different separator, or a new node role is a single-file edit.
+
+worker_hostname()       { printf '%s%s' "$WORKER_HOSTNAME_PREFIX" "$1"; }
+worker_container_name() { printf '%s%s-%s' "$WORKER_HOSTNAME_PREFIX" "$1" "$INSTANCE_ID"; }
+
+# --- Host-side filesystem layout --------------------------------------------
+#
+# Per-instance tree:
+#
+#   $STATE_DIR/                    persistent root for this instance
+#     home/  (= $HOME_SHARE)       the simulated shared drive seen as /home
+#     uid.lock                     flock target during user provisioning
+#
+# After `down.sh`, the only thing left under $STATE_DIR is $HOME_SHARE —
+# the simulated /home is what the operator will want to inspect for test
+# output. `down.sh --purge` deletes $HOME_SHARE too.
+
+: "${STATE_BASE_DIR:=${HOME}/.local/state/slurm-test-env}"
+STATE_DIR="${STATE_BASE_DIR}/${INSTANCE_ID}"
+HOME_SHARE="${STATE_DIR}/home"
+
+# Publish-path mounts mirroring the production slurm wrapper layout
+# (-v /…/out-tmp:/app/out-tmp, -v /…/out-network:/app/out-network).
+# Bind-mounted into every cluster container at the same in-container
+# paths the runtime publishes to, so consumers don't need to override
+# DYNRUNNER_PUBLISH_*_ROOT to make publishes work in the test env.
+# Both shared across the cluster; per-job scoping is done above this
+# level by the runtime.
+OUT_TMP_SHARE="${STATE_DIR}/out-tmp"
+OUT_NETWORK_SHARE="${STATE_DIR}/out-network"
+
+# --- Host SSH port ----------------------------------------------------------
+#
+# MUST be unique per concurrent instance. There is no auto-default that
+# can pick a free port without races; the operator chooses.
+
+: "${SSH_PORT:=2222}"
+
+# --- Per-container resource caps --------------------------------------------
+
+: "${GATEWAY_MEMORY:=1g}"
+: "${GATEWAY_CPUS:=2}"
+: "${WORKER_MEMORY:=4g}"
+: "${WORKER_CPUS:=2}"
+
+# --- User-facing summary ----------------------------------------------------
+#
+# Deliberately shows only what an operator of a real slurm cluster would
+# care about: where the shared /home is on the host (for post-test
+# inspection), and how to ssh in. Everything else — container names,
+# network, image tags, state-dir layout — is implementation detail and
+# is intentionally hidden. Users of this harness should never need to
+# learn the internal naming scheme.
+
+print_layout() {
+  cat <<EOF
+
+  simulated /home:    ${HOME_SHARE}
+  ssh login:          ssh -p ${SSH_PORT} <user>@localhost
+
+EOF
+}
