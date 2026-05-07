@@ -134,13 +134,6 @@ class LocalGateway:
 
         return remote_path.exists()
 
-    def sync_project(self, local_project_root: Path, remote_project_root: Path) -> None:
-        """Synchronize project files to gateway using rsync over SSH
-
-        TODO REMOVE THIS, WE NEVER WANT TO DO THIS AS WE SENT A DOCKER IMAGE INSTEAD!!!
-        """
-        raise RuntimeError("TODO REMOVE THIS, WE NEVER WANT TO DO THIS AS WE SENT A DOCKER IMAGE INSTEAD!!!")
-
     def setup_port_forwarding(self, local_port: int, remote_port: int) -> None:
         """Setup port forwarding (no-op for local gateway)
 

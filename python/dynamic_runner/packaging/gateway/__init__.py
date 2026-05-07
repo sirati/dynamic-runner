@@ -52,12 +52,6 @@ class Gateway(Protocol):
         """Check if file exists on gateway"""
         ...
 
-    def sync_project(self, local_project_root: Path, remote_project_root: Path) -> None:
-        """Synchronize project files to gateway (excluding .git, __pycache__, etc.)
-        TODO REMOVE THIS, WE NEVER WANT TO DO THIS AS WE SENT A DOCKER IMAGE INSTEAD!!!
-        """
-        ...
-
     def setup_port_forwarding(self, local_port: int, remote_port: int) -> None:
         """Setup SSH remote port forwarding: gateway:remote_port -> localhost:local_port
 
