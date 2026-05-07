@@ -4,8 +4,10 @@
 # Stops and removes every globally-scoped resource for this instance —
 # containers, podman network, instance-scoped image tags, and the UID
 # allocation lock file — leaving the host's podman storage with no trace
-# of this run. The simulated /home (= $HOME_SHARE) is preserved so the
-# operator can inspect test output post-mortem; pass --purge to wipe it.
+# of this run. The simulated /home (= $HOME_SHARE) is always preserved
+# so the operator can inspect test output post-mortem and so user
+# provisioning carries across runs; --purge wipes the per-job publish
+# trees (out-tmp, out-network) but never touches /home.
 
 set -euo pipefail
 
@@ -22,10 +24,11 @@ for arg in "$@"; do
       cat <<EOF
 usage: down.sh [--purge]
 
-Stops the cluster. The simulated /home is preserved at
-${HOME_SHARE} for post-test inspection.
+Stops the cluster. The simulated /home is always preserved at
+${HOME_SHARE} for post-test inspection and across-run user state.
 
-  --purge   also wipe the simulated /home.
+  --purge   also wipe the per-job publish trees (out-tmp,
+            out-network). /home is never touched.
 EOF
       exit 0
       ;;
@@ -99,18 +102,25 @@ fi
 # --- Optional state wipe -----------------------------------------------------
 
 if (( purge )); then
-  if [[ -d "$STATE_DIR" ]]; then
-    # Files under $HOME_SHARE (and any other in-container-written dir)
-    # are owned by user-namespace-mapped subuids that the operator can
-    # neither chown nor unlink directly. `podman unshare` enters the
-    # mapping so the unlink succeeds for those subuid-owned files.
-    podman unshare rm -rf -- "$STATE_DIR"
-  fi
+  # /home is intentionally exempt: it carries user provisioning state
+  # (.cluster_uid, .ssh) plus inspectable test output, and re-creating
+  # it is a deliberate operator action (rm -rf the dir by hand under
+  # `podman unshare` if you really want a clean slate).
+  #
+  # Files under the publish trees are owned by user-namespace-mapped
+  # subuids the operator can't unlink directly; `podman unshare`
+  # enters the mapping so rm succeeds.
+  for dir in "$OUT_TMP_SHARE" "$OUT_NETWORK_SHARE"; do
+    if [[ -d "$dir" ]]; then
+      podman unshare rm -rf -- "$dir"
+    fi
+  done
   cat <<EOF
 
 === slurm-test-env :: cluster down (purged) ===
 
-  simulated /home:    ${HOME_SHARE}    (removed)
+  simulated /home:    ${HOME_SHARE}    (preserved — never purged)
+  publish trees:      ${OUT_TMP_SHARE}, ${OUT_NETWORK_SHARE}    (removed)
 
 EOF
 else
@@ -120,7 +130,7 @@ else
 
   simulated /home:    ${HOME_SHARE}    (preserved for inspection)
 
-Pass --purge to also wipe the simulated /home.
+Pass --purge to also wipe the per-job publish trees.
 
 EOF
 fi
