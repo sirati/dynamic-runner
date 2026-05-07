@@ -10,8 +10,11 @@
 //! Both the QUIC `PeerNetwork` and the in-process
 //! `ChannelPeerTransport` already store
 //! `tokio::sync::mpsc::UnboundedSender<DistributedMessage<I>>` as the
-//! value type in their connection maps, so the blanket impl below is
-//! the only one required for current consumers. A new transport gains
+//! value type in their connection maps, so the blanket impl below
+//! covers both production transports. The Router unit tests
+//! additionally provide a `RecordingChannel` impl in
+//! [`crate::relay::testing`] that captures dispatched messages for
+//! assertions without bypassing the trait. A new transport gains
 //! relay parity by impl'ing this trait for whatever its connection
 //! record happens to be — no copy-paste of the dispatch state machine.
 //!
