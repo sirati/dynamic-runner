@@ -341,8 +341,9 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
 
         // Two binaries: "ok" (50 bytes, sorts first under size-DESC
         // → initial-assigned to worker 0) and "flaky" (40 bytes,
-        // stays queued → goes to primary's `primary_pending`
-        // post-promotion via FullTaskList).
+        // stays queued → on promotion the new primary's
+        // `populate_primary_from_cluster_state` rebuilds
+        // `primary_pending` from the replicated cluster ledger).
         let binaries = vec![
             make_binary("ok", 50),
             make_binary("flaky", 40),

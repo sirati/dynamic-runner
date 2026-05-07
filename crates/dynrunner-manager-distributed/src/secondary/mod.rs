@@ -66,18 +66,6 @@ impl Default for SecondaryConfig {
     }
 }
 
-/// Cached `FullTaskList` payload kept on every secondary so that, on
-/// promotion, the new primary can rebuild its `PendingPool` without
-/// asking the (now-dead) original primary for another snapshot.
-///
-/// One alias per concern keeps the secondary struct legible and
-/// lets `populate_primary_tasks` accept the same shape it caches.
-type CachedTaskListSnapshot<I> = (
-    Vec<dynrunner_protocol_primary_secondary::TaskListEntry<I>>,
-    HashSet<String>,
-    HashMap<PhaseId, Vec<PhaseId>>,
-);
-
 /// Per-item bookkeeping for an in-flight primary dispatch.
 ///
 /// One concern: hold everything the primary needs to recover
@@ -232,12 +220,12 @@ where
     /// (mesh formed, watchdog elapsed, or no peers to dial).
     mesh_ready_sent: bool,
 
-    // primary state (populated on promotion + full task list).
-    // `primary_pending` is `None` until the secondary first receives a
-    // `FullTaskList` snapshot from the live primary (or, if it gets
-    // promoted before any snapshot, until it observes one as the new
-    // primary). The pool is rebuilt — not patched — on every snapshot,
-    // because the wire format describes the authoritative pending set.
+    // primary state (populated on promotion).
+    // `primary_pending` is `None` until this secondary is promoted; on
+    // the became-primary transition `populate_primary_from_cluster_state`
+    // rebuilds it from the continuously-replicated `cluster_state` mirror.
+    // No wire round-trip: the cluster ledger has been kept in sync via
+    // `ClusterMutation` broadcasts since the run started.
     primary_pending: Option<PendingPool<I>>,
     primary_completed: HashSet<String>,
     /// Per-item ledger for every primary dispatch that hasn't
@@ -297,15 +285,6 @@ where
     /// `TaskComplete` (proves it's healthy) or when the backoff
     /// window expires naturally.
     backpressured_secondaries: HashMap<String, Instant>,
-
-    // Cached snapshot of the live primary's last `FullTaskList` broadcast.
-    // Every secondary keeps the cache up to date so that, on promotion,
-    // we can populate `primary_pending` immediately without round-tripping
-    // through a fresh `FullTaskList` (which would require a now-dead
-    // primary). Stores the wire-format payload verbatim so the
-    // PendingPool reconstruction logic lives in one place
-    // (`populate_primary_tasks`).
-    cached_full_task_list: Option<CachedTaskListSnapshot<I>>,
 
     /// Set by handlers that detect an unrecoverable local fault (peer
     /// mesh fully failed to form, etc.). The main `process_tasks`
@@ -378,7 +357,6 @@ where
             primary_retry_passes_used: 0,
             exhaustion_warning_emitted: false,
             backpressured_secondaries: HashMap::new(),
-            cached_full_task_list: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
             fatal_exit: None,

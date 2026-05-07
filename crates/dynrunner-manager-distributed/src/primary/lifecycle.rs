@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage,
-    SecondaryTransport, TaskListEntry,
+    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -85,27 +85,41 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         }
     }
 
-    /// Phase-S: seed the replicated cluster ledger with the run's task
-    /// graph. Emits one `TaskAdded` per binary in `all_binaries`; the
+    /// Phase-S/B: seed the replicated cluster ledger with the run's
+    /// task graph and phase-dependency graph. Emits one
+    /// `PhaseDepsSet` (carrying the canonical per-run dep graph)
+    /// followed by one `TaskAdded` per binary in `all_binaries`; the
     /// originator-side `apply_and_broadcast_cluster_mutations` applies
     /// locally and ships the batch to every secondary.
+    ///
+    /// `PhaseDepsSet` rides ahead of `TaskAdded` so receivers'
+    /// `cluster_state.phase_deps()` is populated before any
+    /// post-promotion hydration that consults it. The mutation is
+    /// idempotent (re-application is a no-op when local is non-empty),
+    /// so multiple snapshot sources or duplicate broadcasts are safe.
     ///
     /// Called once at run start, after every secondary has connected
     /// (so `transport.broadcast` reaches the full fleet) and before
     /// `perform_initial_assignment` runs (so the originator's mirror
     /// is non-empty when the first dispatch happens).
     pub(super) async fn seed_cluster_state(&mut self) {
-        let mutations: Vec<ClusterMutation<I>> = self
-            .all_binaries
-            .iter()
-            .map(|b| ClusterMutation::TaskAdded {
-                hash: compute_task_hash(b),
-                task: b.clone(),
-            })
-            .collect();
-        let count = mutations.len();
+        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(
+            self.all_binaries.len() + 1,
+        );
+        mutations.push(ClusterMutation::PhaseDepsSet {
+            deps: self.phase_deps.clone(),
+        });
+        mutations.extend(
+            self.all_binaries
+                .iter()
+                .map(|b| ClusterMutation::TaskAdded {
+                    hash: compute_task_hash(b),
+                    task: b.clone(),
+                }),
+        );
+        let task_count = self.all_binaries.len();
         self.apply_and_broadcast_cluster_mutations(mutations).await;
-        tracing::info!(tasks = count, "seeded cluster ledger");
+        tracing::info!(tasks = task_count, "seeded cluster ledger");
     }
 
     pub(super) async fn send_transfer_complete(&mut self) -> Result<(), String> {
@@ -633,96 +647,6 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 "local primary demoted to observer; promoted secondary is sole authoritative primary"
             );
         }
-        Ok(())
-    }
-
-    // ── Send full task list (legacy snapshot until Phase B) ──
-
-    pub(super) async fn send_full_task_list(&mut self) -> Result<(), String> {
-        // Bail out if no primary was promoted (`promote_primary`
-        // is a no-op when there are no secondaries yet). Every
-        // secondary still
-        // gets the broadcast below — promotion just controls who
-        // gets the pre-designated routing pointer (`primary_id`).
-        if self.primary_id.is_none() {
-            return Ok(());
-        }
-
-        let all_tasks: Vec<TaskListEntry<I>> = self
-            .all_binaries
-            .iter()
-            .map(|binary| {
-                let hash = compute_task_hash(binary);
-                TaskListEntry {
-                    local_path: self.config.wire_local_path(binary),
-                    binary_info: binary_to_distributed(binary),
-                    hash: hash.clone(),
-                    file_path: Some(binary.path.to_string_lossy().into_owned()),
-                }
-            })
-            .collect();
-
-        // Include both completed tasks and currently in-flight tasks as "completed"
-        // so the primary doesn't re-assign tasks that are already being processed
-        let active_hashes: HashSet<String> = self
-            .workers
-            .iter()
-            .filter_map(|w| w.current_task.as_ref().map(compute_task_hash))
-            .collect();
-        let excluded: HashSet<String> = self
-            .completed_tasks
-            .union(&active_hashes)
-            .cloned()
-            .collect();
-
-        let completed_list: Vec<String> = excluded.iter().cloned().collect();
-        let pending_list: Vec<String> = all_tasks
-            .iter()
-            .filter(|t| !excluded.contains(&t.hash))
-            .map(|t| t.hash.clone())
-            .collect();
-
-        let msg = DistributedMessage::FullTaskList {
-            sender_id: self.config.node_id.clone(),
-            timestamp: timestamp_now(),
-            all_tasks,
-            completed_tasks: completed_list,
-            pending_tasks: pending_list,
-            // Canonical phase-deps captured at `run()` start. Lets the
-            // promoted primary build its post-promotion pool
-            // with the same dependency-machine the primary used —
-            // otherwise every phase looks zero-deps to the new
-            // primary and dependent phases dispatch out of order.
-            phase_deps: self.phase_deps.clone(),
-        };
-        // Broadcast to every secondary, not just the pre-designated
-        // primary: F2 election picks a secondary on local-death
-        // and that pick may not be the same node `promote_primary`
-        // picked (the latter uses HashMap iteration order; the former
-        // uses lowest-id-wins). Every secondary needs the cached task
-        // list so any election outcome is survivable. Single-cast
-        // would mean the user-stated invariant — "local can disconnect
-        // once everything is transmitted, and the rest continues" —
-        // only held for `--jobs 1`; broadcasting closes that gap.
-        // Failures on individual secondaries are logged and continue —
-        // losing the cache on one secondary just means F2 won't pick
-        // that one to promote.
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            for (secondary_id, error) in &failures {
-                tracing::warn!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "failed to broadcast FullTaskList; that secondary won't be a viable failover target"
-                );
-            }
-        }
-        let pid = self.primary_id.clone().unwrap();
-
-        tracing::info!(
-            primary = %pid,
-            total = self.all_binaries.len(),
-            "sent full task list"
-        );
         Ok(())
     }
 

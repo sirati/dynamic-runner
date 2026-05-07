@@ -1,12 +1,14 @@
 //! Shared test fixtures for primary-coordinator tests. Compiled only
 //! under `#[cfg(test)]` so they never enter the production binary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{TaskInfo, Identifier, MessageReceiver, MessageSender, PhaseId, TypeId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, DistributedMessage, PeerConnectionInfo, PeerTransport,
+};
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_channel::{
     channel_pair, ChannelManagerEnd, ChannelSecondaryTransportEnd,
@@ -217,11 +219,15 @@ pub(super) async fn fake_secondary(
 /// Also stands in for the secondary-side primary post-handoff:
 /// the real local primary now demotes itself the moment it sends
 /// `PromotePrimary` and stops dispatching, so the fake — when promoted
-/// via `PromotePrimary { new_primary_id == self }` — drains the
-/// `FullTaskList.pending_tasks` payload by emitting `TaskComplete` for
-/// each entry. Without that drain, tests that rely on more binaries
-/// than fit in the initial assignment would hang waiting for
-/// completions that no longer come from the local primary.
+/// via `PromotePrimary { new_primary_id == self }` — drains every task
+/// hash still tracked as Pending in its replicated `cluster_state`
+/// mirror by emitting `TaskComplete` for each. The mirror is fed by
+/// `ClusterMutation::TaskAdded` (entry) /
+/// `ClusterMutation::TaskCompleted | TaskFailed` (terminal) broadcasts
+/// the same way the real `SecondaryCoordinator` ingests them; the
+/// fake drains the Pending set on promotion so tests that rely on
+/// more binaries than fit in the initial assignment don't hang
+/// waiting for completions the local primary no longer issues.
 pub(super) async fn fake_secondary_with_addrs(
     secondary_id: String,
     num_workers: u32,
@@ -272,18 +278,54 @@ pub(super) async fn fake_secondary_with_addrs(
         })
         .unwrap();
 
-    // Track whether this fake is the secondary-side primary
-    // (set by `PromotePrimary` if `new_primary_id` matches our id).
-    // Only the primary drains the post-handoff `pending_tasks`
-    // list from `FullTaskList`; non-promoted secondaries ignore it
-    // (in production they only consult their cache for failover).
-    let mut is_primary = false;
+    // Replicated `cluster_state` mirror, reduced to "hashes still
+    // Pending from this fake's view". Fed by `ClusterMutation::TaskAdded`
+    // (insertion) and removed on `TaskCompleted` / `TaskFailed` /
+    // self-emitted TaskComplete. On promotion the residual set is
+    // drained by emitting TaskComplete for each entry — the same
+    // post-handoff drain the pre-Phase-B FullTaskList path used to
+    // perform, now driven off of the replicated ledger.
+    let mut pending_hashes: HashSet<String> = HashSet::new();
     while let Some(msg) = incoming_from_primary.recv().await {
         match msg {
             DistributedMessage::PeerInfo { .. } => {}
             DistributedMessage::PromotePrimary { new_primary_id, .. } => {
                 if new_primary_id == secondary_id {
-                    is_primary = true;
+                    // Drain the residual Pending set: every hash still
+                    // tracked here is the new primary's responsibility
+                    // post-handoff. Emit TaskComplete for each so the
+                    // primary's counter-check exit can fire.
+                    for task_hash in pending_hashes.drain() {
+                        outgoing_to_primary
+                            .send(DistributedMessage::TaskComplete {
+                                sender_id: secondary_id.clone(),
+                                timestamp: 0.0,
+                                secondary_id: secondary_id.clone(),
+                                worker_id: 0,
+                                task_hash,
+                                result_data: None,
+                            })
+                            .unwrap();
+                    }
+                }
+            }
+            DistributedMessage::ClusterMutation { mutations, .. } => {
+                // Mirror the live cluster ledger: TaskAdded enters
+                // pending, TaskCompleted / TaskFailed terminates.
+                // TaskAssigned and PrimaryChanged are no-ops here —
+                // the fake's drain only cares about whether a hash
+                // is still Pending or already terminal.
+                for m in mutations {
+                    match m {
+                        ClusterMutation::TaskAdded { hash, .. } => {
+                            pending_hashes.insert(hash);
+                        }
+                        ClusterMutation::TaskCompleted { hash }
+                        | ClusterMutation::TaskFailed { hash, .. } => {
+                            pending_hashes.remove(&hash);
+                        }
+                        _ => {}
+                    }
                 }
             }
             DistributedMessage::InitialAssignment {
@@ -308,6 +350,7 @@ pub(super) async fn fake_secondary_with_addrs(
                         .get(idx)
                         .map(|w| w.worker_id)
                         .unwrap_or(0);
+                    pending_hashes.remove(&entry.hash);
                     outgoing_to_primary
                         .send(DistributedMessage::TaskComplete {
                             sender_id: secondary_id.clone(),
@@ -334,31 +377,8 @@ pub(super) async fn fake_secondary_with_addrs(
                 }
             }
             DistributedMessage::TransferComplete { .. } => {}
-            // Stand in for the secondary-side primary: when
-            // the real primary broadcasts `FullTaskList`, every task
-            // that wasn't already in-flight (`pending_tasks`) is the
-            // primary's responsibility. The real
-            // SecondaryCoordinator drains those via its
-            // `primary_pending` self-dispatch path; the fake
-            // short-circuits and emits TaskComplete for each so the
-            // counter-check exit can fire.
-            DistributedMessage::FullTaskList { pending_tasks, .. } => {
-                if is_primary {
-                    for task_hash in pending_tasks {
-                        outgoing_to_primary
-                            .send(DistributedMessage::TaskComplete {
-                                sender_id: secondary_id.clone(),
-                                timestamp: 0.0,
-                                secondary_id: secondary_id.clone(),
-                                worker_id: 0,
-                                task_hash,
-                                result_data: None,
-                            })
-                            .unwrap();
-                    }
-                }
-            }
             DistributedMessage::TaskAssignment { file_hash, .. } => {
+                pending_hashes.remove(&file_hash);
                 outgoing_to_primary
                     .send(DistributedMessage::TaskComplete {
                         sender_id: secondary_id.clone(),

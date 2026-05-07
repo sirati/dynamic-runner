@@ -334,13 +334,13 @@ impl<I: Identifier> PendingPool<I> {
 
     /// Pre-seed `completed_tasks` with task ids the cluster has
     /// already finished. Used by the failover-resume path: when a
-    /// promoted secondary rebuilds its `PendingPool` from a
-    /// `FullTaskList` snapshot, the completed prereqs were filtered
-    /// out of the items vec but their ids must still resolve
-    /// `task_depends_on` references in the surviving items. Without
-    /// this, every variant whose toolchain finished pre-promotion
-    /// would land in `extend()` as `UnknownTaskDep` and the new
-    /// primary would degrade to "no pending tasks".
+    /// promoted secondary rebuilds its `PendingPool` from the
+    /// replicated `cluster_state` mirror, completed prereqs are
+    /// filtered out of the items vec but their ids must still
+    /// resolve `task_depends_on` references in the surviving items.
+    /// Without this, every variant whose toolchain finished
+    /// pre-promotion would land in `extend()` as `UnknownTaskDep`
+    /// and the new primary would degrade to "no pending tasks".
     ///
     /// Idempotent. Must be called BEFORE `extend()` for the seeded
     /// ids to be visible to validation. Calling it later affects
