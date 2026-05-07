@@ -9,6 +9,7 @@ Owns:
 """
 
 import logging
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -263,27 +264,37 @@ class SlurmPreparation:
         """
         gateway_host = self.gateway.host if hasattr(self.gateway, "host") else "localhost"
         gateway_user = self.gateway.user if hasattr(self.gateway, "user") else None
-        gateway_port = self.gateway.port if hasattr(self.gateway, "port") else 22
+        jump_port = self.gateway.port if hasattr(self.gateway, "port") else 22
         remote_user = gateway_user or "root"
 
-        host_with_port = f"{gateway_host}:{gateway_port}" if gateway_port != 22 else gateway_host
-        jump_host = f"{gateway_user}@{host_with_port}" if gateway_user else host_with_port
+        auth_opts = list(self.gateway.auth_options()) if hasattr(self.gateway, "auth_options") else []
+        jump_target = f"{gateway_user}@{gateway_host}" if gateway_user else gateway_host
 
-        ssh_cmd = ["ssh"]
-        # Mirror the gateway's auth contract on this side-channel ssh
-        # subprocess: an explicit identity / config file applies to
-        # both the -J jump-host hop AND the compute-node hop. Without
-        # this, the reverse tunnel would silently fall back to
-        # IdentityAgent over-offering even when the user passed
-        # --ssh-identity-file. Source-of-truth lives on the gateway
-        # (single concern: "how do we authenticate"); this code only
-        # reads the public auth_options primitive.
-        if hasattr(self.gateway, "auth_options"):
-            ssh_cmd.extend(self.gateway.auth_options())
+        ssh_cmd = ["ssh", *auth_opts]
+        # When auth_options is non-empty (--ssh-identity-file or
+        # --ssh-config supplied), -J is unsafe: OpenSSH 7.3+ does NOT
+        # propagate command-line -o flags to the inner ssh that -J
+        # spawns. The inner ssh re-evaluates ~/.ssh/config from
+        # scratch, so IdentityAgent=none / IdentitiesOnly=yes / -F
+        # are silently dropped on the jump-hop and the agent leaks
+        # back in — defeating the entire --ssh-identity-file path.
+        # Workaround: explicit -o ProxyCommand=... that re-issues
+        # the auth flags inline. The proxy ssh inherits them as
+        # genuine argv. Same single-source-of-truth: SSHGateway
+        # owns the flag list; this code shell-quotes it.
+        # No-auth case keeps the simpler -J form (no behavior
+        # change for users without --ssh-identity-file/--ssh-config).
+        if auth_opts:
+            proxy_cmd_parts = ["ssh", *auth_opts]
+            if jump_port != 22:
+                proxy_cmd_parts.extend(["-p", str(jump_port)])
+            proxy_cmd_parts.extend(["-W", "%h:%p", jump_target])
+            ssh_cmd.extend(["-o", f"ProxyCommand={shlex.join(proxy_cmd_parts)}"])
+        else:
+            jump_with_port = f"{jump_target}:{jump_port}" if jump_port != 22 else jump_target
+            ssh_cmd.extend(["-J", jump_with_port])
         ssh_cmd.extend(
             [
-                "-J",
-                jump_host,
                 "-R",
                 f"{tunnel_port}:localhost:{primary_quic_port}",
             ]
