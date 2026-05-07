@@ -64,7 +64,9 @@ from ..comm import (
     DoneResponse,
     ErrorResponse,
     ErrorType,
+    KeepaliveResponse,
     NamedSocketInterface,
+    PhaseUpdateResponse,
     ProcessBinaryCommand,
     ReadyResponse,
     StopCommand,
@@ -102,11 +104,30 @@ class Task:
     or ``None`` if the task carries no payload. ``payload_str`` is
     the raw JSON string for handlers that need it verbatim (e.g. to
     pass it through to a subprocess).
+
+    ``keepalive()`` and ``set_phase(name)`` emit live signaling
+    responses to the manager. They gate the manager's
+    ``stage_timeouts`` enforcement and stuck-worker reporting (see
+    ``manager-local`` ``check_timeouts`` / ``report_stuck_workers``):
+    without a phase update, no per-phase timeout fires; without
+    keepalives, even a phase-emitting worker is killed at the
+    timeout boundary. Calls are no-ops when the task was constructed
+    outside the runtime loop (no ``_emit`` hook wired) so unit-test
+    handlers can construct ``Task`` directly without side-effects.
     """
 
     relative_path: str
     payload: Any = None
     payload_str: Optional[str] = None
+    _emit: Optional[Callable[[Any], None]] = field(default=None, repr=False)
+
+    def keepalive(self) -> None:
+        if self._emit is not None:
+            self._emit(KeepaliveResponse())
+
+    def set_phase(self, phase_name: str) -> None:
+        if self._emit is not None:
+            self._emit(PhaseUpdateResponse(phase_name=phase_name))
 
 
 @dataclass
@@ -320,6 +341,7 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
         relative_path=command.relative_path,
         payload=_parse_payload(command.payload),
         payload_str=command.payload,
+        _emit=lambda response, _ctx=ctx: _try_send(_ctx, response),
     )
 
     ctx.task_in_flight = True
