@@ -131,7 +131,7 @@ class SlurmJobManager:
             f"    {shlex.quote(arg)} \\\n" for arg in self.deployment.extra_run_args
         )
 
-        script = f"""#!/bin/bash
+        script = f"""#!/usr/bin/env bash
 set -e
 
 echo "=================================================="
@@ -369,7 +369,7 @@ exit $CONTAINER_EXIT_CODE
         podman_storage = f"{rndtmp}/storage"
         podman_run = f"{rndtmp}/run"
 
-        return f"""#!/bin/bash
+        return f"""#!/usr/bin/env bash
 set -e
 
 echo "=================================================="
