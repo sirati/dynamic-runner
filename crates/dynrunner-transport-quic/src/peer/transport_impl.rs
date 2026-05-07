@@ -139,8 +139,18 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
             match self.router.process_inbound_sync(msg, clocks) {
-                InboundOutcome::Deliver { msg, .. } => return Some(msg),
-                InboundOutcome::Handled { .. } => continue,
+                InboundOutcome::Deliver { msg, redial_target } => {
+                    if let Some(id) = redial_target {
+                        self.spawn_redial(&id);
+                    }
+                    return Some(msg);
+                }
+                InboundOutcome::Handled { redial_target } => {
+                    if let Some(id) = redial_target {
+                        self.spawn_redial(&id);
+                    }
+                    continue;
+                }
             }
         }
     }
