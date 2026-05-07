@@ -640,9 +640,8 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
 
             // Pre-partition direct send so A's `route_state` for
             // peer-b is `Direct`. The first observation of a
-            // peer's route is silent by design (matches
-            // pre-Router `observe_transition`'s
-            // `(None, _) => {}` arm) — without this, the
+            // peer's route is silent by design (the `None` arm in
+            // Router::observe_relay) — without this warmup, the
             // post-partition relay observation would also be
             // silent and the "peer relay engaged" warn would
             // never fire.

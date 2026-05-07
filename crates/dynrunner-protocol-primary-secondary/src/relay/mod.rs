@@ -36,17 +36,17 @@
 //! 1. **Deterministic forwarder choice** ([`pick_relay`]) — by
 //!    lowest id, the same node makes the same decision every tick
 //!    so two senders don't oscillate between forwarders.
-//! 2. **State-transition observation** ([`observe_transition`]) —
-//!    the only logging on the relay path: direct→relay, relay→relay,
-//!    relay→direct. Successful sends in steady state are silent.
-//! 3. **Pure routing decisions** ([`route_send`], [`forward_step`],
+//! 2. **Pure routing decisions** ([`route_send`], [`forward_step`],
 //!    [`handle_backoff`]) — each takes the full state needed to
 //!    decide and returns what to do, never touches I/O. Transports
 //!    apply the decisions.
 //!
-//! The mechanics of *applying* a routing decision (mpsc fan-out,
-//! clone-on-send, error mapping) live in each [`PeerTransport`] impl —
-//! routing policy is shared, transport plumbing is not.
+//! State-transition observation (direct→relay, relay→direct, etc.)
+//! and the only relay-path logging now live inside [`Router`]
+//! (`relay/router.rs`). Transports never call into this module to
+//! decide — they delegate to [`Router::send_to_peer`] /
+//! [`Router::process_inbound`] / [`Router::process_inbound_sync`],
+//! which call these helpers internally.
 
 pub mod channel;
 pub mod router;
@@ -63,14 +63,6 @@ use std::time::Instant;
 
 use crate::messages::DistributedMessage;
 use dynrunner_core::Identifier;
-
-/// Per-target observed route — drives the transition log so steady-state
-/// sends don't generate noise.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RouteState {
-    Direct,
-    Relay { via: String },
-}
 
 /// A routing decision for one outbound `send_to_peer(target)` call.
 #[derive(Debug)]
@@ -371,59 +363,6 @@ pub fn handle_backoff<I: Identifier, V>(
         }
         None => BackoffDecision::Drop,
     }
-}
-
-/// Update the per-target route state and emit a transition log only on
-/// state change. `new_via` is the actual peer the transport is about
-/// to send to; `target` is the logical destination. Equal means
-/// direct; differ means relay.
-///
-/// Returns the post-transition state for callers that want to assert
-/// in tests (the live caller is fine to discard it).
-pub fn observe_transition(
-    state: &mut HashMap<String, RouteState>,
-    target: &str,
-    new_via: &str,
-) -> RouteState {
-    let new_state = if new_via == target {
-        RouteState::Direct
-    } else {
-        RouteState::Relay {
-            via: new_via.to_string(),
-        }
-    };
-    let prev = state.get(target).cloned();
-    match (&prev, &new_state) {
-        (None, _) => {}
-        (Some(a), b) if a == b => {}
-        (Some(RouteState::Direct), RouteState::Relay { via }) => {
-            tracing::warn!(
-                target = %target,
-                relay = %via,
-                "peer relay engaged: direct link unreachable, forwarding via peer"
-            );
-        }
-        (Some(RouteState::Relay { via: old }), RouteState::Relay { via: new })
-            if old != new =>
-        {
-            tracing::info!(
-                target = %target,
-                from = %old,
-                to = %new,
-                "peer relay forwarder changed"
-            );
-        }
-        (Some(RouteState::Relay { via: old }), RouteState::Direct) => {
-            tracing::info!(
-                target = %target,
-                from = %old,
-                "peer direct link restored"
-            );
-        }
-        _ => {}
-    }
-    state.insert(target.to_string(), new_state.clone());
-    new_state
 }
 
 #[cfg(test)]
@@ -741,38 +680,4 @@ mod tests {
         }
     }
 
-    // ── observe_transition ──
-
-    #[test]
-    fn observe_transition_no_log_on_steady_direct() {
-        let mut state = HashMap::new();
-        let s1 = observe_transition(&mut state, "b", "b");
-        let s2 = observe_transition(&mut state, "b", "b");
-        assert_eq!(s1, RouteState::Direct);
-        assert_eq!(s2, RouteState::Direct);
-    }
-
-    #[test]
-    fn observe_transition_direct_to_relay() {
-        let mut state = HashMap::new();
-        observe_transition(&mut state, "b", "b");
-        let s = observe_transition(&mut state, "b", "a");
-        assert_eq!(s, RouteState::Relay { via: "a".into() });
-    }
-
-    #[test]
-    fn observe_transition_relay_to_direct() {
-        let mut state = HashMap::new();
-        observe_transition(&mut state, "b", "a");
-        let s = observe_transition(&mut state, "b", "b");
-        assert_eq!(s, RouteState::Direct);
-    }
-
-    #[test]
-    fn observe_transition_relay_path_changed() {
-        let mut state = HashMap::new();
-        observe_transition(&mut state, "b", "a");
-        let s = observe_transition(&mut state, "b", "c");
-        assert_eq!(s, RouteState::Relay { via: "c".into() });
-    }
 }
