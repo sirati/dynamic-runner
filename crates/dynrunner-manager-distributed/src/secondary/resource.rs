@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use dynrunner_core::{Identifier, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::ResourcePressureResult;
@@ -85,14 +83,8 @@ where
                 .await;
         }
 
-        let now = Instant::now();
-        let backoff = self.request_backoff.get(&worker_id).copied()
-            .unwrap_or(Self::INITIAL_BACKOFF);
-
-        if let Some(last) = self.last_request_time.get(&worker_id) {
-            if now.duration_since(*last) < backoff {
-                return Ok(());
-            }
+        if !self.primary_link.should_request_now(worker_id) {
+            return Ok(());
         }
 
         let available_memory = if (worker_id as usize) < self.pool.workers.len() {
@@ -111,11 +103,7 @@ where
                 amount: available_memory,
             }],
         };
-        self.last_request_time.insert(worker_id, now);
-
-        // Double the backoff for next time (capped)
-        let next_backoff = (backoff * 2).min(Self::MAX_BACKOFF);
-        self.request_backoff.insert(worker_id, next_backoff);
+        self.primary_link.note_request_sent(worker_id);
 
         self.send_to_current_primary(msg).await
     }
@@ -128,7 +116,7 @@ where
     /// Keepalive, TaskRequest, OOM report) follows the same rule. The
     /// rule is dynamic: at run start the local node is primary and we
     /// route via `primary_transport`; after `PromotePrimary` (and
-    /// after election) `primary_peer_id` names the current
+    /// after election) `primary_link.current_primary()` names the current
     /// primary and we route via `peer_transport.send_to_peer` instead.
     ///
     /// Pre-extraction this routing logic existed inline in exactly one
@@ -151,9 +139,9 @@ where
         &mut self,
         msg: DistributedMessage<I>,
     ) -> Result<(), String> {
-        if let Some(current_primary) = &self.primary_peer_id {
-            if current_primary != &self.config.secondary_id {
-                let peer = current_primary.clone();
+        if let Some(current_primary) = self.primary_link.current_primary() {
+            if current_primary != self.config.secondary_id.as_str() {
+                let peer = current_primary.to_string();
                 return self.peer_transport.send_to_peer(&peer, msg).await;
             }
             // We are the current primary — message addressed to ourselves.
@@ -173,15 +161,9 @@ where
         self.primary_transport.send(msg).await
     }
 
-    /// Reset rate limiting for a worker after a successful task assignment.
-    pub(super) fn reset_request_backoff(&mut self, worker_id: WorkerId) {
-        self.request_backoff.remove(&worker_id);
-        self.last_request_time.remove(&worker_id);
-    }
-
     /// Periodic safety-net wakeup: walk every idle worker and call
     /// `request_task_for_worker`. The per-worker exponential backoff
-    /// (`request_backoff`, doubling from 1s to a 60s cap) suppresses
+    /// (held by `primary_link`, doubling from 1s to a 60s cap) suppresses
     /// requests within the backoff window, so the only fan-out cost is
     /// the in-budget polls — which is precisely the work the kickstart
     /// pattern would have done anyway.

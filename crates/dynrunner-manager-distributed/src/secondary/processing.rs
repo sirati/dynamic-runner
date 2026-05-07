@@ -181,7 +181,7 @@ where
                                 connected_peers = peers,
                                 "primary transport closed; switching to failover detection \
                                  (election will run via peer mesh; further dispatch routes \
-                                 through primary_peer_id once a peer is promoted)"
+                                 through primary_link.current_primary() once a peer is promoted)"
                             );
                             self.primary_disconnected = true;
                             let backdate = self
@@ -216,7 +216,7 @@ where
                     self.primary_drain_check_and_retry().await;
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
-                    // limit (`request_backoff` doubles on each
+                    // limit (in `primary_link`, doubles on each
                     // empty-response, capped at 60s) keeps this
                     // cheap; without the periodic call, an idle
                     // worker that got "no work" once sits forever
@@ -504,9 +504,6 @@ where
             }
         }
     }
-
-    pub(super) const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-    pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     pub(super) async fn stop_all_workers(&mut self) {
         self.pool.stop_all().await;

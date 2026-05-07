@@ -76,41 +76,43 @@ where
     /// abandon any in-flight failover election. Called from the dispatch
     /// path before any other handling.
     ///
-    /// `primary_peer_id` is NOT cleared here — once set (either by an
-    /// explicit `PromotePrimary` from the live primary or by the
-    /// failover-election outcome) it names the current cluster primary
-    /// and survives subsequent keepalives from the now-demoted local
-    /// primary. Pre-fix this method cleared it on every primary
-    /// keepalive, so non-primary secondaries that learned the new
-    /// primary's id from `PromotePrimary` lost the routing target
-    /// the moment the next local-primary keepalive arrived; their
-    /// `send_to_current_primary` then routed via `primary_transport`
-    /// back to the demoted local primary instead of directly to the
-    /// SLURM-primary peer. The local primary's `handle_task_request`
-    /// relayed TaskRequests onward, papering over the bug as long as
-    /// the local primary's transport stayed alive — but when that
-    /// transport closed (laptop suspend, SSH tunnel idle close) the
-    /// relay vanished and the entire fleet stalled. Surfaced in
-    /// dataset's K=2 hello run after 95b9f32: the synchronous
-    /// PromotePrimary state-sync was correct, but the very next
-    /// primary keepalive clobbered `primary_peer_id` back to None.
+    /// The current primary identity is NOT cleared here — once set
+    /// (either by an explicit `PromotePrimary` from the live primary
+    /// or by the failover-election outcome) it names the current
+    /// cluster primary and survives subsequent keepalives from the
+    /// now-demoted local primary. Pre-fix this method cleared it on
+    /// every primary keepalive, so non-primary secondaries that
+    /// learned the new primary's id from `PromotePrimary` lost the
+    /// routing target the moment the next local-primary keepalive
+    /// arrived; their `send_to_current_primary` then routed via
+    /// `primary_transport` back to the demoted local primary instead
+    /// of directly to the SLURM-primary peer. The local primary's
+    /// `handle_task_request` relayed TaskRequests onward, papering
+    /// over the bug as long as the local primary's transport stayed
+    /// alive — but when that transport closed (laptop suspend, SSH
+    /// tunnel idle close) the relay vanished and the entire fleet
+    /// stalled. Surfaced in dataset's K=2 hello run after 95b9f32:
+    /// the synchronous PromotePrimary state-sync was correct, but the
+    /// very next primary keepalive clobbered the routing target
+    /// back to None.
     pub(super) fn record_primary_message(&mut self) {
         self.primary_last_seen = Some(Instant::now());
         // Cancel a failover election in progress: a primary message
         // proves the original primary is still reachable so the
-        // election was a false alarm. The transitional `primary_peer_id`
+        // election was a false alarm. The transitional routing target
         // we set inside the election (pointing at the in-flight
         // candidate) is also stale — clear it so routing goes back to
         // the live primary via `primary_transport`.
         //
-        // For Normal/Promoted states we MUST NOT touch primary_peer_id:
-        //   - Normal-with-Some(primary_peer_id) means an explicit
-        //     handoff is in effect (PromotePrimary, or a completed
+        // For Normal/Promoted states we MUST NOT touch the routing
+        // target:
+        //   - Normal-with-Some(primary) means an explicit handoff is
+        //     in effect (PromotePrimary, or a completed
         //     Voting → Normal election outcome). Demoted local-primary
         //     keepalives still arrive in this state but no longer name
         //     the routing target.
-        //   - Promoted means we ARE the primary; no primary_peer_id
-        //     override applies to ourselves.
+        //   - Promoted means we ARE the primary; no override applies
+        //     to ourselves.
         if matches!(
             self.election,
             ElectionState::Suspecting { .. }
@@ -118,7 +120,7 @@ where
                 | ElectionState::Candidate { .. }
         ) {
             self.election = ElectionState::Normal;
-            self.primary_peer_id = None;
+            self.primary_link.set_current_primary(None);
         }
     }
 
@@ -139,30 +141,30 @@ where
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(false);
 
-        // Cascade election trigger: if a primary peer was
-        // promoted (primary_peer_id is set to a peer, not
-        // ourselves) and that peer's keepalives have gone stale,
-        // we need to run a fresh election regardless of whether
-        // the local-machine primary is still alive. Pre-fix, the
-        // election only fired on local-primary silence — so when
-        // a promoted peer like sec-0 died but the local primary
-        // was still streaming keepalives to other secondaries,
-        // those secondaries observed the disconnect, dropped sec-0
-        // from peer_keepalives, and then sat idle forever
-        // because primary_silent stayed false. Dataset's K=2 run
-        // hit exactly this: 4 surviving secondaries with no
-        // primary, no election attempt, no logged "primary
-        // assigned" lines on any of them.
+        // Cascade election trigger: if a primary peer was promoted
+        // (current_primary names a peer, not ourselves) and that
+        // peer's keepalives have gone stale, we need to run a fresh
+        // election regardless of whether the local-machine primary
+        // is still alive. Pre-fix, the election only fired on
+        // local-primary silence — so when a promoted peer like
+        // sec-0 died but the local primary was still streaming
+        // keepalives to other secondaries, those secondaries
+        // observed the disconnect, dropped sec-0 from
+        // peer_keepalives, and then sat idle forever because
+        // primary_silent stayed false. Dataset's K=2 run hit
+        // exactly this: 4 surviving secondaries with no primary,
+        // no election attempt, no logged "primary assigned" lines
+        // on any of them.
         //
         // A peer is considered the silent primary when:
-        //   - primary_peer_id is set (a promotion happened)
+        //   - current_primary is set (a promotion happened)
         //   - the id is NOT ourselves (we'd be Promoted, handled above)
         //   - its peer_keepalives entry is missing OR its
         //     timestamp is older than `deadline`
         let primary_peer_silent = self
-            .primary_peer_id
-            .as_ref()
-            .filter(|id| id.as_str() != self.config.secondary_id)
+            .primary_link
+            .current_primary()
+            .filter(|id| *id != self.config.secondary_id.as_str())
             .map(|id| {
                 self.peer_keepalives
                     .get(id)
@@ -180,7 +182,7 @@ where
                     miss_threshold = self.config.keepalive_miss_threshold,
                     primary_silent,
                     primary_peer_silent,
-                    primary_peer = ?self.primary_peer_id,
+                    primary_peer = ?self.primary_link.current_primary(),
                     "primary or primary peer missed keepalives; \
                      entering Suspecting"
                 );
@@ -237,7 +239,8 @@ where
                         confirms: HashSet::from([self.config.secondary_id.clone()]),
                         started: Instant::now(),
                     };
-                    self.primary_peer_id = Some(self.config.secondary_id.clone());
+                    self.primary_link
+                        .set_current_primary(Some(self.config.secondary_id.clone()));
                     actions.broadcast.push(DistributedMessage::PromotionVote {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -246,7 +249,7 @@ where
                     });
                 } else if let Some(candidate) = lowest_alive {
                     tracing::info!(%candidate, round, "deferring to lowest-live-id peer");
-                    self.primary_peer_id = Some(candidate.clone());
+                    self.primary_link.set_current_primary(Some(candidate.clone()));
                     self.election = ElectionState::Voting { round, candidate };
                 }
             }
@@ -330,7 +333,7 @@ where
                 round,
                 candidate: candidate.clone(),
             };
-            self.primary_peer_id = Some(candidate.clone());
+            self.primary_link.set_current_primary(Some(candidate.clone()));
         }
         Some(DistributedMessage::PromotionConfirm {
             sender_id: self.config.secondary_id.clone(),
@@ -606,7 +609,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn primary_recovery_clears_routing_target() {
         let mut sec = make_secondary(election_config("sec-a"));
-        sec.primary_peer_id = Some("sec-c".into());
+        sec.primary_link.set_current_primary(Some("sec-c".into()));
         sec.election = ElectionState::Voting {
             round: 1,
             candidate: "sec-c".into(),
@@ -614,7 +617,7 @@ mod tests {
         sec.record_primary_message();
         assert!(matches!(sec.election, ElectionState::Normal));
         assert!(
-            sec.primary_peer_id.is_none(),
+            sec.primary_link.current_primary().is_none(),
             "live primary message should clear the routing target"
         );
     }
@@ -627,20 +630,21 @@ mod tests {
         let mut sec = make_secondary(election_config("sec-a"));
         sec.election = ElectionState::Promoted;
         sec.is_primary = true;
-        sec.primary_peer_id = Some("sec-a".into());
+        sec.primary_link.set_current_primary(Some("sec-a".into()));
 
         sec.record_primary_message();
         assert!(matches!(sec.election, ElectionState::Promoted));
         assert!(sec.is_primary);
     }
 
-    /// Regression: PromotePrimary's `primary_peer_id` survives
+    /// Regression: PromotePrimary's routing target survives
     /// subsequent live-primary keepalives. Pre-fix
-    /// `record_primary_message` unconditionally cleared
-    /// `primary_peer_id` whenever the live primary kept sending
-    /// keepalives, so `send_to_current_primary` on non-primary
-    /// secondaries fell back to `primary_transport` (the demoted
-    /// local primary) instead of unicasting to the SLURM-primary peer.
+    /// `record_primary_message` unconditionally cleared the
+    /// current-primary identity whenever the live primary kept
+    /// sending keepalives, so `send_to_current_primary` on
+    /// non-primary secondaries fell back to `primary_transport`
+    /// (the demoted local primary) instead of unicasting to the
+    /// SLURM-primary peer.
     /// Dispatch worked only as long as the local primary's
     /// `handle_task_request` relay path stayed alive; once its
     /// transport closed (laptop suspend / SSH idle) the relay
@@ -662,14 +666,14 @@ mod tests {
         sec.dispatch_message(promote)
             .await
             .expect("PromotePrimary handler succeeds");
-        assert_eq!(sec.primary_peer_id.as_deref(), Some("sec-a"));
+        assert_eq!(sec.primary_link.current_primary(), Some("sec-a"));
         assert!(!sec.is_primary);
         // The (still-alive, now-demoted) local primary keeps sending
-        // keepalives. Pre-fix this would have flipped
-        // primary_peer_id back to None.
+        // keepalives. Pre-fix this would have flipped the routing
+        // target back to None.
         sec.record_primary_message();
         assert_eq!(
-            sec.primary_peer_id.as_deref(),
+            sec.primary_link.current_primary(),
             Some("sec-a"),
             "live-primary keepalive must not clobber the explicit handoff target",
         );
