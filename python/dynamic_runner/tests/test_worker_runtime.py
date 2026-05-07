@@ -1,0 +1,275 @@
+"""Worker-runtime exception → wire mapping tests.
+
+Covers the contract from plan §D6: every documented exception class
+produces the documented wire response, and the loop terminates on
+the documented terminal conditions (StopCommand, channel close,
+mid-task interrupt, OOM).
+
+Tests use a scripted ``CommunicationInterface`` stub so the loop
+can be driven without spawning a real worker subprocess. The stub
+records every response sent so assertions inspect the wire-level
+sequence directly.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import unittest
+from dataclasses import dataclass, field
+from typing import Optional
+
+from dynamic_runner.comm import (
+    Command,
+    CommunicationInterface,
+    DoneResponse,
+    ErrorResponse,
+    ErrorType,
+    ProcessBinaryCommand,
+    ReadyResponse,
+    Response,
+    StopCommand,
+    WorkerExceptionResponse,
+)
+from dynamic_runner.worker import (
+    NonRecoverableError,
+    RecoverableError,
+    Task,
+    WorkerOutput,
+    run,
+    task_function,
+)
+from dynamic_runner.worker.runtime import _REGISTRY
+
+
+@dataclass
+class ScriptedComm(CommunicationInterface):
+    """Comm stub: feeds a pre-defined queue of commands to the
+    worker, captures every response sent. ``None`` in the queue
+    triggers a channel-close (mirrors ``readline()`` returning empty).
+    """
+
+    inbox: list[Optional[Command]] = field(default_factory=list)
+    outbox: list[Response] = field(default_factory=list)
+    closed: bool = False
+
+    def send_command(self, command):
+        return (True, None)
+
+    def send_response(self, response):
+        self.outbox.append(response)
+        return (True, None)
+
+    def receive_command(self, blocking=True):
+        if not self.inbox:
+            return None
+        return self.inbox.pop(0)
+
+    def receive_responses(self):
+        return []
+
+    def close(self):
+        self.closed = True
+
+    def set_blocking(self, blocking):
+        pass
+
+
+def _drive(handler, commands):
+    """Helper: run the loop with a scripted comm and return outbox."""
+    # Reset registry between tests so registry-pollution from a
+    # previous @task_function decoration doesn't leak in.
+    _REGISTRY.default = None
+    _REGISTRY.overwritten = False
+    comm = ScriptedComm(inbox=list(commands))
+    run(handler, comm=comm)
+    return comm
+
+
+def _process(path: str = "/some/binary", payload: Optional[str] = None):
+    return ProcessBinaryCommand(relative_path=path, payload=payload)
+
+
+class WorkerRuntimeTests(unittest.TestCase):
+    """End-to-end loop behaviour: every command path, every error
+    classification, both terminal and continuation cases.
+    """
+
+    def test_ready_then_done_on_clean_completion(self):
+        def handle(task: Task) -> Optional[WorkerOutput]:
+            return None
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        kinds = [type(r).__name__ for r in comm.outbox]
+        self.assertEqual(kinds, ["ReadyResponse", "DoneResponse"])
+        self.assertTrue(comm.closed)
+
+    def test_done_response_carries_warnings_and_filtered(self):
+        def handle(task: Task) -> WorkerOutput:
+            return WorkerOutput(warnings=3, filtered=7)
+
+        comm = _drive(handle, [_process(), None])
+
+        done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0].warnings, 3)
+        self.assertEqual(done[0].filtered, 7)
+
+    def test_recoverable_error_emits_recoverable_response(self):
+        def handle(task: Task):
+            raise RecoverableError("transient blip")
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        errs = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0].error_type, ErrorType.RECOVERABLE)
+        self.assertIn("transient blip", errs[0].error_message)
+
+    def test_nonrecoverable_error_emits_nonrecoverable_response(self):
+        def handle(task: Task):
+            raise NonRecoverableError("config bad")
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        errs = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0].error_type, ErrorType.NON_RECOVERABLE)
+        self.assertIn("config bad", errs[0].error_message)
+
+    def test_memory_error_emits_oom_and_exits(self):
+        # MemoryError is process-level: the runtime must emit OOM
+        # AND break out of the loop, even if subsequent commands
+        # remain in the inbox.
+        def handle(task: Task):
+            raise MemoryError("blew the heap")
+
+        comm = _drive(handle, [_process(), _process("/should/not/run"), StopCommand()])
+
+        errs = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0].error_type, ErrorType.OUT_OF_MEMORY)
+        # Only the first task ran; the runtime must not have looped.
+        self.assertEqual(
+            len([r for r in comm.outbox if isinstance(r, DoneResponse)]),
+            0,
+        )
+
+    def test_called_process_error_emits_recoverable(self):
+        def handle(task: Task):
+            raise subprocess.CalledProcessError(returncode=2, cmd=["nix", "build"])
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        errs = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0].error_type, ErrorType.RECOVERABLE)
+        self.assertIn("CalledProcessError", errs[0].error_message)
+
+    def test_unclassified_exception_emits_workerexception_recoverable(self):
+        # Unknown exception type → WorkerExceptionResponse with a
+        # full traceback and error_type=RECOVERABLE per plan D6.
+        def handle(task: Task):
+            raise ValueError("bad input")
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        wx = [r for r in comm.outbox if isinstance(r, WorkerExceptionResponse)]
+        self.assertEqual(len(wx), 1)
+        self.assertEqual(wx[0].error_type, ErrorType.RECOVERABLE)
+        self.assertEqual(wx[0].exception_type, "ValueError")
+        self.assertIn("bad input", wx[0].exception_message)
+        self.assertIn("ValueError", wx[0].traceback_str)
+
+    def test_keyboard_interrupt_mid_task_emits_recoverable_and_exits(self):
+        # SIGINT (KeyboardInterrupt) mid-task: report the task as
+        # Recoverable so the framework retries it on a fresh worker,
+        # then exit cleanly.
+        def handle(task: Task):
+            raise KeyboardInterrupt()
+
+        comm = _drive(handle, [_process(), _process("/should/not/run"), StopCommand()])
+
+        errs = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0].error_type, ErrorType.RECOVERABLE)
+        self.assertIn("KeyboardInterrupt", errs[0].error_message)
+
+    def test_payload_is_json_decoded(self):
+        captured: list[Task] = []
+
+        def handle(task: Task):
+            captured.append(task)
+            return None
+
+        payload = json.dumps({"versions": ["1.0", "2.0"]})
+        _drive(handle, [_process(payload=payload), StopCommand()])
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].payload, {"versions": ["1.0", "2.0"]})
+        self.assertEqual(captured[0].payload_str, payload)
+
+    def test_payload_falls_back_to_raw_string_when_invalid_json(self):
+        captured: list[Task] = []
+
+        def handle(task: Task):
+            captured.append(task)
+            return None
+
+        _drive(handle, [_process(payload="not-json-at-all"), StopCommand()])
+
+        self.assertEqual(captured[0].payload, "not-json-at-all")
+
+    def test_stop_command_terminates_loop(self):
+        called = []
+
+        def handle(task: Task):
+            called.append(task)
+            return None
+
+        comm = _drive(handle, [StopCommand(), _process("/should/not/run")])
+
+        self.assertEqual(called, [])
+        # Only the Ready response — no task ever dispatched.
+        self.assertEqual(
+            [type(r).__name__ for r in comm.outbox],
+            ["ReadyResponse"],
+        )
+
+    def test_channel_close_terminates_loop(self):
+        # ``None`` in the inbox stands in for ``readline()`` →
+        # empty string, which the comm interface returns as None.
+        called = []
+
+        def handle(task: Task):
+            called.append(task)
+            return None
+
+        comm = _drive(handle, [None])
+
+        self.assertEqual(called, [])
+        self.assertTrue(comm.closed)
+
+    def test_task_function_decorator_is_used_when_handle_omitted(self):
+        _REGISTRY.default = None
+
+        @task_function
+        def registered_handler(task: Task):
+            return WorkerOutput(warnings=42)
+
+        comm = ScriptedComm(inbox=[_process(), StopCommand()])
+        run(comm=comm)
+
+        done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0].warnings, 42)
+
+    def test_run_without_handler_raises(self):
+        _REGISTRY.default = None
+        comm = ScriptedComm(inbox=[StopCommand()])
+        with self.assertRaises(RuntimeError):
+            run(comm=comm)
+
+
+if __name__ == "__main__":
+    unittest.main()
