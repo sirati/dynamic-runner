@@ -349,6 +349,7 @@ dependencies = [
  "dynrunner-manager-local",
  "dynrunner-protocol-manager-worker",
  "dynrunner-protocol-primary-secondary",
+ "dynrunner-publish",
  "dynrunner-scheduler",
  "dynrunner-scheduler-api",
  "dynrunner-transport-channel",
