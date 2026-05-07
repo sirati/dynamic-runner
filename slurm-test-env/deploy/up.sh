@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# Bring up the slurm-test-env cluster on the local podman engine.
+#
+# Single concern: turn the two image tarballs (built by `nix build` or
+# pre-injected via $SLURM_TEST_ENV_*_IMAGE by the flake wrapper) into a
+# running set of containers — one gateway and N workers — with the shared
+# /home bind mount wired in.
+#
+# Image lifecycle: tarballs are imported with INSTANCE_ID-scoped tags on
+# `up.sh` and removed by `down.sh`. Nothing remains in podman storage
+# after teardown; only the simulated /home persists on the host.
+#
+# No secret management: munge keys are baked into the images via a fixed
+# insecure dev key (see modules/slurm-cluster.nix). User pubkeys land on
+# the shared /home through provision-user.sh — the shared mount itself is
+# the distribution mechanism.
+
+set -euo pipefail
+
+# --- Locate config -----------------------------------------------------------
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/env.sh}"
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+printf '\n=== slurm-test-env :: bringing up cluster ===\n'
+print_layout
+
+# --- Resolve image tarballs --------------------------------------------------
+#
+# Two flows:
+#   - $SLURM_TEST_ENV_*_IMAGE pre-set (flake-wrapped run) → these are the
+#     build-output directories;
+#   - unset → run nix build on the sibling flake to materialize them.
+#
+# .rules requires --max-jobs 6 --cores 4 to avoid OOM on this host.
+
+resolve_image() {
+  local var_name="$1" attr="$2"
+  local value="${!var_name:-}"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+    return
+  fi
+  printf 'Building %s via nix...\n' "$attr" >&2
+  nix build \
+    --no-link \
+    --print-out-paths \
+    --max-jobs 6 \
+    --cores 4 \
+    "${SCRIPT_DIR}/..#${attr}"
+}
+
+# nixos-generators' `format = "docker"` produces a flat NixOS tarball at
+# `<out>/tarball/nixos-system-*.tar.xz` (NOT an OCI layered image). It must
+# be loaded via `podman import` and started with `/init` as the entrypoint;
+# `podman load` would not work here.
+locate_tarball() {
+  local out_dir="$1"
+  if [[ -f "$out_dir" ]]; then
+    printf '%s' "$out_dir"
+    return
+  fi
+  local found
+  found="$(find "$out_dir" -name 'nixos-system-*.tar.xz' -type f 2>/dev/null | head -n1)"
+  if [[ -z "$found" ]]; then
+    printf 'Could not locate nixos-system-*.tar.xz under %q\n' "$out_dir" >&2
+    exit 1
+  fi
+  printf '%s' "$found"
+}
+
+gateway_out="$(resolve_image SLURM_TEST_ENV_GATEWAY_IMAGE gateway-image)"
+worker_out="$(resolve_image SLURM_TEST_ENV_WORKER_IMAGE worker-image)"
+gateway_tar="$(locate_tarball "$gateway_out")"
+worker_tar="$(locate_tarball "$worker_out")"
+
+# --- Shared host-side mount points -------------------------------------------
+#
+# /home (simulated network drive) plus the two publish-path roots that
+# the worker runtime writes to: /app/out-tmp (per-job scratch) and
+# /app/out-network (cross-job results). All three live under $STATE_DIR
+# and survive `down.sh`, get wiped by `down.sh --purge`.
+
+mkdir -p "$HOME_SHARE" "$OUT_TMP_SHARE" "$OUT_NETWORK_SHARE"
+
+# --- Network -----------------------------------------------------------------
+#
+# A user-defined podman network gives the containers internal DNS — so
+# slurm.conf can name them by their cluster-internal hostnames — and
+# default NAT to the host so workers reach the public internet. Only the
+# gateway publishes a host port; workers stay on the internal segment.
+
+if ! podman network exists "$NETWORK"; then
+  printf 'Creating cluster network...\n'
+  podman network create "$NETWORK" >/dev/null
+fi
+
+# --- Import images with instance-scoped tags --------------------------------
+
+printf 'Importing images...\n'
+podman import "$gateway_tar" "$GATEWAY_IMAGE_TAG" >/dev/null
+podman import "$worker_tar" "$WORKER_IMAGE_TAG" >/dev/null
+
+# --- Refuse to overwrite a running cluster -----------------------------------
+#
+# The error message is intentionally generic — it identifies the problem
+# (instance is already up) without revealing the internal naming scheme.
+
+abort_if_running() {
+  local name="$1"
+  if podman container exists "$name"; then
+    printf 'Cluster instance is already running; run down.sh first.\n' >&2
+    exit 1
+  fi
+}
+abort_if_running "$GATEWAY_NAME"
+for i in $(seq 1 "$WORKER_COUNT"); do
+  abort_if_running "$(worker_container_name "$i")"
+done
+
+# --- Common run flags --------------------------------------------------------
+#
+# --systemd=always: PID1 is /init (NixOS systemd); podman wires up
+#   /sys/fs/cgroup, /run, signal forwarding accordingly.
+# --privileged: required for systemd cgroup management + slurm cgroup
+#   tracking + nested podman on workers. Acceptable: this is an explicit
+#   local test harness, not a virtualization boundary.
+# --entrypoint /init: the imported tarball carries no metadata, so we
+#   declare the entrypoint at run time.
+
+common_flags=(
+  --network "$NETWORK"
+  --systemd=always
+  --privileged
+  --entrypoint /init
+  -v "${HOME_SHARE}:/home:rw"
+  -v "${OUT_TMP_SHARE}:/app/out-tmp:rw"
+  -v "${OUT_NETWORK_SHARE}:/app/out-network:rw"
+)
+
+# --- Run gateway -------------------------------------------------------------
+#
+# --name           is the GLOBALLY visible container name (instance-suffixed).
+# --hostname       is the CLUSTER-INTERNAL name; matches slurm.conf.
+# --network-alias  makes the cluster-internal name resolvable inside the
+#                  podman network — separate from --name so two instances
+#                  can both alias their respective gateways to "slurm-gateway"
+#                  inside their own isolated networks.
+
+printf 'Starting gateway...\n'
+podman run -d \
+  --name "$GATEWAY_NAME" \
+  --hostname "$GATEWAY_HOSTNAME" \
+  --network-alias "$GATEWAY_HOSTNAME" \
+  --memory "$GATEWAY_MEMORY" \
+  --cpus "$GATEWAY_CPUS" \
+  --publish "${SSH_PORT}:22" \
+  --tmpfs "/tmp:rw,nosuid,size=512m" \
+  "${common_flags[@]}" \
+  "$GATEWAY_IMAGE_TAG" >/dev/null
+
+# --- Run workers -------------------------------------------------------------
+
+printf 'Starting %d worker(s)...\n' "$WORKER_COUNT"
+for i in $(seq 1 "$WORKER_COUNT"); do
+  c_name="$(worker_container_name "$i")"
+  h_name="$(worker_hostname "$i")"
+  podman run -d \
+    --name "$c_name" \
+    --hostname "$h_name" \
+    --network-alias "$h_name" \
+    --memory "$WORKER_MEMORY" \
+    --cpus "$WORKER_CPUS" \
+    --tmpfs "/tmp:rw,nosuid,size=1g" \
+    "${common_flags[@]}" \
+    "$WORKER_IMAGE_TAG" >/dev/null
+done
+
+cat <<EOF
+
+=== slurm-test-env :: cluster up ===
+EOF
+print_layout
+
+cat <<EOF
+Provision a user (host-side, with the same INSTANCE_ID you set for up.sh):
+  ./scripts/provision-user.sh <username> <pubkey-file>
+  # or, when running from the flake:
+  nix run .#provision-user -- <username> <pubkey-file>
+
+Then submit slurm jobs from the gateway:
+  ssh -p ${SSH_PORT} -i <matching-private-key> <username>@localhost
+  srun --partition=debug -N1 hostname
+  sinfo
+
+EOF
