@@ -263,9 +263,11 @@ class SlurmPreparation:
         """
         gateway_host = self.gateway.host if hasattr(self.gateway, "host") else "localhost"
         gateway_user = self.gateway.user if hasattr(self.gateway, "user") else None
+        gateway_port = self.gateway.port if hasattr(self.gateway, "port") else 22
         remote_user = gateway_user or "root"
 
-        jump_host = f"{gateway_user}@{gateway_host}" if gateway_user else gateway_host
+        host_with_port = f"{gateway_host}:{gateway_port}" if gateway_port != 22 else gateway_host
+        jump_host = f"{gateway_user}@{host_with_port}" if gateway_user else host_with_port
 
         ssh_cmd = [
             "ssh",
