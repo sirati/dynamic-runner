@@ -49,8 +49,14 @@
 //! routing policy is shared, transport plumbing is not.
 
 pub mod channel;
+pub mod router;
+pub mod testing;
 
 pub use channel::OutboundChannel;
+pub use router::{
+    Clocks, InboundOutcome, PeerRouteState, RouteVia, Router, RoutingError, SendOutcome,
+    REDIAL_COOLDOWN, RELAY_LOG_TARGET,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
