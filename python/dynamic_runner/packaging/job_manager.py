@@ -52,6 +52,64 @@ class SlurmJobManager:
 
         logger.info("Directories created successfully")
 
+    def upload_source_binaries(
+        self,
+        binaries: list[Any],
+        source_root: Path,
+    ) -> None:
+        """Upload each binary's underlying file to ``<srcbins_dir>/<rel>``
+        on the gateway so the wrapper's read-only bind-mount of srcbins
+        into ``/app/src-network`` actually has the staged source.
+
+        Without this the StageFile pipeline (which tells the secondary
+        "the file is now at src_network/<rel_path>") points at an empty
+        directory and every TaskAssignment surfaces as ``not pre-staged``
+        — the framework had no primitive that turned the consumer's
+        local ``--source`` tree into a populated ``src_network`` view
+        on the cluster.
+
+        Caller-side gating decides WHEN to call this (file-based task,
+        not ``--source-already-staged``); this method assumes the
+        caller already wants the upload.
+
+        Binaries whose path does not sit under ``source_root`` are
+        skipped — the StageFile record for them ships the absolute
+        path, which the secondary's ``stage_file`` treats as
+        out-of-band-staged (must already exist on the secondary by
+        some other means). Same divergence the Rust ``queue_initial_staging``
+        documents at primary.rs:138-145.
+        """
+        srcbins_dir = self._expanded_remote_path(self.slurm_config.get_srcbins_dir())
+        src_root = Path(source_root).resolve()
+        logger.info(
+            "Uploading %d source files to %s on gateway",
+            len(binaries),
+            srcbins_dir,
+        )
+
+        created_dirs: set[str] = {str(srcbins_dir)}
+        uploaded = 0
+        for binary in binaries:
+            local = Path(binary.path)
+            try:
+                rel = local.resolve().relative_to(src_root)
+            except ValueError:
+                logger.warning(
+                    "Binary %s is not under --source root %s; skipping upload "
+                    "(absolute path will ship as out-of-band; secondary must already see it).",
+                    local,
+                    src_root,
+                )
+                continue
+            remote = srcbins_dir / rel
+            parent = str(remote.parent)
+            if parent not in created_dirs:
+                self.gateway.create_directory(parent)
+                created_dirs.add(parent)
+            self.gateway.transfer_file(local, str(remote))
+            uploaded += 1
+        logger.info("Source-binary upload complete (%d/%d files)", uploaded, len(binaries))
+
     def build_and_transfer_images(self, local_project_root: Path) -> PodmanImageMetadata:
         """Build the single docker image locally and transfer to gateway."""
         logger.info("Building and transferring Docker image...")
