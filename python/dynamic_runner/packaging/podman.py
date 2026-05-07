@@ -395,7 +395,7 @@ class PodmanPackaging:
             shutil.rmtree(scratch, ignore_errors=True)
 
     def get_load_command(self, image_path: str, storage_root: str, run_root: str) -> str:
-        return f"podman --root {storage_root} --runroot {run_root} --runtime /usr/bin/crun load < {image_path}"
+        return f"podman --root {storage_root} --runroot {run_root} load < {image_path}"
 
     def get_run_command(
         self,
@@ -413,8 +413,6 @@ class PodmanPackaging:
             storage_root,
             "--runroot",
             run_root,
-            "--runtime",
-            "/usr/bin/crun",
             "run",
             "--rm",
         ]
