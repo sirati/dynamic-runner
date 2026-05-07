@@ -24,6 +24,8 @@ from dynamic_runner.comm import (
     DoneResponse,
     ErrorResponse,
     ErrorType,
+    KeepaliveResponse,
+    PhaseUpdateResponse,
     ProcessBinaryCommand,
     ReadyResponse,
     Response,
@@ -269,6 +271,45 @@ class WorkerRuntimeTests(unittest.TestCase):
         comm = ScriptedComm(inbox=[StopCommand()])
         with self.assertRaises(RuntimeError):
             run(comm=comm)
+
+    def test_task_keepalive_sends_wire_msg(self):
+        def handle(task: Task):
+            task.keepalive()
+            return None
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        kinds = [type(r).__name__ for r in comm.outbox]
+        self.assertEqual(
+            kinds,
+            ["ReadyResponse", "KeepaliveResponse", "DoneResponse"],
+        )
+
+    def test_task_set_phase_sends_wire_msg(self):
+        def handle(task: Task):
+            task.set_phase("tok")
+            return None
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        phases = [r for r in comm.outbox if isinstance(r, PhaseUpdateResponse)]
+        self.assertEqual(len(phases), 1)
+        self.assertEqual(phases[0].phase_name, "tok")
+        # Phase update precedes the Done that closes the task.
+        kinds = [type(r).__name__ for r in comm.outbox]
+        self.assertEqual(
+            kinds,
+            ["ReadyResponse", "PhaseUpdateResponse", "DoneResponse"],
+        )
+
+    def test_task_emit_silent_when_no_hook(self):
+        # Direct construction (no runtime loop) → calls are no-ops.
+        # This is the unit-test-harness path: a consumer testing its
+        # handler in isolation can build a Task by hand and call
+        # task.keepalive() / task.set_phase() without crashing.
+        t = Task(relative_path="/x")
+        t.keepalive()
+        t.set_phase("phase-a")
 
 
 if __name__ == "__main__":
