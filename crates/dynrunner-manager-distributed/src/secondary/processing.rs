@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_manager_local::WorkerFactory;
@@ -391,13 +391,17 @@ where
                         self.send_to_current_primary(msg.clone()).await?;
                         let _ = self.peer_transport.broadcast(msg).await;
                     } else {
-                        // Compute the wire-format error_type once so
-                        // the primary failure ledger and the
-                        // outbound TaskFailed agree on the string.
+                        // Reuse the upstream classification from the
+                        // worker protocol; default to NonRecoverable
+                        // only when the worker layer didn't tag the
+                        // result (genuine "unknown" — distinct from
+                        // the disconnect path which now reports
+                        // Recoverable explicitly via worker.rs /
+                        // protocol-manager-worker).
                         let error_type = result
                             .error_type
-                            .map(|e| format!("{:?}", e))
-                            .unwrap_or_else(|| "Unknown".into());
+                            .clone()
+                            .unwrap_or(ErrorType::NonRecoverable);
                         // Failure-aware variant: Recoverable failures
                         // land in `primary_failed` for the
                         // retry pass. Phase-machine in-flight
@@ -467,13 +471,29 @@ where
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
 
+                    // Honour the upstream classification produced by
+                    // the worker protocol: a clean Error response on
+                    // the wire (Recoverable / NonRecoverable / OOM)
+                    // already carried `error_type`. The transport-
+                    // closed branch in `protocol-manager-worker` /
+                    // `manager-local` defaults to Recoverable so a
+                    // mid-task disconnect retries (typical cause is
+                    // an environment glitch or worker-process bug
+                    // that the retry-pass exhaustion logic catches
+                    // at `MAX_RETRY_ATTEMPTS`). Pre-Phase-D this
+                    // forwarder hardcoded NonRecoverable, masking
+                    // the upstream signal entirely.
+                    let error_type = result
+                        .error_type
+                        .clone()
+                        .unwrap_or(ErrorType::Recoverable);
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),
                         worker_id,
                         task_hash: hash,
-                        error_type: "NonRecoverable".into(),
+                        error_type,
                         error_message: result
                             .error_message
                             .unwrap_or_else(|| "Worker disconnected".into()),

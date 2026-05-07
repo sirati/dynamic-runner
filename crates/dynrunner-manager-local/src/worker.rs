@@ -155,8 +155,16 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
                 self.protocol = RunnerProtocolState::Stopped(s);
                 Some(WorkerEvent::Disconnected {
                     worker_id: self.worker_id,
+                    // Phase D: framework can't tell from a closed
+                    // transport whether the worker process died from
+                    // a deterministic bug or from an environment
+                    // glitch (OOM-killer, host hiccup). Recoverable
+                    // is the safe default — repeated Recoverable
+                    // classifications still surface as a permanent
+                    // failure once `MAX_RETRY_ATTEMPTS` passes are
+                    // exhausted.
                     result: TaskResult::error(
-                        ErrorType::NonRecoverable,
+                        ErrorType::Recoverable,
                         "Disconnected before Ready".into(),
                     ),
                     binary: None,

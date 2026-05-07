@@ -586,7 +586,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                         secondary_id: id.clone(),
                         worker_id: 0,
                         task_hash: h,
-                        error_type: "Recoverable".into(),
+                        error_type: dynrunner_core::ErrorType::Recoverable,
                         error_message: "always fails".into(),
                     }).unwrap();
                     tx.send(DistributedMessage::TaskRequest {
@@ -691,7 +691,7 @@ async fn retry_max_passes_zero_disables_retry() {
                         secondary_id: id.clone(),
                         worker_id: 0,
                         task_hash: h,
-                        error_type: "Recoverable".into(),
+                        error_type: dynrunner_core::ErrorType::Recoverable,
                         error_message: "always fails".into(),
                     }).unwrap();
                     tx.send(DistributedMessage::TaskRequest {

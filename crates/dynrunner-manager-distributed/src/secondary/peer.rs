@@ -1,5 +1,5 @@
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport, PrimaryTransport,
@@ -81,7 +81,7 @@ where
                 //      from the worker, NonRecoverable, OutOfMemory,
                 //      etc.). The phase machine just needs the
                 //      in-flight counter decremented.
-                let is_backpressure = error_type == "Recoverable"
+                let is_backpressure = matches!(error_type, ErrorType::Recoverable)
                     && error_message == "No idle worker available";
                 if is_backpressure {
                     if let Some(peer) = self.handle_primary_peer_rejection(&task_hash) {
@@ -113,7 +113,7 @@ where
                     tracing::debug!(
                         peer = %secondary_id,
                         task_hash,
-                        error_type,
+                        error_type = ?error_type,
                         "peer task failed"
                     );
                 }

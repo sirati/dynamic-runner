@@ -1,5 +1,6 @@
 use super::*;
 use crate::messages::*;
+use dynrunner_core::{ErrorType, ResourceKind};
 use serde::{Deserialize, Serialize};
 
 /// Test identifier matching the tokenizer's wire format.
@@ -136,7 +137,7 @@ fn roundtrip_task_failed() {
         secondary_id: "sec-1".into(),
         worker_id: 2,
         task_hash: "hash123".into(),
-        error_type: "oom".into(),
+        error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
         error_message: "out of memory".into(),
     };
 
@@ -149,7 +150,7 @@ fn roundtrip_task_failed() {
             error_message,
             ..
         } => {
-            assert_eq!(error_type, "oom");
+            assert_eq!(error_type, ErrorType::ResourceExhausted(ResourceKind::memory()));
             assert_eq!(error_message, "out of memory");
         }
         _ => panic!("expected TaskFailed"),
@@ -315,7 +316,7 @@ fn roundtrip_all_message_types() {
             secondary_id: "s".into(),
             worker_id: 0,
             task_hash: "h".into(),
-            error_type: "oom".into(),
+            error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
             error_message: "m".into(),
         },
         DistributedMessage::Keepalive {

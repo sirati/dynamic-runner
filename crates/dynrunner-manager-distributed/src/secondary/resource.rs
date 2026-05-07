@@ -1,4 +1,4 @@
-use dynrunner_core::{Identifier, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, ResourceKind, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::ResourcePressureResult;
 use dynrunner_manager_local::WorkerFactory;
@@ -44,7 +44,7 @@ where
                         secondary_id: self.config.secondary_id.clone(),
                         worker_id,
                         task_hash: hash,
-                        error_type: "OutOfMemory".into(),
+                        error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
                         error_message: reason,
                     };
                     let _ = self.send_to_current_primary(msg.clone()).await;
