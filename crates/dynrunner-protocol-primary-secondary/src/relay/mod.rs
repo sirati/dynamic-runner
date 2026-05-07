@@ -48,8 +48,12 @@
 //! clone-on-send, error mapping) live in each [`PeerTransport`] impl —
 //! routing policy is shared, transport plumbing is not.
 
+pub mod channel;
+
+pub use channel::OutboundChannel;
+
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::Instant;
 
 use crate::messages::DistributedMessage;
 use dynrunner_core::Identifier;
@@ -108,8 +112,10 @@ pub struct OutgoingRelay<I> {
     pub original_timestamp: f64,
     /// When this state was last touched (created or refreshed by a
     /// retry). Drives the TTL sweep — entries older than the TTL
-    /// are pruned without action.
-    pub last_used_at: SystemTime,
+    /// are pruned without action. Monotonic `Instant` so the TTL
+    /// arithmetic is unaffected by wall-clock jumps; cross-machine
+    /// correlation uses [`OutgoingRelay::original_timestamp`] instead.
+    pub last_used_at: Instant,
 }
 
 /// What the transport should do on receiving a `RelayBackoff` from a
@@ -207,7 +213,7 @@ pub fn route_send<I: Identifier, V>(
         inner: inner.clone(),
         original_sender: my_peer_id.to_string(),
         original_timestamp: timestamp,
-        last_used_at: SystemTime::now(),
+        last_used_at: Instant::now(),
     };
     let wrapped = DistributedMessage::Relay {
         sender_id: my_peer_id.to_string(),
@@ -278,7 +284,7 @@ pub fn forward_step<I: Identifier, V>(
         inner: inner.clone(),
         original_sender: sender_id.to_string(),
         original_timestamp: timestamp,
-        last_used_at: SystemTime::now(),
+        last_used_at: Instant::now(),
     };
     let wrapped = DistributedMessage::Relay {
         sender_id: sender_id.to_string(),
@@ -333,7 +339,7 @@ pub fn handle_backoff<I: Identifier, V>(
     }
     if let Some(via) = pick_relay(connections, excluded.iter().copied()) {
         state.tried.insert(via.clone());
-        state.last_used_at = SystemTime::now();
+        state.last_used_at = Instant::now();
         let wrapped = DistributedMessage::Relay {
             sender_id: state.original_sender.clone(),
             timestamp: state.original_timestamp,
@@ -614,7 +620,7 @@ mod tests {
             inner: Box::new(keepalive("a")),
             original_sender: "a".to_string(),
             original_timestamp: 1.0,
-            last_used_at: SystemTime::now(),
+            last_used_at: Instant::now(),
         }
     }
 
@@ -630,7 +636,7 @@ mod tests {
             inner: Box::new(keepalive("a")),
             original_sender: "a".to_string(),
             original_timestamp: 1.0,
-            last_used_at: SystemTime::now(),
+            last_used_at: Instant::now(),
         }
     }
 

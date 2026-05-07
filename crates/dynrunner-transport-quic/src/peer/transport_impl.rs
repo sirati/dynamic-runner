@@ -7,7 +7,7 @@
 //! them via the per-peer mpsc channels.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
@@ -46,11 +46,9 @@ fn prune_stale<I>(
         OutgoingRelay<I>,
     >,
 ) {
-    let now = SystemTime::now();
+    let now = Instant::now();
     outgoing_relays.retain(|_, st| {
-        now.duration_since(st.last_used_at)
-            .map(|d| d <= RELAY_STATE_TTL)
-            .unwrap_or(true)
+        now.duration_since(st.last_used_at) <= RELAY_STATE_TTL
     });
 }
 
