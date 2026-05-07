@@ -89,6 +89,22 @@ impl PySecondaryCoordinator {
             log_paths,
         )?;
 
+        // Resolve this secondary's per-run log directory under the
+        // log-mount root, using `secondary_id` so two co-located
+        // secondaries on the same shared mount get distinct
+        // directories. `create_dir_all` errors surface as
+        // construction-time failures — silently swallowing this with
+        // `.ok()` produced 6h runs with zero worker log output when
+        // the mount happened to be read-only or missing.
+        let log_dir =
+            task.log_paths
+                .resolve_log_dir(py, &task.output_path, &secondary_id)?;
+        std::fs::create_dir_all(&log_dir).map_err(|e| {
+            pyo3::exceptions::PyOSError::new_err(format!(
+                "failed to create log directory {log_dir:?}: {e}"
+            ))
+        })?;
+
         Ok(Self {
             python_executable: task.python_executable,
             primary_url,
@@ -97,7 +113,7 @@ impl PySecondaryCoordinator {
             ram_bytes,
             source_dir: task.source_path,
             output_dir: task.output_path,
-            log_dir: task.log_dir,
+            log_dir,
             log_paths: task.log_paths,
             worker_spec,
             distributed_config: distributed_config.unwrap_or_default(),

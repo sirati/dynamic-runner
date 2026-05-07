@@ -13,6 +13,7 @@ use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
+use crate::network::gethostname;
 use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
@@ -110,6 +111,30 @@ impl PyLocalManager {
             log_paths,
         )?;
 
+        // Single-process mode synthesises a `secondary_id` from the
+        // hostname (falling back to the literal `"local"`) and feeds
+        // it through the same log-dir template the distributed and
+        // SLURM modes use. The resulting directory is unique by
+        // construction even on a shared mount with other runners,
+        // so there is no special-case "single process" branch in the
+        // log-path policy.
+        let secondary_id = {
+            let h = gethostname();
+            if h.is_empty() || h == "unknown" {
+                "local".to_string()
+            } else {
+                h
+            }
+        };
+        let log_dir =
+            task.log_paths
+                .resolve_log_dir(py, &task.output_path, &secondary_id)?;
+        std::fs::create_dir_all(&log_dir).map_err(|e| {
+            pyo3::exceptions::PyOSError::new_err(format!(
+                "failed to create log directory {log_dir:?}: {e}"
+            ))
+        })?;
+
         // Parse connection mode
         let conn_mode = match connection_mode {
             "socketpair" => ConnectionMode::Socketpair,
@@ -142,7 +167,7 @@ impl PyLocalManager {
             print_pid,
             source_dir: task.source_path,
             output_dir: task.output_path,
-            log_dir: task.log_dir,
+            log_dir,
             log_paths: task.log_paths,
             worker_spec,
             scheduler_config: scheduler_config.unwrap_or_default(),
