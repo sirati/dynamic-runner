@@ -505,10 +505,11 @@ impl<I: Identifier> Router<I> {
     /// Exposed for cross-crate tests (`dynrunner-transport-channel`'s
     /// `tests/mesh_partition.rs`) so partition / heal scenarios can
     /// assert on `last_observed_relay_at` directly without round-
-    /// tripping through `SendOutcome`. Not part of the stable public
-    /// API — production callers should never inspect routing state;
-    /// the audit phase may move this behind a `test-utils` feature
-    /// gate if the surface area becomes problematic.
+    /// tripping through `SendOutcome`. Gated behind the `test-utils`
+    /// feature so production builds cannot accidentally depend on
+    /// internal routing state — flip the feature on in dev-deps,
+    /// never in runtime deps.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn route_state(&self) -> &HashMap<String, PeerRouteState> {
         &self.route_state
     }
