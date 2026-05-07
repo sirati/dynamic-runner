@@ -104,6 +104,7 @@ pub(crate) fn run_local<'py>(
         "phase_status_log_intervals_secs",
         config.phase_status_log_intervals_secs.clone(),
     )?;
+    kwargs.set_item("stage_timeouts_secs", config.stage_timeouts_secs.clone())?;
 
     let cls = module(py)?.getattr("RustLocalManager")?;
     let args = (

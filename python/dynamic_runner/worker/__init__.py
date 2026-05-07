@@ -9,6 +9,11 @@ Re-exports the names every consumer needs to write a worker module:
 
 See ``runtime.py`` for the full contract and exception → wire mapping.
 """
+from .publish import (
+    PublishError,
+    publish,
+    publish_all,
+)
 from .runtime import (
     NonRecoverableError,
     RecoverableError,
@@ -20,9 +25,12 @@ from .runtime import (
 
 __all__ = [
     "NonRecoverableError",
+    "PublishError",
     "RecoverableError",
     "Task",
     "WorkerOutput",
+    "publish",
+    "publish_all",
     "run",
     "task_function",
 ]

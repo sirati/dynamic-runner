@@ -6,6 +6,7 @@ mod estimator;
 mod identifier;
 mod managers;
 mod network;
+mod publish;
 mod pytypes;
 mod subprocess_factory;
 mod system_resources;
@@ -74,5 +75,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<discovery::FolderProxy>()?;
     m.add_class::<discovery::FileProxy>()?;
     m.add_function(wrap_pyfunction!(discovery::find_items, m)?)?;
+    m.add("PublishError", m.py().get_type::<publish::PublishError>())?;
+    m.add_function(wrap_pyfunction!(publish::publish_one, m)?)?;
     Ok(())
 }
