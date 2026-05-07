@@ -127,6 +127,29 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         help="Gateway for SLURM controller. Use 'local' or 'ssh://user@host[:port]'",
     )
     parser.add_argument(
+        "--ssh-identity-file",
+        type=str,
+        default=None,
+        help=(
+            "Path to a private key file used for every framework-issued "
+            "ssh/scp invocation in the gateway path (master, exec, scp, "
+            "reverse tunnel). Adds '-i <path> -o IdentitiesOnly=yes' so "
+            "the agent's other keys are NOT offered. Use this when "
+            "~/.ssh/config-driven IdentityAgent over-offers keys and "
+            "trips the gateway sshd's MaxAuthTries."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-config",
+        type=str,
+        default=None,
+        help=(
+            "Path to an alternate ssh_config (passed as '-F <path>'). "
+            "Escape hatch for any auth/option setup the framework "
+            "doesn't expose directly. Composes with --ssh-identity-file."
+        ),
+    )
+    parser.add_argument(
         "--multi-computer",
         type=str,
         choices=["slurm", "local", "single-process"],

@@ -134,6 +134,12 @@ def run_slurm_pipeline(
     # AND the reverse-connection fallback never fires either.
     log.info("Connecting to gateway...")
     gateway_config = parse_gateway_url(args.gateway)
+    # CLI-supplied auth primitives are gateway-config concerns, not URL
+    # concerns — the URL stays a clean user@host:port. Setting after
+    # parse keeps `parse_gateway_url`'s signature unchanged for any
+    # caller that constructs the URL programmatically.
+    gateway_config.ssh_identity_file = getattr(args, "ssh_identity_file", None)
+    gateway_config.ssh_config_file = getattr(args, "ssh_config", None)
     gateway = create_gateway(gateway_config)
 
     import dynamic_runner as _rs

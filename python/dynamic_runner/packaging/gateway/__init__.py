@@ -11,6 +11,14 @@ class GatewayConfig:
     ssh_host: str | None = None
     ssh_port: int | None = None
     ssh_user: str | None = None
+    # Explicit auth primitives. When set, the framework injects them
+    # into every ssh/scp subprocess in the gateway path (master,
+    # exec, scp upload/download, reverse tunnel). Bypasses
+    # ~/.ssh/config-driven IdentityAgent over-offering — common on
+    # NixOS+gnome-keyring/1password setups where a many-key agent
+    # trips MaxAuthTries before reaching the right key.
+    ssh_identity_file: str | None = None
+    ssh_config_file: str | None = None
 
 
 class Gateway(Protocol):
@@ -109,6 +117,12 @@ def create_gateway(config: GatewayConfig) -> Gateway:
     elif config.mode == "ssh":
         from .ssh_gateway import SSHGateway
 
-        return SSHGateway(host=config.ssh_host, port=config.ssh_port, user=config.ssh_user)
+        return SSHGateway(
+            host=config.ssh_host,
+            port=config.ssh_port,
+            user=config.ssh_user,
+            identity_file=config.ssh_identity_file,
+            config_file=config.ssh_config_file,
+        )
     else:
         raise ValueError(f"Unknown gateway mode: {config.mode}")
