@@ -532,7 +532,7 @@ where
                     {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, wid);
-                            self.reset_request_backoff(wid);
+                            self.primary_link.reset_backoff(wid);
                         }
                         Err(e) => {
                             // `assign_task` failed AFTER we already

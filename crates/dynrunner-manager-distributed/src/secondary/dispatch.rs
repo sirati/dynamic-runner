@@ -111,7 +111,7 @@ where
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
-                            self.reset_request_backoff(target_wid);
+                            self.primary_link.reset_backoff(target_wid);
                             tracing::info!(
                                 worker_id = target_wid,
                                 task_id = ?binary_info.task_id,
@@ -210,7 +210,7 @@ where
                 // (`current_primary == self`) by falling through to
                 // `primary_transport`, so setting the field
                 // unconditionally is correct for both branches.
-                self.primary_peer_id = Some(new_primary_id.clone());
+                self.primary_link.set_current_primary(Some(new_primary_id.clone()));
                 if self.is_primary {
                     // Sync the election state machine with the role
                     // change so `run_election_tick`'s

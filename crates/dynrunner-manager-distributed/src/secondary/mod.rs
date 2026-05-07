@@ -14,6 +14,8 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
 
+use self::primary_link::PrimaryLink;
+
 /// Configuration for the secondary coordinator.
 pub struct SecondaryConfig {
     pub secondary_id: String,
@@ -179,7 +181,7 @@ where
     /// arm of `process_tasks`'s `select!` so the persistently-None
     /// future doesn't hot-loop. Once true, we drive failover via the
     /// election state machine and route work via
-    /// `primary_peer_id` once a peer wins the election.
+    /// `primary_link.current_primary()` once a peer wins the election.
     ///
     /// Pre-fix the recv arm bare-broke the loop on `None` and the
     /// secondary exited cleanly with `completed=0` — losing every
@@ -195,9 +197,11 @@ where
     // Deferred peer messages to send (queued from sync handlers)
     pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
 
-    // Per-worker task request rate limiting
-    last_request_time: HashMap<WorkerId, Instant>,
-    request_backoff: HashMap<WorkerId, Duration>,
+    /// Routing target + per-worker request rate limiting for the
+    /// secondary→primary link. Single owner of "where do operational
+    /// sends go?" and "is this worker's request allowed to fire yet?"
+    /// — see `primary_link.rs` for the boundary contract.
+    pub(in crate::secondary) primary_link: PrimaryLink,
 
     /// One-shot watchdog deadline for "did the peer mesh form?".
     /// Set to `now + 30s` when `wait_for_setup` kicks off the per-peer
@@ -303,14 +307,6 @@ where
     // (`populate_primary_tasks`).
     cached_full_task_list: Option<CachedTaskListSnapshot<I>>,
 
-    // Identity of the current primary peer, if the original primary
-    // is dead and an election has resolved. `None` while the original
-    // primary is alive (TaskRequest goes to `primary_transport`); `Some`
-    // while we're voting for or have voted for a candidate (TaskRequest
-    // is routed to that peer via `peer_transport`). Cleared whenever a
-    // live primary message arrives.
-    primary_peer_id: Option<String>,
-
     /// Set by handlers that detect an unrecoverable local fault (peer
     /// mesh fully failed to form, etc.). The main `process_tasks`
     /// loop checks this once per iteration AFTER the deferred-message
@@ -352,6 +348,7 @@ where
             std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
         });
         let extraction_cache = ExtractionCache::new(tmp_dir, config.src_network.clone());
+        let primary_link = PrimaryLink::new(config.secondary_id.clone());
         Self {
             config,
             primary_transport,
@@ -370,8 +367,7 @@ where
             primary_disconnected: false,
             election: election::ElectionState::Normal,
             pending_peer_messages: Vec::new(),
-            last_request_time: HashMap::new(),
-            request_backoff: HashMap::new(),
+            primary_link,
             peer_mesh_check_at: None,
             peer_dial_count: 0,
             mesh_ready_sent: false,
@@ -383,7 +379,6 @@ where
             exhaustion_warning_emitted: false,
             backpressured_secondaries: HashMap::new(),
             cached_full_task_list: None,
-            primary_peer_id: None,
             pre_staged_mode: false,
             uses_file_based_items: true,
             fatal_exit: None,
@@ -562,6 +557,7 @@ where
 mod dispatch;
 mod election;
 mod peer;
+mod primary_link;
 mod processing;
 mod resource;
 mod primary;
