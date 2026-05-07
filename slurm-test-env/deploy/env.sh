@@ -84,16 +84,6 @@ worker_tmp_dir()        { printf '%s/%s' "$WORKER_TMP_BASE" "$(worker_hostname "
 STATE_DIR="${STATE_BASE_DIR}/${INSTANCE_ID}"
 HOME_SHARE="${STATE_DIR}/home"
 
-# Publish-path mounts mirroring the production slurm wrapper layout
-# (-v /…/out-tmp:/app/out-tmp, -v /…/out-network:/app/out-network).
-# Bind-mounted into every cluster container at the same in-container
-# paths the runtime publishes to, so consumers don't need to override
-# DYNRUNNER_PUBLISH_*_ROOT to make publishes work in the test env.
-# Both shared across the cluster; per-job scoping is done above this
-# level by the runtime.
-OUT_TMP_SHARE="${STATE_DIR}/out-tmp"
-OUT_NETWORK_SHARE="${STATE_DIR}/out-network"
-
 # Per-worker /tmp lives on the host's real /tmp instead of an in-container
 # tmpfs: image tarballs (multi-GB) and other worker scratch can otherwise
 # blow a tmpfs's size cap. The base dir is per-instance so concurrent

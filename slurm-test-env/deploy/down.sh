@@ -6,8 +6,7 @@
 # allocation lock file — leaving the host's podman storage with no trace
 # of this run. The simulated /home (= $HOME_SHARE) is always preserved
 # so the operator can inspect test output post-mortem and so user
-# provisioning carries across runs; --purge wipes the per-job publish
-# trees (out-tmp, out-network) but never touches /home.
+# provisioning carries across runs.
 
 set -euo pipefail
 
@@ -16,19 +15,14 @@ ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/env.sh}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
-purge=0
 for arg in "$@"; do
   case "$arg" in
-    --purge) purge=1 ;;
     -h|--help)
       cat <<EOF
-usage: down.sh [--purge]
+usage: down.sh
 
-Stops the cluster. The simulated /home is always preserved at
+Stops the cluster. The simulated /home is preserved at
 ${HOME_SHARE} for post-test inspection and across-run user state.
-
-  --purge   also wipe the per-job publish trees (out-tmp,
-            out-network). /home is never touched.
 EOF
       exit 0
       ;;
@@ -99,38 +93,10 @@ if [[ -d "$WORKER_TMP_BASE" ]]; then
   podman unshare rm -rf -- "$WORKER_TMP_BASE"
 fi
 
-# --- Optional state wipe -----------------------------------------------------
-
-if (( purge )); then
-  # /home is intentionally exempt: it carries user provisioning state
-  # (.cluster_uid, .ssh) plus inspectable test output, and re-creating
-  # it is a deliberate operator action (rm -rf the dir by hand under
-  # `podman unshare` if you really want a clean slate).
-  #
-  # Files under the publish trees are owned by user-namespace-mapped
-  # subuids the operator can't unlink directly; `podman unshare`
-  # enters the mapping so rm succeeds.
-  for dir in "$OUT_TMP_SHARE" "$OUT_NETWORK_SHARE"; do
-    if [[ -d "$dir" ]]; then
-      podman unshare rm -rf -- "$dir"
-    fi
-  done
-  cat <<EOF
-
-=== slurm-test-env :: cluster down (purged) ===
-
-  simulated /home:    ${HOME_SHARE}    (preserved — never purged)
-  publish trees:      ${OUT_TMP_SHARE}, ${OUT_NETWORK_SHARE}    (removed)
-
-EOF
-else
-  cat <<EOF
+cat <<EOF
 
 === slurm-test-env :: cluster down ===
 
   simulated /home:    ${HOME_SHARE}    (preserved for inspection)
 
-Pass --purge to also wipe the per-job publish trees.
-
 EOF
-fi
