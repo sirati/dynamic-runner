@@ -260,6 +260,12 @@ impl<I: Identifier> PeerNetwork<I> {
     /// Router's `Relay → Direct` info log on the next send through
     /// the restored peer.
     fn spawn_redial(&self, peer_id: &str) {
+        if self.connections.contains_key(peer_id) {
+            return; // already directly connected (mid-heal: prior dial
+                    // landed but the cooldown timestamp is still hot).
+                    // Skipping avoids a duplicate WSS pipe whose sender
+                    // would later be discarded by drain_new_connections.
+        }
         let Some(peer_info) = self.peer_dial_info.get(peer_id).cloned() else {
             return; // peer no longer in the authoritative cluster list
         };
