@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
+use dynrunner_core::{ResourceKind, ResourceMap};
 use dynrunner_manager_distributed::{SecondaryConfig, SecondaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkClient;
@@ -9,6 +10,7 @@ use dynrunner_transport_quic::NetworkClient;
 use crate::config::connection::ConnectionMode;
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
+use crate::config::resources::PyResourceMap;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::TokenizerIdentifier;
@@ -22,7 +24,7 @@ pub(crate) struct PySecondaryCoordinator {
     primary_url: String,
     secondary_id: String,
     num_workers: u32,
-    ram_bytes: u64,
+    max_resources: ResourceMap,
     source_dir: PathBuf,
     output_dir: PathBuf,
     log_dir: PathBuf,
@@ -61,6 +63,7 @@ impl PySecondaryCoordinator {
         distributed_config = None,
         src_network = None,
         src_tmp = None,
+        max_resources = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -78,6 +81,7 @@ impl PySecondaryCoordinator {
         distributed_config: Option<DistributedConfig>,
         src_network: Option<PathBuf>,
         src_tmp: Option<PathBuf>,
+        max_resources: Option<PyResourceMap>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -105,12 +109,19 @@ impl PySecondaryCoordinator {
             ))
         })?;
 
+        // Boundary normalization: typed `max_resources` ResourceMap wins
+        // when supplied; otherwise fall back to a single-key memory map
+        // built from the legacy scalar `ram_bytes`.
+        let max_resources = max_resources.map(|m| m.to_rust()).unwrap_or_else(|| {
+            ResourceMap::from([(ResourceKind::memory(), ram_bytes)])
+        });
+
         Ok(Self {
             python_executable: task.python_executable,
             primary_url,
             secondary_id,
             num_workers,
-            ram_bytes,
+            max_resources,
             source_dir: task.source_path,
             output_dir: task.output_path,
             log_dir,
@@ -131,7 +142,7 @@ impl PySecondaryCoordinator {
         let primary_url = self.primary_url.clone();
         let secondary_id = self.secondary_id.clone();
         let num_workers = self.num_workers;
-        let ram_bytes = self.ram_bytes;
+        let max_resources = self.max_resources.clone();
         let estimator = self.estimator.clone();
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
@@ -305,7 +316,7 @@ impl PySecondaryCoordinator {
                 let config = SecondaryConfig {
                     secondary_id: secondary_id.clone(),
                     num_workers,
-                    max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), ram_bytes)]),
+                    max_resources,
                     hostname: gethostname(),
                     keepalive_interval: dist_keepalive,
                     src_network: cfg_src_network,
