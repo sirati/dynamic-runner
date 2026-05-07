@@ -188,29 +188,39 @@ where
                 self.stage_and_register(&file_hash, &content_hash, &src_path, &dest_path);
                 Ok(())
             }
-            DistributedMessage::PromotePrimary { new_primary_id, .. } => {
+            DistributedMessage::PromotePrimary { new_primary_id, epoch, .. } => {
+                // Apply to the replicated ledger first: last-writer-
+                // wins on (epoch, primary_id) makes a stale lower-
+                // epoch broadcast a no-op against an already-installed
+                // higher-epoch promotion (e.g. a delayed bootstrap
+                // PromotePrimary arriving after a failover round).
+                // If the ledger rejects it, every other side-effect
+                // must short-circuit too — otherwise the routing
+                // target diverges from the cluster's authoritative
+                // primary identity.
+                let outcome = self.cluster_state.apply(ClusterMutation::PrimaryChanged {
+                    new: new_primary_id.clone(),
+                    epoch,
+                });
+                if outcome == crate::cluster_state::ApplyOutcome::NoOp {
+                    tracing::debug!(
+                        new_primary = %new_primary_id,
+                        epoch,
+                        "ignoring stale PromotePrimary superseded by higher epoch"
+                    );
+                    return Ok(());
+                }
                 self.is_primary = new_primary_id == self.config.secondary_id;
-                // Point send_to_current_primary at the new primary
-                // for ALL nodes (the new primary itself, and every
-                // other secondary). Without this, non-primary nodes
-                // kept routing operational messages via
-                // `primary_transport` (the local-machine primary).
-                // The local primary's `handle_task_request` then
-                // relayed TaskRequests onward to `primary_id` (the
-                // SLURM-primary), so dispatch worked as long as the
-                // local primary's transport stayed up. When the local
-                // primary's transport closed (laptop suspend, SSH
-                // tunnel idle close — the tokenizer/dataset trigger),
-                // the relay vanished, TaskRequests never reached the
-                // SLURM-primary, and workers idled forever. After
-                // this fix, secondaries route directly via the peer
-                // mesh and don't depend on the local primary's
-                // transport being alive. `send_to_current_primary`
-                // already handles the self-loopback case
-                // (`current_primary == self`) by falling through to
-                // `primary_transport`, so setting the field
-                // unconditionally is correct for both branches.
-                self.primary_link.set_current_primary(Some(new_primary_id.clone()));
+                // `on_primary_changed` updates the routing target AND
+                // resets per-worker backoff so idle workers fire a
+                // fresh `TaskRequest` at the new primary on their next
+                // tick instead of sitting through stale windows that
+                // accrued against the old primary. This is the
+                // cancel-and-reissue primitive the trace at `feb1052`
+                // exposed as missing — pre-Phase-P only the routing
+                // target moved, leaving the new primary's local
+                // workers silent for the residual window.
+                self.primary_link.on_primary_changed(new_primary_id.clone());
                 if self.is_primary {
                     // Sync the election state machine with the role
                     // change so `run_election_tick`'s
@@ -228,10 +238,11 @@ where
                     // every in-flight task. Surfaced in tokenizer's
                     // v6 trace.
                     self.election = ElectionState::Promoted;
-                    tracing::info!("this secondary has been promoted to primary");
+                    tracing::info!(epoch, "this secondary has been promoted to primary");
                 } else {
                     tracing::info!(
                         new_primary = %new_primary_id,
+                        epoch,
                         "another secondary promoted to primary"
                     );
                 }

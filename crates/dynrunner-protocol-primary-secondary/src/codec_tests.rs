@@ -291,6 +291,7 @@ fn roundtrip_all_message_types() {
             sender_id: "p".into(),
             timestamp: 0.0,
             new_primary_id: "s".into(),
+            epoch: 1,
         },
         DistributedMessage::FullTaskList {
             sender_id: "p".into(),

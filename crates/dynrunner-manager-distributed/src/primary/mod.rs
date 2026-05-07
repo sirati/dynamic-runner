@@ -657,13 +657,19 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // secondary's silence must not stall the run).
         self.wait_for_mesh_ready().await?;
 
-        // Phase 7: Promote primary
+        // Promote primary (atomic role-flip). The chosen secondary's
+        // role-change is broadcast to every node; each node's
+        // `cluster_state` mirror applies `PrimaryChanged` and each
+        // node's `primary_link` re-routes operational sends.
         self.promote_primary().await?;
 
-        // Phase 8: Send full task list to primary
+        // Ship the legacy `FullTaskList` snapshot. Phase B will
+        // replace this with the snapshot RPC; until then it remains
+        // the reliable post-promotion ledger source for nodes whose
+        // CRDT mirror missed earlier broadcasts.
         self.send_full_task_list().await?;
 
-        // Phase 9: Operational loop (main pass)
+        // Operational loop (main pass).
         self.operational_loop().await?;
 
         // Phase 10: Retry pass(es). Each Recoverable / NonRecoverable
