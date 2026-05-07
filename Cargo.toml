@@ -16,6 +16,7 @@ members = [
     "crates/dynrunner-discovery",
     "crates/dynrunner-slurm",
     "crates/dynrunner-pyo3",
+    "crates/dynrunner-publish",
 ]
 
 [workspace.package]
@@ -64,3 +65,4 @@ dynrunner-gateway = { path = "crates/dynrunner-gateway" }
 dynrunner-discovery = { path = "crates/dynrunner-discovery" }
 dynrunner-slurm = { path = "crates/dynrunner-slurm" }
 dynrunner-pyo3 = { path = "crates/dynrunner-pyo3" }
+dynrunner-publish = { path = "crates/dynrunner-publish" }
