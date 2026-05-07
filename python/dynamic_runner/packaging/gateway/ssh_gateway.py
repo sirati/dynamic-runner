@@ -222,17 +222,43 @@ class SSHGateway:
     def auth_options(self) -> list[str]:
         """Explicit-auth flags applied to every ssh/scp invocation.
 
-        ``-i``/``IdentitiesOnly=yes`` and ``-F`` shape *which* credentials
-        ssh considers — orthogonal to ``-p`` (port) which is added per
-        ssh/scp by ``_build_ssh_base_command`` (uses ``-p``) or the
-        per-scp builders (use ``-P``). Exposed publicly so other
-        framework-owned ssh subprocesses (e.g. ``preparation.py``'s
-        reverse tunnel) can mirror the auth contract without
-        bypassing the gateway.
+        ``-i``/``IdentitiesOnly=yes``/``IdentityAgent=none`` and ``-F``
+        shape *which* credentials ssh considers — orthogonal to ``-p``
+        (port) which is added per ssh/scp by ``_build_ssh_base_command``
+        (uses ``-p``) or the per-scp builders (use ``-P``). Exposed
+        publicly so other framework-owned ssh subprocesses (e.g.
+        ``preparation.py``'s reverse tunnel) can mirror the auth
+        contract without bypassing the gateway.
+
+        ``IdentityAgent=none`` is bundled with ``--ssh-identity-file``
+        because ``IdentitiesOnly=yes`` alone does NOT prevent over-
+        offering on systems where ``~/.ssh/config`` has
+        ``Match host * → IdentityAgent <socket>`` (typical
+        NixOS+gnome-keyring/1password setups). OpenSSH still
+        enumerates agent identities ahead of the configured key,
+        and each enumeration counts against the gateway sshd's
+        MaxAuthTries — so a many-key agent kills the connection at
+        "Too many authentication failures" before ``-i`` is reached.
+        ``IdentityAgent=none`` is the only flag that fully shuts the
+        agent out (``-o`` settings beat ``Match`` blocks). Single
+        concern: "given an explicit identity, no agent may leak in".
+
+        ``--ssh-config`` alone does NOT add ``IdentityAgent=none`` —
+        the user's config-file is authoritative about agent behavior
+        in that path.
         """
         opts: list[str] = []
         if self.identity_file is not None:
-            opts.extend(["-i", self.identity_file, "-o", "IdentitiesOnly=yes"])
+            opts.extend(
+                [
+                    "-i",
+                    self.identity_file,
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "IdentityAgent=none",
+                ]
+            )
         if self.config_file is not None:
             opts.extend(["-F", self.config_file])
         return opts
