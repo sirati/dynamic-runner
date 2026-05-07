@@ -1,7 +1,10 @@
 use super::util::parse_cert_pem;
 use super::{EitherPeerTransport, NoPeerTransport, PeerNetwork};
 use crate::certs::CertPair;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerConnectionInfo, PeerTransport, MSG_DIRECT_RESTORED,
+    MSG_RELAY_ENGAGED,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -814,24 +817,30 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             //    framework output and we don't control it.
             let captured = records.lock().unwrap().clone();
 
-            let saw_relay_engaged = captured.iter().any(|e| {
-                e.target == "dynrunner_relay"
-                    && e.message.contains("peer relay engaged")
-            });
-            let saw_direct_restored = captured.iter().any(|e| {
-                e.target == "dynrunner_relay"
-                    && e.message.contains("peer direct link restored")
-            });
-
-            assert!(
-                saw_relay_engaged,
-                "expected dynrunner_relay 'peer relay engaged' warn during partition; \
-                 captured records: {captured:#?}"
+            // Tightened: exactly two dynrunner_relay events in this
+            // order. Catches a future regression where the Router
+            // emits an extra event during the partition or heal
+            // (e.g. forwarder-changed info, a debug log during dial,
+            // a stray try_recv-drop-relay warn from the sync path).
+            let relay_events: Vec<&CapturedEvent> = captured
+                .iter()
+                .filter(|e| e.target == "dynrunner_relay")
+                .collect();
+            assert_eq!(
+                relay_events.len(),
+                2,
+                "expected exactly 2 dynrunner_relay events; got {relay_events:#?}; \
+                 full trace: {captured:#?}"
             );
             assert!(
-                saw_direct_restored,
-                "expected dynrunner_relay 'peer direct link restored' info on heal; \
-                 captured records: {captured:#?}"
+                relay_events[0].message.contains(MSG_RELAY_ENGAGED),
+                "first dynrunner_relay event must be the relay-engaged warn; got {:?}",
+                relay_events[0]
+            );
+            assert!(
+                relay_events[1].message.contains(MSG_DIRECT_RESTORED),
+                "second dynrunner_relay event must be the direct-restored info; got {:?}",
+                relay_events[1]
             );
 
             for ev in captured.iter().filter(|e| e.target.starts_with("dynrunner")) {

@@ -20,3 +20,5 @@ tokio = { workspace = true }
 [dev-dependencies]
 serde = { workspace = true }
 dynrunner-protocol-primary-secondary = { workspace = true, features = ["test-utils"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

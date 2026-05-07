@@ -36,17 +36,21 @@
 //! is the trivial `now_clocks()` wrapper.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dynrunner_protocol_primary_secondary::{
     Clocks, DistributedMessage, InboundOutcome, PeerTransport, RouteVia, Router, SendOutcome,
-    REDIAL_COOLDOWN,
+    MSG_DROPPED_AT_ORIGINATOR, REDIAL_COOLDOWN,
 };
 use dynrunner_transport_channel::{
     peer_mesh_with_adjacency, ChannelPeerTransport,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::Registry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct TestId(String);
@@ -90,6 +94,91 @@ fn keepalive(sender: &str) -> DistributedMessage<TestId> {
         secondary_id: sender.to_string(),
         active_workers: 0,
     }
+}
+
+/// One captured `tracing` event from the relay log target. The
+/// `target` field is redundant given the layer pre-filters on
+/// target == `"dynrunner_relay"`, but keeping it keeps the trace
+/// shape symmetric with `dynrunner-transport-quic`'s
+/// `CapturedEvent` and future-proofs scenarios that want to relax
+/// the pre-filter.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct CapturedRecord {
+    target: String,
+    message: String,
+}
+
+/// Field visitor that pulls the formatted message body out of an
+/// `Event`. Modeled on the same shape used in
+/// `dynrunner-transport-quic/src/peer/tests.rs` — the `tracing`
+/// macros encode the message as a field named `message`.
+struct MessageVisitor(String);
+
+impl Visit for MessageVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        }
+    }
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+/// `tracing-subscriber` layer that appends every relay-target event
+/// it sees to a shared buffer. We pre-filter on the layer side
+/// (target == `"dynrunner_relay"`) so unrelated events from other
+/// crates' instrumentation don't dilute the trace.
+struct RelayCaptureLayer {
+    records: Arc<Mutex<Vec<CapturedRecord>>>,
+}
+
+impl<S: tracing::Subscriber> Layer<S> for RelayCaptureLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let target = event.metadata().target().to_string();
+        if target != "dynrunner_relay" {
+            return;
+        }
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+        if let Ok(mut buf) = self.records.lock() {
+            buf.push(CapturedRecord {
+                target,
+                message: visitor.0,
+            });
+        }
+    }
+}
+
+/// Run `body` with a thread-local `tracing` subscriber that captures
+/// every `dynrunner_relay`-target event. Returns `(body_output,
+/// captured_records)`. Use this in scenarios that need to assert on
+/// the relay-path log trace (e.g. the originator-drop log in
+/// scenario 4).
+///
+/// Caveat: `set_default` installs the subscriber thread-locally. The
+/// scenarios in this file run under `#[tokio::test]`'s default
+/// `current_thread` runtime and do not `tokio::spawn` to other
+/// threads, so every event surfaces through this layer. A future
+/// scenario that crosses thread boundaries would need
+/// `set_global_default` (and serial-execution gating against other
+/// tests).
+async fn with_relay_log_capture<F, T>(body: F) -> (T, Vec<CapturedRecord>)
+where
+    F: std::future::Future<Output = T>,
+{
+    let records: Arc<Mutex<Vec<CapturedRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let layer = RelayCaptureLayer {
+        records: records.clone(),
+    };
+    let subscriber = Registry::default().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let result = body.await;
+    let captured = records.lock().unwrap().clone();
+    (result, captured)
 }
 
 /// Pump every transport's `recv_peer` round-robin (with a tiny
@@ -343,47 +432,67 @@ async fn heal_restores_direct_then_silent() {
 /// outbox lacks D and lacks any non-{A, B} alternative for D after
 /// excluding path+self → emits RelayBackoff back to A. A then picks
 /// C; same dead-end. A's tried set exhausts and the relay drops.
-/// Assertion: D never receives a message.
+/// Assertions: D never receives a message; the originator-drop
+/// log fires exactly once.
 #[tokio::test]
 async fn dead_end_propagates_backoff_to_originator() {
-    let mut mesh = build_mesh(
-        &["a", "b", "c", "d"],
-        &[("a", "b"), ("a", "c"), ("b", "c")],
-    );
-    // D exists in the mesh by virtue of being in `peer_ids`; with no
-    // adjacency entry referencing it, its outgoing map is empty and
-    // no other transport has a sender into its inbox. The relay must
-    // dead-end.
-    mesh.get_mut("a")
-        .unwrap()
-        .send_to_peer("d", keepalive("a"))
-        .await
-        .expect("send ok");
-    let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
-    // Pump until the backoff cascade quiesces. There's no positive
-    // done-condition (we're asserting absence), so we use a short
-    // dedicated deadline rather than the 5s abort guard. 250ms is
-    // ~50x the per-transport recv slice and easily fits the 4-step
-    // cascade (A→B, B→A backoff, A→C, C→A backoff, A drop).
-    let _ = pump_until_with_deadline(
-        &mut mesh,
-        &mut delivered,
-        Instant::now() + Duration::from_millis(250),
-        |_| false,
-    )
+    let ((), captured) = with_relay_log_capture(async {
+        let mut mesh = build_mesh(
+            &["a", "b", "c", "d"],
+            &[("a", "b"), ("a", "c"), ("b", "c")],
+        );
+        // D exists in the mesh by virtue of being in `peer_ids`;
+        // with no adjacency entry referencing it, its outgoing map
+        // is empty and no other transport has a sender into its
+        // inbox. The relay must dead-end.
+        mesh.get_mut("a")
+            .unwrap()
+            .send_to_peer("d", keepalive("a"))
+            .await
+            .expect("send ok");
+        let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> =
+            HashMap::new();
+        // Pump until the backoff cascade quiesces. There's no
+        // positive done-condition (we're asserting absence), so we
+        // use a short dedicated deadline rather than the 5s abort
+        // guard. 250ms is ~50x the per-transport recv slice and
+        // easily fits the 4-step cascade (A→B, B→A backoff, A→C,
+        // C→A backoff, A drop).
+        let _ = pump_until_with_deadline(
+            &mut mesh,
+            &mut delivered,
+            Instant::now() + Duration::from_millis(250),
+            |_| false,
+        )
+        .await;
+        assert!(
+            delivered.get("d").map(|v| v.is_empty()).unwrap_or(true),
+            "d must not receive any message; delivered={delivered:?}"
+        );
+        // First-attempt outcome was Relayed (via B); the dead-end
+        // unfolds via subsequent inbound RelayBackoff handling.
+        assert!(
+            matches!(
+                mesh.get("a").unwrap().last_outcome,
+                Some(SendOutcome::Relayed { .. })
+            ),
+            "first attempt was Relayed before backoff cascade"
+        );
+    })
     .await;
-    assert!(
-        delivered.get("d").map(|v| v.is_empty()).unwrap_or(true),
-        "d must not receive any message; delivered={delivered:?}"
-    );
-    // First-attempt outcome was Relayed (via B); the dead-end
-    // unfolds via subsequent inbound RelayBackoff handling.
-    assert!(
-        matches!(
-            mesh.get("a").unwrap().last_outcome,
-            Some(SendOutcome::Relayed { .. })
-        ),
-        "first attempt was Relayed before backoff cascade"
+    // The originator-drop log fires exactly once when A's tried set
+    // exhausts. Tied to the same constant the runtime emits so a
+    // future rename of the message does not silently invalidate
+    // this assertion.
+    let drop_events: Vec<&CapturedRecord> = captured
+        .iter()
+        .filter(|e| e.message.contains(MSG_DROPPED_AT_ORIGINATOR))
+        .collect();
+    assert_eq!(
+        drop_events.len(),
+        1,
+        "expected exactly one originator-drop log; got {drop_events:#?}; \
+         full trace: {captured:#?}"
     );
 }
 
@@ -612,4 +721,85 @@ async fn receiver_side_relay_observation_triggers_redial() {
         "via is NOT overwritten by receiver-side observation \
          (their inbound being relayed says nothing about our outbound)"
     );
+}
+
+// ── Scenario 9 ──
+
+/// Blacklist persistence end-to-end. Today the
+/// `route_send_blacklist_skips_known_bad_forwarder` unit test on the
+/// pure helper proves the blacklist is consulted *if* it's present,
+/// but no integration test proves the blacklist actually persists
+/// across `Router::send_to_peer` calls — i.e. that
+/// `failed_forwarders` is real owned state on the Router and not a
+/// per-call scratch map.
+///
+/// `{A↔B, A↔C, C↔D}`. First A→D: A picks B (lex-lowest of A's
+/// candidates); B's only neighbor is A (in `path`), so `forward_step`
+/// returns `NoRoute` and B emits `RelayBackoff` to A; A's
+/// `handle_inbound_backoff` records `failed_forwarders[("d", "b")]`
+/// then retries via C; C delivers direct.
+///
+/// Note the missing B↔C link versus scenario 5: with B↔C present,
+/// B forwards via C *itself* and A never receives a backoff —
+/// `failed_forwarders` would never get populated and the test
+/// could not distinguish blacklist-skip from lex-ordering.
+///
+/// Second A→D: B is still lex-lowest in `connections`, but the
+/// blacklist for D excludes it, so `route_send` must pick C
+/// directly without another backoff round-trip.
+#[tokio::test]
+async fn blacklist_persists_across_sends() {
+    let mut mesh = build_mesh(
+        &["a", "b", "c", "d"],
+        &[("a", "b"), ("a", "c"), ("c", "d")],
+    );
+    // First send: A picks B; B backs off; A retries via C; C delivers.
+    mesh.get_mut("a")
+        .unwrap()
+        .send_to_peer("d", keepalive("a"))
+        .await
+        .expect("send ok");
+    let mut delivered: HashMap<String, Vec<DistributedMessage<TestId>>> = HashMap::new();
+    let ok = pump_until_received(&mut mesh, &mut delivered, "d").await;
+    assert!(ok, "d did not receive 1st within deadline; delivered={delivered:?}");
+    match &mesh.get("a").unwrap().last_outcome {
+        Some(SendOutcome::Relayed { forwarder, .. }) => {
+            assert_eq!(forwarder, "b", "first pick is lex-lowest B");
+        }
+        other => panic!("expected first Relayed via b: {other:?}"),
+    }
+    // Pump a bit more so the backoff cascade fully quiesces and
+    // A's `handle_inbound_backoff` records (d, b) in
+    // `failed_forwarders`. `pump_until_received` returns as soon as
+    // D has 1 msg; the backoff handling on A may still be a poll
+    // away on the same loop iteration.
+    let _ = pump_until_with_deadline(
+        &mut mesh,
+        &mut delivered,
+        Instant::now() + Duration::from_millis(100),
+        |_| false,
+    )
+    .await;
+    // Second send: B is blacklisted for D so route_send must skip
+    // it and pick C even though B is still lex-lowest in
+    // `connections`.
+    mesh.get_mut("a")
+        .unwrap()
+        .send_to_peer("d", keepalive("a"))
+        .await
+        .expect("send ok");
+    match &mesh.get("a").unwrap().last_outcome {
+        Some(SendOutcome::Relayed { forwarder, .. }) => {
+            assert_eq!(
+                forwarder, "c",
+                "blacklist must skip B even though B is lex-lowest in connections"
+            );
+        }
+        other => panic!("expected second Relayed via c: {other:?}"),
+    }
+    let ok = pump_until(&mut mesh, &mut delivered, |d| {
+        d.get("d").map(|v| v.len() >= 2).unwrap_or(false)
+    })
+    .await;
+    assert!(ok, "d did not receive 2nd within deadline; delivered={delivered:?}");
 }
