@@ -255,7 +255,7 @@ fi
 # secondaries`. `--pull=never` makes that class of incomplete-load
 # fail loud-and-fast with a clear "image not in local storage"
 # error instead.
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     --pull=never \
     --network host \
     {env_flags} \
@@ -274,7 +274,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun 
 # Run container - standard mode (secondary connects to primary via gateway).
 # `--pull=never`: see the reverse-mode block above for the
 # rationale; same incomplete-load → registry-fallback pitfall.
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     --pull=never \
     --network host \
     {env_flags} \

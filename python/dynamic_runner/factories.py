@@ -51,7 +51,7 @@ class PodmanExecWorkerFactory:
         output_dir: Path | str,
         log_dir: Path | str,
         extra_podman_args: list[str] | None = None,
-        runtime: str = "/usr/bin/crun",
+        runtime: str | None = None,
     ) -> None:
         self.image = image
         self.worker_module = worker_module
@@ -64,10 +64,10 @@ class PodmanExecWorkerFactory:
 
     def spawn(self, worker_id: int, comm_fd: int | None, socket_path: str | None) -> int | None:
         """Launch the worker. Returns the spawned PID."""
-        argv = [
-            "podman",
-            "--runtime",
-            self.runtime,
+        argv = ["podman"]
+        if self.runtime is not None:
+            argv += ["--runtime", self.runtime]
+        argv += [
             "run",
             "--rm",
             "-v",

@@ -302,7 +302,7 @@ echo ""
 # secondaries`. `--pull=never` makes that class of incomplete-load
 # fail loud-and-fast with a clear "image not in local storage"
 # error instead.
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     --pull=never \
     --network host \
     --pids-limit=16384 \
@@ -325,7 +325,7 @@ echo ""
 
 # `--pull=never`: see the reverse-mode block above for the
 # rationale; same incomplete-load → registry-fallback pitfall.
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm \
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     --pull=never \
     --network host \
     --pids-limit=16384 \
@@ -423,7 +423,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" images | grep {image_nam
 echo ""
 
 echo "Testing secondary entrypoint ({self.deployment.secondary_module} --help)..."
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --runtime /usr/bin/crun run --rm {image_name}:{image_tag} {self.deployment.secondary_module} --help | head -5
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm {image_name}:{image_tag} {self.deployment.secondary_module} --help | head -5
 echo ""
 
 echo "=================================================="
