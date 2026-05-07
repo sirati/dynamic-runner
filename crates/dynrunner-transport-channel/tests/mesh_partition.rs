@@ -302,13 +302,13 @@ async fn heal_restores_direct_then_silent() {
         "first send should relay"
     );
     // Heal: synthesize fresh sender pairs and graft them onto A's
-    // outbox-for-D and D's outbox-for-A. The receivers are dropped
-    // immediately — we are only testing the routing decision, not
-    // delivery. `route_send` keys off `connections.contains_key`, so
-    // a sender whose receiver is dropped still counts as a direct
-    // link for the routing decision (a subsequent send through it
-    // would `Err` and the Router would evict; that path is exercised
-    // by `Router`'s unit tests).
+    // outbox-for-D and D's outbox-for-A. The receivers are kept
+    // alive by the leading-underscore bindings (the underscore
+    // suppresses the unused-var warning, it does not drop). They
+    // MUST stay alive: dispatching through a closed receiver would
+    // Err and the Router would evict the entry from `connections`,
+    // forcing the next send back through relay routing — defeating
+    // the test.
     let (a_to_d_tx, _a_to_d_rx) = mpsc::unbounded_channel();
     let (d_to_a_tx, _d_to_a_rx) = mpsc::unbounded_channel();
     mesh.get_mut("a").unwrap().connect_to("d".to_string(), a_to_d_tx);
@@ -421,7 +421,7 @@ async fn backoff_retries_through_alternate_then_succeeds() {
 /// the relay arrives at B, B has no D-direct any more and forwards
 /// via C (the only non-{A, B-self, D-target} candidate left).
 #[tokio::test]
-async fn tried_set_excludes_failed_forwarder_on_retry() {
+async fn forwarder_picks_alternate_when_direct_link_severed_pre_send() {
     let mut mesh = build_mesh(
         &["a", "b", "c", "d"],
         &[
