@@ -459,27 +459,38 @@ impl<I: Identifier> Router<I> {
         }
     }
 
-    /// Sync inbound dispatch for fast-path try-recv loops. Cannot
-    /// forward Relay envelopes because forwarding mutates state +
-    /// dispatches; preserved-from-pre-refactor behavior is to drop
-    /// them with a warn (Relay-not-for-us) or silently
-    /// (RelayBackoff). Variants directed at us are unwrapped and
-    /// delivered, matching today's `try_recv_peer` Relay-target-is-
-    /// self branch. No async dispatch attempted; receiver-side
-    /// redial bookkeeping does NOT fire here — code that relies on
-    /// the redial signal must drive recv via `process_inbound`.
+    /// Sync inbound dispatch for fast-path try-recv loops.
+    ///
+    /// Cannot forward `Relay` envelopes addressed to others, because
+    /// forwarding requires both state mutation AND outbound dispatch
+    /// against the connections map; preserved-from-pre-refactor
+    /// behavior is to drop them with a warn. `RelayBackoff` is
+    /// dropped silently for the same reason.
+    ///
+    /// `Relay` envelopes addressed to us are unwrapped and delivered,
+    /// AND the receiver-side cooldown gate fires — bookkeeping is
+    /// pure state mutation, no outbound dispatch needed, so nothing
+    /// in the sync constraint excludes it. (Pre-A3.M1 this branch
+    /// suppressed the redial signal, leaving a latent gap if a
+    /// consumer ever drove recv via try_recv only.)
     pub fn process_inbound_sync(
         &mut self,
         msg: DistributedMessage<I>,
-        _clocks: Clocks,
+        clocks: Clocks,
     ) -> InboundOutcome<I> {
         match msg {
             DistributedMessage::Relay {
-                target_id, inner, ..
-            } if target_id == self.self_id => InboundOutcome::Deliver {
-                msg: *inner,
-                redial_target: None,
-            },
+                sender_id,
+                target_id,
+                inner,
+                ..
+            } if target_id == self.self_id => {
+                let redial_target = self.observe_relay_recv(&sender_id, clocks.now);
+                InboundOutcome::Deliver {
+                    msg: *inner,
+                    redial_target,
+                }
+            }
             DistributedMessage::Relay { target_id, .. } => {
                 tracing::warn!(
                     target: RELAY_LOG_TARGET,
@@ -1334,7 +1345,12 @@ mod tests {
     // ── process_inbound_sync ──
 
     #[test]
-    fn process_inbound_sync_delivers_relay_for_self_without_state_update() {
+    fn process_inbound_sync_delivers_relay_for_self_and_emits_redial() {
+        // A3.M1: sync path now mirrors the async path for
+        // Relay-for-self — receiver-side bookkeeping is pure state
+        // mutation (no outbound dispatch), so the sync constraint
+        // does not exclude it. A consumer driving recv via try_recv
+        // only must NOT silently lose the redial safety net.
         let mut router = Router::<()>::new("a".into());
         let inbound = DistributedMessage::Relay {
             sender_id: "d".into(),
@@ -1344,23 +1360,22 @@ mod tests {
             path: vec!["d".into(), "b".into()],
             inner: Box::new(keepalive("d")),
         };
-        let outcome = router.process_inbound_sync(inbound, clocks_at(Instant::now(), 1.0));
+        let now = Instant::now();
+        let outcome = router.process_inbound_sync(inbound, clocks_at(now, 1.0));
         match outcome {
             InboundOutcome::Deliver { msg, redial_target } => {
                 assert!(matches!(msg, DistributedMessage::Keepalive { .. }));
-                assert!(
-                    redial_target.is_none(),
-                    "sync path does NOT bump cooldown gate"
-                );
+                assert_eq!(redial_target.as_deref(), Some("d"));
             }
             other => panic!("expected Deliver: {other:?}"),
         }
-        // Sync path must NOT have observed last_observed_relay_at.
-        assert!(router
-            .route_state
-            .get("d")
-            .and_then(|s| s.last_observed_relay_at)
-            .is_none());
+        assert_eq!(
+            router
+                .route_state
+                .get("d")
+                .and_then(|s| s.last_observed_relay_at),
+            Some(now)
+        );
     }
 
     #[test]
