@@ -330,6 +330,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynrunner-publish"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "dynrunner-pyo3"
 version = "0.4.0"
 dependencies = [
@@ -340,6 +349,7 @@ dependencies = [
  "dynrunner-manager-local",
  "dynrunner-protocol-manager-worker",
  "dynrunner-protocol-primary-secondary",
+ "dynrunner-publish",
  "dynrunner-scheduler",
  "dynrunner-scheduler-api",
  "dynrunner-transport-channel",
