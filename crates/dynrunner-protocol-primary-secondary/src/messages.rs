@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use dynrunner_core::{Identifier, PhaseId, ResourceAmount, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceAmount, TaskInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster_mutation::ClusterMutation;
@@ -454,7 +454,7 @@ pub enum DistributedMessage<I> {
         secondary_id: String,
         worker_id: u32,
         task_hash: String,
-        error_type: String,
+        error_type: ErrorType,
         error_message: String,
     },
     Keepalive {

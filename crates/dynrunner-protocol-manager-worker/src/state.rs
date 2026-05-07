@@ -130,9 +130,19 @@ impl<M: ManagerEndpoint> RunnerProtocol<Processing, M> {
     pub async fn poll_status(mut self) -> PollResult<M> {
         match self.transport.recv().await {
             None => {
+                // Phase D: a worker process dying mid-task without
+                // sending a final Error response is most likely an
+                // environment glitch (OOM-killer, host crash, signal)
+                // or a worker-process bug. Either way, retrying is
+                // the safe default — repeated Recoverable failures
+                // still get caught by the retry-pass exhaustion logic
+                // (`MAX_RETRY_ATTEMPTS`). Pre-Phase-D this hardcoded
+                // NonRecoverable, which prevented retry on the
+                // common case (worker crashed in user code without
+                // catching the exception).
                 PollResult::Disconnected {
                     result: TaskResult::error(
-                        ErrorType::NonRecoverable,
+                        ErrorType::Recoverable,
                         "Worker connection closed".into(),
                     ),
                     protocol: RunnerProtocol {

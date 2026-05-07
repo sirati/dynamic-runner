@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport, PrimaryTransport,
@@ -134,7 +134,7 @@ where
                                 secondary_id: self.config.secondary_id.clone(),
                                 worker_id: target_wid,
                                 task_hash: file_hash,
-                                error_type: "NonRecoverable".into(),
+                                error_type: ErrorType::NonRecoverable,
                                 error_message: e,
                             };
                             self.send_to_current_primary(msg).await?;
@@ -151,7 +151,7 @@ where
                         secondary_id: self.config.secondary_id.clone(),
                         worker_id: target_wid,
                         task_hash: file_hash,
-                        error_type: "Recoverable".into(),
+                        error_type: ErrorType::Recoverable,
                         error_message: "No idle worker available".into(),
                     };
                     // Route to whoever currently holds primary
@@ -276,7 +276,7 @@ where
                 // Recoverable retry is owned by the primary
                 // (see `note_primary_item_failed`) and a future
                 // TaskComplete or terminal TaskFailed will arrive.
-                if error_type != "Recoverable" {
+                if !matches!(error_type, ErrorType::Recoverable) {
                     self.completed_tasks.insert(task_hash.clone());
                     // Use the failure-aware variant for symmetry
                     // with the other TaskFailed sites (peer.rs,
@@ -456,7 +456,7 @@ where
                 secondary_id: self.config.secondary_id.clone(),
                 worker_id: wid,
                 task_hash: file_hash.into(),
-                error_type: "NonRecoverable".into(),
+                error_type: ErrorType::NonRecoverable,
                 error_message: format!(
                     "file_hash {file_hash} not pre-staged at {local_path}; \
                      expected StageFile notification first"

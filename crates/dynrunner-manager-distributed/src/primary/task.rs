@@ -1,7 +1,7 @@
 
 use std::time::Instant;
 
-use dynrunner_core::{ErrorType, TaskInfo, Identifier, ResourceMap};
+use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage,
     SecondaryTransport,
@@ -420,20 +420,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // stays untouched.
             self.failed_tasks.insert(task_hash.clone());
             // Replicated-ledger update: every node mirrors the
-            // post-failure state. The wire `error_type` is a legacy
-            // string convention (Phase D round-trips ErrorType through
-            // the wire format properly); for the CRDT we map known
-            // tokens onto the enum and fall back to NonRecoverable for
-            // anything we don't recognise so the mutation still
-            // converges to a terminal Failed.
-            let kind = match error_type.as_str() {
-                "Recoverable" => ErrorType::Recoverable,
-                _ => ErrorType::NonRecoverable,
-            };
+            // post-failure state. The wire `error_type` is now the
+            // typed `ErrorType` enum (Phase D), so the CRDT mutation
+            // takes it verbatim — no string-token mapping.
             self.apply_and_broadcast_cluster_mutations(vec![
                 ClusterMutation::TaskFailed {
                     hash: task_hash.clone(),
-                    kind,
+                    kind: error_type.clone(),
                     error: error_message.clone(),
                 },
             ])
@@ -446,7 +439,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 phase = ?recovered_binary.as_ref().map(|b| b.phase_id.to_string()),
                 task_type = ?recovered_binary.as_ref().map(|b| b.type_id.to_string()),
                 task_hash = %task_hash,
-                error_type = %error_type,
+                error_type = ?error_type,
                 error = %error_message,
                 "task failed"
             );

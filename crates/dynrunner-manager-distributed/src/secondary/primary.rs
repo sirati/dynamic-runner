@@ -276,14 +276,18 @@ where
     /// forward, no-op for Recoverable). The Recoverable filter is
     /// inside this function so the callers don't have to special-case
     /// the retry path.
-    pub(super) fn note_primary_item_failed(&mut self, file_hash: &str, error_type: &str) {
+    pub(super) fn note_primary_item_failed(
+        &mut self,
+        file_hash: &str,
+        error_type: &dynrunner_core::ErrorType,
+    ) {
         let item = match self.primary_in_flight.remove(file_hash) {
             Some(item) => item,
             None => return,
         };
         let phase_id = item.phase_id.clone();
         let task_id = item.binary.task_id.clone();
-        if error_type == "Recoverable" {
+        if matches!(error_type, dynrunner_core::ErrorType::Recoverable) {
             // Stash for the retry pass. Idempotent — the same hash
             // appearing twice (e.g. after re-injection fails again)
             // overwrites with the same binary, which is harmless.
