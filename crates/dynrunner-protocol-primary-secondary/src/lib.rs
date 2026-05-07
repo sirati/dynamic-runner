@@ -9,6 +9,7 @@ pub use messages::*;
 pub use codec::{serialize_message, deserialize_message, decode_frame};
 pub use relay::{
     forward_step, handle_backoff, observe_transition, pick_relay, route_send, BackoffDecision,
-    OutgoingRelay, RouteDecision, RouteState,
+    Clocks, InboundOutcome, OutboundChannel, OutgoingRelay, PeerRouteState, RouteDecision,
+    RouteState, RouteVia, Router, RoutingError, SendOutcome, REDIAL_COOLDOWN, RELAY_LOG_TARGET,
 };
 pub use transport::{PeerTransport, PrimaryTransport, SecondaryTransport};
