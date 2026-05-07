@@ -9,10 +9,19 @@ logger = logging.getLogger(__name__)
 class SSHGateway:
     """Gateway implementation for SSH connection to SLURM controller using persistent connection"""
 
-    def __init__(self, host: str, port: int, user: str | None):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        user: str | None,
+        identity_file: str | None = None,
+        config_file: str | None = None,
+    ):
         self.host = host
         self.port = port
         self.user = user
+        self.identity_file = identity_file
+        self.config_file = config_file
         self.connected = False
         self.remote_home = None
         self.control_path = None
@@ -210,12 +219,32 @@ class SSHGateway:
                     logger.debug(f"stderr: {stderr}")
                 self.gateway_ports_enabled = None
 
+    def auth_options(self) -> list[str]:
+        """Explicit-auth flags applied to every ssh/scp invocation.
+
+        ``-i``/``IdentitiesOnly=yes`` and ``-F`` shape *which* credentials
+        ssh considers — orthogonal to ``-p`` (port) which is added per
+        ssh/scp by ``_build_ssh_base_command`` (uses ``-p``) or the
+        per-scp builders (use ``-P``). Exposed publicly so other
+        framework-owned ssh subprocesses (e.g. ``preparation.py``'s
+        reverse tunnel) can mirror the auth contract without
+        bypassing the gateway.
+        """
+        opts: list[str] = []
+        if self.identity_file is not None:
+            opts.extend(["-i", self.identity_file, "-o", "IdentitiesOnly=yes"])
+        if self.config_file is not None:
+            opts.extend(["-F", self.config_file])
+        return opts
+
     def _build_ssh_base_command(self) -> list[str]:
         """Build base SSH command with port and common options"""
         cmd = ["ssh"]
 
         if self.port != 22:
             cmd.extend(["-p", str(self.port)])
+
+        cmd.extend(self.auth_options())
 
         # Disable host key checking warnings (optional, can be made configurable)
         # cmd.extend(["-o", "StrictHostKeyChecking=no"])
@@ -315,6 +344,8 @@ class SSHGateway:
         if self.port != 22:
             scp_cmd.extend(["-P", str(self.port)])
 
+        scp_cmd.extend(self.auth_options())
+
         # Use the same control socket
         scp_cmd.extend(
             [
@@ -371,6 +402,8 @@ class SSHGateway:
 
         if self.port != 22:
             scp_cmd.extend(["-P", str(self.port)])
+
+        scp_cmd.extend(self.auth_options())
 
         # Use the same control socket
         scp_cmd.extend(["-o", f"ControlPath={self.control_path}"])

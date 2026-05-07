@@ -269,13 +269,25 @@ class SlurmPreparation:
         host_with_port = f"{gateway_host}:{gateway_port}" if gateway_port != 22 else gateway_host
         jump_host = f"{gateway_user}@{host_with_port}" if gateway_user else host_with_port
 
-        ssh_cmd = [
-            "ssh",
-            "-J",
-            jump_host,
-            "-R",
-            f"{tunnel_port}:localhost:{primary_quic_port}",
-        ]
+        ssh_cmd = ["ssh"]
+        # Mirror the gateway's auth contract on this side-channel ssh
+        # subprocess: an explicit identity / config file applies to
+        # both the -J jump-host hop AND the compute-node hop. Without
+        # this, the reverse tunnel would silently fall back to
+        # IdentityAgent over-offering even when the user passed
+        # --ssh-identity-file. Source-of-truth lives on the gateway
+        # (single concern: "how do we authenticate"); this code only
+        # reads the public auth_options primitive.
+        if hasattr(self.gateway, "auth_options"):
+            ssh_cmd.extend(self.gateway.auth_options())
+        ssh_cmd.extend(
+            [
+                "-J",
+                jump_host,
+                "-R",
+                f"{tunnel_port}:localhost:{primary_quic_port}",
+            ]
+        )
         for local_port, gateway_port in self.deployment.extra_port_forwards:
             ssh_cmd.extend(["-R", f"{gateway_port}:localhost:{local_port}"])
         ssh_cmd.extend(
