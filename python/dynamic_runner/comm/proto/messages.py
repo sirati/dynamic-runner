@@ -41,20 +41,36 @@ class ProcessBinaryCommand(Command):
     original `TaskInfo.payload`, serialised as a JSON string. `None`
     means "the task carries no payload" (legacy wire form). Workers
     that want the parsed value can `json.loads(cmd.payload)`.
+
+    `resolved_path` is the secondary's locally-resolved on-disk
+    location for distributed-mode dispatches where the file lives
+    outside the worker's configured source dir (extraction-cache
+    hit / pre-staged shared mount). `None` means "open
+    `relative_path` against the configured source dir" — the
+    legacy behaviour. `Some(p)` means "open `p` directly; treat
+    `relative_path` purely as the wire identifier used for
+    output-tree mirroring and task identity".
     """
 
     relative_path: str
     payload: str | None = None
+    resolved_path: str | None = None
 
     def serialize(self) -> bytes:
-        if self.payload is None:
+        if self.payload is None and self.resolved_path is None:
             return f"{self.relative_path}\n".encode("utf-8")
-        # Wrap path + payload as a JSON object on the new
+        # Wrap path + optional fields as a JSON object on the new
         # `task:`-prefixed wire form. `json.dumps` emits a single
         # line (no newlines) so this is safe to embed in the
-        # line-delimited protocol.
-        wrapper = json.dumps({"path": self.relative_path, "payload": self.payload})
-        return f"task:{wrapper}\n".encode("utf-8")
+        # line-delimited protocol. Absent fields are omitted so
+        # legacy parsers that don't know about them don't trip on
+        # a `null`.
+        wrapper: dict[str, str] = {"path": self.relative_path}
+        if self.payload is not None:
+            wrapper["payload"] = self.payload
+        if self.resolved_path is not None:
+            wrapper["resolved_path"] = self.resolved_path
+        return f"task:{json.dumps(wrapper)}\n".encode("utf-8")
 
 
 @dataclass
@@ -202,15 +218,18 @@ def parse_command(data: str) -> Command | None:
         return StopCommand()
 
     if data.startswith("task:"):
-        # New wire form (FR-3): `task:<json {path, payload}>`. Falls
-        # back to legacy interpretation if the JSON is malformed
-        # (treat the whole line as a literal path) — defensive,
-        # symmetric with the Rust codec's behaviour.
+        # New wire form: `task:<json {path, payload?, resolved_path?}>`.
+        # Falls back to legacy interpretation if the JSON is
+        # malformed (treat the whole line as a literal path) —
+        # defensive, symmetric with the Rust codec's behaviour.
+        # Missing optional fields deserialise to `None`, preserving
+        # wire compatibility with senders that omit either.
         try:
             wrapper = json.loads(data[len("task:"):])
             return ProcessBinaryCommand(
                 relative_path=wrapper.get("path", ""),
                 payload=wrapper.get("payload"),
+                resolved_path=wrapper.get("resolved_path"),
             )
         except (json.JSONDecodeError, AttributeError):
             pass

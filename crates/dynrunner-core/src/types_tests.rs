@@ -91,6 +91,7 @@ fn task_info_generic() {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        resolved_path: None,
     };
     assert_eq!(bi.size, 1024);
     assert_eq!(bi.identifier.0, "test-binary");
@@ -108,6 +109,7 @@ fn task_info_serde_roundtrip_with_phase_fields() {
         payload: serde_json::json!({"k": "v", "n": 42}),
         task_id: None,
         task_depends_on: vec![],
+        resolved_path: None,
     };
     let json = serde_json::to_string(&bi).unwrap();
     let parsed: TaskInfo<TestId> = serde_json::from_str(&json).unwrap();

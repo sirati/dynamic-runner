@@ -17,8 +17,13 @@ pub struct TaskError {
 /// Implementations are provided by Python (via PyO3) or by Rust test harnesses.
 /// The executor receives the relative path to process, the optional
 /// per-task payload (FR-3 — `TaskInfo.payload` serialised as a JSON
-/// string, `None` for the legacy file-only wire), and a handle to
-/// send phase updates and keepalives during execution.
+/// string, `None` for the legacy file-only wire), the optional
+/// locally-resolved on-disk location of the file (`None` for
+/// LocalManager dispatches and any distributed dispatch that didn't
+/// trigger extraction-cache resolution; `Some(p)` means "open `p`
+/// directly; treat `relative_path` purely as the wire identifier
+/// used for output-tree mirroring"), and a handle to send phase
+/// updates and keepalives during execution.
 ///
 /// Generic over `S` (a `MessageSender<Response>`) to avoid dyn-compatibility issues
 /// with async traits.
@@ -27,6 +32,7 @@ pub trait TaskExecutor<S: MessageSender<Response>> {
         &self,
         relative_path: &str,
         payload: Option<&str>,
+        resolved_path: Option<&str>,
         status_sender: &mut S,
     ) -> impl std::future::Future<Output = Result<TaskOutput, TaskError>>;
 }
@@ -52,9 +58,15 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
             Some(Command::ProcessTask {
                 relative_path,
                 payload,
+                resolved_path,
             }) => {
                 match executor
-                    .execute(&relative_path, payload.as_deref(), endpoint)
+                    .execute(
+                        &relative_path,
+                        payload.as_deref(),
+                        resolved_path.as_deref(),
+                        endpoint,
+                    )
                     .await
                 {
                     Ok(output) => {
@@ -91,6 +103,7 @@ mod tests {
             &self,
             relative_path: &str,
             _payload: Option<&str>,
+            _resolved_path: Option<&str>,
             status_sender: &mut ChannelRunnerEnd,
         ) -> Result<TaskOutput, TaskError> {
             let _ = status_sender
@@ -125,7 +138,7 @@ mod tests {
         assert!(matches!(resp, Response::Ready));
 
         manager
-            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None })
+            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None, resolved_path: None })
             .await
             .unwrap();
 
@@ -169,7 +182,7 @@ mod tests {
         let _ = manager.recv().await;
 
         manager
-            .send(Command::ProcessTask { relative_path: "fail".into(), payload: None })
+            .send(Command::ProcessTask { relative_path: "fail".into(), payload: None, resolved_path: None })
             .await
             .unwrap();
 

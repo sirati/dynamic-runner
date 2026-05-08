@@ -388,6 +388,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: Some(name.into()),
             task_depends_on: Vec::new(),
+            resolved_path: None,
         }
     }
 

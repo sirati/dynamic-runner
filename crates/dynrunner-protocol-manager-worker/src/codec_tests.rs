@@ -11,7 +11,7 @@ fn command_stop_roundtrip() {
 
 #[test]
 fn command_process_task_roundtrip() {
-    let cmd = Command::ProcessTask { relative_path: "path/to/binary".into(), payload: None };
+    let cmd = Command::ProcessTask { relative_path: "path/to/binary".into(), payload: None, resolved_path: None, };
     let bytes = serialize_command(&cmd);
     assert_eq!(bytes, b"path/to/binary\n");
     let parsed = parse_command("path/to/binary\n").unwrap();

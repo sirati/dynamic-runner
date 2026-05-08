@@ -552,6 +552,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: None,
             task_depends_on: vec![],
+            resolved_path: None,
         };
         sec.cluster_state.apply(ClusterMutation::PhaseDepsSet {
             deps: std::collections::HashMap::new(),

@@ -177,6 +177,7 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             payload,
             task_id: py.task_id.clone(),
             task_depends_on: py.task_depends_on.clone(),
+            resolved_path: None,
         }
     }
 }
@@ -366,6 +367,7 @@ pub(crate) fn extract_binaries(
                 payload,
                 task_id,
                 task_depends_on,
+                resolved_path: None,
             })
         })
         .collect()

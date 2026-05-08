@@ -348,6 +348,26 @@ pub struct TaskInfo<I> {
     /// than waiting forever for a satisfaction that will never come.
     #[serde(default)]
     pub task_depends_on: Vec<String>,
+    /// Local-only on-disk location, set by the secondary after
+    /// resolving `path` through its extraction cache / pre-staged
+    /// shared mount. `None` means "the worker should open `path`
+    /// against its configured source dir as before". `Some(p)`
+    /// means "open `p` directly; `path` remains the wire-supplied
+    /// identifier used for output-tree mirroring and bookkeeping".
+    ///
+    /// Never crosses the cluster wire — the primary↔secondary
+    /// `DistributedBinaryInfo` round-trip resets it to `None` on
+    /// receive (`#[serde(skip)]`). It exists to decouple two
+    /// concerns that pre-fix collided in `path`: the wire-supplied
+    /// identifier (consumer-visible, used for output layout) and
+    /// the local on-disk file location (host-specific, set by the
+    /// secondary's resolver). Mutating `path` to the resolved
+    /// location made consumers see absolute extraction-cache paths
+    /// in `task.relative_path`, which broke
+    /// `output_dir / Path(relative_path).parent` mirroring (Python
+    /// drops the left side when the right is absolute).
+    #[serde(skip)]
+    pub resolved_path: Option<PathBuf>,
 }
 
 pub type TaskInput<I> = TaskInfo<I>;

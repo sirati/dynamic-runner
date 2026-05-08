@@ -527,6 +527,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: None,
             task_depends_on: vec![],
+            resolved_path: None,
         };
         primary.workers.push(RemoteWorkerState {
             worker_id: 0,
@@ -622,6 +623,7 @@ mod tests {
                 payload: serde_json::Value::Null,
                 task_id: None,
                 task_depends_on: vec![],
+                resolved_path: None,
             }),
             estimated_resources: ResourceMap::new(),
             is_idle: false,

@@ -191,6 +191,7 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             payload,
             task_id: self.task_id.clone(),
             task_depends_on: self.task_depends_on.clone(),
+            resolved_path: None,
         }
     }
 }

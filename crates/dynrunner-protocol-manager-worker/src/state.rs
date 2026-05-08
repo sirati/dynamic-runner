@@ -80,14 +80,23 @@ impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
     /// `payload` field of the parsed `ProcessTask` command and
     /// skip a per-task filesystem read entirely (the FR-3 use
     /// case for `uses_file_based_items=False` consumers).
+    ///
+    /// `resolved_path` is the locally-resolved absolute on-disk
+    /// location for distributed-mode dispatches where the
+    /// extraction cache or pre-staged shared mount put the file
+    /// outside the worker's configured source dir. Pass `None` for
+    /// the LocalManager and any distributed dispatch that didn't
+    /// trigger cache resolution.
     pub async fn assign_task(
         mut self,
         relative_path: String,
         payload: Option<String>,
+        resolved_path: Option<String>,
     ) -> AssignResult<M> {
         let cmd = Command::ProcessTask {
             relative_path,
             payload,
+            resolved_path,
         };
         match self.transport.send(cmd).await {
             Ok(()) => AssignResult::Assigned(RunnerProtocol {

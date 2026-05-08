@@ -25,6 +25,7 @@ fn t(phase: &str, ty: &str, affinity: &str, size: u64) -> TaskInfo<()> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        resolved_path: None,
     }
 }
 

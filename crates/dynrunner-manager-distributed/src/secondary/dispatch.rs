@@ -82,11 +82,16 @@ where
                 }
 
                 // Hydrate from the wire info first (preserves
-                // phase/type/affinity/payload), then override the path
-                // if extraction-cache resolution found a local copy.
+                // phase/type/affinity/payload), then surface the
+                // locally-resolved on-disk path via the dedicated
+                // `resolved_path` field. `binary.path` stays as the
+                // wire-supplied identifier so consumers'
+                // `task.relative_path` keeps its mirror-against-
+                // source-tree meaning regardless of where the
+                // secondary's extraction cache landed the file.
                 let mut binary = distributed_to_binary(&binary_info);
                 if let Some(path) = resolved_path {
-                    binary.path = path;
+                    binary.resolved_path = Some(path);
                 }
                 let estimated = self.estimator.estimate(&binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
