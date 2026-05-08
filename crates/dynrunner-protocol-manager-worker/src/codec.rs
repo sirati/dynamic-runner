@@ -131,6 +131,15 @@ pub fn parse_command(line: &str) -> Option<Command> {
 ///   "error:<type>:<message>\n"
 ///   "phase:<name>\n"
 ///   "keepalive\n"
+///
+/// The bytes after `done:` are fully opaque to the framework: the
+/// codec round-trips them as a `Vec<u8>` and never inspects them.
+/// `done:` vs `error:` is the only structured signal the framework
+/// needs from a worker's terminal response. Anything richer
+/// (warnings/filtered counts, structured per-task results, etc.)
+/// is a consumer concern and must be encoded inside `result_data`
+/// by the producing worker and decoded by the consuming primary —
+/// the framework just forwards the bytes.
 pub fn serialize_response(resp: &Response) -> Vec<u8> {
     match resp {
         Response::Ready => b"ready\n".to_vec(),
