@@ -99,6 +99,8 @@ impl PySshGateway {
             host: host.clone(),
             port,
             user: user.clone(),
+            identity_file: identity_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            config_file: config_file.as_ref().map(|p| p.to_string_lossy().into_owned()),
         };
         Self {
             inner: SshGateway::new(config),
