@@ -218,6 +218,30 @@ pub struct PendingPool<I: Identifier> {
     /// cascade-fail before reaching a bucket). Used by the cascade
     /// walk and by extend-time validation.
     failed_tasks: HashSet<String>,
+    /// Task ids that have been dispatched (popped from a bucket) and
+    /// not yet observed as terminal. Two write sites:
+    ///   * `take_at` — when this pool dispatches a task with a
+    ///     non-empty `task_id`.
+    ///   * `mark_tasks_in_flight` — used by the post-promotion
+    ///     hydration path (`populate_primary_from_cluster_state`)
+    ///     to seed task_ids that are in flight on OTHER nodes,
+    ///     learnt from the replicated cluster ledger.
+    /// Cleared by `on_item_finished` / `on_item_failed_permanent` on
+    /// terminal observation.
+    ///
+    /// Necessary because `extend()`'s dep-validation `known` set was
+    /// previously the union of (queued ∪ blocked ∪ completed ∪
+    /// failed) — which excludes in-flight tasks (popped, not yet
+    /// terminal). A late `extend` whose new items reference an
+    /// in-flight task_id would fail `UnknownTaskDep`. The live
+    /// primary historically avoided this because `extend` is called
+    /// once at startup, but the post-promotion path calls
+    /// `mark_tasks_in_flight` + `extend` after some tasks have
+    /// already been popped on the originating dispatcher. Including
+    /// in-flight ids in the `known` set lets dependents land in
+    /// `blocked` (waiting for completion) instead of failing
+    /// validation.
+    in_flight_tasks: HashSet<String>,
     /// Per-phase count of items currently sitting in `blocked` (not
     /// yet dispatched, waiting on unresolved prereqs). Mirrors
     /// `in_flight_per_phase` so `maybe_transition_drain` correctly
@@ -328,6 +352,7 @@ impl<I: Identifier> PendingPool<I> {
             dependents_of: HashMap::new(),
             completed_tasks: HashSet::new(),
             failed_tasks: HashSet::new(),
+            in_flight_tasks: HashSet::new(),
             blocked_per_phase: HashMap::new(),
         })
     }
@@ -348,6 +373,34 @@ impl<I: Identifier> PendingPool<I> {
     /// `on_item_finished`.
     pub fn mark_tasks_completed(&mut self, ids: impl IntoIterator<Item = String>) {
         self.completed_tasks.extend(ids);
+    }
+
+    /// Pre-seed `in_flight_tasks` (and bump `in_flight_per_phase`) with
+    /// task ids the cluster ledger reports as in flight on OTHER nodes.
+    /// Used by the post-promotion path: when a secondary becomes primary,
+    /// `populate_primary_from_cluster_state` walks the replicated ledger
+    /// and finds tasks in the `InFlight` state — already dispatched by
+    /// the previous primary to some secondary, completion not yet
+    /// observed on this node. Those task_ids must satisfy
+    /// `task_depends_on` validation in `extend()` so dependent variants
+    /// land in `blocked` (waiting for completion) rather than fail with
+    /// `UnknownTaskDep`. The phase counter is bumped so phase-lifecycle
+    /// drain semantics still work — when `on_item_finished` is later
+    /// called for these tasks (TaskComplete arriving via broadcast and
+    /// surfacing through `note_primary_item_completed`), the counter
+    /// correctly decrements and dependent phases unblock.
+    ///
+    /// Idempotent on repeated task_ids. Must be called BEFORE `extend()`
+    /// for the seeded ids to participate in dep validation.
+    pub fn mark_tasks_in_flight(
+        &mut self,
+        items: impl IntoIterator<Item = (String, PhaseId)>,
+    ) {
+        for (task_id, phase_id) in items {
+            if self.in_flight_tasks.insert(task_id) {
+                *self.in_flight_per_phase.entry(phase_id).or_insert(0) += 1;
+            }
+        }
     }
 
     /// Insert items into the pool. Each item is bucketed by
@@ -611,6 +664,9 @@ impl<I: Identifier> PendingPool<I> {
         for id in &self.failed_tasks {
             out.insert(id.clone());
         }
+        for id in &self.in_flight_tasks {
+            out.insert(id.clone());
+        }
         out
     }
 
@@ -862,6 +918,7 @@ impl<I: Identifier> PendingPool<I> {
             *c = c.saturating_sub(1);
         }
         if let Some(id) = task_id {
+            self.in_flight_tasks.remove(id);
             self.completed_tasks.insert(id.to_string());
             // Walk dependents and possibly unblock them. Collect ids
             // first to avoid borrowing `self.dependents_of` while we
@@ -946,6 +1003,7 @@ impl<I: Identifier> PendingPool<I> {
         if let Some(c) = self.in_flight_per_phase.get_mut(phase_id) {
             *c = c.saturating_sub(1);
         }
+        self.in_flight_tasks.remove(task_id);
         self.failed_tasks.insert(task_id.to_string());
 
         let mut cascaded: Vec<TaskInfo<I>> = Vec::new();
