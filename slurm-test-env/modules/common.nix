@@ -36,6 +36,18 @@
       PasswordAuthentication = false;
       KbdInteractiveAuthentication = false;
       PubkeyAuthentication = true;
+
+      # `GatewayPorts no` (OpenSSH default) binds every -R reverse
+      # forward to the gateway's loopback only. Workers in this
+      # cluster live in separate netns on the same podman bridge
+      # network — they can reach the gateway by hostname/IP but not
+      # by loopback, so a loopback-bound reverse forward is invisible
+      # to them. `clientspecified` lets a caller opt in per-forward
+      # via `ssh -R *:port:host:port` (or an explicit bind_addr) to
+      # bind on all interfaces, while a plain `ssh -R port:host:port`
+      # still binds loopback-only — no behavior change for callers
+      # that don't need cross-container reach.
+      GatewayPorts = "clientspecified";
     };
   };
 
