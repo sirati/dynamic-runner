@@ -5,6 +5,7 @@ use tracing;
 
 use crate::config::SshConfig;
 use crate::filesystem::{DirEntry, Filesystem, FsError};
+use crate::path::expand_tilde;
 use crate::traits::{CommandResult, Gateway, GatewayError};
 
 /// Gateway for SSH connections using a persistent ControlMaster connection.
@@ -96,12 +97,10 @@ impl SshGateway {
     }
 
     /// Expand `~` prefix using the detected remote home directory.
+    /// When the home has not yet been detected (pre-connect), the path is
+    /// returned verbatim — preserving the historical behavior.
     fn expand_remote_path(&self, path: &str) -> String {
-        if let (true, Some(home)) = (path.starts_with('~'), &self.remote_home) {
-            path.replacen('~', home, 1)
-        } else {
-            path.to_string()
-        }
+        expand_tilde(path, self.remote_home.as_deref())
     }
 
     async fn check_gateway_ports(&mut self) {
