@@ -68,6 +68,14 @@ fn slurm_config_from_python(
         .getattr("notify_email")
         .ok()
         .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
+    let nodes = bound
+        .getattr("nodes")
+        .ok()
+        .and_then(|v| v.extract::<u32>().ok());
+    let prestaged_src_bins_path = bound
+        .getattr("prestaged_src_bins_path")
+        .ok()
+        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
 
     Ok(SlurmConfig {
         root_folder,
@@ -78,9 +86,9 @@ fn slurm_config_from_python(
         time_limit: time_limit.unwrap_or_else(|| "48:00:00".into()),
         cpus_per_task: cpus_per_task.unwrap_or(14),
         memory_per_node: mem.unwrap_or_else(|| "64G".into()),
-        nodes: 1,
+        nodes: nodes.unwrap_or(1),
         notify_email: email,
-        prestaged_src_bins_path: None,
+        prestaged_src_bins_path,
     })
 }
 
