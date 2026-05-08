@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{resolve_against_root, TaskInfo, Identifier, PhaseId, ResourceMap};
-use dynrunner_protocol_primary_secondary::SecondaryTransport;
+use dynrunner_protocol_primary_secondary::{ClusterMutation, SecondaryTransport};
 use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
@@ -696,6 +696,26 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             total,
             "primary finished"
         );
+
+        // Broadcast `RunComplete` so non-promoted secondaries on the
+        // peer mesh know the run is genuinely over and can exit. Without
+        // this, after a post-promotion handoff scenario, the local
+        // primary disconnects but peers can't tell whether the run
+        // finished or the primary just crashed — they sit in failover
+        // detection holding SLURM job slots indefinitely. Idempotent on
+        // re-application; failures here are non-fatal (the run already
+        // succeeded, this is a cleanup signal).
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete]).await;
+
+        // Brief settle window so the broadcast lands on every
+        // secondary before the dispatcher tears down its transport.
+        // Without this, fast dispatcher exits race the broadcast and
+        // some peers miss the signal — the symptom is leftover SLURM
+        // jobs in CG state for the wrappers whose secondaries didn't
+        // see RunComplete. 500ms is far more than the QUIC delivery
+        // latency of an in-process / podman-bridge mesh; the cost on
+        // happy-path exit is negligible.
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
         Ok(())
     }

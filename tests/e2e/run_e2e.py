@@ -199,6 +199,88 @@ def _fetch_published_outputs_from_gateway(
         )
 
 
+def _list_user_jobs_on_gateway(env: DispatchEnv) -> list[str]:
+    """Return SLURM job IDs still present for our SSH user.
+
+    Used as the post-scenario teardown gate: a healthy run must end
+    with zero leftover SLURM jobs for the dispatcher's SSH user. Any
+    job that's still in the queue (R, PD, CG) means a worker hasn't
+    exited yet — usually a sign of a framework completion-signal
+    regression.
+
+    Polls for up to ``_TEARDOWN_GRACE_S`` seconds so the framework's
+    `RunComplete` broadcast has time to propagate through the peer
+    mesh and the wrapper scripts can finish their cleanup (podman
+    container exit + ``podman unshare rm -rf $RNDTMP`` is the
+    standard ~5-15s teardown). Returns the leftover job ids if the
+    grace window expires with jobs still in the queue.
+
+    Empty list on `squeue` failures (e.g. transient SSH hiccup) so
+    the gate doesn't false-positive on flaky transport. The check is
+    a guardrail, not a hard barrier — the actual scenario assertions
+    are authoritative.
+    """
+    if env.ssh_config_path is None:
+        return []
+    deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    last: list[str] = []
+    while True:
+        rc = subprocess.run(
+            [
+                "ssh",
+                "-F", str(env.ssh_config_path),
+                GATEWAY_HOST_ALIAS,
+                f"squeue --user={env.ssh_user} --noheader --format='%i'",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if rc.returncode != 0:
+            return []
+        last = [j for j in rc.stdout.decode().split() if j.strip()]
+        if not last:
+            return []
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(_TEARDOWN_POLL_S)
+
+
+# Grace window for SLURM jobs to drain post-RunComplete. The wrapper
+# script's `podman unshare rm -rf $RNDTMP` cleanup typically takes
+# 5-15s, but on the slurm-test-env the CG (completing) state can
+# linger up to ~60s before slurmstepd reaps the wrapper PID;
+# 90s gives headroom without making flaky scenarios block forever.
+_TEARDOWN_GRACE_S = 90.0
+_TEARDOWN_POLL_S = 2.0
+
+
+def _scancel_user_jobs_on_gateway(env: DispatchEnv) -> None:
+    """Force-cancel everything owned by the dispatcher's SSH user.
+
+    Called when the post-scenario teardown gate fails — the leftover
+    jobs would block the NEXT scenario's slot allocation. SIGKILL via
+    `scancel -s KILL` so we don't wait through `CG` (completing) state
+    if the wrapper script is hung.
+    """
+    if env.ssh_config_path is None:
+        return
+    subprocess.run(
+        [
+            "ssh",
+            "-F", str(env.ssh_config_path),
+            GATEWAY_HOST_ALIAS,
+            f"scancel -s KILL --user={env.ssh_user} 2>/dev/null; "
+            f"scancel --user={env.ssh_user} 2>/dev/null; true",
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def _select_scenarios(arg: str) -> list[Scenario]:
     """Resolve the ``--scenario`` CLI argument to a list of scenarios.
 
@@ -314,6 +396,31 @@ def _run_one_scenario(
                 _fetch_published_outputs_from_gateway(env, r.plan.paths.publish_dst)
 
         ok, failures = scenario.assert_outputs(env, results)
+
+        # Cluster-teardown verification: after the scenario's
+        # assertions run, no worker job belonging to our SSH user may
+        # remain on the gateway. A leftover means either the scenario
+        # is buggy (didn't tell the framework to wind down) or the
+        # framework has a teardown regression. Either way, the run
+        # is NOT honestly green if SLURM slots are still occupied.
+        if env.mode == "slurm":
+            leftover = _list_user_jobs_on_gateway(env)
+            if leftover:
+                print(
+                    f"[run_e2e]   FAIL: {scenario.name} — "
+                    f"{len(leftover)} SLURM job(s) left running after run "
+                    f"finished: {' '.join(leftover)}. The framework's run "
+                    f"completion did not propagate to all secondaries (see "
+                    f"docs/MIGRATION_2026_05_PYTHON_TO_RUST.md → "
+                    f"'Known issues')",
+                    flush=True,
+                )
+                # Cancel them so the next scenario isn't blocked by
+                # this run's leftover slot occupation. We still report
+                # the failure.
+                _scancel_user_jobs_on_gateway(env)
+                return (False, False)
+
         if ok:
             print(f"[run_e2e]   PASS: {scenario.name}", flush=True)
             return (True, False)
