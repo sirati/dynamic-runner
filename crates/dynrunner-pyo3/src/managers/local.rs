@@ -5,7 +5,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{PhaseId, ResourceKind, ResourceMap, TaskInfo};
+use dynrunner_core::{resolve_against_root, PhaseId, ResourceKind, ResourceMap, TaskInfo};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
 
 use crate::config::connection::ConnectionMode;
@@ -223,10 +223,15 @@ impl PyLocalManager {
     fn process_binaries(&mut self, py: Python<'_>, binaries: &Bound<'_, PyList>) -> PyResult<()> {
         let mut rust_binaries = extract_binaries(binaries)?;
 
-        // Convert absolute paths to relative (matching Python's relative_to(source_dir))
+        // Normalise each `binary.path` to the worker-facing wire id
+        // (relative-to-`source_dir`). Out-of-tree paths are left
+        // verbatim — the worker opens them via
+        // `Path(source_dir).join(<abs>)`, which discards the source
+        // prefix and reaches the absolute target.
         for binary in &mut rust_binaries {
-            if let Ok(rel) = binary.path.strip_prefix(&self.source_dir) {
-                binary.path = rel.to_path_buf();
+            let resolved = resolve_against_root(&binary.path, &self.source_dir);
+            if let Some(rel) = resolved.relative {
+                binary.path = rel;
             }
         }
 

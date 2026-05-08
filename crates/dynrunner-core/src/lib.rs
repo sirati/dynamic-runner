@@ -1,7 +1,9 @@
 pub mod types;
 pub mod traits;
+pub mod path_resolve;
 
 pub use traits::{MessageReceiver, MessageSender};
+pub use path_resolve::{resolve_against_root, ResolvedPath};
 pub use types::{
     AffinityId, TaskInfo, ErrorType, FailedTask, Identifier, PhaseId,
     ResourceAmount, ResourceKind, ResourceMap, RunnerIdentifier, TaskInput,
