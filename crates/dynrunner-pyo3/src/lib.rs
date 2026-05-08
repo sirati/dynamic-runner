@@ -8,6 +8,7 @@ mod managers;
 mod network;
 mod publish;
 mod pytypes;
+mod slurm;
 mod subprocess_factory;
 mod system_resources;
 mod task_def;
@@ -30,6 +31,7 @@ use system_resources::{parse_cores, parse_memory, pick_free_port};
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
 use pytypes::{PyBinaryIdentifier, PyTaskInfo, PyFailedTask, PyProcessingStats};
+use slurm::PyRustSlurmJobManager;
 
 /// Python module definition.
 /// The compiled extension is exposed as `dynamic_runner._native`;
@@ -61,6 +63,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
+    m.add_class::<PyRustSlurmJobManager>()?;
     m.add_class::<PySecondaryCoordinator>()?;
     m.add_class::<PyCallbackWorkerFactory>()?;
     m.add_class::<PyCallbackResourceMonitor>()?;

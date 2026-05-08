@@ -1,9 +1,25 @@
+"""Python-facing SLURM job manager.
+
+Thin shim over `dynamic_runner._native.RustSlurmJobManager` for the
+SLURM lifecycle primitives the Rust `dynrunner_slurm::SlurmJobManager`
+already owns (directory prep, single-job cancel, status query). The
+remaining methods — submit, source-binary upload, image build/transfer,
+bash wrapper-script generation — keep their Python implementations
+until their dedicated migration units (L1.7 / L1.8 / L1.9 / L2.E)
+land and reconcile the Python ↔ Rust semantic gaps. The public class
+name and method signatures are preserved across the cutover so
+callers don't see the move.
+"""
+
+from __future__ import annotations
+
 import logging
 import secrets
 import shlex
 from pathlib import Path
 from typing import Any
 
+from .._native import RustSlurmJobManager
 from ..deployment_spec import TaskDeploymentSpec
 from .podman import PodmanImageMetadata
 
@@ -25,6 +41,16 @@ class SlurmJobManager:
         self.packaging = packaging_method
         self.deployment = deployment
         self.job_ids: list[str] = []
+        # Rust-side delegate for the lifecycle primitives that have
+        # already migrated. The remaining Python methods on this
+        # class don't need it; they're still using ``gateway`` /
+        # ``slurm_config`` / ``packaging`` directly.
+        self._rust = RustSlurmJobManager(
+            gateway,
+            slurm_config,
+            packaging_method,
+            deployment,
+        )
 
     def _normalize_path(self, path: str | Path) -> Path:
         if isinstance(path, Path):
@@ -44,12 +70,7 @@ class SlurmJobManager:
     def prepare_directories(self) -> None:
         """Create necessary directories on gateway."""
         logger.info("Creating SLURM directories on gateway...")
-
-        self.gateway.create_directory(str(self.slurm_config.get_image_dir()))
-        self.gateway.create_directory(str(self.slurm_config.get_srcbins_dir()))
-        self.gateway.create_directory(str(self.slurm_config.get_output_dir()))
-        self.gateway.create_directory(str(self.slurm_config.get_log_dir()))
-
+        self._rust.prepare_directories()
         logger.info("Directories created successfully")
 
     def upload_source_binaries(
@@ -635,11 +656,7 @@ echo "=================================================="
     def cancel_job(self, job_id: str) -> None:
         """Cancel SLURM job."""
         logger.info("Cancelling job: %s", job_id)
-        returncode, _, stderr = self.gateway.execute_command(f"scancel {job_id}")
-        if returncode != 0:
-            logger.warning("Failed to cancel job %s: %s", job_id, stderr)
-        else:
-            logger.info("Job %s cancelled", job_id)
+        self._rust.cancel_job(job_id)
 
     def cancel_all_jobs(self) -> None:
         """Cancel all submitted jobs."""
@@ -649,14 +666,4 @@ echo "=================================================="
 
     def get_job_status(self, job_id: str) -> dict[str, str]:
         """Get status of SLURM job."""
-        cmd = f"squeue -j {job_id} -o '%T|%N|%r' --noheader"
-        returncode, stdout, _ = self.gateway.execute_command(cmd)
-
-        if returncode != 0 or not stdout.strip():
-            return {"state": "UNKNOWN", "node": "", "reason": ""}
-
-        parts = stdout.strip().split("|")
-        if len(parts) != 3:
-            return {"state": "UNKNOWN", "node": "", "reason": ""}
-
-        return {"state": parts[0], "node": parts[1], "reason": parts[2]}
+        return self._rust.get_job_status(job_id)
