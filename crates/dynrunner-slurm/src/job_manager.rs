@@ -8,7 +8,7 @@ use tracing;
 use crate::config::SlurmConfig;
 use crate::packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
 
-/// Status of a SLURM job.
+/// Status of a SLURM job (parsed from the raw squeue state string).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
     Pending,
@@ -17,6 +17,29 @@ pub enum JobStatus {
     Failed,
     Cancelled,
     Unknown(String),
+}
+
+/// Full snapshot returned by `get_job_status`.
+///
+/// `state`/`state_kind` are `None` when squeue had no record for the
+/// job (transient query failure or post-purge). The Python wrapper
+/// exposes that as `state="UNKNOWN"` to mirror the historical
+/// `SlurmJobManager.get_job_status` shape; Rust callers that need the
+/// "no longer in queue → presumed completed" interpretation should
+/// layer it themselves rather than have it baked in here, because
+/// the squeue purge horizon and "actually completed" are not the
+/// same thing on every cluster.
+#[derive(Debug, Clone)]
+pub struct JobStatusInfo {
+    /// Raw squeue state string (e.g. "RUNNING", "PENDING"). `None` if
+    /// the job had no row in squeue's output.
+    pub state: Option<String>,
+    /// Parsed `JobStatus` for Rust callers. `None` mirrors `state`.
+    pub state_kind: Option<JobStatus>,
+    /// Node assignment from squeue (`%N`); empty when unknown.
+    pub node: String,
+    /// Reason field from squeue (`%r`); empty when unknown.
+    pub reason: String,
 }
 
 /// Manages SLURM job submission and lifecycle via a `Gateway`.
@@ -271,8 +294,16 @@ impl<G: Gateway> SlurmJobManager<G> {
     }
 
     /// Cancel all submitted jobs.
-    pub async fn cancel_all_jobs(&self) -> Result<(), SlurmError> {
-        for job_id in &self.job_ids {
+    ///
+    /// Mirrors the Python `SlurmJobManager.cancel_all_jobs` shape:
+    /// after iterating, `self.job_ids` is cleared so a subsequent
+    /// `cancel_all_jobs` is a no-op rather than re-cancelling already-
+    /// cancelled IDs.
+    pub async fn cancel_all_jobs(&mut self) -> Result<(), SlurmError> {
+        // Drain into a temporary so the borrow on `self.job_ids` is
+        // released before we start awaiting `cancel_job(&self, ...)`.
+        let ids: Vec<String> = self.job_ids.drain(..).collect();
+        for job_id in &ids {
             if let Err(e) = self.cancel_job(job_id).await {
                 tracing::warn!(job_id, error = %e, "failed to cancel job");
             }
@@ -281,25 +312,46 @@ impl<G: Gateway> SlurmJobManager<G> {
     }
 
     /// Query the status of a SLURM job.
-    pub async fn get_job_status(&self, job_id: &str) -> Result<JobStatus, SlurmError> {
+    ///
+    /// Returns the full state/node/reason snapshot from a single
+    /// `squeue -o '%T|%N|%r'` line. When the job is missing from
+    /// squeue (already purged, transient failure), `state` and
+    /// `state_kind` are `None` and `node`/`reason` are empty —
+    /// callers that want a "missing → completed" interpretation
+    /// apply it explicitly.
+    pub async fn get_job_status(&self, job_id: &str) -> Result<JobStatusInfo, SlurmError> {
         let cmd = format!("squeue -j {job_id} -o '%T|%N|%r' --noheader 2>/dev/null");
         let result = self.gateway.execute_command(&cmd, None).await?;
 
         if !result.success() || result.stdout.trim().is_empty() {
-            // Job not in queue — likely completed or failed
-            return Ok(JobStatus::Completed);
+            return Ok(JobStatusInfo {
+                state: None,
+                state_kind: None,
+                node: String::new(),
+                reason: String::new(),
+            });
         }
 
         let line = result.stdout.trim();
-        let state = line.split('|').next().unwrap_or("UNKNOWN");
+        let mut parts = line.split('|');
+        let state_str = parts.next().unwrap_or("").to_string();
+        let node = parts.next().unwrap_or("").to_string();
+        let reason = parts.next().unwrap_or("").to_string();
 
-        Ok(match state {
+        let state_kind = match state_str.as_str() {
             "PENDING" => JobStatus::Pending,
             "RUNNING" => JobStatus::Running,
             "COMPLETED" | "COMPLETING" => JobStatus::Completed,
             "FAILED" | "NODE_FAIL" | "TIMEOUT" => JobStatus::Failed,
             "CANCELLED" => JobStatus::Cancelled,
             other => JobStatus::Unknown(other.to_string()),
+        };
+
+        Ok(JobStatusInfo {
+            state: Some(state_str),
+            state_kind: Some(state_kind),
+            node,
+            reason,
         })
     }
 }
