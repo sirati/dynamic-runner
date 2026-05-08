@@ -129,6 +129,19 @@ def generate_ssh_config(
     instances), plus the explicit identity file. Threaded into the
     dispatcher via ``dynamic_runner --ssh-config <path>``.
 
+    The ``host_alias`` is used both as the SSH ``Host`` block label
+    AND as the URL host the dispatcher passes to ``--gateway
+    ssh://<alias>:<port>``. The framework then propagates that
+    string verbatim into the worker wrapper's ``--secondary
+    tcp://<alias>:<port>`` URL (see
+    ``packaging/preparation.py::_determine_gateway_host``). For the
+    slurm-test-env, the alias must match the gateway's podman
+    network-alias (``slurm-gateway``) so workers in the cluster's
+    private podman network can DNS-resolve it. ``HostName
+    localhost`` redirects the SSH client (which runs on the operator's
+    host where ``localhost`` IS the cluster's port-forwarded
+    SSH endpoint) without leaking a hostname workers can't reach.
+
     Re-running overwrites the file — cheap, captures any port/user
     drift between driver invocations.
     """
