@@ -383,21 +383,58 @@ def main() -> int:
 
     scenarios = _select_scenarios(args.scenario)
 
+    # Cluster bring-up — only relevant in slurm mode. TCP-probe-based
+    # check; bring up via `nix run .#up` per the slurm-test-env owner's
+    # contract.
+    ssh_config_path = None
+    ssh_identity_path = None
+    if args.mode == "slurm":
+        if not is_cluster_running(args.ssh_port):
+            try:
+                bring_cluster_up(
+                    SLURM_TEST_ENV_DIR, args.instance_id, args.ssh_port
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[run_e2e] cluster bring-up failed: {e}", flush=True)
+                return 1
+
+        # Per-cluster SSH state: keypair under tests/e2e/state/<id>/keys/,
+        # provisioned dispatcher user (idempotent), generated ssh_config
+        # pinning the slurm-test-env contract options.
+        from ._ssh_state import (
+            ensure_dispatcher_keypair,
+            generate_ssh_config,
+            provision_dispatcher_user,
+            state_dir_for_instance,
+        )
+        state_root = Path(__file__).resolve().parent / "state"
+        instance_state_dir = state_dir_for_instance(state_root, args.instance_id)
+        priv, pub = ensure_dispatcher_keypair(instance_state_dir)
+        ssh_user = "e2e-user"
+        provision_dispatcher_user(
+            SLURM_TEST_ENV_DIR, args.instance_id, ssh_user, pub
+        )
+        ssh_config_path = generate_ssh_config(
+            instance_state_dir,
+            host_alias="localhost",
+            ssh_port=args.ssh_port,
+            user=ssh_user,
+            identity_file=priv,
+        )
+        ssh_identity_path = priv
+        print(f"[ssh] ssh_config: {ssh_config_path}", flush=True)
+        print(f"[ssh] identity:   {ssh_identity_path}", flush=True)
+
     env = DispatchEnv(
         instance_id=args.instance_id,
         ssh_port=args.ssh_port,
         slurm_root_folder=args.slurm_root_folder,
         workers=args.workers,
         mode=args.mode,
+        ssh_user="e2e-user",
+        ssh_config_path=ssh_config_path,
+        ssh_identity_path=ssh_identity_path,
     )
-
-    # Cluster bring-up — only relevant in slurm mode.
-    if env.mode == "slurm" and not is_cluster_running(env.instance_id):
-        try:
-            bring_cluster_up(SLURM_TEST_ENV_DIR, env.instance_id, env.ssh_port)
-        except Exception as e:  # noqa: BLE001
-            print(f"[run_e2e] cluster bring-up failed: {e}", flush=True)
-            return 1
 
     heartbeat_file = args.heartbeat_file or heartbeat_path_for_pid()
     log_dir = args.log_dir or Path(

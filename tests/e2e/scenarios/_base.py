@@ -53,6 +53,22 @@ class DispatchEnv:
     mode: str
     """One of ``slurm``, ``single-process``, ``in-process``. Same
     semantics as ``run_e2e.py --mode``."""
+    ssh_user: str = "e2e-user"
+    """Cluster-side username the dispatcher SSHs in as. Provisioned
+    by the driver before any scenario runs (idempotent re-run of
+    ``nix run .#provision-user``). Not the operator's identity —
+    fresh per-cluster, no relation to ``$USER``."""
+    ssh_config_path: Path | None = None
+    """Path to a generated ssh_config file pinning identity, port,
+    user, ``IdentitiesOnly=yes``, ``IdentityAgent=none``,
+    ``StrictHostKeyChecking=no``, ``UserKnownHostsFile=/dev/null``
+    for this cluster. Threaded into the dispatcher via the framework's
+    ``--ssh-config`` flag (the canonical escape hatch the framework
+    surfaced in commit 178a3af). ``None`` in non-slurm modes."""
+    ssh_identity_path: Path | None = None
+    """Path to the dispatcher's per-cluster private key. Lives under
+    the driver's state dir (``tests/e2e/state/<instance_id>/keys/``),
+    NOT under ``~/.ssh``. ``None`` in non-slurm modes."""
 
 
 @dataclass(frozen=True)
