@@ -23,8 +23,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/env.sh}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/lib.sh"
+# Resolve lib.sh via env var with fallback to a sibling file — same
+# shape as ENV_FILE above. The flake's deploy package installs lib.sh
+# into $out/share/ and points SLURM_TEST_ENV_LIB_SH at it; raw
+# `bash deploy/up.sh` invocations find the sibling instead.
+LIB_SH="${SLURM_TEST_ENV_LIB_SH:-${SCRIPT_DIR}/lib.sh}"
+# shellcheck disable=SC1090
+source "$LIB_SH"
 
 printf '\n=== slurm-test-env :: bringing up cluster ===\n'
 print_layout
