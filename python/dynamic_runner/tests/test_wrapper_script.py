@@ -330,3 +330,110 @@ def test_wrapper_injects_extra_run_args_before_image_tag(
                 "treat it as part of the container command. Invocation:\n"
                 + inv
             )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_names_container_for_teardown_addressability(
+    manager: SlurmJobManager,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """The wrapper must define ``CONTAINER_NAME`` and pass it to
+    ``podman run`` via ``--name "$CONTAINER_NAME"``. Without a stable
+    name the fallback teardown watchdog has no handle to issue
+    ``podman kill``/``podman rm`` against — podman would assign an
+    auto-generated name (e.g. ``eloquent_solomon``) that the watchdog
+    doesn't know in advance.
+
+    The accompanying test
+    :func:`test_wrapper_spawns_podman_teardown_watchdog` covers the
+    watchdog itself; this one guards the addressability precondition."""
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    assert re.search(r'^CONTAINER_NAME="[^"]+"\s*$', wrapper, re.MULTILINE), (
+        "wrapper must assign CONTAINER_NAME to a non-empty literal so the "
+        "fallback teardown watchdog can address the container by name"
+    )
+
+    invocations = _extract_podman_run_invocations(wrapper)
+    assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
+    for i, inv in enumerate(invocations):
+        assert '--name "$CONTAINER_NAME"' in inv, (
+            f"`podman run` invocation #{i} is missing `--name \"$CONTAINER_NAME\"`; "
+            "without it the container has only an auto-generated name and the "
+            "fallback teardown watchdog can't kill it.\nInvocation:\n" + inv
+        )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_spawns_podman_teardown_watchdog(
+    manager: SlurmJobManager,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """Field observation: when scancel hits a job whose secondary
+    runs a podman container, conmon's double-fork detaches the
+    container monitor from the slurmstepd pidtree. If proctrack/cgroup
+    isn't tracking conmon's detached pid, neither scancel nor wrapper
+    exit propagate into the container and it survives both the
+    wrapper and the SLURM job, leaking storage and worker pids on
+    the compute node.
+
+    The wrapper installs a fallback teardown watchdog: a ``setsid -f``
+    detached process that polls ``squeue -j $SLURM_JOB_ID`` and runs
+    ``podman kill`` + ``podman rm -f`` on this container by name when
+    the job is gone. This test guards each ingredient of that
+    mechanism so a future refactor can't silently drop one of them
+    and reintroduce the leak."""
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    # Detached spawn: setsid -f puts the watchdog in its own session
+    # with init as parent so it survives wrapper exit (and, where
+    # cgroup proctrack permits, SLURM job termination).
+    assert "setsid -f bash -c" in wrapper, (
+        "watchdog must be spawned via `setsid -f bash -c '…'` so it survives "
+        "the wrapper's exit and runs detached as the conmon-evades-cgroup "
+        "fallback teardown"
+    )
+
+    # Job-state polling: squeue is the source of truth for whether
+    # the SLURM job is still alive. The watchdog must distinguish
+    # `exit 0 + empty stdout` (job genuinely gone) from `exit nonzero`
+    # (transient query failure → keep polling).
+    assert "squeue -j" in wrapper, (
+        "watchdog must poll `squeue -j $SLURM_JOB_ID` to observe job state"
+    )
+
+    # Teardown sequence: TERM first to give the container a chance to
+    # shut down cleanly, then `rm -f` as belt-and-suspenders if --rm
+    # didn't fire (e.g. conmon was in a bad state).
+    assert "podman" in wrapper and "kill --signal TERM" in wrapper, (
+        "watchdog must issue `podman kill --signal TERM <name>` on detected "
+        "job-gone state"
+    )
+    assert "rm -f" in wrapper, (
+        "watchdog must follow the kill with `podman rm -f <name>` to clean up "
+        "container storage if --rm didn't auto-remove"
+    )
+
+    # Skip-when-not-in-SLURM guard: running the wrapper outside SLURM
+    # (e.g. for local debugging) leaves SLURM_JOB_ID unset; without
+    # the guard the watchdog would call `squeue -j ""` forever and
+    # never trigger the cleanup branch.
+    assert 'if [ -n "${SLURM_JOB_ID:-}" ]' in wrapper, (
+        "watchdog must be guarded by `[ -n \"${SLURM_JOB_ID:-}\" ]` so it's "
+        "skipped when running outside SLURM (where squeue would never find "
+        "a matching job and the watchdog would poll indefinitely)"
+    )
