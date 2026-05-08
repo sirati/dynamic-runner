@@ -110,9 +110,17 @@ class _SleepTask:
 
 
 def _make_binaries(n: int) -> list[_StubTaskInfo]:
+    # Paths must be absolute. The secondary's
+    # `report_unresolvable_task` flags relative paths with no
+    # `resolved_path` and no `src_network` as
+    # "expected StageFile notification first" → NonRecoverable,
+    # which would defeat the failover scenario before it begins.
+    # `_failover_stub_worker` doesn't open the file (just sleeps),
+    # so the path needs to be a valid string but doesn't have to
+    # exist on disk.
     return [
         _StubTaskInfo(
-            path=f"bin_{i}",
+            path=f"/tmp/db-failover-test/bin_{i}",
             size=1000 + i,
             identifier=_StubBinaryIdentifier(
                 binary_name=f"bin_{i}",
