@@ -364,6 +364,17 @@ class SSHGateway:
         except Exception:
             logger.info(f"Transferring file: {local_path} -> {expanded_path}")
 
+        # Pre-flight unlink of the destination. scp opens the dest with
+        # O_WRONLY|O_TRUNC, which fails with EACCES when the existing
+        # file is read-only — observed when sources are produced by a
+        # nix derivation (mode 0444) and scp's prior upload propagated
+        # those bits to the dest. `rm -f` no-ops when the dest is
+        # absent and only requires write perm on the parent directory,
+        # which scp itself already requires. Best-effort: if the rm
+        # fails for any reason we still attempt the scp so the failure
+        # surfaces with the canonical scp error rather than ours.
+        self._execute_ssh_command(f"rm -f {expanded_path}")
+
         # Build scp command using the same control socket
         scp_cmd = ["scp"]
 
