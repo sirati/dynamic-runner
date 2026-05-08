@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 mod config;
 mod discovery;
 mod estimator;
+mod gateway;
 mod identifier;
 mod managers;
 mod network;
@@ -64,6 +65,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
     m.add_class::<PySecondaryCoordinator>()?;
+    m.add_class::<gateway::ssh::PySshGateway>()?;
     m.add_class::<PyCallbackWorkerFactory>()?;
     m.add_class::<PyCallbackResourceMonitor>()?;
     m.add_function(wrap_pyfunction!(run_local, m)?)?;
