@@ -389,8 +389,10 @@ dependencies = [
 name = "dynrunner-slurm"
 version = "0.4.0"
 dependencies = [
+ "dynrunner-core",
  "dynrunner-gateway",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
