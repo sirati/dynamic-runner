@@ -99,6 +99,20 @@ mkdir -p "{log_tmp}"
 mkdir -p "{socket_dir}"
 
 cleanup() {{
+    # Terminate the command-relay subshell and WAIT for it to exit
+    # before removing its FIFO. Without `wait`, kill is racy with
+    # the rm-rf below — and the relay loop is designed to exit 1
+    # with a loud diagnostic if its FIFO disappears unexpectedly
+    # (so a careless ops mistake gets noticed instead of silently
+    # neutering the secondary). During intentional cleanup we don't
+    # want that diagnostic; we want the subshell killed cleanly via
+    # SIGTERM before the FIFO vanishes.
+    # `${{CMD_RELAY_PID:-}}` guard handles early-failure paths where
+    # the relay was never started.
+    if [ -n "${{CMD_RELAY_PID:-}}" ]; then
+        kill -TERM "$CMD_RELAY_PID" 2>/dev/null || true
+        wait "$CMD_RELAY_PID" 2>/dev/null || true
+    fi
     rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
 }}
 # Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
@@ -221,6 +235,16 @@ SOCKET_COUNTER=0
 
                 echo "output_${{SOCKET_COUNTER}}.sock,exit_${{SOCKET_COUNTER}}.sock,signal_${{SOCKET_COUNTER}}.sock,$CMD_PID" > "{cmd_socket}.response"
             fi
+        elif [ ! -p "{cmd_socket}" ]; then
+            # FIFO disappeared with no SIGTERM from cleanup() — that's
+            # corrupt state (external rm, filesystem eviction, etc.),
+            # not a normal lifecycle event. Bail loud so the failure is
+            # diagnosable instead of silently neutering the secondary.
+            # During intentional cleanup, the trap's kill+wait sequence
+            # exits this subshell via signal before the FIFO vanishes,
+            # so this branch only fires on genuine unexpected loss.
+            echo "ERROR: command relay FIFO {cmd_socket} disappeared unexpectedly; secondary cannot continue." >&2
+            exit 1
         fi
     done
 }} &
@@ -747,5 +771,92 @@ mod tests {
         assert_eq!(bash_quote("a$b"), "'a$b'");
         assert_eq!(bash_quote("a'b"), r#"'a'"'"'b'"#);
         assert_eq!(bash_quote("'"), r#"''"'"''"#);
+    }
+
+    /// Both connection modes share the same `cleanup` / relay-loop /
+    /// image-load / watchdog blocks, so the L1.6 regression tests run
+    /// against this matrix instead of duplicating the body twice.
+    fn both_modes() -> [(&'static str, ConnectionMode<'static>); 2] {
+        [
+            (
+                "standard",
+                ConnectionMode::Standard {
+                    gateway_host: "gw",
+                    gateway_port: 1,
+                },
+            ),
+            (
+                "reverse",
+                ConnectionMode::Reverse {
+                    connection_info_dir: "/logs/ci",
+                },
+            ),
+        ]
+    }
+
+    /// `cleanup()` must kill `$CMD_RELAY_PID` AND `wait` for it to
+    /// exit BEFORE the `rm -rf "$RNDTMP"`. Without the kill, the relay
+    /// subshell busy-spins on the deleted FIFO at ~50K iter/sec
+    /// (run-8 reproduced this as a 110-minute spin producing 13 GB of
+    /// stderr). Without `wait`, the kill races the rm-rf and trips
+    /// the loud-error elif (see `relay_loop_exits_loud_on_unexpected_fifo_loss`)
+    /// on every intentional cleanup.
+    #[test]
+    fn cleanup_kills_and_waits_relay_subshell_before_rm() {
+        let config = SlurmConfig::default();
+        for (label, connection) in both_modes() {
+            let cfg = base_cfg(&config, connection, "sec-c");
+            let script = generate_wrapper_script(&cfg);
+            assert!(
+                script.contains("kill -TERM \"$CMD_RELAY_PID\""),
+                "[{label}] cleanup() must SIGTERM CMD_RELAY_PID",
+            );
+            assert!(
+                script.contains("${CMD_RELAY_PID:-}"),
+                "[{label}] kill must be guarded by ${{CMD_RELAY_PID:-}}",
+            );
+            assert!(
+                script.contains("wait \"$CMD_RELAY_PID\""),
+                "[{label}] cleanup() must `wait` for the relay before rm-rf",
+            );
+            let kill_idx = script
+                .find("kill -TERM \"$CMD_RELAY_PID\"")
+                .expect("kill present");
+            let wait_idx = script.find("wait \"$CMD_RELAY_PID\"").expect("wait present");
+            let rm_idx = script.find("rm -rf \"$RNDTMP\"").expect("rm-rf present");
+            assert!(
+                kill_idx < wait_idx && wait_idx < rm_idx,
+                "[{label}] ordering must be kill -> wait -> rm-rf",
+            );
+            assert_renders_valid_bash(&script);
+        }
+    }
+
+    /// Relay loop must exit loud (not silently continue) on
+    /// unexpected FIFO loss. `while true` with no elif silently turns
+    /// into a tight no-op spin if the FIFO is gone; the elif surfaces
+    /// the corruption as a stderr ERROR + `exit 1` so the failure is
+    /// diagnosable instead of silently neutering the secondary.
+    #[test]
+    fn relay_loop_exits_loud_on_unexpected_fifo_loss() {
+        let config = SlurmConfig::default();
+        for (label, connection) in both_modes() {
+            let cfg = base_cfg(&config, connection, "sec-f");
+            let script = generate_wrapper_script(&cfg);
+            assert!(
+                script.contains("elif [ ! -p"),
+                "[{label}] relay loop must have `elif [ ! -p <fifo> ]`",
+            );
+            assert!(
+                script.contains("ERROR: command relay FIFO")
+                    && script.contains("disappeared unexpectedly"),
+                "[{label}] FIFO-loss branch must echo a clear ERROR marker",
+            );
+            assert!(
+                script.contains(">&2"),
+                "[{label}] FIFO-loss ERROR must reach stderr",
+            );
+            assert_renders_valid_bash(&script);
+        }
     }
 }
