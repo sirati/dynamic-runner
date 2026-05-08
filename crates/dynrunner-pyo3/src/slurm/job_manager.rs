@@ -15,10 +15,11 @@
 //! a `RustSlurmConfig` pyclass and removes this duck-typed extraction;
 //! the Rust `SlurmJobManager` API doesn't change.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use tokio::sync::{Mutex, MutexGuard};
 
 use dynrunner_slurm::{JobStatusInfo, SlurmConfig, SlurmJobManager};
 
@@ -67,6 +68,14 @@ fn slurm_config_from_python(
         .getattr("notify_email")
         .ok()
         .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
+    let nodes = bound
+        .getattr("nodes")
+        .ok()
+        .and_then(|v| v.extract::<u32>().ok());
+    let prestaged_src_bins_path = bound
+        .getattr("prestaged_src_bins_path")
+        .ok()
+        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
 
     Ok(SlurmConfig {
         root_folder,
@@ -77,9 +86,9 @@ fn slurm_config_from_python(
         time_limit: time_limit.unwrap_or_else(|| "48:00:00".into()),
         cpus_per_task: cpus_per_task.unwrap_or(14),
         memory_per_node: mem.unwrap_or_else(|| "64G".into()),
-        nodes: 1,
+        nodes: nodes.unwrap_or(1),
         notify_email: email,
-        prestaged_src_bins_path: None,
+        prestaged_src_bins_path,
     })
 }
 
@@ -119,15 +128,20 @@ where
     rt.block_on(local.run_until(future))
 }
 
-/// Acquire the manager mutex or surface a poisoned-lock failure as
-/// a Python `RuntimeError`. Centralises the two-step `lock()` +
-/// `map_err` chain that every Rust-delegated method needs.
-fn lock_manager(
+/// Acquire the manager mutex inside the tokio runtime.
+///
+/// Uses `tokio::sync::Mutex` (not `std::sync::Mutex`) because the
+/// guard is held across `.await` points in every caller — every
+/// `SlurmJobManager` async method runs while we hold the lock. A
+/// `std::sync::MutexGuard` is `!Send` and (worse on a current-thread
+/// runtime) blocks the executor thread on contention, which would
+/// deadlock the moment any awaited call inside the critical section
+/// yields back to the runtime. `tokio::sync::Mutex` yields cleanly
+/// and never poisons, so the helper is infallible.
+async fn lock_manager(
     inner: &Arc<Mutex<SlurmJobManager<PyGatewayAdapter>>>,
-) -> PyResult<std::sync::MutexGuard<'_, SlurmJobManager<PyGatewayAdapter>>> {
-    inner.lock().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("manager mutex poisoned: {e}"))
-    })
+) -> MutexGuard<'_, SlurmJobManager<PyGatewayAdapter>> {
+    inner.lock().await
 }
 
 /// Convert a `dynrunner_slurm::SlurmError` (the unified Rust error
@@ -141,14 +155,24 @@ fn slurm_err_to_py(e: dynrunner_slurm::SlurmError) -> PyErr {
 /// Python-facing wrapper for the Rust SLURM job manager.
 ///
 /// Holds the inner `SlurmJobManager<PyGatewayAdapter>` behind an
-/// `Arc<Mutex<...>>`: cancel- and status-query methods take `&self`
-/// at the trait level but submit-style methods (when they migrate
-/// from the Python shim in a follow-up unit) need `&mut self`, and
-/// the `Arc<Mutex<...>>` smooths that over without requiring
-/// PyO3-level `&mut self`. The `Arc<Mutex<...>>` is also
-/// `Send + Sync`, satisfying the `Ungil` bound on `py.detach`'s
-/// closure when the locked manager is moved into the runtime's
-/// `block_on` future.
+/// `Arc<tokio::sync::Mutex<...>>`. Two distinct properties matter:
+///
+/// 1. **Interior mutability via `&self`**: cancel- and status-query
+///    methods take `&self` at the trait level, but submit-style
+///    methods (when they migrate from the Python shim in a follow-up
+///    unit) need `&mut self`. The mutex smooths that over without
+///    requiring PyO3-level `&mut self` on the wrapper.
+/// 2. **Async-safe locking**: every `SlurmJobManager` method we call
+///    is `async` and the guard is held for the duration of the call,
+///    i.e. across `.await` points. `std::sync::Mutex` is wrong here:
+///    its guard is `!Send` and blocks the runtime thread, so on the
+///    current-thread runtime + `LocalSet` we use, a single yielding
+///    `.await` inside the critical section would deadlock the
+///    executor. `tokio::sync::Mutex` yields cleanly instead.
+///
+/// `Arc<tokio::sync::Mutex<T>>` is `Send + Sync` whenever `T: Send`,
+/// which separately satisfies the `Ungil` bound on the closure passed
+/// to `py.detach` (the GIL release boundary).
 ///
 /// The constructor accepts `packaging_method` and `deployment` to
 /// preserve the Python-side `SlurmJobManager.__init__` signature,
@@ -184,7 +208,8 @@ impl PyRustSlurmJobManager {
         let inner = self.inner.clone();
         py.detach(|| {
             block_on_local(async move {
-                lock_manager(&inner)?
+                lock_manager(&inner)
+                    .await
                     .prepare_directories()
                     .await
                     .map_err(slurm_err_to_py)
@@ -197,7 +222,8 @@ impl PyRustSlurmJobManager {
         let inner = self.inner.clone();
         py.detach(|| {
             block_on_local(async move {
-                lock_manager(&inner)?
+                lock_manager(&inner)
+                    .await
                     .cancel_job(&job_id)
                     .await
                     .map_err(slurm_err_to_py)
@@ -216,7 +242,8 @@ impl PyRustSlurmJobManager {
         let inner = self.inner.clone();
         let info = py.detach(|| {
             block_on_local(async move {
-                lock_manager(&inner)?
+                lock_manager(&inner)
+                    .await
                     .get_job_status(&job_id)
                     .await
                     .map_err(slurm_err_to_py)
