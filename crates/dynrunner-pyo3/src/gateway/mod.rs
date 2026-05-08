@@ -23,7 +23,12 @@ pub(crate) fn gateway_error_to_py(err: GatewayError) -> PyErr {
             pyo3::exceptions::PyRuntimeError::new_err("Gateway not connected")
         }
         GatewayError::CommandFailed(msg) => pyo3::exceptions::PyRuntimeError::new_err(msg),
-        GatewayError::TransferFailed(msg) => pyo3::exceptions::PyRuntimeError::new_err(msg),
+        // Pre-migration Python gateways raised `RuntimeError` for copy
+        // failures (`File copy failed: ...` locally, `SCP failed: ...`
+        // / `SCP download failed: ...` over ssh). `Io` (mkdir in
+        // `create_directory`, etc.) keeps mapping to `OSError` since
+        // those callsites observed the underlying `OSError` directly.
+        GatewayError::CopyFailed(msg) => pyo3::exceptions::PyRuntimeError::new_err(msg),
         GatewayError::Io(e) => pyo3::exceptions::PyOSError::new_err(e.to_string()),
         GatewayError::Other(msg) => pyo3::exceptions::PyRuntimeError::new_err(msg),
     }

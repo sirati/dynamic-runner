@@ -338,7 +338,7 @@ impl Gateway for SshGateway {
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GatewayError::TransferFailed(stderr.into_owned()));
+            return Err(GatewayError::CopyFailed(stderr.into_owned()));
         }
 
         tracing::debug!(?local, remote = expanded, "file transferred via SCP");
@@ -356,8 +356,16 @@ impl Gateway for SshGateway {
 
         let expanded = self.expand_remote_path(remote);
 
+        // Pre-migration Python's ssh_gateway did NOT pre-create the
+        // local parent — scp itself would fail and the non-zero exit
+        // surfaced as `RuntimeError(f"SCP download failed: ...")`. The
+        // Rust port adds a defensive `mkdir -p` on the local parent;
+        // route any failure through `CopyFailed` so the observed
+        // exception class stays `RuntimeError`, not `OSError`.
         if let Some(parent) = local.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| GatewayError::CopyFailed(format!("SCP download failed: {e}")))?;
         }
 
         let mut cmd = Command::new("scp");
@@ -376,7 +384,7 @@ impl Gateway for SshGateway {
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(GatewayError::TransferFailed(stderr.into_owned()));
+            return Err(GatewayError::CopyFailed(stderr.into_owned()));
         }
 
         tracing::debug!(remote = expanded, ?local, "file downloaded via SCP");

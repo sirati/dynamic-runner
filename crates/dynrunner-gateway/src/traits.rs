@@ -75,8 +75,16 @@ pub enum GatewayError {
     NotConnected,
     #[error("command failed: {0}")]
     CommandFailed(String),
-    #[error("transfer failed: {0}")]
-    TransferFailed(String),
+    /// File copy/transfer operation (`transfer_file`, `download_file`)
+    /// failed. Pre-migration the Python gateways raised
+    /// `RuntimeError(f"File copy failed: ...")` /
+    /// `RuntimeError(f"SCP failed: ...")` for these — the PyO3 mapping
+    /// preserves that contract by translating `CopyFailed` to
+    /// `PyRuntimeError`. Distinct from `Io` (which maps to `OSError`
+    /// and is reserved for filesystem failures unrelated to copy
+    /// semantics, e.g. `create_directory`).
+    #[error("copy failed: {0}")]
+    CopyFailed(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
