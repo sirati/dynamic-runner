@@ -13,7 +13,7 @@ use crate::config::log_paths::LogPathConfig;
 use crate::config::resources::PyResourceMap;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
-use crate::identifier::TokenizerIdentifier;
+use crate::identifier::RunnerIdentifier;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
@@ -279,7 +279,7 @@ impl PySecondaryCoordinator {
                 // trait uses RPIT-in-trait and isn't object-safe;
                 // a sum-type is the only way to pick at runtime.
                 let (peer_network, peer_cert_pem, peer_port): (
-                    dynrunner_transport_quic::EitherPeerTransport<TokenizerIdentifier>,
+                    dynrunner_transport_quic::EitherPeerTransport<RunnerIdentifier>,
                     String,
                     u16,
                 ) = if dist_disable_peer_overlay {
@@ -292,7 +292,7 @@ impl PySecondaryCoordinator {
                         0,
                     )
                 } else {
-                    let pn = dynrunner_transport_quic::PeerNetwork::<TokenizerIdentifier>::start(
+                    let pn = dynrunner_transport_quic::PeerNetwork::<RunnerIdentifier>::start(
                         &secondary_id,
                     )
                     .await
@@ -341,7 +341,7 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
-                let mut secondary: SecondaryCoordinator<_, _, _, _, _, TokenizerIdentifier> = SecondaryCoordinator::new(
+                let mut secondary: SecondaryCoordinator<_, _, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(
                     config,
                     client,
                     peer_network,
