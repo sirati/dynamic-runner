@@ -353,6 +353,7 @@ dependencies = [
  "dynrunner-publish",
  "dynrunner-scheduler",
  "dynrunner-scheduler-api",
+ "dynrunner-slurm",
  "dynrunner-transport-channel",
  "dynrunner-transport-quic",
  "dynrunner-transport-socket",

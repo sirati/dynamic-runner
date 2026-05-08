@@ -88,7 +88,7 @@ def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig
     if getattr(args, "source_already_staged", None):
         overrides["prestaged_src_bins_path"] = args.source_already_staged
     return SlurmConfig(
-        root_folder=Path(root),
+        root_folder=str(root),
         image_subfolder=args.slurm_image_subfolder,
         output_subfolder=args.slurm_output_subfolder,
         log_subfolder=args.slurm_log_subfolder,
