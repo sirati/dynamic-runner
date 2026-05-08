@@ -220,6 +220,17 @@ mkdir -p "$RNDTMP"
 mkdir -p "{src_tmp}" "{out_tmp}" "{log_tmp}" "{socket_dir}"
 
 cleanup() {{
+    # Terminate the command-relay subshell BEFORE removing its FIFO.
+    # The relay loop's `read -r CMD < <fifo>` would otherwise turn into
+    # a tight no-op spin (read fails because the FIFO is gone, the if
+    # body skips, while loop iterates again — observed at ~50K
+    # iterations/sec on the slurm-test-env, writing
+    # "No such file or directory" to stderr at ~1.4 GB/h).
+    # `${{CMD_RELAY_PID:-}}` guard handles early-failure paths where
+    # the relay was never started.
+    if [ -n "${{CMD_RELAY_PID:-}}" ]; then
+        kill -TERM "$CMD_RELAY_PID" 2>/dev/null || true
+    fi
     echo "Cleaning up temporary directory: $RNDTMP"
     rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
 }}
@@ -309,7 +320,11 @@ SOCKET_COUNTER=0
     rm -f "{cmd_socket}" "{cmd_socket}.response"
     mkfifo "{cmd_socket}"
     mkfifo "{cmd_socket}.response"
-    while true; do
+    # Defense-in-depth alongside the cleanup-trap kill: if the FIFO
+    # disappears for any reason (cleanup race, external rm, filesystem
+    # eviction) the loop self-terminates instead of spinning on the
+    # `read` failure.
+    while [ -p "{cmd_socket}" ]; do
         if read -r CMD < "{cmd_socket}"; then
             if [ -n "$CMD" ]; then
                 SOCKET_COUNTER=$((SOCKET_COUNTER + 1))
