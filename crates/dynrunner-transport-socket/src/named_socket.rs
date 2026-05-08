@@ -160,10 +160,15 @@ mod tests {
             let cmd = runner.recv().await.unwrap();
             assert!(matches!(cmd, Command::ProcessTask { .. }));
 
-            // Send Done
+            // Send Done with an opaque byte payload. The framework
+            // treats `result_data` as fully opaque (see codec.rs):
+            // the bytes here are arbitrary and chosen to NOT look
+            // like any plausible int-pair shape, so this test
+            // verifies opaque-bytes round-trip and not accidental
+            // legacy-int parsing.
             runner
                 .send(Response::Done {
-                    result_data: Some(b"5:3".to_vec()),
+                    result_data: Some(b"opaque-payload-bytes".to_vec()),
                 })
                 .await
                 .unwrap();
@@ -186,7 +191,7 @@ mod tests {
         let resp = manager.recv().await.unwrap();
         match resp {
             Response::Done { result_data } => {
-                assert_eq!(result_data.unwrap(), b"5:3");
+                assert_eq!(result_data.unwrap(), b"opaque-payload-bytes");
             }
             _ => panic!("expected Done"),
         }
