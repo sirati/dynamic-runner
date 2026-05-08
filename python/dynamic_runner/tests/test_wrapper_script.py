@@ -437,3 +437,105 @@ def test_wrapper_spawns_podman_teardown_watchdog(
         "skipped when running outside SLURM (where squeue would never find "
         "a matching job and the watchdog would poll indefinitely)"
     )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_cleanup_kills_relay_subshell(
+    manager: SlurmJobManager,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """The cleanup trap must terminate ``$CMD_RELAY_PID`` BEFORE the
+    rm-rf, otherwise the relay subshell's ``read -r CMD < <fifo>``
+    busy-spins on a deleted FIFO at ~50K iter/sec until something
+    external kills it (run-8 reproduced this as a 110-minute spin
+    producing 13 GB of stderr).
+
+    Two-layer guard:
+      1. cleanup() kills CMD_RELAY_PID (with ${...:-} for the
+         early-failure path where the relay was never started),
+      2. the relay loop's `while [ -p <fifo> ]` self-terminates
+         if the FIFO disappears for any reason.
+
+    Either layer alone closes the leak; both together cover signal
+    races, external rms, and missed kills."""
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    # Layer 1: cleanup trap kills the relay subshell.
+    assert 'kill -TERM "$CMD_RELAY_PID"' in wrapper, (
+        "cleanup() must kill CMD_RELAY_PID — without it the relay "
+        "subshell busy-spins on the deleted FIFO after the trap fires"
+    )
+    assert '${CMD_RELAY_PID:-}' in wrapper, (
+        "the kill must be guarded by `${CMD_RELAY_PID:-}` for the "
+        "early-failure path where the relay was never started"
+    )
+
+    # Ordering: kill must precede the rm-rf so the FIFO is removed
+    # only after the loop has stopped reading from it.
+    kill_idx = wrapper.index('kill -TERM "$CMD_RELAY_PID"')
+    rm_idx = wrapper.index('rm -rf "$RNDTMP"')
+    assert kill_idx < rm_idx, (
+        "cleanup() must kill the relay subshell BEFORE removing $RNDTMP "
+        "so the rm doesn't race a still-spinning loop"
+    )
+
+    # Layer 2: the relay loop self-terminates if the FIFO disappears.
+    # Positive check only — `while true` survives elsewhere in the
+    # wrapper (e.g. the watchdog's squeue-poll loop, which has an
+    # internal `break`); we just need the relay loop specifically to
+    # be the `while [ -p <fifo> ]` shape.
+    assert re.search(r'while \[ -p "[^"]+" \]; do\s+if read -r CMD', wrapper), (
+        "relay loop must guard each iteration with `[ -p <fifo> ]` so it "
+        "self-exits when the FIFO is gone"
+    )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_image_load_failure_is_visible(
+    manager: SlurmJobManager,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """Image load is the wrapper's longest-running pre-container step
+    and historically the most common point of opaque failure (large
+    tarball, podman storage exhaustion, layer corruption). When it
+    fails, the wrapper must surface a clear marker on STDOUT (not
+    just rely on `set -e` aborting silently between echos), so an
+    operator reading the .out file sees the failure rather than a
+    "Loading…" line followed by a cleanup trap with no diagnostic."""
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    # Failure check must be in place — `if ! <load_command>` is the
+    # canonical shape that captures the exit code without tripping
+    # set -e.
+    assert "if ! podman" in wrapper and "load <" in wrapper, (
+        "image load must be wrapped in `if ! <load_command>; then ... fi` "
+        "so the wrapper can emit a visible failure marker before exiting; "
+        "bare command + set -e gives no diagnostic on the .out file"
+    )
+
+    # Marker must reach stdout (the .out file consumers check first).
+    assert re.search(r'echo\s+"ERROR: image load failed', wrapper), (
+        "image-load failure must print a clear ERROR marker to stdout"
+    )
+
+    # Marker must also reach stderr (>&2) for log-aggregation tools
+    # that watch stderr severity.
+    assert ">&2" in wrapper and re.search(
+        r'echo\s+"ERROR: image load failed[^"]*"\s*>&2', wrapper
+    ), (
+        "image-load failure must mirror the ERROR marker to stderr"
+    )
