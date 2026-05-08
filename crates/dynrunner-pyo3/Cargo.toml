@@ -29,6 +29,7 @@ dynrunner-transport-channel = { workspace = true }
 dynrunner-gateway = { workspace = true }
 dynrunner-discovery = { workspace = true }
 dynrunner-publish = { workspace = true }
+dynrunner-slurm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 pyo3 = { workspace = true }
