@@ -38,8 +38,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/env.sh}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/lib.sh"
+# See up.sh for the SLURM_TEST_ENV_LIB_SH rationale.
+LIB_SH="${SLURM_TEST_ENV_LIB_SH:-${SCRIPT_DIR}/lib.sh}"
+# shellcheck disable=SC1090
+source "$LIB_SH"
 
 usage() {
   cat <<EOF
