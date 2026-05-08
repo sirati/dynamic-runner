@@ -60,7 +60,7 @@ class SlurmJobManager:
         """Expand tilde paths for remote execution."""
         path_str = str(path)
         if path_str.startswith("~") and hasattr(self.gateway, "remote_home") and self.gateway.remote_home:
-            return path_str.replace("~", self.gateway.remote_home, 1)
+            return path_str.replace("~", str(self.gateway.remote_home), 1)
         return path_str
 
     def _expanded_remote_path(self, path: str | Path) -> Path:
