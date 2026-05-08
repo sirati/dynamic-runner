@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{TaskInfo, Identifier, PhaseId, ResourceMap};
+use dynrunner_core::{resolve_against_root, TaskInfo, Identifier, PhaseId, ResourceMap};
 use dynrunner_protocol_primary_secondary::SecondaryTransport;
 use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
@@ -193,30 +193,33 @@ impl Default for PrimaryConfig {
 
 impl PrimaryConfig {
     /// Compute the wire-side `local_path` for a TaskInfo. In normal
-    /// mode it's the absolute path verbatim. In pre-staged mode it's
-    /// the absolute path with `source_pre_staged_root` stripped, so
-    /// the secondary's `src_network.join(<wire local_path>)` resolves
-    /// to the in-container bind-mount path. Paths that don't sit
-    /// under the root (consumer misconfiguration) pass through
-    /// unchanged — the secondary's `resolve_pre_staged` then fails
-    /// NonRecoverable with the offending path, surfacing the
-    /// mismatch instead of silently routing the wrong file.
+    /// mode it's `binary.path` verbatim; in pre-staged mode it's
+    /// the path's tail relative to `source_pre_staged_root`, so the
+    /// secondary's `src_network.join(<wire>)` resolves to the
+    /// in-container bind-mount. The three legitimate `binary.path`
+    /// shapes (see [`resolve_against_root`]) collapse to the right
+    /// wire form here; out-of-tree paths fall through with a warn —
+    /// the secondary's `resolve_pre_staged` will then fail
+    /// NonRecoverable, surfacing the misconfiguration instead of
+    /// silently routing the wrong file.
     pub fn wire_local_path<I: Identifier>(&self, binary: &TaskInfo<I>) -> String {
-        match &self.source_pre_staged_root {
-            None => binary.path.to_string_lossy().into_owned(),
-            Some(root) => match binary.path.strip_prefix(root) {
-                Ok(rel) => rel.to_string_lossy().into_owned(),
-                Err(_) => {
-                    tracing::warn!(
-                        path = %binary.path.display(),
-                        root = %root.display(),
-                        "wire_local_path: TaskInfo path doesn't sit under \
-                         source_pre_staged_root; passing through unchanged \
-                         — secondary will fail NonRecoverable"
-                    );
-                    binary.path.to_string_lossy().into_owned()
-                }
-            },
+        let Some(root) = self.source_pre_staged_root.as_deref() else {
+            return binary.path.to_string_lossy().into_owned();
+        };
+        let resolved = resolve_against_root(&binary.path, root);
+        match resolved.relative {
+            Some(rel) => rel.to_string_lossy().into_owned(),
+            None => {
+                tracing::warn!(
+                    path = %binary.path.display(),
+                    resolved = %resolved.absolute.display(),
+                    root = %root.display(),
+                    "wire_local_path: TaskInfo path doesn't sit under \
+                     source_pre_staged_root; passing through unchanged \
+                     — secondary will fail NonRecoverable"
+                );
+                binary.path.to_string_lossy().into_owned()
+            }
         }
     }
 }
