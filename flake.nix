@@ -48,10 +48,21 @@
 
           # The wheel/Python-package derivation.
           dynamic-runner = pkgs.python3Packages.callPackage ./nix/wheel.nix { };
+
+          # E2E test_consumer container. Built with `nix build .#dockerImage`
+          # (default `TaskDeploymentSpec.nix_build_target` per
+          # `python/dynamic_runner/deployment_spec.py`). Consumed by the
+          # framework's `--packaging podman` SLURM dispatch in
+          # `tests/e2e/run_e2e.py`. See `nix/test-consumer-image.nix`
+          # for the derivation shape and the references it draws on.
+          dockerImage = pkgs.callPackage ./nix/test-consumer-image.nix {
+            inherit dynamic-runner;
+            testsSrc = ./tests;
+          };
         in
         {
           packages = {
-            inherit dynamic-runner;
+            inherit dynamic-runner dockerImage;
             default = dynamic-runner;
           };
 
