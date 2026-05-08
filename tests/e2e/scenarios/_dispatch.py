@@ -80,12 +80,19 @@ def build_dispatch_argv(
             "--packaging",
             "podman",
             "--gateway",
-            f"ssh://testuser@localhost:{env.ssh_port}",
+            f"ssh://{env.ssh_user}@localhost:{env.ssh_port}",
             "--slurm-root-folder",
             env.slurm_root_folder,
             "--jobs",
             str(jobs if jobs is not None else env.workers),
         ]
+        if env.ssh_config_path is not None:
+            # Pin all the slurm-test-env contract options
+            # (IdentitiesOnly=yes, IdentityAgent=none,
+            # StrictHostKeyChecking=no, UserKnownHostsFile=/dev/null,
+            # explicit IdentityFile) via the framework's --ssh-config
+            # escape hatch (commit 178a3af).
+            argv += ["--ssh-config", str(env.ssh_config_path)]
     elif env.mode == "single-process":
         argv += ["--multi-computer", "single-process"]
     # mode == "in-process" → no --multi-computer flag, framework picks

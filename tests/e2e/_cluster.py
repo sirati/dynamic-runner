@@ -7,99 +7,93 @@ operator action).
 This module does NOT know which scenarios will run. It is reused
 across every ``run_e2e.py`` invocation regardless of scenario
 selection.
+
+Bring-up + tear-down go through the slurm-test-env's flake apps
+(``nix run <flake>#up|#down``) — the flake wraps podman + image
+pinning + env wiring. Raw bash + scavenged-store podman is
+explicitly forbidden (per the slurm-test-env owner's broadcast).
 """
 
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 from pathlib import Path
 
 
-def gateway_container_name(instance_id: str) -> str:
-    """Container name the slurm-test-env scripts produce.
+def is_cluster_running(ssh_port: int) -> bool:
+    """TCP probe of the gateway sshd port.
 
-    Mirrors the naming convention in ``slurm-test-env/deploy/env.sh``::
-
-        GATEWAY_NAME="${GATEWAY_HOSTNAME}-${INSTANCE_ID}"
-        GATEWAY_HOSTNAME="slurm-gateway"
+    Sufficient as an "is it up" gate: if SSH refuses, the cluster is
+    either down or the port is wrong; either way the driver wants
+    bring-up. Doesn't shell out to podman, doesn't ssh, doesn't run
+    nix — just a 2s TCP connect.
     """
-    return f"slurm-gateway-{instance_id}"
-
-
-def is_cluster_running(instance_id: str) -> bool:
-    """Probe ``podman ps`` for the gateway container.
-
-    Returns False on any error (podman missing, daemon unreachable,
-    etc.) — the caller treats False as "needs bring-up", which is
-    correct for the missing-podman case anyway (up.sh will surface
-    a clearer error than this probe could).
-    """
-    name = gateway_container_name(instance_id)
     try:
-        result = subprocess.run(
-            ["podman", "ps", "--format", "{{.Names}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+        with socket.create_connection(("localhost", ssh_port), timeout=2):
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
         return False
-    if result.returncode != 0:
-        return False
-    running = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-    return name in running
 
 
 def bring_cluster_up(
     slurm_test_env_dir: Path, instance_id: str, ssh_port: int
 ) -> None:
-    """Run ``slurm-test-env/deploy/up.sh`` with the configured instance.
+    """Run ``nix run <flake>#up``.
 
-    The bring-up is slow (multi-minute on first run because nix has to
-    build the images). We run it inheriting stdout/stderr so the
-    coordinator can see progress in real time.
+    The flake ships podman + image-build pins + env wrapping, so we
+    must NOT invoke ``deploy/up.sh`` directly (that bash falls back
+    to PATH-podman, which our nix-develop environment doesn't
+    provide). Bring-up is slow (multi-minute on first run because
+    nix has to build the images); we inherit stdout/stderr so the
+    coordinator sees progress in real time.
     """
-    up_sh = slurm_test_env_dir / "deploy" / "up.sh"
-    if not up_sh.exists():
+    if not slurm_test_env_dir.exists():
         raise RuntimeError(
-            f"slurm-test-env up.sh not found at {up_sh} — is this the right repo?"
+            f"slurm-test-env flake dir not found at {slurm_test_env_dir}"
         )
     env = os.environ.copy()
-    env.setdefault("INSTANCE_ID", instance_id)
-    env.setdefault("SSH_PORT", str(ssh_port))
+    env["INSTANCE_ID"] = instance_id
+    env["SSH_PORT"] = str(ssh_port)
     print(
-        f"[cluster] not running; bringing up via {up_sh} "
+        f"[cluster] not running; bringing up via nix run {slurm_test_env_dir}#up "
         f"(instance={instance_id}, ssh_port={ssh_port})",
         flush=True,
     )
-    subprocess.run([str(up_sh)], check=True, env=env, cwd=str(slurm_test_env_dir))
+    subprocess.run(
+        ["nix", "run", f"{slurm_test_env_dir}#up"],
+        check=True,
+        env=env,
+    )
 
 
 def bring_cluster_down(
     slurm_test_env_dir: Path, instance_id: str
 ) -> None:
-    """Run ``slurm-test-env/deploy/down.sh``. Caller decides whether
-    to invoke (default behaviour is to leave the cluster up).
+    """Run ``nix run <flake>#down``. Caller decides whether to invoke
+    (default behaviour is to leave the cluster up).
     """
-    down_sh = slurm_test_env_dir / "deploy" / "down.sh"
-    if not down_sh.exists():
+    if not slurm_test_env_dir.exists():
         raise RuntimeError(
-            f"slurm-test-env down.sh not found at {down_sh}"
+            f"slurm-test-env flake dir not found at {slurm_test_env_dir}"
         )
     env = os.environ.copy()
-    env.setdefault("INSTANCE_ID", instance_id)
+    env["INSTANCE_ID"] = instance_id
     print(
-        f"[cluster] tearing down via {down_sh} (instance={instance_id})",
+        f"[cluster] tearing down via nix run {slurm_test_env_dir}#down "
+        f"(instance={instance_id})",
         flush=True,
     )
-    subprocess.run([str(down_sh)], check=True, env=env, cwd=str(slurm_test_env_dir))
+    subprocess.run(
+        ["nix", "run", f"{slurm_test_env_dir}#down"],
+        check=True,
+        env=env,
+    )
 
 
 __all__ = [
     "bring_cluster_down",
     "bring_cluster_up",
-    "gateway_container_name",
     "is_cluster_running",
 ]
