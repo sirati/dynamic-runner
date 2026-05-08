@@ -5,7 +5,7 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport, PrimaryTransport,
+    ClusterMutation, DistributedMessage, PeerTransport, PrimaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -282,6 +282,62 @@ where
                 tracing::info!(
                     permanent_failures = self.primary_failed.len(),
                     "primary drained after live-primary disconnect; exiting"
+                );
+                break;
+            }
+
+            // Promoted-secondary RunComplete broadcast: when this
+            // secondary IS the promoted primary, its primary-pending +
+            // in-flight + active are all empty (the work is done), and
+            // the local-primary disconnected — broadcast `RunComplete`
+            // so the OTHER secondaries on the peer mesh exit their
+            // own loops. The peer_count==0 path above is the
+            // single-secondary case; in the multi-secondary case the
+            // promoted primary needs to actively signal teardown
+            // because peers can't tell "run over" from "primary
+            // crashed" otherwise.
+            if self.primary_disconnected
+                && self.is_primary
+                && self.peer_transport.peer_count() > 0
+                && self.primary_in_flight.is_empty()
+                && self.active_tasks.is_empty()
+                && self.primary_pending_is_empty()
+                && (self.primary_failed.is_empty()
+                    || self.primary_retry_passes_used
+                        >= self.config.retry_max_passes)
+                && !self.cluster_state.run_complete()
+            {
+                tracing::info!(
+                    "promoted primary done; broadcasting RunComplete \
+                     so peers exit"
+                );
+                self.cluster_state.apply(ClusterMutation::RunComplete);
+                let msg = DistributedMessage::ClusterMutation {
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    mutations: vec![ClusterMutation::RunComplete],
+                };
+                let _ = self.peer_transport.broadcast(msg).await;
+                // Keep iterating; the next loop tick's run-complete
+                // exit (below) will fire on this node now that the
+                // flag is set locally.
+            }
+
+            // Run-complete exit: the primary broadcast
+            // `ClusterMutation::RunComplete` just before returning
+            // from its `run()` (see primary/mod.rs). Once that flag
+            // lands on this node and our local pool has no active
+            // work, we can exit even if peers are still up. Without
+            // this, non-promoted secondaries on a peer mesh sit
+            // forever in failover-detection mode after a clean run
+            // finishes — they have no way to distinguish "run is
+            // genuinely over" from "primary just crashed", so they
+            // hold their SLURM job slots indefinitely.
+            if self.cluster_state.run_complete()
+                && self.active_tasks.is_empty()
+            {
+                tracing::info!(
+                    "RunComplete signal received from primary; exiting"
                 );
                 break;
             }

@@ -89,6 +89,11 @@ pub struct ClusterState<I> {
     /// derived from the consumer's `TaskDefinition` declaration and
     /// don't change for the duration of a run.
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Set by `ClusterMutation::RunComplete`. Sticky monotonic flag —
+    /// once true, the run is over and every node should drain and
+    /// exit. Read by the secondary's operational loop to break out
+    /// even when peers haven't disconnected.
+    run_complete: bool,
 }
 
 impl<I> Default for ClusterState<I> {
@@ -98,6 +103,7 @@ impl<I> Default for ClusterState<I> {
             current_primary: None,
             primary_epoch: 0,
             phase_deps: HashMap::new(),
+            run_complete: false,
         }
     }
 }
@@ -367,7 +373,22 @@ impl<I: Identifier> ClusterState<I> {
                 self.phase_deps = deps;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::RunComplete => {
+                if self.run_complete {
+                    return ApplyOutcome::NoOp;
+                }
+                self.run_complete = true;
+                ApplyOutcome::Applied
+            }
         }
+    }
+
+    /// Whether the run has been declared finished by the primary.
+    /// Sticky monotonic flag: once set, never clears for the lifetime
+    /// of this state. Secondaries read this to break their main loop
+    /// when the peer mesh is still up but the run is genuinely over.
+    pub fn run_complete(&self) -> bool {
+        self.run_complete
     }
 }
 

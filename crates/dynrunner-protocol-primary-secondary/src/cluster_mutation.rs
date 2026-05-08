@@ -39,4 +39,20 @@ pub enum ClusterMutation<I> {
     PhaseDepsSet {
         deps: HashMap<PhaseId, Vec<PhaseId>>,
     },
+    /// "The run is done — every secondary should drain and exit."
+    ///
+    /// Emitted exactly once by the primary just before it returns
+    /// from `run()`, after `run_retry_passes` settles. Without this
+    /// signal, non-promoted secondaries (which were waiting for
+    /// PromotePrimary or driving their workers via the promoted
+    /// peer) have no termination cue when the local primary
+    /// disconnects: they enter failover detection, can't tell the
+    /// run is genuinely over vs. just a primary crash, and stay
+    /// alive holding SLURM job slots indefinitely.
+    ///
+    /// Receivers set a local `run_complete` flag; the operational
+    /// loop's exit condition broadens to `run_complete && pool
+    /// drained` so the post-promotion residual peers all exit
+    /// shortly after the primary returns.
+    RunComplete,
 }
