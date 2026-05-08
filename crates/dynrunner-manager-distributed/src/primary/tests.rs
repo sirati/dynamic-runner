@@ -1613,15 +1613,30 @@ fn wire_local_path_strips_pre_staged_prefix() {
     // Off → verbatim.
     assert_eq!(cfg.wire_local_path(&bin), "/srv/data/bin_0");
 
-    // On with matching prefix → relative.
+    // On with matching prefix (abs-under-src) → relative tail.
     cfg.source_pre_staged_root = Some(std::path::PathBuf::from("/srv/data"));
     assert_eq!(cfg.wire_local_path(&bin), "bin_0");
 
-    // On with mismatching prefix → verbatim (consumer misconfig is
-    // surfaced downstream by resolve_pre_staged returning None, not
-    // silently re-routed).
+    // On with mismatching prefix (abs-out-of-tree) → verbatim
+    // (consumer misconfig is surfaced downstream by
+    // `resolve_pre_staged` returning None, not silently re-routed).
     cfg.source_pre_staged_root = Some(std::path::PathBuf::from("/other/prefix"));
     assert_eq!(cfg.wire_local_path(&bin), "/srv/data/bin_0");
+
+    // On with a relative `binary.path` (rel-under-src — the post-
+    // Bug-B wire-id shape consumers emit). Resolving the relative
+    // path against the prestaged root and re-stripping yields the
+    // original relative form verbatim, which is exactly what
+    // `secondary.src_network.join(<wire>)` expects. Pre-fix the
+    // relative path silently fell through the strip-prefix Err arm
+    // and shipped as-is — the value happened to be correct, but
+    // for the wrong reason; this test pins the explicit round-trip.
+    cfg.source_pre_staged_root = Some(std::path::PathBuf::from("/srv/data"));
+    bin.path = std::path::PathBuf::from("bin_0");
+    assert_eq!(cfg.wire_local_path(&bin), "bin_0");
+
+    bin.path = std::path::PathBuf::from("nested/bin_1");
+    assert_eq!(cfg.wire_local_path(&bin), "nested/bin_1");
 }
 
 /// Multi-secondary mesh-ready gate: the primary must NOT issue
