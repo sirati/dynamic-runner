@@ -174,7 +174,37 @@ cleanup() {{
         wait "$CMD_RELAY_PID" 2>/dev/null || true
     fi
     echo "Cleaning up temporary directory: $RNDTMP"
-    rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
+    # Per-file unlink for the image tarball: it's host-UID owned
+    # (cp'd in by this wrapper before any container ran), so a
+    # plain `rm -f` reaches it without entering the user-namespace.
+    # Guarded with `${{LOCAL_IMAGE:-}}` because the trap is installed
+    # before LOCAL_IMAGE gets assigned, so early-failure paths
+    # (port probe, etc.) reach cleanup with the variable unset.
+    # `--` stops accidental flag interpretation. The "rm -rf in
+    # scripts is dangerous" rule pushes us toward per-file unlink
+    # wherever feasible — recursive tree-rm is reserved for
+    # $RNDTMP itself, where there's no other mechanism.
+    if [ -n "${{LOCAL_IMAGE:-}}" ] && [ -e "$LOCAL_IMAGE" ]; then
+        rm -f -- "$LOCAL_IMAGE" 2>/dev/null \
+            || echo "WARNING: failed to unlink $LOCAL_IMAGE" >&2
+    fi
+    # Tmp-tree teardown via `podman unshare`: rootless podman
+    # writes files into $RNDTMP/storage owned by mapped subuids
+    # the host operator's UID can't unlink directly (this leaked
+    # ~3.2 GB per run on slurm-test-env workers — bug AA in the
+    # field log). `podman unshare` enters the user-namespace where
+    # those files are reachable. Plain `rm -rf` is a defensive
+    # fallback for the no-podman case; shouldn't fire on real
+    # workers but keeps the wrapper safe to dry-run on a host
+    # without podman installed. `--` guards against $RNDTMP ever
+    # starting with a dash. Result is logged after the rm
+    # completes so a silent leak is impossible to miss in logs.
+    if podman unshare rm -rf -- "$RNDTMP" 2>/dev/null \
+        || rm -rf -- "$RNDTMP" 2>/dev/null; then
+        echo "Cleaned up temporary directory: $RNDTMP"
+    else
+        echo "ERROR: failed to clean up $RNDTMP — /tmp scratch leaked on $(hostname)" >&2
+    fi
 }}
 # Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
 # at time-limit / scancel, SIGHUP by an ssh disconnect, SIGINT by
@@ -520,7 +550,28 @@ mkdir -p "$RNDTMP"
 cleanup() {{
     echo ""
     echo "Cleaning up temporary directory: $RNDTMP"
-    rm -rf "$RNDTMP" 2>/dev/null || sudo rm -rf "$RNDTMP" 2>/dev/null || true
+    # Per-file unlink of the image tarball before the tree rm —
+    # tarball is host-UID owned (cp'd in by this wrapper), so
+    # plain rm reaches it without entering the user-namespace.
+    # `${{LOCAL_IMAGE:-}}` guard covers early-exit paths that hit
+    # the trap before LOCAL_IMAGE was assigned. See the secondary
+    # wrapper's cleanup() for the rationale on per-file vs tree.
+    if [ -n "${{LOCAL_IMAGE:-}}" ] && [ -e "$LOCAL_IMAGE" ]; then
+        rm -f -- "$LOCAL_IMAGE" 2>/dev/null \
+            || echo "WARNING: failed to unlink $LOCAL_IMAGE" >&2
+    fi
+    # `podman unshare rm -rf` is the only mechanism that reaches
+    # the subuid-mapped files rootless `podman load` writes into
+    # $RNDTMP/storage. Plain rm fallback keeps the wrapper safe
+    # on hosts without podman. `--` blocks accidental flag
+    # interpretation. Result logged AFTER the rm so a leak is
+    # never silent.
+    if podman unshare rm -rf -- "$RNDTMP" 2>/dev/null \
+        || rm -rf -- "$RNDTMP" 2>/dev/null; then
+        echo "Cleaned up temporary directory: $RNDTMP"
+    else
+        echo "ERROR: failed to clean up $RNDTMP — /tmp scratch leaked on $(hostname)" >&2
+    fi
 }}
 # Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
 # at time-limit / scancel, SIGHUP by an ssh disconnect, SIGINT by
@@ -779,15 +830,7 @@ mod tests {
 
     #[test]
     fn test_wrapper_traps_termination_signals() {
-        let cfg = TestWrapperScriptConfig {
-            image_path: "/images/test.tar",
-            image_name: "test-app",
-            image_tag: "latest",
-            image_tar_basename: "test-app.tar",
-            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
-            container_command: "my_runner",
-        };
-        let script = generate_test_wrapper_script(&cfg);
+        let script = generate_test_wrapper_script(&test_wrapper_cfg());
         assert!(script.contains("trap cleanup EXIT TERM HUP INT"));
         assert!(script.contains("/tmp/asm-test-"));
         assert!(script.contains("test-app.tar"));
@@ -801,5 +844,139 @@ mod tests {
         assert_eq!(bash_quote("a b"), "'a b'");
         assert_eq!(bash_quote("it's"), "'it'\\''s'");
         assert_eq!(bash_quote("--pids-limit=16384"), "--pids-limit=16384");
+    }
+
+    /// Bug AA in the field log: rootless `podman load` writes
+    /// $RNDTMP/storage files owned by mapped subuids that the
+    /// host operator's UID can't unlink. The pre-fix cleanup
+    /// silently swallowed the failure and leaked ~3.2 GB per
+    /// run. The fix routes the tree-rm through `podman unshare`
+    /// so it runs inside the user-namespace where those files
+    /// are reachable, with a plain-rm fallback for hosts
+    /// without podman.
+    #[test]
+    fn cleanup_uses_podman_unshare_for_rndtmp_teardown() {
+        let config = SlurmConfig::default();
+        let script = generate_wrapper_script(&standard_cfg(&config, &[]));
+        assert!(
+            script.contains("podman unshare rm -rf -- \"$RNDTMP\""),
+            "cleanup must use `podman unshare rm` to reach subuid-mapped files"
+        );
+        // `--` is critical: blocks accidental flag interpretation
+        // if $RNDTMP ever starts with a dash.
+        assert!(script.contains("rm -rf -- \"$RNDTMP\""));
+        // Old `sudo rm -rf` fallback is gone — sudo can't help
+        // with user-ns subuid files (different uid space) and
+        // workers don't have sudo anyway.
+        assert!(
+            !script.contains("sudo rm -rf"),
+            "sudo fallback was removed — it never worked for subuid-mapped files"
+        );
+    }
+
+    /// Per-file unlink for the image tarball: it's host-UID
+    /// owned (cp'd in by the wrapper before any container ran),
+    /// so a plain `rm -f` reaches it. The "rm -rf in scripts is
+    /// dangerous" rule pushes us to per-file unlink wherever
+    /// feasible.
+    #[test]
+    fn cleanup_unlinks_local_image_per_file() {
+        let config = SlurmConfig::default();
+        let script = generate_wrapper_script(&standard_cfg(&config, &[]));
+        assert!(
+            script.contains("rm -f -- \"$LOCAL_IMAGE\""),
+            "cleanup must per-file unlink $LOCAL_IMAGE before tree-rm"
+        );
+        // The `${LOCAL_IMAGE:-}` guard covers early-exit paths
+        // that hit the trap before LOCAL_IMAGE was assigned.
+        assert!(script.contains("${LOCAL_IMAGE:-}"));
+    }
+
+    /// On rm failure the wrapper must log to stderr — silent
+    /// `|| true` is what masked Bug AA in the first place. On
+    /// success the cleanup line must appear AFTER the rm runs,
+    /// not before, so logs reflect the actual outcome.
+    #[test]
+    fn cleanup_logs_failure_to_stderr_and_success_after_rm() {
+        let config = SlurmConfig::default();
+        let script = generate_wrapper_script(&standard_cfg(&config, &[]));
+        // Failure is logged to stderr (`>&2`) with a marker that
+        // log scrapers can match on. The "leaked" wording is
+        // load-bearing for the field-ops grep.
+        assert!(
+            script.contains("/tmp scratch leaked on $(hostname)") && script.contains(">&2"),
+            "cleanup must log rm failures to stderr with a scrapable marker"
+        );
+        // Success is logged AFTER the rm completes — the
+        // `Cleaned up` (past-tense) string sits inside the
+        // success branch, not before the rm.
+        assert!(script.contains("Cleaned up temporary directory: $RNDTMP"));
+    }
+
+    /// Shared test fixture for the image-validation wrapper.
+    /// Mirrors the shape used by `test_wrapper_traps_termination_signals`
+    /// so all test-wrapper assertions render against the same input.
+    fn test_wrapper_cfg() -> TestWrapperScriptConfig<'static> {
+        TestWrapperScriptConfig {
+            image_path: "/images/test.tar",
+            image_name: "test-app",
+            image_tag: "latest",
+            image_tar_basename: "test-app.tar",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            container_command: "my_runner",
+        }
+    }
+
+    /// Same fix applies to the image-validation wrapper: it
+    /// also runs `podman load` into $RNDTMP/storage and so
+    /// produces the same subuid-mapped tree.
+    #[test]
+    fn test_wrapper_cleanup_uses_podman_unshare() {
+        let script = generate_test_wrapper_script(&test_wrapper_cfg());
+        assert!(script.contains("podman unshare rm -rf -- \"$RNDTMP\""));
+        assert!(script.contains("rm -f -- \"$LOCAL_IMAGE\""));
+        assert!(!script.contains("sudo rm -rf"));
+    }
+
+    /// Render both wrappers and run `bash -n` on each to catch
+    /// quoting / brace / heredoc regressions at unit-test time.
+    /// Without this guard a misplaced `{` or unbalanced quote
+    /// only surfaces on the compute node, where diagnosis costs
+    /// a SLURM round-trip.
+    #[test]
+    fn rendered_wrapper_passes_bash_syntax_check() {
+        use std::io::Write;
+        use std::process::Command;
+
+        // Skip cleanly if `bash` isn't on PATH (e.g. a
+        // stripped-down CI image). Letting the test fail there
+        // would force every consumer of the crate to install
+        // bash before they can run `cargo test`, which isn't
+        // what this guard is meant to enforce.
+        if Command::new("bash").arg("--version").output().is_err() {
+            eprintln!("skipping: bash not available on PATH");
+            return;
+        }
+
+        let config = SlurmConfig::default();
+        let secondary = generate_wrapper_script(&standard_cfg(&config, &[]));
+        let test_wrapper = generate_test_wrapper_script(&test_wrapper_cfg());
+
+        for (label, script) in [("secondary", secondary), ("test", test_wrapper)] {
+            let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            tmp.write_all(script.as_bytes()).expect("write script");
+            let path = tmp.into_temp_path();
+            let out = Command::new("bash")
+                .arg("-n")
+                .arg(&path)
+                .output()
+                .expect("spawn bash -n");
+            assert!(
+                out.status.success(),
+                "{label} wrapper failed `bash -n`:\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        }
     }
 }
