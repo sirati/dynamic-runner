@@ -58,6 +58,8 @@ where
         let mut completed_task_ids: HashSet<String> = HashSet::new();
         let mut primary_completed: HashSet<String> = HashSet::new();
         let mut items: Vec<TaskInfo<I>> = Vec::new();
+        let mut in_flight_pairs: Vec<(String, PhaseId)> = Vec::new();
+        let mut in_flight_seed: Vec<(String, PhaseId, String, TaskInfo<I>)> = Vec::new();
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             match state {
@@ -70,12 +72,68 @@ where
                 TaskState::Pending { task } => {
                     if !self.active_tasks.contains_key(hash) {
                         items.push(task.clone());
+                    } else {
+                        // Pending in cluster_state but actively
+                        // running on a worker of THIS node. The
+                        // production initial-assignment path
+                        // dispatches TaskAssignment over the wire
+                        // without firing a `TaskAssigned` cluster
+                        // mutation, so cluster_state stays `Pending`
+                        // even after dispatch. Locally we know
+                        // the task is in flight (the hash is in
+                        // `active_tasks`); treat it as in-flight
+                        // for pool seeding purposes — same as the
+                        // `InFlight` arm — so dependents validate
+                        // and the pool counter drains correctly
+                        // when this node's worker reports
+                        // completion through `note_primary_item_completed`.
+                        if let Some(id) = &task.task_id {
+                            in_flight_pairs.push((id.clone(), task.phase_id.clone()));
+                        }
+                        in_flight_seed.push((
+                            hash.clone(),
+                            task.phase_id.clone(),
+                            self.config.secondary_id.clone(),
+                            task.clone(),
+                        ));
                     }
                 }
-                TaskState::InFlight { .. } => {
-                    // Owned by the dispatcher that issued the
-                    // assignment; the post-promotion primary does
-                    // not seed in-flight items into its own pool.
+                TaskState::InFlight { task, secondary, .. } => {
+                    // The originating dispatcher owns the work; this
+                    // node will observe completion via the broadcast
+                    // path (peer's TaskComplete on success / TaskFailed
+                    // on terminal failure). To make that observation
+                    // affect the new primary's pool correctly we need
+                    // three things:
+                    //   1. Seed the task_id into `in_flight_tasks` so
+                    //      `extend()`'s dep validation accepts Pending
+                    //      variants whose `task_depends_on` references
+                    //      an in-flight task. Without this every such
+                    //      dependent fails `UnknownTaskDep` and the new
+                    //      primary degrades to "no pending tasks".
+                    //   2. Bump `in_flight_per_phase` for the in-flight
+                    //      task's phase so phase-lifecycle drains
+                    //      correctly when completion arrives — the
+                    //      counter must drop from N+1 to N, not from
+                    //      0 to 0.
+                    //   3. Insert into `primary_in_flight` keyed by
+                    //      file_hash so when the broadcast TaskComplete
+                    //      lands in `dispatch_message`'s
+                    //      TaskComplete arm and triggers
+                    //      `note_primary_item_completed`, the lookup
+                    //      finds the (phase_id, task_id) pair and
+                    //      forwards to `pool.on_item_finished`.
+                    // (1) and (2) are owned by the pool via
+                    // `mark_tasks_in_flight` below; (3) is local state.
+                    if let Some(id) = &task.task_id {
+                        in_flight_pairs.push((id.clone(), task.phase_id.clone()));
+                    }
+                    in_flight_seed.push((
+                        hash.clone(),
+                        task.phase_id.clone(),
+                        secondary.clone(),
+                        task.clone(),
+                    ));
                 }
             }
         }
@@ -85,12 +143,21 @@ where
 
         let phase_deps = self.cluster_state.phase_deps().clone();
 
-        // Phase set = union of (declared phases via deps map) and
-        // (phases observed in the items). Both directions are needed:
-        // the deps map may declare an empty-but-real phase, and the
-        // items may carry a phase the deps map omits.
+        // Phase set = union of (declared phases via deps map),
+        // (phases observed in the items), and (phases of in-flight
+        // tasks). The third source matters when a phase has had every
+        // item dispatched pre-promotion: the items list is empty for
+        // that phase, but `mark_tasks_in_flight` will bump its
+        // counter and the phase must exist in `phase_state` for
+        // drain transitions to fire.
         let mut phase_ids: HashSet<PhaseId> =
             items.iter().map(|i| i.phase_id.clone()).collect();
+        for (_, phase_id) in &in_flight_pairs {
+            phase_ids.insert(phase_id.clone());
+        }
+        for (_, phase_id, _, _) in &in_flight_seed {
+            phase_ids.insert(phase_id.clone());
+        }
         for (child, parents) in &phase_deps {
             phase_ids.insert(child.clone());
             for p in parents {
@@ -101,6 +168,7 @@ where
         let pool = match PendingPool::new(phase_ids, phase_deps) {
             Ok(mut p) => {
                 p.mark_tasks_completed(completed_task_ids);
+                p.mark_tasks_in_flight(in_flight_pairs);
                 if let Err(e) = p.extend(items) {
                     tracing::error!(
                         error = %e,
@@ -122,11 +190,27 @@ where
             }
         };
 
+        // Seed `primary_in_flight` only after `extend` succeeded — a
+        // failure on the items batch leaves `primary_pending = None`
+        // and any in_flight ledger we'd populated would be stranded.
+        for (hash, phase_id, secondary, binary) in in_flight_seed {
+            self.primary_in_flight.insert(
+                hash,
+                PrimaryInFlightItem {
+                    phase_id,
+                    target_secondary_id: secondary,
+                    binary,
+                },
+            );
+        }
+
         let pending_count = pool.len();
+        let in_flight_count = self.primary_in_flight.len();
         self.primary_pending = Some(pool);
 
         tracing::info!(
             pending = pending_count,
+            in_flight = in_flight_count,
             completed = self.primary_completed.len(),
             "populated primary task list"
         );
