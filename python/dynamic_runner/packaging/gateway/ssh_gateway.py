@@ -93,7 +93,14 @@ class SSHGateway:
             logger.error(f"stderr: {result.stderr}")
             if result.stdout:
                 logger.error(f"stdout: {result.stdout}")
-            raise RuntimeError(f"SSH master connection failed: {result.stderr}")
+            raise RuntimeError(
+                f"SSH master connection failed: {result.stderr.strip()}\n"
+                "If this is a host-key/known_hosts issue (ephemeral host keys, "
+                "port reuse across container instances) or any other ssh -o "
+                "option needs adjusting, pass --ssh-config <path> with the "
+                "required options — that's the generic escape hatch and any "
+                "ssh_config(5) directive applies."
+            )
 
         logger.info("SSH master connection established successfully")
         self.connected = True
