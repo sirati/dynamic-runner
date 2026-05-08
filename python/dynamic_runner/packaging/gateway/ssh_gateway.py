@@ -272,10 +272,6 @@ class SSHGateway:
 
         cmd.extend(self.auth_options())
 
-        # Disable host key checking warnings (optional, can be made configurable)
-        # cmd.extend(["-o", "StrictHostKeyChecking=no"])
-        # cmd.extend(["-o", "UserKnownHostsFile=/dev/null"])
-
         return cmd
 
     def _build_ssh_command(self, remote_command: str) -> list[str]:
