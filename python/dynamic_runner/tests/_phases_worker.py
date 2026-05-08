@@ -141,7 +141,11 @@ def _run_protocol(
             # non-zero gap between successive items (helps make the
             # `max(A.ts) <= min(B.ts)` assertion robust).
             time.sleep(0.01)
-            conn.sendall(b"done:0:0\n")
+            # Bare ``done`` — the wire's opaque ``result_data``
+            # field carries no payload here (this stub doesn't track
+            # warnings/filtered counters). The framework only needs
+            # ``done:`` vs ``error:`` for its own correctness.
+            conn.sendall(b"done\n")
     conn.close()
 
 
