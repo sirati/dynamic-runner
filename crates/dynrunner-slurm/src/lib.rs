@@ -5,7 +5,7 @@ pub mod preparation;
 pub mod wrapper_script;
 
 pub use config::SlurmConfig;
-pub use job_manager::SlurmJobManager;
+pub use job_manager::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
 pub use packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
 pub use preparation::{InfoFileReader, PrepError, PreparationOptions, SlurmPreparation};
 pub use wrapper_script::{
