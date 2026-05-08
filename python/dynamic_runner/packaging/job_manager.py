@@ -155,6 +155,7 @@ class SlurmJobManager:
         """Generate bash wrapper script for SLURM job."""
         rnd_suffix = secrets.token_hex(4)
         rndtmp = f"/tmp/asm-{rnd_suffix}"
+        container_name = f"asm-{rnd_suffix}-{secondary_id}"
 
         src_tmp = f"{rndtmp}/src"
         out_tmp = f"{rndtmp}/out"
@@ -348,6 +349,51 @@ echo "Loading image into container runtime..."
 {self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
 echo "Image loaded successfully"
 
+CONTAINER_NAME="{container_name}"
+
+# Detached fallback teardown for the conmon-double-fork-escapes-
+# cgroup case observed in the field: when SLURM proctrack/cgroup
+# either isn't in use or doesn't track the container monitor's
+# detached pid, scancel/timeout/SIGTERM doesn't propagate into
+# the container — conmon and its children survive both the
+# wrapper's death and the SLURM job's termination, leaking
+# storage and worker processes on the compute node.
+#
+# Watchdog polls `squeue -j $SLURM_JOB_ID` once a second; when
+# the job is gone (squeue exit 0 + empty stdout — distinct from
+# transient query failure which exits nonzero), it issues
+# `podman kill` then `podman rm -f` on this wrapper's container
+# by name. Detached via `setsid -f` so it survives wrapper exit
+# and (where possible) cgroup teardown of the wrapper's pidtree.
+#
+# If proctrack/cgroup is in fact tracking the watchdog too, the
+# watchdog dies alongside the rest — but in that case the
+# container is also dead, so there's nothing to clean up. Either
+# branch leaves the system in a clean state.
+#
+# Skipped when SLURM_JOB_ID is empty (running outside SLURM):
+# squeue would never find a matching job so the watchdog could
+# never exit cleanly.
+if [ -n "${{SLURM_JOB_ID:-}}" ]; then
+    setsid -f bash -c '
+        job_id="$1"
+        cname="$2"
+        storage="$3"
+        runroot="$4"
+        while true; do
+            sleep 1
+            if out=$(squeue -j "$job_id" -h -o "%i" 2>/dev/null); then
+                [ -n "$out" ] || break
+            fi
+        done
+        podman --root "$storage" --runroot "$runroot" kill --signal TERM "$cname" 2>/dev/null
+        sleep 5
+        podman --root "$storage" --runroot "$runroot" rm -f "$cname" 2>/dev/null
+    ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
+        </dev/null >/dev/null 2>&1
+    echo "Spawned podman teardown watchdog for SLURM job $SLURM_JOB_ID (container $CONTAINER_NAME)"
+fi
+
 echo "Starting Docker container..."
 echo "  Volumes:"
 echo "    {src_tmp} -> /app/src-tmp"
@@ -375,6 +421,7 @@ echo ""
 # fail loud-and-fast with a clear "image not in local storage"
 # error instead.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
+    --name "$CONTAINER_NAME" \
     --pull=never \
     --network host \
     --pids-limit=16384 \
@@ -398,6 +445,7 @@ echo ""
 # `--pull=never`: see the reverse-mode block above for the
 # rationale; same incomplete-load → registry-fallback pitfall.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
+    --name "$CONTAINER_NAME" \
     --pull=never \
     --network host \
     --pids-limit=16384 \
