@@ -1,43 +1,45 @@
-"""End-to-end driver for the synthetic dynrunner consumer.
+"""End-to-end driver — orchestrates scenarios on the slurm-test-env.
 
-Runs the full dispatch flow (source-dir prep → framework SLURM
-dispatch → publish → output assertion) against a running
-``slurm-test-env`` cluster. Designed to be run by a coordinator that
-monitors the dispatch log for liveness.
-
-Coordinator contract
---------------------
-
-The coordinator is expected to monitor the dispatch log for progress.
-This driver intentionally stays simple — it does not implement its
-own watchdog. The expected hang-detection protocol::
-
-    coordinator: poll log mtime once per minute via Monitor/ScheduleWakeup.
-    coordinator: if 5 min passes with no log activity, surface to user.
-    coordinator: never auto-restart the cluster — call down/up manually.
-
-The cluster stays UP between runs to amortise startup cost. This
-driver does not run ``down.sh`` on success or failure.
+Single concern: scenario selection, cluster lifecycle, hang
+detection, exit-code reporting. Knows nothing about how each
+scenario produces its dispatch argv or asserts its outputs — those
+live behind the :class:`Scenario` API in
+:mod:`tests.e2e.scenarios`.
 
 Usage
 -----
 
 ::
 
-    python tests/e2e/run_e2e.py [--timeout 1800] [--num-tasks N]
+    run_e2e.py --scenario phase-deps [--workers 4] [--timeout 1800]
+    run_e2e.py --scenario all [--down-on-success]
+
+Scenarios available are enumerated from
+:mod:`tests.e2e.scenarios`; see the per-scenario module docstrings
+for what each one exercises.
+
+Hang-detection contract
+-----------------------
+
+The driver writes a heartbeat file every 10s while the dispatch's
+log is showing fresh activity. An outer watcher (coordinator-side
+``Monitor`` poll, shell wrapper, cron) reads the file's mtime and
+alerts if it goes stale beyond a threshold (typically 5 min).
+
+On overall-timeout (``--timeout``, default 30 min), the driver
+prints a multi-line "SLURM CLUSTER MAY BE STUCK — manual inspection
+required" block and exits 124. The cluster is left UP across runs
+so that follow-up iterations don't pay the bring-up cost; only
+``--down-on-success`` flips that.
 
 Exit codes
 ----------
 
-* ``0``   — all phases dispatched, all expected outputs landed.
-* ``1``   — dispatch failed or expected outputs missing.
-* ``2``   — argparse / setup error.
-* ``124`` — overall timeout exceeded; cluster may be stuck. The
-  message printed in this case explicitly tells the operator the
-  cluster needs a manual ``down.sh && up.sh`` reset.
-
-The cluster itself is left running on every exit path so a
-follow-up iteration can run without paying the startup cost.
+* 0   — every requested scenario passed.
+* 1   — at least one scenario failed (assertion or non-zero
+        dispatch exit).
+* 2   — argparse / setup error.
+* 124 — overall timeout exceeded; cluster may be stuck.
 """
 
 from __future__ import annotations
@@ -45,301 +47,273 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
 
+# Support both ``python -m tests.e2e.run_e2e`` (used as a module) and
+# ``python tests/e2e/run_e2e.py`` (used as a script). When invoked as
+# a script ``__package__`` is empty and relative imports raise
+# ImportError; we fall back to absolute imports after putting the
+# repo root on sys.path. This matches the convention every other
+# ``-m``-runnable script in the repo follows; centralising the dance
+# would just reintroduce a meta-import that has the same problem.
+if __package__:
+    from ._cluster import bring_cluster_down, bring_cluster_up, is_cluster_running
+    from ._dispatch_runner import run_plan
+    from ._heartbeat import (
+        HEARTBEAT_PERIOD_S,
+        HeartbeatWriter,
+        heartbeat_path_for_pid,
+    )
+    from .scenarios import Scenario, all_scenarios, scenario_names
+    from .scenarios._base import DispatchEnv, ScenarioResult
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tests.e2e._cluster import (  # noqa: E402
+        bring_cluster_down,
+        bring_cluster_up,
+        is_cluster_running,
+    )
+    from tests.e2e._dispatch_runner import run_plan  # noqa: E402
+    from tests.e2e._heartbeat import (  # noqa: E402
+        HEARTBEAT_PERIOD_S,
+        HeartbeatWriter,
+        heartbeat_path_for_pid,
+    )
+    from tests.e2e.scenarios import (  # noqa: E402
+        Scenario,
+        all_scenarios,
+        scenario_names,
+    )
+    from tests.e2e.scenarios._base import (  # noqa: E402
+        DispatchEnv,
+        ScenarioResult,
+    )
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SLURM_TEST_ENV_DIR = REPO_ROOT / "slurm-test-env"
+
 DEFAULT_INSTANCE_ID = "e2e"
 DEFAULT_SSH_PORT = 2222
 DEFAULT_TIMEOUT_S = 1800
-DEFAULT_NUM_TASKS = 2
+DEFAULT_WORKERS = 4
+DEFAULT_SLURM_ROOT_FOLDER = "/home/testuser/dynrunner-e2e"
+
+# How many seconds without log activity before the heartbeat thread
+# stops touching its file (so an outer watcher knows the dispatch
+# is hung). Independent of HEARTBEAT_PERIOD_S because progress
+# detection and heartbeat tick can have different cadences.
+LOG_QUIESCENT_THRESHOLD_S = 300.0
 
 
-# ─── slurm-test-env lifecycle (idempotent) ──────────────────────────
+def _print_timeout_help(instance_id: str, heartbeat_file: Path) -> None:
+    """The "stuck cluster" message the user explicitly asked for.
 
-
-def _gateway_container_name(instance_id: str) -> str:
-    """Container name the slurm-test-env scripts produce.
-
-    Mirrors the naming convention in ``slurm-test-env/deploy/env.sh``::
-
-        GATEWAY_NAME="${GATEWAY_HOSTNAME}-${INSTANCE_ID}"
-        GATEWAY_HOSTNAME="slurm-gateway"
+    Printed on overall-timeout (124) so the operator knows what to
+    inspect manually. The exact wording is verbatim from the user
+    spec because the message is part of the contract — if the
+    operator greps logs for it, the string must match.
     """
-    return f"slurm-gateway-{instance_id}"
-
-
-def _is_cluster_running(instance_id: str) -> bool:
-    """Probe ``podman ps`` for the gateway container.
-
-    Returns False on any error (podman missing, daemon unreachable,
-    etc.) — the caller treats False as "needs bring-up", which is
-    correct for the missing-podman case anyway (up.sh will surface
-    a clearer error than this probe could).
-    """
-    name = _gateway_container_name(instance_id)
-    try:
-        result = subprocess.run(
-            ["podman", "ps", "--format", "{{.Names}}"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
-        return False
-    running = {line.strip() for line in result.stdout.splitlines() if line.strip()}
-    return name in running
-
-
-def _bring_cluster_up(instance_id: str, ssh_port: int) -> None:
-    """Run ``slurm-test-env/deploy/up.sh`` with the configured instance.
-
-    The bring-up is slow (multi-minute on first run because nix has to
-    build the images). We run it inheriting stdout/stderr so the
-    coordinator can see progress in real time.
-    """
-    up_sh = SLURM_TEST_ENV_DIR / "deploy" / "up.sh"
-    if not up_sh.exists():
-        raise RuntimeError(
-            f"slurm-test-env up.sh not found at {up_sh} — is this the right repo?"
-        )
-    env = os.environ.copy()
-    env.setdefault("INSTANCE_ID", instance_id)
-    env.setdefault("SSH_PORT", str(ssh_port))
     print(
-        f"[run_e2e] cluster not running; bringing up via {up_sh} "
-        f"(instance={instance_id}, ssh_port={ssh_port})",
-        flush=True,
-    )
-    subprocess.run([str(up_sh)], check=True, env=env, cwd=str(SLURM_TEST_ENV_DIR))
-
-
-# ─── source / output staging ────────────────────────────────────────
-
-
-def _prepare_source_dir(num_tasks: int) -> Path:
-    """Materialise N small input files under a fresh tmpdir.
-
-    The synthetic task's ``discover_items`` builds TaskInfos with paths
-    like ``input-0.txt``; the framework needs those paths to exist on
-    disk because the SLURM packaging path uploads them to the gateway.
-    """
-    src_dir = Path(tempfile.mkdtemp(prefix="dynrunner-e2e-src-"))
-    for i in range(num_tasks):
-        (src_dir / f"input-{i}.txt").write_bytes(
-            f"input-{i}-payload\n".encode()
-        )
-    return src_dir
-
-
-def _prepare_output_dir() -> Path:
-    """Fresh output dir per-run. Caller decides cleanup policy."""
-    out_dir = Path(tempfile.mkdtemp(prefix="dynrunner-e2e-out-"))
-    return out_dir
-
-
-# ─── dispatch ───────────────────────────────────────────────────────
-
-
-def _build_dispatch_argv(
-    source_dir: Path,
-    output_dir: Path,
-    num_tasks: int,
-    mode: str,
-    ssh_port: int,
-    slurm_root_folder: str,
-) -> list[str]:
-    """Build the framework dispatch CLI for the synthetic consumer.
-
-    The mode is a parameter so the driver can be pointed at the simple
-    in-process ``run_local`` path for fast smoke checks during
-    development without re-touching every flag. ``slurm`` is the
-    canonical e2e mode the user-facing test runs against.
-    """
-    argv: list[str] = [
-        sys.executable,
-        "-m",
-        "tests.e2e.test_consumer",
-        "--source",
-        str(source_dir),
-        "--output",
-        str(output_dir),
-        "--num-tasks",
-        str(num_tasks),
-        "--raw-logs",
-    ]
-    if mode == "slurm":
-        argv += [
-            "--multi-computer",
-            "slurm",
-            "--packaging",
-            "podman",
-            "--gateway",
-            f"ssh://testuser@localhost:{ssh_port}",
-            "--slurm-root-folder",
-            slurm_root_folder,
-            "--jobs",
-            "1",
-        ]
-    elif mode == "single-process":
-        argv += ["--multi-computer", "single-process"]
-    # mode == "in-process" → no --multi-computer flag, framework picks
-    # the in-process run_local path.
-    return argv
-
-
-def _run_dispatch(
-    argv: list[str],
-    log_file: Path,
-    publish_src_root: Path,
-    publish_dst_root: Path,
-    timeout_s: int,
-) -> int:
-    """Execute the framework dispatch and tee its output to ``log_file``.
-
-    Reads stdout line-by-line so the coordinator's tail can observe
-    progress in near real time. The publish env vars are set in the
-    child process group so workers (in local mode) write+publish into
-    the test-managed roots; in SLURM mode the wrapper overrides these
-    with ``/app/out-{tmp,network}`` inside the container, but exporting
-    them here is harmless.
-    """
-    env = os.environ.copy()
-    env["DYNRUNNER_PUBLISH_SRC_ROOT"] = str(publish_src_root)
-    env["DYNRUNNER_PUBLISH_DST_ROOT"] = str(publish_dst_root)
-    # The consumer + worker live under tests/e2e/test_consumer; the
-    # framework spawns workers as `python -m tests.e2e.test_consumer`.
-    # Running with cwd=REPO_ROOT puts ``tests`` on sys.path so the
-    # ``-m`` import succeeds without a sitecustomize/.pth dance.
-    env.setdefault("PYTHONPATH", str(REPO_ROOT))
-
-    print(f"[run_e2e] dispatch: {' '.join(argv)}", flush=True)
-    print(f"[run_e2e] log file: {log_file}", flush=True)
-
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("w", buffering=1) as logf:
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            cwd=str(REPO_ROOT),
-        )
-        deadline = time.monotonic() + timeout_s
-        try:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                logf.write(line)
-                logf.flush()
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                if time.monotonic() > deadline:
-                    print(
-                        "[run_e2e] TIMEOUT: dispatch exceeded budget; "
-                        "killing child",
-                        flush=True,
-                    )
-                    proc.kill()
-                    return 124
-            return proc.wait(timeout=max(1, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            return 124
-
-
-# ─── output assertion ───────────────────────────────────────────────
-
-
-def _assert_outputs_present(
-    publish_dst_root: Path, num_tasks: int
-) -> tuple[bool, list[str]]:
-    """Verify each phase's expected outputs landed under the destination.
-
-    Returns ``(ok, missing)``: ``ok=True`` when every expected file
-    exists and is non-empty; ``missing`` is a list of human-readable
-    descriptions of the missing / empty files (for the failure
-    message).
-    """
-    missing: list[str] = []
-    for i in range(num_tasks):
-        for stem in (f"produce-{i}.out", f"consume-{i}.out"):
-            p = publish_dst_root / stem
-            if not p.exists():
-                missing.append(f"{p} (missing)")
-            elif p.stat().st_size == 0:
-                missing.append(f"{p} (empty)")
-    return (not missing, missing)
-
-
-# ─── re-run for already-done detection ──────────────────────────────
-
-
-def _assert_idempotent_rerun(
-    argv: list[str],
-    log_file: Path,
-    publish_src_root: Path,
-    publish_dst_root: Path,
-    timeout_s: int,
-) -> int:
-    """Re-run the same dispatch with ``--skip-existing`` and assert the
-    outputs are still present (i.e. not deleted by re-running).
-
-    This is the deferred-bug check for "already-done detection": if the
-    framework's skip-existing machinery is broken, this either re-runs
-    everything (slow but harmless) or — worse — clobbers the publish
-    destination and leaves the outputs in a half-state. The latter
-    surfaces as a missing-output assertion failure.
-    """
-    rerun_argv = [*argv, "--skip-existing"]
-    rerun_log = log_file.with_name(log_file.stem + "-rerun" + log_file.suffix)
-    print("[run_e2e] re-running dispatch with --skip-existing", flush=True)
-    return _run_dispatch(
-        rerun_argv,
-        rerun_log,
-        publish_src_root,
-        publish_dst_root,
-        timeout_s,
-    )
-
-
-# ─── orchestration ──────────────────────────────────────────────────
-
-
-def _print_timeout_help(instance_id: str) -> None:
-    print(
-        "\n[run_e2e] SLURM CLUSTER MAY BE STUCK — manual inspection required.\n"
+        "\n"
+        "============================================================\n"
+        "SLURM CLUSTER MAY BE STUCK — manual inspection required\n"
+        "============================================================\n"
+        f"Last heartbeat: {heartbeat_file}\n"
+        f"Live log dir:   /tmp/ (run_e2e log files are tee'd there)\n"
+        "\n"
+        "To diagnose:\n"
+        f"  ssh into the gateway: ssh -p ${{SSH_PORT:-{DEFAULT_SSH_PORT}}} "
+        "<user>@localhost\n"
+        "  Inside: squeue -u kruppb; sacct -X\n"
+        "  On each worker: ls /tmp/asm-* (should be empty after a clean run)\n"
+        "  podman ps -a (orphan containers indicate the conmon-leak class)\n"
+        "\n"
+        "To reset:\n"
         f"  cd {SLURM_TEST_ENV_DIR}\n"
-        f"  INSTANCE_ID={instance_id} ./deploy/down.sh\n"
-        f"  INSTANCE_ID={instance_id} ./deploy/up.sh\n",
+        f"  INSTANCE_ID={instance_id} ./deploy/down.sh && \\\n"
+        f"  INSTANCE_ID={instance_id} ./deploy/up.sh\n"
+        "============================================================\n",
         flush=True,
     )
 
 
-def main() -> int:
+def _select_scenarios(arg: str) -> list[Scenario]:
+    """Resolve the ``--scenario`` CLI argument to a list of scenarios.
+
+    ``all`` expands to every registered scenario in registry order.
+    A single name resolves to a singleton list. Unknown names raise
+    SystemExit(2) so argparse gets the right exit code.
+    """
+    available = all_scenarios()
+    if arg == "all":
+        return [available[name] for name in scenario_names()]
+    if arg in available:
+        return [available[arg]]
+    print(
+        f"unknown scenario: {arg!r}; available: "
+        f"{', '.join(['all'] + list(available))}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def _run_one_scenario(
+    scenario: Scenario,
+    env: DispatchEnv,
+    *,
+    log_dir: Path,
+    timeout_s: int,
+    heartbeat: HeartbeatWriter,
+    keep_tmp: bool,
+) -> tuple[bool, bool]:
+    """Execute one scenario end-to-end.
+
+    Returns ``(passed, timed_out)``: ``timed_out`` is True iff one of
+    the scenario's plans hit the wallclock cap (rc=124 from
+    dispatch_runner). The driver propagates ``timed_out`` to the
+    overall return code so a hung dispatch surfaces as exit 124 and
+    triggers the stuck-cluster help message.
+
+    The driver allocates a per-scenario tmp_root, asks the scenario
+    for plans, dispatches each plan, and feeds the results into the
+    scenario's assertion. Cleanup of tmp_root is the driver's
+    concern (per the Scenario API contract).
+    """
+    print(f"\n[run_e2e] scenario: {scenario.name} — {scenario.description}", flush=True)
+    if scenario.requires:
+        print(
+            f"[run_e2e]   requires: {', '.join(scenario.requires)}",
+            flush=True,
+        )
+
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"dynrunner-e2e-{scenario.name}-"))
+    try:
+        plans = scenario.prepare(env, tmp_root)
+        results: list[ScenarioResult] = []
+        for plan in plans:
+            label_suffix = f"-{plan.label}" if plan.label else ""
+            log_file = log_dir / f"{scenario.name}{label_suffix}.log"
+            plan_timeout = (
+                plan.timeout_s if plan.timeout_s is not None else timeout_s
+            )
+
+            # Reset the heartbeat's "last activity" baseline for this
+            # plan so a long-running scenario doesn't carry stale
+            # progress state from a prior plan.
+            heartbeat_state = _ProgressTracker()
+            heartbeat.start()
+
+            def _on_log_activity(now: float) -> None:
+                heartbeat_state.record(now)
+
+            def _on_spawn(pid: int) -> None:
+                scenario.run_hook(env, plan, pid)
+
+            heartbeat.set_progress_check(
+                lambda: heartbeat_state.is_recent(LOG_QUIESCENT_THRESHOLD_S)
+            )
+
+            result = run_plan(
+                plan,
+                log_file=log_file,
+                repo_root=REPO_ROOT,
+                timeout_s=plan_timeout,
+                log_activity_callback=_on_log_activity,
+                spawn_callback=_on_spawn,
+            )
+            results.append(result)
+            if result.exit_code == 124:
+                # Surface the timeout immediately and abort the
+                # scenario; the assertion phase is moot. The
+                # caller propagates this to the driver-level exit
+                # code 124 with the stuck-cluster help message.
+                return (False, True)
+            if result.exit_code != 0:
+                print(
+                    f"[run_e2e]   plan{label_suffix} exited "
+                    f"non-zero: {result.exit_code}",
+                    flush=True,
+                )
+                # Continue into assertion — the assertion may
+                # treat non-zero as expected (e.g. negative-test
+                # scenarios). For currently-implemented scenarios
+                # this is always a failure, and the assertion will
+                # report it.
+
+        ok, failures = scenario.assert_outputs(env, results)
+        if ok:
+            print(f"[run_e2e]   PASS: {scenario.name}", flush=True)
+            return (True, False)
+        print(f"[run_e2e]   FAIL: {scenario.name}", flush=True)
+        for line in failures:
+            print(f"    - {line}", flush=True)
+        return (False, False)
+    finally:
+        if not keep_tmp:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+class _ProgressTracker:
+    """Stash for the last log-line timestamp.
+
+    Local to the driver — the heartbeat-writer's
+    ``progress_check`` reads ``is_recent`` once per period.
+    """
+
+    def __init__(self) -> None:
+        self._last = time.monotonic()
+
+    def record(self, now: float) -> None:
+        self._last = now
+
+    def is_recent(self, threshold_s: float) -> bool:
+        return (time.monotonic() - self._last) < threshold_s
+
+
+def _build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
+        "--scenario",
+        type=str,
+        required=True,
+        help=(
+            "Scenario name or 'all'. Available: "
+            + ", ".join(scenario_names())
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Cluster worker count (default {DEFAULT_WORKERS}).",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT_S,
-        help=f"Overall timeout in seconds (default {DEFAULT_TIMEOUT_S}).",
+        help=(
+            f"Overall per-plan timeout in seconds (default {DEFAULT_TIMEOUT_S}). "
+            "On exceed, exits 124 with the stuck-cluster help message."
+        ),
     )
     parser.add_argument(
-        "--num-tasks",
-        type=int,
-        default=DEFAULT_NUM_TASKS,
-        help=f"Tasks per phase (default {DEFAULT_NUM_TASKS}).",
+        "--mode",
+        choices=("slurm", "single-process", "in-process"),
+        default="slurm",
+        help=(
+            "Dispatch mode. 'slurm' is the canonical e2e mode against "
+            "the slurm-test-env cluster. 'single-process' / 'in-process' "
+            "skip the cluster entirely and are useful for iterating on "
+            "the driver / scenarios."
+        ),
     )
     parser.add_argument(
         "--instance-id",
@@ -357,132 +331,132 @@ def main() -> int:
         help=f"slurm-test-env SSH port (default {DEFAULT_SSH_PORT}).",
     )
     parser.add_argument(
-        "--mode",
-        choices=("slurm", "single-process", "in-process"),
-        default="slurm",
-        help=(
-            "Dispatch mode. 'slurm' is the canonical e2e mode against "
-            "the slurm-test-env cluster. 'single-process' uses the "
-            "framework's in-process distributed primary + 1 secondary. "
-            "'in-process' uses the simplest run_local manager (one "
-            "process, N workers) — fastest smoke check while iterating "
-            "on the consumer or driver."
-        ),
-    )
-    parser.add_argument(
         "--slurm-root-folder",
         type=str,
-        default="/home/testuser/dynrunner-e2e",
+        default=DEFAULT_SLURM_ROOT_FOLDER,
         help="Gateway-side root folder for SLURM staging.",
     )
     parser.add_argument(
         "--keep-tmp",
         action="store_true",
-        help="Keep the source / output / publish-staging tmpdirs after exit.",
+        help="Keep per-scenario tmpdirs after exit.",
     )
     parser.add_argument(
-        "--skip-rerun",
+        "--keep-cluster",
         action="store_true",
+        default=True,
         help=(
-            "Skip the second --skip-existing dispatch. Useful when "
-            "iterating on the consumer or driver itself."
+            "Leave the cluster up after success (default). The driver "
+            "never tears down on failure (the operator wants to "
+            "inspect)."
         ),
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--down-on-success",
+        action="store_true",
+        help="Run ``down.sh`` after every scenario passes.",
+    )
+    parser.add_argument(
+        "--heartbeat-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to write the heartbeat (default "
+            "/tmp/dynrunner-e2e-heartbeat-<pid>). An external watcher "
+            "polls the mtime; stale > 5 min indicates a hang."
+        ),
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Where per-plan logs are written (default a fresh "
+            "tmpdir, also referenced in the timeout help message)."
+        ),
+    )
+    return parser
 
-    # 1. Ensure the cluster is up (slurm mode only — the in-process /
-    #    single-process modes don't touch the cluster at all).
-    if args.mode == "slurm" and not _is_cluster_running(args.instance_id):
+
+def main() -> int:
+    args = _build_argparser().parse_args()
+
+    scenarios = _select_scenarios(args.scenario)
+
+    env = DispatchEnv(
+        instance_id=args.instance_id,
+        ssh_port=args.ssh_port,
+        slurm_root_folder=args.slurm_root_folder,
+        workers=args.workers,
+        mode=args.mode,
+    )
+
+    # Cluster bring-up — only relevant in slurm mode.
+    if env.mode == "slurm" and not is_cluster_running(env.instance_id):
         try:
-            _bring_cluster_up(args.instance_id, args.ssh_port)
-        except subprocess.CalledProcessError as e:
-            print(f"[run_e2e] up.sh failed (exit={e.returncode})", flush=True)
+            bring_cluster_up(SLURM_TEST_ENV_DIR, env.instance_id, env.ssh_port)
+        except Exception as e:  # noqa: BLE001
+            print(f"[run_e2e] cluster bring-up failed: {e}", flush=True)
             return 1
 
-    # 2. Stage source files + a fresh output dir + publish-staging tmpdirs.
-    source_dir = _prepare_source_dir(args.num_tasks)
-    output_dir = _prepare_output_dir()
-    publish_src_root = Path(tempfile.mkdtemp(prefix="dynrunner-e2e-pubsrc-"))
-    publish_dst_root = Path(tempfile.mkdtemp(prefix="dynrunner-e2e-pubdst-"))
-    log_file = output_dir / "run_e2e.log"
-    print(f"[run_e2e] source={source_dir}", flush=True)
-    print(f"[run_e2e] output={output_dir}", flush=True)
-    print(f"[run_e2e] publish_src={publish_src_root}", flush=True)
-    print(f"[run_e2e] publish_dst={publish_dst_root}", flush=True)
+    heartbeat_file = args.heartbeat_file or heartbeat_path_for_pid()
+    log_dir = args.log_dir or Path(
+        tempfile.mkdtemp(prefix="dynrunner-e2e-logs-")
+    )
+    print(f"[run_e2e] heartbeat: {heartbeat_file}", flush=True)
+    print(f"[run_e2e] logs: {log_dir}", flush=True)
 
-    cleanup: list[Path] = [source_dir, output_dir, publish_src_root, publish_dst_root]
+    heartbeat = HeartbeatWriter(
+        heartbeat_file,
+        period_s=HEARTBEAT_PERIOD_S,
+    )
+    heartbeat.start()
 
-    rc = 0
+    failures: list[str] = []
+    timed_out = False
     try:
-        # 3. Dispatch.
-        argv = _build_dispatch_argv(
-            source_dir,
-            output_dir,
-            args.num_tasks,
-            args.mode,
-            args.ssh_port,
-            args.slurm_root_folder,
-        )
-        rc = _run_dispatch(
-            argv,
-            log_file,
-            publish_src_root,
-            publish_dst_root,
-            args.timeout,
-        )
-        if rc == 124:
-            _print_timeout_help(args.instance_id)
-            return 124
-        if rc != 0:
-            print(f"[run_e2e] dispatch exited non-zero: {rc}", flush=True)
-            return 1
+        for scenario in scenarios:
+            ok, scenario_timed_out = _run_one_scenario(
+                scenario,
+                env,
+                log_dir=log_dir,
+                timeout_s=args.timeout,
+                heartbeat=heartbeat,
+                keep_tmp=args.keep_tmp,
+            )
+            if scenario_timed_out:
+                # First timeout aborts the whole run — the cluster
+                # is likely stuck, so subsequent scenarios would
+                # waste their wallclock budget. The stuck-cluster
+                # help lands at the bottom of main().
+                timed_out = True
+                failures.append(scenario.name)
+                break
+            if not ok:
+                failures.append(scenario.name)
+    finally:
+        heartbeat.stop()
 
-        # 4. Assert expected publish outputs landed.
-        ok, missing = _assert_outputs_present(publish_dst_root, args.num_tasks)
-        if not ok:
-            print("[run_e2e] FAIL: missing or empty expected outputs:", flush=True)
-            for m in missing:
-                print(f"  - {m}", flush=True)
-            return 1
+    if timed_out:
+        _print_timeout_help(env.instance_id, heartbeat_file)
+        return 124
+    if failures:
         print(
-            f"[run_e2e] OK: {2 * args.num_tasks} expected outputs present "
-            f"under {publish_dst_root}",
+            f"\n[run_e2e] FAIL: scenarios with failures: {', '.join(failures)}",
             flush=True,
         )
+        return 1
 
-        # 5. Re-run with --skip-existing to exercise idempotency.
-        if not args.skip_rerun:
-            rc = _assert_idempotent_rerun(
-                argv,
-                log_file,
-                publish_src_root,
-                publish_dst_root,
-                args.timeout,
+    print(f"\n[run_e2e] PASS: {len(scenarios)} scenario(s)", flush=True)
+    if args.down_on_success and env.mode == "slurm":
+        try:
+            bring_cluster_down(SLURM_TEST_ENV_DIR, env.instance_id)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[run_e2e] WARNING: down.sh failed (cluster left up): {e}",
+                flush=True,
             )
-            if rc == 124:
-                _print_timeout_help(args.instance_id)
-                return 124
-            if rc != 0:
-                print(f"[run_e2e] re-run dispatch exited non-zero: {rc}", flush=True)
-                return 1
-            ok, missing = _assert_outputs_present(publish_dst_root, args.num_tasks)
-            if not ok:
-                print(
-                    "[run_e2e] FAIL: outputs missing after re-run "
-                    "(skip-existing may have clobbered):",
-                    flush=True,
-                )
-                for m in missing:
-                    print(f"  - {m}", flush=True)
-                return 1
-            print("[run_e2e] OK: re-run preserved outputs.", flush=True)
-
-        print("[run_e2e] PASS", flush=True)
-        return 0
-    finally:
-        if not args.keep_tmp:
-            for p in cleanup:
-                shutil.rmtree(p, ignore_errors=True)
+    return 0
 
 
 if __name__ == "__main__":
