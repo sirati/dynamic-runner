@@ -285,6 +285,60 @@ fi
         load_command = cfg.load_command,
     ));
 
+    // Conmon-watchdog: detached fallback teardown for the
+    // conmon-double-fork-escapes-cgroup case observed in the field.
+    // Spawned BEFORE `podman run` (immediately below) so the watchdog
+    // is already polling by the time the container is alive. Addresses
+    // the container by `$CONTAINER_NAME` (assigned earlier in the
+    // script). Skipped outside SLURM (no SLURM_JOB_ID → squeue can't
+    // match a job and the watchdog would poll forever).
+    script.push_str(
+        r##"
+# Detached fallback teardown for the conmon-double-fork-escapes-
+# cgroup case observed in the field: when SLURM proctrack/cgroup
+# either isn't in use or doesn't track the container monitor's
+# detached pid, scancel/timeout/SIGTERM doesn't propagate into
+# the container — conmon and its children survive both the
+# wrapper's death and the SLURM job's termination, leaking
+# storage and worker processes on the compute node.
+#
+# Watchdog polls `squeue -j $SLURM_JOB_ID` once a second; when
+# the job is gone (squeue exit 0 + empty stdout — distinct from
+# transient query failure which exits nonzero), it issues
+# `podman kill` then `podman rm -f` on this wrapper's container
+# by name. Detached via `setsid -f` so it survives wrapper exit
+# and (where possible) cgroup teardown of the wrapper's pidtree.
+#
+# If proctrack/cgroup is in fact tracking the watchdog too, the
+# watchdog dies alongside the rest — but in that case the
+# container is also dead, so there's nothing to clean up. Either
+# branch leaves the system in a clean state.
+#
+# Skipped when SLURM_JOB_ID is empty (running outside SLURM):
+# squeue would never find a matching job so the watchdog could
+# never exit cleanly.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    setsid -f bash -c '
+        job_id="$1"
+        cname="$2"
+        storage="$3"
+        runroot="$4"
+        while true; do
+            sleep 1
+            if out=$(squeue -j "$job_id" -h -o "%i" 2>/dev/null); then
+                [ -n "$out" ] || break
+            fi
+        done
+        podman --root "$storage" --runroot "$runroot" kill --signal TERM "$cname" 2>/dev/null
+        sleep 5
+        podman --root "$storage" --runroot "$runroot" rm -f "$cname" 2>/dev/null
+    ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
+        </dev/null >/dev/null 2>&1
+    echo "Spawned podman teardown watchdog for SLURM job $SLURM_JOB_ID (container $CONTAINER_NAME)"
+fi
+"##,
+    );
+
     // Volume mounts (common to both modes). The optional
     // `dynrunner_network_dir` bind is the consumer-controlled
     // control-plane filesystem mount (see
@@ -888,6 +942,52 @@ mod tests {
             assert!(
                 script.contains("ERROR: image load failed; secondary cannot start.\" >&2"),
                 "[{label}] image-load ERROR must mirror to stderr",
+            );
+            assert_renders_valid_bash(&script);
+        }
+    }
+
+    /// Conmon-watchdog block must be emitted in both modes:
+    ///   * SLURM-gated (skipped when `SLURM_JOB_ID` is empty, otherwise
+    ///     `squeue` would never find a matching job),
+    ///   * detached via `setsid -f` so it survives wrapper exit and
+    ///     (where possible) cgroup teardown of the wrapper's pidtree,
+    ///   * polls `squeue -j ... -h -o %i` (exit 0 + empty stdout =
+    ///     gone; nonzero = transient query failure, keep polling),
+    ///   * issues `podman kill --signal TERM` then `podman rm -f` on
+    ///     `$CONTAINER_NAME` to terminate the cgroup-evading conmon.
+    #[test]
+    fn watchdog_block_is_emitted_in_both_modes() {
+        let config = SlurmConfig::default();
+        for (label, connection) in both_modes() {
+            let cfg = base_cfg(&config, connection, "sec-w");
+            let script = generate_wrapper_script(&cfg);
+            assert!(
+                script.contains("if [ -n \"${SLURM_JOB_ID:-}\" ]; then"),
+                "[{label}] watchdog must be SLURM-gated",
+            );
+            assert!(
+                script.contains("setsid -f bash -c"),
+                "[{label}] watchdog must detach via `setsid -f`",
+            );
+            assert!(
+                script.contains("squeue -j") && script.contains("-h -o \"%i\""),
+                "[{label}] watchdog must poll `squeue -j ... -h -o %i`",
+            );
+            assert!(
+                script.contains("kill --signal TERM"),
+                "[{label}] watchdog must `podman kill --signal TERM`",
+            );
+            assert!(
+                script.contains("rm -f \"$cname\""),
+                "[{label}] watchdog must `podman rm -f $cname`",
+            );
+            // Watchdog must reference $CONTAINER_NAME (the deterministic
+            // handle set by L1.5) so it actually targets THIS wrapper's
+            // container.
+            assert!(
+                script.contains("\"$CONTAINER_NAME\""),
+                "[{label}] watchdog must address container by $CONTAINER_NAME",
             );
             assert_renders_valid_bash(&script);
         }
