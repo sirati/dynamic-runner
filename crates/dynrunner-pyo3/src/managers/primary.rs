@@ -134,24 +134,27 @@ impl PyPrimaryCoordinator {
     /// binary.
     ///
     /// `source_root` is the absolute path of the consumer's
-    /// `--source` directory; the per-binary
-    /// `<src_path>` / `<dest_path>` is each binary's path made
-    /// relative to it. Binaries whose `path` doesn't sit under
-    /// `source_root` (e.g. an absolute-path scan that returned
-    /// out-of-tree results) keep their full path — the secondary's
-    /// `stage_file` handler treats absolute `src_path` as an
-    /// out-of-band-staged source rather than a `src_network`
-    /// lookup.
+    /// `--source` directory. `binary.path` may be either:
+    ///
+    /// * absolute under `source_root` — `<rel>` is the strip-prefixed
+    ///   tail (the legacy shape, e.g. when discovery emits
+    ///   `source_root.join(rel)` directly);
+    /// * absolute out-of-tree — `<rel>` keeps the full path and the
+    ///   secondary's `stage_file` handler treats it as out-of-band
+    ///   staged (must already exist by some other means);
+    /// * relative — resolved against `source_root` for the on-disk
+    ///   read; `<rel>` is the original relative path verbatim. This
+    ///   is the wire-identifier shape consumers should prefer post-
+    ///   Bug B (file-open sites use the resolved path; output-mirror
+    ///   sites use the relative wire id).
     ///
     /// Reads each binary file once on the primary side to compute
     /// `content_hash` (SHA256). Errors out on the first unreadable
     /// file rather than silently skipping — a broken local
-    /// `--source` (or a TaskInfo emitting relative paths that don't
-    /// resolve against CWD) is a configuration bug the consumer
-    /// wants to surface immediately, not a partial dispatch that
-    /// later fails on the secondary as a confusing "not pre-staged
-    /// at <path>" error with no breadcrumb pointing back to the
-    /// primary's drop.
+    /// `--source` is a configuration bug the consumer wants to
+    /// surface immediately, not a partial dispatch that later fails
+    /// on the secondary as a confusing "not pre-staged at <path>"
+    /// error with no breadcrumb pointing back to the primary's drop.
     ///
     /// If a future consumer needs sentinel-style TaskInfos that
     /// intentionally don't back to a real file, the right shape is
@@ -166,22 +169,34 @@ impl PyPrimaryCoordinator {
         let rust_binaries = crate::pytypes::extract_binaries(binaries)?;
         let source_root = std::path::PathBuf::from(source_root);
         for binary in &rust_binaries {
-            let rel = match binary.path.strip_prefix(&source_root) {
+            // Resolve the on-disk read location: relative paths join
+            // against `source_root` (post-Bug-B wire-id shape);
+            // absolute paths are used verbatim. `rel` (the wire form
+            // shipped to secondaries) is then derived from the
+            // resolved path so the strip-prefix branch covers both
+            // legacy `source_root.join(rel)` shapes and new relative
+            // emissions uniformly.
+            let resolved = if binary.path.is_absolute() {
+                binary.path.clone()
+            } else {
+                source_root.join(&binary.path)
+            };
+            let rel = match resolved.strip_prefix(&source_root) {
                 Ok(p) => p.to_string_lossy().into_owned(),
                 Err(_) => binary.path.to_string_lossy().into_owned(),
             };
             let file_hash = dynrunner_manager_distributed::compute_task_hash(binary);
             let Some(content_hash) =
-                dynrunner_manager_distributed::compute_file_hash(&binary.path)
+                dynrunner_manager_distributed::compute_file_hash(&resolved)
             else {
                 return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-                    "queue_initial_staging: cannot read {} (type_id={}). \
-                     Typical causes: TaskInfo emits a relative path that doesn't resolve \
-                     against the current working directory; --source points at the wrong tree; \
-                     the file is missing or permission-denied. Aborting before dispatch so the \
+                    "queue_initial_staging: cannot read {} (resolved={}, type_id={}). \
+                     Typical causes: --source points at the wrong tree; the file is \
+                     missing or permission-denied. Aborting before dispatch so the \
                      misconfiguration surfaces here rather than as a downstream secondary \
                      'not pre-staged at <path>' error.",
                     binary.path.display(),
+                    resolved.display(),
                     binary.type_id,
                 )));
             };
