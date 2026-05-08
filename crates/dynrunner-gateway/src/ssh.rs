@@ -180,8 +180,20 @@ impl Gateway for SshGateway {
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // Hint at the generic escape hatch rather than encoding
+            // host-key-specific advice that would need updating each
+            // time a new failure mode appears. `--ssh-config <path>`
+            // accepts any ssh_config(5) directive, covering ephemeral
+            // host keys, port reuse across container instances, custom
+            // identities, ProxyJump, etc.
             return Err(GatewayError::CommandFailed(format!(
-                "SSH master connection failed: {stderr}"
+                "SSH master connection failed: {}\n\
+                 If this is a host-key/known_hosts issue (ephemeral host keys, \
+                 port reuse across container instances) or any other ssh -o \
+                 option needs adjusting, pass --ssh-config <path> with the \
+                 required options — that's the generic escape hatch and any \
+                 ssh_config(5) directive applies.",
+                stderr.trim()
             )));
         }
 
