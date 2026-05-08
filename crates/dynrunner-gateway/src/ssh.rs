@@ -240,6 +240,17 @@ impl Gateway for SshGateway {
 
         let expanded = self.expand_remote_path(remote);
 
+        // Pre-flight unlink of the destination. scp opens the dest with
+        // O_WRONLY|O_TRUNC, which fails with EACCES when the existing
+        // file is read-only — observed when sources are produced by a
+        // nix derivation (mode 0444) and a prior scp upload propagated
+        // those bits to the dest. `rm -f` no-ops when the dest is
+        // absent and only requires write perm on the parent directory,
+        // which scp itself already requires. Best-effort: any failure
+        // is swallowed so the canonical scp error still surfaces if
+        // the real cause is something else (e.g. parent-dir non-writable).
+        let _ = self.ssh_command(&format!("rm -f {expanded}"), None).await;
+
         let mut cmd = Command::new("scp");
         if self.config.port != 22 {
             cmd.args(["-P", &self.config.port.to_string()]);
