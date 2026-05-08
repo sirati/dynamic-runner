@@ -777,6 +777,8 @@ mod tests {
                 gateway_port: 9000,
             },
             run_log_dir: None,
+            extra_run_args: &[],
+            dynrunner_network_dir: None,
         };
         let script = generate_wrapper_script(&cfg);
         assert!(
