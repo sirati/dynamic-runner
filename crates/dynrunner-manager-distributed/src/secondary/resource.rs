@@ -144,19 +144,29 @@ where
                 let peer = current_primary.to_string();
                 return self.peer_transport.send_to_peer(&peer, msg).await;
             }
-            // We are the current primary — message addressed to ourselves.
-            // The dispatch handlers expect to consume messages off the
-            // transport receivers (primary_transport.recv on secondaries,
-            // peer.recv_peer on peers) rather than self-deliver. The
-            // primary's own self-dispatch path doesn't go through
-            // this helper (`handle_primary_task_request` is called
-            // directly from `request_task_for_worker` when
-            // `is_primary && !primary_pending_is_empty`), so this
-            // branch is hit only by the few odd code paths that don't
-            // know whether the primary is local. Falling through to
-            // `primary_transport.send` is the historical behaviour and
-            // a no-op when the peer is the same node — primary_transport
-            // is local-loopback in that case anyway.
+            // Self-addressed (we ARE the primary). Keep the loopback
+            // through `primary_transport` so the demoted observer can
+            // still tick its completion counter and run the
+            // run-done-termination check (see lifecycle.rs's
+            // observer-mode contract: forwarded outcomes still drive
+            // the local primary's terminal counters, only re-injection
+            // is suppressed).
+            //
+            // Tolerate transport errors on this loopback. Post-
+            // promotion the demoted primary process is allowed to
+            // exit cleanly — when it does, its transport-writer task
+            // closes and subsequent sends fail (QUIC: "transport
+            // writer task exited"; channel test fixture: "channel
+            // closed"). That failure is benign here: every
+            // operational call site has already done the local
+            // bookkeeping directly before invoking this helper, and
+            // we ARE the authoritative primary. Without the swallow,
+            // lone-promoted-primary runs (no peer to relay through,
+            // local primary exited) propagated the error fatally
+            // through `?` operators at processing.rs / dispatch.rs
+            // and crashed the secondary.
+            let _ = self.primary_transport.send(msg).await;
+            return Ok(());
         }
         self.primary_transport.send(msg).await
     }
