@@ -47,9 +47,30 @@ def _parse_worker_id_from_log_file(log_file: str | None) -> str:
     return m.group(1) if m else "?"
 
 
+def _extract_path(cmd: str) -> str:
+    """Pull the relative_path out of either wire form.
+
+    Two wire shapes share this single bidirectional channel:
+    legacy bare `<path>` (emitted when ``TaskInfo.payload`` is null /
+    ``Value::Null`` on the Rust side) and the FR-3 ``task:<json>``
+    wrap (emitted when the consumer attaches a non-null payload — for
+    `_PhasedTask` that's `payload={}`, which the Rust translator
+    routes through the wrap path because `Value::Object({})` is not
+    `is_null()`). Workers that go through the canonical
+    `comm.receive_command` get this normalisation for free; this
+    fixture talks raw sockets, so the unwrap lives here.
+    """
+    if cmd.startswith("task:"):
+        try:
+            return json.loads(cmd[len("task:"):]).get("path", "")
+        except (json.JSONDecodeError, AttributeError):
+            return cmd
+    return cmd
+
+
 def _decode(relative_path: str) -> dict:
     """Reverse of `_PhasedTask.discover_items`'s path encoding."""
-    name = Path(relative_path).name
+    name = Path(_extract_path(relative_path)).name
     parts = name.split(PATH_SEP)
     if len(parts) != 4:
         return {"phase": "?", "type": "?", "affinity": "?", "index": -1, "raw": name}
