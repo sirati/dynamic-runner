@@ -89,19 +89,11 @@ impl<G: Gateway> SlurmJobManager<G> {
             format!("--error={run_log_dir}/slurm_%j.err"),
         ];
 
-        if let Some(partition) = &self.config.partition {
-            sbatch_args.push(format!("--partition={partition}"));
-        }
-        if let Some(time) = &self.config.time_limit {
-            sbatch_args.push(format!("--time={time}"));
-        }
-        if let Some(cpus) = self.config.cpus_per_task {
-            sbatch_args.push(format!("--cpus-per-task={cpus}"));
-        }
-        if let Some(mem) = &self.config.mem {
-            sbatch_args.push(format!("--mem={mem}"));
-        }
-        if let Some(email) = &self.config.email {
+        sbatch_args.push(format!("--partition={}", self.config.partition));
+        sbatch_args.push(format!("--time={}", self.config.time_limit));
+        sbatch_args.push(format!("--cpus-per-task={}", self.config.cpus_per_task));
+        sbatch_args.push(format!("--mem={}", self.config.memory_per_node));
+        if let Some(email) = &self.config.notify_email {
             sbatch_args.push(format!("--mail-user={email}"));
             sbatch_args.push("--mail-type=FAIL".to_string());
         }
