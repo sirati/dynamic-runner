@@ -72,7 +72,12 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     let socket_dir = format!("{rndtmp}/sockets");
     let cmd_socket = format!("{socket_dir}/cmd.sock");
 
-    let srcbins_network = cfg.slurm_config.src_bins_path();
+    // Honors `prestaged_src_bins_path`: when the SlurmConfig has a
+    // pre-staged source override, the wrapper bind-mounts that host
+    // path into `/app/src-network` instead of the primary's staging
+    // directory. The decision lives on `SlurmConfig` so the wrapper
+    // generator stays mount-policy-agnostic.
+    let srcbins_network = cfg.slurm_config.srcbins_mount_source();
     let output_network = cfg.slurm_config.output_path();
     let log_network = cfg
         .run_log_dir
@@ -747,5 +752,40 @@ mod tests {
         assert_eq!(bash_quote("a$b"), "'a$b'");
         assert_eq!(bash_quote("a'b"), r#"'a'"'"'b'"#);
         assert_eq!(bash_quote("'"), r#"''"'"''"#);
+    }
+
+    #[test]
+    fn prestaged_src_bins_redirects_src_network_mount() {
+        // When SlurmConfig has a prestaged path, the wrapper must
+        // bind-mount that host path into /app/src-network instead of
+        // the default staging dir. Same single-source-of-truth as
+        // the Python `get_srcbins_mount_source` flow.
+        let config = SlurmConfig {
+            prestaged_src_bins_path: Some(std::path::PathBuf::from("/srv/staged-src")),
+            ..SlurmConfig::default()
+        };
+        let cfg = WrapperScriptConfig {
+            slurm_config: &config,
+            image_path: "/images/test.tar",
+            secondary_id: "sec-03",
+            image_name: "test-app",
+            image_tag: "latest",
+            load_command: "podman load -i $LOCAL_IMAGE",
+            container_command: "runner",
+            connection: ConnectionMode::Standard {
+                gateway_host: "gateway.example.com",
+                gateway_port: 9000,
+            },
+            run_log_dir: None,
+        };
+        let script = generate_wrapper_script(&cfg);
+        assert!(
+            script.contains("\"/srv/staged-src:/app/src-network:ro\""),
+            "wrapper must mount the prestaged host path into /app/src-network",
+        );
+        assert!(
+            !script.contains("\"~/dynamic_batch/src-bins:/app/src-network:ro\""),
+            "default staging dir must NOT be mounted when prestaged path is set",
+        );
     }
 }
