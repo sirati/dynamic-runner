@@ -47,7 +47,53 @@ impl SshGateway {
             args.push("-p".into());
             args.push(self.config.port.to_string());
         }
+        args.extend(self.auth_options());
         args
+    }
+
+    /// Explicit-auth flags applied to every ssh/scp invocation.
+    ///
+    /// `-i` / `IdentitiesOnly=yes` / `IdentityAgent=none` and `-F`
+    /// shape *which* credentials ssh considers — orthogonal to `-p`
+    /// (port), which is added per ssh/scp by [`Self::base_ssh_args`]
+    /// (uses `-p`) or the per-scp builders in `transfer_file` /
+    /// `download_file` (use `-P`). Exposed publicly so other
+    /// framework-owned ssh subprocesses (e.g. the future Rust port of
+    /// `preparation.py`'s reverse tunnel) can mirror the auth contract
+    /// without bypassing the gateway.
+    ///
+    /// `IdentityAgent=none` is bundled with `--ssh-identity-file`
+    /// because `IdentitiesOnly=yes` alone does NOT prevent over-
+    /// offering on systems where `~/.ssh/config` has
+    /// `Match host * → IdentityAgent <socket>` (typical
+    /// NixOS+gnome-keyring/1password setups). OpenSSH still enumerates
+    /// agent identities ahead of the configured key, and each
+    /// enumeration counts against the gateway sshd's `MaxAuthTries` —
+    /// so a many-key agent kills the connection at "Too many
+    /// authentication failures" before `-i` is reached.
+    /// `IdentityAgent=none` is the only flag that fully shuts the
+    /// agent out (`-o` settings beat `Match` blocks). Single concern:
+    /// "given an explicit identity, no agent may leak in".
+    ///
+    /// `--ssh-config` alone does NOT add `IdentityAgent=none` — the
+    /// user's config-file is authoritative about agent behavior in
+    /// that path.
+    pub fn auth_options(&self) -> Vec<String> {
+        let mut opts = Vec::new();
+        if let Some(identity) = &self.config.identity_file {
+            opts.extend([
+                "-i".to_string(),
+                identity.clone(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "IdentityAgent=none".to_string(),
+            ]);
+        }
+        if let Some(config_file) = &self.config.config_file {
+            opts.extend(["-F".to_string(), config_file.clone()]);
+        }
+        opts
     }
 
     fn control_args(&self) -> Result<Vec<String>, GatewayError> {
@@ -243,6 +289,9 @@ impl Gateway for SshGateway {
         if self.config.port != 22 {
             cmd.args(["-P", &self.config.port.to_string()]);
         }
+        for arg in self.auth_options() {
+            cmd.arg(&arg);
+        }
         if let Some(cp) = &self.control_path {
             cmd.args(["-o", &format!("ControlPath={cp}")]);
         }
@@ -277,6 +326,9 @@ impl Gateway for SshGateway {
         let mut cmd = Command::new("scp");
         if self.config.port != 22 {
             cmd.args(["-P", &self.config.port.to_string()]);
+        }
+        for arg in self.auth_options() {
+            cmd.arg(&arg);
         }
         if let Some(cp) = &self.control_path {
             cmd.args(["-o", &format!("ControlPath={cp}")]);
@@ -467,5 +519,71 @@ mod tests {
     fn parse_find_printf_empty() {
         assert!(parse_find_printf("").is_empty());
         assert!(parse_find_printf("\0\0").is_empty());
+    }
+
+    fn ssh_config_with(
+        identity_file: Option<&str>,
+        config_file: Option<&str>,
+    ) -> SshConfig {
+        SshConfig {
+            host: "h".into(),
+            port: 22,
+            user: None,
+            identity_file: identity_file.map(str::to_string),
+            config_file: config_file.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn auth_options_empty_when_unset() {
+        let gw = SshGateway::new(ssh_config_with(None, None));
+        assert!(gw.auth_options().is_empty());
+    }
+
+    #[test]
+    fn auth_options_identity_file_emits_full_chain() {
+        let gw = SshGateway::new(ssh_config_with(Some("/k/id_ed25519"), None));
+        assert_eq!(
+            gw.auth_options(),
+            vec![
+                "-i".to_string(),
+                "/k/id_ed25519".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "IdentityAgent=none".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_options_config_file_emits_dash_capital_f() {
+        let gw = SshGateway::new(ssh_config_with(None, Some("/etc/ssh/cfg")));
+        assert_eq!(
+            gw.auth_options(),
+            vec!["-F".to_string(), "/etc/ssh/cfg".to_string()],
+        );
+    }
+
+    #[test]
+    fn auth_options_identity_then_config_file_order() {
+        // Order matches Python: -i/IdentitiesOnly/IdentityAgent first,
+        // then -F. Some downstream consumers (e.g. preparation.py's
+        // reverse tunnel) splat this list, so ordering is part of the
+        // contract.
+        let gw = SshGateway::new(ssh_config_with(Some("/k/id"), Some("/c/f")));
+        assert_eq!(
+            gw.auth_options(),
+            vec![
+                "-i".to_string(),
+                "/k/id".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "IdentityAgent=none".to_string(),
+                "-F".to_string(),
+                "/c/f".to_string(),
+            ]
+        );
     }
 }

@@ -4,6 +4,12 @@ pub struct SshConfig {
     pub host: String,
     pub port: u16,
     pub user: Option<String>,
+    /// Path passed as `-i <identity_file>`. When set, the gateway also
+    /// emits `IdentitiesOnly=yes` and `IdentityAgent=none` — see
+    /// `SshGateway::auth_options` for rationale.
+    pub identity_file: Option<String>,
+    /// Path passed as `-F <config_file>`.
+    pub config_file: Option<String>,
 }
 
 /// Gateway configuration.
@@ -42,7 +48,13 @@ pub fn parse_gateway_url(url: &str) -> Result<GatewayConfig, String> {
             (host_port.to_string(), 22)
         };
 
-        return Ok(GatewayConfig::Ssh(SshConfig { host, port, user }));
+        return Ok(GatewayConfig::Ssh(SshConfig {
+            host,
+            port,
+            user,
+            identity_file: None,
+            config_file: None,
+        }));
     }
 
     Err(format!(
