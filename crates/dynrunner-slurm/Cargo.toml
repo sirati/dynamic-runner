@@ -12,8 +12,13 @@ categories.workspace   = true
 readme.workspace       = true
 
 [dependencies]
+dynrunner-core = { workspace = true }
 dynrunner-gateway = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
