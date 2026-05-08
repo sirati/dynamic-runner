@@ -115,35 +115,20 @@ fn make_binary(path: impl Into<PathBuf>) -> TaskInfo<String> {
     }
 }
 
-/// Build a manager whose `src_bins_path()` is the literal string
-/// `"/srcbins"` — keeping the test assertions on exact remote paths
-/// independent of `SlurmConfig::default()` evolution.
+/// Build a manager with the default `SlurmConfig` shape. Assertions
+/// downstream derive the remote-path prefix from
+/// `manager.config.src_bins_path()` so they stay decoupled from any
+/// future `SlurmConfig::default()` changes — what we actually care
+/// about is "files land under `<srcbins>/<rel>`", not the literal
+/// directory string.
 fn make_manager() -> SlurmJobManager<RecordingGateway> {
-    let cfg = SlurmConfig {
-        root_folder: "".into(),
-        image_subfolder: "".into(),
-        output_subfolder: "out".into(),
-        log_subfolder: "log".into(),
-        partition: "All".into(),
-        time_limit: "48:00:00".into(),
-        cpus_per_task: 14,
-        memory_per_node: "64G".into(),
-        nodes: 1,
-        notify_email: None,
-        prestaged_src_bins_path: None,
-    };
-    // `src_bins_path()` returns `format!("{root}/{image_subfolder}/srcbins")`,
-    // so an empty root + empty image_subfolder yields the leading-slash
-    // `//srcbins` (double-slash collapses to single in path semantics) — we want
-    // a "/srcbins" prefix that asserts can match against; let's use a tweaked layout.
-    SlurmJobManager::new(cfg, RecordingGateway::default())
+    SlurmJobManager::new(SlurmConfig::default(), RecordingGateway::default())
 }
 
 /// Case 1 (relative-under-src): wire-id-shape relative path joins
 /// against source_root for the on-disk read, lands at
 /// `<srcbins>/<rel>` on the gateway verbatim.
 #[tokio::test]
-#[ignore = "TODO: fix path expectations after L2.C SlurmConfig field rename to image_subfolder layout"]
 async fn upload_relative_under_src() {
     let tmp = tempfile::tempdir().unwrap();
     let src_root = tmp.path().to_path_buf();
@@ -153,6 +138,7 @@ async fn upload_relative_under_src() {
 
     let mgr = make_manager();
     let binaries = vec![make_binary("subdir/foo.bin")];
+    let srcbins = mgr.config.src_bins_path();
 
     mgr.upload_source_binaries(&binaries, &src_root).await.unwrap();
 
@@ -161,12 +147,13 @@ async fn upload_relative_under_src() {
     let (local, remote) = &transfers[0];
     assert_eq!(local, &local_file, "manager must read from source_root-joined path");
     assert_eq!(
-        remote, "/srcbins/subdir/foo.bin",
+        remote,
+        &format!("{srcbins}/subdir/foo.bin"),
         "remote dest must mirror the relative tail under srcbins",
     );
     let dirs = mgr.gateway().created_dirs();
     assert!(
-        dirs.contains(&"/srcbins/subdir".to_string()),
+        dirs.contains(&format!("{srcbins}/subdir")),
         "parent directory must be created before transfer (got {:?})",
         dirs,
     );
@@ -175,7 +162,6 @@ async fn upload_relative_under_src() {
 /// Case 2 (absolute-under-src, legacy shape): strip_prefix succeeds,
 /// upload lands at the stripped tail under srcbins.
 #[tokio::test]
-#[ignore = "TODO: fix path expectations after L2.C SlurmConfig field rename"]
 async fn upload_absolute_under_src() {
     let tmp = tempfile::tempdir().unwrap();
     let src_root = tmp.path().to_path_buf();
@@ -183,6 +169,7 @@ async fn upload_absolute_under_src() {
     std::fs::write(&local_file, b"hello").unwrap();
 
     let mgr = make_manager();
+    let srcbins = mgr.config.src_bins_path();
     // Absolute path verbatim, sitting under source_root.
     let binaries = vec![make_binary(&local_file)];
 
@@ -193,7 +180,8 @@ async fn upload_absolute_under_src() {
     let (local, remote) = &transfers[0];
     assert_eq!(local, &local_file);
     assert_eq!(
-        remote, "/srcbins/foo.bin",
+        remote,
+        &format!("{srcbins}/foo.bin"),
         "absolute-under-src must strip to the tail and upload to <srcbins>/<tail>",
     );
 }
@@ -230,7 +218,6 @@ async fn skip_absolute_out_of_tree() {
 /// later). This is the shape the d5d0604 fix unblocks: pre-fix the
 /// relative case landed in the skip branch and the tally read `0/N`.
 #[tokio::test]
-#[ignore = "TODO: fix path expectations after L2.C SlurmConfig field rename"]
 async fn mixed_inputs_skip_only_out_of_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let src_root = tmp.path().to_path_buf();
@@ -241,6 +228,7 @@ async fn mixed_inputs_skip_only_out_of_tree() {
     std::fs::write(&abs_file, b"a").unwrap();
 
     let mgr = make_manager();
+    let srcbins = mgr.config.src_bins_path();
     let binaries = vec![
         make_binary("a/rel.bin"),
         make_binary(&abs_file),
@@ -250,8 +238,8 @@ async fn mixed_inputs_skip_only_out_of_tree() {
     mgr.upload_source_binaries(&binaries, &src_root).await.unwrap();
 
     let transfers = mgr.gateway().transfers();
-    let remotes: Vec<&str> = transfers.iter().map(|(_, r)| r.as_str()).collect();
+    let remotes: Vec<String> = transfers.iter().map(|(_, r)| r.clone()).collect();
     assert_eq!(transfers.len(), 2, "exactly the two in-tree binaries upload");
-    assert!(remotes.contains(&"/srcbins/a/rel.bin"));
-    assert!(remotes.contains(&"/srcbins/abs.bin"));
+    assert!(remotes.contains(&format!("{srcbins}/a/rel.bin")));
+    assert!(remotes.contains(&format!("{srcbins}/abs.bin")));
 }

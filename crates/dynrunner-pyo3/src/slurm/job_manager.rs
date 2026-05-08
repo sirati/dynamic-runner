@@ -60,10 +60,13 @@ fn slurm_config_from_python(
         .getattr("cpus_per_task")
         .ok()
         .and_then(|v| v.extract::<u32>().ok());
+    // Missing/None on the Python side maps to Rust `None` so
+    // `submit_job` omits `--mem` (Python parity). Only an explicit
+    // string value on the Python config produces `Some(...)` here.
     let mem = bound
         .getattr("memory_per_node")
         .ok()
-        .and_then(|v| v.extract::<String>().ok());
+        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
     let email = bound
         .getattr("notify_email")
         .ok()
@@ -85,7 +88,7 @@ fn slurm_config_from_python(
         partition: partition.unwrap_or_else(|| "All".into()),
         time_limit: time_limit.unwrap_or_else(|| "48:00:00".into()),
         cpus_per_task: cpus_per_task.unwrap_or(14),
-        memory_per_node: mem.unwrap_or_else(|| "64G".into()),
+        memory_per_node: mem,
         nodes: nodes.unwrap_or(1),
         notify_email: email,
         prestaged_src_bins_path,
