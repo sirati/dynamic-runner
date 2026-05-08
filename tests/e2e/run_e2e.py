@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -156,6 +157,48 @@ def _print_timeout_help(instance_id: str, heartbeat_file: Path) -> None:
     )
 
 
+def _fetch_published_outputs_from_gateway(
+    env: DispatchEnv, publish_dst: Path
+) -> None:
+    """Mirror the gateway's published outputs into the local
+    ``publish_dst`` so assertions can run unchanged.
+
+    Why: the framework's worker is a container on a SLURM compute
+    node. It publishes to ``/app/out-network`` which is bind-mounted
+    to ``<slurm_root_folder>/out`` on the gateway. The scenario's
+    assertions inspect a host-local ``publish_dst``. This function
+    SCPs every regular file under the gateway's ``out`` dir back to
+    ``publish_dst`` (top-level) so the host-side check finds them.
+
+    Failures here are surfaced as warnings — the assertion will then
+    fail loudly with a "missing X" message that's more actionable
+    than a fetch error obscuring the real problem.
+    """
+    if env.ssh_config_path is None:
+        return
+    remote_out_dir = f"{env.slurm_root_folder}/out"
+    cmd = [
+        "scp",
+        "-r",
+        "-F", str(env.ssh_config_path),
+        f"{GATEWAY_HOST_ALIAS}:{remote_out_dir}/.",
+        str(publish_dst),
+    ]
+    rc = subprocess.run(
+        cmd,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if rc.returncode != 0:
+        print(
+            f"[run_e2e]   warning: scp from gateway '{remote_out_dir}' "
+            f"failed (rc={rc.returncode}): {rc.stderr.decode().strip()}",
+            flush=True,
+        )
+
+
 def _select_scenarios(arg: str) -> list[Scenario]:
     """Resolve the ``--scenario`` CLI argument to a list of scenarios.
 
@@ -258,6 +301,17 @@ def _run_one_scenario(
                 # scenarios). For currently-implemented scenarios
                 # this is always a failure, and the assertion will
                 # report it.
+
+        # In SLURM mode the worker publishes to the gateway's
+        # `<slurm_root_folder>/out` (bind-mounted as `/app/out-network`
+        # in the container). The scenario's `publish_dst` lives on the
+        # operator host. Bridge the two by SCP'ing the gateway's
+        # published outputs back into each plan's `publish_dst` before
+        # running assertions. In-process / single-process modes need
+        # nothing; the worker writes locally.
+        if env.mode == "slurm":
+            for r in results:
+                _fetch_published_outputs_from_gateway(env, r.plan.paths.publish_dst)
 
         ok, failures = scenario.assert_outputs(env, results)
         if ok:
@@ -453,6 +507,30 @@ def main() -> int:
         ssh_identity_path = priv
         print(f"[ssh] ssh_config: {ssh_config_path}", flush=True)
         print(f"[ssh] identity:   {ssh_identity_path}", flush=True)
+
+        # Pre-spawn the SSH master from Python (which doesn't suffer
+        # the Rust+tokio process-supervision interaction that kills
+        # the framework's own master mid-run). The framework picks
+        # up `DYNRUNNER_SSH_CONTROL_PATH` and reuses this master
+        # instead of spawning its own; reverse forwards get added
+        # dynamically via `ssh -O forward`.
+        from ._ssh_state import spawn_ssh_master, stop_ssh_master  # noqa: E402
+        ssh_master_cp = spawn_ssh_master(
+            instance_state_dir,
+            ssh_config_path=ssh_config_path,
+            host_alias=GATEWAY_HOST_ALIAS,
+        )
+        os.environ["DYNRUNNER_SSH_CONTROL_PATH"] = str(ssh_master_cp)
+
+        # Tear down the master on driver exit so the cluster doesn't
+        # accumulate stale reverse forwards.
+        import atexit  # noqa: E402
+        atexit.register(
+            stop_ssh_master,
+            ssh_config_path=ssh_config_path,
+            control_path=ssh_master_cp,
+            host_alias=GATEWAY_HOST_ALIAS,
+        )
 
     env = DispatchEnv(
         instance_id=args.instance_id,

@@ -170,9 +170,124 @@ Host {host_alias}
     return cfg_path
 
 
+def spawn_ssh_master(
+    instance_state_dir: Path,
+    *,
+    ssh_config_path: Path,
+    host_alias: str,
+) -> Path:
+    """Pre-spawn an SSH master and return the control socket path.
+
+    Why this exists
+    ---------------
+
+    The framework's ``ssh.rs::connect()`` spawns its own SSH master
+    process via Rust's ``std::process::Command`` (with ``setsid -f``
+    + ``ssh -M -N -f`` daemonisation). Empirically that master gets
+    SIGTERM'd ~2 minutes after handshake when run from a tokio-driven
+    Python (the dispatcher), even though identical command from a
+    plain shell or Python subprocess persists indefinitely.
+
+    Diagnosis of the Rust+tokio process supervision interaction is
+    out of scope for an e2e harness. The framework exposes a
+    ``DYNRUNNER_SSH_CONTROL_PATH`` env var that bypasses its own
+    master spawn and reuses an externally-spawned one — that's what
+    we hit here. The master is spawned via ``subprocess.Popen`` from
+    Python (which doesn't have the issue), then the framework's
+    ``setup_port_forwarding`` issues ``ssh -O forward`` against this
+    master to add reverse forwards dynamically as the run progresses.
+
+    Returns the control socket path the caller exports as
+    ``DYNRUNNER_SSH_CONTROL_PATH`` for the dispatcher subprocess.
+    """
+    # Place the control socket under /tmp (not the state dir) — Unix
+    # socket paths are capped at 108 bytes (sockaddr_un.sun_path), and
+    # the worktree path under .claude is already 80+ chars before the
+    # filename. ssh's bind silently fails on overlong paths.
+    cp = Path(f"/tmp/dynrunner-ssh-master-{instance_state_dir.name}.sock")
+    cp.unlink(missing_ok=True)
+
+    cmd = [
+        "setsid",
+        "-f",
+        "--",
+        "ssh",
+        "-F", str(ssh_config_path),
+        "-M",
+        "-N",
+        "-f",
+        "-o", f"ControlPath={cp}",
+        "-o", "ControlMaster=auto",
+        "-o", "ControlPersist=yes",
+        "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "TCPKeepAlive=yes",
+        "-o", "LogLevel=ERROR",
+        host_alias,
+    ]
+    print(f"[ssh] spawning persistent master via: {' '.join(cmd)}", flush=True)
+    rc = subprocess.run(
+        cmd,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if rc.returncode != 0:
+        raise RuntimeError(
+            f"ssh master spawn failed (rc={rc.returncode}): {rc.stderr.decode()!r}"
+        )
+
+    # Wait for the control socket to appear (handshake done).
+    deadline = 10.0
+    waited = 0.0
+    while not cp.exists():
+        if waited >= deadline:
+            raise RuntimeError(
+                f"ssh master control socket {cp} did not appear within {deadline}s"
+            )
+        import time as _t
+        _t.sleep(0.05)
+        waited += 0.05
+
+    print(f"[ssh] master ready: control_path={cp}", flush=True)
+    return cp
+
+
+def stop_ssh_master(
+    *,
+    ssh_config_path: Path,
+    control_path: Path,
+    host_alias: str,
+) -> None:
+    """Cleanly tear down a master spawned by :func:`spawn_ssh_master`.
+
+    Called by the driver on exit to release the gateway-side reverse
+    forwards. ``ssh -O exit`` talks to the master through the control
+    socket and asks it to terminate; idempotent if the socket is gone.
+    """
+    if not control_path.exists():
+        return
+    subprocess.run(
+        [
+            "ssh",
+            "-F", str(ssh_config_path),
+            "-O", "exit",
+            "-o", f"ControlPath={control_path}",
+            host_alias,
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 __all__ = [
     "ensure_dispatcher_keypair",
     "generate_ssh_config",
     "provision_dispatcher_user",
+    "spawn_ssh_master",
     "state_dir_for_instance",
+    "stop_ssh_master",
 ]

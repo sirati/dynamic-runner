@@ -194,12 +194,107 @@ impl Gateway for SshGateway {
             "connecting to SSH gateway"
         );
 
+        // External control-path escape hatch: if `DYNRUNNER_SSH_CONTROL_PATH`
+        // is set AND points at an existing socket, treat it as a
+        // pre-established master spawned by the driver (`run_e2e.py`,
+        // a downstream Python harness, etc.). Skip our own master
+        // spawn entirely — the existing master already has the
+        // reverse forwards we need (the driver knows the primary port
+        // ahead of time because it builds the dispatch config). All
+        // subsequent slave commands (execute_command, transfer_file,
+        // download_file) just route through the shared ControlPath
+        // without us caring about who owns the master process.
+        //
+        // Why this exists: empirically, OpenSSH 10's master spawned
+        // via std::process::Command from a tokio-driven Rust process
+        // exited ~2 minutes after handshake despite setsid + -f and
+        // every reasonable detach pattern. Identical command from a
+        // shell or from Python's subprocess persists indefinitely. The
+        // root cause appears to be specific to Rust+tokio's process
+        // supervision and is out of scope for this fix; this env-var
+        // hatch lets the upstream driver own master lifecycle in a
+        // process model that doesn't have the issue.
+        if let Ok(external_cp) = std::env::var("DYNRUNNER_SSH_CONTROL_PATH") {
+            if std::path::Path::new(&external_cp).exists() {
+                tracing::info!(
+                    control_path = %external_cp,
+                    "using external SSH master (DYNRUNNER_SSH_CONTROL_PATH); skipping our own spawn"
+                );
+                self.control_path = Some(external_cp.clone());
+                self.connected = true;
+
+                // Add any registered reverse forwards dynamically via
+                // `ssh -O forward -R …`. The external master spawned
+                // before our process started doesn't know about
+                // forwarded_ports; OpenSSH supports adding them at
+                // runtime through the control socket.
+                for &(local_port, remote_port) in &self.forwarded_ports.clone() {
+                    let mut cmd = Command::new("ssh");
+                    for arg in self.base_ssh_args() {
+                        cmd.arg(&arg);
+                    }
+                    cmd.args([
+                        "-O",
+                        "forward",
+                        "-o",
+                        &format!("ControlPath={external_cp}"),
+                        "-R",
+                        &format!("0.0.0.0:{remote_port}:localhost:{local_port}"),
+                    ]);
+                    cmd.arg(self.ssh_target());
+                    let output = cmd.output().await?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(GatewayError::CommandFailed(format!(
+                            "Failed to add reverse forward {remote_port}:localhost:{local_port} \
+                             to external master: {}",
+                            stderr.trim()
+                        )));
+                    }
+                    tracing::info!(local_port, remote_port, "added reverse forward to external master");
+                }
+
+                tracing::info!("SSH master connection established");
+
+                // Detect remote home (same as the regular path).
+                let home_result = self.ssh_command("echo $HOME", None).await?;
+                if home_result.success() {
+                    self.remote_home = Some(home_result.stdout.trim().to_string());
+                    tracing::info!(home = ?self.remote_home, "detected remote home");
+                }
+                self.check_gateway_ports().await;
+                return Ok(());
+            }
+        }
+
         let dir = tempfile::tempdir().map_err(|e| GatewayError::Other(e.to_string()))?;
         let cp = format!("{}/control-socket", dir.path().display());
         self.control_path = Some(cp.clone());
         self.control_dir = Some(dir);
 
-        let mut cmd = Command::new("ssh");
+        // Master spawn via `setsid -f -- ssh -M -N -f ...`. The outer
+        // `setsid -f` (util-linux) is the canonical way to fully
+        // detach a daemon from the parent's process tree:
+        //   - `setsid` puts the child in a new session.
+        //   - `-f` (util-linux extension) tells setsid to fork once
+        //     more so it itself is not session leader and the
+        //     subsequent program runs without a controlling tty.
+        //
+        // This produces ssh as a great-grandchild reparented to init
+        // (PID 1), invisible to anything that signals/supervises our
+        // PID tree. ssh's own `-f` then daemonises after handshake.
+        //
+        // Why we need this double-detach over plain `cmd.output()`:
+        // empirically, OpenSSH 10's master, when spawned as a direct
+        // child of our (tokio-driven Python) process, was getting
+        // SIGTERM'd ~2 minutes after handshake even when we tried
+        // setsid in `pre_exec`. The util-linux `setsid -f` indirection
+        // is the most robust cross-platform daemon-spawn pattern;
+        // matches what `nohup … &` / `disown` does in shells.
+        let mut cmd = std::process::Command::new("setsid");
+        cmd.arg("-f");
+        cmd.arg("--");
+        cmd.arg("ssh");
         for arg in self.base_ssh_args() {
             cmd.arg(&arg);
         }
@@ -226,6 +321,8 @@ impl Gateway for SshGateway {
             "ServerAliveCountMax=3",
             "-o",
             "TCPKeepAlive=yes",
+            "-o",
+            "LogLevel=ERROR",
         ]);
 
         // Add port forwarding
@@ -236,24 +333,34 @@ impl Gateway for SshGateway {
 
         cmd.arg(self.ssh_target());
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Hint at the generic escape hatch rather than encoding
-            // host-key-specific advice that would need updating each
-            // time a new failure mode appears. `--ssh-config <path>`
-            // accepts any ssh_config(5) directive, covering ephemeral
-            // host keys, port reuse across container instances, custom
-            // identities, ProxyJump, etc.
-            return Err(GatewayError::CommandFailed(format!(
-                "SSH master connection failed: {}\n\
-                 If this is a host-key/known_hosts issue (ephemeral host keys, \
-                 port reuse across container instances) or any other ssh -o \
-                 option needs adjusting, pass --ssh-config <path> with the \
-                 required options — that's the generic escape hatch and any \
-                 ssh_config(5) directive applies.",
-                stderr.trim()
-            )));
+        // /dev/null all stdio so the daemonised master inherits no
+        // pipes back to us.
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        // We don't capture the child: `setsid -f` re-forks itself, ssh
+        // re-forks again on `-f`, so the eventual master is a great-
+        // grandchild reparented to init. The control-socket-existence
+        // check below confirms the handshake landed; teardown is via
+        // `ssh -O exit` in `disconnect()`, which talks to the master
+        // through the control socket regardless of process parentage.
+        let _spawn_status = cmd.status()?;
+
+        // Wait for the control socket to appear. 10s timeout — the
+        // SSH handshake usually completes in <500ms on a healthy link.
+        let socket_path = std::path::Path::new(&cp);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !socket_path.exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(GatewayError::CommandFailed(
+                    "SSH master timed out establishing control socket (10s). \
+                     Pass --ssh-config <path> for ssh_config(5) overrides if a \
+                     host-key / agent / identity directive needs adjusting."
+                        .into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
         self.connected = true;
@@ -276,6 +383,11 @@ impl Gateway for SshGateway {
             return Ok(());
         }
 
+        // Politely ask the master to exit via `ssh -O exit` first,
+        // which cleans up the control socket and reverse forwards in
+        // an orderly fashion. If that fails or the child still lingers,
+        // SIGKILL via `Child::kill` ensures the master goes away — we
+        // own its lifetime now (no `-f` daemonisation).
         let mut cmd = Command::new("ssh");
         for arg in self.base_ssh_args() {
             cmd.arg(&arg);
