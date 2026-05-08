@@ -239,8 +239,20 @@ impl Gateway for SshGateway {
         let output = cmd.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // Hint at the generic escape hatch rather than encoding
+            // host-key-specific advice that would need updating each
+            // time a new failure mode appears. `--ssh-config <path>`
+            // accepts any ssh_config(5) directive, covering ephemeral
+            // host keys, port reuse across container instances, custom
+            // identities, ProxyJump, etc.
             return Err(GatewayError::CommandFailed(format!(
-                "SSH master connection failed: {stderr}"
+                "SSH master connection failed: {}\n\
+                 If this is a host-key/known_hosts issue (ephemeral host keys, \
+                 port reuse across container instances) or any other ssh -o \
+                 option needs adjusting, pass --ssh-config <path> with the \
+                 required options — that's the generic escape hatch and any \
+                 ssh_config(5) directive applies.",
+                stderr.trim()
             )));
         }
 
@@ -298,6 +310,17 @@ impl Gateway for SshGateway {
         }
 
         let expanded = self.expand_remote_path(remote);
+
+        // Pre-flight unlink of the destination. scp opens the dest with
+        // O_WRONLY|O_TRUNC, which fails with EACCES when the existing
+        // file is read-only — observed when sources are produced by a
+        // nix derivation (mode 0444) and a prior scp upload propagated
+        // those bits to the dest. `rm -f` no-ops when the dest is
+        // absent and only requires write perm on the parent directory,
+        // which scp itself already requires. Best-effort: any failure
+        // is swallowed so the canonical scp error still surfaces if
+        // the real cause is something else (e.g. parent-dir non-writable).
+        let _ = self.ssh_command(&format!("rm -f {expanded}"), None).await;
 
         let mut cmd = Command::new("scp");
         if self.config.port != 22 {
