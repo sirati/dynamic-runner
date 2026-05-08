@@ -761,7 +761,7 @@ mod tests {
         // the default staging dir. Same single-source-of-truth as
         // the Python `get_srcbins_mount_source` flow.
         let config = SlurmConfig {
-            prestaged_src_bins_path: Some(std::path::PathBuf::from("/srv/staged-src")),
+            prestaged_src_bins_path: Some("/srv/staged-src".into()),
             ..SlurmConfig::default()
         };
         let cfg = WrapperScriptConfig {
@@ -777,6 +777,8 @@ mod tests {
                 gateway_port: 9000,
             },
             run_log_dir: None,
+            extra_run_args: &[],
+            dynrunner_network_dir: None,
         };
         let script = generate_wrapper_script(&cfg);
         assert!(
@@ -784,7 +786,7 @@ mod tests {
             "wrapper must mount the prestaged host path into /app/src-network",
         );
         assert!(
-            !script.contains("\"~/dynamic_batch/src-bins:/app/src-network:ro\""),
+            !script.contains("\"~/dynamic_batch/image_bin/srcbins:/app/src-network:ro\""),
             "default staging dir must NOT be mounted when prestaged path is set",
         );
     }
