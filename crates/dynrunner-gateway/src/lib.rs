@@ -1,6 +1,7 @@
 pub mod config;
 pub mod filesystem;
 pub mod local;
+pub(crate) mod path;
 pub mod ssh;
 pub mod traits;
 
