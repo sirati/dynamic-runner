@@ -201,7 +201,19 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         } else {
             Some(binary.payload.to_string())
         };
-        match idle.assign_task(relative_path, payload).await {
+        // Forward the secondary's locally-resolved on-disk location
+        // when the file lives outside the worker's configured source
+        // dir (extraction-cache hit / pre-staged shared mount). The
+        // worker uses this verbatim to open the binary while still
+        // seeing `relative_path` as the wire-supplied identifier for
+        // output-tree mirroring. `None` here keeps the legacy
+        // worker behaviour: open `relative_path` against the
+        // configured source dir.
+        let resolved_path = binary
+            .resolved_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        match idle.assign_task(relative_path, payload, resolved_path).await {
             AssignResult::Assigned(processing) => {
                 // Spawn a background task that polls the worker protocol.
                 let worker_id = self.worker_id;

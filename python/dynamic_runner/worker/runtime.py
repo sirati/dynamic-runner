@@ -100,6 +100,17 @@ class Task:
     worker opens; for ``uses_file_based_items=False`` tasks (FR-2)
     it's an opaque identifier the worker resolves however it wants.
 
+    ``resolved_path`` is the secondary's locally-resolved on-disk
+    location when the file lives outside the worker's configured
+    source dir (extraction-cache hit / pre-staged shared mount).
+    ``None`` means "open ``relative_path`` against the configured
+    source dir" — the legacy behaviour. When set, the handler
+    should open this path directly while still using
+    ``relative_path`` as the identity / output-mirroring key.
+    The convenience property ``open_path`` returns
+    ``resolved_path`` when set, else ``relative_path``, so most
+    handlers can stay path-agnostic.
+
     ``payload`` is the parsed JSON value attached to ``TaskInfo.payload``,
     or ``None`` if the task carries no payload. ``payload_str`` is
     the raw JSON string for handlers that need it verbatim (e.g. to
@@ -125,7 +136,16 @@ class Task:
     relative_path: str
     payload: Any = None
     payload_str: Optional[str] = None
+    resolved_path: Optional[str] = None
     _emit: Optional[Callable[[Any], None]] = field(default=None, repr=False)
+
+    @property
+    def open_path(self) -> str:
+        """Path the handler should open: ``resolved_path`` when set,
+        else ``relative_path``. Use this in handlers that don't need
+        to distinguish the two (the common case).
+        """
+        return self.resolved_path if self.resolved_path is not None else self.relative_path
 
     def keepalive(self) -> None:
         if self._emit is not None:
@@ -355,6 +375,7 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
         relative_path=command.relative_path,
         payload=_parse_payload(command.payload),
         payload_str=command.payload,
+        resolved_path=command.resolved_path,
         _emit=lambda response, _ctx=ctx: _try_send(_ctx, response),
     )
 

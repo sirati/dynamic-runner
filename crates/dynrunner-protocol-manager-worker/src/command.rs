@@ -18,9 +18,21 @@ pub enum Command {
     /// `<path>\n` line. `Some(json)` ships the wrapped form so a
     /// worker that opted into payload data (FR-3 use case) can
     /// process the task without an additional filesystem read.
+    ///
+    /// `resolved_path` is the locally-resolved absolute on-disk
+    /// location of the file when the secondary's extraction cache /
+    /// pre-staged shared mount placed it somewhere other than
+    /// `<source-dir>/<relative_path>`. `None` means "the worker
+    /// should open `relative_path` against its configured source
+    /// dir as before". `Some(p)` means "the file lives at `p`;
+    /// `relative_path` remains the wire-supplied identifier used
+    /// for output-tree mirroring". Decouples the two concerns that
+    /// pre-fix collided in `relative_path` — see TaskInfo's
+    /// `resolved_path` doc-comment for the why.
     ProcessTask {
         relative_path: String,
         payload: Option<String>,
+        resolved_path: Option<String>,
     },
 }
 

@@ -536,8 +536,14 @@ where
                     self.resolve_for_dispatch(None, &resolution_path, &file_hash);
                 let actual_binary = match resolved {
                     Some(path) => {
+                        // Surface the locally-resolved on-disk path
+                        // via `resolved_path`; keep `binary.path` as
+                        // the wire-supplied identifier so the worker
+                        // sees the consumer's relative-under-source
+                        // string in `task.relative_path` for output
+                        // mirroring.
                         let mut b = binary.clone();
-                        b.path = path;
+                        b.resolved_path = Some(path);
                         b
                     }
                     None if self.pre_staged_mode() => {

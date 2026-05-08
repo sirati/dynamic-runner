@@ -178,7 +178,7 @@ mod tests {
 
         // Send command
         manager
-            .send(Command::ProcessTask { relative_path: "x/y".into(), payload: None })
+            .send(Command::ProcessTask { relative_path: "x/y".into(), payload: None, resolved_path: None, })
             .await
             .unwrap();
 

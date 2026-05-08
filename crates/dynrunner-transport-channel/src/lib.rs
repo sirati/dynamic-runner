@@ -388,7 +388,7 @@ mod tests {
         let (mut manager, mut runner) = channel_pair();
 
         manager
-            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None })
+            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None, resolved_path: None, })
             .await
             .unwrap();
 

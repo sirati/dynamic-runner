@@ -28,32 +28,49 @@ struct WorkerExceptionWire {
 ///
 /// Format:
 ///   "stop\n"
-///   "<relative_path>\n"                          (legacy ProcessTask, no payload)
-///   "task:<json {path, payload}>\n"              (new ProcessTask with payload)
+///   "<relative_path>\n"                          (legacy ProcessTask, no payload, no resolved_path)
+///   "task:<json {path, payload?, resolved_path?}>\n"  (any new field present)
 ///
 /// The `task:` prefix routes the new form. Legacy paths starting
 /// with the literal string `task:` would collide; in practice
-/// paths don't, and consumers that need payload-bearing dispatch
-/// opt in via `Some(payload)` knowing they shouldn't emit
-/// `task:`-prefixed paths in the same run.
+/// paths don't, and consumers that need payload-bearing or
+/// resolved-path dispatch opt in via `Some(...)` knowing they
+/// shouldn't emit `task:`-prefixed paths in the same run.
 pub fn serialize_command(cmd: &Command) -> Vec<u8> {
     match cmd {
         Command::Stop => b"stop\n".to_vec(),
         Command::ProcessTask {
             relative_path,
             payload: None,
+            resolved_path: None,
         } => format!("{relative_path}\n").into_bytes(),
         Command::ProcessTask {
             relative_path,
-            payload: Some(payload),
+            payload,
+            resolved_path,
         } => {
-            let wrapper = serde_json::json!({
-                "path": relative_path,
-                "payload": payload,
-            });
+            // serde_json::json! only includes keys with valid Value
+            // shapes; build the map explicitly to omit absent fields
+            // so legacy parsers that don't know about
+            // `resolved_path` don't trip on a `null`.
+            let mut wrapper = serde_json::Map::new();
+            wrapper.insert(
+                "path".into(),
+                serde_json::Value::String(relative_path.clone()),
+            );
+            if let Some(p) = payload {
+                wrapper.insert("payload".into(), serde_json::Value::String(p.clone()));
+            }
+            if let Some(rp) = resolved_path {
+                wrapper.insert(
+                    "resolved_path".into(),
+                    serde_json::Value::String(rp.clone()),
+                );
+            }
+            let value = serde_json::Value::Object(wrapper);
             // serde_json compact never emits newlines, so this is
             // safe to embed in a single line.
-            format!("task:{}\n", wrapper).into_bytes()
+            format!("task:{}\n", value).into_bytes()
         }
     }
 }
@@ -70,11 +87,14 @@ pub fn parse_command(line: &str) -> Option<Command> {
         return Some(Command::Stop);
     }
     if let Some(rest) = line.strip_prefix("task:") {
-        // New form: task:<json {path, payload}>. Falls back to
-        // legacy interpretation if the JSON is malformed (treat the
-        // whole line as a literal path) — defensive, since a
-        // legacy emitter that happened to send a `task:`-prefixed
-        // path would otherwise hit a parse error here.
+        // New form: task:<json {path, payload?, resolved_path?}>.
+        // Falls back to legacy interpretation if the JSON is
+        // malformed (treat the whole line as a literal path) —
+        // defensive, since a legacy emitter that happened to send a
+        // `task:`-prefixed path would otherwise hit a parse error
+        // here. Missing `payload` / `resolved_path` deserialise as
+        // `None`, preserving wire compatibility with senders that
+        // omit either.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) {
             let path = value
                 .get("path")
@@ -85,15 +105,21 @@ pub fn parse_command(line: &str) -> Option<Command> {
                 .get("payload")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
+            let resolved_path = value
+                .get("resolved_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
             return Some(Command::ProcessTask {
                 relative_path: path,
                 payload,
+                resolved_path,
             });
         }
     }
     Some(Command::ProcessTask {
         relative_path: line.to_owned(),
         payload: None,
+        resolved_path: None,
     })
 }
 

@@ -49,6 +49,7 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        resolved_path: None,
     }
 }
 

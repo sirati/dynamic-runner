@@ -139,6 +139,7 @@ fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        resolved_path: None,
     }
 }
 
@@ -551,6 +552,7 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        resolved_path: None,
     };
     pool.extend(vec![item]).expect("valid extend");
 
