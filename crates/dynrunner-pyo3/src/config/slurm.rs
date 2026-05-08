@@ -24,7 +24,7 @@ pub(crate) struct PySlurmConfig {
     partition: String,
     time_limit: String,
     cpus_per_task: u32,
-    memory_per_node: String,
+    memory_per_node: Option<String>,
     nodes: u32,
     notify_email: Option<String>,
     prestaged_src_bins_path: Option<String>,
@@ -110,7 +110,11 @@ impl PySlurmConfig {
             partition: partition.unwrap_or(d.partition),
             time_limit: time_limit.unwrap_or(d.time_limit),
             cpus_per_task: cpus_per_task.unwrap_or(d.cpus_per_task),
-            memory_per_node: memory_per_node.unwrap_or(d.memory_per_node),
+            // Python passes `memory_per_node=None` through verbatim
+            // (default is None). Operators who want `--mem` set on
+            // sbatch pass an explicit string here; everyone else gets
+            // `None`, which makes `submit_job` omit `--mem` entirely.
+            memory_per_node,
             nodes: nodes.unwrap_or(d.nodes),
             notify_email,
             prestaged_src_bins_path,
