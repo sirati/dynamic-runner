@@ -218,8 +218,12 @@ impl<G: Gateway> SlurmJobManager<G> {
 
     /// Submit a SLURM job using the given wrapper script content.
     ///
-    /// The script is written to a temporary file on the gateway, then
-    /// submitted via `sbatch --parsable`.
+    /// The script is written to `<root_folder>/job_<job_name>.sh` on
+    /// the gateway and then submitted via `sbatch --parsable`. The
+    /// path placement, `--mail-type=ALL` flag, and conditional `--mem`
+    /// emission all mirror the Python `SlurmJobManager.submit_job` in
+    /// `packaging/job_manager.py` so a Rust-driven submission produces
+    /// the same sbatch invocation a Python-driven one would.
     pub async fn submit_job(
         &mut self,
         wrapper_script: &str,
@@ -227,8 +231,12 @@ impl<G: Gateway> SlurmJobManager<G> {
         nodes: u32,
         run_log_dir: &str,
     ) -> Result<String, SlurmError> {
-        // Write script to gateway
-        let script_path = format!("{}/wrapper_{job_name}.sh", self.config.log_path());
+        // Write script to gateway. Python lays the wrapper directly in
+        // `root_folder` as `job_<name>.sh` (NOT under `log_subfolder`)
+        // — keeping that location so a side-by-side cluster has a
+        // single canonical path for the submitted script regardless of
+        // which binding launched the job.
+        let script_path = format!("{}/job_{job_name}.sh", self.config.root_folder);
         let escaped = wrapper_script.replace('\'', "'\\''");
         let write_cmd = format!("printf '%s' '{escaped}' > {script_path} && chmod +x {script_path}");
         let result = self.gateway.execute_command(&write_cmd, None).await?;
@@ -239,7 +247,6 @@ impl<G: Gateway> SlurmJobManager<G> {
             )));
         }
 
-        // Build sbatch command
         let mut sbatch_args = vec![
             "sbatch".to_string(),
             "--parsable".to_string(),
@@ -252,10 +259,18 @@ impl<G: Gateway> SlurmJobManager<G> {
         sbatch_args.push(format!("--partition={}", self.config.partition));
         sbatch_args.push(format!("--time={}", self.config.time_limit));
         sbatch_args.push(format!("--cpus-per-task={}", self.config.cpus_per_task));
-        sbatch_args.push(format!("--mem={}", self.config.memory_per_node));
+        // `--mem` is only emitted when the operator explicitly set
+        // `memory_per_node`. The Python shim never emits `--mem` (the
+        // field isn't in its sbatch argument list), so an unset config
+        // produces a Python-equivalent invocation here.
+        if let Some(mem) = &self.config.memory_per_node {
+            sbatch_args.push(format!("--mem={mem}"));
+        }
         if let Some(email) = &self.config.notify_email {
+            // Mirror Python's flag order: `--mail-type` before
+            // `--mail-user` (cosmetic — sbatch is order-insensitive).
+            sbatch_args.push("--mail-type=ALL".to_string());
             sbatch_args.push(format!("--mail-user={email}"));
-            sbatch_args.push("--mail-type=FAIL".to_string());
         }
 
         sbatch_args.push(script_path);
@@ -374,6 +389,7 @@ mod tests {
 
     use super::*;
     use dynrunner_gateway::local::LocalGateway;
+    use dynrunner_gateway::traits::CommandResult;
 
     /// Records the inputs the manager hands to the packager so we
     /// can assert the boundary contract (output_dir == image_path)
@@ -471,5 +487,160 @@ mod tests {
             }
             other => panic!("expected Packaging(BuildFailed), got {other:?}"),
         }
+    }
+
+    /// Recording gateway for `submit_job` tests: captures every
+    /// `execute_command` and answers any `sbatch ...` line with a
+    /// canned job ID, every other command with empty stdout. Routing
+    /// by command-prefix (rather than call-index) means the test stays
+    /// correct if `submit_job` ever inserts an additional setup
+    /// command before the sbatch invocation.
+    #[derive(Default)]
+    struct SubmitRecordingGateway {
+        commands: Mutex<Vec<String>>,
+    }
+
+    impl SubmitRecordingGateway {
+        fn commands(&self) -> Vec<String> {
+            self.commands.lock().unwrap().clone()
+        }
+
+        fn sbatch_command(&self) -> String {
+            self.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|c| c.starts_with("sbatch "))
+                .expect("sbatch command must have been issued")
+                .clone()
+        }
+    }
+
+    impl Gateway for SubmitRecordingGateway {
+        async fn connect(&mut self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn execute_command(
+            &self,
+            cmd: &str,
+            _cwd: Option<&str>,
+        ) -> Result<CommandResult, GatewayError> {
+            self.commands.lock().unwrap().push(cmd.to_string());
+            // Only `sbatch --parsable` is expected to produce stdout;
+            // anything else (e.g. the `printf … > path` script-write)
+            // is silent in the real shell.
+            let stdout = if cmd.starts_with("sbatch ") {
+                "12345".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                return_code: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }
+        async fn transfer_file(&self, _local: &Path, _remote: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn create_directory(&self, _remote: &str) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        async fn file_exists(&self, _remote: &str) -> Result<bool, GatewayError> {
+            Ok(false)
+        }
+        fn setup_port_forwarding(&mut self, _l: u16, _r: u16) -> Result<(), GatewayError> {
+            Ok(())
+        }
+    }
+
+    /// Parity vs. Python `SlurmJobManager.submit_job` in
+    /// `packaging/job_manager.py`:
+    ///
+    /// (a) `--mail-type=ALL` is the only mail-type emitted when notify
+    ///     is set (Python uses ALL; the negative assertion guards
+    ///     against accidental regression to FAIL).
+    /// (b) `--mem` is OMITTED when `memory_per_node` is `None` —
+    ///     matches Python, which never emits `--mem` at all.
+    /// (c) `memory_per_node = Some("...")` → `--mem={val}` IS emitted
+    ///     so opt-in operators still get a cap.
+    /// (d) Wrapper script lands at `<root_folder>/job_<name>.sh`
+    ///     (Python placement; the negative assertion guards against
+    ///     regression to the historical `<log_path>/wrapper_<name>.sh`).
+    #[tokio::test]
+    async fn submit_job_matches_python_invocation_shape() {
+        // Case A+B+D: defaults — no mem, mail=ALL on notify, script in root.
+        let gw = SubmitRecordingGateway::default();
+        let cfg = SlurmConfig {
+            root_folder: "/srv/slurm".into(),
+            notify_email: Some("ops@example.com".into()),
+            ..SlurmConfig::default()
+        };
+        let mut mgr = SlurmJobManager::new(cfg, gw);
+        let jid = mgr
+            .submit_job("#!/bin/sh\necho hi", "myjob", 1, "/srv/slurm/log/run-1")
+            .await
+            .expect("submit succeeds");
+        assert_eq!(jid, "12345");
+
+        let cmds = mgr.gateway().commands();
+
+        // (d) Script path: `<root_folder>/job_<job_name>.sh`.
+        let write_cmd = cmds
+            .iter()
+            .find(|c| !c.starts_with("sbatch "))
+            .expect("script-write command must precede sbatch");
+        assert!(
+            write_cmd.contains("/srv/slurm/job_myjob.sh"),
+            "wrapper script must land under root_folder, got: {write_cmd}",
+        );
+        assert!(
+            !write_cmd.contains("/log/wrapper_"),
+            "wrapper must not land at <log_path>/wrapper_<name>.sh: {write_cmd}",
+        );
+
+        let sbatch = mgr.gateway().sbatch_command();
+        // (a) mail=ALL only.
+        assert!(
+            sbatch.contains("--mail-type=ALL"),
+            "expected --mail-type=ALL in sbatch; got: {sbatch}",
+        );
+        assert!(
+            !sbatch.contains("--mail-type=FAIL"),
+            "--mail-type=FAIL must not appear: {sbatch}",
+        );
+        // (b) no --mem when memory_per_node is unset.
+        assert!(
+            !sbatch.contains("--mem="),
+            "--mem must be omitted when memory_per_node is None; got: {sbatch}",
+        );
+        // sbatch line ends with the script path argument.
+        assert!(
+            sbatch.ends_with("/srv/slurm/job_myjob.sh"),
+            "sbatch must terminate with the script path; got: {sbatch}",
+        );
+
+        // Case C: memory_per_node explicitly set → --mem={val} emitted.
+        let gw = SubmitRecordingGateway::default();
+        let cfg = SlurmConfig {
+            root_folder: "/srv/slurm".into(),
+            memory_per_node: Some("32G".into()),
+            ..SlurmConfig::default()
+        };
+        let mut mgr = SlurmJobManager::new(cfg, gw);
+        mgr.submit_job("#!/bin/sh", "j2", 1, "/srv/slurm/log/run-2")
+            .await
+            .expect("submit succeeds");
+        let sbatch = mgr.gateway().sbatch_command();
+        assert!(
+            sbatch.contains("--mem=32G"),
+            "expected --mem=32G when memory_per_node is set; got: {sbatch}",
+        );
     }
 }

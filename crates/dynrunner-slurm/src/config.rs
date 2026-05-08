@@ -26,8 +26,11 @@ pub struct SlurmConfig {
     pub time_limit: String,
     /// Number of CPUs per task.
     pub cpus_per_task: u32,
-    /// Memory per node (e.g. "64G").
-    pub memory_per_node: String,
+    /// Memory per node (e.g. "64G"). `None` omits the `--mem` flag
+    /// from `sbatch` entirely (matching the Python shim, which never
+    /// emits `--mem` because the field is not part of its sbatch
+    /// argument list).
+    pub memory_per_node: Option<String>,
     /// Number of nodes to request per submitted job.
     pub nodes: u32,
     /// Email for SLURM notifications. `None` disables `--mail-user`.
@@ -124,7 +127,7 @@ impl Default for SlurmConfig {
             partition: "All".into(),
             time_limit: "48:00:00".into(),
             cpus_per_task: 14,
-            memory_per_node: "64G".into(),
+            memory_per_node: None,
             nodes: 1,
             notify_email: None,
             prestaged_src_bins_path: None,
