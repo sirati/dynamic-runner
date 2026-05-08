@@ -27,3 +27,6 @@ base64 = { workspace = true }
 [dev-dependencies]
 serde = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

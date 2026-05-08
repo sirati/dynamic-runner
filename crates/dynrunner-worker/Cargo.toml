@@ -18,3 +18,6 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 dynrunner-transport-channel = { workspace = true }
+
+[lints]
+workspace = true

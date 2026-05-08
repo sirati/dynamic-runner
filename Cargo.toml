@@ -67,3 +67,10 @@ dynrunner-discovery = { path = "crates/dynrunner-discovery" }
 dynrunner-slurm = { path = "crates/dynrunner-slurm" }
 dynrunner-pyo3 = { path = "crates/dynrunner-pyo3" }
 dynrunner-publish = { path = "crates/dynrunner-publish" }
+
+[workspace.lints.clippy]
+# Catch std::sync::MutexGuard / RefCell::borrow held across `.await`. These
+# can deadlock async runtimes (the future is moved across tasks while the
+# guard pretends to be Send/blocking-safe). See L4.3 audit follow-up.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"

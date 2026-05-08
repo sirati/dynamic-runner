@@ -24,3 +24,6 @@ tracing = { workspace = true }
 # tests/mesh_partition.rs). Production builds must NOT enable this —
 # routing state is an internal invariant, not part of the stable API.
 test-utils = []
+
+[lints]
+workspace = true
