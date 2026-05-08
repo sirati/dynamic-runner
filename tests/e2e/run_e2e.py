@@ -101,7 +101,14 @@ DEFAULT_INSTANCE_ID = "e2e"
 DEFAULT_SSH_PORT = 2222
 DEFAULT_TIMEOUT_S = 1800
 DEFAULT_WORKERS = 4
-DEFAULT_SLURM_ROOT_FOLDER = "/home/testuser/dynrunner-e2e"
+# SSH user the dispatcher provisions and connects as. Per the
+# slurm-test-env owner's contract: never reuse the operator's
+# personal user; provision a dedicated test user via
+# `nix run .#provision-user`. The default slurm root folder
+# below mirrors this so the gateway can `mkdir -p` it (only
+# the matching user owns the home directory).
+DEFAULT_SSH_USER = "e2e-user"
+DEFAULT_SLURM_ROOT_FOLDER = f"/home/{DEFAULT_SSH_USER}/dynrunner-e2e"
 
 # How many seconds without log activity before the heartbeat thread
 # stops touching its file (so an outer watcher knows the dispatch
@@ -410,7 +417,7 @@ def main() -> int:
         state_root = Path(__file__).resolve().parent / "state"
         instance_state_dir = state_dir_for_instance(state_root, args.instance_id)
         priv, pub = ensure_dispatcher_keypair(instance_state_dir)
-        ssh_user = "e2e-user"
+        ssh_user = DEFAULT_SSH_USER
         provision_dispatcher_user(
             SLURM_TEST_ENV_DIR, args.instance_id, ssh_user, pub
         )
@@ -431,7 +438,7 @@ def main() -> int:
         slurm_root_folder=args.slurm_root_folder,
         workers=args.workers,
         mode=args.mode,
-        ssh_user="e2e-user",
+        ssh_user=DEFAULT_SSH_USER,
         ssh_config_path=ssh_config_path,
         ssh_identity_path=ssh_identity_path,
     )
