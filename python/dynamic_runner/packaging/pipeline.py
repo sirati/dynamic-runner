@@ -1,36 +1,63 @@
 """Top-level SLURM pipeline driver.
 
-Replaces the legacy `slurm.primary.SlurmPrimaryCoordinator` for the new
-runner architecture: build the container image (`podman.PodmanPackaging`),
-transfer it to the gateway, submit the SLURM jobs (`job_manager`), then
-hand control to `dynamic_runner.run_primary` to coordinate the work.
+The orchestration body lives in Rust (`crates/dynrunner-slurm/src/pipeline.rs`
++ `crates/dynrunner-pyo3/src/slurm/pipeline.rs`); this Python module is a
+thin shim that:
 
-The legacy coordinator inherited a lot of QUIC-handshake / file-transfer
-plumbing from `multi_computer.primary.coordinator.BaseCoordinator` —
-that whole stack is now Rust-side. Python only owns the
-build/transfer/submit pre-amble plus optional SSH-tunnel setup for the
-reverse-connection mode (compute node → gateway → primary).
+* keeps the public callable `run_slurm_pipeline` importable at this path
+  (consumers and `dynamic_runner.run` import via
+  ``from .packaging import run_slurm_pipeline``),
+* preserves the small argparse-aware helpers (`_make_run_id`,
+  `_validate_slurm_args`, `_make_slurm_config`) that the Rust
+  orchestrator calls back into via PyO3 imports — these helpers
+  manipulate ``argparse.Namespace`` and ``pathlib.Path`` shapes that
+  remain Python-side concerns.
+
+The argparse / Path helpers are kept here (rather than ported to Rust)
+because:
+
+* Rust has no idiomatic ``argparse.Namespace`` analogue; we'd have to
+  marshal a dynamic dict across the FFI boundary on every read.
+* Tilde expansion against ``gateway.remote_home`` requires the gateway
+  pyclass which is itself an L2.A migration concern; once L2.A lands
+  with ``RustSshGateway.remote_home`` exposed, ``_make_slurm_config``
+  reduces to a one-line call into the Rust ``SlurmConfig::from_args``
+  factory.
+
+That follow-up is part of L2.H (final cleanup), not L2.G.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
-import os
-import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from .._shared import process_selection_arguments
+from .slurm_config import SlurmConfig
 
-from ..deployment_spec import TaskDeploymentSpec
-from .gateway import create_gateway, parse_gateway_url
-from .job_manager import SlurmJobManager
-from .podman import PodmanPackaging
-from .preparation import SlurmPreparation
-from .slurm_config import SlurmConfig, validate_slurm_config
-from ..task_protocol import TaskDefinition
+# Re-export the Rust orchestration as the canonical
+# ``run_slurm_pipeline`` callable. Consumers that previously did
+# ``from dynamic_runner.packaging import run_slurm_pipeline`` (or
+# ``from dynamic_runner.packaging.pipeline import run_slurm_pipeline``)
+# get the Rust-implementation transparently.
+from .._native import run_slurm_pipeline as run_slurm_pipeline  # noqa: F401
+
+
+def _slurm_already_spawned(*_args: object, **_kwargs: object) -> None:
+    """No-op spawn_secondary callback for SLURM mode.
+
+    SLURM did the actual spawning, so the Rust runner's
+    ``spawn_secondary`` callback isn't responsible for any subprocess.
+    Returning ``None`` tells the Rust side it doesn't own a process to
+    clean up at the end.
+
+    Defined at module scope so the Rust orchestrator can fetch it via
+    ``py.import("dynamic_runner.packaging.pipeline")``-and-getattr,
+    avoiding an inline ``py.eval`` that would otherwise be needed for
+    a one-line lambda.
+    """
+    return None
 
 logger = logging.getLogger(__name__)
 
@@ -95,277 +122,3 @@ def _make_slurm_config(args: argparse.Namespace, gateway: object) -> SlurmConfig
         notify_email=args.slurm_notify_email,
         **overrides,
     )
-
-
-def run_slurm_pipeline(
-    task: TaskDefinition,
-    args: argparse.Namespace,
-    deployment: TaskDeploymentSpec,
-    log: logging.Logger,
-) -> None:
-    """Build the image, transfer it, submit slurm jobs, then run the
-    primary coordinator (Rust-side via `dynamic_runner.run_primary`).
-
-    Compatibility fallback: if `dynamic_runner` is unavailable (e.g.
-    development checkout without maturin build), the function logs an
-    actionable error and exits cleanly instead of crashing inside the
-    coordinator. The build/transfer/submit half still runs so the user
-    can verify their gateway + image build setup.
-    """
-    if not _validate_slurm_args(args, log):
-        return
-
-    sel_result = process_selection_arguments(args)
-
-    num_secondaries = args.jobs
-    run_id = _make_run_id()
-    log.info(f"Run ID: {run_id}")
-
-    # Set up gateway + slurm config.
-    #
-    # The QUIC port and the SSH -R forward have to be configured BEFORE
-    # `gateway.connect()`: SSHGateway.connect() reads `forwarded_ports`
-    # to build its `-R 0.0.0.0:remote:localhost:local` flags, and
-    # `_check_gateway_ports()` (which decides whether to fall back to
-    # reverse-connection mode) short-circuits when `forwarded_ports`
-    # is empty. So a port-pick + setup_port_forwarding has to happen
-    # before connect — otherwise no listener exists on the gateway,
-    # secondaries get "Connection refused" dialing the gateway FQDN,
-    # AND the reverse-connection fallback never fires either.
-    log.info("Connecting to gateway...")
-    gateway_config = parse_gateway_url(args.gateway)
-    # CLI-supplied auth primitives are gateway-config concerns, not URL
-    # concerns — the URL stays a clean user@host:port. Setting after
-    # parse keeps `parse_gateway_url`'s signature unchanged for any
-    # caller that constructs the URL programmatically.
-    gateway_config.ssh_identity_file = getattr(args, "ssh_identity_file", None)
-    gateway_config.ssh_config_file = getattr(args, "ssh_config", None)
-    gateway = create_gateway(gateway_config)
-
-    import dynamic_runner as _rs
-    primary_quic_port = _rs.pick_free_port()
-    gateway.setup_port_forwarding(primary_quic_port, primary_quic_port)
-
-    # Consumer-supplied extra `-R local:gateway` forwards. Same
-    # ControlMaster, same `gateway.connect()` — the framework only
-    # needs to know the (local, gateway) port pairs; what's actually
-    # listening on `localhost:local` and who connects to
-    # `<gateway-host>:gateway` are the consumer's concerns. Avoids
-    # spawning a parallel SSHGateway from consumer code (which
-    # would duplicate auth and fight SIGHUP semantics on shutdown).
-    for local_port, gateway_port in deployment.extra_port_forwards:
-        gateway.setup_port_forwarding(local_port, gateway_port)
-
-    gateway.connect()
-
-    slurm_config = _make_slurm_config(args, gateway)
-    try:
-        validate_slurm_config(slurm_config, gateway)
-    except ValueError:
-        log.info(f"Creating SLURM root directory: {slurm_config.root_folder}")
-        gateway.create_directory(slurm_config.root_folder)
-
-    # Deployment-correct output root surfaced on `args` so a task's
-    # `discover_items` can drive `find_items` against the same path
-    # outputs land at — gateway-absolute here, local-absolute in
-    # `run.py`. Tasks that implement `--skip-existing` walk this
-    # path with `args.gateway` as the URL; the framework owns no
-    # filtering policy, only the path-derivation primitive.
-    args.resolved_output_root = str(slurm_config.get_output_dir())
-
-    # Item discovery is the task's concern under the post-phases-
-    # redesign Protocol; framework no longer scans. Done here, AFTER
-    # `args.resolved_output_root` is set, so a task that wants to
-    # apply skip-existing logic inside `discover_items` (calling
-    # `_native.find_items` against the gateway output tree) has the
-    # path it needs. Discovered ONCE; the same list flows into
-    # `_drive_rust_primary`.
-    binaries = list(task.discover_items(sel_result.source_dir, args))
-    if not binaries:
-        log.warning("No items discovered. Pipeline will run in test/job-submission mode.")
-
-    # Reverse-connection mode: when the gateway forbids public port
-    # forwarding (GatewayPorts off), we tunnel from primary → each
-    # secondary via the gateway instead.
-    use_reverse_connection = (
-        hasattr(gateway, "gateway_ports_enabled") and gateway.gateway_ports_enabled is False
-    )
-    if use_reverse_connection:
-        log.info("Gateway disallows public port forwarding; switching to SSH ProxyJump tunnel mode.")
-
-    # Clean up any leftover SSH tunnels from previous runs.
-    subprocess.run(
-        ["pkill", "-u", str(os.getuid()), "-f", "ssh.*-R.*localhost"],
-        stderr=subprocess.DEVNULL,
-    )
-
-    # Build + transfer images, then submit slurm jobs, then (if reverse
-    # mode) wait for tunnels to establish.
-    packaging = PodmanPackaging(deployment=deployment)
-    job_manager = SlurmJobManager(gateway, slurm_config, packaging, deployment)
-
-    cert_dir = Path("/tmp") / f"db-runner-cert-{run_id}"
-    cert_dir.mkdir(parents=True, exist_ok=True)
-
-    preparation = SlurmPreparation(
-        slurm_config=slurm_config,
-        job_manager=job_manager,
-        gateway=gateway,
-        deployment=deployment,
-        use_reverse_connection=use_reverse_connection,
-        run_id=run_id,
-    )
-
-    try:
-        prep_result = asyncio.run(
-            preparation.prepare(
-                num_secondaries=num_secondaries,
-                quic_port=primary_quic_port,
-                primary_quic_port=primary_quic_port,
-                cert_dir=cert_dir,
-                skip_image_build=args.skip_image_build,
-            )
-        )
-        log.info(f"SLURM jobs submitted; run_id={prep_result.run_id}")
-
-        # Push the consumer's local --source tree to the gateway's
-        # srcbins dir so the wrapper's RO bind-mount into /app/src-network
-        # is actually populated. Without this the StageFile pipeline
-        # (default mode) issues "the file is at src_network/<rel>"
-        # records pointing at an empty directory and every task fails
-        # NonRecoverable. Skipped when the consumer pre-staged
-        # (--source-already-staged) or the task is non-file-based.
-        # Runs after SLURM submit so secondaries are already starting;
-        # the primary's InitialAssignment (which secondaries process
-        # via stage_file) isn't sent until coord.run() reaches its
-        # peer-mesh-ready gate, so a slow upload just delays dispatch
-        # rather than racing the secondary.
-        if (
-            binaries
-            and getattr(task, "uses_file_based_items", True)
-            and not getattr(args, "source_already_staged", None)
-        ):
-            job_manager.upload_source_binaries(binaries, sel_result.source_dir)
-
-        _drive_rust_primary(
-            task, args, prep_result, primary_quic_port, binaries, slurm_config, log
-        )
-    finally:
-        preparation.cleanup()
-        # Graceful master shutdown FIRST: `ssh -O exit` takes the
-        # master and all its -R forwardings down cleanly. Doing this
-        # after the pkill below caused the documented "Control socket
-        # connect: No such file or directory" warning, because the
-        # broadband pkill had already killed the master.
-        gateway.disconnect()
-        # Belt-and-suspenders for any per-secondary reverse tunnel
-        # that escaped preparation.cleanup() tracking. Pattern
-        # specifically matches `-R <port>:localhost...` (preparation's
-        # shape); the master used `-R 0.0.0.0:<port>:localhost...`
-        # so the regex no longer races the master shutdown above.
-        subprocess.run(
-            ["pkill", "-u", str(os.getuid()), "-f", r"ssh.*-R [0-9]+:localhost"],
-            stderr=subprocess.DEVNULL,
-        )
-
-
-def _drive_rust_primary(
-    task: TaskDefinition,
-    args: argparse.Namespace,
-    prep_result,
-    primary_quic_port: int,
-    binaries: list,
-    slurm_config: SlurmConfig,
-    log: logging.Logger,
-) -> None:
-    """Hand the run over to the Rust primary coordinator.
-
-    `binaries` is the already-discovered item list from
-    `run_slurm_pipeline` — passed through rather than re-discovered
-    so both halves see the exact same set (avoids divergence between
-    the count we logged earlier and the count the coordinator
-    actually queues StageFile notifications for).
-
-    The SLURM jobs already spawned the secondaries, so the
-    `spawn_secondary` callback is a no-op (returns None: Python doesn't
-    own the secondary processes; SLURM does).
-    """
-    try:
-        import dynamic_runner as _rs
-    except ImportError:
-        log.error(
-            "dynamic_runner is not installed; cannot run the primary coordinator. "
-            "Install it via: cd rust/dynamic_batch/crates/db_python_provider && maturin develop --release"
-        )
-        log.warning(
-            "Build/transfer/submit completed successfully — your SLURM jobs are running. "
-            "Re-invoke once dynamic_runner is available, or use the legacy --use-python-backend "
-            "flag with a previous release for end-to-end coordination."
-        )
-        return
-
-    sel_result = process_selection_arguments(args)
-
-    def _slurm_already_spawned(_primary_url: str, _secondary_id: str, _quic_port: int):
-        # SLURM did the actual spawning; the Rust runner's spawn_secondary
-        # callback isn't responsible for any subprocess. Returning None tells
-        # the Rust side it doesn't own a process to clean up at the end.
-        return None
-
-    # Construct the coordinator pyclass directly (rather than the
-    # `run_primary` free function) so we can pre-stage every binary on
-    # every secondary before the coordinator's run-loop starts assigning
-    # work. The coordinator flushes these notifications once secondary
-    # connections are established and before TaskAssignment dispatch.
-    distributed_config = None
-    if getattr(args, "retry_max_passes", None) is not None:
-        distributed_config = _rs.DistributedConfig(
-            retry_max_passes=args.retry_max_passes,
-        )
-    coord = _rs.RustPrimaryCoordinator(
-        prep_result.num_secondaries,
-        task,
-        _slurm_already_spawned,
-        distributed_config=distributed_config,
-        listen_port=primary_quic_port,
-        source_pre_staged_root=(
-            slurm_config.get_srcbins_mount_source()
-            if getattr(args, "source_already_staged", None)
-            else None
-        ),
-    )
-
-    if not coord.uses_file_based_items:
-        # FR-2: TaskDefinition.uses_file_based_items=False — items
-        # aren't files (worker reads payload via JSON/comm-fd, not by
-        # opening TaskInfo.path). Framework does no primary-side
-        # staging at all; secondary will pass `local_path` through to
-        # the worker as an opaque identifier.
-        log.info(
-            "TaskDefinition.uses_file_based_items=False; "
-            "skipping primary StageFile pass and starting coordinator"
-        )
-    elif getattr(args, "source_already_staged", None):
-        # Pre-staged mode: the wrapper script bind-mounts the user-named
-        # host path into each secondary container at /app/src-network.
-        # No primary-side staging pass needed — the secondaries already
-        # see the data through the bind mount.
-        log.info(
-            "Pre-staged source mode (--source-already-staged=%s); "
-            "skipping primary StageFile pass and starting coordinator",
-            args.source_already_staged,
-        )
-    else:
-        # Bulk-queue StageFile notifications in Rust — one PyO3 crossing
-        # for the whole binary list (instead of 4 per binary), and the
-        # rel-path / task-hash / content-hash computations all happen
-        # in the same loop body without re-acquiring the GIL.
-        coord.queue_initial_staging(binaries, str(sel_result.source_dir))
-        log.info(
-            "Queued %d StageFile notifications across %d secondaries; starting coordinator",
-            len(binaries),
-            prep_result.num_secondaries,
-        )
-    coord.run(binaries)
-    log.info(f"Completed: {coord.completed}")
-    log.info(f"Failed: {coord.failed}")
