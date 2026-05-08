@@ -114,8 +114,14 @@ class WorkerRuntimeTests(unittest.TestCase):
 
         done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
         self.assertEqual(len(done), 1)
-        self.assertEqual(done[0].warnings, 3)
-        self.assertEqual(done[0].filtered, 7)
+        # The runtime JSON-encodes ``WorkerOutput`` counters into the
+        # opaque ``result_data`` payload. The framework never inspects
+        # those bytes; a consumer primary that wants the counters
+        # decodes the JSON itself. The test mirrors that decode path
+        # to verify the producer-side contract end-to-end.
+        self.assertIsNotNone(done[0].result_data)
+        decoded = json.loads(done[0].result_data.decode("utf-8"))
+        self.assertEqual(decoded, {"warnings": 3, "filtered": 7})
 
     def test_recoverable_error_emits_recoverable_response(self):
         def handle(task: Task):
@@ -264,7 +270,9 @@ class WorkerRuntimeTests(unittest.TestCase):
 
         done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
         self.assertEqual(len(done), 1)
-        self.assertEqual(done[0].warnings, 42)
+        self.assertIsNotNone(done[0].result_data)
+        decoded = json.loads(done[0].result_data.decode("utf-8"))
+        self.assertEqual(decoded["warnings"], 42)
 
     def test_run_without_handler_raises(self):
         _REGISTRY.default = None

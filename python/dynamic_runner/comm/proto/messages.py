@@ -83,15 +83,31 @@ class Response:
 
 @dataclass
 class DoneResponse(Response):
-    """Response indicating successful completion."""
+    """Response indicating successful completion.
 
-    warnings: int = 0
-    filtered: int = 0
+    ``result_data`` is fully opaque to the framework: the wire form
+    is ``done\\n`` when ``None`` and ``done:<bytes>\\n`` otherwise,
+    where the bytes after ``done:`` are emitted verbatim as UTF-8.
+    The framework only cares about ``done:`` vs ``error:`` for its
+    own correctness; anything richer (per-task counters, structured
+    results, etc.) is a consumer concern and must be encoded by the
+    producing worker and decoded by the consuming primary — the
+    framework simply forwards the bytes. Mirrors the Rust runner's
+    ``Response::Done { result_data }`` shape so the wire is uniform
+    in both directions.
+    """
+
+    result_data: Optional[bytes] = None
 
     def serialize(self) -> bytes:
-        if self.warnings == 0 and self.filtered == 0:
+        if self.result_data is None:
             return b"done\n"
-        return f"done:{self.warnings}:{self.filtered}\n".encode("utf-8")
+        # The wire is line-delimited UTF-8 text; opaque bytes are
+        # spliced in between the ``done:`` prefix and the trailing
+        # newline. Producers that need binary fidelity must
+        # pre-encode (e.g. base64) — matches the Rust codec, which
+        # uses ``String::from_utf8_lossy`` to embed the bytes.
+        return b"done:" + self.result_data + b"\n"
 
 
 @dataclass
@@ -254,10 +270,15 @@ def parse_response(data: str) -> Response | None:
         return DoneResponse()
 
     if data.startswith("done:"):
-        parts = data.split(":", 2)
-        warnings = int(parts[1]) if len(parts) > 1 else 0
-        filtered = int(parts[2]) if len(parts) > 2 else 0
-        return DoneResponse(warnings=warnings, filtered=filtered)
+        # Bytes after ``done:`` are forwarded verbatim as opaque
+        # ``result_data`` — the framework never inspects them.
+        # Encoded UTF-8 is the wire's lingua franca, so we re-encode
+        # the already-decoded string back to bytes; this is lossy
+        # only if the producer emitted non-UTF-8 input (which the
+        # transport's ``read_line``/``decode`` step would already
+        # have mangled).
+        payload = data[len("done:"):].encode("utf-8")
+        return DoneResponse(result_data=payload)
 
     if data.startswith("phase:"):
         phase_name = data.split(":", 1)[1]

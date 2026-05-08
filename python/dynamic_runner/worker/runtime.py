@@ -168,9 +168,14 @@ class Task:
 class WorkerOutput:
     """Successful task result.
 
-    ``warnings`` and ``filtered`` ride along on the ``done:N:M`` wire
-    form and surface in the primary's per-task counters. Both default
-    to 0, which produces the bare ``done`` wire response.
+    ``warnings`` and ``filtered`` are consumer-facing convenience
+    counters the runtime encodes as a JSON payload inside the wire's
+    opaque ``result_data`` field. Both default to 0, which yields a
+    bare ``done`` wire response (no payload). Any nonzero value
+    triggers a ``done:<json>`` wire frame whose JSON shape is
+    ``{"warnings": N, "filtered": M}``; the framework itself does
+    not inspect those bytes — only the producing worker and any
+    consuming primary that opts in to decoding them care.
     """
 
     warnings: int = 0
@@ -178,6 +183,23 @@ class WorkerOutput:
 
 
 _DEFAULT_OUTPUT = WorkerOutput()
+
+
+def _encode_done_payload(output: WorkerOutput) -> Optional[bytes]:
+    """Convert a ``WorkerOutput`` into the opaque bytes the framework
+    threads through ``DoneResponse.result_data``. The framework's wire
+    contract is "anything richer than ``done`` vs ``error`` is
+    consumer-defined opaque bytes" — see ``DoneResponse`` and the
+    Rust ``codec.rs``. ``None`` here means "emit a bare ``done``";
+    a JSON object means "the consumer's primary may opt in to
+    decoding ``{warnings, filtered}``".
+    """
+    if output.warnings == 0 and output.filtered == 0:
+        return None
+    return json.dumps(
+        {"warnings": output.warnings, "filtered": output.filtered}
+    ).encode("utf-8")
+
 
 _HandlerFn = Callable[[Task], Optional[WorkerOutput]]
 
@@ -418,13 +440,7 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
         return not ctx.last_send_failed
     else:
         output = result if result is not None else _DEFAULT_OUTPUT
-        _try_send(
-            ctx,
-            DoneResponse(
-                warnings=output.warnings,
-                filtered=output.filtered,
-            ),
-        )
+        _try_send(ctx, DoneResponse(result_data=_encode_done_payload(output)))
         return not ctx.last_send_failed
     finally:
         ctx.task_in_flight = False
