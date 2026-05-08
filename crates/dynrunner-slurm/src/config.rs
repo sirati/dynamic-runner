@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// SLURM job and directory configuration.
@@ -23,6 +25,14 @@ pub struct SlurmConfig {
     pub mem: Option<String>,
     /// Email for SLURM notifications.
     pub email: Option<String>,
+    /// Pre-staged source override. When set, the wrapper script
+    /// bind-mounts this host path into the container at
+    /// ``/app/src-network`` instead of the primary's staging
+    /// directory (and the primary skips its initial-staging pass
+    /// entirely). Absolute paths used as-is; relative paths
+    /// resolved against ``root_folder``. Mirrors the Python field
+    /// of the same name on ``slurm_config.SlurmConfig``.
+    pub prestaged_src_bins_path: Option<PathBuf>,
 }
 
 impl SlurmConfig {
@@ -34,6 +44,26 @@ impl SlurmConfig {
     /// Get the full source binaries directory path.
     pub fn src_bins_path(&self) -> String {
         format!("{}/{}", self.root_folder, self.src_bins_dir)
+    }
+
+    /// Path to bind-mount into the container at ``/app/src-network``.
+    ///
+    /// Returns ``prestaged_src_bins_path`` (absolute, or resolved
+    /// against ``root_folder`` for relative paths) when set;
+    /// otherwise the primary-staging directory under the image dir.
+    /// Mirrors ``SlurmConfig.get_srcbins_mount_source`` in
+    /// ``packaging/slurm_config.py``.
+    pub fn srcbins_mount_source(&self) -> String {
+        match &self.prestaged_src_bins_path {
+            None => self.src_bins_path(),
+            Some(path) => {
+                if path.is_absolute() {
+                    path.to_string_lossy().into_owned()
+                } else {
+                    format!("{}/{}", self.root_folder, path.to_string_lossy())
+                }
+            }
+        }
     }
 
     /// Get the full output directory path.
@@ -60,6 +90,62 @@ impl Default for SlurmConfig {
             cpus_per_task: None,
             mem: None,
             email: None,
+            prestaged_src_bins_path: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srcbins_mount_source_defaults_to_staging_dir() {
+        let config = SlurmConfig::default();
+        assert_eq!(
+            config.srcbins_mount_source(),
+            "~/dynamic_batch/src-bins",
+            "with prestaged_src_bins_path unset, mount source must equal src_bins_path()",
+        );
+    }
+
+    #[test]
+    fn srcbins_mount_source_uses_prestaged_absolute_path_verbatim() {
+        let config = SlurmConfig {
+            prestaged_src_bins_path: Some(PathBuf::from("/srv/cluster/staged-src")),
+            ..SlurmConfig::default()
+        };
+        assert_eq!(
+            config.srcbins_mount_source(),
+            "/srv/cluster/staged-src",
+            "absolute prestaged path must be used as-is, not joined to root_folder",
+        );
+    }
+
+    #[test]
+    fn srcbins_mount_source_resolves_relative_prestaged_against_root() {
+        let config = SlurmConfig {
+            prestaged_src_bins_path: Some(PathBuf::from("staged-src")),
+            ..SlurmConfig::default()
+        };
+        assert_eq!(
+            config.srcbins_mount_source(),
+            "~/dynamic_batch/staged-src",
+            "relative prestaged path must be joined to root_folder",
+        );
+    }
+
+    #[test]
+    fn srcbins_mount_source_does_not_mutate_src_bins_path() {
+        // Sanity: `src_bins_path()` is the staging-dir contract used
+        // by `prepare_directories`; the prestaged toggle is a
+        // mount-time decision and must not shift the directory we
+        // create on the gateway.
+        let config = SlurmConfig {
+            prestaged_src_bins_path: Some(PathBuf::from("/elsewhere")),
+            ..SlurmConfig::default()
+        };
+        assert_eq!(config.src_bins_path(), "~/dynamic_batch/src-bins");
+        assert_eq!(config.srcbins_mount_source(), "/elsewhere");
     }
 }
