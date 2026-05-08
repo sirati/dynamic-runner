@@ -69,6 +69,20 @@ class LocalGateway:
 
         try:
             remote_path_obj.parent.mkdir(parents=True, exist_ok=True)
+            # Pre-flight unlink of the destination. shutil.copy2 opens
+            # the dest with O_WRONLY|O_TRUNC, which fails with EACCES
+            # when the existing file is read-only — observed when
+            # sources are produced by a nix derivation (mode 0444) and
+            # a prior copy propagated those bits to the dest. unlink
+            # no-ops when the dest is absent and only requires write
+            # perm on the parent directory, which copy2 itself already
+            # requires. Best-effort: if the unlink fails for any reason
+            # we still attempt the copy so the failure surfaces with
+            # the canonical copy2 error rather than ours.
+            try:
+                remote_path_obj.unlink(missing_ok=True)
+            except OSError:
+                pass
             copy2(local_path_obj, remote_path_obj)
         except Exception as e:
             logger.error(f"File copy failed: {e}")
