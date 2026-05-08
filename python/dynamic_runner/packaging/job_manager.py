@@ -72,12 +72,19 @@ class SlurmJobManager:
         not ``--source-already-staged``); this method assumes the
         caller already wants the upload.
 
-        Binaries whose path does not sit under ``source_root`` are
-        skipped — the StageFile record for them ships the absolute
-        path, which the secondary's ``stage_file`` treats as
-        out-of-band-staged (must already exist on the secondary by
-        some other means). Same divergence the Rust ``queue_initial_staging``
-        documents at primary.rs:138-145.
+        ``binary.path`` may be:
+
+        * absolute under ``source_root`` — uploaded to ``<srcbins>/<rel>``
+          where ``<rel>`` is the strip-prefixed tail (legacy shape);
+        * absolute out-of-tree — skipped; the StageFile record ships
+          the absolute path which the secondary's ``stage_file``
+          handler treats as out-of-band-staged (must already exist on
+          the secondary by some other means);
+        * relative — resolved against ``source_root`` for the on-disk
+          read; uploaded to ``<srcbins>/<binary.path>`` verbatim. This
+          is the wire-identifier shape consumers should prefer post-
+          Bug B (mirrors the Rust ``queue_initial_staging`` fix in
+          primary.rs).
         """
         srcbins_dir = self._expanded_remote_path(self.slurm_config.get_srcbins_dir())
         src_root = Path(source_root).resolve()
@@ -90,14 +97,21 @@ class SlurmJobManager:
         created_dirs: set[str] = {str(srcbins_dir)}
         uploaded = 0
         for binary in binaries:
-            local = Path(binary.path)
+            raw = Path(binary.path)
+            # Resolve the on-disk read location: relative paths join
+            # against source_root (post-Bug-B wire-id shape — mirrors
+            # the Rust queue_initial_staging fix); absolute paths use
+            # binary.path verbatim.
+            local = raw if raw.is_absolute() else src_root / raw
             try:
                 rel = local.resolve().relative_to(src_root)
             except ValueError:
                 logger.warning(
-                    "Binary %s is not under --source root %s; skipping upload "
-                    "(absolute path will ship as out-of-band; secondary must already see it).",
-                    local,
+                    "Binary %s (resolved %s) is not under --source root %s; "
+                    "skipping upload (absolute path will ship as out-of-band; "
+                    "secondary must already see it).",
+                    raw,
+                    local.resolve(),
                     src_root,
                 )
                 continue
