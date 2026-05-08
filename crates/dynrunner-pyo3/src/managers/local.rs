@@ -14,7 +14,7 @@ use crate::config::resources::PyResourceMap;
 use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
-use crate::identifier::TokenizerIdentifier;
+use crate::identifier::RunnerIdentifier;
 use crate::network::gethostname;
 use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
@@ -53,9 +53,9 @@ pub(crate) struct PyLocalManager {
     connection_mode: ConnectionMode,
     manual_start_worker: bool,
     stats: Option<ProcessingStats>,
-    failed_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
-    oom_tasks: Vec<dynrunner_core::FailedTask<TokenizerIdentifier>>,
-    task_payloads: Vec<(TaskInfo<TokenizerIdentifier>, Option<Vec<u8>>)>,
+    failed_tasks: Vec<dynrunner_core::FailedTask<RunnerIdentifier>>,
+    oom_tasks: Vec<dynrunner_core::FailedTask<RunnerIdentifier>>,
+    task_payloads: Vec<(TaskInfo<RunnerIdentifier>, Option<Vec<u8>>)>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// and call back into Python from the manager's LocalSet (Phase 5B).
     /// `Py<PyAny>` is `Send + Sync + 'static` so it satisfies the

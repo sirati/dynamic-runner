@@ -10,7 +10,7 @@ use dynrunner_transport_quic::NetworkServer;
 
 use crate::config::distributed::DistributedConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
-use crate::identifier::TokenizerIdentifier;
+use crate::identifier::RunnerIdentifier;
 use crate::pytypes::extract_binaries;
 use crate::task_def::LoadedTopology;
 
@@ -286,7 +286,7 @@ impl PyPrimaryCoordinator {
                 // Bind the network server to the port we already picked.
                 let bind_addr: std::net::SocketAddr =
                     format!("127.0.0.1:{}", port).parse().unwrap();
-                let server: NetworkServer<TokenizerIdentifier> =
+                let server: NetworkServer<RunnerIdentifier> =
                     match NetworkServer::bind(bind_addr).await {
                         Ok(s) => s,
                         Err(e) => {
@@ -318,7 +318,7 @@ impl PyPrimaryCoordinator {
                     mass_death_min_count: dist_mass_death_min_count,
                 };
 
-                let mut primary: PrimaryCoordinator<_, _, _, TokenizerIdentifier> =
+                let mut primary: PrimaryCoordinator<_, _, _, RunnerIdentifier> =
                     PrimaryCoordinator::new(
                         config,
                         server,
