@@ -252,11 +252,21 @@ def run_slurm_pipeline(
         )
     finally:
         preparation.cleanup()
+        # Graceful master shutdown FIRST: `ssh -O exit` takes the
+        # master and all its -R forwardings down cleanly. Doing this
+        # after the pkill below caused the documented "Control socket
+        # connect: No such file or directory" warning, because the
+        # broadband pkill had already killed the master.
+        gateway.disconnect()
+        # Belt-and-suspenders for any per-secondary reverse tunnel
+        # that escaped preparation.cleanup() tracking. Pattern
+        # specifically matches `-R <port>:localhost...` (preparation's
+        # shape); the master used `-R 0.0.0.0:<port>:localhost...`
+        # so the regex no longer races the master shutdown above.
         subprocess.run(
-            ["pkill", "-u", str(os.getuid()), "-f", "ssh.*-R.*localhost"],
+            ["pkill", "-u", str(os.getuid()), "-f", r"ssh.*-R [0-9]+:localhost"],
             stderr=subprocess.DEVNULL,
         )
-        gateway.disconnect()
 
 
 def _drive_rust_primary(
