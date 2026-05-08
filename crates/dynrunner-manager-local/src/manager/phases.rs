@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
+    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -131,6 +131,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             completed = self.stats.completed,
             errored = self.failed_tasks.len(),
             resource_pressure = self.resource_pressure_tasks.len(),
+            unassigned = self.unassigned_tasks.len(),
             "main phase complete"
         );
     }
@@ -211,6 +212,13 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 
         self.in_pressure_phase = true;
 
+        // Worker 0 is the only active worker for the rest of the run
+        // (this phase + the unassigned phase). Its scheduling cap is the
+        // full cluster pool, not the per-worker fraction it received at
+        // startup — `assign_normal` would otherwise refuse oversized
+        // tasks here too, and they'd silently drop out.
+        self.boost_worker0_budget_to_max();
+
         let pressure_tasks: Vec<FailedTask<I>> = self.resource_pressure_tasks.drain(..).collect();
         for task in pressure_tasks {
             self.pool_mut().reinject(task.binary);
@@ -272,6 +280,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             return;
         }
 
+        // The unassigned phase exists exactly to catch tasks whose
+        // estimator value exceeded any single worker's per-worker share.
+        // Worker 0 is the only active worker, so its scheduling cap is
+        // the full cluster pool. Without this boost, `assign_normal`
+        // refuses every oversized task and they drop silently — the
+        // class of "1291/1386 tasks never ran" silent-data-loss bug.
+        self.boost_worker0_budget_to_max();
+
         for task in kept {
             self.pool_mut().reinject(task);
         }
@@ -287,5 +303,66 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             factory,
         )
         .await;
+
+        // Anything still queued is genuinely unfittable: estimator
+        // value exceeds even the boosted (cluster-wide) cap. Surface
+        // each one as a permanent failure with the offending estimate
+        // vs. the cluster cap so the user can fix the estimator or
+        // grow the cluster — never drop silently.
+        if !self.pool_ref().is_empty() {
+            let max = self.max_resources().clone();
+            let max_mb = max.get(&ResourceKind::memory()) / (1024 * 1024);
+            let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
+            tracing::error!(
+                count = remaining.len(),
+                cluster_max_mb = max_mb,
+                "unassigned phase: tasks exceed cluster-wide resource pool; \
+                 reporting as permanent failures (likely estimator overshoot \
+                 or cluster sized too small for this workload)"
+            );
+            for binary in remaining {
+                let estimated = self.estimator.estimate(&binary);
+                let est_mb = estimated.get(&ResourceKind::memory()) / (1024 * 1024);
+                let name = binary.path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                tracing::error!(
+                    binary = %name,
+                    estimated_mb = est_mb,
+                    cluster_max_mb = max_mb,
+                    "unfittable task: estimator value exceeds cluster pool"
+                );
+                self.failed_tasks.push(FailedTask {
+                    binary,
+                    error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
+                    error_message: format!(
+                        "estimator value {est_mb} MB exceeds cluster-wide pool {max_mb} MB; \
+                         task cannot run on this cluster"
+                    ),
+                    retry_count: 0,
+                });
+            }
+        }
+    }
+
+    /// Boost worker 0's `reserved_budgets` to the full cluster pool.
+    ///
+    /// Worker 0 is the only active worker during the resource-pressure
+    /// and unassigned phases. The reserved-budget value it received at
+    /// startup was `max / num_workers` — a sensible cap for parallel
+    /// scheduling, but the wrong cap when it owns the cluster alone.
+    /// Without this boost, `Scheduler::assign_normal` rejects any task
+    /// whose estimate exceeds the per-worker fraction even though the
+    /// global pool would fit it; the rejected tasks silently drop out
+    /// of the run (the class-of-bug seq=15 reported).
+    ///
+    /// Idempotent. Workers stop after the unassigned phase, so the
+    /// mutation is never observed by parallel-scheduling phases.
+    fn boost_worker0_budget_to_max(&mut self) {
+        if self.pool.workers.is_empty() {
+            return;
+        }
+        let max = self.max_resources().clone();
+        self.pool.workers[0].reserved_budgets = max;
     }
 }
