@@ -275,9 +275,11 @@ impl SlurmPreparation {
 }
 
 /// Result a watcher reports on its oneshot channel. The spawned
-/// `Child` is recorded into the shared tunnels Vec from inside the
-/// watcher BEFORE the verification step, so cleanup() catches it
-/// even if the watcher is aborted between spawn and verify.
+/// `Child` is owned locally by `drive_one_watcher` until it has
+/// passed the 3s "established" gate; only then is it pushed into
+/// the shared tunnels Vec for cleanup() to reap. If the watcher
+/// is aborted before verification completes, dropping the local
+/// `Child` SIGKILLs the ssh process via `kill_on_drop(true)`.
 struct WatcherOutcome {
     secondary_id: String,
     tunnel_port: u16,
@@ -315,10 +317,11 @@ impl<R: InfoFileReader> TunnelWatcher<R> {
         )
         .await;
         // Send result. If receiver was dropped (coordinator timed
-        // out), the result is silently dropped and so is the
-        // watcher's view of state — the spawned ssh child has
-        // already been pushed to `tunnels` before verification, so
-        // cleanup() will reach it regardless.
+        // out), the outcome is silently dropped. Children that
+        // passed verification are already in the shared `tunnels`
+        // Vec for cleanup(); children that didn't reach
+        // verification were owned locally inside drive_one_watcher
+        // and dropped there (SIGKILL via `kill_on_drop`).
         let _ = done.send(result);
     }
 }
@@ -358,7 +361,7 @@ async fn drive_one_watcher<R: InfoFileReader>(
         tokio::time::sleep(opts.poll_interval).await;
     };
 
-    let child = spawn_reverse_tunnel(
+    let mut child = spawn_reverse_tunnel(
         secondary_id,
         &host,
         tunnel_port,
@@ -367,18 +370,25 @@ async fn drive_one_watcher<R: InfoFileReader>(
     )
     .await?;
 
-    // Stash child handle BEFORE the 3s verification window. If the
-    // outer timeout fires now, cleanup() will still reach this
-    // process via the shared Vec.
+    // Verify against the locally-owned `Child` — no shared-Vec
+    // `last_mut()`. With ≥2 concurrent watchers, the previous
+    // push-then-`last_mut()` shape raced: watcher A could verify
+    // watcher B's child as soon as their push order interleaved.
+    //
+    // Cancel-safety while we hold `child` locally: the spawning
+    // `Command` had `kill_on_drop(true)` set, so if the outer
+    // timeout aborts this watcher mid-verify, `child` is dropped
+    // and SIGKILL fires automatically — cleanup() doesn't need to
+    // see this child. On verify failure, `child` likewise drops
+    // here (process already exited, drop is a no-op).
+    verify_tunnel_alive(secondary_id, &mut child).await?;
+
+    // Commit to the shared tunnel set only after verification —
+    // cleanup() now only sees established tunnels.
     {
         let mut guard = tunnels.lock().await;
         guard.push(child);
     }
-
-    // Re-borrow the just-pushed child for verification. We hold the
-    // lock briefly to take `&mut` to the last element — verifying
-    // synchronously (no .await inside the borrow) keeps this safe.
-    verify_tunnel_alive(secondary_id, tunnels).await?;
 
     Ok(WatcherOutcome {
         secondary_id: secondary_id.to_owned(),
@@ -496,26 +506,25 @@ async fn spawn_reverse_tunnel(
 /// Verify the just-spawned ssh process stayed alive past the 3s
 /// "established" gate. The corresponding Python idiom is
 /// `proc.wait(timeout=3)` raising `TimeoutExpired` on success.
+///
+/// Operates on a `&mut Child` owned by the caller — no shared-Vec
+/// lookup. With ≥2 concurrent watchers this is the only safe shape:
+/// using `last_mut()` on a shared `Vec<Child>` would race watcher A
+/// onto watcher B's child as soon as their `push` interleaved.
 async fn verify_tunnel_alive(
     secondary_id: &str,
-    tunnels: &Arc<Mutex<Vec<Child>>>,
+    child: &mut Child,
 ) -> Result<(), PrepError> {
     // exit_info encodes alive/dead-with-rc:
     //   Outer None => still alive past 3s (success).
     //   Outer Some(rc_opt) => process exited; rc_opt may be None
     //     (process killed by signal, no exit code).
-    let exit_info: Option<Option<i32>> = {
-        // Lock the mutex for the whole verify window. The mutex is
-        // contended only by the (rare) cleanup() path; under a 3s
-        // deadline this is fine.
-        let mut guard = tunnels.lock().await;
-        let child = guard.last_mut().expect("watcher just pushed a child");
+    let exit_info: Option<Option<i32>> =
         match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
             Err(_elapsed) => None,
             Ok(Ok(status)) => Some(status.code()),
             Ok(Err(e)) => return Err(PrepError::Io(e)),
-        }
-    };
+        };
 
     match exit_info {
         None => {
@@ -525,10 +534,6 @@ async fn verify_tunnel_alive(
         Some(rc) => {
             // Drain stderr from the dead child for the error message.
             let stderr = {
-                let mut guard = tunnels.lock().await;
-                let child = guard
-                    .last_mut()
-                    .expect("watcher just verified a child");
                 let mut buf = Vec::new();
                 if let Some(mut e) = child.stderr.take() {
                     use tokio::io::AsyncReadExt;
@@ -819,6 +824,87 @@ mod tests {
         assert!(proxy_cmd.contains("'-p' '2222'"));
         assert!(proxy_cmd.contains("'-W' '%h:%p'"));
         assert!(proxy_cmd.contains("'alice@gw.example'"));
+    }
+
+    /// Multi-watcher race regression: with ≥2 watchers calling
+    /// `verify_tunnel_alive` concurrently, each must observe the
+    /// outcome of *its own* spawned child — never a sibling's. The
+    /// pre-fix shape (`tunnels.lock().last_mut()`) was structurally
+    /// vulnerable to this: watcher A could verify watcher B's child
+    /// as soon as their `push` order interleaved.
+    ///
+    /// We exercise the failure branch (each child exits immediately
+    /// with a unique stderr message) so the test is fast and the
+    /// stderr-attribution is directly observable in the assertion.
+    /// Pre-fix, the `last_mut()` lookup made misattribution possible
+    /// whenever a sibling's `push` interleaved between this
+    /// watcher's push and verify; the test asserts the post-fix
+    /// invariant that no such interleaving can ever occur because
+    /// each watcher operates on its own owned `Child`.
+    #[test]
+    fn verify_tunnel_alive_attributes_per_child_under_concurrency() {
+        const N: usize = 4;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let outcomes: Vec<(String, PrepError)> = rt.block_on(local.run_until(async move {
+            // Spawn N short-lived shells; each emits a marker
+            // unique to its index on stderr and exits with rc=1.
+            let mut children: Vec<(String, Child)> = Vec::with_capacity(N);
+            for i in 0..N {
+                let marker = format!("MARK-{i}");
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c")
+                    .arg(format!("printf '%s' '{marker}' >&2; exit 1"));
+                cmd.stdin(std::process::Stdio::null());
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd.kill_on_drop(true);
+                let child = cmd.spawn().expect("spawn /bin/sh");
+                children.push((format!("secondary-{i}"), child));
+            }
+
+            // Verify all in parallel from a JoinSet.
+            let mut set: JoinSet<(String, PrepError)> = JoinSet::new();
+            for (id, mut child) in children.into_iter() {
+                set.spawn_local(async move {
+                    let err = verify_tunnel_alive(&id, &mut child)
+                        .await
+                        .expect_err("dying child must surface TunnelFailed");
+                    (id, err)
+                });
+            }
+
+            let mut out = Vec::with_capacity(N);
+            while let Some(joined) = set.join_next().await {
+                out.push(joined.expect("watcher panicked"));
+            }
+            out
+        }));
+
+        assert_eq!(outcomes.len(), N);
+        for (id, err) in outcomes {
+            match err {
+                PrepError::TunnelFailed { secondary_id, stderr, .. } => {
+                    assert_eq!(secondary_id, id);
+                    // Each child's stderr MUST contain its own
+                    // marker — pre-fix `last_mut()` could pull
+                    // sibling stderr instead.
+                    let idx: usize = id
+                        .strip_prefix("secondary-")
+                        .and_then(|s| s.parse().ok())
+                        .expect("id parses");
+                    let expected = format!("MARK-{idx}");
+                    assert_eq!(
+                        stderr, expected,
+                        "watcher {id} got cross-attributed stderr {stderr:?}"
+                    );
+                }
+                other => panic!("expected TunnelFailed, got {other}"),
+            }
+        }
     }
 
     /// LocalDirReader smoke test: when the file exists, the reader
