@@ -112,8 +112,16 @@ impl Gateway for LocalGateway {
 
         let expanded = self.expand(remote);
         let dest = Path::new(&expanded);
+        // Pre-migration Python wrapped parent `mkdir` + `copy2` in a
+        // single try/except that re-raised as
+        // `RuntimeError(f"File copy failed: {e}")`. Bare `?` here
+        // would surface `GatewayError::Io` (=> Python `OSError`) and
+        // silently swap the observed exception class — route both
+        // io faults through `CopyFailed` (=> `PyRuntimeError`).
         if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| GatewayError::CopyFailed(format!("File copy failed: {e}")))?;
         }
         // Pre-flight unlink. `tokio::fs::copy` opens the destination
         // O_WRONLY|O_TRUNC, which fails with EACCES when the existing
@@ -123,7 +131,9 @@ impl Gateway for LocalGateway {
         // for another reason, the subsequent copy will surface the real
         // error. Same race class as the SSH gateway's pre-flight `rm -f`.
         tokio::fs::remove_file(dest).await.ok();
-        tokio::fs::copy(local, dest).await?;
+        tokio::fs::copy(local, dest)
+            .await
+            .map_err(|e| GatewayError::CopyFailed(format!("File copy failed: {e}")))?;
         tracing::debug!(?local, remote = %expanded, "file copied locally");
         Ok(())
     }
@@ -138,10 +148,17 @@ impl Gateway for LocalGateway {
         }
 
         let expanded = self.expand(remote);
+        // See `transfer_file`: parent-mkdir + copy share the
+        // pre-migration `RuntimeError(f"File copy failed: ...")`
+        // contract. Both are routed through `CopyFailed`.
         if let Some(parent) = local.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| GatewayError::CopyFailed(format!("File copy failed: {e}")))?;
         }
-        tokio::fs::copy(&expanded, local).await?;
+        tokio::fs::copy(&expanded, local)
+            .await
+            .map_err(|e| GatewayError::CopyFailed(format!("File copy failed: {e}")))?;
         tracing::debug!(remote = %expanded, ?local, "file downloaded locally");
         Ok(())
     }
@@ -331,6 +348,46 @@ mod tests {
         gw.download_file("~/payload", &local).await.unwrap();
 
         assert_eq!(tokio::fs::read(&local).await.unwrap(), b"hello");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transfer_file_missing_source_yields_copy_failed() {
+        // Pre-migration Python wrapped `copy2(...)` failures in
+        // `RuntimeError(f"File copy failed: {e}")`. The Rust contract
+        // is `GatewayError::CopyFailed(...)` (=> Python `RuntimeError`).
+        // A bare `?` on `tokio::fs::copy` would surface `Io` (=>
+        // `OSError`), which is the bug the audit caught.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gw = gw_with_home(tmp.path().to_str().unwrap());
+        gw.connect().await.unwrap();
+
+        let missing = tmp.path().join("does-not-exist");
+        let dest = tmp.path().join("dst");
+        let err = gw
+            .transfer_file(&missing, dest.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GatewayError::CopyFailed(_)),
+            "expected CopyFailed, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn download_file_missing_source_yields_copy_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gw = gw_with_home(tmp.path().to_str().unwrap());
+        gw.connect().await.unwrap();
+
+        let dest = tmp.path().join("out/copy");
+        let err = gw
+            .download_file("~/does-not-exist", &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GatewayError::CopyFailed(_)),
+            "expected CopyFailed, got {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
