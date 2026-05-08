@@ -69,6 +69,31 @@ class DispatchEnv:
     """Path to the dispatcher's per-cluster private key. Lives under
     the driver's state dir (``tests/e2e/state/<instance_id>/keys/``),
     NOT under ``~/.ssh``. ``None`` in non-slurm modes."""
+    slurm_partition: str = "debug"
+    """SLURM partition name to submit against. The slurm-test-env
+    cluster only ships a ``debug`` partition; the framework's default
+    is ``All`` (suitable for production multi-partition clusters but
+    rejected by the test env's slurmctld). Threaded into the dispatcher
+    via ``--slurm-partition`` in slurm mode."""
+    slurm_cpus_per_task: int = 2
+    """SLURM ``--cpus-per-task`` per secondary. The framework defaults
+    to 14 (sized for production HPC nodes); the test env's workers
+    only have 2 cores each, so requesting 14 yields
+    ``CPU count per node can not be satisfied``. Threaded through
+    ``--slurm-cpus-per-task`` in slurm mode."""
+    gateway_host_alias: str = "slurm-gateway"
+    """Cluster-internal hostname for the gateway. The framework
+    propagates ``self.gateway.host`` verbatim from the
+    ``--gateway`` URL into the worker wrapper's
+    ``--secondary tcp://<host>:<port>`` URL (see
+    ``packaging/preparation.py::_determine_gateway_host``). Workers
+    sit in their own netns on the cluster's podman bridge network,
+    so they cannot reach the operator host's ``localhost``; they
+    DNS-resolve the gateway via its ``--network-alias`` registered
+    in ``slurm-test-env/deploy/lib.sh``. Combined with an SSH
+    ``Host`` block whose ``HostName`` is ``localhost``, the
+    operator host's SSH client still dials the forwarded port
+    while the cluster sees the alias."""
 
 
 @dataclass(frozen=True)

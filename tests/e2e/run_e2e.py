@@ -109,6 +109,13 @@ DEFAULT_WORKERS = 4
 # the matching user owns the home directory).
 DEFAULT_SSH_USER = "e2e-user"
 DEFAULT_SLURM_ROOT_FOLDER = f"/home/{DEFAULT_SSH_USER}/dynrunner-e2e"
+# Cluster-internal hostname workers use to reach the gateway over
+# the podman bridge network (DNS-resolvable via the
+# `--network-alias` slurm-test-env registers on the gateway
+# container — see `slurm-test-env/deploy/lib.sh`). Threaded into
+# the dispatcher's `--gateway` URL so the framework propagates it
+# verbatim into the worker wrapper's `--secondary` argument.
+GATEWAY_HOST_ALIAS = "slurm-gateway"
 
 # How many seconds without log activity before the heartbeat thread
 # stops touching its file (so an outer watcher knows the dispatch
@@ -421,9 +428,24 @@ def main() -> int:
         provision_dispatcher_user(
             SLURM_TEST_ENV_DIR, args.instance_id, ssh_user, pub
         )
+        # `slurm-gateway` is the cluster-internal podman network
+        # alias for the gateway container. Using it as the SSH Host
+        # alias lets us:
+        #   - dial via SSH from the operator host (HostName=localhost
+        #     plus the forwarded port lands us on the gateway's sshd);
+        #   - have the framework propagate `slurm-gateway` verbatim
+        #     into the worker wrapper's
+        #     `--secondary tcp://<gateway_host>:<port>` URL, where
+        #     workers in the cluster's private podman network DNS-
+        #     resolve it via the same `--network-alias` slurm-test-env
+        #     registers in `deploy/lib.sh`.
+        # Otherwise (host_alias=localhost) the wrapper would tell
+        # workers to dial their OWN loopback (each worker container
+        # has its own netns), which is exactly the connection-refused
+        # storm `dynrunner-owner-slurm-test-env-owner` diagnosed.
         ssh_config_path = generate_ssh_config(
             instance_state_dir,
-            host_alias="localhost",
+            host_alias=GATEWAY_HOST_ALIAS,
             ssh_port=args.ssh_port,
             user=ssh_user,
             identity_file=priv,
@@ -441,6 +463,7 @@ def main() -> int:
         ssh_user=DEFAULT_SSH_USER,
         ssh_config_path=ssh_config_path,
         ssh_identity_path=ssh_identity_path,
+        gateway_host_alias=GATEWAY_HOST_ALIAS,
     )
 
     heartbeat_file = args.heartbeat_file or heartbeat_path_for_pid()
