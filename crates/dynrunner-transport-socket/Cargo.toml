@@ -16,3 +16,6 @@ dynrunner-core = { workspace = true }
 dynrunner-protocol-manager-worker = { workspace = true }
 tokio = { workspace = true }
 nix = { workspace = true }
+
+[lints]
+workspace = true
