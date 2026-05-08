@@ -6,4 +6,5 @@ pub(crate) mod phase;
 pub(crate) mod primary_secondary;
 pub(crate) mod resources;
 pub(crate) mod scheduler;
+pub(crate) mod slurm;
 pub(crate) mod worker_spec;
