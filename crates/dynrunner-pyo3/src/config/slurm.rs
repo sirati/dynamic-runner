@@ -1,6 +1,8 @@
 use dynrunner_slurm::SlurmConfig;
 use pyo3::prelude::*;
 
+use crate::pytypes::PyPathStr;
+
 /// Python binding for [`dynrunner_slurm::SlurmConfig`].
 ///
 /// Single concern: expose the SLURM configuration dataclass to Python
@@ -14,10 +16,15 @@ use pyo3::prelude::*;
 /// names rather than the Rust-internal `*_path()` shape — Python is
 /// the consumer-facing surface and renaming there would force every
 /// downstream caller to migrate.
+///
+/// `root_folder` and `prestaged_src_bins_path` are typed `PyPathStr`
+/// so they accept either `str` or `os.PathLike` (matching the
+/// pre-migration Python type hint `str | Path`); both surface to
+/// Python as plain `str`.
 #[pyclass(name = "SlurmConfig", get_all, set_all, from_py_object)]
 #[derive(Clone, Debug)]
 pub(crate) struct PySlurmConfig {
-    root_folder: String,
+    root_folder: PyPathStr,
     image_subfolder: String,
     output_subfolder: String,
     log_subfolder: String,
@@ -27,7 +34,7 @@ pub(crate) struct PySlurmConfig {
     memory_per_node: String,
     nodes: u32,
     notify_email: Option<String>,
-    prestaged_src_bins_path: Option<String>,
+    prestaged_src_bins_path: Option<PyPathStr>,
 }
 
 impl Default for PySlurmConfig {
@@ -39,7 +46,7 @@ impl Default for PySlurmConfig {
 impl From<SlurmConfig> for PySlurmConfig {
     fn from(c: SlurmConfig) -> Self {
         Self {
-            root_folder: c.root_folder,
+            root_folder: PyPathStr::from(c.root_folder),
             image_subfolder: c.image_subfolder,
             output_subfolder: c.output_subfolder,
             log_subfolder: c.log_subfolder,
@@ -49,7 +56,7 @@ impl From<SlurmConfig> for PySlurmConfig {
             memory_per_node: c.memory_per_node,
             nodes: c.nodes,
             notify_email: c.notify_email,
-            prestaged_src_bins_path: c.prestaged_src_bins_path,
+            prestaged_src_bins_path: c.prestaged_src_bins_path.map(PyPathStr::from),
         }
     }
 }
@@ -57,7 +64,7 @@ impl From<SlurmConfig> for PySlurmConfig {
 impl From<&PySlurmConfig> for SlurmConfig {
     fn from(c: &PySlurmConfig) -> Self {
         Self {
-            root_folder: c.root_folder.clone(),
+            root_folder: c.root_folder.as_str().to_owned(),
             image_subfolder: c.image_subfolder.clone(),
             output_subfolder: c.output_subfolder.clone(),
             log_subfolder: c.log_subfolder.clone(),
@@ -67,7 +74,10 @@ impl From<&PySlurmConfig> for SlurmConfig {
             memory_per_node: c.memory_per_node.clone(),
             nodes: c.nodes,
             notify_email: c.notify_email.clone(),
-            prestaged_src_bins_path: c.prestaged_src_bins_path.clone(),
+            prestaged_src_bins_path: c
+                .prestaged_src_bins_path
+                .as_ref()
+                .map(|p| p.as_str().to_owned()),
         }
     }
 }
@@ -89,7 +99,7 @@ impl PySlurmConfig {
         prestaged_src_bins_path = None,
     ))]
     fn new(
-        root_folder: String,
+        root_folder: PyPathStr,
         image_subfolder: Option<String>,
         output_subfolder: Option<String>,
         log_subfolder: Option<String>,
@@ -99,7 +109,7 @@ impl PySlurmConfig {
         memory_per_node: Option<String>,
         nodes: Option<u32>,
         notify_email: Option<String>,
-        prestaged_src_bins_path: Option<String>,
+        prestaged_src_bins_path: Option<PyPathStr>,
     ) -> Self {
         let d = SlurmConfig::default();
         Self {
@@ -198,12 +208,16 @@ impl PySlurmConfig {
     }
 
     fn __repr__(&self) -> String {
+        // `PyPathStr` derives `Debug` which would render as
+        // `PyPathStr("…")`; project the inner `String` (and the
+        // `Option<PyPathStr>` -> `Option<&String>`) so the repr
+        // matches the historical `str | None` shape.
         format!(
             "SlurmConfig(root_folder={:?}, image_subfolder={:?}, \
              output_subfolder={:?}, log_subfolder={:?}, partition={:?}, \
              time_limit={:?}, cpus_per_task={}, memory_per_node={:?}, \
              nodes={}, notify_email={:?}, prestaged_src_bins_path={:?})",
-            self.root_folder,
+            self.root_folder.as_str(),
             self.image_subfolder,
             self.output_subfolder,
             self.log_subfolder,
@@ -213,7 +227,7 @@ impl PySlurmConfig {
             self.memory_per_node,
             self.nodes,
             self.notify_email,
-            self.prestaged_src_bins_path,
+            self.prestaged_src_bins_path.as_ref().map(PyPathStr::as_str),
         )
     }
 }
