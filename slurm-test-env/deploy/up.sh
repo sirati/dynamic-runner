@@ -23,6 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/env.sh}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib.sh"
 
 printf '\n=== slurm-test-env :: bringing up cluster ===\n'
 print_layout
@@ -120,67 +122,19 @@ for i in $(seq 1 "$WORKER_COUNT"); do
   abort_if_running "$(worker_container_name "$i")"
 done
 
-# --- Common run flags --------------------------------------------------------
+# --- Run gateway + workers ---------------------------------------------------
 #
-# --systemd=always: PID1 is /init (NixOS systemd); podman wires up
-#   /sys/fs/cgroup, /run, signal forwarding accordingly.
-# --privileged: required for systemd cgroup management + slurm cgroup
-#   tracking + nested podman on workers. Acceptable: this is an explicit
-#   local test harness, not a virtualization boundary.
-# --entrypoint /init: the imported tarball carries no metadata, so we
-#   declare the entrypoint at run time.
-
-common_flags=(
-  --network "$NETWORK"
-  --systemd=always
-  --privileged
-  --entrypoint /init
-  -v "${HOME_SHARE}:/home:rw"
-)
-
-# --- Run gateway -------------------------------------------------------------
-#
-# --name           is the GLOBALLY visible container name (instance-suffixed).
-# --hostname       is the CLUSTER-INTERNAL name; matches slurm.conf.
-# --network-alias  makes the cluster-internal name resolvable inside the
-#                  podman network — separate from --name so two instances
-#                  can both alias their respective gateways to "slurm-gateway"
-#                  inside their own isolated networks.
+# Per-node run flags and the common-flags array live in deploy/lib.sh —
+# the same helpers are reused by reboot-node.sh, so the canonical run
+# command has a single source of truth.
 
 printf 'Starting gateway...\n'
-podman run -d \
-  --name "$GATEWAY_NAME" \
-  --hostname "$GATEWAY_HOSTNAME" \
-  --network-alias "$GATEWAY_HOSTNAME" \
-  --memory "$GATEWAY_MEMORY" \
-  --cpus "$GATEWAY_CPUS" \
-  --publish "${SSH_PORT}:22" \
-  --tmpfs "/tmp:rw,nosuid,size=512m" \
-  "${common_flags[@]}" \
-  "$GATEWAY_IMAGE_TAG" >/dev/null
-
-# --- Run workers -------------------------------------------------------------
+start_gateway
 
 printf 'Starting %d worker(s)...\n' "$WORKER_COUNT"
 mkdir -p "$WORKER_TMP_BASE"
 for i in $(seq 1 "$WORKER_COUNT"); do
-  c_name="$(worker_container_name "$i")"
-  h_name="$(worker_hostname "$i")"
-  w_tmp="$(worker_tmp_dir "$i")"
-  mkdir -p "$w_tmp"
-  # /tmp expects world-writable + sticky bit so any uid inside the
-  # container (root, slurm users, nested-podman subuids) can write —
-  # matches the semantics of the tmpfs this replaces.
-  chmod 1777 "$w_tmp"
-  podman run -d \
-    --name "$c_name" \
-    --hostname "$h_name" \
-    --network-alias "$h_name" \
-    --memory "$WORKER_MEMORY" \
-    --cpus "$WORKER_CPUS" \
-    -v "${w_tmp}:/tmp:rw" \
-    "${common_flags[@]}" \
-    "$WORKER_IMAGE_TAG" >/dev/null
+  start_worker "$i"
 done
 
 cat <<EOF
