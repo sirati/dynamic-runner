@@ -263,11 +263,21 @@ cp "{image_path}" "$LOCAL_IMAGE"
 # with a fresh cp — if a transit-corruption flake repeats twice
 # the underlying issue is usually deeper than transient and
 # should fail loud, but a single retry catches the common case.
+#
+# Failure of the second attempt is wrapped in an explicit check so
+# the abort surfaces as a clear marker on STDOUT (the .out file
+# consumers check first), not just an opaque `set -e` exit between
+# the preceding echo and the cleanup trap. The container runtime's
+# own stderr still ends up in the .err file as before.
 if ! {load_command}; then
     echo "podman load failed; re-copying image and retrying once" >&2
     rm -f "$LOCAL_IMAGE"
     cp "{image_path}" "$LOCAL_IMAGE"
-    {load_command}
+    if ! {load_command}; then
+        echo "ERROR: image load failed; secondary cannot start. See the .err file for the runtime's diagnostic."
+        echo "ERROR: image load failed; secondary cannot start." >&2
+        exit 1
+    fi
 fi
 "##,
         image_name = cfg.image_name,
@@ -855,6 +865,29 @@ mod tests {
             assert!(
                 script.contains(">&2"),
                 "[{label}] FIFO-loss ERROR must reach stderr",
+            );
+            assert_renders_valid_bash(&script);
+        }
+    }
+
+    /// Image-load failure must surface a clear ERROR marker on STDOUT
+    /// (the .out file consumers check first), not just rely on
+    /// `set -e` aborting silently between the preceding echo and the
+    /// cleanup trap. Marker mirrors to stderr too so log-aggregation
+    /// tools watching stderr severity see it.
+    #[test]
+    fn image_load_failure_emits_visible_marker() {
+        let config = SlurmConfig::default();
+        for (label, connection) in both_modes() {
+            let cfg = base_cfg(&config, connection, "sec-i");
+            let script = generate_wrapper_script(&cfg);
+            assert!(
+                script.contains("ERROR: image load failed; secondary cannot start."),
+                "[{label}] missing image-load ERROR marker",
+            );
+            assert!(
+                script.contains("ERROR: image load failed; secondary cannot start.\" >&2"),
+                "[{label}] image-load ERROR must mirror to stderr",
             );
             assert_renders_valid_bash(&script);
         }
