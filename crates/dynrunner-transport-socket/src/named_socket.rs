@@ -100,15 +100,53 @@ pub struct NamedSocketRunnerEnd {
     writer: tokio::io::WriteHalf<UnixStream>,
 }
 
+/// Maximum time the runner waits for the manager to bind its socket file
+/// before giving up. Mirrors Python `NamedSocketInterface._setup_client`.
+const CONNECT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Polling interval used while waiting for the socket file to appear.
+const CONNECT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl NamedSocketRunnerEnd {
     /// Connect to a named socket at the given path.
+    ///
+    /// Polls for the socket file to appear (manager binds asynchronously) for
+    /// up to [`CONNECT_WAIT_TIMEOUT`], then performs the connect. Returns an
+    /// `ErrorKind::TimedOut` error if the file never appears.
     pub async fn connect(socket_path: &Path) -> std::io::Result<Self> {
+        Self::wait_for_socket(socket_path, CONNECT_WAIT_TIMEOUT).await?;
         let stream = UnixStream::connect(socket_path).await?;
         let (read_half, write_half) = tokio::io::split(stream);
         Ok(Self {
             reader: BufReader::new(read_half),
             writer: write_half,
         })
+    }
+
+    /// Block until the socket file at `socket_path` exists, or `timeout`
+    /// elapses. Cancel-safe: only awaits on `tokio::time::sleep`, which
+    /// is itself cancel-safe. Exposed at crate-private visibility so
+    /// tests can drive it with a short deadline.
+    async fn wait_for_socket(
+        socket_path: &Path,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if socket_path.exists() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "Socket file {} did not appear within {}s",
+                        socket_path.display(),
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            tokio::time::sleep(CONNECT_POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -201,5 +239,94 @@ mod tests {
         // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
         }).await;
+    }
+
+    /// The runner-side `connect` must wait for the manager to bind its
+    /// socket file (mirrors Python `_setup_client`'s 30s poll). Here we
+    /// delay the manager's bind by 1s and assert that `connect` still
+    /// completes successfully — i.e. the wait-loop kicked in instead of
+    /// returning ECONNREFUSED/ENOENT immediately.
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_waits_for_late_socket() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let dir = std::env::temp_dir()
+                    .join(format!("db_test_late_{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let sock_path = dir.join("late.sock");
+                // Make sure no stale file exists.
+                let _ = std::fs::remove_file(&sock_path);
+
+                // Manager binds 1s after the runner starts polling.
+                let manager_path = sock_path.clone();
+                let manager_handle = tokio::task::spawn_local(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let mut manager =
+                        NamedSocketManagerEnd::bind(&manager_path).unwrap();
+                    manager.accept().await.unwrap();
+                    // Hold the connection open until the runner closes.
+                    let _ = manager.recv().await;
+                });
+
+                let start = std::time::Instant::now();
+                let runner = NamedSocketRunnerEnd::connect(&sock_path).await;
+                let elapsed = start.elapsed();
+                assert!(runner.is_ok(), "runner connect failed: {:?}", runner.err());
+                // Sanity check: the wait actually happened (>= ~1s) but
+                // didn't burn the full 30s timeout.
+                assert!(
+                    elapsed >= std::time::Duration::from_millis(900),
+                    "connect returned too fast ({:?}); wait loop likely skipped",
+                    elapsed
+                );
+                assert!(
+                    elapsed < std::time::Duration::from_secs(10),
+                    "connect took unexpectedly long: {:?}",
+                    elapsed
+                );
+
+                // Drop the runner so the manager's recv unblocks.
+                drop(runner);
+                manager_handle.await.unwrap();
+
+                let _ = std::fs::remove_dir_all(&dir);
+            })
+            .await;
+    }
+
+    /// If the socket file never appears, the wait helper must surface
+    /// a TimedOut error rather than hang forever. We invoke the helper
+    /// directly with a short timeout so the test runs quickly.
+    #[tokio::test(flavor = "current_thread")]
+    async fn runner_times_out_when_socket_never_appears() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "db_test_missing_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+
+        let start = std::time::Instant::now();
+        let result = NamedSocketRunnerEnd::wait_for_socket(
+            &sock_path,
+            std::time::Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        let err = result.expect_err("expected TimedOut error");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        // Should have waited roughly the timeout, not bailed instantly
+        // and not hung past it.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "timeout fired too early: {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timeout exceeded budget: {:?}",
+            elapsed
+        );
     }
 }
