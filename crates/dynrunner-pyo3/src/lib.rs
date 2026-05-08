@@ -23,6 +23,7 @@ use config::resources::PyResourceMap;
 use config::scheduler::SchedulerConfig;
 use config::slurm::PySlurmConfig;
 use config::worker_spec::WorkerSpec;
+use gateway::local::PyLocalGateway;
 use managers::distributed::PyDistributedManager;
 use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFactory};
 use managers::local::PyLocalManager;
@@ -61,6 +62,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLocalManagerConfig>()?;
     m.add_class::<PyPrimaryConfig>()?;
     m.add_class::<PySecondaryConfig>()?;
+    m.add_class::<PyLocalGateway>()?;
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
