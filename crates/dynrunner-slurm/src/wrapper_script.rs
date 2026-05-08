@@ -246,10 +246,12 @@ echo "Using QUIC port: $QUIC_PORT"
 
 HOSTNAME=$(hostname -f)
 mkdir -p "{connection_info_dir}"
-{{
-  echo "hostname=$HOSTNAME"
-  echo "tunnel_port=$TUNNEL_PORT"
-}} > "{connection_info_dir}/{sid}.info"
+# Wire format: single-line `<scheme>://<host>:<port>` URI parsed by
+# the Rust-side `parse_connection_uri` in dynrunner-slurm/preparation.
+# Aligns with the framework's `Primary URL: tcp://...` convention and
+# leaves room for future extension (path/query) without re-spinning
+# the parser.
+printf 'tcp://%s:%s\n' "$HOSTNAME" "$TUNNEL_PORT" > "{connection_info_dir}/{sid}.info"
 echo "Connection info written to: {connection_info_dir}/{sid}.info"
 "##
             ));
@@ -727,10 +729,15 @@ mod tests {
         assert!(script.contains("sec-02.info"));
         assert!(script.contains("localhost:$TUNNEL_PORT"));
         assert!(script.contains("my_runner --secondary"));
-        // Reverse-mode connection-info file uses the legacy
-        // `key=value\n` shape until L1.7 lands the URI form.
-        assert!(script.contains("hostname=$HOSTNAME"));
-        assert!(script.contains("tunnel_port=$TUNNEL_PORT"));
+        // Reverse-mode connection-info file is the post-L1.7 URI
+        // wire format: a single `<scheme>://<host>:<port>\n` line
+        // parsed by `parse_connection_uri` on the primary side.
+        assert!(script.contains(r#"printf 'tcp://%s:%s\n' "$HOSTNAME" "$TUNNEL_PORT""#));
+        // The legacy `key=value` shape must not reappear — guards
+        // against an accidental revert that the URI parser would
+        // reject at runtime.
+        assert!(!script.contains("hostname=$HOSTNAME"));
+        assert!(!script.contains("tunnel_port=$TUNNEL_PORT"));
     }
 
     #[test]
@@ -792,6 +799,70 @@ mod tests {
         assert!(script.contains("/tmp/asm-test-"));
         assert!(script.contains("test-app.tar"));
         assert!(script.contains("my_runner --help"));
+    }
+
+    /// Render the wrapper in both connection modes and pipe through
+    /// `bash -n` to catch any quoting/escape regression that compiles
+    /// fine but produces a syntactically broken script — the kind of
+    /// failure that would only surface on a SLURM compute node, miles
+    /// from the developer's terminal. Guarded on `bash` being on
+    /// $PATH; on stripped CI sandboxes the test silently no-ops.
+    #[test]
+    fn rendered_scripts_pass_bash_syntax_check() {
+        let bash = match std::process::Command::new("bash")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(s) if s.success() => "bash",
+            _ => return,
+        };
+
+        let config = SlurmConfig::default();
+        let standard = generate_wrapper_script(&standard_cfg(&config, &[]));
+        let reverse = generate_wrapper_script(&WrapperScriptConfig {
+            connection: ConnectionMode::Reverse {
+                connection_info_dir: "/logs/connection_info",
+            },
+            ..standard_cfg(&config, &[])
+        });
+        let test_wrapper = generate_test_wrapper_script(&TestWrapperScriptConfig {
+            image_path: "/images/test.tar",
+            image_name: "test-app",
+            image_tag: "latest",
+            image_tar_basename: "test-app.tar",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            container_command: "my_runner",
+        });
+
+        for (label, script) in [
+            ("standard", standard.as_str()),
+            ("reverse", reverse.as_str()),
+            ("test-wrapper", test_wrapper.as_str()),
+        ] {
+            use std::io::Write;
+            let mut child = std::process::Command::new(bash)
+                .args(["-n", "/dev/stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn bash");
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().expect("wait bash");
+            assert!(
+                out.status.success(),
+                "bash -n rejected the {label}-mode wrapper:\nSTDERR:\n{}\n--- script ---\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                script,
+            );
+        }
     }
 
     #[test]
