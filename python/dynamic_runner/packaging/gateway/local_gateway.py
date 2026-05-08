@@ -1,145 +1,83 @@
-import logging
-import subprocess
-from pathlib import Path
-from shutil import copy2, copytree, ignore_patterns
+"""Thin Python shim over the Rust ``RustLocalGateway`` pyclass.
 
-logger = logging.getLogger(__name__)
+The actual gateway logic (subprocess execution, file copy, directory
+creation, existence checks) lives in
+``crates/dynrunner-gateway/src/local.rs`` and is exposed to Python by
+``crates/dynrunner-pyo3/src/gateway/local.rs`` as
+``dynamic_runner._native.RustLocalGateway``.
+
+This module exists only to:
+
+* Preserve the public class name ``LocalGateway`` and its import path
+  for backward-compatible callers.
+* Pin the Python ``Gateway`` Protocol (see ``packaging/gateway/__init__.py``)
+  to the underlying Rust implementation by forwarding each method call
+  with the call-site argument shapes Python consumers already use.
+"""
+
+from pathlib import Path
+
+from dynamic_runner._native import RustLocalGateway
 
 
 class LocalGateway:
-    """Gateway implementation for local SLURM controller"""
+    """Gateway implementation for local SLURM controller (thin shim)."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        self._inner = RustLocalGateway()
         self.connected = False
+        # Exposed for callers that template paths like ``f"{gw.remote_home}/slurm"``
+        # before handing them back to the gateway (slurm_config / pipeline /
+        # job_manager). Tilde-expansion at gateway-call time is the Rust
+        # gateway's responsibility; this attribute is purely informational.
         self.remote_home = Path.home()
 
     def connect(self) -> None:
-        """Establish connection to local gateway"""
-        logger.info(f"Using local gateway (direct SLURM access, home: {self.remote_home})")
+        """Establish connection to local gateway."""
+        self._inner.connect()
         self.connected = True
 
     def disconnect(self) -> None:
-        """Close connection to gateway"""
+        """Close connection to gateway."""
+        self._inner.disconnect()
         self.connected = False
-        logger.info("Local gateway disconnected")
 
-    def execute_command(self, command: str, cwd: Path | None = None) -> tuple[int, str, str]:
-        """Execute command locally
+    def execute_command(
+        self, command: str, cwd: Path | None = None
+    ) -> tuple[int, str, str]:
+        """Execute command locally.
 
         Returns:
             (return_code, stdout, stderr)
         """
-        if not self.connected:
-            raise RuntimeError("Gateway not connected")
+        return self._inner.execute_command(command, cwd)
 
-        logger.debug(f"Executing locally: {command}")
+    def transfer_file(
+        self, local_path: Path | str, remote_path: Path | str
+    ) -> None:
+        """Transfer file from local to gateway (a copy in local mode)."""
+        self._inner.transfer_file(Path(local_path), Path(remote_path))
 
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            return result.returncode, result.stdout, result.stderr
-        except subprocess.TimeoutExpired:
-            logger.error(f"Command timed out: {command}")
-            return -1, "", "Command timed out"
-        except Exception as e:
-            logger.error(f"Command execution failed: {e}")
-            return -1, "", str(e)
+    def upload_file(
+        self, local_path: str | Path, remote_path: str | Path
+    ) -> None:
+        """Upload file from local to gateway (alias for transfer_file)."""
+        self._inner.upload_file(Path(local_path), Path(remote_path))
 
-    def transfer_file(self, local_path: Path | str, remote_path: Path | str) -> None:
-        """Transfer file from local to gateway (just a copy for local mode)"""
-        if not self.connected:
-            raise RuntimeError("Gateway not connected")
-
-        local_path_obj = Path(local_path)
-        remote_path_obj = Path(remote_path)
-
-        # Expand ~ using home directory
-        path_str = str(remote_path_obj)
-        if path_str.startswith("~"):
-            path_str = path_str.replace("~", str(self.remote_home), 1)
-            remote_path_obj = Path(path_str)
-
-        logger.debug(f"Copying {local_path_obj} to {remote_path_obj}")
-
-        try:
-            remote_path_obj.parent.mkdir(parents=True, exist_ok=True)
-            copy2(local_path_obj, remote_path_obj)
-        except Exception as e:
-            logger.error(f"File copy failed: {e}")
-            raise RuntimeError(f"File copy failed: {e}")
-
-    def upload_file(self, local_path: str | Path, remote_path: str | Path) -> None:
-        """Upload file from local to gateway (alias for transfer_file in local mode)"""
-        self.transfer_file(Path(local_path), Path(remote_path))
-
-    def download_file(self, remote_path: str | Path, local_path: str | Path) -> None:
-        """Download file from gateway to local (just a copy for local mode)"""
-        if not self.connected:
-            raise RuntimeError("Gateway not connected")
-
-        remote_path_obj = Path(remote_path)
-        local_path_obj = Path(local_path)
-
-        # Expand ~ using home directory
-        path_str = str(remote_path_obj)
-        if path_str.startswith("~"):
-            path_str = path_str.replace("~", str(self.remote_home), 1)
-            remote_path_obj = Path(path_str)
-
-        logger.debug(f"Copying {remote_path_obj} to {local_path_obj}")
-
-        try:
-            local_path_obj.parent.mkdir(parents=True, exist_ok=True)
-            copy2(remote_path_obj, local_path_obj)
-        except Exception as e:
-            logger.error(f"File copy failed: {e}")
-            raise RuntimeError(f"File copy failed: {e}")
+    def download_file(
+        self, remote_path: str | Path, local_path: str | Path
+    ) -> None:
+        """Download file from gateway to local (a copy in local mode)."""
+        self._inner.download_file(Path(remote_path), Path(local_path))
 
     def create_directory(self, remote_path: Path | str) -> None:
-        """Create directory on gateway (local mkdir)"""
-        if not self.connected:
-            raise RuntimeError("Gateway not connected")
+        """Create directory on gateway (local mkdir)."""
+        self._inner.create_directory(Path(remote_path))
 
-        remote_path_obj = Path(remote_path)
-
-        # Expand ~ using home directory
-        path_str = str(remote_path_obj)
-        if path_str.startswith("~"):
-            path_str = path_str.replace("~", str(self.remote_home), 1)
-            remote_path_obj = Path(path_str)
-
-        try:
-            remote_path_obj.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Created directory: {remote_path_obj}")
-        except Exception as e:
-            logger.error(f"Directory creation failed: {e}")
-            raise
-
-    def file_exists(self, remote_path: Path) -> bool:
-        """Check if file exists on gateway"""
-        if not self.connected:
-            raise RuntimeError("Gateway not connected")
-
-        # Expand ~ using home directory
-        path_str = str(remote_path)
-        if path_str.startswith("~"):
-            path_str = path_str.replace("~", str(self.remote_home), 1)
-            remote_path = Path(path_str)
-
-        return remote_path.exists()
+    def file_exists(self, remote_path: Path | str) -> bool:
+        """Check if file exists on gateway."""
+        return self._inner.file_exists(Path(remote_path))
 
     def setup_port_forwarding(self, local_port: int, remote_port: int) -> None:
-        """Setup port forwarding (no-op for local gateway)
-
-        Args:
-            local_port: Port on local machine where primary listens
-            remote_port: Port that secondaries will connect to
-        """
-        # For local gateway, no forwarding needed - everything is local
-        logger.debug(f"Port forwarding not needed for local gateway (local:{local_port})")
+        """Setup port forwarding (no-op for local gateway)."""
+        self._inner.setup_port_forwarding(local_port, remote_port)
