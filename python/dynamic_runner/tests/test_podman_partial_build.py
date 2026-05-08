@@ -236,7 +236,7 @@ def test_cache_is_refreshed_after_successful_build(patched_subprocess, tmp_path)
 
 
 def test_cache_disabled_when_layer_cache_path_is_false(patched_subprocess, tmp_path):
-    pp = PodmanPackaging(layer_cache_path=False)
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT, layer_cache_path=False)
     pp._build_nix_target(
         local_project_root=patched_subprocess.project_root,
         target=".#dockerImage",
@@ -253,7 +253,7 @@ def test_cache_disabled_when_layer_cache_path_is_false(patched_subprocess, tmp_p
 
 def test_explicit_cache_path_override(patched_subprocess, tmp_path):
     custom_cache = tmp_path / "custom" / "layers.json"
-    pp = PodmanPackaging(layer_cache_path=custom_cache)
+    pp = PodmanPackaging(deployment=_TEST_DEPLOYMENT, layer_cache_path=custom_cache)
     pp._build_nix_target(
         local_project_root=patched_subprocess.project_root,
         target=".#dockerImage",
