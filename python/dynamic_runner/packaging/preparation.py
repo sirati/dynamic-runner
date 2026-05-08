@@ -6,18 +6,30 @@ Owns:
 - SLURM job submission via job_manager
 - SSH tunnel setup for reverse connections (when the compute nodes can't
   reach the primary directly)
+
+The SSH-tunnel-watcher state machine + subprocess teardown live in
+Rust (`dynamic_runner._native.RustSlurmPreparation`). This module
+keeps the orchestration glue (image build, job submit, run-id
+bookkeeping) in Python and delegates tunnel lifecycle to the Rust
+class — single concern at the FFI boundary.
 """
 
+import asyncio
 import logging
-import shlex
-import subprocess
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..deployment_spec import TaskDeploymentSpec
 from .podman import PodmanImageMetadata
+
+try:
+    from .._native import RustSlurmPreparation
+except ImportError as e:  # pragma: no cover — unbuilt wheel
+    raise ImportError(
+        "dynamic_runner._native.RustSlurmPreparation is required; "
+        "rebuild the wheel after a Rust change"
+    ) from e
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +70,18 @@ class SlurmPreparation:
         base_log_dir = self.slurm_config.get_log_dir()
         self.run_log_dir = f"{base_log_dir}/{run_id}"
 
+        # The SSH-tunnel watcher + subprocess teardown live in Rust.
+        # Constructed lazily inside `_setup_ssh_tunnels` so non-reverse
+        # runs (which never call _setup_ssh_tunnels) avoid touching
+        # auth_options / extra_port_forwards.
+        self._tunnel_manager: RustSlurmPreparation | None = None
+        # Map kept for callers that read mode_specific_data; populated
+        # from the Rust side once tunnels are established.
         self.secondary_port_map: dict[str, int] = {}
-        self.ssh_tunnels: list[subprocess.Popen[Any]] = []
+        # Legacy attribute — Rust now owns the subprocess handles.
+        # Kept as an empty list so any code reading it (or iterating
+        # over mode_specific_data["ssh_tunnels"]) still works.
+        self.ssh_tunnels: list[Any] = []
 
     async def prepare(
         self,
@@ -176,237 +198,74 @@ class SlurmPreparation:
     async def _setup_ssh_tunnels(self, num_secondaries: int, primary_quic_port: int) -> None:
         """Setup SSH reverse tunnels (compute → primary via gateway).
 
-        Reverse-connection mode is used when the gateway has
-        ``GatewayPorts no`` so the standard "secondaries dial the
-        gateway" path can't work. Instead each compute node's
-        wrapper picks a free ``TUNNEL_PORT`` locally, the wrapper
-        invokes the secondary with ``--secondary tcp://localhost:$TUNNEL_PORT``,
-        and we set up an SSH ``-R`` from the primary that asks the
-        compute node's sshd to open ``localhost:tunnel_port`` and
-        forward back to ``primary's localhost:primary_quic_port``.
-        That way the secondary's outbound connect to its own
-        ``localhost:tunnel_port`` actually reaches the primary's QUIC
-        coordinator.
+        Delegates the per-secondary watcher state machine + tunnel
+        spawning + subprocess tracking to Rust. Reverse-connection
+        mode is used when the gateway has ``GatewayPorts no`` so the
+        standard "secondaries dial the gateway" path can't work;
+        instead each compute node's wrapper picks a free
+        ``TUNNEL_PORT`` locally, the wrapper invokes the secondary
+        with ``--secondary tcp://localhost:$TUNNEL_PORT``, and the
+        Rust side opens an ``ssh -N -R`` from the primary that asks
+        the compute node's sshd to bind ``localhost:tunnel_port`` and
+        forward back to the primary's ``localhost:primary_quic_port``.
+
+        Auth-flag chain (``-i`` / ``IdentitiesOnly=yes`` /
+        ``IdentityAgent=none`` / ``-F config``) is read off the
+        gateway via :meth:`auth_options` so the gateway stays the
+        single source of truth — Rust receives an opaque
+        ``list[str]`` to splice verbatim into each ssh command.
+
+        Connection-info file is in URI form
+        (``<scheme>://<host>:<port>``) per the post-L1.7 wire
+        contract.
         """
         logger.info("Setting up SSH reverse tunnels for reverse connections...")
 
         connection_info_dir = f"{self.run_log_dir}/connection_info"
         self.gateway.create_directory(connection_info_dir)
 
-        connected: set[str] = set()
-        timeout = 600
-        start_time = time.time()
-
-        while len(connected) < num_secondaries:
-            if time.time() - start_time > timeout:
-                logger.error(
-                    "Timeout waiting for secondary connection info. Found: %d/%d",
-                    len(connected),
-                    num_secondaries,
-                )
-                raise TimeoutError("Failed to get all secondary connection info")
-
-            for i in range(num_secondaries):
-                secondary_id = f"secondary-{i}"
-                if secondary_id in connected:
-                    continue
-
-                info_file = f"{connection_info_dir}/{secondary_id}.info"
-                returncode, stdout, _stderr = self.gateway.execute_command(f"cat {info_file}")
-
-                if returncode == 0 and stdout.strip():
-                    lines = stdout.strip().split("\n")
-                    if len(lines) >= 2:
-                        hostname = lines[0].split("=")[1].strip()
-                        tunnel_port = int(lines[1].split("=")[1].strip())
-
-                        logger.info("Found connection info for %s: %s:%d", secondary_id, hostname, tunnel_port)
-
-                        self._create_ssh_tunnel(
-                            secondary_id,
-                            remote_host=hostname,
-                            tunnel_port=tunnel_port,
-                            primary_quic_port=primary_quic_port,
-                        )
-
-                        self.secondary_port_map[secondary_id] = tunnel_port
-                        connected.add(secondary_id)
-
-            if len(connected) < num_secondaries:
-                await self._async_sleep(2)
-
-        logger.info("All %d SSH tunnels established", num_secondaries)
-
-    def _create_ssh_tunnel(
-        self,
-        secondary_id: str,
-        remote_host: str,
-        tunnel_port: int,
-        primary_quic_port: int,
-    ) -> None:
-        """Create an SSH reverse tunnel from primary back through the gateway
-        to the compute node. Compute node's sshd binds
-        ``localhost:tunnel_port`` and forwards to the primary's
-        ``localhost:primary_quic_port``.
-
-        Also fans out each
-        :attr:`TaskDeploymentSpec.extra_port_forwards` entry as an
-        additional ``-R gateway_port:localhost:local_port`` on the
-        same SSH connection. Under ``GatewayPorts=no`` the
-        master-side ``setup_port_forwarding`` for these entries
-        binds 127.0.0.1 on the gateway and is unreachable from
-        compute; the per-compute fan-out gives each secondary a
-        local ``localhost:gateway_port`` listener that tunnels back
-        to ``primary:localhost:local_port``. Same URL shape as the
-        ``GatewayPorts=on`` direct-bind path, so consumer code
-        (e.g. ssh-debug, harmonia federation) doesn't have to
-        know which path is in effect.
-        """
         gateway_host = self.gateway.host if hasattr(self.gateway, "host") else "localhost"
         gateway_user = self.gateway.user if hasattr(self.gateway, "user") else None
-        jump_port = self.gateway.port if hasattr(self.gateway, "port") else 22
-        remote_user = gateway_user or "root"
-
+        gateway_port = self.gateway.port if hasattr(self.gateway, "port") else 22
         auth_opts = list(self.gateway.auth_options()) if hasattr(self.gateway, "auth_options") else []
-        jump_target = f"{gateway_user}@{gateway_host}" if gateway_user else gateway_host
+        extra_forwards = list(self.deployment.extra_port_forwards)
 
-        ssh_cmd = ["ssh", *auth_opts]
-        # When auth_options is non-empty (--ssh-identity-file or
-        # --ssh-config supplied), -J is unsafe: OpenSSH 7.3+ does NOT
-        # propagate command-line -o flags to the inner ssh that -J
-        # spawns. The inner ssh re-evaluates ~/.ssh/config from
-        # scratch, so IdentityAgent=none / IdentitiesOnly=yes / -F
-        # are silently dropped on the jump-hop and the agent leaks
-        # back in — defeating the entire --ssh-identity-file path.
-        # Workaround: explicit -o ProxyCommand=... that re-issues
-        # the auth flags inline. The proxy ssh inherits them as
-        # genuine argv. Same single-source-of-truth: SSHGateway
-        # owns the flag list; this code shell-quotes it.
-        # No-auth case keeps the simpler -J form (no behavior
-        # change for users without --ssh-identity-file/--ssh-config).
-        if auth_opts:
-            proxy_cmd_parts = ["ssh", *auth_opts]
-            if jump_port != 22:
-                proxy_cmd_parts.extend(["-p", str(jump_port)])
-            proxy_cmd_parts.extend(["-W", "%h:%p", jump_target])
-            ssh_cmd.extend(["-o", f"ProxyCommand={shlex.join(proxy_cmd_parts)}"])
-        else:
-            jump_with_port = f"{jump_target}:{jump_port}" if jump_port != 22 else jump_target
-            ssh_cmd.extend(["-J", jump_with_port])
-        ssh_cmd.extend(
-            [
-                "-R",
-                f"{tunnel_port}:localhost:{primary_quic_port}",
-            ]
-        )
-        for local_port, gateway_port in self.deployment.extra_port_forwards:
-            ssh_cmd.extend(["-R", f"{gateway_port}:localhost:{local_port}"])
-        ssh_cmd.extend(
-            [
-                f"{remote_user}@{remote_host}",
-                "-N",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                # Fail fast if the remote -R forward can't be set up
-                # (e.g. tunnel_port already bound on the compute node,
-                # remote sshd refusing port forwarding). Without this
-                # flag ssh stays alive even when the forward request
-                # fails, leaving us with a "running" PID but a broken
-                # tunnel — the secondary then hits Connection refused
-                # on localhost:tunnel_port and the dispatch eventually
-                # dies on the SecondaryWelcome handshake timeout. With
-                # this flag ssh exits, and the post-Popen verification
-                # below sees the non-None poll() and aborts.
-                "-o",
-                "ExitOnForwardFailure=yes",
-                # Default-on keepalive on long-lived ssh tunnels.
-                # Sends an application-layer probe every 30s and
-                # tolerates 3 missed probes before the local ssh
-                # exits. With these flags the tunnel survives quiet
-                # periods (e.g. NAT idle-timeouts on consumer
-                # routers) without relying on app-layer traffic to
-                # keep the connection warm; without them an idle
-                # tunnel can sit "established" on both ends while
-                # the underlying socket is silently dead. Mirrored
-                # in ssh_gateway.py for the persistent master
-                # connection.
-                "-o",
-                "ServerAliveInterval=30",
-                "-o",
-                "ServerAliveCountMax=3",
-                "-o",
-                "TCPKeepAlive=yes",
-            ]
+        self._tunnel_manager = RustSlurmPreparation(
+            self.gateway,
+            self.run_log_dir,
+            gateway_host,
+            int(gateway_port),
+            auth_opts,
+            extra_forwards,
+            gateway_user,
         )
 
-        logger.info(
-            "Creating SSH reverse tunnel for %s: %s:localhost:%d -> primary:localhost:%d (+ %d extra forwards)",
-            secondary_id,
-            remote_host,
-            tunnel_port,
+        # The Rust core's `setup_ssh_tunnels` is sync from Python's
+        # perspective but releases the GIL inside its tokio runtime.
+        # Drive it on a worker thread so this `async def` keeps
+        # cooperating with the surrounding asyncio loop — important
+        # for any caller awaiting alongside us. `asyncio.to_thread`
+        # is the right primitive here; the GIL is held briefly for
+        # the bridge call and released for the duration of the
+        # 600s state machine.
+        port_map = await asyncio.to_thread(
+            self._tunnel_manager.setup_ssh_tunnels,
+            num_secondaries,
             primary_quic_port,
-            len(self.deployment.extra_port_forwards),
-        )
-        logger.debug("SSH command: %s", " ".join(ssh_cmd))
-
-        proc = subprocess.Popen(
-            ssh_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.DEVNULL,
-        )
-        self.ssh_tunnels.append(proc)
-
-        # Verify ssh actually stayed alive long enough to establish the
-        # forward. ssh -N -R never exits on its own, so a clean exit
-        # within a few seconds means setup failed: jump-host (-J) couldn't
-        # reach the gateway, the gateway-side sshd refused, the remote -R
-        # request collided with an existing listener (caught by
-        # ExitOnForwardFailure=yes above), or auth failed.
-        #
-        # Idiom: wait(timeout=3) raises TimeoutExpired if the process is
-        # STILL alive after 3s — which is the success case for a
-        # long-running -N tunnel. A clean return from wait() means ssh
-        # already died and we have an exit code + captured stderr to
-        # surface.
-        try:
-            returncode = proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            logger.info("SSH tunnel established for %s (PID: %s)", secondary_id, proc.pid)
-            return
-
-        stderr_bytes = proc.stderr.read() if proc.stderr is not None else b""
-        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
-        logger.error(
-            "SSH tunnel for %s exited within 3s (rc=%s) — forward not established. stderr: %s",
-            secondary_id,
-            returncode,
-            stderr_text,
-        )
-        raise RuntimeError(
-            f"SSH reverse tunnel for {secondary_id} failed to establish "
-            f"(ssh exited rc={returncode}): {stderr_text}"
         )
 
-    async def _async_sleep(self, seconds: float) -> None:
-        import asyncio
-
-        await asyncio.sleep(seconds)
+        # Reflect into the legacy attribute for any caller reading
+        # `mode_specific_data["secondary_port_map"]`.
+        self.secondary_port_map = {k: int(v) for k, v in port_map.items()}
+        logger.info("All %d SSH tunnels established", num_secondaries)
 
     def cleanup(self) -> None:
-        """Cleanup SLURM preparation resources."""
+        """Cleanup SLURM preparation resources.
+
+        Idempotent — safe to call from a ``finally`` block even when
+        ``_setup_ssh_tunnels`` was never invoked (non-reverse mode).
+        """
         logger.info("Cleaning up SLURM preparation resources...")
-
-        for proc in self.ssh_tunnels:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
+        if self._tunnel_manager is not None:
+            self._tunnel_manager.cleanup()
         logger.info("SLURM preparation cleanup complete")

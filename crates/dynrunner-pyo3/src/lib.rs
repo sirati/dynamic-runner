@@ -86,5 +86,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(publish::publish_one, m)?)?;
     m.add_function(wrap_pyfunction!(slurm::wrapper_script::generate_wrapper_script, m)?)?;
     m.add_function(wrap_pyfunction!(slurm::wrapper_script::generate_test_wrapper_script, m)?)?;
+    m.add_class::<slurm::preparation::PySlurmPreparation>()?;
     Ok(())
 }

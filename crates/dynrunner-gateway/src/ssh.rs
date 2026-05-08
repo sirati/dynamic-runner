@@ -6,6 +6,7 @@ use tracing;
 use crate::config::SshConfig;
 use crate::filesystem::{DirEntry, Filesystem, FsError};
 use crate::path::expand_tilde;
+use crate::shell::shell_quote;
 use crate::traits::{CommandResult, Gateway, GatewayError};
 
 /// Gateway for SSH connections using a persistent ControlMaster connection.
@@ -397,22 +398,6 @@ impl Gateway for SshGateway {
     }
 }
 
-/// Wrap `s` in POSIX single quotes, escaping any embedded single quote as
-/// `'\''`. Safe to interpolate into a remote shell command line.
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 /// Parse the null-delimited output of
 /// `find <dir> -mindepth 1 -maxdepth 1 -L -printf "%y\t%s\t%P\0"`
 /// into [`DirEntry`] values. The `-L` flag dereferences symlinks so `%y`
@@ -490,16 +475,6 @@ impl Filesystem for SshGateway {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shell_quote_simple() {
-        assert_eq!(shell_quote("/tmp/foo"), "'/tmp/foo'");
-    }
-
-    #[test]
-    fn shell_quote_embedded_single_quote() {
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-    }
 
     #[test]
     fn parse_find_printf_basic() {
