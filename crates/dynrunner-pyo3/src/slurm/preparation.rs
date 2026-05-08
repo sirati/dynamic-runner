@@ -20,6 +20,7 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use dynrunner_gateway::shell::shell_quote;
 use dynrunner_slurm::preparation::{
     InfoFileReader, PrepError, PreparationOptions, SlurmPreparation,
 };
@@ -70,7 +71,7 @@ impl InfoFileReader for PyGatewayReader {
             let res = tokio::task::spawn_blocking(move || {
                 Python::attach(|py| -> PyResult<(i32, String)> {
                     let bound = gateway.bind(py);
-                    let cmd = format!("cat {}", shell_escape(&path));
+                    let cmd = format!("cat {}", shell_quote(&path));
                     // execute_command(cmd) → (rc, stdout, stderr)
                     let result = bound.call_method1("execute_command", (cmd,))?;
                     let rc: i32 = result.get_item(0)?.extract()?;
@@ -98,33 +99,16 @@ impl InfoFileReader for PyGatewayReader {
     }
 }
 
-/// Single-quote `s` so the gateway's remote shell sees a literal path.
-/// Tunnel info files are placed under `<run_log_dir>/connection_info`
-/// — paths under user control should never contain quotes, but be
-/// defensive: backticks/quotes/spaces all become safe under
-/// single-quote shell-escape.
-fn shell_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 /// Python-facing tunnel-lifecycle manager. The Python `SlurmPreparation`
 /// thin shim instantiates one of these per-run and delegates
 /// `_setup_ssh_tunnels` + `cleanup` to it.
 ///
-/// `unsendable` because the gateway callback path re-acquires the
-/// GIL on the GIL thread; pinning the class to a single Python
-/// thread keeps that contract clean.
-#[pyclass(name = "RustSlurmPreparation", unsendable)]
+/// Send-safe: both fields are `Send` (`SlurmPreparation` holds only
+/// owned plain data + `Arc<Mutex<...>>`; `Py<PyAny>` is unconditionally
+/// `Send` per pyo3). Cross-thread use is intentional — the Python
+/// shim drives `setup_ssh_tunnels` via `asyncio.to_thread` so the
+/// surrounding event loop keeps cooperating during the 600s deadline.
+#[pyclass(name = "RustSlurmPreparation")]
 pub(crate) struct PySlurmPreparation {
     inner: SlurmPreparation,
     gateway: Py<PyAny>,

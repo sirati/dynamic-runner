@@ -33,6 +33,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dynrunner_gateway::shell::shell_join;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
@@ -385,16 +386,18 @@ async fn drive_one_watcher<R: InfoFileReader>(
     })
 }
 
-/// Build and spawn `ssh -N -R <tunnel_port>:localhost:<primary> ...`
-/// per the Python implementation's argv shape, including the
-/// auth-options-aware ProxyCommand workaround for OpenSSH 7.3+.
-async fn spawn_reverse_tunnel(
-    secondary_id: &str,
+/// Build the argv for `ssh -N -R <tunnel_port>:localhost:<primary> ...`
+/// per the Python implementation's shape — including the auth-options-
+/// aware ProxyCommand workaround for OpenSSH 7.3+.
+///
+/// Pure (no I/O), so the argv shape is unit-testable without spawning
+/// a real subprocess.
+fn build_ssh_argv(
     remote_host: &str,
     tunnel_port: u16,
     primary_quic_port: u16,
     opts: &PreparationOptions,
-) -> Result<Child, PrepError> {
+) -> Vec<String> {
     let mut argv: Vec<String> = vec!["ssh".into()];
     argv.extend(opts.auth_options.iter().cloned());
 
@@ -458,6 +461,18 @@ async fn spawn_reverse_tunnel(
         "-o".into(),
         "TCPKeepAlive=yes".into(),
     ]);
+    argv
+}
+
+/// Spawn the ssh tunnel subprocess from `build_ssh_argv` output.
+async fn spawn_reverse_tunnel(
+    secondary_id: &str,
+    remote_host: &str,
+    tunnel_port: u16,
+    primary_quic_port: u16,
+    opts: &PreparationOptions,
+) -> Result<Child, PrepError> {
+    let argv = build_ssh_argv(remote_host, tunnel_port, primary_quic_port, opts);
 
     tracing::info!(
         secondary_id,
@@ -553,31 +568,6 @@ async fn terminate_child(child: &mut Child) {
     }
 }
 
-/// POSIX shell-join (single-quote each arg, escape inner quotes).
-/// Matches Python `shlex.join(...)` for portability between the two
-/// implementations during the migration.
-fn shell_join(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|p| shell_quote(p))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 /// Parse a connection-info URI line. Accepts `<scheme>://<host>:<port>`
 /// (post-L1.7 wire format). Returns `(host, port)`.
 fn parse_connection_uri(line: &str) -> Result<(String, u16), String> {
@@ -668,13 +658,6 @@ mod tests {
     fn parse_uri_garbage() {
         let err = parse_connection_uri("not a uri at all").unwrap_err();
         assert!(err.contains("not a valid URL"), "got {err}");
-    }
-
-    #[test]
-    fn shell_join_round_trip() {
-        let parts = vec!["ssh".to_string(), "-i".into(), "/path/with space".into()];
-        let joined = shell_join(&parts);
-        assert_eq!(joined, "'ssh' '-i' '/path/with space'");
     }
 
     /// Bench reader for the timeout/cancel path: returns Ok(None)
@@ -774,7 +757,7 @@ mod tests {
     /// without launching a real subprocess.
     #[test]
     fn argv_no_auth_uses_proxyjump_dash_j() {
-        let mut o = PreparationOptions::new(
+        let o = PreparationOptions::new(
             "/logs".into(),
             "gw.example".into(),
             Some("alice".into()),
@@ -782,8 +765,7 @@ mod tests {
             vec![],
             vec![(2222, 9090)],
         );
-        o.setup_timeout = Duration::from_secs(600);
-        let argv = build_ssh_argv("secondary-0", "compute01", 40000, 51000, &o);
+        let argv = build_ssh_argv("compute01", 40000, 51000, &o);
         // -J alice@gw.example
         let j_idx = argv.iter().position(|s| s == "-J").expect("has -J");
         assert_eq!(argv[j_idx + 1], "alice@gw.example");
@@ -823,7 +805,7 @@ mod tests {
             auth,
             vec![],
         );
-        let argv = build_ssh_argv("secondary-0", "compute01", 40000, 51000, &o);
+        let argv = build_ssh_argv("compute01", 40000, 51000, &o);
         // No -J
         assert!(!argv.iter().any(|s| s == "-J"));
         // ProxyCommand= present, contains -i /tmp/key, IdentitiesOnly=yes,
@@ -837,74 +819,6 @@ mod tests {
         assert!(proxy_cmd.contains("'-p' '2222'"));
         assert!(proxy_cmd.contains("'-W' '%h:%p'"));
         assert!(proxy_cmd.contains("'alice@gw.example'"));
-    }
-
-    /// Test-only: replicate the argv-building done inside
-    /// `spawn_reverse_tunnel` so the shape is unit-testable without
-    /// launching a real subprocess. Kept private to the test module
-    /// — production code must NOT take this shortcut.
-    fn build_ssh_argv(
-        _secondary_id: &str,
-        remote_host: &str,
-        tunnel_port: u16,
-        primary_quic_port: u16,
-        opts: &PreparationOptions,
-    ) -> Vec<String> {
-        let mut argv: Vec<String> = vec!["ssh".into()];
-        argv.extend(opts.auth_options.iter().cloned());
-
-        let jump_target = match &opts.gateway_user {
-            Some(u) => format!("{u}@{}", opts.gateway_host),
-            None => opts.gateway_host.clone(),
-        };
-
-        if !opts.auth_options.is_empty() {
-            let mut proxy_parts: Vec<String> = vec!["ssh".into()];
-            proxy_parts.extend(opts.auth_options.iter().cloned());
-            if opts.gateway_port != 22 {
-                proxy_parts.push("-p".into());
-                proxy_parts.push(opts.gateway_port.to_string());
-            }
-            proxy_parts.push("-W".into());
-            proxy_parts.push("%h:%p".into());
-            proxy_parts.push(jump_target.clone());
-            argv.push("-o".into());
-            argv.push(format!("ProxyCommand={}", shell_join(&proxy_parts)));
-        } else {
-            let jump_with_port = if opts.gateway_port != 22 {
-                format!("{jump_target}:{}", opts.gateway_port)
-            } else {
-                jump_target.clone()
-            };
-            argv.push("-J".into());
-            argv.push(jump_with_port);
-        }
-
-        argv.push("-R".into());
-        argv.push(format!("{tunnel_port}:localhost:{primary_quic_port}"));
-        for (local_port, gateway_port) in &opts.extra_port_forwards {
-            argv.push("-R".into());
-            argv.push(format!("{gateway_port}:localhost:{local_port}"));
-        }
-
-        let remote_user = opts.gateway_user.as_deref().unwrap_or("root");
-        argv.push(format!("{remote_user}@{remote_host}"));
-        argv.extend([
-            "-N".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=no".into(),
-            "-o".into(),
-            "UserKnownHostsFile=/dev/null".into(),
-            "-o".into(),
-            "ExitOnForwardFailure=yes".into(),
-            "-o".into(),
-            "ServerAliveInterval=30".into(),
-            "-o".into(),
-            "ServerAliveCountMax=3".into(),
-            "-o".into(),
-            "TCPKeepAlive=yes".into(),
-        ]);
-        argv
     }
 
     /// LocalDirReader smoke test: when the file exists, the reader
