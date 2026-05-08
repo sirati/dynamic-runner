@@ -361,7 +361,16 @@ cp "{image_path}" "$LOCAL_IMAGE"
 echo "Image copied to: $LOCAL_IMAGE"
 
 echo "Loading image into container runtime..."
-{self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}
+# Wrap the load command in an explicit failure check so the abort
+# surfaces as a clear marker on STDOUT (the .out file consumers
+# check first), not just an opaque set-e exit between the
+# "Loading…" line and the cleanup trap. The container runtime's
+# own stderr still ends up in the .err file as before.
+if ! {self.packaging.get_load_command("$LOCAL_IMAGE", "$PODMAN_STORAGE", "$PODMAN_RUN")}; then
+    echo "ERROR: image load failed; secondary cannot start. See the .err file for the runtime's diagnostic."
+    echo "ERROR: image load failed; secondary cannot start." >&2
+    exit 1
+fi
 echo "Image loaded successfully"
 
 CONTAINER_NAME="{container_name}"
