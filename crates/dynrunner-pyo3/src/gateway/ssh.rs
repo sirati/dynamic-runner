@@ -32,16 +32,43 @@ use dynrunner_gateway::{Gateway, SshConfig, SshGateway};
 /// the runtime drops at the end of the call, so any spawned local
 /// task that outlives the await chain is dropped with it (cancel-safe
 /// by construction; no `select!` on non-cancel-safe futures).
+///
+/// Nested-runtime guard: when a tokio runtime is already active on
+/// the calling thread (e.g. `SlurmJobManager` driving a
+/// `PyGatewayAdapter` that round-trips through Python and re-enters
+/// this binding), tokio's `block_on` would panic with "Cannot start
+/// a runtime from within a runtime". We spawn a worker thread via
+/// `std::thread::scope` to break out of the calling thread's
+/// runtime, run the new current-thread runtime there, and join.
+/// Cleanest fix until `PyGatewayAdapter` short-circuits to the
+/// inner Rust gateway directly (the follow-up optimisation noted in
+/// `crates/dynrunner-pyo3/src/slurm/py_gateway.rs`).
 fn block_on_local<F, T>(fut: F) -> T
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime");
-    let local = tokio::task::LocalSet::new();
-    rt.block_on(local.run_until(fut))
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to create tokio runtime");
+                let local = tokio::task::LocalSet::new();
+                rt.block_on(local.run_until(fut))
+            })
+            .join()
+            .expect("nested-runtime worker thread panicked")
+        })
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime");
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(fut))
+    }
 }
 
 /// Map a [`dynrunner_gateway::traits::GatewayError`] to a Python
