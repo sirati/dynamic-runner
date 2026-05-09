@@ -539,6 +539,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         self.cluster_state.counts()
     }
 
+    /// Test-only borrow of the primary's replicated cluster ledger.
+    /// Lets tests read failure reasons (`TaskState::Failed.last_error`)
+    /// to pin specific regression-mode error strings without parsing
+    /// log output.
+    #[cfg(test)]
+    pub fn cluster_state_for_test(&self) -> &crate::cluster_state::ClusterState<I> {
+        &self.cluster_state
+    }
+
     /// Run the full coordination pipeline.
     ///
     /// `phase_deps` declares the per-phase `depends_on` graph. Items in
