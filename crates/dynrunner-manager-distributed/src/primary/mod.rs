@@ -816,7 +816,7 @@ mod connect;
 mod heartbeat;
 mod lifecycle;
 mod peer_setup;
-mod staging;
+pub mod staging;
 mod task;
 pub mod wire;
 
