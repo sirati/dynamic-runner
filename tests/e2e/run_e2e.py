@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -279,6 +280,361 @@ def _scancel_user_jobs_on_gateway(env: DispatchEnv) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+# ── Worker-node leak gate ─────────────────────────────────────────────
+#
+# Single concern: after the gateway-side SLURM-job-list gate passes
+# (zero jobs left), verify each compute node has no leaked artefacts
+# that the wrapper script's cleanup() trap was responsible for. A job
+# can finish (squeue empty) while leaving a detached podman container
+# behind — the conmon-double-fork-escapes-cgroup case the wrapper's
+# watchdog tries to mop up. If that mop-up missed, the leak surfaces
+# here.
+#
+# Filterable signatures the wrapper sets (see
+# crates/dynrunner-slurm/src/wrapper_script.rs):
+#   - tempdir prefix `/tmp/asm-<hex8>`         (RNDTMP)
+#   - test-wrapper tempdir prefix `/tmp/asm-test-<hex8>`
+#   - container name prefix `asm-<hex8>-<secondary_id>`
+#   - watchdog process: `setsid -f bash -c '...' watchdog ...` whose
+#     argv contains the container name (so includes `asm-<hex8>`)
+#
+# Probe pattern `asm-[0-9a-f]{8}` (regex) discriminates framework
+# state from any other operator's. `--user <ssh_user>` further
+# narrows the pgrep scope so we never touch another operator's
+# processes on a shared cluster.
+
+# Eight lowercase hex chars after `asm-` — the wrapper's `rand_hex8`
+# token. Used both as a literal grep substring (`asm-`) and a strict
+# regex (`asm-[0-9a-f]{8}`) for discrimination from incidental matches.
+_WRAPPER_TOKEN_PREFIX = "asm-"
+# pgrep -f uses extended regular expressions (ERE), so `{8}` is the
+# bounded-repetition operator — no backslash escaping. The pattern
+# matches `asm-` followed by exactly 8 lowercase hex chars, the
+# wrapper's `rand_hex8()` token. Tighter than the bare prefix to
+# avoid spurious matches on unrelated `asm-*` names operators may
+# have running on shared infrastructure.
+_WRAPPER_TOKEN_REGEX = "asm-[0-9a-f]{8}"
+# Tempdir glob prefixes, ordered most-specific-first so the test
+# wrapper's `asm-test-*` is enumerated separately from secondary
+# wrappers' `asm-<hex>-*`. Both classes are framework state and
+# cleaned up the same way.
+_LEAK_TEMPDIR_GLOBS: tuple[str, ...] = ("/tmp/asm-*",)
+
+
+def _discover_worker_hostnames(env: DispatchEnv) -> list[str]:
+    """Enumerate compute-node hostnames via the gateway's `sinfo`.
+
+    Uses the slurm-test-env's slurmctld view so the leak gate adapts
+    to whatever node count the cluster was brought up with — no need
+    to thread `args.workers` through (which is the requested count,
+    not necessarily what's currently configured).
+
+    `sinfo -h -o '%N'` returns a compressed nodelist (e.g.
+    `slurm-worker[1-4]`); `scontrol show hostnames` expands it. The
+    pipeline runs on the gateway because slurm tooling isn't on the
+    operator host.
+
+    Returns ``[]`` on `sinfo` failure (transient SSH hiccup, gateway
+    down) so the gate doesn't false-positive — symmetric with
+    ``_list_user_jobs_on_gateway``'s behaviour on `squeue` failure.
+    """
+    if env.ssh_config_path is None:
+        return []
+    rc = subprocess.run(
+        [
+            "ssh",
+            "-F", str(env.ssh_config_path),
+            GATEWAY_HOST_ALIAS,
+            "sinfo -h -o '%N' | xargs -I{} scontrol show hostnames {}",
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if rc.returncode != 0:
+        return []
+    return [
+        line.strip()
+        for line in rc.stdout.decode().splitlines()
+        if line.strip()
+    ]
+
+
+@dataclass
+class _WorkerLeak:
+    """What a single worker leaked. Empty fields = clean.
+
+    Container IDs are kept separate from `containers` lines so the
+    forced-cleanup path can pass them straight to ``podman rm -f``
+    without re-parsing.
+    """
+
+    hostname: str
+    tempdirs: list[str]
+    containers: list[str]
+    container_ids: list[str]
+    processes: list[str]
+    process_pids: list[str]
+
+    def is_empty(self) -> bool:
+        return not (self.tempdirs or self.containers or self.processes)
+
+
+# Per-worker probe shell. Single round-trip: lists each leak class
+# under a labelled section header so the parser can split deterministi-
+# cally. The `--user <ssh_user>` filter on pgrep matches `id -u <user>`
+# at runtime so the probe doesn't depend on the caller knowing the
+# worker's UID for the dispatcher account. Each section is silent on
+# no-match (`|| true`) so the parser sees an empty body, not a
+# spurious error line.
+_PROBE_SHELL_TEMPLATE = (
+    "set +e; "
+    "echo '##TEMPDIRS##'; "
+    "for g in {tempdir_globs}; do ls -d $g 2>/dev/null; done; "
+    "echo '##CONTAINERS##'; "
+    "podman ps -a "
+    "--filter 'name={token_prefix}' "
+    "--format '{{{{.ID}}}} {{{{.Names}}}} {{{{.Image}}}} {{{{.Status}}}}' "
+    "2>/dev/null; "
+    "echo '##PROCESSES##'; "
+    "pgrep -u {user} -af '{token_regex}' 2>/dev/null; "
+    "echo '##END##'; "
+    "true"
+)
+
+
+def _build_probe_shell(env: DispatchEnv) -> str:
+    return _PROBE_SHELL_TEMPLATE.format(
+        tempdir_globs=" ".join(_LEAK_TEMPDIR_GLOBS),
+        token_prefix=_WRAPPER_TOKEN_PREFIX,
+        token_regex=_WRAPPER_TOKEN_REGEX,
+        user=env.ssh_user,
+    )
+
+
+def _parse_probe_output(hostname: str, stdout: str) -> _WorkerLeak:
+    """Split the probe's section-headered stdout into a _WorkerLeak.
+
+    Sections are delimited by ``##NAME##`` markers. Anything between
+    two markers is the section's body — empty body means no leak in
+    that class.
+
+    Container IDs are extracted from the first whitespace-separated
+    token of each container line (matches the `{{.ID}}` format in
+    `_PROBE_SHELL_TEMPLATE`). PIDs likewise from `pgrep -af` output's
+    first column.
+    """
+    sections: dict[str, list[str]] = {
+        "TEMPDIRS": [], "CONTAINERS": [], "PROCESSES": [],
+    }
+    current: str | None = None
+    for raw in stdout.splitlines():
+        line = raw.rstrip()
+        if line.startswith("##") and line.endswith("##"):
+            tag = line.strip("#")
+            current = tag if tag in sections else None
+            continue
+        if current is None or not line.strip():
+            continue
+        sections[current].append(line)
+
+    container_ids = [
+        line.split()[0] for line in sections["CONTAINERS"] if line.split()
+    ]
+    process_pids = [
+        line.split()[0] for line in sections["PROCESSES"] if line.split()
+    ]
+    return _WorkerLeak(
+        hostname=hostname,
+        tempdirs=sections["TEMPDIRS"],
+        containers=sections["CONTAINERS"],
+        container_ids=container_ids,
+        processes=sections["PROCESSES"],
+        process_pids=process_pids,
+    )
+
+
+def _run_probe_on_worker(
+    env: DispatchEnv, hostname: str
+) -> _WorkerLeak | None:
+    """Submit one srun job to ``hostname`` and parse its output.
+
+    Returns ``None`` on srun failure (the gate then logs a soft
+    warning, like the gateway-side gate's behaviour on `squeue`
+    failure — the check is a guardrail, not a hard barrier). Workers
+    don't accept the operator's SSH key directly via ProxyJump on
+    slurm-test-env (see ``scenarios/cleanup_teardown.py`` rationale),
+    so we route the probe through `srun -w <node>` which authenticates
+    via the slurm controller — same path the framework's actual job
+    dispatch takes.
+    """
+    if env.ssh_config_path is None:
+        return None
+    probe = _build_probe_shell(env)
+    srun_cmd = (
+        f"srun --partition={env.slurm_partition} "
+        f"--nodelist={hostname} "
+        "--ntasks=1 --cpus-per-task=1 --time=00:01:00 "
+        "--quiet "
+        f"sh -c {_shell_quote(probe)}"
+    )
+    rc = subprocess.run(
+        [
+            "ssh",
+            "-F", str(env.ssh_config_path),
+            GATEWAY_HOST_ALIAS,
+            srun_cmd,
+        ],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=120,
+    )
+    if rc.returncode != 0:
+        return None
+    return _parse_probe_output(hostname, rc.stdout.decode())
+
+
+def _shell_quote(s: str) -> str:
+    """POSIX-safe single-quote wrap, mirroring shlex.quote.
+
+    Inlined rather than imported so the helper has no extra import
+    dependency at module top — and shlex.quote's exact behaviour
+    (single-quote everything, escape internal `'` as `'\\''`) is
+    short enough to express directly.
+    """
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _list_worker_node_leaks(
+    env: DispatchEnv, worker_hostnames: list[str]
+) -> list[_WorkerLeak]:
+    """Per-worker drain-and-check loop, mirroring the gateway gate.
+
+    Submits the probe on every worker each iteration; clears the loop
+    when every worker reports empty leaks. Polls for up to
+    ``_TEARDOWN_GRACE_S`` seconds — the wrapper's
+    ``podman unshare rm -rf $RNDTMP`` is the slowest cleanup step,
+    and on slurm-test-env that runs ~5-15s after the SLURM job exits
+    (the watchdog spawns from `setsid -f` so it survives wrapper EXIT
+    by ~5s by design).
+
+    Returns the list of non-empty ``_WorkerLeak`` snapshots from the
+    final iteration. Empty list means clean.
+    """
+    if env.ssh_config_path is None or not worker_hostnames:
+        return []
+    deadline = time.monotonic() + _TEARDOWN_GRACE_S
+    last: list[_WorkerLeak] = []
+    while True:
+        last = []
+        for hostname in worker_hostnames:
+            probe = _run_probe_on_worker(env, hostname)
+            if probe is None:
+                # Treat probe failure as "no signal this round". A
+                # transient srun outage shouldn't false-positive the
+                # gate; the next poll iteration retries. If every
+                # iteration's probe fails we simply return [] which
+                # is the same contract _list_user_jobs_on_gateway
+                # follows on `squeue` failure.
+                continue
+            if not probe.is_empty():
+                last.append(probe)
+        if not last:
+            return []
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(_TEARDOWN_POLL_S)
+
+
+def _force_cleanup_worker_leaks(
+    env: DispatchEnv, leaks: list[_WorkerLeak]
+) -> None:
+    """Symmetric with ``_scancel_user_jobs_on_gateway``: kill leaks
+    so the next scenario isn't poisoned.
+
+    Per-worker srun that runs:
+      - ``podman rm -f <id>...``  for each leaked container id
+      - ``kill -KILL <pid>...``   for the specific PIDs pgrep matched
+        (NOT a name-pattern pkill — see CLAUDE.md / the task spec's
+        "PKILL CAVEAT": match by id-list to avoid touching another
+        operator's processes on shared infrastructure)
+      - ``podman unshare rm -rf -- <tempdir>``  for each leaked
+        tempdir, mirroring the wrapper's own cleanup primitive
+        (rootless podman writes subuid-mapped files unreachable via
+        plain `rm`; per memory rule against `rm -rf $computed_path`
+        in scripts, the user-namespaced primitive is the right tool).
+    """
+    if env.ssh_config_path is None or not leaks:
+        return
+    for leak in leaks:
+        commands: list[str] = []
+        if leak.container_ids:
+            ids = " ".join(_shell_quote(c) for c in leak.container_ids)
+            commands.append(f"podman rm -f {ids} 2>/dev/null || true")
+        if leak.process_pids:
+            pids = " ".join(_shell_quote(p) for p in leak.process_pids)
+            commands.append(f"kill -KILL {pids} 2>/dev/null || true")
+        for tempdir in leak.tempdirs:
+            quoted = _shell_quote(tempdir)
+            commands.append(
+                f"podman unshare rm -rf -- {quoted} 2>/dev/null "
+                f"|| rm -rf -- {quoted} 2>/dev/null || true"
+            )
+        if not commands:
+            continue
+        cleanup_shell = "; ".join(commands)
+        srun_cmd = (
+            f"srun --partition={env.slurm_partition} "
+            f"--nodelist={leak.hostname} "
+            "--ntasks=1 --cpus-per-task=1 --time=00:01:00 "
+            "--quiet "
+            f"sh -c {_shell_quote(cleanup_shell)}"
+        )
+        subprocess.run(
+            [
+                "ssh",
+                "-F", str(env.ssh_config_path),
+                GATEWAY_HOST_ALIAS,
+                srun_cmd,
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+
+
+def _format_worker_leak_report(
+    scenario_name: str, leaks: list[_WorkerLeak]
+) -> list[str]:
+    """Multi-line FAIL message mirroring the gateway-gate style.
+
+    Returns the lines so the caller can ``print`` them with the same
+    flush cadence as the rest of the driver's output. Includes a
+    pointer to the wrapper script for the operator's "Known issues"
+    starting point.
+    """
+    lines: list[str] = [
+        f"[run_e2e]   FAIL: {scenario_name} — worker-node leak(s) "
+        f"detected after teardown gate. The wrapper script's cleanup "
+        f"trap (or its watchdog fallback) did not finish — see "
+        f"crates/dynrunner-slurm/src/wrapper_script.rs::cleanup()."
+    ]
+    for leak in leaks:
+        lines.append(f"[run_e2e]     {leak.hostname}:")
+        for path in leak.tempdirs:
+            lines.append(f"[run_e2e]       tempdir leaked: {path}")
+        for line in leak.containers:
+            lines.append(f"[run_e2e]       container leaked: {line}")
+        for line in leak.processes:
+            lines.append(f"[run_e2e]       process leaked: {line}")
+    return lines
 
 
 def _ensure_ssh_master_alive(env: DispatchEnv) -> None:
