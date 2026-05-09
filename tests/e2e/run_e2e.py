@@ -817,6 +817,28 @@ def _run_one_scenario(
                 _scancel_user_jobs_on_gateway(env)
                 return (False, False)
 
+            # Second teardown gate: the SLURM-jobs check above is
+            # blind to detached state on the compute node (a job can
+            # finish while leaving a podman container behind via the
+            # conmon-double-fork-escapes-cgroup case). Probe each
+            # worker for leaked tempdirs / containers / processes
+            # the wrapper script was responsible for cleaning up.
+            workers = _discover_worker_hostnames(env)
+            leaks = _list_worker_node_leaks(env, workers)
+            if leaks:
+                for line in _format_worker_leak_report(scenario.name, leaks):
+                    print(line, flush=True)
+                # Force-cleanup so the next scenario starts with a
+                # clean compute-node state. Mirrors the scancel path
+                # of the SLURM-jobs gate.
+                _force_cleanup_worker_leaks(env, leaks)
+                return (False, False)
+            print(
+                f"[run_e2e]   teardown clean: {scenario.name} — "
+                f"{len(workers)} worker node(s) free of framework state",
+                flush=True,
+            )
+
         if ok:
             print(f"[run_e2e]   PASS: {scenario.name}", flush=True)
             return (True, False)
