@@ -79,6 +79,27 @@ def _resolve_source_path(task: Task, source_dir: Path) -> Path:
     return source_dir / p
 
 
+def _maybe_sleep() -> None:
+    """Honor ``DYNRUNNER_E2E_TASK_SLEEP_S`` for distribution scenarios.
+
+    The synthetic per-task work otherwise completes in <50ms, which is
+    too short for the parallel-4-workers scenario: the first-online
+    secondary grabs the entire queue before its peers finish their
+    startup handshake. Setting this env to e.g. 0.5 makes each task
+    take 500ms and forces multi-secondary distribution.
+    """
+    import time
+    raw = os.environ.get("DYNRUNNER_E2E_TASK_SLEEP_S", "")
+    if not raw:
+        return
+    try:
+        secs = float(raw)
+    except ValueError:
+        return
+    if secs > 0:
+        time.sleep(secs)
+
+
 def _produce(task: Task, source_dir: Path) -> WorkerOutput:
     """Read the input, write an output, publish it."""
     payload = task.payload or {}
@@ -87,6 +108,7 @@ def _produce(task: Task, source_dir: Path) -> WorkerOutput:
         raise NonRecoverableError(
             f"produce task has no 'idx' in payload: {payload!r}"
         )
+    _maybe_sleep()
 
     src = _resolve_source_path(task, source_dir)
     try:
@@ -112,6 +134,7 @@ def _produce(task: Task, source_dir: Path) -> WorkerOutput:
 
 def _consume(task: Task, source_dir: Path) -> WorkerOutput:
     """Verify the producer's output published, then write + publish ours."""
+    _maybe_sleep()
     payload = task.payload or {}
     idx = payload.get("idx")
     expected_producer_output = payload.get("expects_output")

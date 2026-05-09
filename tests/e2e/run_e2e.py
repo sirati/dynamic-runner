@@ -281,6 +281,41 @@ def _scancel_user_jobs_on_gateway(env: DispatchEnv) -> None:
     )
 
 
+def _ensure_ssh_master_alive(env: DispatchEnv) -> None:
+    """Re-spawn the Python-managed SSH master if its control socket
+    is gone.
+
+    The SSH master under `DYNRUNNER_SSH_CONTROL_PATH` is supposed to
+    live for the whole run, but empirically OpenSSH 10's master can
+    die mid-run under sustained slurm-test-env load (suspected
+    keepalive miss + MaxSessions contention). Without this guard, the
+    next dispatch's reverse-forward setup silently no-ops and the
+    secondaries hang on `Connection refused`. Called at every
+    scenario-boundary AND per-plan dispatch boundary so a master that
+    died mid-scenario still gets resurrected before the next plan
+    runs.
+    """
+    if env.mode != "slurm" or env.ssh_config_path is None:
+        return
+    cp_str = os.environ.get("DYNRUNNER_SSH_CONTROL_PATH")
+    if cp_str is None:
+        return
+    if Path(cp_str).exists():
+        return
+    print(
+        f"[ssh] master socket missing at {cp_str}; respawning",
+        flush=True,
+    )
+    from ._ssh_state import spawn_ssh_master  # noqa: E402
+    instance_state_dir = env.ssh_config_path.parent
+    new_cp = spawn_ssh_master(
+        instance_state_dir,
+        ssh_config_path=env.ssh_config_path,
+        host_alias=GATEWAY_HOST_ALIAS,
+    )
+    os.environ["DYNRUNNER_SSH_CONTROL_PATH"] = str(new_cp)
+
+
 def _select_scenarios(arg: str) -> list[Scenario]:
     """Resolve the ``--scenario`` CLI argument to a list of scenarios.
 
@@ -335,6 +370,11 @@ def _run_one_scenario(
         plans = scenario.prepare(env, tmp_root)
         results: list[ScenarioResult] = []
         for plan in plans:
+            # Per-plan SSH-master health check. Some scenarios (e.g.
+            # already-done) emit multiple plans; the master can die
+            # between them and the next plan would silently lose its
+            # reverse-forward path.
+            _ensure_ssh_master_alive(env)
             label_suffix = f"-{plan.label}" if plan.label else ""
             log_file = log_dir / f"{scenario.name}{label_suffix}.log"
             plan_timeout = (
@@ -668,6 +708,7 @@ def main() -> int:
     timed_out = False
     try:
         for scenario in scenarios:
+            _ensure_ssh_master_alive(env)
             ok, scenario_timed_out = _run_one_scenario(
                 scenario,
                 env,
