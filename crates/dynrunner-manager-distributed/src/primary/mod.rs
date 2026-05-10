@@ -830,6 +830,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // retry that matches the local manager's behaviour.
         self.run_retry_passes().await?;
 
+        // Drain any TaskComplete / TaskFailed messages that crossed the
+        // wire while the operational loop was winding down but hadn't
+        // been pulled by `transport.recv` yet. Without this, the
+        // accounting below sees pre-drain counts and classifies
+        // successful completions as `stranded`, false-positiving clean
+        // runs into `RunError::ClusterCollapsed`. Bounded by 500ms so
+        // the cost on a fully-quiesced happy-path exit is one
+        // 50ms quiet-window probe; the longer ceiling covers
+        // heavily-pipelined teardowns where a burst of TaskCompletes
+        // is still in flight as the loop exits.
+        self.drain_pending_messages(Duration::from_millis(500)).await?;
+
         // Final accounting: any task in `total_tasks` that is neither
         // in `completed_tasks` nor in `failed_tasks` is *stranded* —
         // the run loop exited (transport closed, all secondaries dead,
