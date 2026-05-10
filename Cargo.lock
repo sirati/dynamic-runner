@@ -259,6 +259,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dynrunner-driver"
+version = "0.4.0"
+dependencies = [
+ "nix",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-test",
+]
+
+[[package]]
 name = "dynrunner-gateway"
 version = "0.4.0"
 dependencies = [
@@ -347,6 +359,7 @@ version = "0.4.0"
 dependencies = [
  "dynrunner-core",
  "dynrunner-discovery",
+ "dynrunner-driver",
  "dynrunner-gateway",
  "dynrunner-manager-distributed",
  "dynrunner-manager-local",
