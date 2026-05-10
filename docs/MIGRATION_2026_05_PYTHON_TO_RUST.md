@@ -137,6 +137,35 @@ The framework's `--gateway` URL host should match the `Host` block alias when th
 
 **Recommended for asm-tokenizer / asm-dataset-nix slurm dispatch:** if you've been carrying `IdentityAgent=none` or other workarounds in your call sites, move them into a per-cluster ssh_config and pass `--ssh-config`. Cleaner and survives any future framework `-o` defaults change.
 
+The framework also pins one SSH directive that you should NOT replicate in your ssh_config because it's load-bearing for master-process leak prevention — see "SSH keepalive — anti-leak floor (18h ServerAlive default)" below.
+
+### SSH keepalive — anti-leak floor (18h ServerAlive default)
+
+The framework's SSH master spawn pins
+`-o ServerAliveInterval=60 -o ServerAliveCountMax=1080`, giving an
+18-hour total timeout (60s × 1080 = 64800s) on unacknowledged
+keepalive probes. This is the one SSH knob the framework chooses
+for you; the others (IdentitiesOnly=yes, IdentityAgent=none,
+StrictHostKeyChecking=no, UserKnownHostsFile=/dev/null) belong
+in your operator-owned ssh_config (see "New CLI flag: `--ssh-config <path>`"
+section above).
+
+The 18h floor prevents orphan masters on truly dead links from
+persisting indefinitely. Concrete scenarios where the floor cleans
+up: gateway host suspend/resume across the master's lifetime,
+network partition that doesn't heal, podman bridge teardown
+(e.g. operator running `nix run slurm-test-env#down` while a
+dispatcher holds an open master), netns deletion. In all these
+cases the master would otherwise persist with a stale control
+socket until the operator manually cleaned up.
+
+The original "master dies ~2 min after handshake" symptom under
+PyO3+Python is being investigated separately; the floor does NOT
+claim to fix that. To use a different keepalive policy (or
+override entirely), pre-spawn the master with whatever
+`ServerAlive*` (or `ControlPersist`) values you want and point
+the framework at it via `DYNRUNNER_SSH_CONTROL_PATH=<socket>`.
+
 ### 5. Path arguments accept `os.PathLike`
 
 `SlurmConfig.root_folder` and `SlurmConfig.prestaged_src_bins_path` (and other path-shaped fields) now accept `pathlib.Path` (or any `os.PathLike`) in addition to `str`. The Rust translator coerces via `str()` at the boundary. No change needed in callers that already pass strings; callers passing `Path` no longer need to wrap in `str(...)` themselves.
@@ -212,7 +241,9 @@ Required: `podman ≥4.0` (where `unshare rm -rf` is reliable). Most modern dist
 
 ## Known issue: SSH master under tokio
 
-The framework's `ssh.rs::connect()` spawns its own SSH master (`ssh -M -N -f -R …`) for the lifetime of a dispatch. Empirically, when `connect()` is driven from a tokio runtime nested inside a Python CLI process (the dispatcher), the master gets terminated ~2 minutes after handshake. Identical command from a plain shell or Python `subprocess.Popen` persists indefinitely.
+> See also: "SSH keepalive — anti-leak floor (18h ServerAlive default)" earlier in the guide. The 18h floor is independent of the 2-min symptom — it caps how long *any* master, framework- or driver-spawned, can hold a dead link.
+
+The framework's `ssh.rs::connect()` spawns its own SSH master (`ssh -M -N -R …`) for the lifetime of a dispatch. Empirically, when `connect()` is driven from a tokio runtime nested inside a Python CLI process (the dispatcher), the master gets terminated ~2 minutes after handshake. Identical command from a plain shell or Python `subprocess.Popen` persists indefinitely.
 
 We have not fully diagnosed the root cause (suspect: tokio's process supervision interaction with OpenSSH 10's daemonisation). Multiple workarounds attempted (setsid in `pre_exec`, double-fork, util-linux `setsid -f`, capturing `Child` to prevent reaping) did not stabilize the master under the tokio path.
 
