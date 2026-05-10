@@ -148,12 +148,22 @@ pub(crate) fn run_local<'py>(
 
 /// Run the network-based primary coordinator. Spawns secondaries via the
 /// `spawn_secondary` callback (called once per `config.num_secondaries`).
+///
+/// `source_dir` (optional) is the local source-tree root the primary
+/// reads file contents from for the initial staging walk. Threaded
+/// to `RustPrimaryCoordinator.__init__(source_dir=...)` so the
+/// inner coordinator's config has the root needed for the content-
+/// hash + per-secondary fan-out without each caller re-implementing
+/// the staging orchestration. `None` is the right default for pre-
+/// staged-source mode, `uses_file_based_items=False`, and remote-
+/// only primaries.
 #[pyfunction]
 #[pyo3(signature = (
     config,
     task_definition,
     spawn_secondary,
     binaries,
+    source_dir = None,
 ))]
 pub(crate) fn run_primary<'py>(
     py: Python<'py>,
@@ -161,9 +171,13 @@ pub(crate) fn run_primary<'py>(
     task_definition: &Bound<'py, PyAny>,
     spawn_secondary: Py<PyAny>,
     binaries: &Bound<'py, PyList>,
+    source_dir: Option<std::path::PathBuf>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
+    if let Some(sd) = source_dir.as_ref() {
+        kwargs.set_item("source_dir", sd)?;
+    }
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;
     let args = (

@@ -460,6 +460,7 @@ mod tests {
             // exercise the mass-death path build their own config.
             mass_death_grace: Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         }
     }
 
