@@ -286,18 +286,45 @@ where
     /// window expires naturally.
     backpressured_secondaries: HashMap<String, Instant>,
 
-    /// Set by handlers that detect an unrecoverable local fault (peer
-    /// mesh fully failed to form, etc.). The main `process_tasks`
-    /// loop checks this once per iteration AFTER the deferred-message
-    /// flush; if `Some`, the loop returns `Err(reason)` and the
-    /// secondary's `run()` propagates that out so the process exits
-    /// non-zero.
+    /// Set by handlers that detect an unrecoverable local fault.
+    /// The main `process_tasks` loop checks this once per iteration
+    /// AFTER the deferred-message flush; if `Some`, the loop returns
+    /// `Err(reason)` and the secondary's `run()` propagates that out
+    /// so the process exits non-zero.
     ///
-    /// One-concern wiring: handlers (e.g. the peer-mesh watchdog)
-    /// only WRITE this; the main loop only READS. Avoids `break`
-    /// from inside a sub-handler — every flag-setter stays cancel-
-    /// safe and the loop owns its own exit condition.
+    /// One-concern wiring: handlers only WRITE this; the main loop
+    /// only READS. Avoids `break` from inside a sub-handler — every
+    /// flag-setter stays cancel-safe and the loop owns its own exit
+    /// condition.
     pub(super) fatal_exit: Option<String>,
+
+    /// "Peer mesh did not form" sentinel. Set true by
+    /// `check_peer_mesh_watchdog` when the 30s deadline elapses with
+    /// zero connected peers. The watchdog used to make this fatal,
+    /// stranding every remaining task in the run; the failure is now
+    /// a degraded state instead — task dispatch over WSS still works,
+    /// only the peer-mesh-dependent paths (failover election, peer
+    /// keepalive broadcasts) fail-loud-or-skip on this flag.
+    ///
+    /// Read by:
+    ///   - the failover election entry in `run_election_tick`: a
+    ///     primary-silent transition without a quorum-capable peer
+    ///     mesh sets `fatal_exit` (degraded run can't elect a new
+    ///     primary, so the only safe move is to bail clearly instead
+    ///     of self-promoting solo).
+    ///   - the inter-secondary keepalive paths
+    ///     (`send_keepalive`'s broadcast, `check_peer_timeouts`):
+    ///     skip the cycle. With zero peers these are no-ops anyway,
+    ///     but the explicit guard documents the contract and avoids
+    ///     a surprise the day a future peer-transport variant
+    ///     buffers messages even when nothing is connected.
+    ///
+    /// Distinct from `peer_mesh_check_at`: the watchdog field tracks
+    /// the in-flight deadline (cleared when mesh forms OR watchdog
+    /// fires). `peer_mesh_degraded` is the post-fire latch that
+    /// callers consult to decide whether peer-mesh-dependent
+    /// behaviour is available.
+    pub(super) peer_mesh_degraded: bool,
 
     /// Replicated mirror of the cluster ledger. Maintained by applying
     /// every `DistributedMessage::ClusterMutation` the primary
@@ -360,6 +387,7 @@ where
             pre_staged_mode: false,
             uses_file_based_items: true,
             fatal_exit: None,
+            peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
         }
     }
