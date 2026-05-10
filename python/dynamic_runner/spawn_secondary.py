@@ -35,6 +35,16 @@ def build_subprocess_spawn(
     secondary_module, --secondary URL, --secondary-id ID,
     --secondary-quic-port PORT])``. It propagates ``--raw-logs`` from
     the primary's argv when set.
+
+    ``--src-network`` is auto-threaded to the dispatcher's ``--source``
+    so the spawned secondary can resolve the framework's auto-stage
+    relative paths against the primary's source tree. Without this,
+    every relative ``stage_file`` errors with "src_path is relative
+    but no src_network is configured" because the secondary subprocess
+    defaults ``src_network=None`` outside the SLURM wrapper container.
+    Single-host invariant: in ``--multi-computer local`` mode primary
+    and secondary share the local filesystem, so the primary's
+    ``source_dir`` IS the secondary's ``src_network``.
     """
 
     def spawn_secondary(primary_url: str, secondary_id: str, quic_port: int) -> subprocess.Popen:
@@ -42,6 +52,9 @@ def build_subprocess_spawn(
         cmd += ["--secondary", primary_url]
         cmd += ["--secondary-id", secondary_id]
         cmd += ["--secondary-quic-port", str(quic_port)]
+        source = getattr(args, "source", None)
+        if source:
+            cmd += ["--src-network", str(source)]
         if getattr(args, "raw_logs", False):
             cmd.append("--raw-logs")
         return subprocess.Popen(cmd)
