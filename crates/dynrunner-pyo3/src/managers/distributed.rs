@@ -5,7 +5,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_core::{PhaseId, ResourceKind, ResourceMap, TypeId};
-use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
+use dynrunner_manager_distributed::{
+    PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
+};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
 
@@ -38,6 +40,12 @@ pub(crate) struct PyDistributedManager {
     estimator: PyMemoryEstimatorBridge,
     completed: u32,
     failed: u32,
+    /// Tasks that exited the inner run loop without a recorded
+    /// outcome (`total - completed - failed`). Mirrors the same
+    /// counter on `PyPrimaryCoordinator`; surfaced via the `stranded`
+    /// PyO3 getter so the Python in-process distributed entrypoint
+    /// can include it in the result dict.
+    stranded: u32,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B). The
     /// distributed in-process pipeline drives a primary; secondaries
@@ -114,6 +122,7 @@ impl PyDistributedManager {
             estimator: task.estimator,
             completed: 0,
             failed: 0,
+            stranded: 0,
             task_definition: task_definition.clone().unbind(),
         })
     }
@@ -192,6 +201,13 @@ impl PyDistributedManager {
 
         let mut completed = 0u32;
         let mut failed = 0u32;
+        let mut stranded = 0u32;
+        // Cluster-collapsed signal carried out of the detached tokio
+        // runtime — see `PyPrimaryCoordinator::run` for the full
+        // rationale; the in-process distributed manager mirrors the
+        // same translation so a collapse here surfaces as a
+        // `RuntimeError` to the Python caller of `run_distributed`.
+        let mut cluster_collapsed: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -383,9 +399,13 @@ impl PyDistributedManager {
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary failed");
                 }
+                if let Err(RunError::ClusterCollapsed { .. }) = &result {
+                    cluster_collapsed = result.err();
+                }
 
                 completed = primary.completed_count() as u32;
                 failed = primary.failed_count() as u32;
+                stranded = primary.stranded_count() as u32;
 
                 // Drop primary to close channels, allowing secondaries to exit
                 drop(primary);
@@ -409,6 +429,11 @@ impl PyDistributedManager {
 
         self.completed = completed;
         self.failed = failed;
+        self.stranded = stranded;
+
+        if let Some(err) = cluster_collapsed {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
 
         Ok(())
     }
@@ -421,6 +446,13 @@ impl PyDistributedManager {
     #[getter]
     fn failed(&self) -> u32 {
         self.failed
+    }
+
+    /// Tasks left without a recorded outcome at the end of the run
+    /// (`total - completed - failed`). Mirrors `RustPrimaryCoordinator.stranded`.
+    #[getter]
+    fn stranded(&self) -> u32 {
+        self.stranded
     }
 }
 
