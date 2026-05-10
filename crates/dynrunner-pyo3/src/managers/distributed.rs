@@ -354,45 +354,25 @@ impl PyDistributedManager {
                     estimator,
                 );
 
-                // Queue initial staging entries before the operational
-                // loop starts. Mirrors the SLURM pipeline's pre-`run()`
-                // `queue_initial_staging` call (slurm/pipeline.rs) and
-                // the gate semantics there: pre-staged-source mode is
-                // not reachable in this pipeline (the in-process
-                // distributed manager hard-codes
-                // `source_pre_staged_root: None` above), so the only
-                // skip condition is the `uses_file_based_items=False`
-                // opt-out for non-file-backed task items.
-                //
-                // Without this call, `pending_stage_files` stays empty,
-                // every secondary's `InitialAssignment.staged_files`
-                // arrives empty, every TaskAssignment's `local_path`
-                // resolves to nothing on the secondary, and dispatch's
-                // `report_unresolvable_task` fails every task with
-                // "expected StageFile notification first".
-                if uses_file_based_items {
-                    // Secondary IDs the in-process distributed
-                    // manager spawns under (`sec-{i}` per the
-                    // `sec_log_dirs` loop above); the staging walk
-                    // is naming-convention-agnostic but the SLURM/
-                    // network primary uses `secondary-{i}` instead,
-                    // so the IDs are explicit at every call site
-                    // rather than baked into the walk.
-                    let secondary_ids: Vec<String> = (0..num_secondaries)
-                        .map(|i| format!("sec-{i}"))
-                        .collect();
-                    if let Err(e) = primary.queue_initial_staging_from_binaries(
-                        &rust_binaries,
-                        &secondary_ids,
-                        &source_dir,
-                    ) {
-                        tracing::error!(
-                            error = %e,
-                            "queue_initial_staging_from_binaries failed; aborting run"
-                        );
-                        return;
-                    }
-                }
+                // Initial staging is now driven by
+                // `PrimaryCoordinator::run` itself: with
+                // `PrimaryConfig.source_dir = Some(source_dir)`
+                // threaded above, the manager's auto-stage gate
+                // (`pending_stage_files.is_empty()` &&
+                // `uses_file_based_items` && pre-staged-mode off
+                // && source_dir is Some) walks `binaries ×
+                // secondary_ids` once secondaries have welcomed
+                // and queues the entries before initial
+                // assignment. Removes the previous explicit pre-
+                // call here in favour of a single source of truth
+                // at the manager boundary; consistent with the
+                // network-primary path, which also relies on the
+                // auto-stage. The SLURM pipeline retains its
+                // explicit `queue_initial_staging` because that
+                // caller's source-root resolution depends on
+                // `--source-already-staged` and other flags
+                // unique to it; the gate detects the non-empty
+                // queue and skips.
 
                 // phase_deps + lifecycle closures captured from the
                 // outer scope (5A built phase_deps; 5B built the
