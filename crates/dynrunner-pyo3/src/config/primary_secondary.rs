@@ -272,6 +272,12 @@ impl PySecondaryConfig {
             peer_timeout: self.distributed_config.peer_timeout(),
             keepalive_miss_threshold: self.distributed_config.keepalive_miss_threshold(),
             retry_max_passes: self.distributed_config.retry_max_passes(),
+            primary_link_failure_threshold: self
+                .distributed_config
+                .primary_link_failure_threshold(),
+            primary_link_failure_window: self
+                .distributed_config
+                .primary_link_failure_window(),
         }
     }
 }

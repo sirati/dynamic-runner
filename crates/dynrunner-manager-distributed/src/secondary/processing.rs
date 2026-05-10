@@ -74,41 +74,42 @@ where
                             self.dispatch_message(m).await?;
                         }
                         None => {
-                            // Primary's transport closed. Two
-                            // distinct cases:
+                            // Primary's transport returned None — the
+                            // bridge writer or reader task exited. Two
+                            // structural cases live here:
                             //
                             // 1. Single-secondary / no-peer-mesh
-                            //    runs (the test fixture drops
-                            //    primary explicitly to signal
-                            //    shutdown; production single-jobs
-                            //    runs do the same when the local
-                            //    primary's run() returns). There's
-                            //    no failover candidate, so exit
-                            //    cleanly to preserve the historical
-                            //    "primary close = end of run"
-                            //    contract.
+                            //    runs (the test fixture drops primary
+                            //    explicitly to signal shutdown;
+                            //    production single-jobs runs do the
+                            //    same when the local primary's run()
+                            //    returns). There's no failover
+                            //    candidate, so exit cleanly to
+                            //    preserve the historical "primary
+                            //    close = end of run" contract.
                             //
                             // 2. Multi-secondary failover. The peer
-                            //    mesh is alive, an election can
-                            //    pick a primary, and dispatch
-                            //    can keep flowing. Backdating
-                            //    `primary_last_seen` past the miss
-                            //    threshold makes the next keepalive
-                            //    tick's `run_election_tick` enter
-                            //    Suspecting immediately. The
-                            //    `primary_disconnected` guard above
-                            //    suppresses this arm on subsequent
-                            //    iterations so the persistently-None
-                            //    recv future doesn't hot-loop.
+                            //    mesh is alive, an election can pick
+                            //    a primary, and dispatch can keep
+                            //    flowing.
                             //
-                            // Pre-fix this arm bare-broke the loop
-                            // for both cases and the secondary
-                            // exited cleanly with completed=0 the
-                            // moment the local primary's transport
-                            // closed — losing every task the
-                            // primary peer was about to
-                            // dispatch. Dataset peer reported this
-                            // on the dev-box-primary scenario.
+                            // Pre-R1 case 2 fired the failover-arm
+                            // logic IMMEDIATELY on the first recv-None
+                            // event: a single dropped TCP packet that
+                            // killed the WSS bridge writer would have
+                            // armed an election even though the primary
+                            // was perfectly alive (just briefly
+                            // unreachable). R1 introduces a primary-link
+                            // health sub-state in `primary_link.rs`
+                            // that requires N=5 probes OR 30s of sustained
+                            // failure before arming — so a one-off
+                            // glitch is benign, but a sustained outage
+                            // still arms within a bounded window. The
+                            // architectural invariant "transport-level
+                            // mesh state is independent of the
+                            // primary-vs-secondary role" is preserved:
+                            // recording a probe doesn't mutate the peer
+                            // mesh in any way.
                             let peers = self.peer_transport.peer_count();
 
                             // primary path: once this secondary has
@@ -118,38 +119,14 @@ where
                             // pool authoritatively (per the post-demotion
                             // contract: `lifecycle.rs` demotes the local
                             // primary on `PromotePrimary`, after which the
-                            // local side is purely advisory). Two failure
-                            // modes the framework hit before this guard:
-                            //   1. `peers == 0` branch: tokenizer's cohort-5
-                            //      run exited with `completed=19/216` when
-                            //      the local primary went silent ~30min in
-                            //      — the legacy `pending_local` heuristic
-                            //      conditioned termination on WORK STATE
-                            //      (primary_in_flight / active_tasks /
-                            //      primary_pending) instead of ROLE STATE
-                            //      and went wrong when those were
-                            //      momentarily empty. Fixed in 5f6a267.
-                            //   2. `peers > 0` branch: dataset's K=2 run
-                            //      had sec-0 (the promoted primary)
-                            //      enter "switching to failover detection
-                            //      (election will run via peer mesh ...
-                            //      once a peer is promoted)" — i.e. it
-                            //      tried to elect a primary as if it
-                            //      weren't already the elected one. ~3min
-                            //      later sec-0 itself died with "transport
-                            //      writer task exited" (likely from the
-                            //      bogus self-election state churn) and
-                            //      cascaded its peers into bail. Fixed
-                            //      here, in this commit.
+                            // local side is purely advisory).
                             //
                             // Pull the `is_primary` check OUT of the
-                            // peer-count branches so BOTH cases benefit:
-                            // a promoted secondary should never re-enter
-                            // election just because its bootstrap-time
-                            // primary went away. Termination is owned by
-                            // the natural terminal conditions
-                            // (total-tasks / fleet-dead-analogue), NOT by
-                            // the local primary's transport state.
+                            // threshold path so a promoted secondary
+                            // skips it entirely — it has no use for
+                            // failover and termination is owned by the
+                            // pool-drained checks elsewhere in the
+                            // loop.
                             if self.is_primary {
                                 tracing::info!(
                                     connected_peers = peers,
@@ -162,11 +139,6 @@ where
                                      election needed; this node IS the promoted primary)"
                                 );
                                 self.primary_disconnected = true;
-                                // Don't break: keep iterating so worker
-                                // events and any reconnecting peers land.
-                                // Termination is owned by the pool-drained
-                                // / total-tasks checks elsewhere in the
-                                // loop.
                                 continue;
                             }
 
@@ -177,19 +149,52 @@ where
                                 );
                                 break;
                             }
-                            tracing::warn!(
-                                connected_peers = peers,
-                                "primary transport closed; switching to failover detection \
-                                 (election will run via peer mesh; further dispatch routes \
-                                 through primary_link.current_primary() once a peer is promoted)"
-                            );
+
+                            // Multi-secondary case: feed one probe
+                            // into the primary-link health sub-state.
+                            // It records the first-failure timestamp,
+                            // bumps the counter, and tells us whether
+                            // the threshold has breached. If yes, we
+                            // arm failover here (existing path:
+                            // backdate `primary_last_seen` so the
+                            // next keepalive tick's election fires).
+                            // If no, we just gate the recv arm so the
+                            // persistently-None future doesn't
+                            // hot-loop on the dead bridge — the
+                            // keepalive-tick path below will check
+                            // `should_arm_failover` again on the time
+                            // axis once the window elapses.
+                            let armed_now = self.primary_link.record_recv_failure();
                             self.primary_disconnected = true;
-                            let backdate = self
-                                .config
-                                .keepalive_interval
-                                .saturating_mul(self.config.keepalive_miss_threshold + 1);
-                            self.primary_last_seen =
-                                Some(Instant::now().checked_sub(backdate).unwrap_or_else(Instant::now));
+                            if armed_now {
+                                tracing::warn!(
+                                    connected_peers = peers,
+                                    "primary transport closed (threshold breached); \
+                                     switching to failover detection (election will run \
+                                     via peer mesh; further dispatch routes through \
+                                     primary_link.current_primary() once a peer is promoted)"
+                                );
+                                let backdate = self
+                                    .config
+                                    .keepalive_interval
+                                    .saturating_mul(self.config.keepalive_miss_threshold + 1);
+                                self.primary_last_seen = Some(
+                                    Instant::now()
+                                        .checked_sub(backdate)
+                                        .unwrap_or_else(Instant::now),
+                                );
+                            } else {
+                                tracing::info!(
+                                    connected_peers = peers,
+                                    "primary transport recv returned None; recording \
+                                     probe (failover threshold not yet breached, holding \
+                                     election)"
+                                );
+                                // Don't backdate yet — the keepalive
+                                // tick will re-check `should_arm_failover`
+                                // on each iteration and arm once the
+                                // time window elapses.
+                            }
                         }
                     }
                 }
@@ -202,6 +207,16 @@ where
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
                     self.check_peer_mesh_watchdog().await;
+                    // R1 time-axis arming: once a recv-None has been
+                    // recorded, the count-axis trigger may not fire
+                    // (e.g. recv was gated immediately so no further
+                    // probes accrue, or the recv future stays
+                    // pending). The time-axis half of the threshold
+                    // catches that case: every tick, ask the
+                    // primary-link health sub-state whether the
+                    // failure window has elapsed. If yes, arm
+                    // failover the same way the recv-arm path does.
+                    self.check_primary_link_threshold();
                     // primary retry pass. When this node is
                     // acting as primary and the main pass has
                     // drained with Recoverable failures still
@@ -353,6 +368,69 @@ where
         }
 
         Ok(())
+    }
+
+    /// Tick-driven re-check of the primary-link failover threshold.
+    /// Called once per keepalive tick from `process_tasks`. The
+    /// recv-None branch only triggers on a NEW recv-None event;
+    /// since the bridge architecture turns the recv future permanently
+    /// pending after a single None, a single dropped-bridge event would
+    /// otherwise never re-evaluate the time axis. This method bridges
+    /// the gap by polling `primary_link.should_arm_failover()` on
+    /// every tick and arming once the time window elapses.
+    ///
+    /// Idempotent: harmless when the link is healthy (the predicate
+    /// short-circuits on `first_failure_at.is_none()`), and harmless
+    /// when failover is already armed (`primary_disconnected` short-
+    /// circuits the body so we don't re-backdate `primary_last_seen`).
+    /// `is_primary` short-circuits as well — a promoted secondary has
+    /// no use for failover.
+    pub(super) fn check_primary_link_threshold(&mut self) {
+        if self.is_primary {
+            return;
+        }
+        if !self.primary_link.is_link_failing() {
+            return;
+        }
+        if !self.primary_link.should_arm_failover() {
+            return;
+        }
+        // Already-armed: nothing to do — election is in flight.
+        // We still want to gate the recv arm if it hasn't been
+        // gated yet (first iteration of the time-elapsed branch
+        // before any recv-None observation).
+        if self.primary_disconnected {
+            return;
+        }
+        let peers = self.peer_transport.peer_count();
+        if peers == 0 {
+            // The recv-arm None branch handles the no-mesh case via
+            // `break`; we shouldn't be reachable here without at
+            // least one peer (since the time-axis arming requires
+            // a prior recv-None which would have taken the no-peer
+            // exit). Defensive: exit cleanly if we somehow are.
+            tracing::info!(
+                "primary-link threshold breached and no peer mesh; \
+                 deferring exit to natural termination path"
+            );
+            self.primary_disconnected = true;
+            return;
+        }
+        tracing::warn!(
+            connected_peers = peers,
+            "primary-link failure-window elapsed; arming failover \
+             (election will run via peer mesh)"
+        );
+        self.primary_disconnected = true;
+        let backdate = self
+            .config
+            .keepalive_interval
+            .saturating_mul(self.config.keepalive_miss_threshold + 1);
+        self.primary_last_seen = Some(
+            Instant::now()
+                .checked_sub(backdate)
+                .unwrap_or_else(Instant::now),
+        );
     }
 
     /// Send keepalive to the current primary and broadcast to peers.

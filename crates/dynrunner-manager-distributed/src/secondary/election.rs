@@ -97,6 +97,15 @@ where
     /// back to None.
     pub(super) fn record_primary_message(&mut self) {
         self.primary_last_seen = Some(Instant::now());
+        // Reset the primary-link health sub-state. A real message
+        // arriving on the (possibly-reconnected) transport proves
+        // the link is alive again, so any failure-window we'd been
+        // tracking should be discarded. Pre-fix the failover
+        // arming kept counting probes against a stale window even
+        // after a brief flap recovered, so the second flap would
+        // arm faster than the first — confusing semantics. The
+        // reset closes that loop. Idempotent on a healthy link.
+        self.primary_link.record_recv_success();
         // Cancel a failover election in progress: a primary message
         // proves the original primary is still reachable so the
         // election was a false alarm. The transitional routing target
