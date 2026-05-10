@@ -190,6 +190,27 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 break;
             }
 
+            // Replicated-ledger run-complete signal. The promoted
+            // primary broadcasts `ClusterMutation::RunComplete` as the
+            // last act before its own `run()` returns; `handle_cluster_mutation`
+            // applies it to our `cluster_state` mirror. For the demoted
+            // local primary this is the load-bearing exit cue: the
+            // counter-based check above only trips when every per-task
+            // outcome reaches `completed_tasks` / `failed_tasks`, and
+            // post-promotion cross-secondary completions can miss that
+            // path entirely (the new primary's pool dispatched a
+            // task on a peer; the peer's TaskComplete reaches the new
+            // primary's pool, never the demoted primary's local
+            // accounting). Without this exit, the demoted primary's
+            // tokio runtime never decides "done" and the local-primary
+            // process sits forever — asm-dataset-nix R2 / T3 1200s
+            // hang. Sticky monotonic flag, so this fires at most once
+            // per run.
+            if self.cluster_state.run_complete() && active_workers == 0 {
+                tracing::info!("RunComplete signal received from cluster; exiting");
+                break;
+            }
+
             // Fleet-dead detection. When every secondary has been
             // declared dead (via `requeue_dead_secondary`) and the
             // pool still has pending work, the loop would otherwise
