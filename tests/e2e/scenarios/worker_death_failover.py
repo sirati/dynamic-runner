@@ -53,6 +53,17 @@ heuristic — bump if we observe the kill landing too early on a
 slow-starting cluster.
 """
 
+# Failover requires at least one surviving secondary after the kill.
+# Below this threshold the scenario's premise (kill one of N>=2 and
+# observe N-1 absorb the load) collapses: at N=1 the kill leaves zero
+# survivors and the dispatch necessarily fails. Both run_hook and
+# assert_outputs short-circuit when env.workers is below this so the
+# matrix's N=1 cell still validates the basic outputs contract without
+# the cross-worker premise. Self-contained inside the scenario module —
+# the matrix driver does not need to know which scenarios degenerate
+# at low N.
+_MIN_FAILOVER_WORKERS = 2
+
 
 class WorkerDeathFailoverScenario(Scenario):
     name = "worker-death-failover"
@@ -79,6 +90,18 @@ class WorkerDeathFailoverScenario(Scenario):
         self, env: DispatchEnv, plan: ScenarioPlan, dispatch_pid: int
     ) -> None:
         del plan, dispatch_pid
+
+        if env.workers < _MIN_FAILOVER_WORKERS:
+            # No survivor would remain after the kill — skip the kill
+            # so the dispatch can complete normally. assert_outputs
+            # mirrors this and validates outputs only.
+            print(
+                f"[worker-death-failover] env.workers={env.workers} "
+                f"< {_MIN_FAILOVER_WORKERS}; kill skipped (premise "
+                "not testable)",
+                flush=True,
+            )
+            return
 
         def kill_one() -> None:
             time.sleep(_KILL_DELAY_S)
@@ -113,16 +136,23 @@ class WorkerDeathFailoverScenario(Scenario):
     def assert_outputs(
         self, env: DispatchEnv, results: list[ScenarioResult]
     ) -> tuple[bool, list[str]]:
-        del env
         result = results[0]
         if result.exit_code != 0:
-            return (
-                False,
-                [
+            # Diagnostic differs by premise: at sub-threshold N the
+            # kill was skipped (see run_hook), so a non-zero rc is
+            # a generic framework failure — not a failover regression.
+            if env.workers < _MIN_FAILOVER_WORKERS:
+                msg = (
+                    f"dispatch exited non-zero (rc={result.exit_code}) "
+                    f"at env.workers={env.workers} (kill skipped) — "
+                    "generic framework failure, not failover"
+                )
+            else:
+                msg = (
                     f"dispatch exited non-zero (rc={result.exit_code}) — "
                     "framework didn't recover from worker death"
-                ],
-            )
+                )
+            return (False, [msg])
         return assert_files_present(
             result.plan.paths.publish_dst,
             expected_canonical_outputs(_NUM_TASKS_PER_PHASE),
