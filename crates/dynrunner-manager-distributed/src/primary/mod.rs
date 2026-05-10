@@ -168,6 +168,19 @@ pub struct PrimaryConfig {
     /// connected secondaries always falls through to the standard
     /// per-secondary requeue path. Default `2`.
     pub mass_death_min_count: u32,
+
+    /// Local source-tree root the primary uses to read file
+    /// contents for the initial staging walk (content-hash + per-
+    /// secondary StageFile fan-out). Threaded by every pyo3-side
+    /// caller that has it (SLURM pipeline, in-process distributed
+    /// manager, network primary with local secondaries) so a
+    /// single field tells the manager whether it can read source
+    /// files from the primary's filesystem. `None` for callers
+    /// that don't (pre-staged-source mode bind-mounts the source
+    /// into each secondary; `uses_file_based_items=false` makes
+    /// `local_path` opaque; tests with absolute on-disk paths and
+    /// fake workers that never open them).
+    pub source_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for PrimaryConfig {
@@ -187,6 +200,7 @@ impl Default for PrimaryConfig {
             mesh_ready_timeout: Duration::from_secs(60),
             mass_death_grace: Duration::from_secs(60),
             mass_death_min_count: 2,
+            source_dir: None,
         }
     }
 }

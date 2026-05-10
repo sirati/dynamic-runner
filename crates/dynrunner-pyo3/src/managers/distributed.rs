@@ -334,6 +334,17 @@ impl PyDistributedManager {
                     mesh_ready_timeout: std::time::Duration::from_secs(60),
                     mass_death_grace: dist_mass_death_grace,
                     mass_death_min_count: dist_mass_death_min_count,
+                    // Threaded into PrimaryConfig so the manager's
+                    // run() has the local source root needed for the
+                    // initial staging walk's content-hash + per-
+                    // secondary fan-out. The explicit
+                    // `queue_initial_staging_from_binaries` call
+                    // below pre-populates the queue today; threading
+                    // the field uniformly keeps the manager's
+                    // future-direction (auto-stage when no caller
+                    // pre-queues) wired without each caller re-
+                    // implementing the orchestration.
+                    source_dir: Some(source_dir.clone()),
                 };
 
                 let mut primary = PrimaryCoordinator::new(
