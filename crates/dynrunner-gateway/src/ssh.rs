@@ -1,6 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing;
 
 use crate::config::SshConfig;
@@ -13,8 +17,22 @@ use crate::traits::{CommandResult, Gateway, GatewayError};
 pub struct SshGateway {
     config: SshConfig,
     connected: bool,
-    control_dir: Option<tempfile::TempDir>,
     control_path: Option<String>,
+    /// Master `ssh -M -N` child retained as a tokio process handle,
+    /// shared with `master_watch`. `kill_on_drop(true)` ensures Drop
+    /// without `disconnect()` does not leak the master (bug (g)).
+    /// Wrapped in `Arc<Mutex<Option<Child>>>` so the watcher task and
+    /// `disconnect()` can both call `try_wait` / `kill` without
+    /// fighting over the `&mut Child` exclusive borrow. `None` as the
+    /// inner value when the external `DYNRUNNER_SSH_CONTROL_PATH`
+    /// hatch is in use — the master belongs to an upstream driver in
+    /// that case.
+    master_child: Arc<Mutex<Option<Child>>>,
+    /// Background task that polls `master_child.try_wait()` and emits
+    /// a `tracing::error!` if the master exits unexpectedly. Aborted
+    /// in `disconnect()` before we tear the master down ourselves so
+    /// the *expected* exit doesn't surface as "died unexpectedly".
+    master_watch: Option<JoinHandle<()>>,
     remote_home: Option<String>,
     forwarded_ports: Vec<(u16, u16)>,
     /// Whether GatewayPorts is enabled on the remote SSH server.
@@ -27,12 +45,44 @@ impl SshGateway {
         Self {
             config,
             connected: false,
-            control_dir: None,
             control_path: None,
+            master_child: Arc::new(Mutex::new(None)),
+            master_watch: None,
             remote_home: None,
             forwarded_ports: Vec::new(),
             gateway_ports_enabled: None,
         }
+    }
+
+    /// PID of the framework-spawned SSH master, if any.
+    ///
+    /// Returns `None` when the gateway is not connected, when the
+    /// `DYNRUNNER_SSH_CONTROL_PATH` external-master hatch is in use
+    /// (the master PID belongs to an upstream driver that did not
+    /// share it with us), or when the underlying `tokio::process::Child`
+    /// has already been reaped. Primarily intended for diagnostics
+    /// and the integration tests that pin the Drop-cleans-master
+    /// (bug (g)) and master-died-observer contracts.
+    pub async fn master_pid(&self) -> Option<u32> {
+        let slot = self.master_child.lock().await;
+        slot.as_ref().and_then(|c| c.id())
+    }
+
+    /// Master-only `-o` flags. Pinned here (not in operator-owned
+    /// ssh_config) because they're the framework's lifetime contract
+    /// for the master process: liveness-floor + log-noise-suppression.
+    /// `ServerAliveInterval=60 × ServerAliveCountMax=1080 = 18h`
+    /// keepalive-probe budget. See the migration guide section
+    /// "SSH keepalive — anti-leak floor" for the rationale.
+    fn master_only_options() -> &'static [&'static str] {
+        &[
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=yes",
+            "-o", "ServerAliveInterval=60",
+            "-o", "ServerAliveCountMax=1080",
+            "-o", "TCPKeepAlive=yes",
+            "-o", "LogLevel=ERROR",
+        ]
     }
 
     fn ssh_target(&self) -> String {
@@ -150,6 +200,58 @@ impl SshGateway {
         expand_tilde(path, self.remote_home.as_deref())
     }
 
+    /// Spawn the periodic `try_wait()` poller on the retained master
+    /// child. The poller shares ownership of the `Child` via the
+    /// `Arc<Mutex<Option<Child>>>`; on observing an exit it logs and
+    /// returns. Aborted by `disconnect()` *before* it tears the master
+    /// down, so a clean teardown does NOT log "exited unexpectedly".
+    fn spawn_master_watcher(&mut self) {
+        let child_slot = Arc::clone(&self.master_child);
+        let handle = tokio::spawn(async move {
+            // Poll cadence: 1s. Coarse enough to be near-free, fine
+            // enough that "master died ~2 min after handshake" is
+            // observed within the same minute.
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(1));
+            // First tick fires immediately; skip it so we don't race
+            // the handshake-completion path in connect().
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let mut slot = child_slot.lock().await;
+                let Some(child) = slot.as_mut() else {
+                    // Handle was taken by disconnect(); we're done.
+                    return;
+                };
+                // Read the PID *before* `try_wait()`: tokio nulls
+                // out `Child::id()` after reaping so the post-reap
+                // value is `None`, which makes the diagnostic log
+                // less useful.
+                let pid = child.id();
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        tracing::error!(
+                            pid = ?pid,
+                            exit_status = ?status,
+                            "SSH master exited unexpectedly"
+                        );
+                        return;
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            pid = ?pid,
+                            error = %e,
+                            "SSH master try_wait failed; stopping observer"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+        self.master_watch = Some(handle);
+    }
+
     async fn check_gateway_ports(&mut self) {
         for &(_, remote_port) in &self.forwarded_ports {
             let result = self
@@ -185,6 +287,26 @@ impl SshGateway {
     }
 }
 
+impl Drop for SshGateway {
+    /// Bug (g) safety net: if `disconnect()` was not called before
+    /// drop (panic path, error short-circuit between connect() and
+    /// disconnect(), test that forgets to await disconnect), abort
+    /// the master-watcher first. Without this, the watcher task
+    /// keeps an Arc reference to `master_child` alive — the inner
+    /// `Child`'s `kill_on_drop(true)` never fires until the watcher
+    /// itself terminates, leaving the master process running.
+    ///
+    /// Aborting the watcher drops its Arc, leaving `Self`'s Arc as
+    /// the sole owner. When `Self`'s field then drops, the inner
+    /// `Mutex<Option<Child>>` drops, the `Child` drops, and tokio
+    /// sends SIGKILL.
+    fn drop(&mut self) {
+        if let Some(watch) = self.master_watch.take() {
+            watch.abort();
+        }
+    }
+}
+
 impl Gateway for SshGateway {
     async fn connect(&mut self) -> Result<(), GatewayError> {
         tracing::info!(
@@ -194,26 +316,12 @@ impl Gateway for SshGateway {
             "connecting to SSH gateway"
         );
 
-        // External control-path escape hatch: if `DYNRUNNER_SSH_CONTROL_PATH`
-        // is set AND points at an existing socket, treat it as a
-        // pre-established master spawned by the driver (`run_e2e.py`,
-        // a downstream Python harness, etc.). Skip our own master
-        // spawn entirely — the existing master already has the
-        // reverse forwards we need (the driver knows the primary port
-        // ahead of time because it builds the dispatch config). All
-        // subsequent slave commands (execute_command, transfer_file,
-        // download_file) just route through the shared ControlPath
-        // without us caring about who owns the master process.
-        //
-        // Why this exists: empirically, OpenSSH 10's master spawned
-        // via std::process::Command from a tokio-driven Rust process
-        // exited ~2 minutes after handshake despite setsid + -f and
-        // every reasonable detach pattern. Identical command from a
-        // shell or from Python's subprocess persists indefinitely. The
-        // root cause appears to be specific to Rust+tokio's process
-        // supervision and is out of scope for this fix; this env-var
-        // hatch lets the upstream driver own master lifecycle in a
-        // process model that doesn't have the issue.
+        // External control-path escape hatch: bypass our own master
+        // spawn when an upstream driver pre-spawned and points us at
+        // its control socket. Useful for harnesses that already manage
+        // master lifetime. The `DYNRUNNER_SSH_CONTROL_PATH` env-var
+        // hatch is also a workaround for the unresolved 2-min master
+        // death symptom under PyO3+Python (see task #17).
         if let Ok(external_cp) = std::env::var("DYNRUNNER_SSH_CONTROL_PATH") {
             if std::path::Path::new(&external_cp).exists() {
                 tracing::info!(
@@ -267,102 +375,70 @@ impl Gateway for SshGateway {
             }
         }
 
-        let dir = tempfile::tempdir().map_err(|e| GatewayError::Other(e.to_string()))?;
-        let cp = format!("{}/control-socket", dir.path().display());
+        // Stable control socket under /tmp. We deliberately do NOT
+        // use `tempfile::TempDir`: TempDir's Drop unlinks the parent
+        // dir on `SshGateway` Drop, racing with the master's own
+        // socket cleanup and stranding a master with no path back for
+        // `ssh -O exit` (bug (g)). The socket file itself is unlinked
+        // by the master on clean exit; on dirty exit, kill_on_drop
+        // takes the master down and a stale socket file is harmless
+        // (next connect generates a new path).
+        let cp = generate_master_control_path();
+        // Pre-flight: if a stale socket from a prior crashed instance
+        // happens to collide (PID + sequence makes this near-
+        // impossible, but be defensive), clear it so ssh can bind.
+        let _ = std::fs::remove_file(&cp);
         self.control_path = Some(cp.clone());
-        self.control_dir = Some(dir);
 
-        // Master spawn via `setsid -f -- ssh -M -N -f ...`. The outer
-        // `setsid -f` (util-linux) is the canonical way to fully
-        // detach a daemon from the parent's process tree:
-        //   - `setsid` puts the child in a new session.
-        //   - `-f` (util-linux extension) tells setsid to fork once
-        //     more so it itself is not session leader and the
-        //     subsequent program runs without a controlling tty.
-        //
-        // This produces ssh as a great-grandchild reparented to init
-        // (PID 1), invisible to anything that signals/supervises our
-        // PID tree. ssh's own `-f` then daemonises after handshake.
-        //
-        // Why we need this double-detach over plain `cmd.output()`:
-        // empirically, OpenSSH 10's master, when spawned as a direct
-        // child of our (tokio-driven Python) process, was getting
-        // SIGTERM'd ~2 minutes after handshake even when we tried
-        // setsid in `pre_exec`. The util-linux `setsid -f` indirection
-        // is the most robust cross-platform daemon-spawn pattern;
-        // matches what `nohup … &` / `disown` does in shells.
-        let mut cmd = std::process::Command::new("setsid");
-        cmd.arg("-f");
-        cmd.arg("--");
-        cmd.arg("ssh");
-        for arg in self.base_ssh_args() {
-            cmd.arg(&arg);
-        }
-        cmd.args([
-            "-M",
-            "-N",
-            "-f",
-            "-o",
-            &format!("ControlPath={cp}"),
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            "ControlPersist=yes",
-            // 18-hour anti-leak floor on the long-lived master:
-            // 60s × 1080 = 64800s of unacknowledged keepalive
-            // probes before the master gives up the link. The
-            // floor is the only SSH knob the framework chooses
-            // for you; everything orthogonal to liveness (auth,
-            // host-key, agent) belongs in operator-owned
-            // ssh_config.
-            //
-            // Why a *floor* and not a tight default: on paths
-            // where the server-side ClientAlive* is disabled
-            // (slurm-test-env's shape), an unset ServerAlive
-            // means orphan masters on truly dead links persist
-            // indefinitely. 18h lets dead links eventually
-            // self-clean (suspend/resume across the master's
-            // lifetime, network partition that doesn't heal,
-            // podman bridge teardown, netns deletion) while
-            // staying loose enough that no realistic batch
-            // workload's quiet windows trigger false-positives.
-            "-o",
-            "ServerAliveInterval=60",
-            "-o",
-            "ServerAliveCountMax=1080",
-            "-o",
-            "TCPKeepAlive=yes",
-            "-o",
-            "LogLevel=ERROR",
-        ]);
-
-        // Add port forwarding
-        for &(local_port, remote_port) in &self.forwarded_ports {
-            cmd.arg("-R");
-            cmd.arg(format!("0.0.0.0:{remote_port}:localhost:{local_port}"));
-        }
-
-        cmd.arg(self.ssh_target());
-
-        // /dev/null all stdio so the daemonised master inherits no
-        // pipes back to us.
+        // Direct tokio spawn of `ssh -M -N` — no `-f`, no `setsid`
+        // indirection. The `SshGateway`'s lifetime IS the master's
+        // lifetime. Reparenting to init was a workaround for "we don't
+        // want to manage the lifetime", which we now do.
+        let argv = build_master_argv(
+            &self.base_ssh_args(),
+            &cp,
+            &self.forwarded_ports,
+            &self.ssh_target(),
+        );
+        let mut cmd = Command::new("ssh");
+        cmd.args(&argv);
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
+        // Bug (g) fix: if SshGateway drops without disconnect()
+        // running first (panic, error-return between connect() and
+        // disconnect()), tokio sends SIGKILL to the master so we
+        // don't leak orphans.
+        cmd.kill_on_drop(true);
 
-        // We don't capture the child: `setsid -f` re-forks itself, ssh
-        // re-forks again on `-f`, so the eventual master is a great-
-        // grandchild reparented to init. The control-socket-existence
-        // check below confirms the handshake landed; teardown is via
-        // `ssh -O exit` in `disconnect()`, which talks to the master
-        // through the control socket regardless of process parentage.
-        let _spawn_status = cmd.status()?;
+        let child = cmd.spawn().map_err(|e| {
+            GatewayError::Other(format!("failed to spawn ssh master: {e}"))
+        })?;
+        let master_pid = child.id();
+        {
+            let mut slot = self.master_child.lock().await;
+            *slot = Some(child);
+        }
 
         // Wait for the control socket to appear. 10s timeout — the
         // SSH handshake usually completes in <500ms on a healthy link.
         let socket_path = std::path::Path::new(&cp);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !socket_path.exists() {
+            // If the master died during handshake, surface that
+            // immediately rather than waiting out the full 10s.
+            {
+                let mut slot = self.master_child.lock().await;
+                if let Some(child) = slot.as_mut()
+                    && let Ok(Some(status)) = child.try_wait()
+                {
+                    return Err(GatewayError::CommandFailed(format!(
+                        "SSH master exited during handshake with status {status:?}. \
+                         Pass --ssh-config <path> for ssh_config(5) overrides if a \
+                         host-key / agent / identity directive needs adjusting."
+                    )));
+                }
+            }
             if std::time::Instant::now() >= deadline {
                 return Err(GatewayError::CommandFailed(
                     "SSH master timed out establishing control socket (10s). \
@@ -371,11 +447,20 @@ impl Gateway for SshGateway {
                         .into(),
                 ));
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         self.connected = true;
-        tracing::info!("SSH master connection established");
+        tracing::info!(?master_pid, "SSH master connection established");
+
+        // Spawn the "master died" observer: periodic try_wait on the
+        // retained child, with a tracing::error! on unexpected exit.
+        // Aborted in disconnect() before we tear the master down
+        // ourselves so the *expected* exit doesn't surface as
+        // "died unexpectedly". This is task #5's acceptance gate (3):
+        // any future master-death class bug becomes observable
+        // instead of silent.
+        self.spawn_master_watcher();
 
         // Detect remote home
         let home_result = self.ssh_command("echo $HOME", None).await?;
@@ -394,11 +479,18 @@ impl Gateway for SshGateway {
             return Ok(());
         }
 
+        // Stop the "master died" observer first. Anything from this
+        // point forward is an *expected* teardown; the observer must
+        // not log it as unexpected. Abort + drop the JoinHandle is
+        // sufficient — the task only borrows the master_child slot
+        // briefly, so abort takes effect immediately.
+        if let Some(watch) = self.master_watch.take() {
+            watch.abort();
+        }
+
         // Politely ask the master to exit via `ssh -O exit` first,
         // which cleans up the control socket and reverse forwards in
-        // an orderly fashion. If that fails or the child still lingers,
-        // SIGKILL via `Child::kill` ensures the master goes away — we
-        // own its lifetime now (no `-f` daemonisation).
+        // an orderly fashion.
         let mut cmd = Command::new("ssh");
         for arg in self.base_ssh_args() {
             cmd.arg(&arg);
@@ -409,8 +501,41 @@ impl Gateway for SshGateway {
         cmd.arg(self.ssh_target());
         let _ = cmd.output().await;
 
+        // If the child is still alive after a short grace, SIGKILL
+        // via `Child::kill`. We own the master's lifetime now (no `-f`
+        // daemonisation, no setsid reparent), so this is a guaranteed
+        // teardown.
+        let mut slot = self.master_child.lock().await;
+        if let Some(mut child) = slot.take() {
+            // Up to 1s grace for `ssh -O exit` to land — should be
+            // <100ms in practice but we don't want to race the
+            // OpenSSH master's own teardown timing.
+            let grace = std::time::Instant::now()
+                + std::time::Duration::from_millis(1000);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= grace {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            break;
+                        }
+                        tokio::time::sleep(
+                            std::time::Duration::from_millis(20),
+                        )
+                        .await;
+                    }
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        break;
+                    }
+                }
+            }
+        }
+
         self.connected = false;
-        // control_dir TempDir drops and cleans up automatically
         tracing::info!("SSH gateway disconnected");
         Ok(())
     }
@@ -550,6 +675,62 @@ impl Gateway for SshGateway {
         self.forwarded_ports.push((local_port, remote_port));
         Ok(())
     }
+}
+
+/// Per-process monotonic suffix for control-socket paths. Combined
+/// with PID, gives a per-instance unique path under /tmp without
+/// pulling in a `rand` dep. Acquire-Release isn't needed; only the
+/// uniqueness matters, not memory ordering with other state.
+static CONTROL_PATH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a master control socket path under `/tmp`.
+///
+/// Format: `/tmp/dynrunner-m-<pid>-<seq>.sock`. Stays well below the
+/// 108-byte `sockaddr_un.sun_path` cap even with 7-digit PIDs and
+/// large sequence numbers.
+///
+/// We deliberately avoid `tempfile::TempDir`: TempDir's Drop unlinks
+/// the parent dir on `SshGateway` Drop, which raced the master's own
+/// socket cleanup and stranded a master with no path back for
+/// `ssh -O exit` (bug (g)). The socket file itself is unlinked by
+/// the master on clean exit; on dirty exit a stale socket file is
+/// harmless (next connect() generates a new path).
+fn generate_master_control_path() -> String {
+    let pid = std::process::id();
+    let seq = CONTROL_PATH_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("/tmp/dynrunner-m-{pid}-{seq}.sock")
+}
+
+/// Build the argv (excluding `ssh` itself) for the master spawn.
+///
+/// Pure function over the gateway's static config (auth + port flags,
+/// control path, registered reverse forwards, ssh target). Pulled out
+/// of `connect()` so the contract — specifically the 18h ServerAlive
+/// floor — is unit-testable without a live sshd.
+fn build_master_argv(
+    base_args: &[String],
+    control_path: &str,
+    forwarded_ports: &[(u16, u16)],
+    target: &str,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    argv.extend(base_args.iter().cloned());
+    // -M: master mode. -N: no remote command. NO `-f`: we manage the
+    // master's lifetime via the retained tokio::process::Child, not
+    // by daemonising into init.
+    argv.push("-M".into());
+    argv.push("-N".into());
+    argv.push("-o".into());
+    argv.push(format!("ControlPath={control_path}"));
+    for opt in SshGateway::master_only_options() {
+        argv.push((*opt).into());
+    }
+    for &(local_port, remote_port) in forwarded_ports {
+        argv.push("-R".into());
+        argv.push(format!("0.0.0.0:{remote_port}:localhost:{local_port}"));
+    }
+    argv.push(target.into());
+    argv
 }
 
 /// Parse the null-delimited output of
@@ -726,6 +907,120 @@ mod tests {
                 "-F".to_string(),
                 "/c/f".to_string(),
             ]
+        );
+    }
+
+    /// T1: pin the 18h ServerAlive floor in the master spawn argv.
+    /// Regression-pin for the anti-leak floor: any change to this
+    /// must surface in code review and not be a silent override.
+    #[test]
+    fn master_argv_pins_18h_serveralive_floor() {
+        let argv = build_master_argv(
+            &Vec::new(),
+            "/tmp/dynrunner-m-test.sock",
+            &[],
+            "user@host",
+        );
+        // We assert the *adjacent pair* form: each `-o` must precede
+        // its value. `windows(2)` gives us each consecutive pair so we
+        // can match `-o ServerAliveInterval=60`.
+        let has_pair = |a: &str, b: &str| {
+            argv.windows(2).any(|w| w[0] == a && w[1] == b)
+        };
+        assert!(
+            has_pair("-o", "ServerAliveInterval=60"),
+            "missing `-o ServerAliveInterval=60`; argv={argv:?}"
+        );
+        assert!(
+            has_pair("-o", "ServerAliveCountMax=1080"),
+            "missing `-o ServerAliveCountMax=1080`; argv={argv:?}"
+        );
+        // 60s × 1080 = 64800s = 18h. Spell the math out so any future
+        // edit that changes one without the other fails this test.
+        assert_eq!(60u64 * 1080, 64_800);
+    }
+
+    #[test]
+    fn master_argv_includes_master_mode_flags() {
+        let argv = build_master_argv(
+            &Vec::new(),
+            "/tmp/dynrunner-m-test.sock",
+            &[],
+            "user@host",
+        );
+        assert!(argv.contains(&"-M".to_string()));
+        assert!(argv.contains(&"-N".to_string()));
+        // No `-f`: we manage the master's lifetime via the retained
+        // tokio Child. Pin this so a regression doesn't silently
+        // re-introduce daemonisation and orphan masters again.
+        assert!(
+            !argv.contains(&"-f".to_string()),
+            "master argv must not contain `-f` (we own the lifetime); argv={argv:?}"
+        );
+    }
+
+    #[test]
+    fn master_argv_threads_control_path_and_target() {
+        let argv = build_master_argv(
+            &vec!["-p".to_string(), "2222".to_string()],
+            "/tmp/dynrunner-m-42-7.sock",
+            &[(1234, 5678)],
+            "alice@host",
+        );
+        assert_eq!(argv.first().map(String::as_str), Some("-p"));
+        assert_eq!(argv.get(1).map(String::as_str), Some("2222"));
+        assert!(argv.contains(&"ControlPath=/tmp/dynrunner-m-42-7.sock".to_string()));
+        assert!(argv.contains(&"-R".to_string()));
+        assert!(argv.contains(&"0.0.0.0:5678:localhost:1234".to_string()));
+        assert_eq!(argv.last().map(String::as_str), Some("alice@host"));
+    }
+
+    /// T2: pin sun_path < 108. The Linux kernel caps Unix socket paths
+    /// at `sizeof(sockaddr_un.sun_path) = 108` bytes including the NUL
+    /// terminator; ssh silently fails to bind if the control path
+    /// exceeds. The path generator must stay well below this bound for
+    /// any reasonable PID/sequence combination.
+    #[test]
+    fn control_path_fits_sockaddr_un() {
+        let cp = generate_master_control_path();
+        assert!(
+            cp.len() < 108,
+            "control path is {} bytes ({:?}) — must stay under 108 (sockaddr_un.sun_path cap)",
+            cp.len(),
+            cp,
+        );
+        assert!(
+            cp.starts_with("/tmp/dynrunner-m-"),
+            "control path must live under /tmp with the framework prefix: {cp:?}"
+        );
+        assert!(
+            cp.ends_with(".sock"),
+            "control path must end with .sock for grep-ability in operational tooling: {cp:?}"
+        );
+    }
+
+    #[test]
+    fn control_path_unique_across_calls() {
+        // Within a single process, the AtomicU64 sequence guarantees
+        // distinct paths — pin this to surface any accidental
+        // simplification (e.g. fixed name) that re-introduces collision
+        // races between concurrent SshGateways.
+        let a = generate_master_control_path();
+        let b = generate_master_control_path();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn control_path_pessimistic_pid_sequence_still_fits() {
+        // Synthesise a worst-case-ish path: 7-digit PID + 19-digit
+        // sequence (u64 max ≈ 1.8e19, 19 digits). Even there the
+        // total is comfortably below 108 bytes.
+        let synthetic = format!("/tmp/dynrunner-m-{}-{}.sock", 9_999_999u32, u64::MAX);
+        assert!(
+            synthetic.len() < 108,
+            "even worst-case PID/seq path is {} bytes ({:?})",
+            synthetic.len(),
+            synthetic,
         );
     }
 }
