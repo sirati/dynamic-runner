@@ -149,17 +149,21 @@ esac
 #
 # `podman exec` runs as root in the gateway container, which has the
 # munge key needed to authenticate to slurmctld locally — no ssh /
-# user-key dance.
+# user-key dance. pexec() (from lib.sh) injects /run/current-system/
+# sw/bin onto PATH so the bare `scontrol` command resolves; without
+# that, podman exec inherits the image's minimal default PATH and
+# scontrol exits with command-not-found.
 if [[ "$target_kind" == worker ]]; then
   printf 'Resuming %s in slurmctld...\n' "$target_hostname"
-  if ! podman exec "$GATEWAY_NAME" \
+  if ! pexec "$GATEWAY_NAME" \
        scontrol update "NodeName=${target_hostname}" State=RESUME; then
     cat >&2 <<EOF
 
 slurmctld notification failed — the worker container is running but
 slurmctld may still mark it DOWN. Once the gateway is reachable:
 
-  podman exec ${GATEWAY_NAME} scontrol update NodeName=${target_hostname} State=RESUME
+  podman exec --env PATH=/run/current-system/sw/bin:/usr/bin:/bin \\
+    ${GATEWAY_NAME} scontrol update NodeName=${target_hostname} State=RESUME
 
 EOF
     exit 1
