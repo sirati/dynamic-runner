@@ -200,27 +200,34 @@ where
     }
 
     /// One-shot watchdog: 30s after `connect_to_peers` fired with a
-    /// non-empty peer list, declare full mesh failure if zero peers
-    /// connected. Self-healing if the mesh forms before the deadline
+    /// non-empty peer list, decide whether the peer mesh formed.
+    /// Self-healing if the mesh forms before the deadline
     /// (`peer_count() > 0` suppresses the fault) or partially forms
     /// after the deadline (any incoming peer connection clears
     /// `peer_mesh_check_at`, no fault).
     ///
-    /// On a confirmed full-mesh failure this is HARD ERROR: the
-    /// framework relies on the peer mesh for failover, post-promotion
-    /// routing, and broadcasts. With zero peers, a promoted
-    /// node wedges in a tokio busy-poll (dataset peer reported 86%
-    /// CPU + 54k epoll_wait/sec on a stuck primary). The
-    /// previous warn-and-continue behaviour silently degraded the
-    /// run instead of failing fast. We now:
-    ///   1. Send a `SecondaryFatalError` to the current primary so
-    ///      it can drop us from the routable set + requeue any
-    ///      in-flight tasks immediately (instead of waiting for the
-    ///      keepalive miss threshold).
-    ///   2. Set `self.fatal_exit` to a human-readable reason. The
-    ///      main loop in `process_tasks` checks this after the
-    ///      select! body and returns `Err(reason)`, so the secondary
-    ///      process exits non-zero.
+    /// On confirmed full-mesh failure (deadline elapsed, zero peers)
+    /// the run enters DEGRADED mode rather than dying:
+    ///   1. `peer_mesh_degraded` is latched true so callers that
+    ///      need the mesh (failover election, peer-broadcast
+    ///      keepalives) can fail loud or skip — the contract is
+    ///      owned by those callers, not by this watchdog.
+    ///   2. `MeshReady` is sent with `peer_count=0` so the primary's
+    ///      `wait_for_mesh_ready` step releases `PromotePrimary` and
+    ///      operational dispatch (over WSS, not the peer mesh) can
+    ///      flow. Without this the whole run blocks on the missing
+    ///      mesh signal.
+    ///   3. `peer_mesh_check_at = None` so the watchdog is one-shot.
+    ///
+    /// Why not fatal? Operational dispatch primary→secondary uses
+    /// WSS, not the QUIC peer mesh. If no failover is ever needed
+    /// the run can complete cleanly even with zero peers. The old
+    /// fatal behaviour (send `SecondaryFatalError`, set
+    /// `fatal_exit`) stranded every remaining task whenever the
+    /// peer mesh genuinely couldn't form — see
+    /// asm-tokenizer's `--jobs 2` regression where 474 of 484 tasks
+    /// were lost ~30s into the run because the watchdog fired even
+    /// though primary→secondary dispatch was healthy.
     ///
     /// `peer_count()` already calls `drain_new_connections` so this
     /// reads the freshest state.
@@ -244,47 +251,25 @@ where
         if std::time::Instant::now() < deadline {
             return;
         }
-        // Latch the watchdog off first so we never re-fire even if
-        // the fatal-error send takes a few ticks to flush.
+        // Latch the watchdog off first so it never re-fires.
         self.peer_mesh_check_at = None;
+        self.peer_mesh_degraded = true;
 
-        let error = format!(
-            "peer mesh fully failed to form: 0 of {} peers reachable; \
-             cluster routing impossible",
-            self.peer_dial_count
-        );
-        tracing::error!(
+        tracing::warn!(
             attempted = self.peer_dial_count,
             connected = 0,
-            "{error}; reporting fatal error to primary and exiting"
+            "peer mesh did not form — failover and inter-secondary \
+             keepalive paths are unavailable; run will continue but \
+             is fragile (tasks dispatched via primary→secondary WSS \
+             still flow)"
         );
-        // Report mesh-ready first (with peer_count=0) so the primary's
-        // `wait_for_mesh_ready` step doesn't deadlock the full timeout
-        // for a secondary we're about to declare dead anyway. The
-        // primary's `SecondaryFatalError` handler will then drop us
-        // from the routable set; the wait step's accounting can be
-        // either-completes (mesh-ready OR fatal removes from waiting
-        // pool). Both paths are idempotent.
+
+        // Report mesh-ready (with peer_count=0) so the primary's
+        // `wait_for_mesh_ready` step releases `PromotePrimary`
+        // instead of blocking the full mesh-ready timeout on a
+        // secondary that will never see peers. Idempotent via
+        // `mesh_ready_sent`.
         self.report_mesh_ready_if_needed().await;
-
-        let fatal = DistributedMessage::<I>::SecondaryFatalError {
-            sender_id: self.config.secondary_id.clone(),
-            timestamp: timestamp_now(),
-            secondary_id: self.config.secondary_id.clone(),
-            error: error.clone(),
-        };
-        // Best-effort: even if the send fails (primary already gone,
-        // transport closed, ...) we still want to exit. Logging the
-        // send-side error is enough — the operator will see both the
-        // fault line above AND the send failure if any.
-        if let Err(e) = self.send_to_current_primary(fatal).await {
-            tracing::warn!(
-                error = %e,
-                "failed to deliver SecondaryFatalError to primary; exiting anyway"
-            );
-        }
-
-        self.fatal_exit = Some(error);
     }
 
     /// Single source of truth for "have we told the primary the
@@ -362,6 +347,17 @@ where
     /// Non-primary peers don't have a primary_in_flight ledger
     /// to recover, so the recovery path is a no-op for them.
     pub(super) fn check_peer_timeouts(&mut self) {
+        // Degraded-mesh skip: with no peer mesh, there's no peer
+        // keepalive to time out and no in-flight peer-targeted work
+        // to recover. The walk below is a no-op against an empty
+        // `peer_keepalives` map anyway — short-circuiting here
+        // documents the contract so a future change that buffers
+        // peer state pre-connection doesn't accidentally make this
+        // matter. See `peer_mesh_degraded` field doc on the
+        // SecondaryCoordinator for the full set of guarded paths.
+        if self.peer_mesh_degraded {
+            return;
+        }
         let now = timestamp_now();
         let timeout_secs = self.config.peer_timeout.as_secs_f64();
         let mut timed_out = Vec::new();

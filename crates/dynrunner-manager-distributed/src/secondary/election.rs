@@ -177,6 +177,36 @@ where
 
         match &self.election {
             ElectionState::Normal if need_election => {
+                // Degraded-mesh failover guard: the election protocol
+                // needs a peer mesh to gather quorum responses
+                // (`TimeoutQuery` / `TimeoutResponse` /
+                // `PromotionVote` / `PromotionConfirm` all flow over
+                // peer_transport). With zero peers, the next
+                // Suspecting tick would self-promote on `quorum=1` —
+                // the same secondary that just lost its only primary
+                // would unilaterally claim authority. That's worse
+                // than failing loud: there's no other surviving
+                // node to coordinate with, so the cluster is
+                // already unsalvageable. Bail with a clear reason
+                // instead of pretending the election succeeded.
+                if self.peer_mesh_degraded {
+                    let reason = format!(
+                        "peer mesh required for failover but not \
+                         available: primary went silent (primary_silent={}, \
+                         primary_peer_silent={}) and no peers connected to \
+                         elect a new primary; exiting",
+                        primary_silent, primary_peer_silent,
+                    );
+                    tracing::error!(
+                        secondary = %self.config.secondary_id,
+                        primary_silent,
+                        primary_peer_silent,
+                        primary_peer = ?self.primary_link.current_primary(),
+                        "{reason}"
+                    );
+                    self.fatal_exit = Some(reason);
+                    return actions;
+                }
                 tracing::warn!(
                     secondary = %self.config.secondary_id,
                     miss_threshold = self.config.keepalive_miss_threshold,
