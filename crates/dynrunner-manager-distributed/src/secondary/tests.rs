@@ -719,6 +719,105 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
     );
 }
 
+/// Watchdog-silent-after-RunComplete: in an in-process distributed
+/// run the secondaries observe `ClusterMutation::RunComplete` from
+/// the primary's broadcast right before teardown, ~30s before their
+/// own peer-mesh deadline would elapse on the next keepalive tick.
+/// Pre-fix the watchdog still fired during clean shutdown, emitting
+/// a misleading "peer mesh did not form" warn and latching
+/// `peer_mesh_degraded`. Post-fix the watchdog short-circuits on
+/// `cluster_state.run_complete()`, disarming itself silently.
+///
+/// The single-source-of-truth read lives inside the watchdog
+/// (`peer.rs::check_peer_mesh_watchdog`) rather than at each
+/// `cluster_state.apply(RunComplete)` site, so the dispatch /
+/// processing call sites don't need to know about peer-mesh policy.
+#[tokio::test(flavor = "current_thread")]
+async fn watchdog_silent_after_run_complete() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (mut secondary, mut sec_to_pri_rx) = arm_watchdog_no_peers("sec-rc", 4);
+
+    // Pre-condition: degraded latch off, no fatal exit, deadline
+    // armed past the elapsed point so the watchdog WOULD fire
+    // without the run-complete short-circuit.
+    assert!(!secondary.peer_mesh_degraded);
+    assert!(secondary.fatal_exit.is_none());
+    assert!(secondary.peer_mesh_check_at.is_some());
+
+    // Simulate the primary's run-complete broadcast landing on the
+    // local cluster mirror — same code path as the production
+    // `dispatch.rs::apply_cluster_mutations` arm.
+    secondary
+        .cluster_state
+        .apply(ClusterMutation::<TestId>::RunComplete);
+
+    secondary.check_peer_mesh_watchdog().await;
+
+    // Post-fire: degraded NOT latched, watchdog disarmed silently,
+    // no `MeshReady` and no `SecondaryFatalError` on the wire.
+    assert!(
+        !secondary.peer_mesh_degraded,
+        "run-complete short-circuit must NOT enter degraded mode"
+    );
+    assert!(secondary.fatal_exit.is_none());
+    assert!(
+        secondary.peer_mesh_check_at.is_none(),
+        "run-complete short-circuit must disarm the watchdog"
+    );
+    assert!(
+        sec_to_pri_rx.try_recv().is_err(),
+        "watchdog must NOT emit messages after run-complete"
+    );
+
+    // Re-tick is also a no-op.
+    secondary.check_peer_mesh_watchdog().await;
+    assert!(sec_to_pri_rx.try_recv().is_err());
+}
+
+/// Counterpart to `watchdog_silent_after_run_complete`: with the
+/// same setup but WITHOUT the `RunComplete` mutation, the watchdog
+/// still fires the #15 graceful-degrade path. Pins that the
+/// run-complete short-circuit doesn't leak past its precondition
+/// (i.e. `cluster_state.run_complete()` flipping is genuinely
+/// required to suppress the fault).
+#[tokio::test(flavor = "current_thread")]
+async fn watchdog_still_fires_pre_run_complete() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let (mut secondary, mut sec_to_pri_rx) = arm_watchdog_no_peers("sec-pre-rc", 4);
+
+    // Sanity: cluster_state has not seen RunComplete.
+    assert!(
+        !secondary.cluster_state.run_complete(),
+        "pre-condition: run is not yet complete"
+    );
+
+    secondary.check_peer_mesh_watchdog().await;
+
+    // #15 contract is preserved: degraded latched, watchdog
+    // disarmed, MeshReady(peer_count=0) emitted to the primary.
+    assert!(
+        secondary.peer_mesh_degraded,
+        "pre-RunComplete watchdog must still enter degraded mode"
+    );
+    assert!(secondary.peer_mesh_check_at.is_none());
+    assert!(secondary.fatal_exit.is_none());
+
+    let mut saw_mesh_ready = false;
+    while let Ok(msg) = sec_to_pri_rx.try_recv() {
+        if let DistributedMessage::MeshReady { peer_count, .. } = msg {
+            assert_eq!(peer_count, 0);
+            saw_mesh_ready = true;
+        }
+    }
+    assert!(
+        saw_mesh_ready,
+        "pre-RunComplete watchdog must still send MeshReady(0)"
+    );
+}
+
 /// T-B1-graceful continued: with `peer_mesh_degraded` already
 /// latched, an operational `TaskAssignment` arriving over the
 /// (WSS-equivalent) primary_transport must still dispatch
