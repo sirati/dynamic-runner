@@ -191,11 +191,14 @@ def test_wrapper_omits_extra_run_args_when_default(
 ) -> None:
     """With the default ``extra_run_args=()`` the rendered wrapper
     must not inject any *consumer*-supplied flags between the
-    env/volume block and the image-tag argument. ``--pids-limit`` is
-    NOT probed here — it became a framework default (see
-    :func:`test_wrapper_emits_default_pids_limit`); ``--ulimit``,
-    ``--cap-add``, and ``--shm-size`` remain pure consumer-side and
-    must be absent on the empty-tuple path."""
+    env/volume block and the image-tag argument. ``--pids-limit`` and
+    ``--ulimit nproc=`` are NOT probed here — both became framework
+    defaults (see :func:`test_wrapper_emits_default_pids_limit` and
+    :func:`test_wrapper_emits_default_nproc_ulimit`); ``--cap-add`` and
+    ``--shm-size`` remain pure consumer-side and must be absent on the
+    empty-tuple path. ``--ulimit`` with a non-``nproc`` rlimit name
+    (``nofile``, ``memlock``, etc.) is still consumer-only — probed via
+    the substring ``--ulimit=`` (the consumer-side spelling)."""
     manager = _build_manager(tmp_path, extra_run_args=())
     wrapper = manager.generate_wrapper_script(
         image_metadata=image_metadata,
@@ -208,7 +211,12 @@ def test_wrapper_omits_extra_run_args_when_default(
     invocations = _extract_podman_run_invocations(wrapper)
     assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
     for inv in invocations:
-        for consumer_only_flag in ("--ulimit", "--cap-add", "--shm-size"):
+        # `--ulimit=` (with `=`) is the canonical consumer spelling
+        # used by tests; the framework's default uses the
+        # space-separated form `--ulimit nproc=...`. Probing the
+        # `=` form keeps this assertion sharp without false-positiving
+        # on the framework default.
+        for consumer_only_flag in ("--ulimit=", "--cap-add", "--shm-size"):
             assert consumer_only_flag not in inv, (
                 f"default `extra_run_args=()` must not inject {consumer_only_flag!r} "
                 f"into the podman-run line; found in:\n" + inv
@@ -280,6 +288,81 @@ def test_wrapper_consumer_pids_limit_overrides_default(
             f"`podman run` invocation #{i}: consumer-supplied {consumer_value!r} "
             "must appear AFTER the framework default `--pids-limit=16384` so "
             "podman's last-wins parsing applies the consumer's value. "
+            "Invocation:\n" + inv
+        )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_emits_default_nproc_ulimit(
+    tmp_path: Path,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """Every rendered ``podman run`` invocation must carry the
+    framework default ``--ulimit nproc=32768:32768``. Sibling concern
+    to ``--pids-limit``: ``--pids-limit`` caps the container cgroup's
+    pids.max, ``--ulimit nproc`` overrides the host-side RLIMIT_NPROC
+    that podman would otherwise propagate from the SLURM job's
+    inherited per-user nproc cap (or podman's `containers.conf`
+    default). Without this default, fork-heavy in-container workloads
+    (autotools `./configure`, parallel gcc/clang, JVM thread spawn)
+    fail with `EAGAIN: Resource temporarily unavailable` whenever the
+    inherited cap lands below the workload's peak fork count —
+    independently of `--pids-limit`. Override path is the same as
+    `--pids-limit`: pass `--ulimit nproc=<N>:<N>` via
+    ``TaskDeploymentSpec.extra_run_args``; podman applies the LAST
+    occurrence."""
+    manager = _build_manager(tmp_path, extra_run_args=())
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    invocations = _extract_podman_run_invocations(wrapper)
+    assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
+    for i, inv in enumerate(invocations):
+        assert "--ulimit nproc=32768:32768" in inv, (
+            f"`podman run` invocation #{i} is missing the framework default "
+            "`--ulimit nproc=32768:32768` flag. Invocation:\n" + inv
+        )
+
+
+@pytest.mark.parametrize("reverse_connection", [False, True])
+def test_wrapper_consumer_nproc_ulimit_overrides_default(
+    tmp_path: Path,
+    image_metadata: PodmanImageMetadata,
+    reverse_connection: bool,
+) -> None:
+    """A consumer that supplies ``--ulimit=nproc=N:N`` via
+    ``extra_run_args`` gets BOTH the framework default
+    ``--ulimit nproc=32768:32768`` AND their own value rendered into
+    the invocation. podman applies the LAST occurrence of a flag, so
+    the consumer's entry wins. The test asserts both appear and the
+    consumer's value lands AFTER the default — the order podman uses
+    to pick the effective value. Mirrors
+    :func:`test_wrapper_consumer_pids_limit_overrides_default`."""
+    consumer_value = "--ulimit=nproc=65536:65536"
+    manager = _build_manager(tmp_path, extra_run_args=(consumer_value,))
+    wrapper = manager.generate_wrapper_script(
+        image_metadata=image_metadata,
+        secondary_id="secondary-0",
+        gateway_host="gateway.example",
+        gateway_port=12345,
+        reverse_connection=reverse_connection,
+    )
+
+    invocations = _extract_podman_run_invocations(wrapper)
+    assert invocations, "expected at least one `podman run --rm` invocation in wrapper"
+    for i, inv in enumerate(invocations):
+        default_idx = inv.index("--ulimit nproc=32768:32768")
+        consumer_idx = inv.index(consumer_value)
+        assert default_idx < consumer_idx, (
+            f"`podman run` invocation #{i}: consumer-supplied {consumer_value!r} "
+            "must appear AFTER the framework default `--ulimit nproc=32768:32768` "
+            "so podman's last-wins parsing applies the consumer's value. "
             "Invocation:\n" + inv
         )
 
