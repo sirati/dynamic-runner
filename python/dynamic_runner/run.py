@@ -300,7 +300,13 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         num_secondaries=num_secondaries,
         distributed_config=distributed_config,
     )
-    result = _rs.run_primary(primary_cfg, task, spawn_secondary, binaries)
+    result = _rs.run_primary(
+        primary_cfg,
+        task,
+        spawn_secondary,
+        binaries,
+        source_dir=str(config.source_dir),
+    )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
 
