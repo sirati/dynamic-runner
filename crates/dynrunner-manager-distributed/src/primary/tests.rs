@@ -2,8 +2,8 @@
 //! `super::test_helpers`; this file holds the test scenarios.
 
 use super::test_helpers::{
-    fake_secondary, fake_secondary_with_addrs, make_binary, setup_test, FakeWorkerFactory,
-    FixedEstimator, NoPeers, TestId,
+    fake_secondary, fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
+    FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
 };
 use super::*;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
@@ -2282,4 +2282,262 @@ fn dispatch_order_no_idle_workers() {
     ];
     let order = super::lifecycle::dispatch_order(&workers);
     assert!(order.is_empty());
+}
+
+// ── Regression gate: in-process distributed pipeline must queue
+// initial staging entries before `run()`. Without them, every task's
+// `local_path` arrives at the secondary unstaged and dispatch's
+// `report_unresolvable_task` rejects it with "expected StageFile
+// notification first". The pair below pins:
+//   T1: the failure mode is reachable when staging is omitted.
+//   T2: calling `queue_initial_staging_from_binaries` clears it.
+//
+// Setup is deliberately minimal: 1 binary with a relative `path`
+// (so `local_path_is_relative=true` triggers the unresolvable-task
+// guard), 1 real secondary with `src_network=None` (so the guard's
+// `src_network.is_some()` clause stays false too — the relative-path
+// branch does the work), 1 worker (sufficient to dispatch the single
+// binary).
+//
+// We use a real `SecondaryCoordinator` (not a `fake_secondary`) so
+// the wire path that produces the regression error string is
+// exercised end-to-end on the secondary side, not just simulated.
+
+/// T1 — regression pin. Asserts that without `queue_stage_file` /
+/// `queue_initial_staging_from_binaries`, the in-process distributed
+/// pipeline's failure mode is reachable: the task lands as `Failed`
+/// with the canonical `expected StageFile notification first` error
+/// substring.
+///
+/// Pairs with T2 (same setup, plus the staging call) — together they
+/// form the regression gate against re-introducing the gap that
+/// caused asm-tokenizer's `--multi-computer single-process` runs to
+/// 100%-fail at HEAD `2f30920`.
+#[tokio::test(flavor = "current_thread")]
+async fn run_without_stage_file_queue_fails_all_tasks() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let secondary_id = "secondary-0".to_string();
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+        );
+
+        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+            spawn_real_secondary(secondary_id.clone(), 1, max_res);
+
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            // `retry_max_passes = 0` so a Recoverable failure becomes
+            // permanent on the first pass — the regression we're
+            // pinning produces NonRecoverable failures (the unresolvable
+            // task guard sends `ErrorType::NonRecoverable`), so the
+            // budget is moot, but keeping it at 0 avoids any chance of
+            // a retry pass masking the assertion.
+            retry_max_passes: 0,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Relative path → wire `local_path` is relative → secondary's
+        // `report_unresolvable_task` sees `src_network=None` AND
+        // `local_path_is_relative=true` → fires the StageFile-error
+        // failure path under test.
+        let binaries = vec![make_relative_binary("missing/binary", 50)];
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // Failure mode reached: 0 completed, 1 permanent failure.
+        assert_eq!(
+            primary.completed_count(),
+            0,
+            "no task should complete when staging is omitted"
+        );
+        assert_eq!(
+            primary.failed_count(),
+            1,
+            "the single task must land in failed_tasks"
+        );
+
+        // Pin the canonical error substring so a future refactor that
+        // changes the wording surfaces here (a deliberate breakage,
+        // not a silent drift). Consumers (asm-tokenizer's e2e check)
+        // grep for this string.
+        let cs = primary.cluster_state_for_test();
+        let mut saw_expected = false;
+        for (_hash, state) in cs.tasks_iter() {
+            if let crate::cluster_state::TaskState::Failed { last_error, .. } = state {
+                assert!(
+                    last_error.contains("expected StageFile notification first"),
+                    "failed task's last_error must carry the canonical \
+                     regression substring; got: {last_error}"
+                );
+                saw_expected = true;
+            }
+        }
+        assert!(
+            saw_expected,
+            "cluster_state must record at least one Failed task"
+        );
+
+        drop(primary);
+        let _ = sec_handle.await;
+    }).await;
+}
+
+/// T2 — fix validation. Same setup as T1, but `queue_initial_staging_from_binaries`
+/// is invoked before `run()` so the secondary receives a StageFile
+/// record in its `InitialAssignment.staged_files`. Asserts the task
+/// completes (i.e. the lift-to-Rust method is wired correctly and
+/// the per-secondary fan-out targets the supplied id).
+///
+/// Pairs with T1 — together the two pin the regression at `2f30920`.
+#[tokio::test(flavor = "current_thread")]
+async fn run_with_initial_staging_succeeds() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // Materialise a real source tree so `compute_file_hash` can
+        // succeed: the staging walk reads the file from disk to hash
+        // the contents. Single binary keeps the test fast and the
+        // assertion surface tight.
+        let source_root = std::env::temp_dir().join(format!(
+            "stage_init_t2_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_rel = std::path::PathBuf::from("missing/binary");
+        let on_disk = source_root.join(&bin_rel);
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
+        std::fs::write(&on_disk, b"t2-staging-payload").unwrap();
+
+        let secondary_id = "secondary-0".to_string();
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+        );
+
+        // Secondary needs `src_network` pointing at the source tree
+        // so its `stage_file` step can copy the file into the cache —
+        // mirrors the real in-process pipeline, where the secondary
+        // shares filesystem visibility with the primary. Without
+        // `src_network` set the staging copy fails (no source root)
+        // and the task still falls through to the unresolvable
+        // guard, which would mask the fix.
+        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+            spawn_real_secondary_with_src_network(
+                secondary_id.clone(),
+                1,
+                max_res,
+                Some(source_root.clone()),
+            );
+
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 0,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_relative_binary(
+            bin_rel.to_str().unwrap(),
+            18, // matches payload length above; size is informational
+        )];
+
+        // The fix under test: lift-to-Rust staging walk. The single
+        // secondary's id matches `spawn_real_secondary_with_src_network`'s
+        // welcome message, so its `pending_stage_files` entry routes
+        // correctly through `staged_per_secondary`.
+        let secondary_ids = vec![secondary_id.clone()];
+        primary
+            .queue_initial_staging_from_binaries(
+                &binaries,
+                &secondary_ids,
+                &source_root,
+            )
+            .expect("staging walk should succeed for a present, readable file");
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        assert_eq!(
+            primary.completed_count(),
+            1,
+            "task should complete when staging is queued"
+        );
+        assert_eq!(
+            primary.failed_count(),
+            0,
+            "no task should fail when staging is queued"
+        );
+
+        drop(primary);
+        let _ = sec_handle.await;
+
+        // Best-effort cleanup; `tempdir`-style teardown.
+        let _ = std::fs::remove_dir_all(&source_root);
+    }).await;
 }

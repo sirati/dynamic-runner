@@ -4,7 +4,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_core::PhaseId;
-use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator};
+use dynrunner_manager_distributed::{
+    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, StagingError,
+};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
 
@@ -125,42 +127,18 @@ impl PyPrimaryCoordinator {
 
     /// Bulk-queue StageFile notifications for every binary in
     /// `binaries`, broadcast to all `num_secondaries` configured on
-    /// this coordinator. Replaces the previous per-binary Python
-    /// loop in the SLURM pipeline that called `compute_task_hash`,
-    /// `compute_file_hash`, and `notify_stage_file` separately for
-    /// each binary — the Python side held no state the loop needed,
-    /// the only Python-exclusive piece (relative-path computation)
-    /// is trivially Rust, and bundling avoids 4 PyO3 crossings per
-    /// binary.
+    /// this coordinator.
     ///
-    /// `source_root` is the absolute path of the consumer's
-    /// `--source` directory. `binary.path` may be either:
-    ///
-    /// * absolute under `source_root` — `<rel>` is the strip-prefixed
-    ///   tail (the legacy shape, e.g. when discovery emits
-    ///   `source_root.join(rel)` directly);
-    /// * absolute out-of-tree — `<rel>` keeps the full path and the
-    ///   secondary's `stage_file` handler treats it as out-of-band
-    ///   staged (must already exist by some other means);
-    /// * relative — resolved against `source_root` for the on-disk
-    ///   read; `<rel>` is the original relative path verbatim. This
-    ///   is the wire-identifier shape consumers should prefer post-
-    ///   Bug B (file-open sites use the resolved path; output-mirror
-    ///   sites use the relative wire id).
-    ///
-    /// Reads each binary file once on the primary side to compute
-    /// `content_hash` (SHA256). Errors out on the first unreadable
-    /// file rather than silently skipping — a broken local
-    /// `--source` is a configuration bug the consumer wants to
-    /// surface immediately, not a partial dispatch that later fails
-    /// on the secondary as a confusing "not pre-staged at <path>"
-    /// error with no breadcrumb pointing back to the primary's drop.
-    ///
-    /// If a future consumer needs sentinel-style TaskInfos that
-    /// intentionally don't back to a real file, the right shape is
-    /// an explicit marker on TaskInfo (e.g. `is_synthetic: bool`)
-    /// so this branch can distinguish "no file by design" from
-    /// "no file by mistake".
+    /// PyO3 layer is intentionally a thin extract-and-delegate
+    /// shell: the staging walk (path resolution, content hashing,
+    /// per-secondary fan-out, error classification) lives in
+    /// `dynrunner_manager_distributed::compute_initial_staging_entries`
+    /// so the in-process distributed pipeline (which constructs its
+    /// `PrimaryCoordinator` directly, never crossing this PyO3
+    /// boundary) shares the same code. This wrapper does
+    /// PyList → `Vec<TaskInfo>`, delegates, and maps the typed
+    /// `StagingError` variants to the consumer-facing Python
+    /// exceptions.
     fn queue_initial_staging(
         &mut self,
         binaries: &Bound<'_, pyo3::types::PyList>,
@@ -168,48 +146,23 @@ impl PyPrimaryCoordinator {
     ) -> PyResult<()> {
         let rust_binaries = crate::pytypes::extract_binaries(binaries)?;
         let source_root = std::path::PathBuf::from(source_root);
-        for binary in &rust_binaries {
-            // Resolve the on-disk read location: relative paths join
-            // against `source_root` (post-Bug-B wire-id shape);
-            // absolute paths are used verbatim. `rel` (the wire form
-            // shipped to secondaries) is then derived from the
-            // resolved path so the strip-prefix branch covers both
-            // legacy `source_root.join(rel)` shapes and new relative
-            // emissions uniformly.
-            let resolved = if binary.path.is_absolute() {
-                binary.path.clone()
-            } else {
-                source_root.join(&binary.path)
-            };
-            let rel = match resolved.strip_prefix(&source_root) {
-                Ok(p) => p.to_string_lossy().into_owned(),
-                Err(_) => binary.path.to_string_lossy().into_owned(),
-            };
-            let file_hash = dynrunner_manager_distributed::compute_task_hash(binary);
-            let Some(content_hash) =
-                dynrunner_manager_distributed::compute_file_hash(&resolved)
-            else {
-                return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
-                    "queue_initial_staging: cannot read {} (resolved={}, type_id={}). \
-                     Typical causes: --source points at the wrong tree; the file is \
-                     missing or permission-denied. Aborting before dispatch so the \
-                     misconfiguration surfaces here rather than as a downstream secondary \
-                     'not pre-staged at <path>' error.",
-                    binary.path.display(),
-                    resolved.display(),
-                    binary.type_id,
-                )));
-            };
-            for i in 0..self.num_secondaries {
-                self.pending_stage_files.push((
-                    format!("secondary-{i}"),
-                    file_hash.clone(),
-                    content_hash.clone(),
-                    rel.clone(),
-                    rel.clone(),
-                ));
+        // Secondary IDs the SLURM/network primary spawns under;
+        // mirrors the format used in `run` below (line ~225) and in
+        // `connect.rs`'s missing-secondary diagnostic.
+        let secondary_ids: Vec<String> = (0..self.num_secondaries)
+            .map(|i| format!("secondary-{i}"))
+            .collect();
+        let entries = compute_initial_staging_entries(
+            &rust_binaries,
+            &secondary_ids,
+            &source_root,
+        )
+        .map_err(|e| match e {
+            StagingError::SourceUnreadable { .. } => {
+                pyo3::exceptions::PyFileNotFoundError::new_err(e.to_string())
             }
-        }
+        })?;
+        self.pending_stage_files.extend(entries);
         Ok(())
     }
 

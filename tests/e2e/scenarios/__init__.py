@@ -36,6 +36,7 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "heartbeat-keepalive",
     "reverse-mode",
     "cleanup-teardown",
+    "distributed-single-process",
 )
 
 
