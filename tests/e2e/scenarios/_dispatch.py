@@ -99,6 +99,20 @@ def build_dispatch_argv(
             argv += ["--ssh-config", str(env.ssh_config_path)]
     elif env.mode == "single-process":
         argv += ["--multi-computer", "single-process"]
+    elif env.mode == "local":
+        # Network-based primary that spawns local-subprocess
+        # secondaries via `build_subprocess_spawn`. The framework
+        # requires `--jobs` here (consumed by
+        # `_dispatch_multi_computer_local::num_secondaries`); no
+        # `--packaging` flag because local mode does not invoke the
+        # SLURM packaging pipeline — the consumer's TaskDeploymentSpec
+        # alone supplies the secondary module name.
+        argv += [
+            "--multi-computer",
+            "local",
+            "--jobs",
+            str(jobs if jobs is not None else env.workers),
+        ]
     # mode == "in-process" → no --multi-computer flag, framework picks
     # the in-process run_local path.
     argv += list(extra_args)
