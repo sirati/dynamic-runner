@@ -237,6 +237,21 @@ The wrapper script's cleanup path uses `podman unshare rm -rf -- "$RNDTMP"` to r
 
 Required: `podman ≥4.0` (where `unshare rm -rf` is reliable). Most modern distros ship this.
 
+### Container fork-limit defaults: `--pids-limit` and `--ulimit nproc`
+
+The wrapper's `podman run` invocation now ships two framework defaults that constrain the container's fork/thread budget:
+
+- `--pids-limit=16384` (added 2026-05-05, commit `9b3dce0`) caps the container cgroup's `pids.max`. Replaces podman rootless's 2048 default — too tight for autotools + parallel gcc/clang fanout and for JVM-heavy workloads (Ghidra etc.).
+- `--ulimit nproc=32768:32768` (this guide) overrides the host-side `RLIMIT_NPROC` that podman would otherwise propagate into the container from the SLURM job's inherited per-user cap (pam_limits / `/etc/security/limits.conf`) or from podman's `containers.conf` default ulimits. Without this, fork-heavy in-container workloads hit `./configure: fork: Resource temporarily unavailable` (i.e. `EAGAIN`) whenever the inherited cap lands below the workload's peak fork count, *independently* of the `--pids-limit` ceiling — they count against different kernel quotas (cgroup pids.max vs per-user RLIMIT_NPROC).
+
+Field signal: `asm-dataset-nix`'s workload-sized nix builds (`hello-aarch64-clang10` and similar) wedged with `./configure: fork: Resource temporarily unavailable` 10/10 attempts on a cluster whose user shells inherited a 4096 nproc cap. The 32768 default = 2× the per-container `--pids-limit` (so two concurrent containers on one node can each hit their cgroup ceiling without bumping into the per-user nproc cap) and ½ of 65536 (the kernel's typical max), leaving operator headroom.
+
+**Override path** (consumers): pass `--pids-limit=<N>` or `--ulimit=nproc=<N>:<N>` via `TaskDeploymentSpec.extra_run_args`. podman applies the last occurrence of a flag, so the consumer's entry wins over the framework default.
+
+**Operator-policy ceiling** (cannot be overridden by the framework): if the cluster's SLURM cgroup config sets a `pids.max` lower than 16384 per job, or pam_limits caps `nproc` lower than 32768 per user, those caps apply regardless of the framework defaults. The framework's `--pids-limit` can only *lower* the cgroup limit, not raise it; `--ulimit nproc` can only override what podman *propagates*, not what the kernel enforces against the real-uid. If your workload needs more than 32768 forks per user across all concurrent containers on a node, the cluster operator must raise the underlying limits.
+
+> Related: `RLIMIT_NOFILE` (open file descriptors) is *not* set by the framework. fd-heavy workloads (databases, parallel I/O fans-out) that hit the operator's `nofile` default should pass `--ulimit=nofile=<N>:<N>` via `extra_run_args`. Symptom is `EMFILE: Too many open files`, distinct from the nproc `EAGAIN` discussed above.
+
 ---
 
 ## Known issue: SSH master under tokio
