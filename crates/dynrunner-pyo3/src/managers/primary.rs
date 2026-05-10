@@ -54,6 +54,15 @@ pub(crate) struct PyPrimaryCoordinator {
     /// secondaries via `InitialAssignment.pre_staged_mode` so
     /// dispatch skips the hash machinery.
     source_pre_staged_root: Option<std::path::PathBuf>,
+    /// Local source-tree root for the staging walk. Threaded into
+    /// `PrimaryConfig.source_dir` so the inner coordinator owns a
+    /// root for the content-hash + per-secondary fan-out without
+    /// each caller re-implementing the staging orchestration.
+    /// SLURM and network-primary callers both pass it; `None` is
+    /// the right default for pre-staged-source mode,
+    /// `uses_file_based_items=False`, and remote-only primaries
+    /// that never read the source from this filesystem.
+    source_dir: Option<std::path::PathBuf>,
     /// Whether dispatched task items back to real files. Read at
     /// construction from `TaskDefinition.uses_file_based_items`
     /// (defaults to True). Propagated to secondaries via
@@ -81,6 +90,7 @@ impl PyPrimaryCoordinator {
         distributed_config = None,
         listen_port = None,
         source_pre_staged_root = None,
+        source_dir = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -90,6 +100,7 @@ impl PyPrimaryCoordinator {
         distributed_config: Option<DistributedConfig>,
         listen_port: Option<u16>,
         source_pre_staged_root: Option<std::path::PathBuf>,
+        source_dir: Option<std::path::PathBuf>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -109,6 +120,7 @@ impl PyPrimaryCoordinator {
             failed: 0,
             pending_stage_files: Vec::new(),
             source_pre_staged_root,
+            source_dir,
             uses_file_based_items,
             max_concurrent_per_type: topology.max_concurrent_per_type,
             task_definition: task_definition.clone().unbind(),
@@ -183,6 +195,7 @@ impl PyPrimaryCoordinator {
         let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
+        let source_dir = self.source_dir.clone();
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
 
@@ -284,6 +297,17 @@ impl PyPrimaryCoordinator {
                     mesh_ready_timeout: std::time::Duration::from_secs(60),
                     mass_death_grace: dist_mass_death_grace,
                     mass_death_min_count: dist_mass_death_min_count,
+                    // Threaded from the constructor's `source_dir`
+                    // kwarg so the inner coordinator owns a local
+                    // root for the initial staging walk's
+                    // content-hash + per-secondary fan-out. SLURM
+                    // and network-primary callers both supply it;
+                    // `None` is acceptable for callers that don't
+                    // read source files from the primary's
+                    // filesystem (pre-staged-source mode,
+                    // `uses_file_based_items=false`, or future
+                    // remote-only primaries).
+                    source_dir,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, RunnerIdentifier> =

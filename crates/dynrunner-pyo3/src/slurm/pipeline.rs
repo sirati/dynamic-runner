@@ -483,6 +483,15 @@ fn drive_rust_primary<'py>(
         let root = slurm_config.call_method0("get_srcbins_mount_source")?;
         coord_kwargs.set_item("source_pre_staged_root", root)?;
     }
+    // Thread source_dir into the coordinator's config uniformly.
+    // The SLURM pipeline retains its explicit
+    // `queue_initial_staging` pre-call below (it depends on
+    // `pre_staged_root` resolution that's unique to this caller),
+    // so the field is supplied for parity with the in-process and
+    // network-primary callers — keeps a single source of truth at
+    // the manager boundary.
+    let source_dir_str = sel_result.getattr("source_dir")?.str()?;
+    coord_kwargs.set_item("source_dir", source_dir_str)?;
     let num_secondaries = prep_result.getattr("num_secondaries")?;
     let coord = coord_cls.call(
         PyTuple::new(py, [&num_secondaries, task, &no_spawn_callback])?,
