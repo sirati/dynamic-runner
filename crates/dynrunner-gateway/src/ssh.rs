@@ -308,17 +308,28 @@ impl Gateway for SshGateway {
             "ControlMaster=auto",
             "-o",
             "ControlPersist=yes",
-            // Default-on keepalive on the long-lived master
-            // connection so the underlying TCP socket stays warm
-            // through quiet periods. Same rationale as the per-
-            // secondary reverse tunnel in Python's preparation.py
-            // — an idle ssh socket that's been NAT-timed-out can
-            // sit "established" on both ends while writes silently
-            // fail.
+            // 18-hour anti-leak floor on the long-lived master:
+            // 60s × 1080 = 64800s of unacknowledged keepalive
+            // probes before the master gives up the link. The
+            // floor is the only SSH knob the framework chooses
+            // for you; everything orthogonal to liveness (auth,
+            // host-key, agent) belongs in operator-owned
+            // ssh_config.
+            //
+            // Why a *floor* and not a tight default: on paths
+            // where the server-side ClientAlive* is disabled
+            // (slurm-test-env's shape), an unset ServerAlive
+            // means orphan masters on truly dead links persist
+            // indefinitely. 18h lets dead links eventually
+            // self-clean (suspend/resume across the master's
+            // lifetime, network partition that doesn't heal,
+            // podman bridge teardown, netns deletion) while
+            // staying loose enough that no realistic batch
+            // workload's quiet windows trigger false-positives.
             "-o",
-            "ServerAliveInterval=30",
+            "ServerAliveInterval=60",
             "-o",
-            "ServerAliveCountMax=3",
+            "ServerAliveCountMax=1080",
             "-o",
             "TCPKeepAlive=yes",
             "-o",
