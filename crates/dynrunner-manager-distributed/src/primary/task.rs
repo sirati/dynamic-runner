@@ -470,4 +470,80 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 .await;
         }
     }
+
+    /// Apply a replicated `DistributedMessage::ClusterMutation` batch.
+    ///
+    /// Single concern: keep the demoted primary's CRDT mirror — and the
+    /// accounting sets the operational loop's exit-counter check
+    /// reads — converged with the cluster's view, even when the live
+    /// primary authority has handed off to a promoted secondary.
+    ///
+    /// Pre-fix the primary's `dispatch_message` had no arm for
+    /// `MessageType::ClusterMutation`: any mutation broadcast addressed
+    /// at the demoted primary fell through the catch-all. The
+    /// operational loop's `completed + failed >= total` exit check
+    /// reads `self.completed_tasks` / `self.failed_tasks`, which on a
+    /// demoted primary are fed only by direct `TaskComplete` /
+    /// `TaskFailed` forwards reaching the local primary's transport.
+    /// Cross-secondary completions on the new primary's pool never
+    /// arrived as direct forwards (the new primary doesn't loopback
+    /// peer-observed completions to the demoted primary's transport),
+    /// so the counter never reached the total and the run loop sat
+    /// forever — the asm-dataset-nix R2 / T3 hang.
+    ///
+    /// Mirrors `secondary::dispatch::apply_cluster_mutations` in shape
+    /// (idempotent fan-out over a `Vec<ClusterMutation>`); diverges in
+    /// that the primary additionally maintains `completed_tasks` /
+    /// `failed_tasks` because those are the sets the lifecycle
+    /// exit-counter reads. The CRDT idempotency on `cluster_state`
+    /// makes repeated apply safe; `HashSet::insert` is idempotent on
+    /// the accounting side.
+    pub(super) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
+        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+            for m in mutations {
+                self.mirror_mutation_to_accounting(&m);
+                self.cluster_state.apply(m);
+            }
+        }
+    }
+
+    /// Update `completed_tasks` / `failed_tasks` (the sets the
+    /// operational loop reads for its exit-counter check) from a
+    /// single `ClusterMutation`. Non-terminal mutations
+    /// (`TaskAdded`, `TaskAssigned`, `PrimaryChanged`, `PhaseDepsSet`,
+    /// `RunComplete`) leave both sets untouched: `TaskAdded` /
+    /// `TaskAssigned` describe non-terminal lifecycle states the
+    /// counter check ignores, `PrimaryChanged` / `PhaseDepsSet` are
+    /// orthogonal, and `RunComplete` flows through `cluster_state`'s
+    /// own `run_complete` flag which the loop reads separately.
+    ///
+    /// Terminal mutations preserve the same single-bucket invariant
+    /// `handle_task_complete` / `handle_task_failed` enforce: a hash
+    /// sits in exactly one of {completed, failed} at a time. A late
+    /// `TaskCompleted` after a `TaskFailed` removes from `failed_tasks`
+    /// and inserts into `completed_tasks` (success supersedes
+    /// recoverable failure, mirroring the live-primary behaviour).
+    /// `TaskFailed` for a hash already in `completed_tasks` does NOT
+    /// regress — the cluster_state apply will NoOp the mutation by
+    /// terminal-locked-out semantics, and we mirror that here by
+    /// skipping the failed-set insert when the hash is already
+    /// completed.
+    fn mirror_mutation_to_accounting(&mut self, m: &ClusterMutation<I>) {
+        match m {
+            ClusterMutation::TaskCompleted { hash } => {
+                self.failed_tasks.remove(hash);
+                self.completed_tasks.insert(hash.clone());
+            }
+            ClusterMutation::TaskFailed { hash, .. } => {
+                if !self.completed_tasks.contains(hash) {
+                    self.failed_tasks.insert(hash.clone());
+                }
+            }
+            ClusterMutation::TaskAdded { .. }
+            | ClusterMutation::TaskAssigned { .. }
+            | ClusterMutation::PrimaryChanged { .. }
+            | ClusterMutation::PhaseDepsSet { .. }
+            | ClusterMutation::RunComplete => {}
+        }
+    }
 }
