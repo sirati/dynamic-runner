@@ -12,29 +12,40 @@ Bring-up + tear-down go through the slurm-test-env's flake apps
 (``nix run <flake>#up|#down``) — the flake wraps podman + image
 pinning + env wiring. Raw bash + scavenged-store podman is
 explicitly forbidden (per the slurm-test-env owner's broadcast).
+
+Migration note (handoff/extract-dynrunner-driver)
+-------------------------------------------------
+
+``is_cluster_running`` now delegates to
+:func:`dynamic_runner.driver.cluster_is_running` — the TCP probe is
+identical (2s timeout, localhost only) but the implementation lives
+in the public ``dynrunner-driver`` Rust crate so harnesses other
+than this e2e suite can reuse it.
+
+``bring_cluster_up`` / ``bring_cluster_down`` are NOT in the
+framework crate (locked design point (l)): they shell out to the
+slurm-test-env-specific flake apps, which are harness state, not
+framework state.
 """
 
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 from pathlib import Path
 
+from dynamic_runner.driver import cluster_is_running as _driver_cluster_is_running
+
 
 def is_cluster_running(ssh_port: int) -> bool:
-    """TCP probe of the gateway sshd port.
+    """TCP probe of the gateway sshd port (delegated to driver).
 
-    Sufficient as an "is it up" gate: if SSH refuses, the cluster is
-    either down or the port is wrong; either way the driver wants
-    bring-up. Doesn't shell out to podman, doesn't ssh, doesn't run
-    nix — just a 2s TCP connect.
+    Thin Python wrapper around
+    :func:`dynamic_runner.driver.cluster_is_running`. Sufficient as
+    an "is it up" gate: if SSH refuses, the cluster is either down
+    or the port is wrong; either way the driver wants bring-up.
     """
-    try:
-        with socket.create_connection(("localhost", ssh_port), timeout=2):
-            return True
-    except (ConnectionRefusedError, socket.timeout, OSError):
-        return False
+    return _driver_cluster_is_running(ssh_port)
 
 
 def bring_cluster_up(
