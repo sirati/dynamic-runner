@@ -935,3 +935,304 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
     }
     assert!(saw_mesh_ready, "MeshReady must be sent on the healthy path");
 }
+
+// ============================================================
+// R1: secondary failover on primary-link disconnect.
+// Tests below pin the contract introduced by the R1 fix:
+// (helpers in `r1_helpers` keep the test bodies focused on the
+// state-machine assertions rather than wiring boilerplate)
+
+mod r1_helpers {
+    //! Shared setup for R1 tests. Uses `FixedPeerCount(N)` so the
+    //! processing-loop's peer-count check observes a healthy mesh
+    //! (which is what makes promotion via election possible). The
+    //! `make_secondary` helper in `test_helpers.rs` uses `NoPeers`,
+    //! which reports peer_count=0 — fine for election-state tests
+    //! that don't go through the operational threshold path, but
+    //! wrong for R1 tests that do.
+
+    use super::super::test_helpers::{election_config, FixedEstimator, FixedPeerCount, TestId};
+    use super::*;
+    use dynrunner_scheduler::ResourceStealingScheduler;
+
+    pub(super) type R1Secondary = SecondaryCoordinator<
+        ChannelPrimaryTransportEnd<TestId>,
+        FixedPeerCount,
+        dynrunner_transport_channel::ChannelManagerEnd,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >;
+
+    /// Construct a SecondaryCoordinator with `FixedPeerCount(peers)`
+    /// for the peer transport so the processing-loop helper's
+    /// peer-count check observes the configured mesh size.
+    pub(super) fn make_with_peers(secondary_id: &str, peers: usize) -> R1Secondary {
+        let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+        let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+        let transport = ChannelPrimaryTransportEnd {
+            tx: sec_to_pri_tx,
+            rx: pri_to_sec_rx,
+        };
+        SecondaryCoordinator::new(
+            election_config(secondary_id),
+            transport,
+            FixedPeerCount(peers),
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        )
+    }
+
+    /// Inline `wire::timestamp_now()` (path is `pub(super)` to wire,
+    /// not visible from this test module).
+    pub(super) fn timestamp_now() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+    }
+}
+//
+//   1. A SUSTAINED primary-link outage (count or time threshold
+//      breached) arms `primary_disconnected = true` and backdates
+//      `primary_last_seen` so the next election tick promotes.
+//   2. A TRANSIENT outage (one probe, brief flap) does NOT arm
+//      failover — `record_primary_message` resets the health
+//      sub-state cleanly when the primary message arrives.
+//   3. The #15 degraded-mesh guard still holds: a primary-link
+//      threshold breach with `peer_mesh_degraded = true` results in
+//      a fatal exit, NOT a unilateral self-promotion.
+//   4. Promotion preserves the peer mesh: no transport-close events
+//      on inter-peer connections during the promotion window.
+//
+// The tests use the `make_secondary` helper (channel transports +
+// NoPeers / FixedPeerCount stubs) and drive the threshold via
+// direct `check_primary_link_threshold` / `run_election_tick`
+// calls. The full `process_tasks` loop is not exercised here —
+// existing integration tests already cover the loop's structural
+// behaviour, and these tests would be flaky against the loop's
+// internal `tokio::select!` ordering.
+
+/// T-R1-promotion-on-disconnect (count axis): a non-promoted
+/// secondary with a healthy peer mesh observes the primary-link
+/// threshold breach via N consecutive recv-None probes, arms
+/// `primary_disconnected`, and the next election tick enters
+/// Suspecting (the count-axis half of the threshold). Pinning
+/// the count path here keeps the test deterministic — no
+/// wall-clock reliance.
+#[tokio::test(flavor = "current_thread")]
+async fn r1_promotion_on_disconnect_count_axis() {
+    use super::election::ElectionState;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Healthy peer mesh: 2 peers visible at the transport layer
+    // so the threshold path takes the elect-via-mesh branch
+    // (not the no-peer break-out).
+    let mut sec = r1_helpers::make_with_peers("sec-a", 2);
+    sec.peer_keepalives
+        .insert("sec-b".into(), r1_helpers::timestamp_now());
+    sec.peer_keepalives
+        .insert("sec-c".into(), r1_helpers::timestamp_now());
+    sec.record_primary_message();
+
+    // Drive the count-axis by feeding 3 probes (test_helpers sets
+    // failure_threshold=3). Each probe records a recv-None event;
+    // the third returns true and arms the link.
+    assert!(!sec.primary_link.record_recv_failure());
+    assert!(!sec.primary_link.record_recv_failure());
+    assert!(
+        sec.primary_link.record_recv_failure(),
+        "third probe must arm the link (threshold=3 in election_config)"
+    );
+    assert!(sec.primary_link.should_arm_failover());
+
+    // The processing-loop helper translates "should_arm" into the
+    // operational arming flags. Pre-arming, primary_disconnected
+    // should still be false (the count probes were direct
+    // record_recv_failure calls — they don't touch the operational
+    // flag; that's the processing-loop's job).
+    assert!(!sec.primary_disconnected);
+    sec.check_primary_link_threshold();
+    assert!(
+        sec.primary_disconnected,
+        "tick re-check must propagate the threshold breach to the operational flag"
+    );
+
+    // Election tick now sees the primary as silent (backdated
+    // past the keepalive miss threshold) and enters Suspecting.
+    // With healthy peers, the degraded-mesh guard does NOT fire.
+    let actions = sec.run_election_tick();
+    assert!(
+        matches!(sec.election, ElectionState::Suspecting { .. }),
+        "election must enter Suspecting on threshold-armed failover; \
+         got {:?}",
+        std::mem::discriminant(&sec.election)
+    );
+    assert!(
+        actions
+            .broadcast
+            .iter()
+            .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+        "Suspecting transition must broadcast TimeoutQuery"
+    );
+    assert!(
+        sec.fatal_exit.is_none(),
+        "healthy mesh must not fatal-exit"
+    );
+}
+
+/// T-R1-recover-on-primary-back: a transient flap (one probe, then
+/// a primary message arrives via `record_primary_message`) resets
+/// the health sub-state cleanly. No election fires. The test
+/// drives the API contract directly — the message-arrival path
+/// itself runs through `dispatch_message` in production but that
+/// path is already covered by `primary_recovery_clears_routing_target`
+/// elsewhere in the file.
+#[tokio::test(flavor = "current_thread")]
+async fn r1_recover_on_primary_back() {
+    use super::election::ElectionState;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let mut sec = r1_helpers::make_with_peers("sec-a", 1);
+    sec.peer_keepalives
+        .insert("sec-b".into(), r1_helpers::timestamp_now());
+    sec.record_primary_message();
+
+    // One probe, then primary comes back — short flap.
+    sec.primary_link.record_recv_failure();
+    assert!(sec.primary_link.is_link_failing());
+
+    sec.record_primary_message();
+    assert!(
+        !sec.primary_link.is_link_failing(),
+        "primary-back must reset the health sub-state"
+    );
+    assert!(!sec.primary_link.should_arm_failover());
+
+    // Tick re-check is a no-op now that the link is healthy.
+    sec.check_primary_link_threshold();
+    assert!(!sec.primary_disconnected, "no arming on healthy link");
+
+    // Election stays in Normal — no Suspecting.
+    let actions = sec.run_election_tick();
+    assert!(matches!(sec.election, ElectionState::Normal));
+    assert!(actions.broadcast.is_empty());
+}
+
+/// T-R1-respects-degraded-guard: when the peer mesh is degraded
+/// (#15 contract), a primary-link threshold breach must NOT
+/// self-promote. The election tick fatal-exits with the
+/// degraded-failover reason. Pre-fix the degraded-mesh guard
+/// could have been bypassed if the threshold path armed via a
+/// different code path; this test pins that the threshold and the
+/// guard compose correctly.
+#[tokio::test(flavor = "current_thread")]
+async fn r1_respects_degraded_guard() {
+    use super::election::ElectionState;
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Degraded mode is the no-peers case; FixedPeerCount(0) so the
+    // processing-loop helper's peer_count check matches reality.
+    // The watchdog has already latched the degraded flag (#15
+    // contract: peer mesh failed to form). Threshold arming must
+    // still flow through `check_primary_link_threshold`, then the
+    // election tick should fatal-exit.
+    let mut sec = r1_helpers::make_with_peers("sec-a", 0);
+    sec.peer_mesh_degraded = true;
+    sec.peer_dial_count = 4;
+    sec.record_primary_message();
+
+    // Drive count-axis past threshold.
+    sec.primary_link.record_recv_failure();
+    sec.primary_link.record_recv_failure();
+    sec.primary_link.record_recv_failure();
+    assert!(sec.primary_link.should_arm_failover());
+
+    // Tick re-check observes peer_count == 0 and takes the
+    // no-peer-mesh exit (sets primary_disconnected without
+    // backdating). The election tick then needs to fire on the
+    // primary_silent axis. We need to backdate primary_last_seen
+    // to past the deadline manually for the election tick to
+    // observe the silence — in production the keepalive-tick
+    // pathway would have backdated already if the primary was
+    // actually silent, but in this state-machine-isolated test
+    // we set it explicitly. This mirrors how
+    // `degraded_failover_fails_loud_instead_of_self_promoting`
+    // sets up its precondition.
+    sec.check_primary_link_threshold();
+    assert!(sec.primary_disconnected);
+
+    // Drive the elapsed-time precondition for run_election_tick by
+    // pre-aging the primary_last_seen by past the deadline.
+    sec.primary_last_seen = Some(
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(150))
+            .unwrap_or_else(std::time::Instant::now),
+    );
+
+    // Election tick observes degraded mesh + primary-silent and
+    // sets fatal_exit per the #15 contract.
+    let _actions = sec.run_election_tick();
+    let reason = sec
+        .fatal_exit
+        .as_ref()
+        .expect("degraded + threshold-armed must set fatal_exit");
+    assert!(
+        reason.contains("peer mesh required for failover"),
+        "fatal reason should explain the degraded-failover bail, got: {reason}"
+    );
+    assert!(
+        matches!(sec.election, ElectionState::Normal),
+        "degraded failover bail must NOT transition the election state"
+    );
+}
+
+/// T-R1-no-mesh-rebuild: the threshold path is purely state-machine
+/// internal and does not touch the peer transport in any way. This
+/// test pins that contract: drive the threshold, observe arming,
+/// and assert the peer-mesh view (`peer_keepalives`) and routing
+/// target (`primary_link.current_primary`) are unchanged across
+/// the arming window.
+///
+/// The architectural invariant is that the threshold path produces
+/// ZERO peer-transport side effects during arming — only the
+/// election-tick path emits `TimeoutQuery` (which is a NORMAL
+/// message, not a mesh rebuild).
+#[tokio::test(flavor = "current_thread")]
+async fn r1_no_mesh_rebuild_during_arming() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let mut sec = r1_helpers::make_with_peers("sec-a", 2);
+    sec.peer_keepalives
+        .insert("sec-b".into(), r1_helpers::timestamp_now());
+    sec.peer_keepalives
+        .insert("sec-c".into(), r1_helpers::timestamp_now());
+    sec.record_primary_message();
+
+    // Snapshot the peer-mesh view before arming so we can assert
+    // it's preserved across the threshold path.
+    let peers_before: std::collections::HashSet<String> =
+        sec.peer_keepalives.keys().cloned().collect();
+    assert_eq!(peers_before.len(), 2);
+
+    // Drive count-axis past threshold and arm.
+    sec.primary_link.record_recv_failure();
+    sec.primary_link.record_recv_failure();
+    sec.primary_link.record_recv_failure();
+    sec.check_primary_link_threshold();
+    assert!(sec.primary_disconnected);
+
+    // Peer-mesh view unchanged.
+    let peers_after: std::collections::HashSet<String> =
+        sec.peer_keepalives.keys().cloned().collect();
+    assert_eq!(peers_before, peers_after, "arming must not mutate peer keepalives");
+
+    // The primary_link's current_primary routing target stays
+    // unchanged at None (primary not yet promoted to a peer) —
+    // arming alone doesn't pick a candidate; that's the election's
+    // job.
+    assert!(
+        sec.primary_link.current_primary().is_none(),
+        "arming alone must not set a routing target"
+    );
+}
