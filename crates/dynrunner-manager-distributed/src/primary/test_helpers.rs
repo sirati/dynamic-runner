@@ -30,6 +30,32 @@ impl ResourceEstimator<TestId> for FixedEstimator {
     }
 }
 
+/// Build a `TaskInfo` whose `path` is RELATIVE. Pairs with the
+/// staging-coverage tests: dispatch's `report_unresolvable_task`
+/// gate fires on `local_path_is_relative=true && src_network=None`,
+/// so a relative-path binary is the wire shape that exercises the
+/// "primary forgot to queue StageFile" failure mode the in-process
+/// distributed pipeline regressed into.
+///
+/// Co-located with `make_binary` instead of inlined in the test
+/// because both regression tests (T1 — failure pin; T2 — fix
+/// validation) share the exact same binary shape; centralising
+/// keeps them in lockstep.
+pub(super) fn make_relative_binary(name: &str, size: u64) -> TaskInfo<TestId> {
+    TaskInfo {
+        path: std::path::PathBuf::from(name),
+        size,
+        identifier: TestId(name.into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: None,
+        task_depends_on: vec![],
+        resolved_path: None,
+    }
+}
+
 pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
     // Absolute path (despite no real file backing it) — the in-process
     // test fixtures don't configure src_network, and dispatch.rs's

@@ -248,7 +248,27 @@ impl PyDistributedManager {
                             max_resources: sec_max_resources,
                             hostname: "localhost".into(),
                             keepalive_interval: dist_keepalive,
-                            src_network: None,
+                            // In-process mode: primary and
+                            // secondaries share filesystem
+                            // visibility, so the staging walk's
+                            // relative `src_path` (e.g.
+                            // `input-0.txt`, derived from
+                            // `binary.path` post-strip-prefix)
+                            // resolves under the primary's
+                            // `source_dir`. Without this set,
+                            // `stage_and_register`'s `stage_file`
+                            // call rejects every relative
+                            // src_path with "no src_network is
+                            // configured" and the next
+                            // TaskAssignment surfaces as the
+                            // legacy "expected StageFile
+                            // notification first" failure even
+                            // though staging WAS queued — pairs
+                            // with the staging-walk fix above:
+                            // both are needed for the in-process
+                            // pipeline to actually process file-
+                            // backed items.
+                            src_network: Some(sec_source.clone()),
                             src_tmp: None,
                             peer_timeout: dist_peer_timeout,
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
@@ -322,6 +342,46 @@ impl PyDistributedManager {
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );
+
+                // Queue initial staging entries before the operational
+                // loop starts. Mirrors the SLURM pipeline's pre-`run()`
+                // `queue_initial_staging` call (slurm/pipeline.rs) and
+                // the gate semantics there: pre-staged-source mode is
+                // not reachable in this pipeline (the in-process
+                // distributed manager hard-codes
+                // `source_pre_staged_root: None` above), so the only
+                // skip condition is the `uses_file_based_items=False`
+                // opt-out for non-file-backed task items.
+                //
+                // Without this call, `pending_stage_files` stays empty,
+                // every secondary's `InitialAssignment.staged_files`
+                // arrives empty, every TaskAssignment's `local_path`
+                // resolves to nothing on the secondary, and dispatch's
+                // `report_unresolvable_task` fails every task with
+                // "expected StageFile notification first".
+                if uses_file_based_items {
+                    // Secondary IDs the in-process distributed
+                    // manager spawns under (`sec-{i}` per the
+                    // `sec_log_dirs` loop above); the staging walk
+                    // is naming-convention-agnostic but the SLURM/
+                    // network primary uses `secondary-{i}` instead,
+                    // so the IDs are explicit at every call site
+                    // rather than baked into the walk.
+                    let secondary_ids: Vec<String> = (0..num_secondaries)
+                        .map(|i| format!("sec-{i}"))
+                        .collect();
+                    if let Err(e) = primary.queue_initial_staging_from_binaries(
+                        &rust_binaries,
+                        &secondary_ids,
+                        &source_dir,
+                    ) {
+                        tracing::error!(
+                            error = %e,
+                            "queue_initial_staging_from_binaries failed; aborting run"
+                        );
+                        return;
+                    }
+                }
 
                 // phase_deps + lifecycle closures captured from the
                 // outer scope (5A built phase_deps; 5B built the
