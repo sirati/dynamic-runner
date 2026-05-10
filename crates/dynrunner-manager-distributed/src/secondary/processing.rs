@@ -356,6 +356,10 @@ where
     }
 
     /// Send keepalive to the current primary and broadcast to peers.
+    /// In degraded-mesh mode (`peer_mesh_degraded`) the peer
+    /// broadcast is skipped — there's nothing to broadcast to. The
+    /// primary→secondary keepalive over WSS still fires so the
+    /// primary keeps seeing us as alive.
     pub(super) async fn send_keepalive(&mut self) {
         let active_count = self
             .pool.workers
@@ -371,6 +375,9 @@ where
         // Send to whoever is currently primary (local at run start;
         // the promoted peer after PromotePrimary).
         let _ = self.send_to_current_primary(msg.clone()).await;
+        if self.peer_mesh_degraded {
+            return;
+        }
         // Broadcast to peers (including the primary if it's a peer —
         // duplicate but idempotent).
         let _ = self.peer_transport.broadcast(msg).await;
