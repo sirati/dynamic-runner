@@ -95,6 +95,23 @@ class Parallel4WorkersScenario(Scenario):
         if not ok_present:
             return (False, missing)
 
+        # Distinct-worker premise is meaningless below
+        # _MIN_DISTINCT_WORKERS — there aren't enough secondaries to
+        # observe distribution. Short-circuit so the matrix's N=1
+        # cell still validates the basic outputs contract (40 tasks
+        # completed) without the cross-worker premise the rest of
+        # this scenario asserts. Kept self-contained inside the
+        # scenario module: the matrix driver does not need to know
+        # which scenarios degenerate at low N.
+        if env.workers < _MIN_DISTINCT_WORKERS:
+            print(
+                f"[parallel-4-workers] env.workers={env.workers} "
+                f"< {_MIN_DISTINCT_WORKERS}; distribution check "
+                "skipped (premise not testable)",
+                flush=True,
+            )
+            return (True, [])
+
         # Log the distribution informationally (operator-visible
         # diagnostic; does NOT gate pass/fail — see the module
         # docstring for why distribution isn't asserted on this
