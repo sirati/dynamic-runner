@@ -47,6 +47,20 @@ pub(crate) struct DistributedConfig {
     /// disables the failover/promote-primary path — with no
     /// peer mesh, primary loss = job loss.
     disable_peer_overlay: bool,
+    /// R1 primary-link failover threshold: number of recv-None probes
+    /// after which the secondary arms failover. Defaults to 5
+    /// (matches `dynrunner_manager_distributed::secondary::primary_link::DEFAULT_FAILURE_THRESHOLD`).
+    /// Bound below 3 risks self-promoting on a single dropped TCP
+    /// packet retransmit — strongly discouraged.
+    primary_link_failure_threshold: u32,
+    /// R1 primary-link failover window in seconds. Wall-clock time
+    /// after the first observed recv-None probe within which the
+    /// failure-count threshold must breach to avoid time-based
+    /// arming. Defaults to 30s (matches `DEFAULT_FAILURE_WINDOW`).
+    /// Used to bound failover latency on slow-keepalive
+    /// configurations where 5 probes would exceed the SLURM time
+    /// budget.
+    primary_link_failure_window_secs: f64,
 }
 
 impl Default for DistributedConfig {
@@ -61,6 +75,8 @@ impl Default for DistributedConfig {
             mass_death_grace_secs: 60.0,
             mass_death_min_count: 2,
             disable_peer_overlay: false,
+            primary_link_failure_threshold: 5,
+            primary_link_failure_window_secs: 30.0,
         }
     }
 }
@@ -78,6 +94,8 @@ impl DistributedConfig {
         mass_death_grace_secs = None,
         mass_death_min_count = None,
         disable_peer_overlay = None,
+        primary_link_failure_threshold = None,
+        primary_link_failure_window_secs = None,
     ))]
     fn new(
         connect_timeout_secs: Option<f64>,
@@ -89,6 +107,8 @@ impl DistributedConfig {
         mass_death_grace_secs: Option<f64>,
         mass_death_min_count: Option<u32>,
         disable_peer_overlay: Option<bool>,
+        primary_link_failure_threshold: Option<u32>,
+        primary_link_failure_window_secs: Option<f64>,
     ) -> Self {
         let d = DistributedConfig::default();
         Self {
@@ -102,6 +122,10 @@ impl DistributedConfig {
             mass_death_grace_secs: mass_death_grace_secs.unwrap_or(d.mass_death_grace_secs),
             mass_death_min_count: mass_death_min_count.unwrap_or(d.mass_death_min_count),
             disable_peer_overlay: disable_peer_overlay.unwrap_or(d.disable_peer_overlay),
+            primary_link_failure_threshold: primary_link_failure_threshold
+                .unwrap_or(d.primary_link_failure_threshold),
+            primary_link_failure_window_secs: primary_link_failure_window_secs
+                .unwrap_or(d.primary_link_failure_window_secs),
         }
     }
 }
@@ -133,6 +157,12 @@ impl DistributedConfig {
     }
     pub(crate) fn disable_peer_overlay(&self) -> bool {
         self.disable_peer_overlay
+    }
+    pub(crate) fn primary_link_failure_threshold(&self) -> u32 {
+        self.primary_link_failure_threshold
+    }
+    pub(crate) fn primary_link_failure_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.primary_link_failure_window_secs)
     }
 }
 
