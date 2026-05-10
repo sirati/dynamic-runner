@@ -168,6 +168,8 @@ async fn secondary_with_real_workers_processes_tasks() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
             };
 
             let binaries = vec![
@@ -227,6 +229,8 @@ async fn secondary_multi_worker_processes_tasks() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..6)
@@ -292,6 +296,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..15)
@@ -383,6 +389,8 @@ async fn stage_file_then_assign_task_succeeds() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
             };
 
             let secondary_id_clone = config.secondary_id.clone();
@@ -610,6 +618,8 @@ fn arm_watchdog_no_peers(
         peer_timeout: Duration::from_secs(120),
         keepalive_miss_threshold: 2,
         retry_max_passes: 1,
+        primary_link_failure_threshold: 5,
+        primary_link_failure_window: Duration::from_secs(30),
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -747,6 +757,8 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
             };
             let binaries = vec![
                 make_binary("a", 50),
@@ -871,6 +883,8 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         peer_timeout: Duration::from_secs(120),
         keepalive_miss_threshold: 2,
         retry_max_passes: 1,
+        primary_link_failure_threshold: 5,
+        primary_link_failure_window: Duration::from_secs(30),
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
