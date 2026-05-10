@@ -48,6 +48,7 @@ async fn single_secondary_processes_all_tasks() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -101,6 +102,7 @@ async fn two_secondaries_distribute_work() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -191,6 +193,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -330,6 +333,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -449,6 +453,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -533,6 +538,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -639,6 +645,7 @@ async fn retry_max_passes_zero_disables_retry() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -894,6 +901,7 @@ async fn e2e_primary_and_secondary_single_node() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -971,6 +979,7 @@ async fn e2e_primary_and_two_secondaries() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -1044,6 +1053,7 @@ async fn live_distribution_continues_past_initial_batch() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -1102,6 +1112,7 @@ async fn notify_stage_file_emits_wire_message() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, TestId> =
@@ -1235,6 +1246,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 mesh_ready_timeout: std::time::Duration::from_secs(5),
                 mass_death_grace: std::time::Duration::ZERO,
                 mass_death_min_count: 2,
+                source_dir: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1382,6 +1394,7 @@ async fn e2e_pre_staged_source_mode() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1461,6 +1474,7 @@ async fn e2e_uses_file_based_items_false() {
                 mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1558,6 +1572,7 @@ async fn e2e_per_type_max_concurrent() {
                 mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -1703,6 +1718,7 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 mesh_ready_timeout: std::time::Duration::from_secs(10),
                 mass_death_grace: std::time::Duration::ZERO,
                 mass_death_min_count: 2,
+                source_dir: None,
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -1980,6 +1996,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -2115,6 +2132,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -2360,6 +2378,7 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -2493,6 +2512,7 @@ async fn run_with_initial_staging_succeeds() {
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
+            source_dir: None,
         };
 
         let mut primary = PrimaryCoordinator::new(

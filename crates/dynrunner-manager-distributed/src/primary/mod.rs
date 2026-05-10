@@ -168,6 +168,19 @@ pub struct PrimaryConfig {
     /// connected secondaries always falls through to the standard
     /// per-secondary requeue path. Default `2`.
     pub mass_death_min_count: u32,
+
+    /// Local source-tree root the primary uses to read file
+    /// contents for the initial staging walk (content-hash + per-
+    /// secondary StageFile fan-out). Threaded by every pyo3-side
+    /// caller that has it (SLURM pipeline, in-process distributed
+    /// manager, network primary with local secondaries) so a
+    /// single field tells the manager whether it can read source
+    /// files from the primary's filesystem. `None` for callers
+    /// that don't (pre-staged-source mode bind-mounts the source
+    /// into each secondary; `uses_file_based_items=false` makes
+    /// `local_path` opaque; tests with absolute on-disk paths and
+    /// fake workers that never open them).
+    pub source_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for PrimaryConfig {
@@ -187,6 +200,7 @@ impl Default for PrimaryConfig {
             mesh_ready_timeout: Duration::from_secs(60),
             mass_death_grace: Duration::from_secs(60),
             mass_death_min_count: 2,
+            source_dir: None,
         }
     }
 }
@@ -627,6 +641,34 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections().await?;
+
+        // Phase 2.5: Auto-stage. Run the staging walk on behalf of
+        // callers that didn't pre-queue via `queue_stage_file` /
+        // `queue_initial_staging_from_binaries`. Gate semantics
+        // (and the rationale for each one) live on
+        // `staging::maybe_auto_stage_initial`. The four-way gate
+        // collapses to "we have a root to walk, items are file-
+        // backed, we're not in pre-staged mode, and no caller pre-
+        // populated the queue" — any one false skips silently.
+        //
+        // Performed AFTER `wait_for_connections` so `self.secondaries`
+        // has the welcome-registered IDs (the staging fan-out is
+        // per-secondary), and BEFORE `perform_initial_assignment`
+        // which drains `pending_stage_files` into each recipient's
+        // `InitialAssignment.staged_files`. This is the single
+        // Rust-side call site for the staging walk; pyo3 wrappers
+        // just thread `source_dir` into config.
+        //
+        // Without this, the network-primary + local-secondaries
+        // pipeline (`--multi-computer local`) had no staging call
+        // site at all and lost every task to "expected StageFile
+        // notification first" on the secondary's
+        // unresolvable-task guard. The in-process distributed
+        // pipeline kept its explicit pre-call from #7, which the
+        // gate detects (non-empty queue) and skips — consistent
+        // SLURM-pipeline semantics where the explicit pre-call
+        // also wins.
+        self.maybe_auto_stage_initial()?;
 
         // Phase 3: Send peer lists
         self.send_peer_lists().await?;
