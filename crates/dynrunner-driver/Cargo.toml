@@ -1,0 +1,41 @@
+[package]
+name             = "dynrunner-driver"
+version.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+description            = "Public driver crate: SshMaster lifetime + Session command layer + identity/cluster helpers."
+keywords.workspace     = true
+categories.workspace   = true
+readme.workspace       = true
+
+[dependencies]
+# `ssh -M -N` master spawn is sync (per locked design point (i)) so we
+# only need std::process::Command. Sessions remain async-capable; the
+# tokio dep is kept for future use by the Session command layer (and
+# the existing dynrunner-gateway crate, which will eventually call into
+# us). For now the crate is sync end-to-end at construction time.
+tokio = { workspace = true, features = ["process", "fs", "time"] }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# `nix::sys::signal::kill` for the daemon-PID lifetime contract.
+# - `kill(pid, None)` is the existence probe used by the watcher and
+#   the SIGTERM→SIGKILL ladder.
+# - `Signal::SIGTERM` / `Signal::SIGKILL` are the teardown levers.
+nix = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile = "3"
+# Log-capture for the panic-in-Drop prohibition test: we deliberately
+# trigger UnkillableMaster and assert that `tracing::error!` fires
+# instead of a panic propagating out of Drop. `no-env-filter` is
+# required because Rust integration tests build as a separate crate
+# from `dynrunner-driver`, so the default `RUST_LOG=<crate>=trace`
+# env filter would silence logs emitted from the crate's own paths.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
+[lints]
+workspace = true

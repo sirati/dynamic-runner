@@ -15,6 +15,19 @@ owner's hard rules (broadcast 2026-05-08):
 - **Disable host-key checking** — every cluster instance regenerates
   host keys, so a pinned ``known_hosts`` would fight us.
 
+Migration note (handoff/extract-dynrunner-driver)
+-------------------------------------------------
+
+The keypair / ssh_config / master-spawn / master-stop primitives now
+live in the public ``dynamic_runner.driver`` crate (Rust, exposed via
+PyO3). This module retains the four function signatures the e2e
+suite imports — ``ensure_dispatcher_keypair``, ``generate_ssh_config``,
+``spawn_ssh_master``, ``stop_ssh_master`` — but delegates each to
+``dynamic_runner.driver`` internally. The harness-specific
+``provision_dispatcher_user`` stays here verbatim because it shells
+out to the slurm-test-env flake (out of scope for the framework crate
+per locked design point (l)).
+
 The dispatcher consumes the produced ``ssh_config`` via the
 framework's ``--ssh-config`` flag (the escape hatch surfaced in
 commit ``178a3af``).
@@ -25,6 +38,12 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+
+from dynamic_runner.driver import (
+    SshMaster,
+    ensure_dispatcher_keypair as _driver_ensure_dispatcher_keypair,
+    write_ssh_config as _driver_write_ssh_config,
+)
 
 
 def state_dir_for_instance(state_root: Path, instance_id: str) -> Path:
@@ -42,36 +61,15 @@ def state_dir_for_instance(state_root: Path, instance_id: str) -> Path:
 
 
 def ensure_dispatcher_keypair(instance_state_dir: Path) -> tuple[Path, Path]:
-    """Generate an ed25519 keypair if absent.
+    """Generate an ed25519 keypair if absent (delegated to driver).
 
-    Returns ``(private_key_path, public_key_path)``. Both live under
-    ``<instance_state_dir>/keys/``; ``mode 0600`` on the private key.
-    Re-runnable: on second invocation we just return the existing
-    paths without regenerating (the cluster's authorized_keys already
-    has the matching pubkey from the prior provision).
+    Thin Python wrapper around
+    :func:`dynamic_runner.driver.ensure_dispatcher_keypair`. The
+    behaviour matches the pre-migration helper bit-for-bit:
+    ``<instance_state_dir>/keys/id_ed25519{,.pub}``, ``mode 0600`` on
+    the private key, re-runnable.
     """
-    keys_dir = instance_state_dir / "keys"
-    keys_dir.mkdir(parents=True, exist_ok=True)
-    priv = keys_dir / "id_ed25519"
-    pub = keys_dir / "id_ed25519.pub"
-    if priv.exists() and pub.exists():
-        return priv, pub
-    # Wipe any half-generated state from a prior failed run.
-    priv.unlink(missing_ok=True)
-    pub.unlink(missing_ok=True)
-    subprocess.run(
-        [
-            "ssh-keygen",
-            "-t", "ed25519",
-            "-f", str(priv),
-            "-N", "",
-            "-C", f"dynrunner-e2e-{instance_state_dir.name}",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    priv.chmod(0o600)
-    return priv, pub
+    return _driver_ensure_dispatcher_keypair(instance_state_dir)
 
 
 def provision_dispatcher_user(
@@ -87,6 +85,10 @@ def provision_dispatcher_user(
     we don't try to detect "already provisioned" — we just re-call
     every time the driver runs. After a cluster restart the
     authorized_keys may be stale; this guarantees it's current.
+
+    Out-of-scope for the framework crate per locked design point (l):
+    provisioning shells out to the harness's flake app, which isn't
+    a framework concern.
     """
     if not slurm_test_env_dir.exists():
         raise RuntimeError(
@@ -120,54 +122,40 @@ def generate_ssh_config(
     user: str,
     identity_file: Path,
 ) -> Path:
-    """Write the per-cluster ssh_config and return its absolute path.
+    """Write the per-cluster ssh_config and return its absolute path
+    (delegated to driver).
 
-    Pins every option the slurm-test-env contract demands:
-    ``IdentitiesOnly=yes`` + ``IdentityAgent=none`` (no agent
-    consultation), ``StrictHostKeyChecking=no`` +
-    ``UserKnownHostsFile=/dev/null`` (no host-key reuse across
-    instances), plus the explicit identity file. Threaded into the
-    dispatcher via ``dynamic_runner --ssh-config <path>``.
-
-    The ``host_alias`` is used both as the SSH ``Host`` block label
-    AND as the URL host the dispatcher passes to ``--gateway
-    ssh://<alias>:<port>``. The framework then propagates that
-    string verbatim into the worker wrapper's ``--secondary
-    tcp://<alias>:<port>`` URL (see
-    ``packaging/preparation.py::_determine_gateway_host``). For the
-    slurm-test-env, the alias must match the gateway's podman
-    network-alias (``slurm-gateway``) so workers in the cluster's
-    private podman network can DNS-resolve it. ``HostName
-    localhost`` redirects the SSH client (which runs on the operator's
-    host where ``localhost`` IS the cluster's port-forwarded
-    SSH endpoint) without leaking a hostname workers can't reach.
-
-    Re-running overwrites the file — cheap, captures any port/user
-    drift between driver invocations.
+    Thin wrapper around
+    :func:`dynamic_runner.driver.write_ssh_config`. Threads
+    ``host_alias`` into BOTH the ``Host`` block label AND the URL
+    host the dispatcher passes downstream; pins
+    ``HostName localhost`` so the SSH client (on the operator host)
+    dials the cluster's port-forwarded sshd endpoint without leaking a
+    hostname workers can't reach. Re-running overwrites the file —
+    cheap, captures any port/user drift between driver invocations.
     """
-    cfg_path = instance_state_dir / "ssh_config"
-    cfg_path.write_text(
-        f"""# Auto-generated by tests/e2e/_ssh_state.py — do not edit.
-# Instance: {instance_state_dir.name}
-# Regenerated on every run_e2e.py invocation.
-
-Host {host_alias}
-    HostName localhost
-    Port {ssh_port}
-    User {user}
-    IdentityFile {identity_file}
-    IdentitiesOnly yes
-    IdentityAgent none
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
-    ServerAliveInterval 30
-    ServerAliveCountMax 3
-    TCPKeepAlive yes
-    ConnectTimeout 10
-"""
+    return _driver_write_ssh_config(
+        instance_state_dir,
+        host_alias,
+        # host_name — see the locked design point (l) doc on why this
+        # is a separate kwarg from host_alias. In the slurm-test-env
+        # case the alias is the cluster-internal network alias
+        # (slurm-gateway) and the host is `localhost` because the
+        # cluster's sshd is reached via host-side port forward.
+        "localhost",
+        ssh_port,
+        user,
+        identity_file,
     )
-    cfg_path.chmod(0o600)
-    return cfg_path
+
+
+# Per-process registry of live SshMaster instances keyed by control
+# socket path. ``spawn_ssh_master`` returns just the path (matching
+# the pre-migration contract) so the caller can stash it in scenario
+# state; the underlying SshMaster object lives here, anchored against
+# Python GC so its Rust Drop only fires on
+# :func:`stop_ssh_master` (idempotent).
+_LIVE_MASTERS: dict[Path, SshMaster] = {}
 
 
 def spawn_ssh_master(
@@ -176,88 +164,45 @@ def spawn_ssh_master(
     ssh_config_path: Path,
     host_alias: str,
 ) -> Path:
-    """Pre-spawn an SSH master and return the control socket path.
+    """Pre-spawn an SSH master and return the control socket path
+    (delegated to driver).
 
-    Why this exists
-    ---------------
+    Migration to ``dynamic_runner.driver.SshMaster``
+    -------------------------------------------------
 
-    The framework's ``ssh.rs::connect()`` spawns its own SSH master
-    process via Rust's ``std::process::Command`` (with ``setsid -f``
-    + ``ssh -M -N -f`` daemonisation). Empirically that master gets
-    SIGTERM'd ~2 minutes after handshake when run from a tokio-driven
-    Python (the dispatcher), even though identical command from a
-    plain shell or Python subprocess persists indefinitely.
+    The previous implementation used ``setsid -f -- ssh -M -N -f`` via
+    ``subprocess.run`` to fork a detached master. The new
+    implementation uses :class:`dynamic_runner.driver.SshMaster`,
+    which is the Rust-side port of the same lifecycle (``ssh -M -N``
+    directly, daemon-PID tracking, watcher thread, SIGTERM→SIGKILL
+    ladder on drop).
 
-    Diagnosis of the Rust+tokio process supervision interaction is
-    out of scope for an e2e harness. The framework exposes a
-    ``DYNRUNNER_SSH_CONTROL_PATH`` env var that bypasses its own
-    master spawn and reuses an externally-spawned one — that's what
-    we hit here. The master is spawned via ``subprocess.Popen`` from
-    Python (which doesn't have the issue), then the framework's
-    ``setup_port_forwarding`` issues ``ssh -O forward`` against this
-    master to add reverse forwards dynamically as the run progresses.
-
-    Returns the control socket path the caller exports as
-    ``DYNRUNNER_SSH_CONTROL_PATH`` for the dispatcher subprocess.
+    Signature is unchanged so existing callers (``run_e2e`` and the
+    ``escape-hatch-external-master`` scenario) need no edits. The
+    SshMaster instance is anchored in a module-level registry keyed
+    by control path; :func:`stop_ssh_master` looks it up and calls
+    ``disconnect()``.
     """
-    # Place the control socket under /tmp (not the state dir) — Unix
-    # socket paths are capped at 108 bytes (sockaddr_un.sun_path), and
-    # the worktree path under .claude is already 80+ chars before the
-    # filename. ssh's bind silently fails on overlong paths.
-    cp = Path(f"/tmp/dynrunner-ssh-master-{instance_state_dir.name}.sock")
-    cp.unlink(missing_ok=True)
-
-    cmd = [
-        "setsid",
-        "-f",
-        "--",
-        "ssh",
-        "-F", str(ssh_config_path),
-        "-M",
-        "-N",
-        "-f",
-        "-o", f"ControlPath={cp}",
-        "-o", "ControlMaster=auto",
-        "-o", "ControlPersist=yes",
-        # 18-hour anti-leak floor (60s × 1080 = 64800s),
-        # mirroring the framework's master-spawn default in
-        # `crates/dynrunner-gateway/src/ssh.rs`. The harness's
-        # operator-side master must inherit the same posture as
-        # framework-spawned masters so behaviour under e2e matches
-        # production. Per-scenario boundary in run_e2e respawns
-        # the master if its control socket vanishes.
-        "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=1080",
-        "-o", "TCPKeepAlive=yes",
-        "-o", "LogLevel=ERROR",
-        host_alias,
-    ]
-    print(f"[ssh] spawning persistent master via: {' '.join(cmd)}", flush=True)
-    rc = subprocess.run(
-        cmd,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+    # The driver's master_spawn generates its own control socket
+    # path under /tmp (sun_path<108 enforced internally). The old
+    # helper also placed the socket under /tmp for the same reason
+    # — the worktree path under .claude is already 80+ chars before
+    # the filename. So we accept the driver's path generator over
+    # the prior helper's INSTANCE_ID-derived name (functionally
+    # equivalent: both unique-per-spawn, both under /tmp).
+    _ = instance_state_dir  # retained kwarg for caller signature compat
+    master = SshMaster.spawn(
+        host=host_alias,
+        port=22,
+        config_file=ssh_config_path,
     )
-    if rc.returncode != 0:
-        raise RuntimeError(
-            f"ssh master spawn failed (rc={rc.returncode}): {rc.stderr.decode()!r}"
-        )
-
-    # Wait for the control socket to appear (handshake done).
-    deadline = 10.0
-    waited = 0.0
-    while not cp.exists():
-        if waited >= deadline:
-            raise RuntimeError(
-                f"ssh master control socket {cp} did not appear within {deadline}s"
-            )
-        import time as _t
-        _t.sleep(0.05)
-        waited += 0.05
-
-    print(f"[ssh] master ready: control_path={cp}", flush=True)
+    cp = Path(master.control_path)
+    _LIVE_MASTERS[cp] = master
+    print(
+        f"[ssh] master ready: control_path={cp} "
+        f"(daemon_pid={master.master_pid})",
+        flush=True,
+    )
     return cp
 
 
@@ -267,27 +212,25 @@ def stop_ssh_master(
     control_path: Path,
     host_alias: str,
 ) -> None:
-    """Cleanly tear down a master spawned by :func:`spawn_ssh_master`.
+    """Cleanly tear down a master spawned by :func:`spawn_ssh_master`
+    (delegated to driver).
 
-    Called by the driver on exit to release the gateway-side reverse
-    forwards. ``ssh -O exit`` talks to the master through the control
-    socket and asks it to terminate; idempotent if the socket is gone.
+    Looks up the matching :class:`SshMaster` in the module registry
+    and calls ``disconnect()`` (which runs the SIGTERM→SIGKILL ladder
+    for spawn-master). Idempotent: missing-key paths return without
+    raising, matching the prior helper's "no-op if socket is gone"
+    behaviour.
+
+    ``ssh_config_path`` / ``host_alias`` kwargs are retained for
+    caller signature compat — the new disconnect path doesn't need
+    them (the master holds its own target / auth state internally).
     """
-    if not control_path.exists():
+    _ = ssh_config_path  # retained for caller signature compat
+    _ = host_alias  # retained for caller signature compat
+    master = _LIVE_MASTERS.pop(control_path, None)
+    if master is None:
         return
-    subprocess.run(
-        [
-            "ssh",
-            "-F", str(ssh_config_path),
-            "-O", "exit",
-            "-o", f"ControlPath={control_path}",
-            host_alias,
-        ],
-        check=False,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    master.disconnect()
 
 
 __all__ = [

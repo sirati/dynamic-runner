@@ -27,6 +27,7 @@ dynrunner-protocol-manager-worker = { workspace = true }
 dynrunner-transport-socket = { workspace = true }
 dynrunner-transport-channel = { workspace = true }
 dynrunner-gateway = { workspace = true }
+dynrunner-driver = { workspace = true }
 dynrunner-slurm = { workspace = true }
 dynrunner-discovery = { workspace = true }
 dynrunner-publish = { workspace = true }
