@@ -274,6 +274,14 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
+    # Stranded = tasks the run loop never accounted for (cluster routing
+    # collapsed before dispatch / mid-run). Always logged so ops scripts
+    # see a deterministic three-line shape; >0 implies the inner run()
+    # raised RuntimeError and this branch is unreachable for collapses.
+    # Kept here for the no-op zero on every healthy run, paired with the
+    # underlying coordinator's `stranded_count` getter that the
+    # cluster-collapse tracing::error already surfaces.
+    logger.info(f"Stranded: {result['stranded']}")
 
 
 def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, logger) -> None:
@@ -309,6 +317,8 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
+    # See the run_distributed branch above for stranded semantics.
+    logger.info(f"Stranded: {result['stranded']}")
 
 
 def _dispatch_slurm(task, args, deployment: TaskDeploymentSpec, logger) -> None:
