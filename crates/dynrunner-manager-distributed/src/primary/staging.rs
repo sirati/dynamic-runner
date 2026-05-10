@@ -190,6 +190,80 @@ where
         Ok(())
     }
 
+    /// Auto-stage entry point invoked from `run()` after
+    /// `wait_for_connections`. Walks `self.all_binaries` against
+    /// `self.config.source_dir` and queues per-secondary StageFile
+    /// entries for every connected secondary, but only when:
+    ///
+    ///   * `pending_stage_files.is_empty()` — no caller pre-queued
+    ///     (the SLURM pipeline's explicit `queue_initial_staging`
+    ///     pre-call wins; here we'd skip).
+    ///   * `config.uses_file_based_items` — items are file-backed
+    ///     (when False the framework passes `local_path` through to
+    ///     the worker as an opaque identifier, no staging).
+    ///   * `config.source_pre_staged_root.is_none()` — pre-staged
+    ///     mode bind-mounts the source; staging would be redundant.
+    ///   * `config.source_dir.is_some()` — we have a root to read
+    ///     file contents from for the content-hash. Callers without
+    ///     `source_dir` (e.g. tests with absolute on-disk paths and
+    ///     fake workers) must pre-queue or accept the failure.
+    ///
+    /// Errors propagate as the `String` shape `run()` already returns
+    /// (the `StagingError` formatting carries the full diagnostic).
+    /// Each gate is logged at debug level so a regression where a
+    /// caller forgot to thread `source_dir` is visible without
+    /// silently losing staging.
+    pub(super) fn maybe_auto_stage_initial(&mut self) -> Result<(), String> {
+        if !self.pending_stage_files.is_empty() {
+            tracing::debug!(
+                pre_queued = self.pending_stage_files.len(),
+                "auto-stage skipped: caller pre-queued staging entries"
+            );
+            return Ok(());
+        }
+        if !self.config.uses_file_based_items {
+            tracing::debug!(
+                "auto-stage skipped: uses_file_based_items=false (opaque local_path)"
+            );
+            return Ok(());
+        }
+        if self.config.source_pre_staged_root.is_some() {
+            tracing::debug!(
+                "auto-stage skipped: pre-staged-source mode (bind-mount)"
+            );
+            return Ok(());
+        }
+        let Some(source_dir) = self.config.source_dir.clone() else {
+            tracing::debug!(
+                "auto-stage skipped: source_dir not configured; \
+                 caller must pre-queue or rely on out-of-band staging"
+            );
+            return Ok(());
+        };
+        let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
+        if secondary_ids.is_empty() {
+            // Reachable only as a contract violation:
+            // maybe_auto_stage_initial runs after wait_for_connections,
+            // which only returns Ok once num_secondaries are
+            // registered. Defending against a future refactor that
+            // moves the call site.
+            tracing::warn!(
+                "auto-stage skipped: zero connected secondaries at staging time \
+                 (called before wait_for_connections?)"
+            );
+            return Ok(());
+        }
+        let binaries = self.all_binaries.clone();
+        tracing::info!(
+            binaries = binaries.len(),
+            secondaries = secondary_ids.len(),
+            source_dir = %source_dir.display(),
+            "auto-staging initial entries (no caller pre-queue)"
+        );
+        self.queue_initial_staging_from_binaries(&binaries, &secondary_ids, &source_dir)
+            .map_err(|e| e.to_string())
+    }
+
     /// Send a `StageFile` notification to a specific secondary.
     ///
     /// `src_path` is interpreted by the secondary relative to its
