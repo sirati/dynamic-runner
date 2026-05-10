@@ -465,11 +465,32 @@ echo ""
 # secondaries`. `--pull=never` makes that class of incomplete-load
 # fail loud-and-fast with a clear "image not in local storage"
 # error instead.
+#
+# `--ulimit nproc=32768:32768` overrides the host-side RLIMIT_NPROC
+# that podman would otherwise propagate into the container. Without
+# this, fork-heavy in-container workloads (autotools `./configure`,
+# parallel gcc/clang, JVM thread spawn) hit `EAGAIN: Resource
+# temporarily unavailable` whenever the SLURM job's inherited
+# per-user nproc cap (or podman's `containers.conf` default) lands
+# below the workload's peak fork count — independently of the
+# `--pids-limit` cgroup ceiling, which only constrains pids.max
+# inside the container's cgroup. Sibling fix to the `--pids-limit`
+# default (commit 9b3dce0): same class of pre-2026-05 per-consumer
+# rediscovery tax. 32768 = 2× the per-container `--pids-limit`
+# (so two concurrent containers on one node can each hit their
+# cgroup ceiling without bumping into the per-user nproc cap)
+# and ½ of 65536 (the kernel's typical max), leaving operator
+# headroom. Override path is the same as `--pids-limit`: pass
+# `--ulimit nproc=<N>:<N>` via `TaskDeploymentSpec.extra_run_args`;
+# podman applies the LAST occurrence. NOTE: this cannot raise the
+# SLURM cgroup's pids.max — that's operator policy. Documented in
+# `docs/MIGRATION_2026_05_PYTHON_TO_RUST.md`.
 podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     --name "$CONTAINER_NAME" \
     --pull=never \
     --network host \
     --pids-limit=16384 \
+    --ulimit nproc=32768:32768 \
     ${{MEM_FLAGS}} \
     -e PRIMARY_NODE_IPV4="$PRIMARY_NODE_IPV4" \
     -e PRIMARY_NODE_IPV6="$PRIMARY_NODE_IPV6" \
@@ -731,11 +752,13 @@ mod tests {
         assert!(script.contains("PRIMARY_NODE_IPV4="));
         assert!(script.contains("-e PRIMARY_NODE_IPV4="));
         assert!(script.contains("-e PRIMARY_NODE_IPV6="));
-        // `--pull=never` and `--pids-limit=16384` are framework
-        // defaults the wrapper must always emit (commits 48288f7
-        // and the pids-limit framework-default).
+        // `--pull=never`, `--pids-limit=16384`, and
+        // `--ulimit nproc=32768:32768` are framework defaults the
+        // wrapper must always emit (commits 48288f7, 9b3dce0, and
+        // the nproc framework-default sibling).
         assert!(script.contains("--pull=never"));
         assert!(script.contains("--pids-limit=16384"));
+        assert!(script.contains("--ulimit nproc=32768:32768"));
         // Cleanup trap covers SLURM-induced signals (commit 485629c).
         assert!(script.contains("trap cleanup EXIT TERM HUP INT"));
         // Watchdog block (commit a12f84a).
@@ -833,6 +856,33 @@ mod tests {
         let script = generate_wrapper_script(&cfg);
         // The space forces single-quoting.
         assert!(script.contains("'--annotation=hello world'"));
+    }
+
+    /// Consumer-supplied `--ulimit nproc=N:N` via `extra_run_args`
+    /// must land AFTER the framework default in the rendered
+    /// invocation so podman's last-wins flag parsing applies the
+    /// consumer's value. Mirrors the pids-limit override semantic
+    /// (commit 9b3dce0) — same rule, sibling concern.
+    #[test]
+    fn consumer_nproc_ulimit_lands_after_framework_default() {
+        let config = SlurmConfig::default();
+        let consumer_value = "--ulimit=nproc=65536:65536".to_string();
+        let extras = vec![consumer_value.clone()];
+        let cfg = standard_cfg(&config, &extras);
+        let script = generate_wrapper_script(&cfg);
+
+        let default_idx = script
+            .find("--ulimit nproc=32768:32768")
+            .expect("framework default `--ulimit nproc=32768:32768` must be present");
+        let consumer_idx = script
+            .find(consumer_value.as_str())
+            .expect("consumer-supplied nproc override must be rendered");
+        assert!(
+            default_idx < consumer_idx,
+            "consumer-supplied nproc override must follow the framework default \
+             so podman's last-wins parsing applies the consumer's value; \
+             got default at {default_idx} and consumer at {consumer_idx}"
+        );
     }
 
     #[test]
