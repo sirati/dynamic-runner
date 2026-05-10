@@ -11,8 +11,15 @@ Usage
 
 ::
 
-    run_e2e.py --scenario phase-deps [--workers 4] [--timeout 1800]
+    run_e2e.py --scenario phase-deps [--workers 1,4] [--timeout 1800]
     run_e2e.py --scenario all [--down-on-success]
+
+``--workers`` is a comma-separated worker-count matrix; every
+selected scenario is dispatched once per value. The default
+``1,4`` exercises both the single-job (cross-job fan-out
+degenerates) and multi-job code paths for every scenario.
+Backward-compatible: ``--workers 4`` (single int) still works
+and degenerates the matrix to one iteration per scenario.
 
 Scenarios available are enumerated from
 :mod:`tests.e2e.scenarios`; see the per-scenario module docstrings
@@ -51,7 +58,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 
@@ -102,7 +109,12 @@ SLURM_TEST_ENV_DIR = REPO_ROOT / "slurm-test-env"
 DEFAULT_INSTANCE_ID = "e2e"
 DEFAULT_SSH_PORT = 2222
 DEFAULT_TIMEOUT_S = 1800
-DEFAULT_WORKERS = 4
+# The default worker matrix. Every scenario runs once per value, so
+# `[1, 4]` exercises the single-job and multi-job code paths for every
+# scenario by default. Cross-job behaviours (RunComplete fan-out,
+# distribution skew tolerance) need N>=2; single-job behaviours
+# (one-secondary completion path) need N=1. Both must stay green.
+DEFAULT_WORKERS_MATRIX: tuple[int, ...] = (1, 4)
 # SSH user the dispatcher provisions and connects as. Per the
 # slurm-test-env owner's contract: never reuse the operator's
 # personal user; provision a dedicated test user via
@@ -672,6 +684,59 @@ def _ensure_ssh_master_alive(env: DispatchEnv) -> None:
     os.environ["DYNRUNNER_SSH_CONTROL_PATH"] = str(new_cp)
 
 
+def _parse_workers_list(raw: str) -> list[int]:
+    """Argparse type for ``--workers``: comma-separated positive ints.
+
+    Accepts a single value (``"4"`` -> ``[4]``) and a CSV list
+    (``"1,4"`` -> ``[1, 4]``) so the same flag spans backward-
+    compat and matrix-mode invocations. Whitespace inside the CSV
+    is tolerated for hand-typed values; empty entries reject so
+    ``"1,,4"`` doesn't silently become ``[1, 4]``.
+
+    Validation rejects zero, negatives, and non-integer tokens so
+    the operator gets argparse exit-2 (not a buried RuntimeError
+    in the driver loop). Returned list preserves operator-supplied
+    order; duplicates are kept verbatim — running the same N twice
+    is the operator's choice, not the driver's to dedupe.
+    """
+    if not raw:
+        raise argparse.ArgumentTypeError(
+            "--workers: empty value; expected an int or CSV list"
+        )
+    out: list[int] = []
+    for tok in raw.split(","):
+        s = tok.strip()
+        if not s:
+            raise argparse.ArgumentTypeError(
+                f"--workers: empty entry in {raw!r}"
+            )
+        try:
+            n = int(s)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(
+                f"--workers: {s!r} is not an integer"
+            ) from e
+        if n <= 0:
+            raise argparse.ArgumentTypeError(
+                f"--workers: {n} is not a positive integer "
+                f"(must be >= 1)"
+            )
+        out.append(n)
+    return out
+
+
+def _format_failure_label(scenario_name: str, n_workers: int) -> str:
+    """Render a (scenario, worker-count) pair for the failure summary.
+
+    The driver's matrix collects ``(name, N)`` pairs into the
+    ``failures`` list; the final summary line joins them with this
+    formatter so the operator immediately sees which (scenario,
+    worker-count) combinations failed. Format is ``name@wN`` —
+    short, greppable, distinct from any path/file syntax.
+    """
+    return f"{scenario_name}@w{n_workers}"
+
+
 def _select_scenarios(arg: str) -> list[Scenario]:
     """Resolve the ``--scenario`` CLI argument to a list of scenarios.
 
@@ -714,14 +779,25 @@ def _run_one_scenario(
     scenario's assertion. Cleanup of tmp_root is the driver's
     concern (per the Scenario API contract).
     """
-    print(f"\n[run_e2e] scenario: {scenario.name} — {scenario.description}", flush=True)
+    print(
+        f"\n[run_e2e] scenario: {scenario.name} "
+        f"(workers={env.workers}) — {scenario.description}",
+        flush=True,
+    )
     if scenario.requires:
         print(
             f"[run_e2e]   requires: {', '.join(scenario.requires)}",
             flush=True,
         )
 
-    tmp_root = Path(tempfile.mkdtemp(prefix=f"dynrunner-e2e-{scenario.name}-"))
+    # Embed the worker count in the tmp prefix and log filename so a
+    # matrix run (same scenario, multiple Ns) produces distinguishable
+    # tmpdirs / logs without clobbering. The scenario itself never
+    # sees this string — it gets a clean per-(scenario, N) tmp_root
+    # via prepare().
+    tmp_root = Path(
+        tempfile.mkdtemp(prefix=f"dynrunner-e2e-{scenario.name}-w{env.workers}-")
+    )
     try:
         plans = scenario.prepare(env, tmp_root)
         results: list[ScenarioResult] = []
@@ -732,7 +808,7 @@ def _run_one_scenario(
             # reverse-forward path.
             _ensure_ssh_master_alive(env)
             label_suffix = f"-{plan.label}" if plan.label else ""
-            log_file = log_dir / f"{scenario.name}{label_suffix}.log"
+            log_file = log_dir / f"{scenario.name}-w{env.workers}{label_suffix}.log"
             plan_timeout = (
                 plan.timeout_s if plan.timeout_s is not None else timeout_s
             )
@@ -840,9 +916,17 @@ def _run_one_scenario(
             )
 
         if ok:
-            print(f"[run_e2e]   PASS: {scenario.name}", flush=True)
+            print(
+                f"[run_e2e]   PASS: "
+                f"{_format_failure_label(scenario.name, env.workers)}",
+                flush=True,
+            )
             return (True, False)
-        print(f"[run_e2e]   FAIL: {scenario.name}", flush=True)
+        print(
+            f"[run_e2e]   FAIL: "
+            f"{_format_failure_label(scenario.name, env.workers)}",
+            flush=True,
+        )
         for line in failures:
             print(f"    - {line}", flush=True)
         return (False, False)
@@ -884,9 +968,13 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--workers",
-        type=int,
-        default=DEFAULT_WORKERS,
-        help=f"Cluster worker count (default {DEFAULT_WORKERS}).",
+        type=_parse_workers_list,
+        default=list(DEFAULT_WORKERS_MATRIX),
+        help=(
+            "--workers 1,4 (default): comma-separated worker counts. "
+            "Each scenario runs once per value. Single value works "
+            "(matrix=[N])."
+        ),
     )
     parser.add_argument(
         "--timeout",
@@ -1057,11 +1145,16 @@ def main() -> int:
             host_alias=GATEWAY_HOST_ALIAS,
         )
 
-    env = DispatchEnv(
+    # Base env carries every cluster-wide knob except ``workers`` —
+    # that one is reassigned per matrix iteration via
+    # ``dataclasses.replace`` below. ``DispatchEnv`` is frozen, so
+    # cloning is the only legal mutation path.
+    workers_matrix: list[int] = list(args.workers)
+    base_env = DispatchEnv(
         instance_id=args.instance_id,
         ssh_port=args.ssh_port,
         slurm_root_folder=args.slurm_root_folder,
-        workers=args.workers,
+        workers=workers_matrix[0],
         mode=args.mode,
         ssh_user=DEFAULT_SSH_USER,
         ssh_config_path=ssh_config_path,
@@ -1082,46 +1175,71 @@ def main() -> int:
     )
     heartbeat.start()
 
-    failures: list[str] = []
+    print(
+        f"[run_e2e] worker matrix: {workers_matrix} "
+        f"({len(scenarios)} scenario(s) x {len(workers_matrix)} = "
+        f"{len(scenarios) * len(workers_matrix)} dispatch(es))",
+        flush=True,
+    )
+
+    # Failure ledger: ``(scenario.name, n_workers)`` so the summary line
+    # tells the operator exactly which combination(s) failed. The
+    # matrix is scenario-major, worker-minor — every scenario runs at
+    # every requested N before moving on, mirroring the ordering an
+    # operator would use to debug one scenario across worker counts.
+    failures: list[tuple[str, int]] = []
     timed_out = False
     try:
         for scenario in scenarios:
-            _ensure_ssh_master_alive(env)
-            ok, scenario_timed_out = _run_one_scenario(
-                scenario,
-                env,
-                log_dir=log_dir,
-                timeout_s=args.timeout,
-                heartbeat=heartbeat,
-                keep_tmp=args.keep_tmp,
-            )
-            if scenario_timed_out:
-                # First timeout aborts the whole run — the cluster
-                # is likely stuck, so subsequent scenarios would
-                # waste their wallclock budget. The stuck-cluster
-                # help lands at the bottom of main().
-                timed_out = True
-                failures.append(scenario.name)
+            for n_workers in workers_matrix:
+                env = replace(base_env, workers=n_workers)
+                _ensure_ssh_master_alive(env)
+                ok, scenario_timed_out = _run_one_scenario(
+                    scenario,
+                    env,
+                    log_dir=log_dir,
+                    timeout_s=args.timeout,
+                    heartbeat=heartbeat,
+                    keep_tmp=args.keep_tmp,
+                )
+                if scenario_timed_out:
+                    # First timeout aborts the whole run — the cluster
+                    # is likely stuck, so subsequent (scenario, N)
+                    # pairs would waste their wallclock budget. The
+                    # stuck-cluster help lands at the bottom of main().
+                    timed_out = True
+                    failures.append((scenario.name, n_workers))
+                    break
+                if not ok:
+                    failures.append((scenario.name, n_workers))
+            if timed_out:
                 break
-            if not ok:
-                failures.append(scenario.name)
     finally:
         heartbeat.stop()
 
     if timed_out:
-        _print_timeout_help(env.instance_id, heartbeat_file)
+        _print_timeout_help(base_env.instance_id, heartbeat_file)
         return 124
     if failures:
+        rendered = ", ".join(
+            _format_failure_label(name, n) for name, n in failures
+        )
         print(
-            f"\n[run_e2e] FAIL: scenarios with failures: {', '.join(failures)}",
+            f"\n[run_e2e] FAIL: scenarios with failures: {rendered}",
             flush=True,
         )
         return 1
 
-    print(f"\n[run_e2e] PASS: {len(scenarios)} scenario(s)", flush=True)
-    if args.down_on_success and env.mode == "slurm":
+    total = len(scenarios) * len(workers_matrix)
+    print(
+        f"\n[run_e2e] PASS: {total} dispatch(es) "
+        f"({len(scenarios)} scenario(s) x {len(workers_matrix)} "
+        f"worker count(s))",
+        flush=True,
+    )
+    if args.down_on_success and base_env.mode == "slurm":
         try:
-            bring_cluster_down(SLURM_TEST_ENV_DIR, env.instance_id)
+            bring_cluster_down(SLURM_TEST_ENV_DIR, base_env.instance_id)
         except Exception as e:  # noqa: BLE001
             print(
                 f"[run_e2e] WARNING: down.sh failed (cluster left up): {e}",
