@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{resolve_against_root, TaskInfo, Identifier, PhaseId, ResourceMap};
@@ -9,6 +10,65 @@ use dynrunner_scheduler_api::{
 
 use crate::cluster_state::ClusterState;
 use crate::state::SecondaryConnectionState;
+
+/// Outcome of a `PrimaryCoordinator::run()` invocation.
+///
+/// Distinct from a free-form `String` so callers (especially the PyO3
+/// `RustPrimaryCoordinator::run` and `RustDistributedManager::run`
+/// wrappers) can match on the `ClusterCollapsed` variant when the
+/// run finishes with tasks unaccounted for, surface the per-category
+/// counters, and translate the structured error into a non-zero
+/// process exit. CI / ops scripts that previously read exit code 0
+/// despite hundreds of un-dispatched tasks (the `Completed: 10 /
+/// Failed: 0 / Total: 484` failure mode reported by asm-tokenizer)
+/// now see a typed failure they can trust.
+///
+/// `Other(String)` is the pass-through for every other failure mode
+/// the inner pipeline raises today (transport handshake errors, pool
+/// rejections, peer-mesh setup failures, etc.); a blanket
+/// `From<String>` makes the existing `?`-on-`Result<(), String>`
+/// helper sites compile unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The run loop exited (transport collapse, inactivity timeout,
+    /// etc.) with tasks left neither in the completed set nor in the
+    /// failed set. `stranded = total - completed - failed`.
+    ClusterCollapsed {
+        stranded: usize,
+        completed: usize,
+        failed: usize,
+    },
+    /// Any other run-time failure — transport setup, pool
+    /// construction, broadcast deliveries that exhausted retries, etc.
+    Other(String),
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClusterCollapsed { stranded, completed, failed } => write!(
+                f,
+                "{stranded} tasks left unassigned because cluster routing collapsed \
+                 (completed={completed} failed={failed} stranded={stranded})"
+            ),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
+impl From<String> for RunError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(s: &str) -> Self {
+        Self::Other(s.to_owned())
+    }
+}
 
 /// Per-phase lifecycle hook invoked by the coordinator when a phase
 /// flips Blocked → Active. The pyo3 layer (Phase 5B) wires this to the
@@ -302,6 +362,14 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
 
     // Task state
     pub(super) total_tasks: usize,
+    /// Number of tasks left unaccounted for at the end of the most
+    /// recent `run()` call: `total - completed - failed`. Populated
+    /// inside `run()` after the operational loop and the retry passes
+    /// have both drained, so it reflects the final accounting that
+    /// `RunError::ClusterCollapsed` carries on the wire. Zero on a
+    /// clean run; `>0` on the cluster-collapse path the tokenizer hit
+    /// on 2026-05-10. Reset to 0 at the start of every `run()`.
+    pub(super) stranded_count: usize,
     pub(super) all_binaries: Vec<TaskInfo<I>>,
     /// Phase-aware pending pool. Lazily initialised at `run()` start so
     /// the constructor doesn't need the phase set / dependency graph;
@@ -428,6 +496,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             secondaries: HashMap::new(),
             workers: Vec::new(),
             total_tasks: 0,
+            stranded_count: 0,
             all_binaries: Vec::new(),
             pending: None,
             phase_deps: HashMap::new(),
@@ -541,6 +610,21 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         self.failed_tasks.len()
     }
 
+    /// Tasks the run loop never accounted for (neither completed nor
+    /// failed). Populated by `run()` after the loop exits — common
+    /// causes are transport collapse before every task dispatched,
+    /// secondaries dying mid-run, or any exit path that left items
+    /// queued / in-flight without a recorded outcome.
+    ///
+    /// Reset to 0 at the start of every `run()`. Zero on a clean run
+    /// (the loop exits via the `completed + failed >= total` arm).
+    /// `>0` is the structured-error case that surfaces as
+    /// `RunError::ClusterCollapsed` on the wire — read either via the
+    /// matched error variant or via this getter post-call.
+    pub fn stranded_count(&self) -> usize {
+        self.stranded_count
+    }
+
     pub fn secondary_count(&self) -> usize {
         self.secondaries.len()
     }
@@ -577,7 +661,12 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
         on_phase_start: OnPhaseStart,
         on_phase_end: OnPhaseEnd,
-    ) -> Result<(), String> {
+    ) -> Result<(), RunError> {
+        // Reset the stranded counter so a previous run's residue
+        // can't leak into this one. Populated below after both loops
+        // drain; the structured-error path consults it.
+        self.stranded_count = 0;
+
         // Discover the phase set: union of (1) every phase referenced
         // by an item, (2) every phase mentioned as a key or parent in
         // the deps map. The pool's constructor validates that every
@@ -741,12 +830,24 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // retry that matches the local manager's behaviour.
         self.run_retry_passes().await?;
 
-        tracing::info!(
-            completed = self.completed_tasks.len(),
-            failed = self.failed_tasks.len(),
-            total,
-            "primary finished"
-        );
+        // Final accounting: any task in `total_tasks` that is neither
+        // in `completed_tasks` nor in `failed_tasks` is *stranded* —
+        // the run loop exited (transport closed, all secondaries dead,
+        // inactivity timeout, etc.) before the per-task outcome could
+        // be recorded. Surfacing this category as a distinct counter
+        // (rather than silently letting it vanish into "total -
+        // completed - failed = unaccounted") is the load-bearing
+        // observability fix: pre-fix, asm-tokenizer's primary returned
+        // exit 0 with `Completed: 10 / Failed: 0 / Total: 484` and CI
+        // / ops scripts checking exit code saw green when 474 tasks
+        // had never even been dispatched. Post-fix, the same scenario
+        // produces a structured `RunError::ClusterCollapsed` with the
+        // per-category counts, the diagnostic log line below, and a
+        // non-zero exit at the PyO3 boundary.
+        let completed = self.completed_tasks.len();
+        let failed = self.failed_tasks.len();
+        self.stranded_count = total.saturating_sub(completed + failed);
+        let stranded = self.stranded_count;
 
         // Broadcast `RunComplete` so non-promoted secondaries on the
         // peer mesh know the run is genuinely over and can exit. Without
@@ -756,6 +857,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // detection holding SLURM job slots indefinitely. Idempotent on
         // re-application; failures here are non-fatal (the run already
         // succeeded, this is a cleanup signal).
+        //
+        // Issued whether or not stranded > 0: even on the cluster-
+        // collapse path, any peer still on the mesh deserves the same
+        // run-is-over signal so it can release its SLURM slot.
         self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::RunComplete]).await;
 
         // Brief settle window so the broadcast lands on every
@@ -767,6 +872,25 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // latency of an in-process / podman-bridge mesh; the cost on
         // happy-path exit is negligible.
         tokio::time::sleep(Duration::from_millis(500)).await;
+
+        if stranded > 0 {
+            tracing::error!(
+                completed,
+                failed,
+                stranded,
+                total,
+                "{stranded} tasks left unassigned because cluster routing collapsed \
+                 (completed={completed} failed={failed} stranded={stranded})"
+            );
+            return Err(RunError::ClusterCollapsed { stranded, completed, failed });
+        }
+
+        tracing::info!(
+            completed,
+            failed,
+            total,
+            "primary finished"
+        );
 
         Ok(())
     }

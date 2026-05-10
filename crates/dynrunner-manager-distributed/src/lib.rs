@@ -5,7 +5,7 @@ pub mod primary;
 pub mod secondary;
 pub mod zip_extract;
 
-pub use primary::{PrimaryCoordinator, PrimaryConfig};
+pub use primary::{PrimaryCoordinator, PrimaryConfig, RunError};
 pub use primary::staging::{compute_initial_staging_entries, StagingError};
 pub use primary::wire::compute_task_hash;
 pub use zip_extract::compute_file_hash;
