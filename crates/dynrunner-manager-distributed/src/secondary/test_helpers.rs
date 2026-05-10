@@ -131,6 +131,15 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         peer_timeout: Duration::from_secs(120),
         keepalive_miss_threshold: 2,
         retry_max_passes: 1,
+        // Tight failover threshold so R1 tests don't have to wait
+        // 30s of wall-clock. Threshold of 3 is the minimum allowed
+        // by the design (single-packet drop margin); the time
+        // window is 200ms (4 keepalive intervals at 50ms each)
+        // which is the smallest window that still gives the
+        // count-axis some headroom in tests that drive only
+        // count-axis behaviour.
+        primary_link_failure_threshold: 3,
+        primary_link_failure_window: Duration::from_millis(200),
     }
 }
 

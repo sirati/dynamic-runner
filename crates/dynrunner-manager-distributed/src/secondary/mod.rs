@@ -47,6 +47,24 @@ pub struct SecondaryConfig {
     /// field is inert — the live primary's `retry_max_passes` is what
     /// drives retry while the live primary is still authoritative.
     pub retry_max_passes: u32,
+
+    /// Number of consecutive primary-link recv-None probes after
+    /// which the secondary arms failover (i.e. sets
+    /// `primary_disconnected = true` and lets the election state
+    /// machine take over). Default is `primary_link::DEFAULT_FAILURE_THRESHOLD`
+    /// (5). Lower values arm faster — but bounding below 3 risks
+    /// promoting on a single dropped TCP packet retransmit, which is
+    /// wrong (per the architectural invariant: a transient packet
+    /// drop is not a leadership event).
+    pub primary_link_failure_threshold: u32,
+
+    /// Wall-clock window after the first observed primary-link recv
+    /// failure within which the threshold-attempts counter must
+    /// breach to avoid time-based arming. Default is
+    /// `primary_link::DEFAULT_FAILURE_WINDOW` (30s). Used to bound
+    /// failover latency on slow-keepalive configurations where 5
+    /// probes would exceed the SLURM time budget.
+    pub primary_link_failure_window: Duration,
 }
 
 impl Default for SecondaryConfig {
@@ -62,6 +80,8 @@ impl Default for SecondaryConfig {
             peer_timeout: Duration::from_secs(120),
             keepalive_miss_threshold: 3,
             retry_max_passes: 1,
+            primary_link_failure_threshold: primary_link::DEFAULT_FAILURE_THRESHOLD,
+            primary_link_failure_window: primary_link::DEFAULT_FAILURE_WINDOW,
         }
     }
 }
@@ -354,7 +374,11 @@ where
             std::env::temp_dir().join(format!("db_secondary_{}", &config.secondary_id))
         });
         let extraction_cache = ExtractionCache::new(tmp_dir, config.src_network.clone());
-        let primary_link = PrimaryLink::new(config.secondary_id.clone());
+        let primary_link = PrimaryLink::with_failover_threshold(
+            config.secondary_id.clone(),
+            config.primary_link_failure_threshold,
+            config.primary_link_failure_window,
+        );
         Self {
             config,
             primary_transport,

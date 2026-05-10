@@ -167,6 +167,10 @@ impl PyDistributedManager {
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_mass_death_grace = self.distributed_config.mass_death_grace();
         let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
+        let dist_primary_link_failure_threshold =
+            self.distributed_config.primary_link_failure_threshold();
+        let dist_primary_link_failure_window =
+            self.distributed_config.primary_link_failure_window();
         let worker_spec = self.worker_spec.clone();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
@@ -289,6 +293,10 @@ impl PyDistributedManager {
                             peer_timeout: dist_peer_timeout,
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
                             retry_max_passes: dist_retry_max_passes,
+                            primary_link_failure_threshold:
+                                dist_primary_link_failure_threshold,
+                            primary_link_failure_window:
+                                dist_primary_link_failure_window,
                         };
 
                         let estimator = sec_estimator;
