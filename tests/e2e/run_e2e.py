@@ -637,41 +637,6 @@ def _format_worker_leak_report(
     return lines
 
 
-def _ensure_ssh_master_alive(env: DispatchEnv) -> None:
-    """Re-spawn the Python-managed SSH master if its control socket
-    is gone.
-
-    The SSH master under `DYNRUNNER_SSH_CONTROL_PATH` is supposed to
-    live for the whole run, but empirically OpenSSH 10's master can
-    die mid-run under sustained slurm-test-env load (suspected
-    keepalive miss + MaxSessions contention). Without this guard, the
-    next dispatch's reverse-forward setup silently no-ops and the
-    secondaries hang on `Connection refused`. Called at every
-    scenario-boundary AND per-plan dispatch boundary so a master that
-    died mid-scenario still gets resurrected before the next plan
-    runs.
-    """
-    if env.mode != "slurm" or env.ssh_config_path is None:
-        return
-    cp_str = os.environ.get("DYNRUNNER_SSH_CONTROL_PATH")
-    if cp_str is None:
-        return
-    if Path(cp_str).exists():
-        return
-    print(
-        f"[ssh] master socket missing at {cp_str}; respawning",
-        flush=True,
-    )
-    from ._ssh_state import spawn_ssh_master  # noqa: E402
-    instance_state_dir = env.ssh_config_path.parent
-    new_cp = spawn_ssh_master(
-        instance_state_dir,
-        ssh_config_path=env.ssh_config_path,
-        host_alias=GATEWAY_HOST_ALIAS,
-    )
-    os.environ["DYNRUNNER_SSH_CONTROL_PATH"] = str(new_cp)
-
-
 def _select_scenarios(arg: str) -> list[Scenario]:
     """Resolve the ``--scenario`` CLI argument to a list of scenarios.
 
@@ -726,11 +691,6 @@ def _run_one_scenario(
         plans = scenario.prepare(env, tmp_root)
         results: list[ScenarioResult] = []
         for plan in plans:
-            # Per-plan SSH-master health check. Some scenarios (e.g.
-            # already-done) emit multiple plans; the master can die
-            # between them and the next plan would silently lose its
-            # reverse-forward path.
-            _ensure_ssh_master_alive(env)
             label_suffix = f"-{plan.label}" if plan.label else ""
             log_file = log_dir / f"{scenario.name}{label_suffix}.log"
             plan_timeout = (
@@ -1032,30 +992,12 @@ def main() -> int:
         ssh_identity_path = priv
         print(f"[ssh] ssh_config: {ssh_config_path}", flush=True)
         print(f"[ssh] identity:   {ssh_identity_path}", flush=True)
-
-        # Pre-spawn the SSH master from Python (which doesn't suffer
-        # the Rust+tokio process-supervision interaction that kills
-        # the framework's own master mid-run). The framework picks
-        # up `DYNRUNNER_SSH_CONTROL_PATH` and reuses this master
-        # instead of spawning its own; reverse forwards get added
-        # dynamically via `ssh -O forward`.
-        from ._ssh_state import spawn_ssh_master, stop_ssh_master  # noqa: E402
-        ssh_master_cp = spawn_ssh_master(
-            instance_state_dir,
-            ssh_config_path=ssh_config_path,
-            host_alias=GATEWAY_HOST_ALIAS,
-        )
-        os.environ["DYNRUNNER_SSH_CONTROL_PATH"] = str(ssh_master_cp)
-
-        # Tear down the master on driver exit so the cluster doesn't
-        # accumulate stale reverse forwards.
-        import atexit  # noqa: E402
-        atexit.register(
-            stop_ssh_master,
-            ssh_config_path=ssh_config_path,
-            control_path=ssh_master_cp,
-            host_alias=GATEWAY_HOST_ALIAS,
-        )
+        # Note: the e2e driver does NOT auto-set DYNRUNNER_SSH_CONTROL_PATH.
+        # The framework's own master spawn path (crates/dynrunner-gateway/
+        # src/ssh.rs::connect()) handles the SSH master lifecycle. The
+        # env-var hatch is preserved as an opt-in feature for harnesses
+        # that want to manage their own master — operators set it
+        # externally before invoking run_e2e if they need it.
 
     env = DispatchEnv(
         instance_id=args.instance_id,
@@ -1086,7 +1028,6 @@ def main() -> int:
     timed_out = False
     try:
         for scenario in scenarios:
-            _ensure_ssh_master_alive(env)
             ok, scenario_timed_out = _run_one_scenario(
                 scenario,
                 env,
