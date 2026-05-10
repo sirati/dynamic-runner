@@ -642,6 +642,34 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections().await?;
 
+        // Phase 2.5: Auto-stage. Run the staging walk on behalf of
+        // callers that didn't pre-queue via `queue_stage_file` /
+        // `queue_initial_staging_from_binaries`. Gate semantics
+        // (and the rationale for each one) live on
+        // `staging::maybe_auto_stage_initial`. The four-way gate
+        // collapses to "we have a root to walk, items are file-
+        // backed, we're not in pre-staged mode, and no caller pre-
+        // populated the queue" — any one false skips silently.
+        //
+        // Performed AFTER `wait_for_connections` so `self.secondaries`
+        // has the welcome-registered IDs (the staging fan-out is
+        // per-secondary), and BEFORE `perform_initial_assignment`
+        // which drains `pending_stage_files` into each recipient's
+        // `InitialAssignment.staged_files`. This is the single
+        // Rust-side call site for the staging walk; pyo3 wrappers
+        // just thread `source_dir` into config.
+        //
+        // Without this, the network-primary + local-secondaries
+        // pipeline (`--multi-computer local`) had no staging call
+        // site at all and lost every task to "expected StageFile
+        // notification first" on the secondary's
+        // unresolvable-task guard. The in-process distributed
+        // pipeline kept its explicit pre-call from #7, which the
+        // gate detects (non-empty queue) and skips — consistent
+        // SLURM-pipeline semantics where the explicit pre-call
+        // also wins.
+        self.maybe_auto_stage_initial()?;
+
         // Phase 3: Send peer lists
         self.send_peer_lists().await?;
 
