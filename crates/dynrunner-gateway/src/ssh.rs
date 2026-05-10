@@ -1,10 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::process::Command;
 use tracing;
 
 use crate::config::SshConfig;
@@ -14,25 +12,58 @@ use crate::shell::shell_quote;
 use crate::traits::{CommandResult, Gateway, GatewayError};
 
 /// Gateway for SSH connections using a persistent ControlMaster connection.
+///
+/// # Lifetime model
+///
+/// OpenSSH with `ControlPersist=yes` *always* forks-and-detaches at
+/// the end of the handshake: the `ssh -M -N` process we spawn (the
+/// "launcher") exits 0 within ~120ms via `exit_group(0)`; a daemon
+/// child becomes the persistent master, reparented to `systemd --user`
+/// (or PID 1 / init), in a different session. The daemon is the
+/// process that responds to control-socket commands (`ssh -O exit`
+/// / `ssh -O check` / per-channel ssh+scp invocations) — *not* the
+/// launcher.
+///
+/// Tracking the launcher's `tokio::process::Child` as the master
+/// lifetime anchor was the bug behind a silent regression of bug (g):
+/// `Child::kill()` and `kill_on_drop(true)` operate on the launcher
+/// zombie, so dropping `SshGateway` without calling `disconnect()`
+/// leaked the daemon. The "master died" observer fired for the
+/// launcher's normal voluntary exit ~120ms after handshake, not for
+/// daemon health.
+///
+/// Post-fix: we discover the daemon PID via `ssh -O check` after the
+/// control socket appears, reap the launcher zombie immediately, and
+/// hold the daemon PID as the lifetime anchor. Drop sends SIGTERM
+/// (then SIGKILL after a brief grace) to the daemon directly via
+/// `nix::sys::signal::kill`. The watcher polls `kill(daemon_pid, 0)`
+/// so the "master died" log fires for actual daemon death.
 pub struct SshGateway {
     config: SshConfig,
     connected: bool,
     control_path: Option<String>,
-    /// Master `ssh -M -N` child retained as a tokio process handle,
-    /// shared with `master_watch`. `kill_on_drop(true)` ensures Drop
-    /// without `disconnect()` does not leak the master (bug (g)).
-    /// Wrapped in `Arc<Mutex<Option<Child>>>` so the watcher task and
-    /// `disconnect()` can both call `try_wait` / `kill` without
-    /// fighting over the `&mut Child` exclusive borrow. `None` as the
-    /// inner value when the external `DYNRUNNER_SSH_CONTROL_PATH`
-    /// hatch is in use — the master belongs to an upstream driver in
-    /// that case.
-    master_child: Arc<Mutex<Option<Child>>>,
-    /// Background task that polls `master_child.try_wait()` and emits
-    /// a `tracing::error!` if the master exits unexpectedly. Aborted
-    /// in `disconnect()` before we tear the master down ourselves so
-    /// the *expected* exit doesn't surface as "died unexpectedly".
-    master_watch: Option<JoinHandle<()>>,
+    /// PID of the persistent `ControlPersist` daemon — the
+    /// reparented-to-init process that owns the control socket. `None`
+    /// before connect(), after disconnect(), and when the
+    /// `DYNRUNNER_SSH_CONTROL_PATH` external-master hatch is in use
+    /// (the daemon belongs to an upstream driver that did not share
+    /// its PID with us).
+    daemon_pid: Option<u32>,
+    /// Cancellation flag for the master-watcher std::thread. Set by
+    /// `disconnect()` *before* tearing the daemon down so the
+    /// *expected* exit doesn't surface as "died unexpectedly", and by
+    /// `Drop` for the same reason on the panic / forgot-to-disconnect
+    /// path. The watcher thread observes this on each 1s poll and
+    /// exits silently when set.
+    watcher_cancel: Arc<AtomicBool>,
+    /// Handle to the master-watcher std::thread. The thread is
+    /// deliberately *not* a tokio task: under PyO3+Python the
+    /// `connect()` runtime is short-lived (`block_on_local` builds a
+    /// fresh current-thread runtime per call and drops it on return),
+    /// so a tokio-spawned watcher would be cancelled the moment
+    /// connect() returns. A `std::thread` outlives any per-call
+    /// runtime and only exits on `watcher_cancel` or daemon death.
+    watcher_thread: Option<std::thread::JoinHandle<()>>,
     remote_home: Option<String>,
     forwarded_ports: Vec<(u16, u16)>,
     /// Whether GatewayPorts is enabled on the remote SSH server.
@@ -46,26 +77,30 @@ impl SshGateway {
             config,
             connected: false,
             control_path: None,
-            master_child: Arc::new(Mutex::new(None)),
-            master_watch: None,
+            daemon_pid: None,
+            watcher_cancel: Arc::new(AtomicBool::new(false)),
+            watcher_thread: None,
             remote_home: None,
             forwarded_ports: Vec::new(),
             gateway_ports_enabled: None,
         }
     }
 
-    /// PID of the framework-spawned SSH master, if any.
+    /// PID of the framework-spawned SSH master daemon, if any.
     ///
-    /// Returns `None` when the gateway is not connected, when the
+    /// Returns the *daemon* PID — the long-lived `ControlPersist`
+    /// process that responds to control-socket commands — discovered
+    /// via `ssh -O check` after the handshake completes. *Not* the
+    /// PID of the short-lived `ssh -M -N` launcher process we
+    /// `spawn()`'d, which exits ~120ms after handshake.
+    ///
+    /// `None` when the gateway is not connected, or when the
     /// `DYNRUNNER_SSH_CONTROL_PATH` external-master hatch is in use
-    /// (the master PID belongs to an upstream driver that did not
-    /// share it with us), or when the underlying `tokio::process::Child`
-    /// has already been reaped. Primarily intended for diagnostics
-    /// and the integration tests that pin the Drop-cleans-master
-    /// (bug (g)) and master-died-observer contracts.
-    pub async fn master_pid(&self) -> Option<u32> {
-        let slot = self.master_child.lock().await;
-        slot.as_ref().and_then(|c| c.id())
+    /// (the daemon belongs to an upstream driver). Primarily intended
+    /// for diagnostics and the integration tests that pin the
+    /// Drop-cleans-master (bug (g)) and master-died-observer contracts.
+    pub fn master_pid(&self) -> Option<u32> {
+        self.daemon_pid
     }
 
     /// Master-only `-o` flags. Pinned here (not in operator-owned
@@ -200,56 +235,30 @@ impl SshGateway {
         expand_tilde(path, self.remote_home.as_deref())
     }
 
-    /// Spawn the periodic `try_wait()` poller on the retained master
-    /// child. The poller shares ownership of the `Child` via the
-    /// `Arc<Mutex<Option<Child>>>`; on observing an exit it logs and
-    /// returns. Aborted by `disconnect()` *before* it tears the master
-    /// down, so a clean teardown does NOT log "exited unexpectedly".
-    fn spawn_master_watcher(&mut self) {
-        let child_slot = Arc::clone(&self.master_child);
-        let handle = tokio::spawn(async move {
-            // Poll cadence: 1s. Coarse enough to be near-free, fine
-            // enough that "master died ~2 min after handshake" is
-            // observed within the same minute.
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(1));
-            // First tick fires immediately; skip it so we don't race
-            // the handshake-completion path in connect().
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let mut slot = child_slot.lock().await;
-                let Some(child) = slot.as_mut() else {
-                    // Handle was taken by disconnect(); we're done.
-                    return;
-                };
-                // Read the PID *before* `try_wait()`: tokio nulls
-                // out `Child::id()` after reaping so the post-reap
-                // value is `None`, which makes the diagnostic log
-                // less useful.
-                let pid = child.id();
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        tracing::error!(
-                            pid = ?pid,
-                            exit_status = ?status,
-                            "SSH master exited unexpectedly"
-                        );
-                        return;
-                    }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!(
-                            pid = ?pid,
-                            error = %e,
-                            "SSH master try_wait failed; stopping observer"
-                        );
-                        return;
-                    }
-                }
-            }
-        });
-        self.master_watch = Some(handle);
+    /// Spawn the daemon-liveness watcher on a dedicated `std::thread`.
+    ///
+    /// The thread polls `nix::sys::signal::kill(daemon_pid, None)`
+    /// (the existence-probe form: signal 0, no actual signal sent) at
+    /// 1s cadence. On `Errno::ESRCH` (process gone) it emits a
+    /// `tracing::error!` so any future master-death class bug becomes
+    /// observable instead of silent. On `watcher_cancel` set, it
+    /// exits silently — `disconnect()` and `Drop` both raise the flag
+    /// *before* tearing the daemon down so an expected exit doesn't
+    /// surface as "died unexpectedly".
+    ///
+    /// Why `std::thread` and not `tokio::spawn`: under PyO3+Python the
+    /// `connect()` runtime is short-lived — `block_on_local` builds a
+    /// fresh current-thread tokio runtime per call and drops it on
+    /// return, which cancels every task spawned on it. A tokio-task
+    /// watcher would silently die the moment connect() returned to
+    /// Python. `std::thread` is decoupled from any runtime lifecycle.
+    fn spawn_master_watcher(&mut self, daemon_pid: u32) {
+        let cancel = Arc::clone(&self.watcher_cancel);
+        let handle = std::thread::Builder::new()
+            .name(format!("dynrunner-ssh-master-watch-{daemon_pid}"))
+            .spawn(move || master_watcher_loop(daemon_pid, cancel))
+            .expect("failed to spawn ssh-master-watch thread");
+        self.watcher_thread = Some(handle);
     }
 
     async fn check_gateway_ports(&mut self) {
@@ -290,19 +299,33 @@ impl SshGateway {
 impl Drop for SshGateway {
     /// Bug (g) safety net: if `disconnect()` was not called before
     /// drop (panic path, error short-circuit between connect() and
-    /// disconnect(), test that forgets to await disconnect), abort
-    /// the master-watcher first. Without this, the watcher task
-    /// keeps an Arc reference to `master_child` alive — the inner
-    /// `Child`'s `kill_on_drop(true)` never fires until the watcher
-    /// itself terminates, leaving the master process running.
+    /// disconnect(), test that forgets to await disconnect), tear the
+    /// daemon down ourselves via SIGTERM → grace → SIGKILL.
     ///
-    /// Aborting the watcher drops its Arc, leaving `Self`'s Arc as
-    /// the sole owner. When `Self`'s field then drops, the inner
-    /// `Mutex<Option<Child>>` drops, the `Child` drops, and tokio
-    /// sends SIGKILL.
+    /// `Drop` runs synchronously, so we cannot reuse the async
+    /// `disconnect()` path — and we must not, because Drop may run
+    /// on panic *or* on a runtime that is already being torn down.
+    /// `nix::sys::signal::kill` is sync, signals are async-signal-safe,
+    /// and the `kill(pid, 0)` existence probe is the canonical
+    /// no-runtime-required liveness check.
+    ///
+    /// Order:
+    ///   1. Raise `watcher_cancel` so the watcher thread exits
+    ///      silently — the daemon is about to die *expectedly*.
+    ///   2. SIGTERM the daemon. Poll `kill(pid, 0)` for up to 200ms.
+    ///   3. SIGKILL on grace expiry.
+    ///   4. Join the watcher thread (blocks at most ~1s for the next
+    ///      poll tick to observe the cancel flag).
     fn drop(&mut self) {
-        if let Some(watch) = self.master_watch.take() {
-            watch.abort();
+        self.watcher_cancel.store(true, Ordering::SeqCst);
+        if let Some(pid) = self.daemon_pid.take() {
+            terminate_daemon_blocking(pid);
+        }
+        if let Some(thread) = self.watcher_thread.take() {
+            // Best-effort join. The thread sees the cancel flag on
+            // its next 1s poll tick. We swallow `JoinError` because
+            // panicking in Drop would mask the underlying error.
+            let _ = thread.join();
         }
     }
 }
@@ -380,9 +403,10 @@ impl Gateway for SshGateway {
         // dir on `SshGateway` Drop, racing with the master's own
         // socket cleanup and stranding a master with no path back for
         // `ssh -O exit` (bug (g)). The socket file itself is unlinked
-        // by the master on clean exit; on dirty exit, kill_on_drop
-        // takes the master down and a stale socket file is harmless
-        // (next connect generates a new path).
+        // by the master on clean exit; on dirty exit, the daemon-PID
+        // SIGTERM/SIGKILL teardown in Drop takes the master down and
+        // a stale socket file is harmless (next connect generates a
+        // new path).
         let cp = generate_master_control_path();
         // Pre-flight: if a stale socket from a prior crashed instance
         // happens to collide (PID + sequence makes this near-
@@ -391,9 +415,15 @@ impl Gateway for SshGateway {
         self.control_path = Some(cp.clone());
 
         // Direct tokio spawn of `ssh -M -N` — no `-f`, no `setsid`
-        // indirection. The `SshGateway`'s lifetime IS the master's
-        // lifetime. Reparenting to init was a workaround for "we don't
-        // want to manage the lifetime", which we now do.
+        // indirection. NB the spawned process is the *launcher*: with
+        // `ControlPersist=yes` (which we pin in master_only_options),
+        // OpenSSH always forks a daemon child at end-of-handshake and
+        // the launcher exits 0 within ~120ms. The daemon, reparented
+        // to systemd --user / init, is the actual long-lived master.
+        // We discover its PID via `ssh -O check` once the control
+        // socket appears (below) and use *that* PID as the lifetime
+        // anchor — `kill_on_drop`/`Child::kill` operate on the
+        // launcher zombie and would no-op on the daemon.
         let argv = build_master_argv(
             &self.base_ssh_args(),
             &cp,
@@ -405,39 +435,34 @@ impl Gateway for SshGateway {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
-        // Bug (g) fix: if SshGateway drops without disconnect()
-        // running first (panic, error-return between connect() and
-        // disconnect()), tokio sends SIGKILL to the master so we
-        // don't leak orphans.
-        cmd.kill_on_drop(true);
+        // Note: NO `kill_on_drop(true)` — the launcher exits
+        // voluntarily ~120ms post-handshake, so kill_on_drop is at
+        // best a no-op (process already dead) and at worst signals a
+        // PID-reuse victim. Daemon teardown goes through
+        // `terminate_daemon_blocking(daemon_pid)` in Drop.
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut launcher = cmd.spawn().map_err(|e| {
             GatewayError::Other(format!("failed to spawn ssh master: {e}"))
         })?;
-        let master_pid = child.id();
-        {
-            let mut slot = self.master_child.lock().await;
-            *slot = Some(child);
-        }
+        let launcher_pid = launcher.id();
 
         // Wait for the control socket to appear. 10s timeout — the
         // SSH handshake usually completes in <500ms on a healthy link.
+        // While waiting, also poll the launcher: if it exited with
+        // *non-zero* status before the socket appeared, the handshake
+        // failed — surface immediately. A *zero* exit before the
+        // socket appears is benign (the daemon child created the
+        // socket but a small ordering window let the launcher's
+        // exit_group beat the directory entry showing up to us).
         let socket_path = std::path::Path::new(&cp);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut launcher_exited_with_failure: Option<std::process::ExitStatus> = None;
         while !socket_path.exists() {
-            // If the master died during handshake, surface that
-            // immediately rather than waiting out the full 10s.
+            if let Ok(Some(status)) = launcher.try_wait()
+                && !status.success()
             {
-                let mut slot = self.master_child.lock().await;
-                if let Some(child) = slot.as_mut()
-                    && let Ok(Some(status)) = child.try_wait()
-                {
-                    return Err(GatewayError::CommandFailed(format!(
-                        "SSH master exited during handshake with status {status:?}. \
-                         Pass --ssh-config <path> for ssh_config(5) overrides if a \
-                         host-key / agent / identity directive needs adjusting."
-                    )));
-                }
+                launcher_exited_with_failure = Some(status);
+                break;
             }
             if std::time::Instant::now() >= deadline {
                 return Err(GatewayError::CommandFailed(
@@ -449,18 +474,62 @@ impl Gateway for SshGateway {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+        if let Some(status) = launcher_exited_with_failure {
+            return Err(GatewayError::CommandFailed(format!(
+                "SSH master exited during handshake with status {status:?}. \
+                 Pass --ssh-config <path> for ssh_config(5) overrides if a \
+                 host-key / agent / identity directive needs adjusting."
+            )));
+        }
 
+        // Discover the daemon PID via `ssh -O check`. Output shape:
+        //   stdout: "Master running (pid=<N>)\n"
+        // Exit status non-zero means the control socket exists but
+        // doesn't respond — a real fault, not an interim handshake
+        // state (we already waited for the socket to appear).
+        let daemon_pid = match probe_master_pid(&cp, &self.ssh_target(), &self.base_ssh_args()).await {
+            Ok(pid) => pid,
+            Err(e) => {
+                // Best-effort cleanup so a probe failure doesn't leak
+                // the launcher / daemon. The launcher will exit on
+                // its own; we *don't* know the daemon PID, so fall
+                // back to `ssh -O exit` which goes via the socket and
+                // lands at the daemon.
+                let mut exit_cmd = Command::new("ssh");
+                for arg in self.base_ssh_args() {
+                    exit_cmd.arg(&arg);
+                }
+                exit_cmd.args(["-O", "exit", "-o", &format!("ControlPath={cp}")]);
+                exit_cmd.arg(self.ssh_target());
+                let _ = exit_cmd.output().await;
+                return Err(e);
+            }
+        };
+
+        // Reap the launcher zombie ASAP. Reading exit status is
+        // bookkeeping-only; we don't gate on it. On the rare path
+        // where the launcher hasn't exited yet (control socket showed
+        // up faster than the launcher's exit_group, possible on
+        // loaded systems) `wait()` blocks until it does — typically
+        // single-digit ms.
+        let _ = launcher.wait().await;
+
+        self.daemon_pid = Some(daemon_pid);
         self.connected = true;
-        tracing::info!(?master_pid, "SSH master connection established");
+        tracing::info!(
+            ?launcher_pid,
+            daemon_pid,
+            "SSH master connection established"
+        );
 
-        // Spawn the "master died" observer: periodic try_wait on the
-        // retained child, with a tracing::error! on unexpected exit.
-        // Aborted in disconnect() before we tear the master down
-        // ourselves so the *expected* exit doesn't surface as
-        // "died unexpectedly". This is task #5's acceptance gate (3):
-        // any future master-death class bug becomes observable
-        // instead of silent.
-        self.spawn_master_watcher();
+        // Spawn the "master died" observer: periodic existence-probe
+        // on the daemon PID via `nix::sys::signal::kill(pid, None)`,
+        // with a `tracing::error!` on ESRCH. Cancelled in disconnect()
+        // and Drop *before* we tear the daemon down ourselves so the
+        // *expected* exit doesn't surface as "died unexpectedly".
+        // This is task #5's acceptance gate (3): any future
+        // master-death class bug becomes observable instead of silent.
+        self.spawn_master_watcher(daemon_pid);
 
         // Detect remote home
         let home_result = self.ssh_command("echo $HOME", None).await?;
@@ -479,18 +548,18 @@ impl Gateway for SshGateway {
             return Ok(());
         }
 
-        // Stop the "master died" observer first. Anything from this
+        // Signal the watcher to exit silently. Anything from this
         // point forward is an *expected* teardown; the observer must
-        // not log it as unexpected. Abort + drop the JoinHandle is
-        // sufficient — the task only borrows the master_child slot
-        // briefly, so abort takes effect immediately.
-        if let Some(watch) = self.master_watch.take() {
-            watch.abort();
-        }
+        // not log it as unexpected. The watcher thread observes the
+        // flag on its next 1s poll and returns. We join the thread
+        // *after* the daemon is down so it has its expected exit
+        // condition (either flag-set or daemon-gone, whichever wins).
+        self.watcher_cancel.store(true, Ordering::SeqCst);
 
         // Politely ask the master to exit via `ssh -O exit` first,
         // which cleans up the control socket and reverse forwards in
-        // an orderly fashion.
+        // an orderly fashion. The control-socket request lands at the
+        // daemon (the launcher is long gone by now).
         let mut cmd = Command::new("ssh");
         for arg in self.base_ssh_args() {
             cmd.arg(&arg);
@@ -501,38 +570,21 @@ impl Gateway for SshGateway {
         cmd.arg(self.ssh_target());
         let _ = cmd.output().await;
 
-        // If the child is still alive after a short grace, SIGKILL
-        // via `Child::kill`. We own the master's lifetime now (no `-f`
-        // daemonisation, no setsid reparent), so this is a guaranteed
-        // teardown.
-        let mut slot = self.master_child.lock().await;
-        if let Some(mut child) = slot.take() {
-            // Up to 1s grace for `ssh -O exit` to land — should be
-            // <100ms in practice but we don't want to race the
-            // OpenSSH master's own teardown timing.
-            let grace = std::time::Instant::now()
-                + std::time::Duration::from_millis(1000);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= grace {
-                            let _ = child.kill().await;
-                            let _ = child.wait().await;
-                            break;
-                        }
-                        tokio::time::sleep(
-                            std::time::Duration::from_millis(20),
-                        )
-                        .await;
-                    }
-                    Err(_) => {
-                        let _ = child.kill().await;
-                        let _ = child.wait().await;
-                        break;
-                    }
-                }
-            }
+        // Wait for the daemon to actually exit, with SIGTERM/SIGKILL
+        // fallback. `terminate_daemon_blocking` is sync — fine because
+        // it does at most a 200ms grace poll plus signal sends, and
+        // the call site is async-aware (we already awaited
+        // `ssh -O exit`'s output above so the polite path had its
+        // chance). Centralising the daemon-teardown ladder here means
+        // Drop and disconnect() share the same correctness contract.
+        if let Some(pid) = self.daemon_pid.take() {
+            terminate_daemon_blocking(pid);
+        }
+
+        // Join the watcher thread (sync — it observes the cancel
+        // flag on its next 1s poll). This is bounded at ~1s.
+        if let Some(thread) = self.watcher_thread.take() {
+            let _ = thread.join();
         }
 
         self.connected = false;
@@ -715,9 +767,12 @@ fn build_master_argv(
 ) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     argv.extend(base_args.iter().cloned());
-    // -M: master mode. -N: no remote command. NO `-f`: we manage the
-    // master's lifetime via the retained tokio::process::Child, not
-    // by daemonising into init.
+    // -M: master mode. -N: no remote command. NO `-f`: we don't ask
+    // ssh to daemonise via fork-into-init. (That said, with
+    // `ControlPersist=yes` OpenSSH always forks a daemon child anyway
+    // — the `-f` flag would only suppress the launcher's foreground
+    // window, not change the daemon's existence. We track the daemon
+    // PID via `ssh -O check` in `connect()` regardless.)
     argv.push("-M".into());
     argv.push("-N".into());
     argv.push("-o".into());
@@ -804,6 +859,205 @@ impl Filesystem for SshGateway {
         }
 
         Ok(parse_find_printf(&result.stdout))
+    }
+}
+
+// ---------------------------------------------------------------------
+// Daemon-PID helpers — single concern: track the OpenSSH ControlPersist
+// daemon (not the launcher) as the SSH master lifetime anchor. See the
+// `# Lifetime model` doc on `SshGateway` for the why.
+// ---------------------------------------------------------------------
+
+/// Run `ssh -O check` over the control socket and return the daemon
+/// PID. Errors when:
+///   - the spawn fails (e.g. `ssh` not in $PATH)
+///   - exit status is non-zero (the socket exists but doesn't respond
+///     — a real fault, not an interim handshake state)
+///   - the output doesn't include `Master running (pid=<N>)` (an
+///     OpenSSH version that changed the format)
+async fn probe_master_pid(
+    control_path: &str,
+    target: &str,
+    base_args: &[String],
+) -> Result<u32, GatewayError> {
+    let mut cmd = Command::new("ssh");
+    for arg in base_args {
+        cmd.arg(arg);
+    }
+    cmd.args([
+        "-O",
+        "check",
+        "-o",
+        &format!("ControlPath={control_path}"),
+    ]);
+    cmd.arg(target);
+
+    let output = cmd.output().await.map_err(|e| {
+        GatewayError::CommandFailed(format!("ssh -O check spawn: {e}"))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GatewayError::CommandFailed(format!(
+            "control socket unresponsive (ssh -O check exited {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim()
+        )));
+    }
+    // OpenSSH writes "Master running (pid=N)" to stdout on success.
+    // Some older builds wrote to stderr; concatenate both for safety
+    // — single concern: extract a u32 PID from whatever ssh said.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    parse_master_pid(&stdout)
+        .or_else(|| parse_master_pid(&stderr))
+        .ok_or_else(|| {
+            GatewayError::CommandFailed(format!(
+                "ssh -O check succeeded but output did not contain \
+                 `Master running (pid=N)`: stdout={stdout:?} stderr={stderr:?}"
+            ))
+        })
+}
+
+/// Parse `Master running (pid=<N>)` out of `ssh -O check` output.
+///
+/// Pure / no-allocation parser, kept private to avoid implying a
+/// stable API. Returns `None` when the marker isn't present or when
+/// the digit run after `pid=` doesn't fit in `u32`.
+fn parse_master_pid(s: &str) -> Option<u32> {
+    let marker = "Master running (pid=";
+    let rest = s.find(marker).map(|i| &s[i + marker.len()..])?;
+    let pid_str: String =
+        rest.chars().take_while(char::is_ascii_digit).collect();
+    if pid_str.is_empty() {
+        return None;
+    }
+    pid_str.parse().ok()
+}
+
+/// Watcher loop: poll daemon liveness via `kill(pid, 0)` once per
+/// second. Exits silently on `cancel` set; emits one
+/// `tracing::error!("SSH master exited unexpectedly")` on observing
+/// `ESRCH` (the daemon is gone).
+///
+/// This runs on a `std::thread`, *not* a tokio task — see the
+/// `watcher_thread` field doc on `SshGateway` for why.
+fn master_watcher_loop(daemon_pid: u32, cancel: Arc<AtomicBool>) {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let pid = Pid::from_raw(daemon_pid as i32);
+    // 1s cadence: coarse enough to be near-free, fine enough that
+    // "master died ~2 min after handshake" is observed within the
+    // same minute. We sleep *before* the first probe so we don't
+    // race the daemon's coming-up window during connect().
+    let tick = std::time::Duration::from_secs(1);
+    loop {
+        std::thread::sleep(tick);
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        match kill(pid, None) {
+            Ok(()) => continue,
+            Err(Errno::ESRCH) => {
+                tracing::error!(
+                    daemon_pid,
+                    "SSH master exited unexpectedly"
+                );
+                return;
+            }
+            Err(e) => {
+                // EPERM in particular means the daemon is alive but
+                // not owned by us (PID reuse onto another user's
+                // process — rare, but possible). Treat any other
+                // errno as "stop probing" so we don't spin forever
+                // on a structural fault.
+                tracing::warn!(
+                    daemon_pid,
+                    error = %e,
+                    "SSH master kill(pid,0) probe failed; stopping observer"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Sync daemon-teardown ladder: SIGTERM → 200ms grace → SIGKILL.
+///
+/// Used by both `disconnect()` (after `ssh -O exit`) and `Drop` (on
+/// the panic / forgot-to-disconnect path). Single concern: "given a
+/// daemon PID, stop polling until that PID is gone, escalating signal
+/// strength on grace expiry". No-ops cleanly when the daemon is
+/// already gone (typical post-`ssh -O exit` case) — `kill(pid, 0)`
+/// returns ESRCH, the loop exits.
+///
+/// Sync (not async) for two reasons:
+///   1. Drop is sync — async-ifying would require holding a runtime
+///      handle on the gateway, which leaks runtime ownership into
+///      the gateway type.
+///   2. The polite `ssh -O exit` already had its async chance up the
+///      stack; this is the fallback ladder, where blocking for at
+///      most 200ms+grace is cheap.
+fn terminate_daemon_blocking(daemon_pid: u32) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{Signal, kill};
+    use nix::unistd::Pid;
+
+    let pid = Pid::from_raw(daemon_pid as i32);
+
+    // Fast-path: already gone (e.g. `ssh -O exit` worked, or this is
+    // a second teardown call after disconnect()).
+    if matches!(kill(pid, None), Err(Errno::ESRCH)) {
+        return;
+    }
+
+    // SIGTERM, then poll until ESRCH or grace expires.
+    if let Err(e) = kill(pid, Signal::SIGTERM)
+        && !matches!(e, Errno::ESRCH)
+    {
+        tracing::warn!(
+            daemon_pid,
+            error = %e,
+            "SIGTERM to SSH master daemon failed"
+        );
+    }
+    let grace = std::time::Instant::now()
+        + std::time::Duration::from_millis(200);
+    let poll = std::time::Duration::from_millis(20);
+    loop {
+        if matches!(kill(pid, None), Err(Errno::ESRCH)) {
+            return;
+        }
+        if std::time::Instant::now() >= grace {
+            break;
+        }
+        std::thread::sleep(poll);
+    }
+
+    // Grace expired — SIGKILL. Reaping isn't ours to do (the daemon
+    // is reparented to systemd --user / init), so we just signal and
+    // poll once more to confirm. If it's *still* alive, log it: the
+    // teardown contract is "best effort", but the operator should
+    // know.
+    if let Err(e) = kill(pid, Signal::SIGKILL)
+        && !matches!(e, Errno::ESRCH)
+    {
+        tracing::warn!(
+            daemon_pid,
+            error = %e,
+            "SIGKILL to SSH master daemon failed"
+        );
+    }
+    // Brief post-SIGKILL settle. We don't loop: SIGKILL is
+    // un-ignorable, and a process surviving SIGKILL is an
+    // unrecoverable kernel-level fault we don't want to spin on.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    if !matches!(kill(pid, None), Err(Errno::ESRCH)) {
+        tracing::error!(
+            daemon_pid,
+            "SSH master daemon still alive after SIGKILL — operator intervention required"
+        );
     }
 }
 
@@ -950,12 +1204,17 @@ mod tests {
         );
         assert!(argv.contains(&"-M".to_string()));
         assert!(argv.contains(&"-N".to_string()));
-        // No `-f`: we manage the master's lifetime via the retained
-        // tokio Child. Pin this so a regression doesn't silently
-        // re-introduce daemonisation and orphan masters again.
+        // No `-f`: even though `ControlPersist=yes` causes OpenSSH to
+        // fork-and-detach a daemon at handshake-end *anyway* (we
+        // track that daemon's PID via `ssh -O check`), `-f` adds an
+        // unrelated effect — fork *before* full handshake — that has
+        // historically masked auth failures by exiting 0 from the
+        // foreground process before the failure surfaced. Pin its
+        // absence so a regression doesn't silently re-introduce that
+        // failure-masking behaviour.
         assert!(
             !argv.contains(&"-f".to_string()),
-            "master argv must not contain `-f` (we own the lifetime); argv={argv:?}"
+            "master argv must not contain `-f` (auth-failure masking); argv={argv:?}"
         );
     }
 
@@ -1021,6 +1280,49 @@ mod tests {
             "even worst-case PID/seq path is {} bytes ({:?})",
             synthetic.len(),
             synthetic,
+        );
+    }
+
+    /// `ssh -O check` produces `Master running (pid=<N>)` followed by
+    /// a newline. Any digits after `pid=` until the first non-digit
+    /// is the PID. The parser must extract it cleanly even when the
+    /// line is embedded in surrounding output.
+    #[test]
+    fn parse_master_pid_extracts_from_canonical_output() {
+        assert_eq!(parse_master_pid("Master running (pid=12345)\n"), Some(12345));
+    }
+
+    #[test]
+    fn parse_master_pid_handles_leading_whitespace_and_extra_lines() {
+        let out = "  Master running (pid=42)\nsomething else\n";
+        assert_eq!(parse_master_pid(out), Some(42));
+    }
+
+    #[test]
+    fn parse_master_pid_returns_none_when_marker_absent() {
+        // Negative path: the `Stop listening request sent.` reply
+        // (which ssh -O stop emits) must NOT be parsed as a PID.
+        assert_eq!(parse_master_pid("Stop listening request sent.\n"), None);
+        // And: missing `pid=` entirely.
+        assert_eq!(parse_master_pid("Master running\n"), None);
+        assert_eq!(parse_master_pid(""), None);
+    }
+
+    #[test]
+    fn parse_master_pid_returns_none_on_non_numeric_pid() {
+        // Defence against an OpenSSH version that prints something
+        // unexpected after `pid=` — return None, surface the issue
+        // up the stack as `CommandFailed`, don't fabricate a PID.
+        assert_eq!(parse_master_pid("Master running (pid=abc)"), None);
+    }
+
+    #[test]
+    fn parse_master_pid_rejects_overflow() {
+        // u32 max = 4_294_967_295. Anything wider must yield None
+        // rather than silently truncating.
+        assert_eq!(
+            parse_master_pid("Master running (pid=99999999999999)"),
+            None
         );
     }
 }

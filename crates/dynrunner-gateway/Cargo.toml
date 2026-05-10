@@ -16,6 +16,13 @@ tokio = { workspace = true, features = ["process", "fs", "time"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tempfile = "3"
+# `nix::sys::signal::kill` for daemon-master lifetime control: the
+# OpenSSH `ControlPersist=yes` master forks-and-detaches at handshake
+# end (reparented to systemd --user / init), so the launcher Child we
+# spawned is a short-lived zombie. We track the daemon PID via
+# `ssh -O check` and signal it directly. `kill(pid, None)` is the
+# existence probe; SIGTERM/SIGKILL the teardown levers in Drop.
+nix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

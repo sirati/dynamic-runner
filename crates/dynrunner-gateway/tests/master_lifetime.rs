@@ -8,6 +8,20 @@
 //!   gateway is connected, the periodic poller must emit a
 //!   `tracing::error!("SSH master exited unexpectedly")` event so
 //!   any future similar-class bug is observable instead of silent.
+//! - **T5** (`drop_kills_daemon_master`): the bug-(g)-redux
+//!   regression-pin. The first attempted bug-(g) fix tracked the
+//!   *launcher* PID (the `ssh -M -N` process we spawn), which exits
+//!   ~120ms post-handshake under `ControlPersist=yes` regardless of
+//!   anything we do. So `Child::kill()` / `kill_on_drop(true)`
+//!   operated on the launcher zombie and the *daemon* — the
+//!   reparented-to-init `ControlPersist` master that actually owns
+//!   the control socket — survived `SshGateway::Drop`. T5 explicitly
+//!   takes the daemon PID (now what `master_pid()` returns) and
+//!   asserts it's gone within 1s of drop.
+//! - **T-launcher-vs-daemon-pid** (`master_pid_is_daemon_not_launcher`):
+//!   pin that `master_pid()` returns the daemon PID by re-deriving
+//!   the daemon PID independently via a fresh `ssh -O check`
+//!   subprocess and asserting both match.
 //!
 //! These tests need an actual sshd they can authenticate against.
 //! They:
@@ -23,11 +37,13 @@
 
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use dynrunner_gateway::config::SshConfig;
 use dynrunner_gateway::ssh::SshGateway;
 use dynrunner_gateway::traits::Gateway;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// True iff something is listening on `localhost:22`. Used to skip
 /// these integration tests on hosts without sshd (most CI runners).
@@ -37,6 +53,25 @@ fn sshd_reachable() -> bool {
         Duration::from_millis(200),
     )
     .is_ok()
+}
+
+/// Serialise all tests in this file. They mutate `~/.ssh/authorized_keys`
+/// via `AuthorizedKey::provision` / `Drop` and bind ports + spawn
+/// `ssh -M -N` masters; running them in parallel races
+/// authorized_keys (`Drop` strips lines that other in-flight tests
+/// wrote) and produces flaky `exit 255` handshake failures. Cargo's
+/// default `--test-threads=N>1` would otherwise schedule them in
+/// parallel.
+///
+/// `tokio::sync::Mutex` (not `std::sync::Mutex`) because every test
+/// holds the guard across `.await` points, and the workspace lints
+/// deny `clippy::await_holding_lock`. The async-aware mutex yields
+/// cleanly while holding the guard. The witness type is `()` so
+/// there's nothing to corrupt under contention.
+async fn serialise() -> OwnedMutexGuard<()> {
+    static SERIAL: OnceLock<std::sync::Arc<Mutex<()>>> = OnceLock::new();
+    let m = SERIAL.get_or_init(|| std::sync::Arc::new(Mutex::new(())));
+    m.clone().lock_owned().await
 }
 
 unsafe extern "C" {
@@ -164,6 +199,7 @@ fn make_gateway(authorized: &AuthorizedKey) -> SshGateway {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t3_drop_cleans_master() {
+    let _serial = serialise().await;
     if !sshd_reachable() {
         eprintln!("[skip] sshd not reachable on localhost:22 — bug-(g) fix unverified");
         return;
@@ -183,15 +219,19 @@ async fn t3_drop_cleans_master() {
 
     let pid = gw
         .master_pid()
-        .await
         .expect("framework-spawned master must report a PID");
     assert!(pid_alive(pid), "master must be alive immediately after connect");
 
     // Drop the gateway WITHOUT calling disconnect(). Bug (g) was: the
     // master would persist after this drop because the framework had
     // discarded the std::process::Child on `setsid -f -- ssh -M -N -f`.
-    // Post-fix: the retained tokio Child + kill_on_drop(true) take it
-    // down within milliseconds.
+    // The first attempted fix (retained tokio Child + kill_on_drop)
+    // tracked the *launcher* PID, which exits ~120ms post-handshake
+    // anyway — so kill_on_drop hit a zombie and the daemon (the
+    // actual long-lived `ControlPersist` process, reparented to
+    // systemd --user) survived. Post-the-real-fix: `master_pid()`
+    // returns the *daemon* PID and Drop sends SIGTERM/SIGKILL via
+    // `nix::kill` directly to it.
     drop(gw);
 
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -206,6 +246,7 @@ async fn t3_drop_cleans_master() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[tracing_test::traced_test]
 async fn t4_master_died_observer_emits_log() {
+    let _serial = serialise().await;
     if !sshd_reachable() {
         eprintln!("[skip] sshd not reachable on localhost:22 — observer log unverified");
         return;
@@ -221,7 +262,7 @@ async fn t4_master_died_observer_emits_log() {
     let mut gw = make_gateway(&authorized);
     gw.connect().await.expect("connect");
 
-    let pid = gw.master_pid().await.expect("master pid");
+    let pid = gw.master_pid().expect("master pid");
     // Kill the master externally with SIGKILL — simulates the
     // "master dies under us" class of failure.
     let rc = unsafe { kill(pid as i32, 9) };
@@ -258,3 +299,164 @@ async fn t4_master_died_observer_emits_log() {
 // `logs_contain(...)` and `logs_assert(...)` are injected into the
 // test's scope by the `#[tracing_test::traced_test]` attribute
 // macro — see its docs for the capture-and-search semantics.
+
+/// T5: regression-pin for bug-(g)-redux — the first attempted fix
+/// tracked the launcher PID, which exits ~120ms post-handshake on its
+/// own under `ControlPersist=yes`. `kill_on_drop(true)` therefore
+/// hit a zombie (no-op) and the daemon, reparented to systemd --user
+/// / init, leaked. Distinct from T3 in *intent* (pin the explicit
+/// daemon-vs-launcher contract) and *aggressiveness* (read the
+/// daemon PID via the public `master_pid()` accessor explicitly,
+/// then verify ESRCH after drop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t5_drop_kills_daemon_master() {
+    let _serial = serialise().await;
+    if !sshd_reachable() {
+        eprintln!("[skip] sshd not reachable on localhost:22 — bug-(g)-redux unverified");
+        return;
+    }
+    let authorized = match AuthorizedKey::provision() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[skip] could not provision authorized_keys: {e}");
+            return;
+        }
+    };
+
+    let mut gw = make_gateway(&authorized);
+    gw.connect().await.expect("connect to local sshd");
+
+    let daemon_pid = gw
+        .master_pid()
+        .expect("master_pid() must report the daemon PID after connect");
+    assert!(
+        pid_alive(daemon_pid),
+        "daemon pid {daemon_pid} must be alive immediately after connect"
+    );
+
+    // Drop the gateway WITHOUT calling disconnect(). Pre-bug-(g)-redux
+    // fix: this would NOT take the daemon down because we tracked
+    // the launcher PID. Post-fix: Drop sends SIGTERM (then SIGKILL
+    // after 200ms grace) directly to the daemon via nix::kill.
+    drop(gw);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while pid_alive(daemon_pid) {
+        if Instant::now() >= deadline {
+            panic!(
+                "daemon pid {daemon_pid} still alive 1s after gateway drop — \
+                 bug-(g)-redux regression: Drop is hitting the launcher \
+                 zombie instead of the ControlPersist daemon"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// T-launcher-vs-daemon-pid: assert that `master_pid()` returns the
+/// daemon PID — the long-lived, reparented-to-init `ControlPersist`
+/// process — by independently re-deriving it from a fresh
+/// `ssh -O check` invocation. The two PIDs must agree. Pre-fix,
+/// `master_pid()` returned the launcher PID (the `ssh -M -N` process
+/// we spawned), which is a different PID than what `ssh -O check`
+/// reports as the master.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn master_pid_is_daemon_not_launcher() {
+    let _serial = serialise().await;
+    if !sshd_reachable() {
+        eprintln!("[skip] sshd not reachable on localhost:22 — daemon-PID contract unverified");
+        return;
+    }
+    let authorized = match AuthorizedKey::provision() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[skip] could not provision authorized_keys: {e}");
+            return;
+        }
+    };
+
+    let mut gw = make_gateway(&authorized);
+    gw.connect().await.expect("connect");
+
+    let reported_pid = gw
+        .master_pid()
+        .expect("master_pid() must report the daemon PID after connect");
+
+    // Independently parse the daemon PID from a fresh `ssh -O check`
+    // — bypassing the gateway's cached value. We don't have direct
+    // access to the control_path field (it's private), so reach for
+    // it via a short-lived `Filesystem`-style probe: list `/tmp` for
+    // `dynrunner-m-*.sock` and pick the most recent. With one
+    // gateway instance per test process this is unambiguous; with
+    // many it'd be racy but the test runs single-instance.
+    let cp = std::fs::read_dir("/tmp")
+        .expect("read /tmp")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("dynrunner-m-") && s.ends_with(".sock"))
+        })
+        .max_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .expect("could not locate the gateway's control socket under /tmp");
+
+    let target = format!(
+        "{}@127.0.0.1",
+        std::env::var("USER").expect("USER")
+    );
+    let out = StdCommand::new("ssh")
+        .args([
+            "-i",
+            authorized.private_path.to_str().unwrap(),
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-F",
+            authorized.key_dir.path().join("ssh_config").to_str().unwrap(),
+            "-O",
+            "check",
+            "-o",
+            &format!("ControlPath={}", cp.display()),
+            &target,
+        ])
+        .output()
+        .expect("spawn ssh -O check");
+    assert!(
+        out.status.success(),
+        "ssh -O check failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let marker = "Master running (pid=";
+    let i = combined
+        .find(marker)
+        .expect("ssh -O check output missing `Master running (pid=`");
+    let rest = &combined[i + marker.len()..];
+    let pid_str: String =
+        rest.chars().take_while(char::is_ascii_digit).collect();
+    let independent_pid: u32 = pid_str
+        .parse()
+        .expect("ssh -O check pid was non-numeric");
+
+    assert_eq!(
+        reported_pid, independent_pid,
+        "master_pid() ({reported_pid}) must match the daemon PID reported \
+         by an independent `ssh -O check` ({independent_pid}). If they \
+         differ, master_pid() is leaking the launcher PID — the very \
+         class of bug we're pinning against."
+    );
+
+    // Clean up.
+    gw.disconnect().await.expect("disconnect");
+}
