@@ -5,7 +5,7 @@ use pyo3::types::PyList;
 
 use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{
-    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, StagingError,
+    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, RunError, StagingError,
 };
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
@@ -34,6 +34,15 @@ pub(crate) struct PyPrimaryCoordinator {
     listen_port: Option<u16>,
     completed: u32,
     failed: u32,
+    /// Tasks that exited the inner run loop without a recorded
+    /// outcome (`total - completed - failed`). Mirrors
+    /// `PrimaryCoordinator::stranded_count` after `run()` returns; the
+    /// `stranded` PyO3 getter exposes it so consumers (Python `run.py`,
+    /// SLURM pipeline) can include the per-category count in their
+    /// "Completed: / Failed: / Stranded:" output and ops scripts can
+    /// distinguish "everything ran but some failed" from "the cluster
+    /// collapsed before all tasks even dispatched".
+    stranded: u32,
     // Pre-`run()` queue of StageFile notifications. The pipeline calls
     // `notify_stage_file(...)` on this pyclass as part of packaging
     // (before `run()` ever starts the coordinator). On `run()`, this
@@ -118,6 +127,7 @@ impl PyPrimaryCoordinator {
             listen_port,
             completed: 0,
             failed: 0,
+            stranded: 0,
             pending_stage_files: Vec::new(),
             source_pre_staged_root,
             source_dir,
@@ -255,6 +265,17 @@ impl PyPrimaryCoordinator {
 
         let mut completed = 0u32;
         let mut failed = 0u32;
+        let mut stranded = 0u32;
+        // Cluster-collapsed signal carried out of the detached tokio
+        // runtime. `Some(...)` iff the inner `PrimaryCoordinator::run`
+        // returned `RunError::ClusterCollapsed { .. }`; the GIL-side
+        // tail of this method translates it into a `PyRuntimeError`
+        // so the Python caller's exit code reflects the cluster
+        // collapse instead of the historical silent exit-0. Other
+        // `RunError::Other(...)` failures keep the legacy log-and-
+        // swallow behaviour to minimise the blast radius of this
+        // accounting-only patch.
+        let mut cluster_collapsed: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -331,9 +352,13 @@ impl PyPrimaryCoordinator {
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary coordinator failed");
                 }
+                if let Err(RunError::ClusterCollapsed { .. }) = &result {
+                    cluster_collapsed = result.err();
+                }
 
                 completed = primary.completed_count() as u32;
                 failed = primary.failed_count() as u32;
+                stranded = primary.stranded_count() as u32;
             }));
         });
 
@@ -345,6 +370,11 @@ impl PyPrimaryCoordinator {
 
         self.completed = completed;
         self.failed = failed;
+        self.stranded = stranded;
+
+        if let Some(err) = cluster_collapsed {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
+        }
 
         Ok(())
     }
@@ -357,6 +387,18 @@ impl PyPrimaryCoordinator {
     #[getter]
     fn failed(&self) -> u32 {
         self.failed
+    }
+
+    /// Tasks left without a recorded outcome at the end of the run
+    /// (`total - completed - failed`). Zero on a clean run; `>0` is
+    /// the cluster-collapse path the underlying `RunError::ClusterCollapsed`
+    /// reports — Python `run.py` reads this getter (alongside
+    /// `completed` / `failed`) to log the per-category breakdown
+    /// before the `RuntimeError` from `run()` propagates and surfaces
+    /// the non-zero exit.
+    #[getter]
+    fn stranded(&self) -> u32 {
+        self.stranded
     }
 }
 
