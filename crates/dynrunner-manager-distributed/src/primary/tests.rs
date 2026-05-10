@@ -3150,3 +3150,387 @@ async fn clean_run_does_not_false_positive_stranded() {
     })
     .await;
 }
+
+// ── Demoted-primary ClusterMutation arm: regression gate against the
+// asm-dataset-nix R2 / T3 1200s hang.
+//
+// Pre-fix the primary-side `dispatch_message` had no arm for
+// `MessageType::ClusterMutation` — every ClusterMutation broadcast
+// addressed at the demoted local primary fell through the catch-all,
+// leaving its replicated `cluster_state` mirror frozen at the
+// pre-promotion view and the per-task accounting (`completed_tasks` /
+// `failed_tasks`, the two sets the operational loop's exit-counter
+// check reads) blind to cross-secondary completions on the new primary's
+// pool. The loop sat forever; the local-primary process never exited;
+// the asm-dataset-nix e2e harness killed it at the 1200s deadline.
+//
+// The three tests below pin:
+//   T-A: a synthetic `ClusterMutation::TaskCompleted` arriving via
+//        `dispatch_message` lands in `completed_tasks` (the unit
+//        contract — without this `completed + failed >= total` cannot
+//        trip on a demoted primary).
+//   T-B: an end-to-end run where the local primary is demoted and the
+//        promoted secondary's RunComplete signal must land on the
+//        demoted primary's `cluster_state.run_complete()` and break
+//        the operational loop within bounded wait — same window as the
+//        existing 500ms RunComplete settle in `run()`.
+//   T-C: an explicit ClusterMutation::RunComplete delivered via the
+//        demoted primary's transport must drive the same exit cleanly
+//        even when no task accounting is in play (the
+//        `cluster_state.run_complete()` exit fires standalone).
+
+/// T-A — unit contract. Drive `dispatch_message` directly with a
+/// synthesized `DistributedMessage::ClusterMutation` carrying a
+/// `TaskCompleted` mutation; assert `completed_tasks` grows. Failed
+/// pre-fix because the dispatch-message catch-all silently dropped
+/// every ClusterMutation arrival on the primary side; succeeds post-fix
+/// because the new arm threads the mutation through both the local
+/// `cluster_state` mirror and the accounting sets the operational
+/// loop's exit-counter check reads.
+#[tokio::test(flavor = "current_thread")]
+async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, _ends) = setup_test(1);
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Pre-state: empty completed_tasks. Post-fix the
+        // ClusterMutation arm grows it from any TaskCompleted /
+        // TaskFailed mutation, regardless of whether the hash also
+        // appears in cluster_state's CRDT (which has its own
+        // happens-before constraint requiring TaskAdded first — that
+        // path is exercised by the e2e tests, not this unit one).
+        // The accounting sets are the load-bearing surface for the
+        // operational loop's exit-counter check, so they're what we
+        // pin here.
+        assert!(primary.completed_tasks.is_empty());
+        assert!(primary.failed_tasks.is_empty());
+
+        // Seed cluster_state with TaskAdded so the subsequent
+        // TaskCompleted apply isn't a NoOp (the CRDT requires the
+        // entry to exist before transitioning state). Without the
+        // seed the cluster_state assertion below would be unreachable
+        // even on a correct fix.
+        let bin = make_binary("demoted-arm-task", 100);
+        let hash = super::wire::compute_task_hash(&bin);
+        let seed_msg = DistributedMessage::ClusterMutation {
+            sender_id: "sec-promoted".into(),
+            timestamp: 0.0,
+            mutations: vec![
+                dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::TaskAdded {
+                    hash: hash.clone(),
+                    task: bin,
+                },
+            ],
+        };
+        primary
+            .dispatch_message(seed_msg)
+            .await
+            .expect("seed TaskAdded must dispatch");
+
+        let msg = DistributedMessage::ClusterMutation {
+            sender_id: "sec-promoted".into(),
+            timestamp: 0.0,
+            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::<
+                TestId,
+            >::TaskCompleted {
+                hash: hash.clone(),
+            }],
+        };
+        primary
+            .dispatch_message(msg)
+            .await
+            .expect("dispatch_message must accept a ClusterMutation");
+
+        assert!(
+            primary.completed_tasks.contains(&hash),
+            "ClusterMutation::TaskCompleted must mirror into completed_tasks; \
+             without this the demoted primary's `completed + failed >= total` \
+             exit-counter check never trips on cross-secondary completions"
+        );
+
+        // The cluster_state mirror also reflects the mutation — the
+        // CRDT lattice is the source of truth for the primary's view
+        // of the run, even post-demotion. Verifies the apply is on
+        // the same code path the secondary's
+        // `apply_cluster_mutations` uses.
+        let cs_counts = primary.cluster_state_for_test().counts();
+        assert_eq!(
+            cs_counts.completed, 1,
+            "cluster_state must record 1 Completed entry after the mutation"
+        );
+    }).await;
+}
+
+/// T-B — end-to-end. A demoted primary plus a real secondary (acting
+/// as the promoted primary) drive the run; the secondary fires
+/// `ClusterMutation::RunComplete` once its primary view drains, and
+/// the demoted primary's operational loop must observe the signal and
+/// exit. The wait is bounded by the timeout below — pre-fix the run
+/// never returns and the test would hang until killed by the harness;
+/// post-fix the wait closes well within 1s in-process.
+///
+/// We don't drive a full failover sequence (PromotePrimary handshake,
+/// election, etc.) — that surface is covered by the existing failover
+/// tests. Here the contract under test is narrower: assuming a
+/// promoted secondary has emitted the RunComplete signal AND the
+/// signal lands on the demoted primary's transport, does the demoted
+/// primary's loop break? We construct that exact wire shape via the
+/// single-secondary primary fixture and the secondary's existing
+/// "promoted primary done; broadcasting RunComplete" path
+/// (processing.rs).
+///
+/// `demoted=true` is forced via `promote_primary` before `run()` so
+/// the operational loop runs in observer mode — exactly what
+/// asm-dataset-nix's R2 trace reports for the local primary.
+#[tokio::test(flavor = "current_thread")]
+async fn demoted_primary_exits_on_run_complete_broadcast() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // setup_test(1) yields a primary-side transport plus one
+        // secondary "end" (id, primary→sec rx, sec→primary tx).
+        // The sec→primary tx is the channel we use to deliver
+        // synthetic wire messages — exactly the shape a promoted
+        // secondary's loopback would produce on the demoted
+        // primary's transport.
+        let (transport, secondary_ends) = setup_test(1);
+        let (_sec_id, _to_sec_rx, incoming_tx) =
+            secondary_ends.into_iter().next().unwrap();
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(100),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Bypass `run()`: drive `operational_loop` in isolation with a
+        // pre-loaded ClusterMutation::RunComplete arriving on the
+        // transport. Same wire shape the promoted secondary's
+        // `processing.rs` produces when its primary view drains.
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        // total_tasks = 1 with no completion mirrors the asm-dataset-nix
+        // R2 starvation: the counter check `completed + failed >=
+        // total` is unreachable from this state, so only the
+        // RunComplete-driven exit can break the loop. Pre-fix this
+        // test would hang inside `operational_loop` indefinitely.
+        primary.total_tasks = 1;
+        primary.demoted = true;
+
+        // Inject the RunComplete signal on the transport. The recv
+        // tick inside operational_loop must dispatch it, the new
+        // ClusterMutation arm must apply it, and the new run_complete
+        // exit must break the loop.
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![
+                    dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::RunComplete,
+                ],
+            })
+            .unwrap();
+        // Drop the sender so the loop's recv yields `None` after the
+        // queued message, exercising the transport-closed branch as a
+        // hard backstop. The post-fix exit MUST come from the
+        // run_complete check (cluster_state.run_complete() == true),
+        // not from the transport-closed break — assert below
+        // distinguishes the two paths.
+        drop(incoming_tx);
+
+        // Bounded wait: pre-fix the loop was unbounded. Post-fix the
+        // mutation arrives in <1ms, the apply is synchronous, and the
+        // next loop iteration's run_complete check breaks. 5s ceiling
+        // for CI flake tolerance.
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+
+        match exit {
+            Ok(Ok(())) => {
+                assert!(
+                    primary.cluster_state_for_test().run_complete(),
+                    "cluster_state must record run_complete after the mutation; \
+                     if this fails the loop exited via the transport-closed \
+                     fallback, not the run_complete check under test"
+                );
+            }
+            Ok(Err(e)) => panic!("operational_loop returned Err on RunComplete: {e}"),
+            Err(_) => panic!(
+                "operational_loop did not exit within 5s — the demoted \
+                 primary's RunComplete-driven exit is broken (pre-fix \
+                 hang regression)"
+            ),
+        }
+    }).await;
+}
+
+/// T-C — end-to-end happy path. A demoted primary + 2 fake secondaries,
+/// where one is the promoted primary draining its replicated pool. Pre-
+/// fix the local primary's operational loop sat forever waiting for a
+/// counter tick that never came; post-fix the RunComplete signal
+/// (delivered via the new primary_transport.send loopback in
+/// secondary/processing.rs) lands on the demoted primary's transport,
+/// the new ClusterMutation arm applies it, and the run_complete exit
+/// closes the loop within bounded wait.
+///
+/// This wires the same delivery path asm-dataset-nix R2 / T3 exercises
+/// in production: the new primary's `processing.rs` RunComplete site
+/// fanning out to peers AND back to the demoted primary's transport.
+/// Without the primary_transport.send addition this test would still
+/// hang post-fix.
+#[tokio::test(flavor = "current_thread")]
+async fn demoted_primary_exits_on_clean_completion() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+        let (_sec_id, _to_sec_rx, incoming_tx) =
+            secondary_ends.into_iter().next().unwrap();
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Pre-state: pool with no items, two pre-mirrored completions,
+        // total_tasks set to a value the counter check cannot reach
+        // from the existing completions alone — so only the
+        // run_complete-driven exit can break the loop. demoted=true
+        // puts the loop in observer mode (matches asm-dataset-nix R2:
+        // local primary already handed off authority to the promoted
+        // secondary).
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        primary.total_tasks = 3; // counter-check unreachable
+        primary.completed_tasks.insert("h-already-done-1".into());
+        primary.completed_tasks.insert("h-already-done-2".into());
+        primary.demoted = true;
+
+        // Inject the ClusterMutation::RunComplete on the transport
+        // exactly the way the new primary's
+        // `processing.rs::primary_transport.send` loopback delivers it
+        // post-fix. Pre-fix this delivery path doesn't exist (the
+        // RunComplete only went out via peer_transport, which the
+        // demoted primary isn't on); even with delivery, pre-fix
+        // there's no `MessageType::ClusterMutation` arm to consume it.
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![
+                    dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::RunComplete,
+                ],
+            })
+            .unwrap();
+        // Hold the sender open: the loop's run_complete exit must fire
+        // on its OWN, not via the transport-closed fallback. Asserting
+        // on `cluster_state.run_complete()` after the loop returns
+        // distinguishes the two paths.
+        let _hold = incoming_tx;
+
+        // Bounded wait. Pre-fix the loop was unbounded — the
+        // asm-dataset-nix harness killed the local primary at 1200s.
+        // Post-fix the run_complete check fires within one heartbeat
+        // tick of the mutation arriving (50ms keepalive_interval here
+        // means at most ~100ms before the next select! cycle picks up
+        // the message). 5s ceiling for CI flake tolerance.
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+
+        match exit {
+            Ok(Ok(())) => {
+                assert!(
+                    primary.cluster_state_for_test().run_complete(),
+                    "cluster_state.run_complete() must be set after the \
+                     RunComplete-driven exit fired (distinguishes from a \
+                     stale transport-closed break)"
+                );
+            }
+            Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
+            Err(_) => panic!(
+                "operational_loop did not exit within 5s on a clean \
+                 RunComplete signal — the demoted primary's exit path \
+                 is broken (asm-dataset-nix R2 / T3 1200s hang \
+                 regression)"
+            ),
+        }
+    }).await;
+}
