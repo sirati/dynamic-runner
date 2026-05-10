@@ -97,15 +97,16 @@ class TaskDeploymentSpec:
     # Additional flags interpolated into the SLURM wrapper's
     # ``podman run`` invocation, BEFORE the ``{image_name}:{image_tag}``
     # argument and AFTER the framework's own flags (``--pull=never``,
-    # ``--network=host``, ``--pids-limit=16384``, the auto-derived
-    # ``--memory`` cap, the ``-e PRIMARY_NODE_IPV{4,6}`` env hints,
-    # the standard ``-v`` volume mounts). Intended as a
-    # consumer-controlled escape hatch for *workload-dependent*
-    # podman flags the framework can't auto-derive from system state
-    # — e.g. ``--ulimit=nofile=...``, extra ``--cap-add``/``--cap-drop``,
-    # ``--shm-size=...``, etc. Each entry is bash-quoted via
-    # :func:`shlex.quote` when interpolated, so values containing
-    # spaces or shell-metacharacters survive intact.
+    # ``--network=host``, ``--pids-limit=16384``,
+    # ``--ulimit nproc=32768:32768``, the auto-derived ``--memory``
+    # cap, the ``-e PRIMARY_NODE_IPV{4,6}`` env hints, the standard
+    # ``-v`` volume mounts). Intended as a consumer-controlled escape
+    # hatch for *workload-dependent* podman flags the framework can't
+    # auto-derive from system state — e.g. ``--ulimit=nofile=...``,
+    # extra ``--cap-add``/``--cap-drop``, ``--shm-size=...``, etc.
+    # Each entry is bash-quoted via :func:`shlex.quote` when
+    # interpolated, so values containing spaces or
+    # shell-metacharacters survive intact.
     #
     # The framework's ``--pids-limit=16384`` default replaces podman
     # rootless's 2048 cap, which is too tight for compile-heavy
@@ -114,6 +115,22 @@ class TaskDeploymentSpec:
     # native threads that count against ``pids.max``). To override,
     # pass ``--pids-limit=<N>`` here; podman takes the LAST value when
     # the flag appears twice, so the consumer-supplied entry wins.
+    #
+    # The framework's ``--ulimit nproc=32768:32768`` default overrides
+    # the host-side RLIMIT_NPROC podman would otherwise propagate from
+    # the SLURM job's inherited per-user cap (or podman's
+    # ``containers.conf`` default). Without it, fork-heavy in-container
+    # workloads (autotools ``./configure``, parallel gcc/clang, JVM
+    # thread spawn) hit ``EAGAIN: Resource temporarily unavailable``
+    # whenever the inherited cap lands below the workload's peak fork
+    # count — independently of ``--pids-limit`` (which caps cgroup
+    # pids.max, a different counter). To override, pass
+    # ``--ulimit=nproc=<N>:<N>`` here; same last-wins semantic.
+    # NOTE: this default cannot raise the SLURM cgroup's pids.max —
+    # that's operator policy. If your workload needs more than 32768
+    # forks per user across all concurrent containers on a node, the
+    # cluster operator must raise pam_limits' nproc and/or the SLURM
+    # cgroup's pids.max. See ``docs/MIGRATION_2026_05_PYTHON_TO_RUST.md``.
     #
     # Do NOT set ``--memory`` / ``--memory-swap`` here: the wrapper
     # auto-caps container memory at ``NodeRAM - 2GiB`` (probed at
