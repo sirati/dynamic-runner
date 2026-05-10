@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **SLURM wrapper now defaults `--ulimit nproc=32768:32768`** on every
+  `podman run` invocation. Without it, podman propagates the SLURM
+  job's inherited per-user `RLIMIT_NPROC` (pam_limits) — or the
+  `containers.conf` default — into the container, and fork-heavy
+  in-container workloads (autotools `./configure`, parallel
+  gcc/clang, JVM thread spawn) fail with
+  `fork: Resource temporarily unavailable` (`EAGAIN`) whenever that
+  inherited cap lands below the workload's peak fork count. This is
+  a *different* counter from `--pids-limit` (which caps the
+  container cgroup's `pids.max`); both must be permissive for the
+  workload to make progress. Field signal: asm-dataset-nix's
+  workload-sized nix builds wedged 10/10 attempts on a cluster
+  whose user shells inherited a 4096 nproc cap. Override via
+  `TaskDeploymentSpec.extra_run_args=("--ulimit=nproc=<N>:<N>",)`;
+  podman last-wins parsing applies the consumer's value. See
+  `docs/MIGRATION_2026_05_PYTHON_TO_RUST.md` and the rationale
+  comment in `crates/dynrunner-slurm/src/wrapper_script.rs`.
 - `nix/wheel.nix` `cargoDeps.hash` was the v0.2.0 value
   (`MscydA1Kui...`) on v0.3.0 / v0.3.1. The workspace version bump
   0.1.0 → 0.3.0 in Cargo.lock invalidates the recorded SRI hash even
