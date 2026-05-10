@@ -219,17 +219,15 @@ def spawn_ssh_master(
         "-o", f"ControlPath={cp}",
         "-o", "ControlMaster=auto",
         "-o", "ControlPersist=yes",
-        # Generous keepalive so the master survives bursts of sshd
-        # contention on the slurm-test-env (4 secondaries each
-        # spawning their own ssh during dispatch + image upload can
-        # spike the gateway's MaxSessions quota and delay our
-        # keepalive replies). Default 30s/3=90s threshold was too
-        # tight; 60s/10=600s gives 10min before the master assumes
-        # the link is dead. Compensated by an explicit health-check
-        # in run_e2e's per-scenario boundary that respawns on
-        # missing socket.
+        # 18-hour anti-leak floor (60s × 1080 = 64800s),
+        # mirroring the framework's master-spawn default in
+        # `crates/dynrunner-gateway/src/ssh.rs`. The harness's
+        # operator-side master must inherit the same posture as
+        # framework-spawned masters so behaviour under e2e matches
+        # production. Per-scenario boundary in run_e2e respawns
+        # the master if its control socket vanishes.
         "-o", "ServerAliveInterval=60",
-        "-o", "ServerAliveCountMax=10",
+        "-o", "ServerAliveCountMax=1080",
         "-o", "TCPKeepAlive=yes",
         "-o", "LogLevel=ERROR",
         host_alias,
