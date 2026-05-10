@@ -544,7 +544,14 @@ fn drive_rust_primary<'py>(
     coord.call_method1("run", (binaries,))?;
     let completed = coord.getattr("completed")?;
     let failed = coord.getattr("failed")?;
+    // Stranded mirrors `RustPrimaryCoordinator.stranded` and is zero on
+    // every successful return — the cluster-collapse path raises a
+    // `RuntimeError` that propagates through `?` above before we get
+    // here. Logged unconditionally so the SLURM-pipeline output stays
+    // shape-compatible with the in-process / network-primary variants.
+    let stranded = coord.getattr("stranded")?;
     log.call_method1("info", (format!("Completed: {completed}"),))?;
     log.call_method1("info", (format!("Failed: {failed}"),))?;
+    log.call_method1("info", (format!("Stranded: {stranded}"),))?;
     Ok(())
 }
