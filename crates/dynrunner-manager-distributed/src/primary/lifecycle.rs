@@ -210,18 +210,28 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 let since = *self.fleet_dead_since.get_or_insert(now);
                 let elapsed = now.duration_since(since);
                 if elapsed >= self.config.fleet_dead_timeout {
+                    // Drain the queued pool so the pool's own bookkeeping
+                    // doesn't pretend work is still pending after we
+                    // exit. The drained binaries deliberately do NOT
+                    // land in `failed_tasks` — they were never
+                    // dispatched, no secondary attempted them, and no
+                    // worker reported a failure. Final accounting in
+                    // `run()` classifies anything that's neither
+                    // completed nor failed as `stranded`, which is
+                    // exactly the right category for "cluster died
+                    // before this task could even be tried". Pre-fix,
+                    // pushing into `failed_tasks` here conflated two
+                    // distinct outcomes (worker-reported failure vs
+                    // never-dispatched) and exhausted the retry budget
+                    // for tasks that hadn't actually failed.
                     let pending = self.pool_mut().drain_queued();
                     tracing::error!(
                         elapsed_s = elapsed.as_secs_f64(),
                         timeout_s = self.config.fleet_dead_timeout.as_secs_f64(),
-                        marking_failed = pending.len(),
+                        marking_stranded = pending.len(),
                         "fleet-dead timeout: every secondary gone with non-empty pool; \
-                         marking pending tasks failed and exiting operational loop"
+                         pending tasks left stranded and exiting operational loop"
                     );
-                    for binary in pending {
-                        let hash = compute_task_hash(&binary);
-                        self.failed_tasks.insert(hash);
-                    }
                     break;
                 }
             } else {
