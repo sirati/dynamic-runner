@@ -2973,3 +2973,180 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
     })
     .await;
 }
+
+/// Pin: `drain_pending_messages` processes any `TaskComplete` /
+/// `TaskFailed` messages still queued in the inbound transport when
+/// it's invoked, updating `completed_tasks` / `failed_tasks` exactly
+/// as the operational loop's `recv → dispatch_message` pipeline does.
+/// This is the helper the post-loop drain step in `run()` calls before
+/// computing the stranded count, closing the window where the
+/// pre-fix accounting saw pre-drain counters and false-positived clean
+/// runs into `RunError::ClusterCollapsed` (counted successful
+/// completions as `stranded`).
+///
+/// Construction: we drive the helper directly (no `run()` lifecycle)
+/// by pre-loading TaskComplete messages into the shared incoming
+/// channel and asserting the helper drains them. The drain helper
+/// reuses `dispatch_message`, which calls `handle_task_complete`,
+/// which inserts into `completed_tasks` regardless of whether a
+/// matching worker exists — so we don't have to plumb a fake worker
+/// to exercise the counter update.
+#[tokio::test(flavor = "current_thread")]
+async fn drain_pending_messages_updates_completed_set() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Inject three TaskComplete messages from the fake secondary's
+        // outbound clone (which is what `secondary_ends[i].2` is — the
+        // shared inbound side from the primary's perspective). Closing
+        // the sender at the end ensures `transport.recv()` will yield
+        // `Some` for each queued message and then `None`, exercising
+        // the drain helper's "process until empty" path through both
+        // arms of the recv result.
+        let (sec_id, _to_sec_rx, incoming_tx) = secondary_ends.into_iter().next().unwrap();
+        for hash in ["hash-a", "hash-b", "hash-c"] {
+            incoming_tx
+                .send(DistributedMessage::TaskComplete {
+                    sender_id: sec_id.clone(),
+                    timestamp: 0.0,
+                    secondary_id: sec_id.clone(),
+                    worker_id: 0,
+                    task_hash: hash.into(),
+                    result_data: None,
+                })
+                .unwrap();
+        }
+        // Drop the sender so the recv channel will eventually yield
+        // `None`. The drain helper should treat that as "transport
+        // closed → drain complete" and break.
+        drop(incoming_tx);
+
+        primary
+            .drain_pending_messages(Duration::from_millis(500))
+            .await
+            .expect("drain must succeed on healthy transport");
+
+        assert_eq!(
+            primary.completed_count(),
+            3,
+            "drain must have processed all three queued TaskComplete messages"
+        );
+        for hash in ["hash-a", "hash-b", "hash-c"] {
+            assert!(
+                primary.completed_tasks.contains(hash),
+                "completed_tasks must contain {hash} after drain"
+            );
+        }
+    })
+    .await;
+}
+
+/// Pin Fix-#23 contract end-to-end: a happy-path run with multiple
+/// secondaries where every dispatched task succeeds must not surface
+/// any task as `stranded`. Pre-fix the accounting in `run()` ran
+/// before any post-loop drain of in-flight TaskComplete messages,
+/// flipping clean runs into `RunError::ClusterCollapsed`. Post-fix
+/// the drain step processes whatever was still in transit before the
+/// stranded computation, so completed runs report
+/// `completed=N / failed=0 / stranded=0` and `run()` returns `Ok(())`.
+///
+/// Two secondaries here (vs the N=1 fixture in
+/// `stranded_count_is_zero_on_clean_run`) widens the surface to the
+/// multi-secondary code paths — completion-forwarding, per-secondary
+/// worker bookkeeping — that the e2e scenario in #19 surfaced.
+#[tokio::test(flavor = "current_thread")]
+async fn clean_run_does_not_false_positive_stranded() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(2);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 2,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries: Vec<TaskInfo<TestId>> = (0..4)
+            .map(|i| make_binary(&format!("bin_{i}"), 50 + i * 10))
+            .collect();
+        let total = binaries.len();
+
+        for (id, rx, tx) in secondary_ends {
+            tokio::task::spawn_local(fake_secondary(
+                id,
+                /* num_workers = */ 2,
+                1024 * 1024 * 1024,
+                rx,
+                tx,
+            ));
+        }
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary
+            .run(binaries, deps, ops, ope)
+            .await
+            .expect("clean multi-secondary run must return Ok");
+
+        assert_eq!(
+            primary.completed_count(),
+            total,
+            "every binary must report completed on a clean run"
+        );
+        assert_eq!(
+            primary.failed_count(),
+            0,
+            "no binary should land in failed on a clean run"
+        );
+        assert_eq!(
+            primary.stranded_count(),
+            0,
+            "no binary should be stranded on a clean run — \
+             pre-fix the accounting ran before pending TaskCompletes \
+             drained, false-positiving successful tasks as stranded"
+        );
+    })
+    .await;
+}

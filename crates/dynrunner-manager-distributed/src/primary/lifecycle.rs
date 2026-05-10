@@ -396,6 +396,76 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         Ok(())
     }
 
+    /// Final-stage drain: between the operational loop's exit and the
+    /// stranded-task accounting in `run()`, any `TaskComplete` /
+    /// `TaskFailed` messages that crossed the wire while the loop was
+    /// winding down (transport.recv hadn't yielded them yet, or they
+    /// arrived in the gap between an exit-condition trip and the next
+    /// recv tick) must be dispatched through the same handlers the
+    /// loop used so `completed_tasks` / `failed_tasks` reflect every
+    /// outcome the cluster actually produced. Without this drain, the
+    /// counter-based stranded computation (`total - completed -
+    /// failed`) reads pre-drain values and surfaces successful
+    /// completions as `stranded`, flipping clean runs into
+    /// `RunError::ClusterCollapsed` with a non-zero exit at the PyO3
+    /// boundary.
+    ///
+    /// Drain shape: peek at the transport with a short per-iteration
+    /// timeout; quiet means "nothing else in transit" and the drain
+    /// terminates. Total time is bounded by `budget` (overall) AND
+    /// the per-iteration `quiet_window` (each empty poll). On a
+    /// happy-path run with no in-flight messages this returns after
+    /// one `quiet_window` (~50ms); on a heavily-pipelined run with
+    /// dozens of pending TaskCompletes it processes them sequentially
+    /// at network speed.
+    ///
+    /// Reuses `dispatch_message` so every message type the operational
+    /// loop knew how to handle is handled identically here — no parallel
+    /// switch-statement, no special-cased subset. The drain is a
+    /// post-loop continuation, not a different code path.
+    pub(super) async fn drain_pending_messages(
+        &mut self,
+        budget: Duration,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + budget;
+        let quiet_window = Duration::from_millis(50);
+        let mut drained = 0usize;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let poll_window = std::cmp::min(quiet_window, remaining);
+            match tokio::time::timeout(poll_window, self.transport.recv()).await {
+                Ok(Some(msg)) => {
+                    self.dispatch_message(msg).await?;
+                    drained += 1;
+                }
+                Ok(None) => {
+                    // Transport closed — no more messages will ever
+                    // arrive. Drain is complete.
+                    break;
+                }
+                Err(_) => {
+                    // Quiet window elapsed without a message. Treat as
+                    // drained: the operational loop's prior recv tick
+                    // already pulled everything in flight, the brief
+                    // quiet window confirms nothing else is racing in.
+                    break;
+                }
+            }
+        }
+        if drained > 0 {
+            tracing::info!(
+                drained,
+                completed = self.completed_tasks.len(),
+                failed = self.failed_tasks.len(),
+                "drained pending wire messages before final accounting"
+            );
+        }
+        Ok(())
+    }
+
     /// Iterate every idle worker and dispatch a task from the pool
     /// if one fits. Used by `run_retry_passes` to kickstart dispatch
     /// after re-injection (workers won't send a fresh TaskRequest on
