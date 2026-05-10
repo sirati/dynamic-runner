@@ -18,7 +18,15 @@ thiserror = { workspace = true }
 tempfile = "3"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+# Log-capture for the master-watcher integration test (T4): assert
+# that `tracing::error!("SSH master exited unexpectedly")` actually
+# fires when the master process dies under us. `no-env-filter` is
+# required because Rust integration tests (`tests/*.rs`) build as a
+# separate crate from `dynrunner-gateway`, so the default
+# `RUST_LOG=<crate>=trace` env filter would silence logs emitted from
+# `dynrunner_gateway`'s code path.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 
 [lints]
 workspace = true
