@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 
 mod config;
 mod discovery;
+mod driver;
 mod estimator;
 mod gateway;
 mod identifier;
@@ -90,5 +91,23 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(slurm::wrapper_script::generate_test_wrapper_script, m)?)?;
     m.add_class::<slurm::preparation::PySlurmPreparation>()?;
     m.add_function(wrap_pyfunction!(slurm::pipeline::run_slurm_pipeline, m)?)?;
+
+    // `dynamic_runner.driver` submodule — public driver primitives
+    // extracted into the `dynrunner-driver` crate. Wired as a
+    // submodule so the Python import path is
+    // `dynamic_runner.driver.SshMaster` (not
+    // `dynamic_runner._native.SshMaster`). The submodule is created
+    // here at extension-init time; the package-level `__init__.py`
+    // imports from `dynamic_runner._native.driver`.
+    let driver_mod = PyModule::new(m.py(), "driver")?;
+    driver_mod.add_class::<driver::PySshMaster>()?;
+    driver_mod.add_function(wrap_pyfunction!(driver::py_cluster_is_running, &driver_mod)?)?;
+    driver_mod.add_function(wrap_pyfunction!(
+        driver::py_ensure_dispatcher_keypair,
+        &driver_mod
+    )?)?;
+    driver_mod.add_function(wrap_pyfunction!(driver::py_write_ssh_config, &driver_mod)?)?;
+    m.add_submodule(&driver_mod)?;
+
     Ok(())
 }
