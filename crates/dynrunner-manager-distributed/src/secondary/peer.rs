@@ -231,11 +231,31 @@ where
     ///
     /// `peer_count()` already calls `drain_new_connections` so this
     /// reads the freshest state.
+    ///
+    /// Run-complete short-circuit: once the cluster mirror records
+    /// `RunComplete` (either from a peer's broadcast in `dispatch.rs`
+    /// or from this node's own promoted-primary broadcast in
+    /// `processing.rs`), the peer mesh is irrelevant — failover and
+    /// inter-secondary keepalive paths have nothing left to guard.
+    /// Disarming the watchdog at run-complete suppresses a misleading
+    /// "peer mesh did not form" warn during clean teardown of an
+    /// in-process distributed run, where secondaries observe
+    /// `RunComplete` ~30s before the watchdog deadline would fire on
+    /// the last keepalive tick before exit. Single source of truth:
+    /// the read lives in the watchdog itself rather than at every
+    /// `cluster_state.apply(RunComplete)` site, so call sites stay
+    /// agnostic to peer-mesh policy.
     pub(super) async fn check_peer_mesh_watchdog(&mut self) {
         let deadline = match self.peer_mesh_check_at {
             Some(d) => d,
             None => return,
         };
+        if self.cluster_state.run_complete() {
+            // Run is over; the mesh fault has nothing to report.
+            // Disarm so subsequent ticks are no-ops.
+            self.peer_mesh_check_at = None;
+            return;
+        }
         // peer_count drains new connections internally; calling it
         // BEFORE the deadline check lets a fresh connection clear
         // the watchdog without firing the fault.
