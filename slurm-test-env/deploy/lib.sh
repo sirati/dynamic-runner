@@ -39,6 +39,21 @@ remove_node_container() {
   fi
 }
 
+# `podman exec` doesn't run a login shell, so the container PATH is
+# the image's minimal default — NixOS keeps its real binaries under
+# /run/current-system/sw/bin and that's not on the default PATH.
+# pexec()/pexec_i() inject that prefix so bare command names (id,
+# getent, useradd, scontrol, install, ...) resolve. Used by both
+# host-side host-to-container scripts (reboot-node.sh, scripts/
+# provision-user.sh) — keep it here so the PATH list has exactly
+# one source of truth.
+pexec() {
+  podman exec --env PATH=/run/current-system/sw/bin:/usr/bin:/bin "$@"
+}
+pexec_i() {
+  podman exec -i --env PATH=/run/current-system/sw/bin:/usr/bin:/bin "$@"
+}
+
 # Start the gateway container.
 #
 # --name           globally visible container name (instance-suffixed).

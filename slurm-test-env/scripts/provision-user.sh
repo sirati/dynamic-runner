@@ -65,18 +65,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${SLURM_TEST_ENV_ENV_FILE:-${SCRIPT_DIR}/../deploy/env.sh}"
 # shellcheck disable=SC1090
 source "$ENV_FILE"
-
-# `podman exec` doesn't run a login shell, so the container PATH is the
-# minimal default (/usr/bin etc.) — NixOS keeps its real binaries under
-# /run/current-system/sw/bin and that's not on the default PATH. pexec()
-# wraps every in-container invocation to inject that prefix, so bare
-# command names (id, getent, useradd, install, ...) resolve.
-pexec() {
-  podman exec --env PATH=/run/current-system/sw/bin:/usr/bin:/bin "$@"
-}
-pexec_i() {
-  podman exec -i --env PATH=/run/current-system/sw/bin:/usr/bin:/bin "$@"
-}
+# pexec()/pexec_i() live in lib.sh — see deploy/up.sh for the
+# SLURM_TEST_ENV_LIB_SH env-var-with-fallback rationale.
+LIB_SH="${SLURM_TEST_ENV_LIB_SH:-${SCRIPT_DIR}/../deploy/lib.sh}"
+# shellcheck disable=SC1090
+source "$LIB_SH"
 
 # --- UID assignment ----------------------------------------------------------
 #
