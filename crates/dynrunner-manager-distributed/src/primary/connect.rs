@@ -135,6 +135,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             MessageType::MeshReady => self.handle_mesh_ready(msg),
             MessageType::Keepalive => { /* tracked above, no further action */ }
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
+            // Replicated cluster ledger maintenance. Without this arm
+            // the demoted local primary cannot observe completions
+            // forwarded only via the CRDT bus (the cross-secondary
+            // case after promotion); see `handle_cluster_mutation`
+            // for the full rationale and the asm-dataset-nix R2 / T3
+            // hang it pins.
+            MessageType::ClusterMutation => self.handle_cluster_mutation(msg).await,
             other => {
                 tracing::debug!(?other, "unhandled message type");
             }

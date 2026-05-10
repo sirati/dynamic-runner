@@ -332,6 +332,19 @@ where
                     timestamp: timestamp_now(),
                     mutations: vec![ClusterMutation::RunComplete],
                 };
+                // Fan out to BOTH the peer mesh and the demoted local
+                // primary's transport. peer_transport.broadcast covers
+                // surviving secondaries; primary_transport.send is the
+                // only path that reaches the demoted primary (it's not
+                // a peer, it sits on the other end of the secondary→
+                // primary channel, mute-routing is asymmetric). Without
+                // the loopback the demoted primary stays in its
+                // operational loop indefinitely waiting for a counter
+                // tick that will never come — asm-dataset-nix R2 / T3
+                // 1200s hang. Errors are swallowed: if the loopback
+                // tx is closed the demoted primary already exited
+                // some other way, which is the desired terminal state.
+                let _ = self.primary_transport.send(msg.clone()).await;
                 let _ = self.peer_transport.broadcast(msg).await;
                 // Keep iterating; the next loop tick's run-complete
                 // exit (below) will fire on this node now that the
