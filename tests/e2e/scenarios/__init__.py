@@ -37,6 +37,7 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "reverse-mode",
     "cleanup-teardown",
     "distributed-single-process",
+    "distributed-local-subprocess",
 )
 
 
