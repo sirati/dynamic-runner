@@ -58,6 +58,35 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
+/// PeerTransport stub that reports a fixed peer count without
+/// actually wiring any messages. Used by the peer-mesh watchdog
+/// tests to drive the "mesh formed" branch (peer_count > 0)
+/// without spinning up real QUIC endpoints.
+pub(super) struct FixedPeerCount(pub usize);
+
+impl<I: Identifier> PeerTransport<I> for FixedPeerCount {
+    async fn broadcast(&mut self, _msg: DistributedMessage<I>) -> Result<(), String> {
+        Ok(())
+    }
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        _msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        std::future::pending().await
+    }
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        None
+    }
+    fn peer_count(&self) -> usize {
+        self.0
+    }
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+}
+
 /// WorkerFactory that fakes a runner: replies Ready, then echoes Done for
 /// each ProcessTask without doing real work.
 pub(super) struct FakeWorkerFactory;
