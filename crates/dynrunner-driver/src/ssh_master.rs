@@ -74,6 +74,11 @@ use crate::ssh_target::SshTarget;
 /// After watcher-observed invalidation, `master_pid()` returns the
 /// *last known* PID (`Some(pid)`, not `None`) — see locked design
 /// point (h.1) and the field doc on [`Self::invalidated`].
+///
+/// `Debug` is intentionally a hand-written non-derive impl below so
+/// the `test_kill_hook` field (a closure with no `Debug`) doesn't
+/// block the impl, and so error / log output never leaks the closure
+/// (which is internal-test-only).
 pub struct SshMaster {
     /// `user@host` (or `host`) target arg used by every ssh
     /// subprocess. Stored so error variants can include it without
@@ -155,12 +160,35 @@ pub struct SshMaster {
     /// this to a closure that returns `Err(UnkillableMaster)`. The
     /// field is `Option<...>` rather than a generic so SshMaster's
     /// type signature stays unchanged in production.
-    #[cfg(test)]
+    ///
+    /// Always-compiled (not `cfg(test)`-gated) so integration tests
+    /// in `tests/` can reach it via [`SshMaster::install_test_kill_hook`].
+    /// Marked `#[doc(hidden)]` on its setter to keep it out of the
+    /// public docs surface — the API is internal-test-only.
     test_kill_hook: Option<TestKillHook>,
 }
 
-#[cfg(test)]
 type TestKillHook = Box<dyn Fn(u32, &SshTarget) -> Result<(), SshMasterError> + Send + Sync>;
+
+impl std::fmt::Debug for SshMaster {
+    /// Hand-written `Debug` impl: the `test_kill_hook` field stores
+    /// a closure (no `Debug`), so we can't `derive(Debug)`. The impl
+    /// also intentionally surfaces only the operator-relevant state
+    /// — target, control path, daemon PID, invalidation, spawn-vs-
+    /// adopt — never the auth flags or the test hook closure.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshMaster")
+            .field("target", &self.target)
+            .field("control_path", &self.control_path)
+            .field("port", &self.port)
+            .field("daemon_pid", &self.daemon_pid)
+            .field("last_known_pid", &self.last_known_pid)
+            .field("is_spawned", &self.is_spawned)
+            .field("invalidated", &self.invalidated.load(Ordering::SeqCst))
+            .field("forwarded_ports", &self.forwarded_ports)
+            .finish_non_exhaustive()
+    }
+}
 
 impl SshMaster {
     /// Construct by spawning `ssh -M -N`. Sync (per locked design
@@ -311,7 +339,6 @@ impl SshMaster {
             forwarded_ports: config.forwarded_ports,
             is_spawned: true,
             spawn_timestamp: Instant::now(),
-            #[cfg(test)]
             test_kill_hook: None,
         })
     }
@@ -367,9 +394,21 @@ impl SshMaster {
         }
         // (3) `ssh -O check` with MINIMAL flags. Master responds via
         // the unix socket; the host arg is ignored at the master
-        // layer. Avoids host/identity mismatch issues.
+        // layer. Avoids host/identity mismatch issues. We add a
+        // hard 3s timeout because `ssh -O check` against a socket
+        // that has a listener but isn't an SSH multiplex master
+        // hangs indefinitely waiting for a response — we observed
+        // this with `std::os::unix::net::UnixListener::bind`-only
+        // sockets in the integration tests. The timeout converts
+        // that hang into a typed `MasterAdoptFailed`.
         let cp_str = path.to_string_lossy().into_owned();
-        let probed_pid = probe_master_pid(&cp_str, target.as_str(), &[]).map_err(|e| {
+        let probed_pid = probe_master_pid_with_timeout(
+            &cp_str,
+            target.as_str(),
+            &[],
+            Duration::from_secs(3),
+        )
+        .map_err(|e| {
             SshMasterError::adopt_failed(
                 path.clone(),
                 format!("ssh -O check rejected adoption: {e}"),
@@ -406,7 +445,6 @@ impl SshMaster {
             forwarded_ports: Vec::new(),
             is_spawned: false,
             spawn_timestamp: Instant::now(),
-            #[cfg(test)]
             test_kill_hook: None,
         })
     }
@@ -683,11 +721,8 @@ impl SshMaster {
     /// outcome without sending real signals.
     #[inline]
     fn run_kill_ladder(&self, pid: u32) -> Result<(), SshMasterError> {
-        #[cfg(test)]
-        {
-            if let Some(hook) = &self.test_kill_hook {
-                return hook(pid, &self.target);
-            }
+        if let Some(hook) = &self.test_kill_hook {
+            return hook(pid, &self.target);
         }
         terminate_daemon_blocking(pid, &self.target)
     }
@@ -892,6 +927,82 @@ pub(crate) fn probe_master_pid(
         .ok_or(SshMasterError::MasterPidProbeFailed)
 }
 
+/// Same as [`probe_master_pid`] but with a hard timeout: if the
+/// `ssh -O check` subprocess hasn't returned within `timeout`, we
+/// SIGKILL it and surface [`SshMasterError::MasterPidProbeFailed`].
+///
+/// Why this exists: `ssh -O check` against a socket that has a
+/// listener but doesn't speak the SSH multiplex protocol hangs
+/// indefinitely. We observed this in the
+/// `adopt_rejects_stale_socket_no_master_behind_it` integration test
+/// (a Rust `UnixListener::bind` with no accept loop). The fast-path
+/// (a real master responding to the probe) returns in <1ms; the
+/// slow-path is a bug-class signal we want to convert into a typed
+/// error, not a hang.
+///
+/// Implementation: spawn the subprocess and poll its `try_wait`
+/// status at 50ms cadence, sending SIGKILL on deadline. Sync (we're
+/// already in a sync path) and dependency-free.
+fn probe_master_pid_with_timeout(
+    control_path: &str,
+    target: &str,
+    base_args: &[String],
+    timeout: Duration,
+) -> Result<u32, SshMasterError> {
+    let mut cmd = Command::new("ssh");
+    for arg in base_args {
+        cmd.arg(arg);
+    }
+    cmd.args([
+        "-O",
+        "check",
+        "-o",
+        &format!("ControlPath={control_path}"),
+    ]);
+    cmd.arg(target);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| SshMasterError::MasterPidProbeFailed)?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Subprocess exited. Read its output.
+                let out = child.wait_with_output().unwrap_or_else(|_| {
+                    std::process::Output {
+                        status,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }
+                });
+                if !out.status.success() {
+                    return Err(SshMasterError::MasterPidProbeFailed);
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                return parse_master_pid(&stdout)
+                    .or_else(|| parse_master_pid(&stderr))
+                    .ok_or(SshMasterError::MasterPidProbeFailed);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Hung subprocess — kill and surface as probe failure.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SshMasterError::MasterPidProbeFailed);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return Err(SshMasterError::MasterPidProbeFailed),
+        }
+    }
+}
+
 /// Parse `Master running (pid=<N>)` out of `ssh -O check` output.
 fn parse_master_pid(s: &str) -> Option<u32> {
     let marker = "Master running (pid=";
@@ -1033,17 +1144,30 @@ fn terminate_daemon_blocking(daemon_pid: u32, target: &SshTarget) -> Result<(), 
 
 // ---------------------------------------------------------------------
 // Test-only API: install a fake kill ladder for the panic-in-Drop
-// prohibition test (locked point (j)). Lives behind `cfg(test)` so
-// production builds don't carry the hook.
+// prohibition test (locked point (j)). The hook is always compiled
+// (not `cfg(test)`-gated) so integration tests in `tests/` — which
+// link against the crate as an external dep — can reach it. Marked
+// `#[doc(hidden)]` to keep it out of the public docs surface; the
+// API is internal-test-only.
 // ---------------------------------------------------------------------
 
-#[cfg(test)]
 impl SshMaster {
     /// Install a closure that will be invoked instead of
     /// [`terminate_daemon_blocking`] from `disconnect_spawn_master`
-    /// and `Drop`. Used by tests to inject UnkillableMaster outcomes
-    /// without sending real signals.
-    pub(crate) fn install_test_kill_hook(
+    /// and `Drop`. **Internal test API only** — production code
+    /// must never call this. Used by the
+    /// `drop_does_not_panic_on_unkillable_master` integration test
+    /// to inject UnkillableMaster outcomes without sending real
+    /// signals.
+    ///
+    /// Naming + `#[doc(hidden)]` are the visibility contract: the
+    /// symbol exists for testing but does not surface in rustdoc.
+    /// A future feature-flag gate (`__test-hooks`) is the cleaner
+    /// long-term home, but adding it requires a workspace-wide
+    /// feature wiring change that's out of scope for the extraction
+    /// commit.
+    #[doc(hidden)]
+    pub fn install_test_kill_hook(
         &mut self,
         hook: impl Fn(u32, &SshTarget) -> Result<(), SshMasterError> + Send + Sync + 'static,
     ) {
