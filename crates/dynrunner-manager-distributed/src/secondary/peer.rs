@@ -36,7 +36,9 @@ where
             }
             DistributedMessage::TaskComplete {
                 secondary_id,
+                worker_id,
                 task_hash,
+                result_data,
                 ..
             } => {
                 // Track peer's completed task to avoid duplicate processing
@@ -56,9 +58,38 @@ where
                     task_hash,
                     "peer task complete"
                 );
+                // When self holds primary authority post-promotion,
+                // forward the observed peer completion back to the
+                // demoted local primary. The demoted primary's
+                // `handle_task_complete` is the only site that
+                // originates `ClusterMutation::TaskCompleted` (and
+                // grows its own `completed_tasks` set) for tasks
+                // outside its own loopback path. Without this
+                // forward the demoted primary's per-task accounting
+                // is missing every cross-secondary completion the
+                // promoted primary observed via the peer mesh,
+                // surfacing as inflated `stranded` counts on a
+                // genuinely clean run (`RunError::ClusterCollapsed`
+                // at the boundary). Loopback failures are benign:
+                // post-demotion the local primary is allowed to
+                // exit before this fanout completes; in that case
+                // the run is already terminating cleanly via the
+                // RunComplete signal path.
+                if self.is_primary {
+                    let forward = DistributedMessage::TaskComplete {
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        secondary_id,
+                        worker_id,
+                        task_hash,
+                        result_data,
+                    };
+                    let _ = self.primary_transport.send(forward).await;
+                }
             }
             DistributedMessage::TaskFailed {
                 secondary_id,
+                worker_id,
                 task_hash,
                 error_type,
                 error_message,
@@ -116,6 +147,27 @@ where
                         error_type = ?error_type,
                         "peer task failed"
                     );
+                    // Mirror the TaskComplete arm: when self holds
+                    // primary authority post-promotion, forward the
+                    // terminal failure to the demoted local primary
+                    // so its `handle_task_failed` site grows
+                    // `failed_tasks` and broadcasts
+                    // `ClusterMutation::TaskFailed`. Backpressure-
+                    // rejection failures bypass this branch entirely
+                    // (the task never ran; nothing to record on the
+                    // ledger).
+                    if self.is_primary {
+                        let forward = DistributedMessage::TaskFailed {
+                            sender_id: self.config.secondary_id.clone(),
+                            timestamp: timestamp_now(),
+                            secondary_id,
+                            worker_id,
+                            task_hash,
+                            error_type,
+                            error_message,
+                        };
+                        let _ = self.primary_transport.send(forward).await;
+                    }
                 }
             }
             DistributedMessage::TimeoutDetected {
