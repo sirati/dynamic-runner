@@ -268,3 +268,102 @@ impl PrimaryLink {
         self.first_failure_at.is_some()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit-level coverage for the primary-link health sub-state. The
+    //! integration-level tests live in `secondary/tests.rs` and drive
+    //! these methods via the full processing loop.
+
+    use super::*;
+
+    /// T-R1-count-arms: count-axis half of the threshold. After
+    /// `failure_threshold` consecutive `record_recv_failure` calls,
+    /// `should_arm_failover` returns true and the next
+    /// `record_recv_failure` returns true at the call boundary.
+    /// Pinning the threshold separately from the time axis keeps the
+    /// test deterministic — wall-clock isn't involved.
+    #[test]
+    fn reconnect_threshold_arms_election_after_n_failures() {
+        let mut link = PrimaryLink::with_failover_threshold(
+            "sec-a".into(),
+            5,
+            Duration::from_secs(3600), // huge window — count axis only
+        );
+        assert!(!link.should_arm_failover());
+        for i in 1..5 {
+            let armed = link.record_recv_failure();
+            assert!(!armed, "should not arm before threshold (probe {i})");
+            assert!(!link.should_arm_failover());
+        }
+        // Fifth probe breaches the threshold.
+        let armed = link.record_recv_failure();
+        assert!(armed, "fifth probe must arm failover");
+        assert!(link.should_arm_failover());
+    }
+
+    /// T-R1-time-arms: time-axis half of the threshold. Once the
+    /// failure window has elapsed since the first probe,
+    /// `should_arm_failover` returns true even if `failure_count`
+    /// hasn't reached `failure_threshold`.
+    #[test]
+    fn reconnect_threshold_arms_after_window_elapsed() {
+        let mut link = PrimaryLink::with_failover_threshold(
+            "sec-a".into(),
+            1000, // huge count threshold — time axis only
+            Duration::from_millis(50),
+        );
+        assert!(!link.record_recv_failure());
+        // Sleep beyond the window.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            link.should_arm_failover(),
+            "time-axis must arm once window elapsed"
+        );
+    }
+
+    /// T-R1-recv-success-resets: a primary message arriving (which
+    /// calls `record_recv_success` via `record_primary_message`)
+    /// resets the failure window so the next probe starts fresh.
+    /// Without this, a brief flap that recovers would still leave
+    /// the link half-armed on the next flap.
+    #[test]
+    fn record_recv_success_resets_failure_window() {
+        let mut link = PrimaryLink::with_failover_threshold(
+            "sec-a".into(),
+            3,
+            Duration::from_secs(30),
+        );
+        link.record_recv_failure();
+        link.record_recv_failure();
+        assert!(link.is_link_failing());
+        link.record_recv_success();
+        assert!(!link.is_link_failing());
+        assert!(!link.should_arm_failover());
+        // After reset, a single new failure shouldn't arm.
+        assert!(!link.record_recv_failure());
+    }
+
+    /// Boundary: the `should_arm_failover` predicate is a pure read —
+    /// calling it repeatedly without `record_recv_failure` doesn't
+    /// bump anything. Pins the side-effect contract so callers can
+    /// rely on tick-driven re-checks.
+    #[test]
+    fn should_arm_failover_is_pure() {
+        let mut link = PrimaryLink::with_failover_threshold(
+            "sec-a".into(),
+            5,
+            Duration::from_secs(3600),
+        );
+        assert!(!link.should_arm_failover());
+        assert!(!link.should_arm_failover());
+        // Still healthy.
+        assert!(!link.is_link_failing());
+        // First failure registers.
+        link.record_recv_failure();
+        assert!(link.is_link_failing());
+        // Repeated should_arm calls don't change state.
+        assert!(!link.should_arm_failover());
+        assert!(!link.should_arm_failover());
+    }
+}
