@@ -200,6 +200,12 @@ pub(crate) fn run_primary<'py>(
     let dict = PyDict::new(py);
     dict.set_item("completed", coord.getattr("completed")?)?;
     dict.set_item("failed", coord.getattr("failed")?)?;
+    // `stranded` carries the cluster-collapse counter that the
+    // underlying `RustPrimaryCoordinator.run` raises a `RuntimeError`
+    // on; on every successful return it's zero, but exposing the field
+    // unconditionally keeps the Python-facing dict shape consistent
+    // (consumers' "Completed: / Failed: / Stranded:" log line).
+    dict.set_item("stranded", coord.getattr("stranded")?)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -367,5 +373,9 @@ pub(crate) fn run_distributed<'py>(
     let dict = PyDict::new(py);
     dict.set_item("completed", mgr.getattr("completed")?)?;
     dict.set_item("failed", mgr.getattr("failed")?)?;
+    // See `run_primary` above for the rationale; the in-process
+    // distributed manager mirrors the same dict shape so callers
+    // don't have to special-case the network vs in-process variants.
+    dict.set_item("stranded", mgr.getattr("stranded")?)?;
     Ok(dict.into_any().unbind())
 }
