@@ -593,7 +593,20 @@ where
                     self.request_task_for_worker(worker_id).await?;
                 }
 
+                // Operator-facing INFO: did the worker finish a
+                // task, and did it succeed? The `secondary_id` is
+                // redundant in per-secondary slurm_*.out files
+                // (the file IS the secondary). Per-task identity
+                // (task_id / phase / task_type) moves to the
+                // sibling DEBUG so the operator log stays terse
+                // while diagnostic context is preserved.
                 tracing::info!(
+                    worker_id,
+                    task_hash = ?log_task_hash,
+                    success = result.success,
+                    "task done"
+                );
+                tracing::debug!(
                     secondary = %self.config.secondary_id,
                     worker_id,
                     task_id = ?binary.as_ref().and_then(|b| b.task_id.as_deref()),
@@ -601,7 +614,7 @@ where
                     task_type = ?binary.as_ref().map(|b| b.type_id.to_string()),
                     task_hash = ?log_task_hash,
                     success = result.success,
-                    "task completed"
+                    "task done: identity"
                 );
 
                 Ok(None)

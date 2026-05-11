@@ -608,7 +608,7 @@ if [ -n "${{SLURM_JOB_ID:-}}" ]; then
         podman --root "$storage" --runroot "$runroot" kill --signal KILL "$cname" 2>/dev/null
     ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
         </dev/null >/dev/null 2>&1
-    echo "Spawned podman teardown watchdog for SLURM job $SLURM_JOB_ID (container $CONTAINER_NAME), state-poll=5s, debounce=2, grace=60s"
+    echo "Spawned podman teardown watchdog (poll=5s debounce=2 grace=60s)"
 fi
 
 echo "Starting Docker container..."
@@ -1124,10 +1124,10 @@ mod tests {
             "watchdog must log SIGKILL escalation when grace \
              expires; render did not contain the escalation log"
         );
-        // Spawn-confirmation echo surfaces the new tunables so
-        // operators see them without reading the bash.
+        // Spawn-confirmation echo surfaces the watchdog tunables
+        // so operators see them without reading the bash.
         assert!(
-            script.contains("state-poll=5s, debounce=2, grace=60s"),
+            script.contains("poll=5s debounce=2 grace=60s"),
             "spawn-confirmation echo must surface the watchdog \
              tunables; render did not contain them"
         );
