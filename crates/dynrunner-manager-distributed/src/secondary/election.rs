@@ -271,7 +271,49 @@ where
                     .map(|id| id == &self.config.secondary_id)
                     .unwrap_or(false);
                 let round = next_round(&self.election);
-                if we_lead {
+                // Observer self-exclusion (#35): even when our id is
+                // the lex-lowest in the alive set, an observer MUST
+                // NOT self-promote. Observers are non-candidates by
+                // design — they receive cluster updates but cannot
+                // host the primary role (no workers, no dispatch
+                // authority). The full fortification (peers also
+                // skipping observers when picking `lowest_alive`)
+                // needs `PeerConnectionInfo.is_observer`, tracked as
+                // a follow-up; until that lands the observer
+                // self-policing is the load-bearing guard.
+                //
+                // If we_lead but is_observer, we defer to the NEXT-
+                // lowest-id peer that ISN'T us — that peer will
+                // self-promote on its own tick. If we're the only
+                // alive secondary (peer_keepalives empty), there's
+                // no candidate at all and we stay Voting (effectively
+                // waiting for another secondary to come online); the
+                // peer_mesh_degraded guard above catches the
+                // pathological "alone and primary's dead" case.
+                if self.config.is_observer && we_lead {
+                    let next_lowest = self
+                        .peer_keepalives
+                        .keys()
+                        .min()
+                        .cloned();
+                    tracing::info!(
+                        observer = %self.config.secondary_id,
+                        ?next_lowest,
+                        round,
+                        "observer would have self-promoted by lowest-id but \
+                         is non-candidate; deferring to next-lowest peer \
+                         (peers without observer-awareness will need to \
+                         self-promote on their own ticks)"
+                    );
+                    if let Some(candidate) = next_lowest {
+                        self.primary_link.set_current_primary(Some(candidate.clone()));
+                        self.election = ElectionState::Voting { round, candidate };
+                    }
+                    // No next_lowest = we're the only one alive AND
+                    // we're an observer. Don't transition; let the
+                    // peer-mesh-degraded path catch this in a future
+                    // tick (or a new secondary arrival fixes it).
+                } else if we_lead {
                     tracing::info!(round, "self-promoting");
                     self.election = ElectionState::Candidate {
                         round,
@@ -866,5 +908,82 @@ mod tests {
             !matches!(sec_b.election, ElectionState::Promoted),
             "sec-b must NOT also promote — split-brain prevented"
         );
+    }
+
+    /// Observer self-exclusion (#35): a secondary with
+    /// `is_observer = true` MUST NOT self-promote even when its id
+    /// is lex-lowest in the alive set. Setup: "obs-a" (observer)
+    /// and "sec-b" (regular), obs-a is lex-lowest. Primary goes
+    /// silent. obs-a's election tick should defer to sec-b
+    /// (next-lowest) instead of entering Candidate state.
+    ///
+    /// This is the load-bearing observer guard until the peer-side
+    /// `lowest_alive` filter lands (which requires extending
+    /// PeerConnectionInfo with is_observer and broadcasting via
+    /// PeerInfo — tracked as a follow-up). Without this guard, an
+    /// observer in the alive set with a lex-low id would
+    /// self-promote despite having no workers and no dispatch
+    /// authority — the cluster would then stall because the
+    /// "promoted" node can't actually do anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn observer_never_self_promotes_even_when_lowest_id() {
+        use super::super::test_helpers::{election_config, make_secondary};
+
+        let mut cfg = election_config("obs-a");
+        cfg.is_observer = true;
+        let mut sec = make_secondary(cfg);
+
+        // sec-b is the next-lowest. obs-a is lex-lowest in the alive
+        // set (obs-a < sec-b lexicographically). Pre-fix this would
+        // make obs-a self-promote on its election tick.
+        sec.peer_keepalives.insert("sec-b".into(), timestamp_now());
+        sec.record_primary_message();
+
+        // Primary goes silent.
+        tokio::time::sleep(PAST_DEATH).await;
+        sec.run_election_tick();
+        tokio::time::sleep(ONE_INTERVAL).await;
+
+        // sec-b's TimeoutResponse so obs-a's Suspecting tick has
+        // peer agreement to reach quorum.
+        sec.record_timeout_response("sec-b".into(), None);
+
+        let actions = sec.run_election_tick();
+
+        // Observer MUST NOT enter Candidate state.
+        assert!(
+            !matches!(sec.election, ElectionState::Candidate { .. }),
+            "observer entered Candidate state despite is_observer=true — \
+             observer self-exclusion guard regressed. Election state: \
+             {:?}",
+            std::mem::discriminant(&sec.election),
+        );
+
+        // No PromotionVote broadcast either — observers must not
+        // even campaign.
+        assert!(
+            !actions
+                .broadcast
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::PromotionVote { .. })),
+            "observer broadcast a PromotionVote — must not campaign"
+        );
+
+        // Routing target should point at sec-b (the next-lowest
+        // non-observer peer), so the observer's send_to_current_primary
+        // routes correctly once sec-b self-promotes on its own tick.
+        match &sec.election {
+            ElectionState::Voting { candidate, .. } => {
+                assert_eq!(
+                    candidate, "sec-b",
+                    "observer must defer to next-lowest non-observer peer"
+                );
+            }
+            other => panic!(
+                "observer should be in Voting state pointing at sec-b, got \
+                 discriminant={:?}",
+                std::mem::discriminant(other)
+            ),
+        }
     }
 }

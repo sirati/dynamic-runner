@@ -299,6 +299,7 @@ impl PyDistributedManager {
                             primary_link_failure_window:
                                 dist_primary_link_failure_window,
                             setup_deadline: dist_setup_deadline,
+                            is_observer: false,
                         };
 
                         let estimator = sec_estimator;

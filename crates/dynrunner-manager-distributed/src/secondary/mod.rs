@@ -66,6 +66,35 @@ pub struct SecondaryConfig {
     /// probes would exceed the SLURM time budget.
     pub primary_link_failure_window: Duration,
 
+    /// Observer mode: this secondary participates in cluster updates
+    /// (ClusterMutation broadcasts, PeerInfo, Keepalive, peer-routed
+    /// task-state messages) but cannot become primary and has no
+    /// workers. Use case: the dispatcher in SLURM mode hosts an
+    /// in-process observer so it stays connected to the cluster as
+    /// a non-candidate secondary even after a primary handoff/death
+    /// — the surviving SLURM secondaries elect among themselves and
+    /// the dispatcher's observer just receives the broadcasts.
+    ///
+    /// When `is_observer = true`:
+    ///   - `num_workers` should be 0 (no work to take on); the
+    ///     framework does not validate this, but processing-loop
+    ///     paths that iterate workers behave correctly with an
+    ///     empty pool.
+    ///   - The election state machine refuses to enter `Candidate`
+    ///     state — the observer never self-promotes even when it
+    ///     would otherwise be the lowest-id alive peer. See
+    ///     `election.rs::run_election_tick`'s `we_lead` branch.
+    ///   - A `PromotePrimary` naming this secondary is rejected
+    ///     with a loud error (defensive: should not happen if peers
+    ///     honour the same flag, but protects against a misconfigured
+    ///     peer or a wire-level forgery).
+    ///
+    /// Default `false` (regular secondary). The peer-mesh-side
+    /// fortification (peers filtering observers from `lowest_alive`
+    /// candidate selection) requires extending `PeerConnectionInfo`
+    /// with this flag; tracked as a follow-up to this commit.
+    pub is_observer: bool,
+
     /// Maximum wall-clock the secondary will spend in setup phases
     /// (send_welcome + send_cert_exchange + wait_for_setup) before
     /// concluding the cluster is dead and exiting cold. Default 60s.
@@ -108,6 +137,7 @@ impl Default for SecondaryConfig {
             retry_max_passes: 1,
             primary_link_failure_threshold: primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: primary_link::DEFAULT_FAILURE_WINDOW,
+            is_observer: false,
             setup_deadline: Duration::from_secs(60),
         }
     }
