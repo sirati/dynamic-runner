@@ -52,12 +52,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import signal
 import socket as _socket
 import subprocess
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+
+# Module-level logger for the worker runtime's own diagnostic
+# observability. Lives at `dynamic_runner.worker.runtime` so
+# operators can filter via standard Python logging config. Default
+# behaviour is unconfigured-logger silence; the framework's CLI
+# entry points install a handler that routes worker log records to
+# the `--log-file` argument.
+_LOG = logging.getLogger(__name__)
 
 from ..comm import (
     CommunicationInterface,
@@ -451,6 +460,13 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
             # process.
             if classified.error_type == ErrorType.NON_RECOVERABLE:
                 ctx.non_recoverable_emitted = True
+                _LOG.info(
+                    "worker.runtime: NonRecoverableError observed; "
+                    "process exit code will be 1 at run() return "
+                    "(message=%r last_send_failed=%s)",
+                    classified.error_message,
+                    ctx.last_send_failed,
+                )
             return not ctx.last_send_failed
         # Unknown exception → ship the full traceback. Default to
         # RECOVERABLE per plan D6: an unhandled bug retried on a
@@ -566,7 +582,17 @@ def run(
     # SystemExit propagates past the finally block above without
     # disturbing comm.close() / signal-handler restoration — both
     # have already run.
+    _LOG.info(
+        "worker.runtime: run() loop exited (non_recoverable_emitted=%s "
+        "last_send_failed=%s); about to choose exit code",
+        ctx.non_recoverable_emitted,
+        ctx.last_send_failed,
+    )
     if ctx.non_recoverable_emitted:
+        _LOG.info(
+            "worker.runtime: raising SystemExit(1) per "
+            "NonRecoverableError exit-code contract"
+        )
         raise SystemExit(1)
 
 
