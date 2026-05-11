@@ -170,6 +170,7 @@ class SlurmJobManager:
         gateway_host: str | None,
         gateway_port: int | None,
         cores_spec: str = "0",
+        max_memory_spec: str = "-2G",
         reverse_connection: bool = False,
         run_log_dir: str | None = None,
     ) -> str:
@@ -190,6 +191,18 @@ class SlurmJobManager:
         semantic in heterogeneous SLURM deployments. Defaults to
         ``"0"`` (all detected cores) for back-compat with callers
         that haven't been updated to pass an explicit spec.
+
+        ``max_memory_spec`` is the verbatim ``--max-memory`` spec
+        string (``"16G"``, ``"4G"``, ``"-2G"``, ``"+1G"``, …)
+        forwarded the same way; each secondary resolves it locally
+        via :func:`parse_memory` against ITS host's
+        ``/proc/meminfo:MemTotal`` (or cgroup-v2 ``memory.max``).
+        Defaults to ``"-2G"`` (host minus 2 GiB headroom), matching
+        the CLI's default. SLURM-only: the ``--multi-computer local``
+        path INTENTIONALLY does not forward memory because all local
+        secondaries share one host's RAM (double-counting); SLURM
+        secondaries are each on a different host with their own
+        budget so per-machine semantic applies.
         """
         connection_info_dir = (
             self._expand_path(f"{run_log_dir or self.slurm_config.get_log_dir()}/connection_info")
@@ -210,6 +223,7 @@ class SlurmJobManager:
             srcbins_mount_source=self._expand_path(self.slurm_config.get_srcbins_mount_source()),
             output_dir=self._expand_path(self.slurm_config.get_output_dir()),
             cores_spec=cores_spec,
+            max_memory_spec=max_memory_spec,
             run_log_dir=self._expand_path(run_log_dir or self.slurm_config.get_log_dir()),
             dynrunner_network_dir=(
                 self._expand_path(self.deployment.dynrunner_network_dir)
