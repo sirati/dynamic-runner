@@ -1513,3 +1513,93 @@ async fn cold_start_with_peers_emits_distinct_error() {
         })
         .await;
 }
+
+/// T-#28 (post-promotion task distribution):
+/// When a peer-routed TaskAssignment arrives at `handle_peer_message`,
+/// it MUST be dispatched to a worker — not silently dropped via the
+/// `_` catch-all. Pre-fix, `handle_peer_message` had no
+/// `TaskAssignment` arm; the promoted peer-primary's assignments to
+/// other secondaries fell through to `tracing::debug!("unhandled peer
+/// message")` and never reached `pool.workers[i].assign_task`.
+/// Symptom (asm-tokenizer 9ca9124): the promoted node's own workers
+/// ran 445/446 tasks each while peer secondaries' workers stopped at
+/// 1 task each (their pre-promotion initial assignment), parking
+/// half the cluster's compute.
+///
+/// This test drives `handle_peer_message` directly with a fabricated
+/// TaskAssignment and asserts that `active_tasks` contains the
+/// expected hash, proving the worker received the assignment.
+#[tokio::test(flavor = "current_thread")]
+async fn handle_peer_message_dispatches_task_assignment_to_worker() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-1".into(),
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_secs(60),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
+            };
+
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                transport,
+                NoPeers,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            // Initialise workers so `assign_task` has a target.
+            let mut factory = FakeWorkerFactory;
+            secondary.initialize_workers(&mut factory).await.unwrap();
+
+            // Fabricate the wire shape the promoted-peer-primary would
+            // send. file_hash is the key we'll later assert against in
+            // `active_tasks` to prove the dispatch actually happened.
+            let binary = make_binary("post-promotion-task", 50);
+            let file_hash = format!("hash_{}", binary.identifier.0);
+            let assignment = DistributedMessage::TaskAssignment {
+                sender_id: "sec-0".into(),       // promoted peer-primary
+                timestamp: 0.0,
+                secondary_id: "sec-1".into(),
+                worker_id: 0,
+                zip_file: None,
+                binary_info: DistributedBinaryInfo::from_task_info(&binary),
+                local_path: binary.path.to_string_lossy().into_owned(),
+                file_hash: file_hash.clone(),
+            };
+
+            // The critical call: route via peer_transport handler.
+            // Pre-fix this fell into the catch-all and was lost.
+            secondary.handle_peer_message(assignment).await;
+
+            // Worker received the assignment → `active_tasks` records it.
+            // (The `dispatch_message` body inserts on the assign_task
+            // success path; the FakeWorkerFactory's runner always
+            // accepts assignments.)
+            assert!(
+                secondary.active_tasks.contains_key(&file_hash),
+                "TaskAssignment via peer_transport must reach the worker; \
+                 active_tasks={:?}",
+                secondary.active_tasks
+            );
+        })
+        .await;
+}

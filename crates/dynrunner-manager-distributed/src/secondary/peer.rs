@@ -245,6 +245,34 @@ where
                     tracing::warn!(error = %e, "post-promotion peer TaskRequest dispatch failed");
                 }
             }
+            // Post-promotion TaskAssignment: when the new primary IS a
+            // peer, its TaskAssignment to this secondary arrives over
+            // peer_transport, not primary_transport. The dispatch body
+            // (path resolution, worker assignment, failure reporting)
+            // is identical regardless of transport, so we delegate to
+            // dispatch_message — keeping ONE place that handles the
+            // wire shape. Pre-fix this arm was absent and the message
+            // fell through the `_` catch-all below, silently dropped.
+            // Observable symptom: asm-tokenizer 9ca9124 post-promotion
+            // run, the promoted node's own workers ran 445/446 tasks
+            // each while peer secondaries' workers stopped at 1 task
+            // each (their pre-promotion initial assignment) — half the
+            // cluster's compute parked.
+            //
+            // record_primary_message inside dispatch_message is the
+            // right semantic for a promoted-peer-to-us TaskAssignment:
+            // the sender IS the current primary, so its message arrival
+            // IS a primary-link health signal. The reset of
+            // primary-link's failure tracking is also correct (the
+            // primary is reachable via the peer mesh now).
+            msg @ DistributedMessage::TaskAssignment { .. } => {
+                if let Err(e) = self.dispatch_message(msg).await {
+                    tracing::warn!(
+                        error = %e,
+                        "post-promotion peer TaskAssignment dispatch failed"
+                    );
+                }
+            }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled peer message");
             }
