@@ -359,6 +359,26 @@ pub(crate) fn run_slurm_pipeline<'py>(
         .ok()
         .and_then(|v| v.extract::<String>().ok())
         .unwrap_or_else(|| "0".into());
+    // Symmetric with cores: `args.max_memory` is the verbatim
+    // `--max-memory` spec string (`"16G"`, `"-2G"`, `"+1G"`, …)
+    // passed by the user or its argparse default `"-2G"`. The
+    // SlurmPreparation Python class accepts `max_memory_spec` and
+    // forwards it to job_manager.generate_wrapper_script, which
+    // emits `--max-memory={spec}` in the secondary's container_command.
+    //
+    // BUG-FIX (asm-dataset-nix repro at 3aa9920): the #30 commit
+    // (57d7ee8) added `cores_spec` extraction here but FORGOT the
+    // symmetric `max_memory_spec` line + set_item. The secondary's
+    // wrapper then rendered `--max-memory=-2G` (the default) even
+    // when the user passed `--max-memory 2G` on the dispatcher. The
+    // `worker_id=0 budget_mb=4096` over-allocation that #30 was
+    // meant to close stayed open because the plumbing dead-ended
+    // one hop early. This commit closes the gap.
+    let max_memory_spec: String = args
+        .getattr("max_memory")
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_else(|| "-2G".into());
 
     let preparation_module = py.import("dynamic_runner.packaging.preparation")?;
     let preparation_cls = preparation_module.getattr("SlurmPreparation")?;
@@ -370,6 +390,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
     prep_kwargs.set_item("use_reverse_connection", use_reverse_connection)?;
     prep_kwargs.set_item("run_id", &run_id)?;
     prep_kwargs.set_item("cores_spec", cores_spec)?;
+    prep_kwargs.set_item("max_memory_spec", max_memory_spec)?;
     let preparation = preparation_cls.call((), Some(&prep_kwargs))?;
 
     // ---- try/finally guard. Owns gateway + (post-prep) preparation. ----
