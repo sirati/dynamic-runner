@@ -410,7 +410,25 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // keeps cycling work back to it. Tokenizer hit this on
             // a 1791-task cohort: 3128 errors all on one secondary,
             // 1511 permanent failures.
-            let is_backpressure = error_message == "No idle worker available";
+            // Two backpressure shapes — both mean "task DIDN'T
+            // actually run; requeue at the pool, do not consume
+            // retry budget":
+            //
+            //   1. "No idle worker available" — peer's worker
+            //      pool was full at dispatch time.
+            //   2. "worker pipe broken; respawning" — peer's
+            //      target worker subprocess died between tasks;
+            //      pipe-write failed; the peer is respawning.
+            //      The not-yet-attempted task comes back with
+            //      this marker so the primary requeues into the
+            //      pool and re-dispatches once a peer signals
+            //      capacity. Without this case Bug C produced
+            //      silent task loss on every Broken-pipe assign
+            //      attempt at a peer secondary (#46 secondary-
+            //      side fix needed this primary-side companion
+            //      to actually requeue rather than mark-as-failed).
+            let is_backpressure = error_message == "No idle worker available"
+                || error_message == "worker pipe broken; respawning";
             if is_backpressure {
                 let backoff_ms = 500;
                 self.backpressured_secondaries.insert(
