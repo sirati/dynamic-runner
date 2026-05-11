@@ -169,6 +169,7 @@ class SlurmJobManager:
         secondary_id: str,
         gateway_host: str | None,
         gateway_port: int | None,
+        cores_spec: str = "0",
         reverse_connection: bool = False,
         run_log_dir: str | None = None,
     ) -> str:
@@ -180,6 +181,15 @@ class SlurmJobManager:
         kwargs the Rust generator expects. The actual bash-template
         rendering lives in ``crates/dynrunner-slurm/src/wrapper_script.rs``
         and is exposed via ``_native.generate_wrapper_script``.
+
+        ``cores_spec`` is the verbatim ``--cores`` spec string
+        (``"0"``, ``"N"``, ``"+N"``, ``"-N"``) forwarded to the
+        secondary subprocess inside the container. Each secondary
+        resolves it locally against its OWN container's detected
+        CPU count via :func:`parse_cores`, preserving the per-machine
+        semantic in heterogeneous SLURM deployments. Defaults to
+        ``"0"`` (all detected cores) for back-compat with callers
+        that haven't been updated to pass an explicit spec.
         """
         connection_info_dir = (
             self._expand_path(f"{run_log_dir or self.slurm_config.get_log_dir()}/connection_info")
@@ -199,6 +209,7 @@ class SlurmJobManager:
             container_command=self.deployment.secondary_module,
             srcbins_mount_source=self._expand_path(self.slurm_config.get_srcbins_mount_source()),
             output_dir=self._expand_path(self.slurm_config.get_output_dir()),
+            cores_spec=cores_spec,
             run_log_dir=self._expand_path(run_log_dir or self.slurm_config.get_log_dir()),
             dynrunner_network_dir=(
                 self._expand_path(self.deployment.dynrunner_network_dir)
