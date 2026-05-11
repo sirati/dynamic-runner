@@ -605,6 +605,15 @@ where
                 result,
                 binary,
             } => {
+                // Reap the subprocess BEFORE reclaim_protocol so the
+                // exit status rides the same log line as the
+                // disconnect. `try_reap_exit` is non-blocking; `None`
+                // means PID was untracked, kernel hasn't reaped yet
+                // (SIGCHLD race), or the child was already reaped by
+                // another path. See WorkerHandle::try_reap_exit for
+                // the full set of None conditions.
+                let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
+
                 // Reclaim protocol state from the spawned poll task
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
@@ -612,6 +621,7 @@ where
                 tracing::warn!(
                     worker_id,
                     error = ?result.error_message,
+                    exit_status = exit_status.as_ref().map(|s| s.to_string()),
                     "worker disconnected"
                 );
 

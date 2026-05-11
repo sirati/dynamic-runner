@@ -20,6 +20,15 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+# `nix::sys::wait::waitpid` for non-blocking reap of dead worker
+# subprocesses. The `process` feature gates `sys::wait`. Cfg-gated
+# to unix because waitpid is POSIX; the framework treats reap-not-
+# available as `exit_status: None`, so non-unix builds still
+# compile and the dispatcher just logs the disconnect without
+# signal info.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [dev-dependencies]
 dynrunner-scheduler = { workspace = true }
 dynrunner-transport-socket = { workspace = true }
