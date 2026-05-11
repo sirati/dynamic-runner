@@ -161,6 +161,7 @@ impl PySecondaryCoordinator {
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
+        let dist_setup_deadline = self.distributed_config.setup_deadline();
         let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
@@ -330,6 +331,7 @@ impl PySecondaryCoordinator {
                     retry_max_passes: dist_retry_max_passes,
                     primary_link_failure_threshold: dist_primary_link_failure_threshold,
                     primary_link_failure_window: dist_primary_link_failure_window,
+                    setup_deadline: dist_setup_deadline,
                 };
 
                 let mut factory = SubprocessWorkerFactory {

@@ -777,6 +777,7 @@ fn spawn_real_secondary_with_src_network(
             retry_max_passes: 1,
             primary_link_failure_threshold: 5,
             primary_link_failure_window: Duration::from_secs(30),
+            setup_deadline: Duration::from_secs(60),
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -842,6 +843,7 @@ fn spawn_real_secondary_flaky(
             retry_max_passes,
             primary_link_failure_threshold: 5,
             primary_link_failure_window: Duration::from_secs(30),
+            setup_deadline: Duration::from_secs(60),
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -1207,6 +1209,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     retry_max_passes: 1,
                     primary_link_failure_threshold: 5,
                     primary_link_failure_window: Duration::from_secs(30),
+                    setup_deadline: Duration::from_secs(60),
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,
