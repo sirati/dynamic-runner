@@ -344,6 +344,22 @@ pub(crate) fn run_slurm_pipeline<'py>(
     mkdir_kwargs.set_item("exist_ok", true)?;
     cert_dir.call_method("mkdir", (), Some(&mkdir_kwargs))?;
 
+    // `args.cores` is the verbatim `--cores` spec string the user
+    // passed (or its argparse default `"0"`). Forward it to
+    // SlurmPreparation so each SLURM wrapper appends `--cores <spec>`
+    // to the secondary's container_command — symmetric with the
+    // `--multi-computer local` fix at spawn_secondary.py (commit
+    // 38a0c30 / task #26). Without this, the secondary subprocess
+    // inside the SLURM container's cgroup-CPU-quota auto-detects
+    // host CPU count from `available_parallelism` (returns 32 on
+    // a 32-core host even when the container is quota'd to 2 CPUs)
+    // and oversaturates the per-job cgroup with worker spawns.
+    let cores_spec: String = args
+        .getattr("cores")
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_else(|| "0".into());
+
     let preparation_module = py.import("dynamic_runner.packaging.preparation")?;
     let preparation_cls = preparation_module.getattr("SlurmPreparation")?;
     let prep_kwargs = PyDict::new(py);
@@ -353,6 +369,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
     prep_kwargs.set_item("deployment", deployment)?;
     prep_kwargs.set_item("use_reverse_connection", use_reverse_connection)?;
     prep_kwargs.set_item("run_id", &run_id)?;
+    prep_kwargs.set_item("cores_spec", cores_spec)?;
     let preparation = preparation_cls.call((), Some(&prep_kwargs))?;
 
     // ---- try/finally guard. Owns gateway + (post-prep) preparation. ----

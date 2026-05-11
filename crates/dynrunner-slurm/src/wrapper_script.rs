@@ -38,10 +38,24 @@ pub struct WrapperScriptConfig<'a> {
     /// `if ! { ... }` failure-marker block.
     pub load_command: &'a str,
     /// In-container entrypoint and its args after `--secondary` URL,
-    /// `--secondary-id`, `--secondary-quic-port` are appended. For
-    /// the typical case this is the consumer's
+    /// `--secondary-id`, `--secondary-quic-port`, and `--cores` are
+    /// appended. For the typical case this is the consumer's
     /// `TaskDeploymentSpec.secondary_module`.
     pub container_command: &'a str,
+    /// CLI `--cores` spec (verbatim string: `"0"`, `"N"`, `"+N"`,
+    /// `"-N"`) forwarded to the secondary subprocess inside the
+    /// container. Each secondary parses this locally against its
+    /// own container's detected CPU count via `parse_cores`,
+    /// preserving the per-machine semantic. The framework's
+    /// `PySecondaryConfig.__new__` auto-detect (which reads the
+    /// host's `available_parallelism` from inside a cgroup-CPU-
+    /// quota'd container and returns the host CPU count, not the
+    /// SLURM cgroup's quota) is then suppressed because the
+    /// secondary's argparse parses `--cores` and explicitly
+    /// populates `num_workers`. Symmetric with the
+    /// `--multi-computer local` fix in `spawn_secondary.py`
+    /// (commit 38a0c30 / task #26).
+    pub cores_spec: &'a str,
     /// Connection-mode-specific config (gateway/standard vs reverse).
     pub connection: ConnectionMode<'a>,
     /// Optional override for the run-log directory used as the
@@ -434,6 +448,7 @@ echo "  Secondary ID: {secondary_id}"
     let image_ref = format!("{}:{}", cfg.image_name, cfg.image_tag);
     let sid = cfg.secondary_id;
     let container_command = cfg.container_command;
+    let cores_spec = cfg.cores_spec;
     let (mode_banner, secondary_url) = match &cfg.connection {
         ConnectionMode::Reverse { .. } => (
             "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\""
@@ -502,7 +517,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     -v "{log_network}:/app/log-network" \
 {dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_ref} \
-    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT"##
+    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores {cores_spec}"##
     ));
 
     script.push_str(
@@ -723,6 +738,7 @@ mod tests {
             image_tar_basename: "test-app.tar",
             load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
             container_command: "dynamic_batch_tokenizer",
+            cores_spec: "0",
             connection: ConnectionMode::Standard {
                 gateway_host: "gateway.example.com",
                 gateway_port: 9000,
@@ -733,6 +749,46 @@ mod tests {
             output_dir: None,
             extra_run_args,
         }
+    }
+
+    #[test]
+    fn standard_mode_script_forwards_cores_spec() {
+        // Task #29: each SLURM secondary's container_command MUST
+        // receive `--cores <spec>` as a verbatim argument so the
+        // secondary subprocess inside the cgroup-CPU-quota'd
+        // container resolves the per-machine core count via
+        // `parse_cores` instead of falling back to
+        // `available_parallelism` (which inside the SLURM container
+        // reads the host's CPU count, not the cgroup quota — the
+        // foot-gun this fix closes). Pre-fix this argv suffix was
+        // entirely absent and asm-dataset-nix observed
+        // `secondary starting workers=32` even with `--cores 2` on
+        // the dispatcher.
+        let config = SlurmConfig::default();
+        let mut cfg = standard_cfg(&config, &[]);
+        cfg.cores_spec = "-2";
+        let script = generate_wrapper_script(&cfg);
+        assert!(
+            script.contains("--cores -2"),
+            "wrapper script must forward `--cores -2` to secondary; \
+             render did not contain it"
+        );
+        // The `--cores` flag MUST appear AFTER `--secondary-quic-port`
+        // (the argv-build order matches the regular CLI order):
+        // assert position to catch regressions that move the flag
+        // somewhere broken (e.g. into the podman-run flags block
+        // instead of the container_command suffix).
+        let port_idx = script
+            .find("--secondary-quic-port")
+            .expect("--secondary-quic-port must be present");
+        let cores_idx = script
+            .find("--cores")
+            .expect("--cores must be present");
+        assert!(
+            cores_idx > port_idx,
+            "--cores must appear after --secondary-quic-port in the secondary's \
+             argv (currently at byte {cores_idx}, port at {port_idx})"
+        );
     }
 
     #[test]
@@ -789,6 +845,7 @@ mod tests {
             image_tar_basename: "test-app.tar",
             load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
             container_command: "my_runner",
+            cores_spec: "0",
             connection: ConnectionMode::Reverse {
                 connection_info_dir: "/logs/connection_info",
             },

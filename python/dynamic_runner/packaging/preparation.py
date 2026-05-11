@@ -59,6 +59,7 @@ class SlurmPreparation:
         deployment: TaskDeploymentSpec,
         use_reverse_connection: bool = False,
         run_id: str = "default",
+        cores_spec: str = "0",
     ):
         self.slurm_config = slurm_config
         self.job_manager = job_manager
@@ -66,6 +67,13 @@ class SlurmPreparation:
         self.deployment = deployment
         self.use_reverse_connection = use_reverse_connection
         self.run_id = run_id
+        # Verbatim `--cores` spec string forwarded to each SLURM
+        # secondary's container_command. Defaults to "0" (all
+        # detected cores) for back-compat with callers that
+        # construct SlurmPreparation directly. The framework's
+        # `pipeline.rs` always populates this from `args.cores`;
+        # the default only applies to programmatic test fixtures.
+        self.cores_spec = cores_spec
 
         base_log_dir = self.slurm_config.get_log_dir()
         self.run_log_dir = f"{base_log_dir}/{run_id}"
@@ -166,6 +174,7 @@ class SlurmPreparation:
                 secondary_id=secondary_id,
                 gateway_host=gateway_host,
                 gateway_port=primary_quic_port,
+                cores_spec=self.cores_spec,
                 reverse_connection=self.use_reverse_connection,
                 run_log_dir=self.run_log_dir,
             )
