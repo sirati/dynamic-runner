@@ -574,7 +574,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     .count() as u32
                     - 1;
                 self.workers[worker_idx].current_task = Some(binary.clone());
-                self.workers[worker_idx].estimated_resources = estimated_usage;
+                self.workers[worker_idx].estimated_resources = estimated_usage.clone();
                 self.workers[worker_idx].is_idle = false;
 
                 let task_hash = compute_task_hash(&binary);
@@ -588,7 +588,46 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     local_path: self.config.wire_local_path(&binary),
                     file_hash: task_hash.clone(),
                 };
-                self.transport.send_to(&sec_id, assignment_msg).await?;
+
+                // Transport-send failure rollback: pre-fix the
+                // `await?` returned Err with the worker's
+                // `current_task` set, `is_idle = false`, and the
+                // pool's `in_flight_per_phase` bumped (via the
+                // earlier `take_from_view` call) — but the task
+                // itself never reached the peer. The primary's
+                // view permanently believed the slot was busy,
+                // `dispatch_order` skipped it forever, and the
+                // leaked in_flight slot never decremented (no
+                // TaskComplete / TaskFailed will ever arrive for
+                // a task that wasn't sent). Cumulative leaks
+                // explain asm-tokenizer's "33 in_flight with
+                // active=0" jam at 84f669c.
+                //
+                // Rollback symmetry: revert worker state,
+                // requeue the binary back to the FRONT of its
+                // bucket (matches `handle_primary_peer_rejection`),
+                // release the type slot, and `continue` the
+                // dispatch loop so other idle workers still get a
+                // chance this tick. WARN so an operator grepping
+                // for the jam symptom sees the proximate cause.
+                if let Err(send_err) =
+                    self.transport.send_to(&sec_id, assignment_msg).await
+                {
+                    tracing::warn!(
+                        secondary = %sec_id,
+                        worker_id = local_worker_id,
+                        task_hash = %task_hash,
+                        error = %send_err,
+                        "task-assignment send failed; rolling back worker state and requeuing binary"
+                    );
+                    self.workers[worker_idx].current_task = None;
+                    self.workers[worker_idx].estimated_resources =
+                        ResourceMap::new();
+                    self.workers[worker_idx].is_idle = true;
+                    self.release_type_slot(&binary.type_id);
+                    self.pool_mut().requeue(binary);
+                    continue;
+                }
 
                 // Operator-facing INFO: which secondary/worker just
                 // took the task. Per-task identity (task_id /

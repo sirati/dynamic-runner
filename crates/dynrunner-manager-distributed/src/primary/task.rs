@@ -126,7 +126,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                         self.reserve_type_slot(&binary.type_id);
                         let sec_id = self.workers[idx].secondary_id.clone();
                         self.workers[idx].current_task = Some(binary.clone());
-                        self.workers[idx].estimated_resources = estimated_usage;
+                        self.workers[idx].estimated_resources = estimated_usage.clone();
                         self.workers[idx].is_idle = false;
 
                         let task_hash = compute_task_hash(&binary);
@@ -140,7 +140,46 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                             local_path: self.config.wire_local_path(&binary),
                             file_hash: task_hash.clone(),
                         };
-                        self.transport.send_to(&sec_id, assignment_msg).await?;
+
+                        // Same partial-commit-leak rollback as
+                        // `dispatch_to_idle_workers`: a send_to
+                        // failure here pre-fix left the worker's
+                        // current_task set + is_idle=false + pool
+                        // in_flight bumped. dispatch_order then
+                        // skipped the slot forever; the leaked
+                        // in_flight never decremented because no
+                        // TaskComplete/TaskFailed could arrive for
+                        // a task that wasn't sent. asm-tokenizer's
+                        // 33-in_flight/active=0 jam at 84f669c is
+                        // the operator-facing symptom of cumulative
+                        // leaks from this and the sibling path.
+                        if let Err(send_err) =
+                            self.transport.send_to(&sec_id, assignment_msg).await
+                        {
+                            tracing::warn!(
+                                secondary = %sec_id,
+                                worker_id,
+                                task_hash = %task_hash,
+                                error = %send_err,
+                                "task-assignment send failed; rolling back worker state and requeuing binary"
+                            );
+                            self.workers[idx].current_task = None;
+                            self.workers[idx].estimated_resources =
+                                ResourceMap::new();
+                            self.workers[idx].is_idle = true;
+                            self.release_type_slot(&binary.type_id);
+                            self.pool_mut().requeue(binary);
+                            // Return early without setting
+                            // `assigned`: the binary is back in
+                            // the pool, the slot is open again,
+                            // and the requesting secondary will
+                            // retry the TaskRequest on its next
+                            // tick. Falling through to the
+                            // relay-to-primary arm would re-send
+                            // the same TaskRequest we just failed
+                            // to handle, looping work back.
+                            return Ok(());
+                        }
 
                         // Operator-facing INFO: which secondary/
                         // worker just took the task. Per-task
