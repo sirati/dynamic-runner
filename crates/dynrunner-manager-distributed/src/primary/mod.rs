@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{resolve_against_root, TaskInfo, Identifier, PhaseId, ResourceMap};
+use dynrunner_core::{resolve_against_root, ErrorType, TaskInfo, Identifier, PhaseId, ResourceMap};
 use dynrunner_protocol_primary_secondary::{ClusterMutation, SecondaryTransport};
 use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
@@ -31,12 +31,18 @@ use crate::state::SecondaryConnectionState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     /// The run loop exited (transport collapse, inactivity timeout,
-    /// etc.) with tasks left neither in the completed set nor in the
-    /// failed set. `stranded = total - completed - failed`.
+    /// etc.) with tasks left neither in the completed set nor in
+    /// any failure bucket. `stranded = total - outcome.total_terminal()`.
+    ///
+    /// `outcome` carries the per-class breakdown so post-mortem
+    /// tooling can render `succeeded` separately from the three
+    /// `fail_*` buckets; pre-restructure shape `{ stranded,
+    /// completed, failed }` collapsed all failure classes into a
+    /// single `failed` field and hid OOM-vs-final-vs-retryable
+    /// downstream of the error variant.
     ClusterCollapsed {
         stranded: usize,
-        completed: usize,
-        failed: usize,
+        outcome: OutcomeSummary,
     },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
@@ -46,10 +52,14 @@ pub enum RunError {
 impl fmt::Display for RunError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ClusterCollapsed { stranded, completed, failed } => write!(
+            Self::ClusterCollapsed { stranded, outcome } => write!(
                 f,
                 "{stranded} tasks left unassigned because cluster routing collapsed \
-                 (completed={completed} failed={failed} stranded={stranded})"
+                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} stranded={stranded})",
+                s = outcome.succeeded,
+                r = outcome.fail_retry,
+                o = outcome.fail_oom,
+                fi = outcome.fail_final,
             ),
             Self::Other(msg) => f.write_str(msg),
         }
@@ -318,6 +328,45 @@ pub(super) struct PendingMassDeath {
     pub(super) last_keepalive_at_defer: Instant,
 }
 
+/// Per-class outcome breakdown the primary emits on every
+/// counter-bearing log line. Replaces the older single-number
+/// `completed=N failed=N` shape: `succeeded` is the unique-hash
+/// completion count, and the three `fail_*` fields partition the
+/// `failed_tasks` ledger by ErrorType.
+///
+/// Mapping from ErrorType:
+///   - `Recoverable`                       → `fail_retry`
+///   - `ResourceExhausted("memory")`       → `fail_oom`
+///   - `ResourceExhausted(other)` |
+///     `NonRecoverable`                    → `fail_final`
+///
+/// Semantics note: classification is by the task's last-observed
+/// ErrorType, not by retry-eligibility. A Recoverable failure
+/// that exhausts the retry budget stays in `fail_retry` at
+/// terminal report — the operator reads the bucket name as
+/// "what class of error did this task hit", not "is this
+/// task going to retry". Retry-budget exhaustion is reported
+/// via the existing "retry budget exhausted" log line; the
+/// numeric breakdown is class-of-failure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutcomeSummary {
+    pub succeeded: usize,
+    pub fail_retry: usize,
+    pub fail_oom: usize,
+    pub fail_final: usize,
+}
+
+impl OutcomeSummary {
+    /// Sum across all four buckets — the total tasks that reached
+    /// a terminal state (success or failure). Distinct from
+    /// `total_tasks` on the coordinator, which counts the input
+    /// batch; `total_terminal()` reaches `total_tasks` exactly
+    /// when the run is fully accounted for.
+    pub fn total_terminal(&self) -> usize {
+        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final
+    }
+}
+
 /// Virtual worker tracked by the authoritative primary for each remote worker.
 #[derive(Debug, Clone)]
 pub(super) struct RemoteWorkerState<I: Identifier> {
@@ -385,7 +434,19 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// between runs.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
-    pub(super) failed_tasks: HashSet<String>,
+    /// Failed-task ledger keyed by task hash. The value carries the
+    /// most-recent ErrorType so the dispatcher can report per-class
+    /// failure counts (Recoverable → fail_retry, ResourceExhausted
+    /// (memory) → fail_oom, NonRecoverable / non-memory exhaustion →
+    /// fail_final) without re-scanning the task pool.
+    ///
+    /// A retry-success removes the entry; a retry-fail overwrites
+    /// the ErrorType with the new failure's classification (the same
+    /// retry can shift from Recoverable to ResourceExhausted etc.).
+    /// At end-of-run, the entries that remain are the permanent
+    /// failures; their ErrorType classification is the operator's
+    /// post-mortem signal.
+    pub(super) failed_tasks: HashMap<String, ErrorType>,
     /// Per-phase completion counters fed to `on_phase_end`. Incremented
     /// inside the same code paths that update `completed_tasks` /
     /// `failed_tasks`.
@@ -501,7 +562,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             pending: None,
             phase_deps: HashMap::new(),
             completed_tasks: HashSet::new(),
-            failed_tasks: HashSet::new(),
+            failed_tasks: HashMap::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
             in_flight_per_type: HashMap::new(),
@@ -608,6 +669,38 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
     pub fn failed_count(&self) -> usize {
         self.failed_tasks.len()
+    }
+
+    /// Per-class outcome breakdown. Iterates `failed_tasks` once and
+    /// partitions by ErrorType. Returned snapshot is consumed by
+    /// every log site that previously emitted `completed=N failed=N`,
+    /// so the operator sees the 4-class state instead of a single
+    /// failure count.
+    ///
+    /// O(n) over `failed_tasks` — the dispatcher emits this at most
+    /// once per task-terminal event and once per heartbeat tick, so
+    /// the cost is bounded.
+    pub fn outcome_summary(&self) -> OutcomeSummary {
+        let mut retry = 0usize;
+        let mut oom = 0usize;
+        let mut final_ = 0usize;
+        for err in self.failed_tasks.values() {
+            match err {
+                ErrorType::Recoverable => retry += 1,
+                ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
+                    oom += 1
+                }
+                ErrorType::ResourceExhausted(_) | ErrorType::NonRecoverable => {
+                    final_ += 1
+                }
+            }
+        }
+        OutcomeSummary {
+            succeeded: self.completed_tasks.len(),
+            fail_retry: retry,
+            fail_oom: oom,
+            fail_final: final_,
+        }
     }
 
     /// Tasks the run loop never accounted for (neither completed nor
@@ -856,9 +949,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // produces a structured `RunError::ClusterCollapsed` with the
         // per-category counts, the diagnostic log line below, and a
         // non-zero exit at the PyO3 boundary.
-        let completed = self.completed_tasks.len();
-        let failed = self.failed_tasks.len();
-        self.stranded_count = total.saturating_sub(completed + failed);
+        let outcome = self.outcome_summary();
+        self.stranded_count = total.saturating_sub(outcome.total_terminal());
         let stranded = self.stranded_count;
 
         // Broadcast `RunComplete` so non-promoted secondaries on the
@@ -887,19 +979,27 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
 
         if stranded > 0 {
             tracing::error!(
-                completed,
-                failed,
+                succeeded = outcome.succeeded,
+                fail_retry = outcome.fail_retry,
+                fail_oom = outcome.fail_oom,
+                fail_final = outcome.fail_final,
                 stranded,
                 total,
                 "{stranded} tasks left unassigned because cluster routing collapsed \
-                 (completed={completed} failed={failed} stranded={stranded})"
+                 (succeeded={s} fail_retry={r} fail_oom={o} fail_final={fi} stranded={stranded})",
+                s = outcome.succeeded,
+                r = outcome.fail_retry,
+                o = outcome.fail_oom,
+                fi = outcome.fail_final,
             );
-            return Err(RunError::ClusterCollapsed { stranded, completed, failed });
+            return Err(RunError::ClusterCollapsed { stranded, outcome });
         }
 
         tracing::info!(
-            completed,
-            failed,
+            succeeded = outcome.succeeded,
+            fail_retry = outcome.fail_retry,
+            fail_oom = outcome.fail_oom,
+            fail_final = outcome.fail_final,
             total,
             "primary finished"
         );
