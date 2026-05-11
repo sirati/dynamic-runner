@@ -506,7 +506,7 @@ mod tests {
         // sender hasn't started yet, so falsely declaring dead
         // would drop a healthy node mid-setup).
         let conn = SecondaryConnection::new("dead-sec".into())
-            .receive_welcome(1, vec![], "host".into(), 0, None)
+            .receive_welcome(1, vec![], "host".into(), 0, None, false)
             .receive_cert_exchange(String::new(), None, None, 0)
             .begin_peer_discovery()
             .peers_ready()
@@ -600,7 +600,7 @@ mod tests {
         E: ResourceEstimator<TestId>,
     {
         let conn = SecondaryConnection::new(secondary_id.into())
-            .receive_welcome(1, vec![], "host".into(), 0, None)
+            .receive_welcome(1, vec![], "host".into(), 0, None, false)
             .receive_cert_exchange(String::new(), None, None, 0)
             .begin_peer_discovery()
             .peers_ready()
@@ -813,6 +813,7 @@ mod tests {
             "host".into(),
             0,
             None,
+            false,
         );
         primary.secondaries.insert(
             "dead-sec".into(),

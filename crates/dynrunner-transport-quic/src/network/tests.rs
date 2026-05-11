@@ -38,6 +38,7 @@ async fn server_accepts_wss_bidirectional() {
                     }],
                     worker_count: 1,
                     hostname: "test".into(),
+                    is_observer: false,
                 };
                 MessageSender::send(&mut client, welcome).await.unwrap();
 

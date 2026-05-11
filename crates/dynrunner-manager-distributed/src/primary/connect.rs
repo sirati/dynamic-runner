@@ -177,6 +177,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             resources,
             worker_count,
             hostname,
+            is_observer,
             ..
         } = msg
         {
@@ -188,11 +189,19 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 secondary = %secondary_id,
                 workers = worker_count,
                 ram_gb = ram_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                is_observer,
                 "secondary connected"
             );
 
             let conn = SecondaryConnection::new(secondary_id.clone());
-            let conn = conn.receive_welcome(worker_count, resources, hostname, 0, None);
+            let conn = conn.receive_welcome(
+                worker_count,
+                resources,
+                hostname,
+                0,
+                None,
+                is_observer,
+            );
             self.secondaries.insert(
                 secondary_id.clone(),
                 SecondaryConnectionState::Handshaking(conn),

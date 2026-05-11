@@ -181,6 +181,7 @@ mod tests {
             ipv4: ipv4.map(|s| s.into()),
             ipv6: ipv6.map(|s| s.into()),
             port,
+            is_observer: false,
         }
     }
 

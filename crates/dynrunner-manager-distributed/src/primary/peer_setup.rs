@@ -37,6 +37,11 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 ipv4: s.ipv4().map(|s| s.to_string()),
                 ipv6: s.ipv6().map(|s| s.to_string()),
                 port: s.quic_port(),
+                // Task #36: fan out per-peer observer status so each
+                // receiving secondary can populate its peer_observers
+                // set and filter observers from `lowest_alive`
+                // candidate selection in `election.rs`.
+                is_observer: s.is_observer(),
             })
             .collect();
 
