@@ -618,14 +618,36 @@ where
                             // for an Assigned task), so this is the
                             // only log line the operator sees for a
                             // self-assign-time death.
+                            //
+                            // Bug B: queue this worker for respawn
+                            // so the next `process_tasks` tick
+                            // brings a fresh subprocess up. Without
+                            // this, the docstring contract on
+                            // `NonRecoverableError` ("worker process
+                            // is restarted on the next assignment")
+                            // was unmet on the SLURM-secondary path:
+                            // the dead pipe stayed dead and every
+                            // subsequent assignment to this slot
+                            // failed the same way.
+                            //
+                            // Bug C: the binary is recovered back to
+                            // the local pool (via
+                            // `recover_in_flight_to_pool`), NOT
+                            // marked as failed. The task hasn't
+                            // been attempted by a worker — the
+                            // pipe-write never landed. Once the
+                            // worker respawns, its first
+                            // TaskRequest re-picks the binary from
+                            // the pool. Task retried, not lost.
                             let exit_status =
                                 self.pool.workers[wid as usize].try_reap_exit();
                             tracing::warn!(
                                 worker_id = wid,
                                 error = %e,
                                 exit_status = exit_status.as_ref().map(|s| s.to_string()),
-                                "primary self-assign failed; re-queuing binary"
+                                "primary self-assign failed; queuing worker respawn + re-queuing binary"
                             );
+                            self.pending_worker_restarts.insert(wid);
                             self.recover_in_flight_to_pool(&file_hash);
                         }
                     }

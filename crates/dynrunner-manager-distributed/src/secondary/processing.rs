@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier, WorkerId};
@@ -376,8 +377,25 @@ where
                 break;
             }
 
-            // Restart any workers that disconnected
-            for wid in workers_to_restart {
+            // Restart workers that disconnected (via the
+            // pool-event channel — typical when a poll_loop
+            // observed pipe-EOF mid-task) OR workers that the
+            // assignment-time paths flagged for respawn (no
+            // poll_loop was running, so no Disconnected event
+            // arrived; the dispatch attempt itself saw the dead
+            // pipe). The two sources are unioned so duplicates are
+            // harmless: `restart_worker` first stops the slot,
+            // which is a no-op on an already-stopped one.
+            //
+            // Per Bug B's contract (worker process is restarted on
+            // the next assignment after NonRecoverableError), the
+            // respawn happens here, BEFORE `request_task_for_worker`
+            // re-engages the fresh subprocess with the primary's
+            // pool.
+            let mut restart_set: HashSet<WorkerId> =
+                workers_to_restart.into_iter().collect();
+            restart_set.extend(self.pending_worker_restarts.drain());
+            for wid in restart_set {
                 if let Err(e) = self.pool.restart_worker(wid, factory, false).await {
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;

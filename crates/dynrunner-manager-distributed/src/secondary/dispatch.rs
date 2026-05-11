@@ -134,20 +134,43 @@ where
                             // conditions.
                             let exit_status =
                                 self.pool.workers[target_wid as usize].try_reap_exit();
-                            tracing::error!(
+                            tracing::warn!(
                                 worker_id = target_wid,
                                 error = %e,
                                 exit_status = exit_status.as_ref().map(|s| s.to_string()),
-                                "failed to assign task"
+                                "peer-assign failed; queuing worker respawn + requeuing task at primary"
                             );
+                            // Bug B: queue the worker for respawn
+                            // at the next `process_tasks` tick. The
+                            // dead pipe stays dead until the manager
+                            // brings a replacement up; pre-fix the
+                            // SLURM-secondary path silently abandoned
+                            // the slot.
+                            self.pending_worker_restarts.insert(target_wid);
+                            // Bug C: the task hasn't been attempted
+                            // — the pipe-write never landed. Send
+                            // the primary a backpressure-shaped
+                            // TaskFailed (`Recoverable` + the marker
+                            // message the primary's
+                            // `handle_primary_peer_rejection` path
+                            // recognises via `is_backpressure`) so
+                            // the primary requeues the binary into
+                            // its pool and re-dispatches once a peer
+                            // signals capacity. Pre-fix this sent
+                            // `NonRecoverable + e` which marked the
+                            // un-attempted task as terminal failed;
+                            // combined with Bug B (no respawn) this
+                            // lost every subsequent task assigned
+                            // to the dead slot.
                             let msg = DistributedMessage::TaskFailed {
                                 sender_id: self.config.secondary_id.clone(),
                                 timestamp: timestamp_now(),
                                 secondary_id: self.config.secondary_id.clone(),
                                 worker_id: target_wid,
                                 task_hash: file_hash,
-                                error_type: ErrorType::NonRecoverable,
-                                error_message: e,
+                                error_type: ErrorType::Recoverable,
+                                error_message:
+                                    "worker pipe broken; respawning".into(),
                             };
                             self.send_to_current_primary(msg).await?;
                         }

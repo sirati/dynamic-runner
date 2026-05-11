@@ -112,8 +112,25 @@ where
                 //      from the worker, NonRecoverable, OutOfMemory,
                 //      etc.). The phase machine just needs the
                 //      in-flight counter decremented.
+                // Backpressure shapes — both mean "task didn't
+                // actually run; requeue at the primary pool instead
+                // of decrementing in_flight as failed":
+                //
+                //   1. "No idle worker available" — peer's worker
+                //      pool full at dispatch time.
+                //   2. "worker pipe broken; respawning" — peer's
+                //      target worker subprocess died between
+                //      tasks; pipe-write failed; the peer is
+                //      respawning. The not-yet-attempted task is
+                //      sent back with this marker so the primary
+                //      requeues (does not mark as terminal-failed)
+                //      and re-dispatches to a peer with capacity.
+                //      Without this case, Bug C produced silent
+                //      task loss on every Broken-pipe assign
+                //      attempt at a peer secondary.
                 let is_backpressure = matches!(error_type, ErrorType::Recoverable)
-                    && error_message == "No idle worker available";
+                    && (error_message == "No idle worker available"
+                        || error_message == "worker pipe broken; respawning");
                 if is_backpressure {
                     if let Some(peer) = self.handle_primary_peer_rejection(&task_hash) {
                         tracing::debug!(
