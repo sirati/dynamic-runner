@@ -7,6 +7,23 @@ fully unobserved kill (the dispatcher itself dies, so the test has
 NO live observer of the post-kill cluster; we verify via the
 out-of-process artefact landscape).
 
+Mode-aware: runs in both `--multi-computer local` (subprocess
+secondaries on operator host) AND `--mode slurm` (SLURM-job
+secondaries on remote nodes). Both share the SIGKILL-the-dispatcher
+mechanic; the assertion path differs:
+  - local: poll the local publish_dst tmpdir for output files
+  - slurm: ssh into the gateway and `find` the gateway-side
+    output_dir for output files
+
+The framework's `local-as-non-candidate-observer` feature
+(task #37) is NOT exercised here — that would require the
+dispatcher process to SURVIVE the primary kill, which the SIGKILL
+mechanic deliberately doesn't allow. Once #37 lands and the
+dispatcher hosts an in-process observer, a separate scenario
+(or a mode-3 branch here) can use a softer kill signal that
+takes down only the primary task while leaving the observer
+running on the dispatcher process.
+
 Mechanic
 --------
 
@@ -66,7 +83,6 @@ checks.
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import signal
 import threading
@@ -76,6 +92,7 @@ from pathlib import Path
 from ._assertions import assert_files_present, expected_canonical_outputs
 from ._base import DispatchEnv, Scenario, ScenarioPlan, ScenarioResult
 from ._dispatch import build_dispatch_argv
+from ._ssh import gateway_ssh
 from ._staging import stage_inputs
 
 
@@ -130,9 +147,10 @@ _POLL_INTERVAL_S = 2.0
 class PrimaryDeathFailoverScenario(Scenario):
     name = "primary-death-failover"
     description = (
-        "SIGKILL the dispatcher's primary mid-run with --multi-computer "
-        "local --jobs 3; assert surviving subprocess secondaries elect "
-        "a new primary and the cluster completes all outputs out-of-band."
+        "SIGKILL the dispatcher's primary mid-run (mode-aware: "
+        "local subprocess secondaries OR SLURM-node secondaries); "
+        "assert surviving secondaries elect a new primary and the "
+        "cluster completes all outputs out-of-band."
     )
     requires = ()
 
@@ -140,12 +158,13 @@ class PrimaryDeathFailoverScenario(Scenario):
         self, env: DispatchEnv, tmp_root: Path
     ) -> list[ScenarioPlan]:
         paths = stage_inputs(tmp_root, _NUM_TASKS_PER_PHASE)
-        # Force local mode regardless of harness --mode. SLURM-mode
-        # primary failover is a separate scenario (would need ssh-side
-        # cluster-state polling, which this minimal scenario avoids).
-        local_env = dataclasses.replace(env, mode="local")
+        # Honour the harness's --mode (was previously force-local).
+        # In SLURM mode the dispatch goes through the full SLURM
+        # packaging pipeline; in local mode the subprocess-secondary
+        # path. SIGKILL works identically in both — only the
+        # output-assertion path differs (see assert_outputs).
         argv = build_dispatch_argv(
-            env=local_env,
+            env=env,
             source=paths.source,
             output=paths.output,
             num_tasks=_NUM_TASKS_PER_PHASE,
@@ -192,7 +211,6 @@ class PrimaryDeathFailoverScenario(Scenario):
     def assert_outputs(
         self, env: DispatchEnv, results: list[ScenarioResult]
     ) -> tuple[bool, list[str]]:
-        del env
         result = results[0]
 
         # The dispatcher was killed with SIGKILL, so its exit_code
@@ -204,32 +222,33 @@ class PrimaryDeathFailoverScenario(Scenario):
         expected = expected_canonical_outputs(_NUM_TASKS_PER_PHASE)
         publish_dst = result.plan.paths.publish_dst
 
-        deadline = time.monotonic() + _POST_KILL_DEADLINE_S
-        last_ok = False
-        last_missing: list[str] = []
-        while time.monotonic() < deadline:
-            ok, missing = assert_files_present(publish_dst, expected)
-            if ok:
-                last_ok = True
-                break
-            last_missing = missing
-            time.sleep(_POLL_INTERVAL_S)
+        # Mode-aware polling. Local-mode outputs land on the
+        # operator host's tmpdir; SLURM-mode outputs land on the
+        # gateway's NFS-mounted output_dir, reachable only via ssh.
+        # The poll loop is the same shape either way — different
+        # "is the output set complete yet?" check.
+        if env.mode == "slurm":
+            ok, missing_or_err = _poll_outputs_slurm(
+                env, result.plan.paths.output, expected
+            )
+        else:
+            ok, missing_or_err = _poll_outputs_local(publish_dst, expected)
 
-        if not last_ok:
+        if not ok:
             return (
                 False,
                 [
                     f"cluster failed to converge on expected outputs "
                     f"within {_POST_KILL_DEADLINE_S:.0f}s after "
                     f"dispatcher SIGKILL (exit_code={result.exit_code}). "
-                    f"missing files: {last_missing!r}. "
-                    f"publish_dst={publish_dst!s}. "
+                    f"missing/error: {missing_or_err!r}. "
+                    f"mode={env.mode}, publish_dst={publish_dst!s}. "
                     "Likely causes: R1 threshold-armed failover didn't "
                     "fire (check primary_link.rs failure_threshold), "
                     "election didn't reach quorum (check election.rs "
                     "PromotionVote/Confirm flow), promoted primary "
                     "didn't route TaskAssignment to peers (regression of #28), "
-                    "or surviving subprocess secondaries crashed."
+                    "or surviving secondaries crashed."
                 ],
             )
 
@@ -251,6 +270,82 @@ class PrimaryDeathFailoverScenario(Scenario):
             )
 
         return (True, [])
+
+
+def _poll_outputs_local(
+    publish_dst: Path,
+    expected: set[str],
+) -> tuple[bool, list[str]]:
+    """Poll the operator-host publish_dst for the expected output
+    files. Returns (True, []) on convergence or (False, <missing>)
+    on timeout."""
+    deadline = time.monotonic() + _POST_KILL_DEADLINE_S
+    last_missing: list[str] = []
+    while time.monotonic() < deadline:
+        ok, missing = assert_files_present(publish_dst, expected)
+        if ok:
+            return (True, [])
+        last_missing = missing
+        time.sleep(_POLL_INTERVAL_S)
+    return (False, last_missing)
+
+
+def _poll_outputs_slurm(
+    env: DispatchEnv,
+    output_dir: Path,
+    expected: set[str],
+) -> tuple[bool, list[str]]:
+    """Poll the GATEWAY's output_dir via ssh for the expected output
+    set. The dispatcher is dead, so we can't rely on the framework's
+    own publish pipeline — secondaries write directly to NFS-mounted
+    /app/out-network (bind-mounted from the gateway's output_dir
+    per `wrapper_script.rs`'s `-v "{output_network}:/app/out-network"`).
+    Returns (True, []) on convergence or (False, <error-string>)
+    on timeout."""
+    # `output_dir` here is the path the dispatcher passed via
+    # `--output`; in SLURM mode that's a gateway-side path (e.g.
+    # `/home/<gateway-user>/.../e2e-outputs/...`). The dispatcher
+    # ssh-creates it during preparation. We don't tilde-expand
+    # locally — the gateway-side find walks the literal path.
+    deadline = time.monotonic() + _POST_KILL_DEADLINE_S
+    last_err = ""
+    while time.monotonic() < deadline:
+        # Just count regular files under output_dir; the test_consumer
+        # writes one per task. We don't enforce the exact filename
+        # set on the SLURM side because the publish staging tree
+        # is a black box from the ssh assertion's vantage point —
+        # the count is the load-bearing invariant.
+        cmd = (
+            f"find {output_dir!s} -mindepth 1 -maxdepth 8 "
+            "-type f 2>/dev/null | wc -l"
+        )
+        try:
+            proc = gateway_ssh(env, cmd, timeout_s=10)
+        except Exception as e:
+            last_err = f"gateway ssh failed: {e}"
+            time.sleep(_POLL_INTERVAL_S)
+            continue
+        if proc.returncode != 0:
+            last_err = (
+                f"ssh rc={proc.returncode} "
+                f"stderr={proc.stderr.strip()!r}"
+            )
+            time.sleep(_POLL_INTERVAL_S)
+            continue
+        try:
+            count = int(proc.stdout.strip() or "0")
+        except ValueError:
+            last_err = f"unparseable wc -l output: {proc.stdout!r}"
+            time.sleep(_POLL_INTERVAL_S)
+            continue
+        if count >= len(expected):
+            return (True, [])
+        last_err = (
+            f"only {count} of {len(expected)} expected outputs "
+            f"present on gateway under {output_dir!s}"
+        )
+        time.sleep(_POLL_INTERVAL_S)
+    return (False, [last_err])
 
 
 SCENARIO = PrimaryDeathFailoverScenario()
