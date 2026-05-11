@@ -437,6 +437,35 @@ where
     /// produce mutations (Phase L will move the originator-side logic
     /// onto whichever node currently holds the primary role).
     pub(super) cluster_state: ClusterState<I>,
+
+    /// Worker IDs queued for respawn at the next `process_tasks`
+    /// tick. Populated by code paths that observe a worker
+    /// subprocess as dead WITHOUT a corresponding
+    /// `WorkerEvent::Disconnected` arriving on the pool's event
+    /// channel:
+    ///
+    ///   - `handle_primary_task_request`'s self-assign Err arm
+    ///     (the local worker's pipe is broken when we try to write
+    ///     the next task to it),
+    ///   - `dispatch_message`'s peer-assign Err arm (same shape on
+    ///     the peer-assigned path).
+    ///
+    /// In both cases the worker subprocess has voluntarily exited
+    /// — typically because `NonRecoverableError` in the task
+    /// handler causes the runtime to send the error response,
+    /// then the framework's restart-on-next-assignment contract
+    /// (see `dynamic_runner.worker.runtime.NonRecoverableError`
+    /// docstring) kicks in. The `assign_task` write subsequently
+    /// fails on Broken pipe and the worker_id ends up here.
+    ///
+    /// `process_tasks` drains the set at the end of each tick and
+    /// calls `pool.restart_worker(wid, factory, _)` for each
+    /// entry, then re-issues a `TaskRequest` so the fresh worker
+    /// pulls fresh work from the primary's pool. Idempotent on
+    /// duplicate entries — the worker either restarted at the
+    /// last drain (set was emptied) or is still queued (no-op
+    /// already in flight).
+    pub(super) pending_worker_restarts: HashSet<WorkerId>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -499,6 +528,7 @@ where
             fatal_exit: None,
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
+            pending_worker_restarts: HashSet::new(),
         }
     }
 
