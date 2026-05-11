@@ -256,7 +256,7 @@ echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
 
-# Cap container memory at MIN(NodeRAM - 2GiB, wrapper-cgroup-memory-max)
+# Cap container memory at MIN(host MemTotal - 2GiB, wrapper-cgroup-memory-max)
 # so a runaway worker hits a graceful container-OOM (just kills the
 # worker process) instead of a host kernel-OOM that wedges the cgroup
 # and leaves zombie SLURM jobs stuck COMPLETING.
@@ -313,17 +313,17 @@ esac
 if [ -n "${{MEM_BYTES_NODE}}" ] && [ -n "${{MEM_BYTES_CGROUP}}" ]; then
     if [ "${{MEM_BYTES_NODE}}" -lt "${{MEM_BYTES_CGROUP}}" ]; then
         MEM_BYTES="${{MEM_BYTES_NODE}}"
-        MEM_SOURCE="NodeRAM - 2GiB (tighter than cgroup ${{MEM_BYTES_CGROUP}})"
+        MEM_SOURCE="host MemTotal - 2GiB (tighter than cgroup ${{MEM_BYTES_CGROUP}})"
     else
         MEM_BYTES="${{MEM_BYTES_CGROUP}}"
-        MEM_SOURCE="wrapper cgroup memory.max (tighter than NodeRAM-2GiB ${{MEM_BYTES_NODE}})"
+        MEM_SOURCE="wrapper cgroup memory.max (tighter than host-MemTotal-2GiB ${{MEM_BYTES_NODE}})"
     fi
 elif [ -n "${{MEM_BYTES_NODE}}" ]; then
     MEM_BYTES="${{MEM_BYTES_NODE}}"
-    MEM_SOURCE="NodeRAM - 2GiB (no cgroup cap detected)"
+    MEM_SOURCE="host MemTotal - 2GiB (no cgroup cap detected)"
 elif [ -n "${{MEM_BYTES_CGROUP}}" ]; then
     MEM_BYTES="${{MEM_BYTES_CGROUP}}"
-    MEM_SOURCE="wrapper cgroup memory.max (NodeRAM probe failed)"
+    MEM_SOURCE="wrapper cgroup memory.max (host-MemTotal probe failed)"
 else
     MEM_BYTES=""
 fi
@@ -332,7 +332,7 @@ if [ -n "${{MEM_BYTES}}" ]; then
     echo "Container memory cap: ${{MEM_BYTES}} bytes RAM + unlimited swap (${{MEM_SOURCE}})"
 else
     MEM_FLAGS=""
-    echo "Container memory cap: disabled (NodeRAM and cgroup probes both empty)"
+    echo "Container memory cap: disabled (host-MemTotal and cgroup probes both empty)"
 fi
 echo ""
 
@@ -1151,7 +1151,7 @@ mod tests {
         // Memory-cap block: both probes (NodeRAM + wrapper cgroup
         // memory.max) must be present so the min() logic engages on
         // any cluster where SLURM imposes a per-job cap tighter than
-        // NodeRAM-2GiB. The renaming from MEM_BYTES to MEM_BYTES_NODE
+        // host-MemTotal-2GiB. The renaming from MEM_BYTES to MEM_BYTES_NODE
         // in #31 is intentional — the new shape composes two probes
         // before settling on MEM_BYTES.
         assert!(script.contains("MEM_BYTES_NODE=$(awk"));
