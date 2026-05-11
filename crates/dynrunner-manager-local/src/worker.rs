@@ -267,6 +267,58 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         try_reap_subprocess(self.pid)
     }
 
+    /// Actively SIGKILL the worker subprocess. Used by the
+    /// secondary's restart path to ensure a stuck or otherwise
+    /// non-responsive worker is dead BEFORE its replacement comes
+    /// up, rather than relying on the worker to notice EOF on its
+    /// transport and exit on its own. Idempotent on absence: no-op
+    /// if `pid` is None, the kernel already reaped, or the process
+    /// is otherwise gone (ESRCH).
+    ///
+    /// SIGKILL (not SIGTERM) is intentional here: by the time
+    /// this is called, the framework has already decided the
+    /// worker is going to be replaced. SIGTERM would invite the
+    /// worker's signal handler (which translates SIGTERM into a
+    /// `SystemExit("signal 15")` per `runtime.py::_install_term_handler`)
+    /// to enter a graceful-exit code path that's slower than
+    /// the manager wants to wait. SIGKILL is the "no graceful
+    /// shutdown" lever.
+    #[cfg(unix)]
+    pub fn kill_subprocess(&self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let pid = Pid::from_raw(pid as i32);
+        match kill(pid, Signal::SIGKILL) {
+            Ok(()) => {
+                tracing::debug!(
+                    worker_id = self.worker_id,
+                    pid = %pid,
+                    "worker: sent SIGKILL before restart"
+                );
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                // Already gone — kernel reaped or process exited
+                // on its own. Either way, the goal ("worker is
+                // dead before restart") is satisfied.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = self.worker_id,
+                    pid = %pid,
+                    error = %e,
+                    "worker: SIGKILL pre-restart failed; \
+                     proceeding with restart anyway"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn kill_subprocess(&self) {}
+
     pub fn is_idle_state(&self) -> bool {
         self.protocol.is_idle()
     }
