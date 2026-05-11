@@ -582,7 +582,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     -v "{log_network}:/app/log-network" \
 {dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_ref} \
-    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores {cores_spec} --max-memory {max_memory_spec}"##
+    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec}"##
     ));
 
     script.push_str(
@@ -834,10 +834,16 @@ mod tests {
         let mut cfg = standard_cfg(&config, &[]);
         cfg.cores_spec = "-2";
         let script = generate_wrapper_script(&cfg);
+        // `=` syntax mandatory (task #32): `--cores -2` confuses
+        // argparse on the secondary because `-2` matches argparse's
+        // "looks like a flag" heuristic and the option-with-required-
+        // value rejects it. `--cores=-2` always treats RHS as literal
+        // value regardless of leading dash.
         assert!(
-            script.contains("--cores -2"),
-            "wrapper script must forward `--cores -2` to secondary; \
-             render did not contain it"
+            script.contains("--cores=-2"),
+            "wrapper script must forward `--cores=-2` (not `--cores -2`) \
+             to secondary so argparse parses the leading-dash value as \
+             a value, not a flag; render did not contain it"
         );
         // The `--cores` flag MUST appear AFTER `--secondary-quic-port`
         // (the argv-build order matches the regular CLI order):
@@ -848,8 +854,8 @@ mod tests {
             .find("--secondary-quic-port")
             .expect("--secondary-quic-port must be present");
         let cores_idx = script
-            .find("--cores")
-            .expect("--cores must be present");
+            .find("--cores=")
+            .expect("--cores= must be present");
         assert!(
             cores_idx > port_idx,
             "--cores must appear after --secondary-quic-port in the secondary's \
@@ -877,17 +883,27 @@ mod tests {
         cfg.max_memory_spec = "3G";
         let script = generate_wrapper_script(&cfg);
         assert!(
-            script.contains("--max-memory 3G"),
-            "wrapper script must forward `--max-memory 3G` to secondary; \
+            script.contains("--max-memory=3G"),
+            "wrapper script must forward `--max-memory=3G` to secondary; \
              render did not contain it"
+        );
+        // Also test the negative-prefix case explicitly — this is the
+        // exact value that caused the original argparse-collision
+        // (asm-dataset-nix T3 at 57d7ee8 with default `-2G`).
+        cfg.max_memory_spec = "-2G";
+        let script_negative = generate_wrapper_script(&cfg);
+        assert!(
+            script_negative.contains("--max-memory=-2G"),
+            "wrapper script must use `=` syntax for negative-offset memory \
+             specs (task #32 argparse-collision fix); render did not contain it"
         );
         // `--max-memory` MUST land AFTER `--cores` (argv-build order).
         let cores_idx = script
-            .find("--cores")
-            .expect("--cores must be present");
+            .find("--cores=")
+            .expect("--cores= must be present");
         let mem_idx = script
-            .find("--max-memory")
-            .expect("--max-memory must be present");
+            .find("--max-memory=")
+            .expect("--max-memory= must be present");
         assert!(
             mem_idx > cores_idx,
             "--max-memory must appear after --cores in the secondary's argv \
