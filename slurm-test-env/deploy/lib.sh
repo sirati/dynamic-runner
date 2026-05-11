@@ -88,11 +88,22 @@ start_worker() {
   # slurm users, nested-podman subuids) can write — matches tmpfs
   # semantics.
   chmod 1777 "$w_tmp"
+  # --memory-swap=-1 makes the host's full swap available to the
+  # worker on top of its $WORKER_MEMORY RAM cap. Podman's default
+  # when --memory is set but --memory-swap is unset is 2 × --memory
+  # (so 4 GiB worker would silently get 4 GiB swap regardless of
+  # what swap the host has); -1 instead grants unlimited swap, so a
+  # workload that briefly spikes past 4 GiB swaps gracefully on a
+  # swap-equipped host instead of cgroup-OOMing. The RAM cap is
+  # still 4 GiB — workloads that genuinely need more RAM still
+  # surface the over-allocation, just as swap pressure rather than
+  # immediate kill.
   podman run -d \
     --name "$c_name" \
     --hostname "$h_name" \
     --network-alias "$h_name" \
     --memory "$WORKER_MEMORY" \
+    --memory-swap=-1 \
     --cpus "$WORKER_CPUS" \
     --pids-limit "$WORKER_PIDS_LIMIT" \
     -v "${w_tmp}:/tmp:rw" \
