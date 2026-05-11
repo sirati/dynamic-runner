@@ -51,7 +51,18 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         }
         for peer_id in &errors {
             self.connections.remove(peer_id);
-            tracing::warn!(peer = %peer_id, "peer disconnected during broadcast");
+            // Engage the reconnect tracker on detection so the
+            // first 5s retry pulse already has the peer in its
+            // tracking set. Idempotent on already-tracked peers
+            // (returns false). On first observation, kick a
+            // redial immediately rather than waiting for the
+            // next periodic tick — the user-directed contract is
+            // "reconnect immediately, then every 5 seconds".
+            let first_observation =
+                self.reconnect_tracker.observe_disconnect(peer_id);
+            if first_observation {
+                self.spawn_redial(peer_id);
+            }
         }
         Ok(())
     }
@@ -91,8 +102,17 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         let mut clocks = now_clocks();
         self.router.prune(clocks.now);
         loop {
+            // The reconnect tick is conditionally polled: take()
+            // the receiver out for the duration of the select so
+            // tokio's borrow checker is happy, restore it on each
+            // arm. Single-secondary test fixtures that construct
+            // PeerNetwork without `start()` leave
+            // `reconnect_tick_rx = None`; that branch resolves to
+            // `pending::<Option<()>>().await` and never fires.
+            let mut tick_rx = self.reconnect_tick_rx.take();
             tokio::select! {
                 msg = self.incoming_rx.recv() => {
+                    self.reconnect_tick_rx = tick_rx;
                     self.drain_new_connections();
                     clocks = now_clocks();
                     self.router.prune(clocks.now);
@@ -117,8 +137,16 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                 }
                 accepted = self.new_conn_rx.recv() => {
+                    self.reconnect_tick_rx = tick_rx;
                     if let Some(accepted) = accepted {
                         if !self.connections.contains_key(&accepted.peer_id) {
+                            // Same observe_reconnect-before-register
+                            // ordering as drain_new_connections so
+                            // operator log shows resolution
+                            // (with attempts+elapsed) immediately
+                            // before "incoming peer registered".
+                            self.reconnect_tracker
+                                .observe_reconnect(&accepted.peer_id);
                             tracing::info!(
                                 peer = %accepted.peer_id,
                                 "incoming peer registered (during recv)"
@@ -127,6 +155,23 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                                 .insert(accepted.peer_id, accepted.outgoing_tx);
                         }
                     }
+                }
+                _ = async {
+                    match tick_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<()>>().await,
+                    }
+                } => {
+                    self.reconnect_tick_rx = tick_rx;
+                    // Periodic reconnect-tick. The tracker
+                    // reconciles against the authoritative cluster
+                    // list (peer_dial_info) so a peer that dropped
+                    // out of `connections` via any path — not just
+                    // the broadcast disconnect detector — gets
+                    // picked up here. `spawn_redial` deduplicates
+                    // against `connections` so duplicate dials on
+                    // a freshly-restored peer are harmless.
+                    self.process_reconnect_tick();
                 }
             }
         }

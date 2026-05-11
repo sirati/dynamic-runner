@@ -22,6 +22,7 @@ mod dial;
 mod either;
 mod handler;
 mod no_peer;
+mod reconnect;
 mod transport_impl;
 mod util;
 
@@ -77,6 +78,19 @@ pub struct PeerNetwork<I: Identifier> {
     /// `spawn_redial` when the Router emits a redial target after a
     /// relay observation.
     pub(super) peer_dial_info: HashMap<String, PeerConnectionInfo>,
+    /// Periodic reconnect-tick receiver. The 5s ticker spawned in
+    /// `start()` fires `()` here; `recv_peer`'s tokio::select! arm
+    /// pulls the tick and drives the reconnect state machine.
+    /// `Option` so single-secondary test fixtures that bypass
+    /// `start()` (e.g. unit tests that construct `PeerNetwork`
+    /// directly) compile without modifying every test.
+    pub(super) reconnect_tick_rx: Option<mpsc::UnboundedReceiver<()>>,
+    /// Per-peer reconnect-attempt state. See `reconnect.rs` for
+    /// the milestone schedule and the disconnect/reconnect event
+    /// semantics. Visibility limited to the `peer` submodule so
+    /// the tracker stays an implementation detail; callers don't
+    /// see (or depend on) the milestone schedule directly.
+    pub(super) reconnect_tracker: reconnect::ReconnectTracker,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -113,6 +127,38 @@ impl<I: Identifier> PeerNetwork<I> {
             });
         }
 
+        // Periodic reconnect ticker: every RECONNECT_TICK
+        // (5s, per peer/reconnect.rs), the tick task sends ()
+        // through `tick_tx`. PeerNetwork's recv_peer pulls the
+        // tick and runs `reconnect_tracker.tick()` to issue a
+        // redial for every peer currently in the disconnect
+        // tracker. The cadence is decoupled from the keepalive
+        // interval and from the Router-driven redial pulse — they
+        // coexist; `spawn_redial` deduplicates against
+        // `connections` so a freshly-restored peer doesn't get a
+        // second dial.
+        let (reconnect_tick_tx, reconnect_tick_rx) = mpsc::unbounded_channel();
+        {
+            let tick_tx = reconnect_tick_tx;
+            tokio::task::spawn_local(async move {
+                let mut interval =
+                    tokio::time::interval(reconnect::RECONNECT_TICK);
+                interval.set_missed_tick_behavior(
+                    tokio::time::MissedTickBehavior::Skip,
+                );
+                // Skip the first immediate tick: `Interval::tick()`
+                // resolves immediately on first call which would
+                // ping the tracker before any peers are tracked.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    if tick_tx.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
         tracing::info!(peer_id, port, "peer network listening (QUIC/UDP + WSS/TCP)");
 
         Ok(Self {
@@ -126,6 +172,8 @@ impl<I: Identifier> PeerNetwork<I> {
             new_conn_tx,
             router: Router::new(peer_id.to_string()),
             peer_dial_info: HashMap::new(),
+            reconnect_tick_rx: Some(reconnect_tick_rx),
+            reconnect_tracker: reconnect::ReconnectTracker::new(),
         })
     }
 
@@ -243,10 +291,50 @@ impl<I: Identifier> PeerNetwork<I> {
     fn drain_new_connections(&mut self) {
         while let Ok(accepted) = self.new_conn_rx.try_recv() {
             if !self.connections.contains_key(&accepted.peer_id) {
+                // Clear reconnect-tracker state for this peer
+                // BEFORE inserting into `connections` so the
+                // operator log shape is:
+                //   "peer reconnected (attempts=N elapsed=Ms)"
+                // then
+                //   "incoming peer registered"
+                // (resolution preceded by the reconnect-tracker
+                // disposition the operator was tracking).
+                self.reconnect_tracker.observe_reconnect(&accepted.peer_id);
                 tracing::info!(peer = %accepted.peer_id, "incoming peer registered");
                 self.connections
                     .insert(accepted.peer_id, accepted.outgoing_tx);
             }
+        }
+    }
+
+    /// Drive the reconnect state machine. Called from `recv_peer`'s
+    /// select arm on every reconnect-ticker pulse (5s). Reconciles
+    /// the tracker against the authoritative cluster list:
+    /// - any peer in `peer_dial_info` that is NOT in `connections`
+    ///   becomes tracked (observe_disconnect, idempotent on
+    ///   already-tracked peers);
+    /// - any peer in `connections` is cleared from the tracker
+    ///   (observe_reconnect, idempotent on absence);
+    /// - then `tracker.tick()` bumps attempt counters, emits any
+    ///   crossed-milestone WARNs, and returns the list of peers to
+    ///   redial.
+    ///
+    /// `spawn_redial` itself deduplicates against `connections`,
+    /// so this method is safe even if a redial from a prior tick
+    /// is still in flight when the next tick fires.
+    fn process_reconnect_tick(&mut self) {
+        let cluster_peers: Vec<String> =
+            self.peer_dial_info.keys().cloned().collect();
+        for peer_id in &cluster_peers {
+            if self.connections.contains_key(peer_id) {
+                self.reconnect_tracker.observe_reconnect(peer_id);
+            } else {
+                self.reconnect_tracker.observe_disconnect(peer_id);
+            }
+        }
+        let to_dial = self.reconnect_tracker.tick();
+        for peer_id in to_dial {
+            self.spawn_redial(&peer_id);
         }
     }
 

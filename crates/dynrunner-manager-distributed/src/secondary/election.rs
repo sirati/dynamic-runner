@@ -128,6 +128,19 @@ where
                 | ElectionState::Voting { .. }
                 | ElectionState::Candidate { .. }
         ) {
+            // Visibility on election recovery: pre-fix the
+            // transition from Suspecting/Voting/Candidate back to
+            // Normal was silent — an operator tailing the log saw
+            // the entering-Suspecting WARN but no resolution
+            // signal when keepalives resumed. With this log they
+            // can grep "election recovered" to confirm a
+            // transient blip rather than chase a phantom election
+            // failure.
+            tracing::info!(
+                secondary = %self.config.secondary_id,
+                from = ?std::mem::discriminant(&self.election),
+                "election recovered: primary message resumed, reverting to Normal"
+            );
             self.election = ElectionState::Normal;
             self.primary_link.set_current_primary(None);
         }
