@@ -256,21 +256,67 @@ echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
 
-# Cap container memory at NodeRAM - 2GiB so a runaway worker hits a
-# graceful container-OOM (just kills the worker process) instead of a
-# host kernel-OOM that wedges the cgroup and leaves zombie SLURM jobs
-# stuck COMPLETING. Probed at wrapper-execution time on the compute
-# node — node RAM is not known at submit time and may differ from the
-# primary. --memory-swap is set equal to --memory so podman cannot
-# silently swap-thrash under memory pressure. Falls back to no cap on
-# absurdly small nodes (<2GiB MemTotal, implausible on cluster).
-MEM_BYTES=$(awk '/MemTotal:/{{val = $2*1024 - 2*1024*1024*1024; if (val > 0) print val; else print ""}}' /proc/meminfo)
+# Cap container memory at MIN(NodeRAM - 2GiB, wrapper-cgroup-memory-max)
+# so a runaway worker hits a graceful container-OOM (just kills the
+# worker process) instead of a host kernel-OOM that wedges the cgroup
+# and leaves zombie SLURM jobs stuck COMPLETING.
+#
+# Two probes feed the cap:
+#   1. /proc/meminfo:MemTotal — node-wide physical RAM. Always shows
+#      the HOST's MemTotal even from inside a container/cgroup;
+#      represents the upper bound on what the kernel can give us.
+#   2. /sys/fs/cgroup/memory.max — the wrapper's own cgroup v2 memory
+#      cap. SLURM with TaskPlugin=task/cgroup sets this per-job;
+#      podman's own slurm-worker container also caps the slurmd
+#      process tree (`WORKER_MEMORY` knob on slurm-test-env).
+#      The literal string "max" means "no cap at this level"; any
+#      numeric value is the active cap in bytes.
+#
+# Taking the min ensures we never tell podman the secondary container
+# can have more RAM than its parent cgroup actually permits. Pre-fix
+# the wrapper only consulted /proc/meminfo and on slurm-test-env
+# (NodeRAM=96GiB but WORKER_MEMORY=4GiB) advertised `--memory=94GiB`
+# to podman; inside the secondary container `/sys/fs/cgroup/memory.max`
+# then reflected 94 GiB, the framework's `detect_total_memory_bytes`
+# read that as the budget, workers allocated 90+ GiB each, and the
+# kernel-enforced 4 GiB outer cap OOM-killed them on first nix-build
+# fork burst — surfacing as `Broken pipe (os error 32)` on the
+# nix-daemon socket (asm-dataset-nix T3 at 3c5f105). The min-with-
+# cgroup-max fix closes this.
+#
+# --memory-swap is set equal to --memory so podman cannot silently
+# swap-thrash under memory pressure. Falls back to no cap when both
+# probes yield empty (absurdly small node and no cgroup cap —
+# implausible on cluster).
+MEM_BYTES_NODE=$(awk '/MemTotal:/{{val = $2*1024 - 2*1024*1024*1024; if (val > 0) print val; else print ""}}' /proc/meminfo)
+MEM_BYTES_CGROUP=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "")
+case "$MEM_BYTES_CGROUP" in
+    ""|max) MEM_BYTES_CGROUP="" ;;
+    *[!0-9]*) MEM_BYTES_CGROUP="" ;;  # defend against unexpected shapes
+esac
+if [ -n "${{MEM_BYTES_NODE}}" ] && [ -n "${{MEM_BYTES_CGROUP}}" ]; then
+    if [ "${{MEM_BYTES_NODE}}" -lt "${{MEM_BYTES_CGROUP}}" ]; then
+        MEM_BYTES="${{MEM_BYTES_NODE}}"
+        MEM_SOURCE="NodeRAM - 2GiB (tighter than cgroup ${{MEM_BYTES_CGROUP}})"
+    else
+        MEM_BYTES="${{MEM_BYTES_CGROUP}}"
+        MEM_SOURCE="wrapper cgroup memory.max (tighter than NodeRAM-2GiB ${{MEM_BYTES_NODE}})"
+    fi
+elif [ -n "${{MEM_BYTES_NODE}}" ]; then
+    MEM_BYTES="${{MEM_BYTES_NODE}}"
+    MEM_SOURCE="NodeRAM - 2GiB (no cgroup cap detected)"
+elif [ -n "${{MEM_BYTES_CGROUP}}" ]; then
+    MEM_BYTES="${{MEM_BYTES_CGROUP}}"
+    MEM_SOURCE="wrapper cgroup memory.max (NodeRAM probe failed)"
+else
+    MEM_BYTES=""
+fi
 if [ -n "${{MEM_BYTES}}" ]; then
     MEM_FLAGS="--memory=${{MEM_BYTES}} --memory-swap=${{MEM_BYTES}}"
-    echo "Container memory cap: ${{MEM_BYTES}} bytes (NodeRAM - 2GiB)"
+    echo "Container memory cap: ${{MEM_BYTES}} bytes (${{MEM_SOURCE}})"
 else
     MEM_FLAGS=""
-    echo "Container memory cap: disabled (MemTotal probe yielded non-positive headroom)"
+    echo "Container memory cap: disabled (NodeRAM and cgroup probes both empty)"
 fi
 echo ""
 
@@ -878,8 +924,15 @@ mod tests {
         // Watchdog block (commit a12f84a).
         assert!(script.contains("setsid -f bash -c"));
         assert!(script.contains("podman teardown watchdog"));
-        // Memory-cap block.
-        assert!(script.contains("MEM_BYTES=$(awk"));
+        // Memory-cap block: both probes (NodeRAM + wrapper cgroup
+        // memory.max) must be present so the min() logic engages on
+        // any cluster where SLURM imposes a per-job cap tighter than
+        // NodeRAM-2GiB. The renaming from MEM_BYTES to MEM_BYTES_NODE
+        // in #31 is intentional — the new shape composes two probes
+        // before settling on MEM_BYTES.
+        assert!(script.contains("MEM_BYTES_NODE=$(awk"));
+        assert!(script.contains("MEM_BYTES_CGROUP="));
+        assert!(script.contains("/sys/fs/cgroup/memory.max"));
         assert!(script.contains("${MEM_FLAGS}"));
         // FIFO loud-error elif (commit 179afd9).
         assert!(script.contains("disappeared unexpectedly"));
