@@ -56,6 +56,24 @@ pub struct WrapperScriptConfig<'a> {
     /// `--multi-computer local` fix in `spawn_secondary.py`
     /// (commit 38a0c30 / task #26).
     pub cores_spec: &'a str,
+    /// CLI `--max-memory` spec (verbatim string: `"16G"`, `"4G"`,
+    /// `"-2G"`, `"+1G"`, …) forwarded to the secondary subprocess
+    /// inside the container. Each secondary parses this locally via
+    /// `parse_memory` against its OWN host's `/proc/meminfo:MemTotal`
+    /// (or cgroup-v2 memory.max if a cap applies), preserving the
+    /// per-machine semantic in heterogeneous SLURM clusters. Without
+    /// forwarding, the secondary's argparse default (`"-2G"` =
+    /// host_memory - 2 GiB) and PySecondaryConfig's auto-detect
+    /// (`detect_total_memory_bytes`) read the host's full RAM from
+    /// inside the cgroup-memory-quota'd container (asm-dataset-nix
+    /// observed `budget_mb=92030` for a worker in a 4 GiB-capped
+    /// container at 3c5f105) — workers then think they have 90+ GiB
+    /// each and over-allocate. Symmetric with `cores_spec`. The
+    /// `--multi-computer local` path INTENTIONALLY does NOT forward
+    /// memory (single-host shared RAM = double-counting); this
+    /// SLURM-only forward is correct because SLURM secondaries are
+    /// each on a different host with their own RAM budget.
+    pub max_memory_spec: &'a str,
     /// Connection-mode-specific config (gateway/standard vs reverse).
     pub connection: ConnectionMode<'a>,
     /// Optional override for the run-log directory used as the
@@ -449,6 +467,7 @@ echo "  Secondary ID: {secondary_id}"
     let sid = cfg.secondary_id;
     let container_command = cfg.container_command;
     let cores_spec = cfg.cores_spec;
+    let max_memory_spec = cfg.max_memory_spec;
     let (mode_banner, secondary_url) = match &cfg.connection {
         ConnectionMode::Reverse { .. } => (
             "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\""
@@ -517,7 +536,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     -v "{log_network}:/app/log-network" \
 {dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_ref} \
-    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores {cores_spec}"##
+    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores {cores_spec} --max-memory {max_memory_spec}"##
     ));
 
     script.push_str(
@@ -739,6 +758,7 @@ mod tests {
             load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
             container_command: "dynamic_batch_tokenizer",
             cores_spec: "0",
+            max_memory_spec: "-2G",
             connection: ConnectionMode::Standard {
                 gateway_host: "gateway.example.com",
                 gateway_port: 9000,
@@ -788,6 +808,44 @@ mod tests {
             cores_idx > port_idx,
             "--cores must appear after --secondary-quic-port in the secondary's \
              argv (currently at byte {cores_idx}, port at {port_idx})"
+        );
+    }
+
+    #[test]
+    fn standard_mode_script_forwards_max_memory_spec() {
+        // Task #30: each SLURM secondary's container_command MUST
+        // receive `--max-memory <spec>` symmetrically with `--cores`.
+        // Without forwarding, the secondary inside the cgroup-memory-
+        // quota'd container falls through to its argparse default
+        // (`-2G` = HOST_MemTotal - 2G as seen via /proc/meminfo).
+        // Inside a 4 GiB-capped container, /proc/meminfo still shows
+        // the host's full RAM, so the framework computes 90+ GiB
+        // worker budgets and workers OOM-die under the outer
+        // cgroup's actual cap (asm-dataset-nix observed
+        // `worker_id=0 budget_mb=92030` inside WORKER_MEMORY=4g).
+        //
+        // Defends the explicit-forward contract: dispatcher value
+        // reaches the wrapper, wrapper emits the argv suffix.
+        let config = SlurmConfig::default();
+        let mut cfg = standard_cfg(&config, &[]);
+        cfg.max_memory_spec = "3G";
+        let script = generate_wrapper_script(&cfg);
+        assert!(
+            script.contains("--max-memory 3G"),
+            "wrapper script must forward `--max-memory 3G` to secondary; \
+             render did not contain it"
+        );
+        // `--max-memory` MUST land AFTER `--cores` (argv-build order).
+        let cores_idx = script
+            .find("--cores")
+            .expect("--cores must be present");
+        let mem_idx = script
+            .find("--max-memory")
+            .expect("--max-memory must be present");
+        assert!(
+            mem_idx > cores_idx,
+            "--max-memory must appear after --cores in the secondary's argv \
+             (currently at byte {mem_idx}, cores at {cores_idx})"
         );
     }
 
@@ -846,6 +904,7 @@ mod tests {
             load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
             container_command: "my_runner",
             cores_spec: "0",
+            max_memory_spec: "-2G",
             connection: ConnectionMode::Reverse {
                 connection_info_dir: "/logs/connection_info",
             },
