@@ -63,8 +63,28 @@ in
       "debug Nodes=${workerNodeSpec} Default=YES MaxTime=INFINITE State=UP"
     ];
 
+    # proctrack/cgroup pairs with TaskPlugin=task/cgroup (below) to put
+    # batch-job processes in a per-job cgroup, distinct from slurmd's own
+    # cgroup. Without this, a fork-bomby batch job (e.g. a nix-daemon
+    # substitution storm with many parallel build workers) exhausts the
+    # shared cgroup's pids/threads accounting and slurmd's next
+    # pthread_create fails with EAGAIN — observed end-to-end on
+    # ds-test 2026-05-11 at 09:53:28 UTC, slurmd died fatally after a
+    # 102s task/none job. cgroup-isolating jobs from slurmd fixes the
+    # whole class.
+    procTrackType = "proctrack/cgroup";
+    # extraCgroupConfig deliberately left at "" — slurm's defaults
+    # (ConstrainCores/RAMSpace/SwapSpace=no, CgroupAutomount=no,
+    # CgroupPlugin=autodetect) are exactly what we want here: per-job
+    # cgroup membership for process tracking, NO new resource
+    # constraints. The existing RealMemory accounting via select/cons_tres
+    # is untouched; adding ConstrainRAMSpace=yes would silently tighten
+    # the per-job memory ceiling to the slurm-allocated --mem value,
+    # which is a behavioural change downstream consumers haven't asked
+    # for. Additive in a future iteration if needed.
+
     extraConfig = ''
-      TaskPlugin=task/none
+      TaskPlugin=task/cgroup
       SchedulerType=sched/backfill
       SelectType=select/cons_tres
       SelectTypeParameters=CR_Core_Memory
