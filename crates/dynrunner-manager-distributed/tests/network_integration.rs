@@ -115,6 +115,7 @@ async fn e2e_primary_secondary_over_wss() {
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
+                is_observer: false,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
@@ -228,6 +229,7 @@ async fn e2e_primary_secondary_over_quic() {
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
+                is_observer: false,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
