@@ -51,6 +51,7 @@ async fn two_peers_exchange_messages() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: port_a,
+                    is_observer: false,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -58,6 +59,7 @@ async fn two_peers_exchange_messages() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: port_b,
+                    is_observer: false,
                 },
             ];
 
@@ -126,6 +128,7 @@ async fn higher_id_does_not_dial_lower_id() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: port_low,
+                    is_observer: false,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -133,6 +136,7 @@ async fn higher_id_does_not_dial_lower_id() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: port_high,
+                    is_observer: false,
                 },
             ];
 
@@ -258,6 +262,7 @@ async fn either_peer_transport_real_round_trips_a_message() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: port_a,
+                    is_observer: false,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -265,6 +270,7 @@ async fn either_peer_transport_real_round_trips_a_message() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: port_b,
+                    is_observer: false,
                 },
             ];
 
@@ -484,6 +490,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: peer_a.port(),
+                    is_observer: false,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-b".into(),
@@ -491,6 +498,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: peer_b.port(),
+                    is_observer: false,
                 },
                 PeerConnectionInfo {
                     secondary_id: "peer-c".into(),
@@ -498,6 +506,7 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
                     ipv4: Some("127.0.0.1".into()),
                     ipv6: None,
                     port: peer_c.port(),
+                    is_observer: false,
                 },
             ];
 

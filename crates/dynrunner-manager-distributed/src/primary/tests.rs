@@ -562,6 +562,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
                 }],
                 worker_count: 1,
                 hostname: "test".into(),
+                is_observer: false,
             }).unwrap();
             tx.send(DistributedMessage::CertExchange {
                 sender_id: id.clone(), timestamp: 0.0,
@@ -673,6 +674,7 @@ async fn retry_max_passes_zero_disables_retry() {
                 }],
                 worker_count: 1,
                 hostname: "test".into(),
+                is_observer: false,
             }).unwrap();
             tx.send(DistributedMessage::CertExchange {
                 sender_id: id.clone(), timestamp: 0.0,
@@ -1818,6 +1820,7 @@ async fn gated_mesh_secondary(
             }],
             worker_count: num_workers,
             hostname: "test-host".into(),
+            is_observer: false,
         })
         .unwrap();
 
@@ -2174,7 +2177,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
         primary.total_tasks = 1;
 
         let conn = SecondaryConnection::new("sec-0".into())
-            .receive_welcome(1, vec![], "host".into(), 0, None)
+            .receive_welcome(1, vec![], "host".into(), 0, None, false)
             .receive_cert_exchange(String::new(), None, None, 0)
             .begin_peer_discovery()
             .peers_ready()
@@ -2673,6 +2676,7 @@ async fn fake_secondary_dies_post_mesh_ready(
             }],
             worker_count: num_workers,
             hostname: "test-host".into(),
+            is_observer: false,
         })
         .unwrap();
     outgoing_to_primary

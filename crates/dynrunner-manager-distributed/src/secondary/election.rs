@@ -260,10 +260,27 @@ where
                     );
                     return actions;
                 }
+                // Task #36: filter observer peers from candidate
+                // selection. An observer in the alive set with a
+                // lex-low ID would otherwise be deferred-to by
+                // non-observer peers; the observer would then refuse
+                // self-promotion (#35 self-skip), stalling the
+                // cluster. Filtering at the peer-side complements
+                // the observer's self-exclusion: both sides agree
+                // observers can't be candidates. The #35 self-only
+                // guard below (`is_observer && we_lead`) becomes
+                // belt-and-suspenders once peer_observers is correctly
+                // populated, but stays in place to handle the case
+                // where peer_observers is empty (e.g. observer's
+                // PeerInfo broadcast was lost or pre-#36 senders).
                 let lowest_alive = self
                     .peer_keepalives
                     .keys()
-                    .chain(std::iter::once(&self.config.secondary_id))
+                    .filter(|id| !self.peer_observers.contains(*id))
+                    .chain(
+                        std::iter::once(&self.config.secondary_id)
+                            .filter(|_| !self.config.is_observer),
+                    )
                     .min()
                     .cloned();
                 let we_lead = lowest_alive
@@ -985,5 +1002,120 @@ mod tests {
                 std::mem::discriminant(other)
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod observer_peer_side_tests {
+    use super::super::test_helpers::{election_config, make_secondary};
+    use super::*;
+    use std::time::Duration;
+
+    const PAST_DEATH: Duration = Duration::from_millis(110);
+    const ONE_INTERVAL: Duration = Duration::from_millis(60);
+
+    /// #36 peer-side filter: a NON-observer secondary observing an
+    /// observer in `peer_keepalives` MUST NOT defer to it as the
+    /// `lowest_alive` candidate, even when the observer's id is
+    /// lex-lowest. Pre-#36 the non-observer would have picked the
+    /// observer as candidate and the cluster would stall (observer
+    /// refuses self-promotion per #35).
+    ///
+    /// Setup: sec-b (non-observer) sees obs-a (in peer_observers).
+    /// obs-a is lex-lowest. After primary silence + quorum, sec-b
+    /// must SELF-PROMOTE (since the only other peer is filtered).
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_observer_filters_observer_from_lowest_alive() {
+        let mut sec = make_secondary(election_config("sec-b"));
+        // obs-a is registered as a peer AND marked observer.
+        sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
+        sec.peer_observers.insert("obs-a".into());
+        sec.record_primary_message();
+
+        tokio::time::sleep(PAST_DEATH).await;
+        sec.run_election_tick();
+        tokio::time::sleep(ONE_INTERVAL).await;
+
+        // obs-a doesn't respond to TimeoutQuery (observers can
+        // respond, but this test pins the case where they don't —
+        // the filter must still work). sec-b alone is enough for
+        // quorum because peer_count is 1 (just obs-a), quorum =
+        // (1+1)/2 + 1 = 2, agreeing = 1 (self) + 0 = 1.
+        // For this test we have to either: (a) lower the threshold,
+        // or (b) bypass the quorum check.
+        //
+        // Simpler: drive obs-a TimeoutResponse so quorum is met,
+        // then assert filter behavior.
+        sec.record_timeout_response("obs-a".into(), None);
+
+        let actions = sec.run_election_tick();
+
+        // sec-b MUST be in Candidate state (self-promoted), NOT
+        // Voting for obs-a. The lowest_alive filter saw only sec-b
+        // (after dropping obs-a) so sec-b is the lex-lowest and
+        // self-promotes.
+        assert!(
+            matches!(sec.election, ElectionState::Candidate { .. }),
+            "non-observer sec-b should self-promote (peer-filter dropped \
+             obs-a from lowest_alive); got state={:?}",
+            std::mem::discriminant(&sec.election)
+        );
+        assert!(
+            actions
+                .broadcast
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::PromotionVote {
+                    candidate_id, ..
+                } if candidate_id == "sec-b")),
+            "expected PromotionVote naming sec-b (self); broadcasts: \
+             {} messages",
+            actions.broadcast.len()
+        );
+    }
+
+    /// Defensive guard test: a PromotePrimary naming an observer is
+    /// rejected loud rather than installed in the routing target.
+    /// Should not happen if peers honour the filter, but the
+    /// rejection protects against forgeries and misconfigured peers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promote_primary_naming_observer_is_rejected() {
+        let mut sec = make_secondary(election_config("sec-b"));
+        sec.peer_observers.insert("obs-a".into());
+
+        let promote = DistributedMessage::PromotePrimary::<
+            super::super::test_helpers::TestId,
+        > {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "obs-a".into(),
+            epoch: 1,
+        };
+        let result = sec.dispatch_message(promote).await;
+
+        // Handler returns Ok(()) (silently rejects) — we don't
+        // upgrade to Err because Err propagates to the processing
+        // loop and exits the secondary, which is overkill for a
+        // single bad PromotePrimary message. The rejection is
+        // logged as error-level, which suffices.
+        assert!(result.is_ok());
+
+        // Routing target NOT installed; cluster_state primary
+        // unchanged.
+        assert!(
+            sec.primary_link.current_primary().map(|s| s != "obs-a").unwrap_or(true),
+            "primary_link.current_primary should NOT be obs-a after \
+             rejected PromotePrimary"
+        );
+        assert!(
+            sec.cluster_state
+                .current_primary()
+                .map(|s| s != "obs-a")
+                .unwrap_or(true),
+            "cluster_state should NOT install obs-a as primary"
+        );
+        assert!(
+            !sec.is_primary,
+            "sec-b should NOT have flipped to primary role"
+        );
     }
 }

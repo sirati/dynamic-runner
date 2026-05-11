@@ -28,6 +28,11 @@ pub struct SecondaryConnection<S> {
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub transport: Option<QuicConnection>,
+    /// Task #36: observer-mode flag, received in `SecondaryWelcome`.
+    /// Propagated into `peer_setup::send_peer_lists`'s
+    /// `PeerConnectionInfo.is_observer` so other secondaries know
+    /// to exclude this peer from `lowest_alive` candidate selection.
+    pub is_observer: bool,
     _state: PhantomData<S>,
 }
 
@@ -44,6 +49,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             ipv4: None,
             ipv6: None,
             transport: None,
+            is_observer: false,
             _state: PhantomData,
         }
     }
@@ -56,12 +62,14 @@ impl SecondaryConnection<AwaitingWelcome> {
         hostname: String,
         quic_port: u16,
         cert_pem: Option<String>,
+        is_observer: bool,
     ) -> SecondaryConnection<Handshaking> {
         self.num_workers = num_workers;
         self.resources = resources;
         self.hostname = hostname;
         self.quic_port = quic_port;
         self.cert_pem = cert_pem;
+        self.is_observer = is_observer;
         SecondaryConnection {
             secondary_id: self.secondary_id,
             num_workers: self.num_workers,
@@ -72,6 +80,7 @@ impl SecondaryConnection<AwaitingWelcome> {
             ipv4: self.ipv4,
             ipv6: self.ipv6,
             transport: self.transport,
+            is_observer: self.is_observer,
             _state: PhantomData,
         }
     }
@@ -100,6 +109,7 @@ impl SecondaryConnection<Handshaking> {
             ipv4: self.ipv4,
             ipv6: self.ipv6,
             transport: self.transport,
+            is_observer: self.is_observer,
             _state: PhantomData,
         }
     }
@@ -118,6 +128,7 @@ impl SecondaryConnection<CertExchanging> {
             ipv4: self.ipv4,
             ipv6: self.ipv6,
             transport: self.transport,
+            is_observer: self.is_observer,
             _state: PhantomData,
         }
     }
@@ -136,6 +147,7 @@ impl SecondaryConnection<PeerDiscovery> {
             ipv4: self.ipv4,
             ipv6: self.ipv6,
             transport: self.transport,
+            is_observer: self.is_observer,
             _state: PhantomData,
         }
     }
@@ -154,6 +166,7 @@ impl SecondaryConnection<InitialAssigning> {
             ipv4: self.ipv4,
             ipv6: self.ipv6,
             transport: self.transport,
+            is_observer: self.is_observer,
             _state: PhantomData,
         }
     }
@@ -172,6 +185,7 @@ impl SecondaryConnection<Operational> {
             ipv4: self.ipv4,
             ipv6: self.ipv6,
             transport: self.transport,
+            is_observer: self.is_observer,
             _state: PhantomData,
         }
     }
@@ -287,6 +301,21 @@ impl SecondaryConnectionState {
         }
     }
 
+    /// Observer mode (task #36). False until receive_welcome carries
+    /// the flag — pre-welcome states default to false, which matches
+    /// the "regular secondary" wire-compat default.
+    pub fn is_observer(&self) -> bool {
+        match self {
+            Self::AwaitingWelcome(c) => c.is_observer,
+            Self::Handshaking(c) => c.is_observer,
+            Self::CertExchanging(c) => c.is_observer,
+            Self::PeerDiscovery(c) => c.is_observer,
+            Self::InitialAssigning(c) => c.is_observer,
+            Self::Operational(c) => c.is_observer,
+            Self::ShuttingDown(c) => c.is_observer,
+        }
+    }
+
     /// True if we have received the welcome and cert exchange.
     pub fn is_at_least_cert_exchanged(&self) -> bool {
         matches!(
@@ -332,6 +361,7 @@ mod tests {
             "node1".into(),
             5000,
             None,
+            false,
         );
         assert_eq!(conn.num_workers, 4);
 
@@ -380,6 +410,7 @@ mod tests {
             "h".into(),
             5000,
             None,
+            false,
         );
         let conn = conn.receive_cert_exchange(
             "CERT".into(),
