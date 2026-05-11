@@ -30,10 +30,14 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--cores",
         type=str,
-        default="-0",
+        default="0",
         help=(
-            "Number of cores to use. Can be int, +int (add to available), or -int "
-            "(subtract from available). Default: all available cores"
+            "Cores per secondary (per-machine semantic). Accepted forms: "
+            "0 = all detected cores (default), N = exactly N workers, "
+            "+N = detected+N (clamped to detected), -N = detected-N "
+            "(floored at 1). Each secondary resolves this against its "
+            "own host's detected CPU count, so heterogeneous clusters "
+            "get sized per-node."
         ),
     )
     parser.add_argument(
