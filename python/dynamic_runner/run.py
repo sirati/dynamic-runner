@@ -194,18 +194,54 @@ def _dispatch_secondary(task, args, logger) -> None:
     distributed_config = (
         _rs.DistributedConfig(disable_peer_overlay=True) if args.disable_peer_overlay else None
     )
-    # Per-machine cores: resolve the spec against THIS host's
-    # detected CPU count, not the primary's. spawn_secondary.py
-    # forwards the verbatim spec string so a heterogeneous cluster
-    # gets each node sized to its own ground truth. --max-memory
-    # is intentionally NOT plumbed through the spawn argv (see
-    # spawn_secondary.build_subprocess_spawn doc-comment); leaving
-    # the secondary's argparse default ("-2G" = host-2G headroom)
-    # in place is the right single-host behaviour.
+    # Per-machine cores AND memory: resolve both specs against
+    # THIS host's detected resources, not the primary's. The
+    # spawn argv carries `--cores=<spec>` always; `--max-memory`
+    # is plumbed by the SLURM wrapper (each secondary on its own
+    # host with its own cgroup) but intentionally NOT by
+    # `--multi-computer local`'s `build_subprocess_spawn`
+    # (multiple subprocesses share the operator host's RAM, so
+    # the secondary's argparse default `"-2G"` is sufficient and
+    # avoids the double-counting trap of forwarding an explicit
+    # absolute spec verbatim N times to N subprocesses on one
+    # host).
+    #
+    # Plumbing args.max_memory into SecondaryConfig.max_resources
+    # is load-bearing for SLURM: pre-fix the SLURM wrapper
+    # correctly emitted `--max-memory=2G` in the secondary's
+    # argv, the secondary's argparse stored `args.max_memory =
+    # "2G"`, but THIS function (`_dispatch_secondary`) never
+    # read it — SecondaryConfig fell through to its auto-detect
+    # path (`detect_total_memory_bytes`) which read the cgroup
+    # memory.max (the FULL secondary container's cap, e.g. 4
+    # GiB). The descending ResourceStealingScheduler budgets
+    # then gave `worker_0 = 4 GiB`, `worker_1 = 2.2 GiB`, sum
+    # over the cap, concurrent peak OOM-killed both workers
+    # (asm-dataset-nix T3 at afd1654). With explicit
+    # `--max-memory 2G` plumbed here, SecondaryConfig gets
+    # `max_resources = 2 GiB`, and the descending formula's
+    # `worker_0 = 2 GiB` + `worker_1 = 1.15 GiB` = 3.15 GiB
+    # fits comfortably under the 4 GiB cgroup cap.
+    #
+    # For `--multi-computer local`: spawn_secondary.py omits
+    # `--max-memory` so args.max_memory stays at the argparse
+    # default `"-2G"`. parse_memory("-2G") on the operator host
+    # gives `host_mem - 2 GiB`. With N>1 subprocess secondaries
+    # on the same host this nominally over-allocates (N*(host-
+    # 2G)), but the descending-budget formula's intent is exactly
+    # that workers don't all peak simultaneously — for workloads
+    # like tokenizer this is fine. For workloads that DO peak
+    # concurrently (nix-build), the operator passes an explicit
+    # absolute spec on the primary's argv; for SLURM that
+    # propagates; for local mode the user accepts the over-
+    # commit trade-off or switches to `--multi-computer
+    # single-process` (which divides cluster-wide).
     num_workers = _rs.parse_cores(args.cores)
+    max_memory_bytes = _rs.parse_memory(args.max_memory)
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
         num_workers=num_workers,
+        max_resources=_rs.ResourceMap({"memory": max_memory_bytes}),
         src_network=args.src_network,
         src_tmp=args.src_tmp,
         distributed_config=distributed_config,
