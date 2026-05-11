@@ -38,6 +38,7 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "cleanup-teardown",
     "distributed-single-process",
     "distributed-local-subprocess",
+    "primary-death-failover",
     "escape-hatch-external-master",
 )
 
