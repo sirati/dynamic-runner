@@ -2827,20 +2827,24 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
         let outcome = primary.run(binaries, deps, ops, ope).await;
 
         match outcome {
-            Err(RunError::ClusterCollapsed { stranded, completed, failed }) => {
+            Err(RunError::ClusterCollapsed { stranded, outcome }) => {
                 assert!(stranded > 0, "stranded must be positive on cluster collapse");
                 assert_eq!(
-                    completed + failed + stranded,
+                    outcome.total_terminal() + stranded,
                     total,
-                    "completed + failed + stranded must equal total"
+                    "succeeded + fail_retry + fail_oom + fail_final + stranded must equal total"
                 );
-                assert_eq!(completed, primary.completed_count());
-                assert_eq!(failed, primary.failed_count());
+                assert_eq!(outcome.succeeded, primary.completed_count());
+                assert_eq!(
+                    outcome.fail_retry + outcome.fail_oom + outcome.fail_final,
+                    primary.failed_count(),
+                    "per-class fail buckets must sum to total failed_tasks count"
+                );
                 assert_eq!(stranded, primary.stranded_count());
             }
             other => panic!(
                 "expected RunError::ClusterCollapsed, got {other:?} (counters: \
-                 completed={} failed={} stranded={} total={})",
+                 succeeded={} failed={} stranded={} total={})",
                 primary.completed_count(),
                 primary.failed_count(),
                 primary.stranded_count(),

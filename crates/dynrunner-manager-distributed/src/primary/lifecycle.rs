@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage,
     SecondaryTransport,
@@ -307,18 +307,29 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
                     if active > 0 {
+                        let outcome = self.outcome_summary();
                         tracing::warn!(
                             active_workers = active,
-                            completed = self.completed_tasks.len(),
-                            failed = self.failed_tasks.len(),
+                            succeeded = outcome.succeeded,
+                            fail_retry = outcome.fail_retry,
+                            fail_oom = outcome.fail_oom,
+                            fail_final = outcome.fail_final,
                             total = self.total_tasks,
                             "operational loop timeout with active workers, marking in-flight tasks as failed"
                         );
-                        // Mark all in-flight tasks as failed
+                        // Mark all in-flight tasks as failed. These
+                        // are workers that didn't ack progress for the
+                        // operational-loop timeout window — typically
+                        // a stuck worker or wedged transport. Classify
+                        // as Recoverable so `run_retry_passes` gets a
+                        // chance to re-dispatch them; if they wedge
+                        // the same way on retry, the retry-budget
+                        // exhaustion path takes over.
                         for worker in &mut self.workers {
                             if let Some(binary) = worker.current_task.take() {
                                 let hash = compute_task_hash(&binary);
-                                self.failed_tasks.insert(hash);
+                                self.failed_tasks
+                                    .insert(hash, ErrorType::Recoverable);
                                 worker.estimated_resources = ResourceMap::new();
                                 worker.is_idle = true;
                             }
@@ -365,18 +376,22 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 break;
             }
 
-            // Snapshot the failed-task hashes, clear the set, then
-            // re-inject each matching binary into the pool. The
-            // `failed_tasks` set tracks "currently considered failed"
-            // — by clearing it here we let the upcoming operational
-            // loop populate it fresh with the (smaller) set of
-            // tasks that fail in THIS retry pass.
-            let to_retry_hashes: HashSet<String> =
+            // Snapshot the failed-task hashes, clear the ledger,
+            // then re-inject each matching binary into the pool.
+            // The `failed_tasks` map tracks "currently considered
+            // failed" (with last-observed ErrorType) — by clearing
+            // it here we let the upcoming operational loop populate
+            // it fresh with the (smaller) set of tasks that fail in
+            // THIS retry pass, each carrying that pass's outcome
+            // class. ErrorType from the previous pass is discarded;
+            // a task's terminal classification is the one from its
+            // last observed failure.
+            let to_retry_entries: HashMap<String, ErrorType> =
                 std::mem::take(&mut self.failed_tasks);
             let to_retry: Vec<TaskInfo<I>> = self
                 .all_binaries
                 .iter()
-                .filter(|b| to_retry_hashes.contains(&compute_task_hash(b)))
+                .filter(|b| to_retry_entries.contains_key(&compute_task_hash(b)))
                 .cloned()
                 .collect();
 
@@ -477,10 +492,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             }
         }
         if drained > 0 {
+            let outcome = self.outcome_summary();
             tracing::info!(
                 drained,
-                completed = self.completed_tasks.len(),
-                failed = self.failed_tasks.len(),
+                succeeded = outcome.succeeded,
+                fail_retry = outcome.fail_retry,
+                fail_oom = outcome.fail_oom,
+                fail_final = outcome.fail_final,
                 "drained pending wire messages before final accounting"
             );
         }

@@ -237,6 +237,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
+            let outcome = self.outcome_summary();
             tracing::info!(
                 secondary = %secondary_id,
                 worker_id,
@@ -244,7 +245,10 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 phase = ?completed_meta.as_ref().map(|(p, _, _)| p.to_string()),
                 task_type = ?completed_meta.as_ref().map(|(_, t, _)| t.to_string()),
                 task_hash = %task_hash,
-                completed = self.completed_tasks.len(),
+                succeeded = outcome.succeeded,
+                fail_retry = outcome.fail_retry,
+                fail_oom = outcome.fail_oom,
+                fail_final = outcome.fail_final,
                 "task complete"
             );
 
@@ -419,7 +423,8 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // `pool.requeue` (NOT through this function). The task
             // never reached `failed_tasks`, so its retry budget
             // stays untouched.
-            self.failed_tasks.insert(task_hash.clone());
+            self.failed_tasks
+                .insert(task_hash.clone(), error_type.clone());
             // Replicated-ledger update: every node mirrors the
             // post-failure state. The wire `error_type` is now the
             // typed `ErrorType` enum (Phase D), so the CRDT mutation
@@ -534,9 +539,9 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 self.failed_tasks.remove(hash);
                 self.completed_tasks.insert(hash.clone());
             }
-            ClusterMutation::TaskFailed { hash, .. } => {
+            ClusterMutation::TaskFailed { hash, kind, .. } => {
                 if !self.completed_tasks.contains(hash) {
-                    self.failed_tasks.insert(hash.clone());
+                    self.failed_tasks.insert(hash.clone(), kind.clone());
                 }
             }
             ClusterMutation::TaskAdded { .. }
