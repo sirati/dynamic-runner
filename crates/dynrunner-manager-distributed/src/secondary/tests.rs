@@ -170,6 +170,7 @@ async fn secondary_with_real_workers_processes_tasks() {
                 retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
             };
 
             let binaries = vec![
@@ -231,6 +232,7 @@ async fn secondary_multi_worker_processes_tasks() {
                 retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..6)
@@ -298,6 +300,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..15)
@@ -391,6 +394,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
             };
 
             let secondary_id_clone = config.secondary_id.clone();
@@ -620,6 +624,7 @@ fn arm_watchdog_no_peers(
         retry_max_passes: 1,
         primary_link_failure_threshold: 5,
         primary_link_failure_window: Duration::from_secs(30),
+        setup_deadline: Duration::from_secs(60),
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -858,6 +863,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
             };
             let binaries = vec![
                 make_binary("a", 50),
@@ -984,6 +990,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         retry_max_passes: 1,
         primary_link_failure_threshold: 5,
         primary_link_failure_window: Duration::from_secs(30),
+        setup_deadline: Duration::from_secs(60),
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -1334,4 +1341,175 @@ async fn r1_no_mesh_rebuild_during_arming() {
         sec.primary_link.current_primary().is_none(),
         "arming alone must not set a routing target"
     );
+}
+
+/// T-cold-start (#25 asm-dataset-nix T7 attempt 2):
+/// A late-arriving secondary boots AFTER the run has logically
+/// completed; the primary URL is unreachable and no peer has dialled
+/// in. Pre-fix, the secondary hung in `wait_for_setup`'s blocking
+/// recv for ~6min (transport retries) before SLURM container
+/// teardown reaped it. Post-fix, the orchestration-level
+/// `setup_deadline` cancels the setup future and the secondary
+/// exits cold with a clear error.
+///
+/// Test shape: drop the primary tx end immediately and use
+/// `NoPeers` for the peer transport (`peer_count() == 0`). Set a
+/// tight deadline (200ms) so the test finishes in milliseconds
+/// rather than the production 60s. Verify `run()` returns Err and
+/// that the error message identifies the cold-start cause so
+/// operators can distinguish it from mid-run failure modes.
+///
+/// Why this lives at the orchestration level: `wait_for_setup`'s
+/// own doc-comment explicitly forbids a `tokio::select!` race
+/// against `recv()` (cancellation hazard around partially-decoded
+/// messages). The deadline wraps the entire setup phase from
+/// outside, so a cancellation simply abandons the partial state
+/// — no subsequent iteration touches it.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            // KEEP `_pri_to_sec_tx` bound (the `_` prefix is just an
+            // unused-name lint suppressor — Rust drops bindings at
+            // end of scope, not immediately). This makes
+            // `primary_transport.recv()` BLOCK forever rather than
+            // returning None — simulating the asm-dataset-nix T7
+            // scenario where the primary URL is unreachable and the
+            // transport's internal retries never give up. Returning
+            // None hits `wait_for_setup`'s existing `primary
+            // disconnected during setup` arm in milliseconds, well
+            // before setup_deadline fires; we want to exercise the
+            // deadline path.
+            let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-cold".into(),
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_millis(50),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                // Tight deadline so the test reaps in ~200ms.
+                setup_deadline: Duration::from_millis(200),
+            };
+
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                transport,
+                NoPeers,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let mut factory = FakeWorkerFactory;
+            let start = std::time::Instant::now();
+            let result = secondary.run(&mut factory).await;
+            let elapsed = start.elapsed();
+
+            // Should be Err — the primary is unreachable AND no peers.
+            assert!(
+                result.is_err(),
+                "expected cold-start failure, got Ok: {result:?}"
+            );
+
+            // Error should identify the cold-start case so operators
+            // can distinguish it from mid-run failures. The exact
+            // wording is "no primary, no peers" per the doc-comment.
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("no primary") && err.contains("no peers"),
+                "expected cold-start identifier in error, got: {err}"
+            );
+
+            // Should reap promptly — at most setup_deadline + slack
+            // (worker init, log emission, future cancellation cost).
+            // 2s is generous; the actual elapsed is typically <250ms.
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "cold-start reap took too long: {elapsed:?} (expected < 2s)"
+            );
+        })
+        .await;
+}
+
+/// T-cold-start-with-peers (#25 negative branch):
+/// When the primary URL is unreachable BUT peers HAVE dialled in,
+/// the secondary still exits on setup_deadline — but with a
+/// different error class than the no-peers branch. This is the
+/// "primary unresponsive but mesh formed" scenario, which is
+/// distinct from "everyone is gone" and should be operator-
+/// distinguishable. Pinning the branch divergence to prevent
+/// future code from silently merging them.
+#[tokio::test(flavor = "current_thread")]
+async fn cold_start_with_peers_emits_distinct_error() {
+    use super::test_helpers::FixedPeerCount;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            // Same blocking-recv trick as the no-peers test above —
+            // keep the sender bound so the secondary blocks waiting
+            // for the primary that never speaks.
+            let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+
+            let config = SecondaryConfig {
+                secondary_id: "sec-cold-with-peers".into(),
+                num_workers: 1,
+                max_resources: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024)]),
+                hostname: "test-host".into(),
+                keepalive_interval: Duration::from_millis(50),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_millis(200),
+            };
+
+            // FixedPeerCount(2) reports peer_count() == 2 without
+            // actually wiring messages; that's enough for the
+            // `peer_count() == 0` check to fail and route to the
+            // "peers reachable" branch.
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                transport,
+                FixedPeerCount(2),
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let mut factory = FakeWorkerFactory;
+            let result = secondary.run(&mut factory).await;
+            assert!(result.is_err(), "expected setup-deadline failure");
+
+            let err = result.unwrap_err();
+            // Distinct from the no-peers branch: error mentions
+            // peers reachable, NOT "no primary, no peers".
+            assert!(
+                err.contains("peer") && !err.contains("no peers"),
+                "expected peers-reachable identifier, got: {err}"
+            );
+        })
+        .await;
 }
