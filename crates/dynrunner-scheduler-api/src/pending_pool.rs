@@ -398,7 +398,16 @@ impl<I: Identifier> PendingPool<I> {
     ) {
         for (task_id, phase_id) in items {
             if self.in_flight_tasks.insert(task_id) {
-                *self.in_flight_per_phase.entry(phase_id).or_insert(0) += 1;
+                let count = self
+                    .in_flight_per_phase
+                    .entry(phase_id.clone())
+                    .or_insert(0);
+                *count += 1;
+                tracing::debug!(
+                    phase = %phase_id,
+                    new_in_flight = *count,
+                    "pool: in_flight +1 (mark_tasks_in_flight; post-promotion hydration)"
+                );
             }
         }
     }
@@ -874,7 +883,16 @@ impl<I: Identifier> PendingPool<I> {
             self.worker_affinity.entry(worker_id).or_insert(None);
         }
 
-        *self.in_flight_per_phase.entry(key.0.clone()).or_insert(0) += 1;
+        let in_flight_count = self
+            .in_flight_per_phase
+            .entry(key.0.clone())
+            .or_insert(0);
+        *in_flight_count += 1;
+        tracing::debug!(
+            phase = %key.0,
+            new_in_flight = *in_flight_count,
+            "pool: in_flight +1 (take_from_view)"
+        );
 
         if bucket.items.is_empty() {
             let drained_pinners = std::mem::take(&mut bucket.pinned_workers);
@@ -915,7 +933,14 @@ impl<I: Identifier> PendingPool<I> {
     /// `on_item_failed_permanent`.
     pub fn on_item_finished(&mut self, phase_id: &PhaseId, task_id: Option<&str>) {
         if let Some(c) = self.in_flight_per_phase.get_mut(phase_id) {
+            let was = *c;
             *c = c.saturating_sub(1);
+            tracing::debug!(
+                phase = %phase_id,
+                new_in_flight = *c,
+                saturated = was == 0,
+                "pool: in_flight -1 (on_item_finished)"
+            );
         }
         if let Some(id) = task_id {
             self.in_flight_tasks.remove(id);
@@ -1051,7 +1076,16 @@ impl<I: Identifier> PendingPool<I> {
     /// machine to observe the dispatch so a `Draining` transition
     /// fires only after the cluster reports the item finished.
     pub fn mark_in_flight(&mut self, phase_id: &PhaseId) {
-        *self.in_flight_per_phase.entry(phase_id.clone()).or_insert(0) += 1;
+        let count = self
+            .in_flight_per_phase
+            .entry(phase_id.clone())
+            .or_insert(0);
+        *count += 1;
+        tracing::debug!(
+            phase = %phase_id,
+            new_in_flight = *count,
+            "pool: in_flight +1 (mark_in_flight)"
+        );
     }
 
     /// Re-queue an item that needs retry (worker death, transient
@@ -1062,7 +1096,14 @@ impl<I: Identifier> PendingPool<I> {
     pub fn requeue(&mut self, item: TaskInfo<I>) {
         let phase_id = item.phase_id.clone();
         if let Some(c) = self.in_flight_per_phase.get_mut(&phase_id) {
+            let was = *c;
             *c = c.saturating_sub(1);
+            tracing::debug!(
+                phase = %phase_id,
+                new_in_flight = *c,
+                saturated = was == 0,
+                "pool: in_flight -1 (requeue)"
+            );
         }
         let key = (
             item.phase_id.clone(),
