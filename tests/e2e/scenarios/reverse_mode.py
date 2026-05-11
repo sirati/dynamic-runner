@@ -81,23 +81,51 @@ class ReverseModeScenario(Scenario):
         if not ok_present:
             return (False, missing)
 
-        # Soft check for the URI-form parser code path. Logs the
-        # "Primary URL: tcp://" line on the L4.1+ path. Absence is
-        # NOT a failure (a pre-L4.1 build still works) — we just
-        # surface a warning.
         try:
             log_text = result.log_file.read_text(
                 encoding="utf-8", errors="replace"
             )
-            if "tcp://" not in log_text:
-                print(
-                    "[reverse-mode] WARNING: log contains no 'tcp://' "
-                    "marker — pre-L4.1 build, URI parser path not "
-                    "exercised by this run",
-                    flush=True,
-                )
-        except OSError:
-            pass
+        except OSError as e:
+            return (False, [f"could not read dispatch log: {e}"])
+
+        # Hard assertion (task #3): the framework must auto-detect
+        # GatewayPorts=no and announce the ProxyJump fall-back. This
+        # is the user-visible signal that the auto-detect logic in
+        # ``dynrunner-gateway::ssh::check_gateway_ports`` flipped
+        # ``gateway_ports_enabled`` to Some(false), and that
+        # ``dynrunner-pyo3::slurm::pipeline::use_reverse_connection``
+        # picked up on it. Without this assertion the scenario would
+        # silently pass even if the auto-detect regressed (a future
+        # change e.g. always-true could go unnoticed: the workload
+        # completes either way on a GatewayPorts=no cluster — the
+        # cluster refuses the public bind, which the reverse-forward
+        # path falls back to localhost anyway, so outputs are the same).
+        proxy_jump_marker = (
+            "Gateway disallows public port forwarding; switching to SSH "
+            "ProxyJump tunnel mode."
+        )
+        if proxy_jump_marker not in log_text:
+            return (
+                False,
+                [
+                    "ProxyJump auto-detect message missing — framework did "
+                    "NOT report flipping to ProxyJump despite running "
+                    "against a GatewayPorts=no cluster. Expected log line: "
+                    f'"{proxy_jump_marker}"'
+                ],
+            )
+
+        # Soft check for the URI-form parser code path. Logs the
+        # "Primary URL: tcp://" line on the L4.1+ path. Absence is
+        # NOT a failure (a pre-L4.1 build still works) — we just
+        # surface a warning.
+        if "tcp://" not in log_text:
+            print(
+                "[reverse-mode] WARNING: log contains no 'tcp://' "
+                "marker — pre-L4.1 build, URI parser path not "
+                "exercised by this run",
+                flush=True,
+            )
         return (True, [])
 
 
