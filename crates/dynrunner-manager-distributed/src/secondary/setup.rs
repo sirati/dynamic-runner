@@ -46,6 +46,13 @@ where
             resources: self.config.max_resources.to_resource_amounts(),
             worker_count: self.config.num_workers,
             hostname: self.config.hostname.clone(),
+            // Task #36: surface observer status to the primary so
+            // peer broadcasts can carry it. The primary stores this
+            // on its per-secondary connection state and fans it out
+            // via PeerInfo's `PeerConnectionInfo.is_observer`,
+            // letting OTHER secondaries filter observers from their
+            // `lowest_alive` candidate selection in election.
+            is_observer: self.config.is_observer,
         };
         self.primary_transport.send(msg).await
     }
@@ -112,6 +119,16 @@ where
                                 .filter(|p| p.secondary_id != self.config.secondary_id)
                                 .count();
                             tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
+                            // Task #36: extract observer flag per peer so
+                            // election.rs's `lowest_alive` can filter
+                            // observers from candidate selection. Empty
+                            // set is harmless — without observers, the
+                            // filter is a no-op.
+                            for p in peers.iter() {
+                                if p.is_observer {
+                                    self.peer_observers.insert(p.secondary_id.clone());
+                                }
+                            }
                             // Non-blocking: per-peer dials run as
                             // spawn_local tasks; returns immediately.
                             self.peer_transport.connect_to_peers(peers).await;

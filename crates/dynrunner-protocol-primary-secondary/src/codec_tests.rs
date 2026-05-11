@@ -61,6 +61,7 @@ fn roundtrip_secondary_welcome() {
         resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 8 * 1024 * 1024 * 1024 }],
         worker_count: 4,
         hostname: "node-01".into(),
+        is_observer: false,
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -169,6 +170,7 @@ fn roundtrip_peer_info() {
                 ipv4: Some("10.0.0.1".into()),
                 ipv6: None,
                 port: 5000,
+                is_observer: false,
             },
             PeerConnectionInfo {
                 secondary_id: "sec-2".into(),
@@ -176,6 +178,7 @@ fn roundtrip_peer_info() {
                 ipv4: None,
                 ipv6: Some("::1".into()),
                 port: 5001,
+                is_observer: false,
             },
         ],
     };
@@ -225,6 +228,7 @@ fn roundtrip_all_message_types() {
             resources: vec![ResourceAmount { kind: ResourceKind::memory(), amount: 1024 }],
             worker_count: 1,
             hostname: "h".into(),
+            is_observer: false,
         },
         DistributedMessage::Entropy {
             sender_id: "p".into(),
