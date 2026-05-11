@@ -77,13 +77,27 @@ class ScriptedComm(CommunicationInterface):
 
 
 def _drive(handler, commands):
-    """Helper: run the loop with a scripted comm and return outbox."""
+    """Helper: run the loop with a scripted comm and return outbox.
+
+    `comm.exit_code` is populated with the SystemExit code that
+    `run()` raised on the way out (0 if `run()` returned normally,
+    or whatever code SystemExit was raised with — e.g. 1 on a
+    NonRecoverableError-bearing run, per Bug A's exit-code
+    contract).
+    """
     # Reset registry between tests so registry-pollution from a
     # previous @task_function decoration doesn't leak in.
     _REGISTRY.default = None
     _REGISTRY.overwritten = False
     comm = ScriptedComm(inbox=list(commands))
-    run(handler, comm=comm)
+    comm.exit_code = 0
+    try:
+        run(handler, comm=comm)
+    except SystemExit as exc:
+        # Mirror the OS-level exit code into the comm fixture so
+        # tests can assert on it without catching SystemExit
+        # themselves.
+        comm.exit_code = exc.code if isinstance(exc.code, int) else 1
     return comm
 
 
@@ -144,6 +158,61 @@ class WorkerRuntimeTests(unittest.TestCase):
         self.assertEqual(len(errs), 1)
         self.assertEqual(errs[0].error_type, ErrorType.NON_RECOVERABLE)
         self.assertIn("config bad", errs[0].error_message)
+        # Bug A: a worker that emitted at least one
+        # NonRecoverableError MUST exit with a non-zero process
+        # exit code. The wire-protocol error reached the manager
+        # synchronously (asserted above); the exit-code half of
+        # the contract reaches the parent-process supervisor via
+        # SystemExit propagation.
+        self.assertEqual(
+            comm.exit_code,
+            1,
+            "NonRecoverableError run must exit with code 1 so OS-level "
+            "supervisors can discriminate clean shutdown from "
+            "non-recoverable-error shutdown",
+        )
+
+    def test_clean_completion_exits_zero(self):
+        # Inverse of the Bug A regression test: a run with no
+        # NonRecoverableError raised must NOT exit non-zero.
+        # Without this guard, a logic flip on the
+        # `non_recoverable_emitted` flag could silently start
+        # exit-1-ing every clean run and only surface as a
+        # downstream supervisor classification regression.
+        def handle(task: Task):
+            return None  # Clean completion → DoneResponse
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        dones = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(dones), 1)
+        self.assertEqual(
+            comm.exit_code,
+            0,
+            "clean-completion run must exit with code 0",
+        )
+
+    def test_recoverable_error_exits_zero(self):
+        # RecoverableError is "stay alive, retry the task" per the
+        # NonRecoverableError class docstring contract — the
+        # framework retries; the worker process keeps living for
+        # the next task. The process should NOT exit non-zero on
+        # a Recoverable failure; the exit-code contract applies
+        # only to NonRecoverable.
+        def handle(task: Task):
+            raise RecoverableError("transient blip")
+
+        comm = _drive(handle, [_process(), StopCommand()])
+
+        errs = [r for r in comm.outbox if isinstance(r, ErrorResponse)]
+        self.assertEqual(len(errs), 1)
+        self.assertEqual(errs[0].error_type, ErrorType.RECOVERABLE)
+        self.assertEqual(
+            comm.exit_code,
+            0,
+            "Recoverable-only run must exit with code 0 — the worker "
+            "stays alive for the next task per docstring contract",
+        )
 
     def test_memory_error_emits_oom_and_exits(self):
         # MemoryError is process-level: the runtime must emit OOM
