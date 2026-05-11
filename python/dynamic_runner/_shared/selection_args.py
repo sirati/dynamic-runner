@@ -81,6 +81,18 @@ def process_selection_arguments(args: argparse.Namespace) -> SelectionConfig:
     the gateway-side filesystem, not locally; the consumer's
     `discover_items` is responsible for routing through the SSH
     backend in that case.
+
+    SLURM mode (`--multi-computer slurm`) skips the local
+    `output_dir.mkdir` because `--output` refers to the GATEWAY's
+    filesystem, not the dispatcher's local host. The SLURM
+    packaging pipeline ssh-creates the output dir on the gateway
+    via :class:`SshGateway`; the dispatcher itself never writes to
+    ``output_dir`` locally. Pre-fix the unconditional local mkdir
+    failed with ``PermissionError: '/home/<gateway-user>'`` when
+    the gateway user's home didn't exist on the dispatcher's local
+    host (asm-tokenizer Tier-2 dispatch at 3c5f105). Symmetric with
+    the source-already-staged skip — both flags identify "this
+    path is gateway-side, not local".
     """
     source_dir = Path(args.source).resolve()
     output_dir = Path(args.output).resolve()
@@ -93,7 +105,14 @@ def process_selection_arguments(args: argparse.Namespace) -> SelectionConfig:
         )
         sys.exit(1)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # SLURM-mode output is gateway-side; skip the local mkdir. Local
+    # and single-process modes share the operator's filesystem with
+    # the workers, so the mkdir IS load-bearing there — the worker
+    # would otherwise crash on first `publish()` to a non-existent
+    # root.
+    is_slurm = getattr(args, "multi_computer", None) == "slurm"
+    if not is_slurm:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     return SelectionConfig(
         source_dir=source_dir,
