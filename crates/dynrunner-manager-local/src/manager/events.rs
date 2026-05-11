@@ -59,6 +59,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 result,
                 binary,
             } => {
+                // Reap the subprocess BEFORE reclaim_protocol so the
+                // exit status rides the same log line as the
+                // disconnect. After restart_worker the factory may
+                // drop the old `Child`; reaping then races that drop.
+                // `try_reap_exit` is non-blocking; `None` carries the
+                // operationally-useful "framework lost diagnostic
+                // visibility" signal (vs. "definitely clean exit").
+                let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
+
                 // Reclaim protocol state from the spawned poll task
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
@@ -66,6 +75,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 tracing::warn!(
                     worker_id,
                     error = ?result.error_message,
+                    exit_status = exit_status.as_ref().map(|s| s.to_string()),
                     "worker disconnected"
                 );
                 // Log resource usage before recording result
