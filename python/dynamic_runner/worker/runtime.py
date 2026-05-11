@@ -359,6 +359,21 @@ class _RunCtx:
     exit_after_response: bool = False
     last_send_failed: bool = False
     fatal_send_errors: list[str] = field(default_factory=list)
+    # Whether at least one NonRecoverableError was raised by the
+    # task handler during this run. Set when `_classify_exception`
+    # produces an ErrorType.NON_RECOVERABLE response; consumed at
+    # end-of-`run()` to decide the process exit code.
+    #
+    # The contract `run()` enforces: a worker that emitted a
+    # NonRecoverableError MUST exit with a non-zero process exit
+    # code so OS-level supervisors (slurm accounting, podman exit
+    # watchers, parent-process waitpid via #41) can discriminate
+    # "worker ran to clean completion" from "worker bailed via
+    # non-recoverable error". The wire-protocol-level
+    # ErrorResponse(NON_RECOVERABLE) reaches the manager
+    # synchronously; the exit-code half of the contract reaches
+    # whoever spawned the worker process.
+    non_recoverable_emitted: bool = False
 
 
 def _try_send(ctx: _RunCtx, response: Any) -> None:
@@ -423,6 +438,19 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
             # leave the worker alive for the next task.
             if classified.error_type == ErrorType.OUT_OF_MEMORY:
                 return False
+            # NonRecoverableError marks the worker as having
+            # produced an error result for this task; the worker
+            # stays alive for the next assignment (manager's
+            # respawn contract handles the dead-worker case via
+            # the broken-pipe path in the pool). Flag this on the
+            # ctx so `run()`'s post-loop exit-code decision can
+            # discriminate `clean shutdown` from `bailed via
+            # non-recoverable error`. The wire-protocol-level
+            # ErrorResponse already reached the manager; the
+            # exit-code half of the contract reaches the parent
+            # process.
+            if classified.error_type == ErrorType.NON_RECOVERABLE:
+                ctx.non_recoverable_emitted = True
             return not ctx.last_send_failed
         # Unknown exception → ship the full traceback. Default to
         # RECOVERABLE per plan D6: an unhandled bug retried on a
@@ -525,6 +553,21 @@ def run(
                 signal.signal(signal.SIGTERM, prev_term)
             except (ValueError, OSError):
                 pass
+
+    # Exit-code contract: if the task handler raised
+    # NonRecoverableError during this run, the worker process
+    # exits with code 1 so OS-level supervisors (slurm accounting,
+    # podman exit watchers, parent-process waitpid via #41) can
+    # discriminate "worker ran to clean completion" from "worker
+    # bailed via non-recoverable error". The wire-protocol-level
+    # ErrorResponse(NON_RECOVERABLE) reached the manager earlier;
+    # the process exit code reaches the parent process tree.
+    #
+    # SystemExit propagates past the finally block above without
+    # disturbing comm.close() / signal-handler restoration — both
+    # have already run.
+    if ctx.non_recoverable_emitted:
+        raise SystemExit(1)
 
 
 __all__ = [
