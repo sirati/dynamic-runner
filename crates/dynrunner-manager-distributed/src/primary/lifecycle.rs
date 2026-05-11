@@ -315,7 +315,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                             fail_oom = outcome.fail_oom,
                             fail_final = outcome.fail_final,
                             total = self.total_tasks,
-                            "operational loop timeout with active workers, marking in-flight tasks as failed"
+                            "operational loop timeout; marking in-flight tasks failed"
                         );
                         // Mark all in-flight tasks as failed. These
                         // are workers that didn't ack progress for the
@@ -590,14 +590,23 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 };
                 self.transport.send_to(&sec_id, assignment_msg).await?;
 
+                // Operator-facing INFO: which secondary/worker just
+                // took the task. Per-task identity (task_id /
+                // phase / type) → DEBUG sibling.
                 tracing::info!(
+                    secondary = %sec_id,
+                    worker_id = local_worker_id,
+                    task_hash = %task_hash,
+                    "task assigned"
+                );
+                tracing::debug!(
                     secondary = %sec_id,
                     worker_id = local_worker_id,
                     task_id = ?binary.task_id,
                     phase = %binary.phase_id,
                     task_type = %binary.type_id,
                     task_hash = %task_hash,
-                    "task assigned"
+                    "task assigned: identity"
                 );
             }
         }
