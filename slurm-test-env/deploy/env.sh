@@ -105,6 +105,21 @@ HOME_SHARE="${STATE_DIR}/home"
 : "${WORKER_MEMORY:=4g}"
 : "${WORKER_CPUS:=2}"
 
+# Cgroup pids.max for worker containers. Podman's default --pids-limit
+# for rootless containers is 2048, which a fork-heavy nix build
+# (configure + parallel make + cc + ld) blows past container-wide
+# regardless of how the per-job slurm cgroup is set up — observed end-
+# to-end on ds-test 2026-05-11 (run_20260511_135927) where slurmd
+# survived (post-2bf8410) but variant builds hit `Broken pipe` /
+# `unexpected end-of-file` because the nix-build subprocess tree hit
+# the 2048 ceiling. 32768 matches the framework's per-process nproc
+# ceiling (--ulimit nproc=32768, task #20) — same scale at the cgroup
+# layer for symmetry, large enough that realistic workloads don't
+# trip it. Gateway containers are not affected (slurmctld + sshd
+# don't fork much), so no GATEWAY_PIDS_LIMIT — added only when a
+# concrete failure surfaces.
+: "${WORKER_PIDS_LIMIT:=32768}"
+
 # --- User-facing summary ----------------------------------------------------
 #
 # Deliberately shows only what an operator of a real slurm cluster would

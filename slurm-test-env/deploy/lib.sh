@@ -94,6 +94,7 @@ start_worker() {
     --network-alias "$h_name" \
     --memory "$WORKER_MEMORY" \
     --cpus "$WORKER_CPUS" \
+    --pids-limit "$WORKER_PIDS_LIMIT" \
     -v "${w_tmp}:/tmp:rw" \
     "${NODE_COMMON_FLAGS[@]}" \
     "$WORKER_IMAGE_TAG" >/dev/null
