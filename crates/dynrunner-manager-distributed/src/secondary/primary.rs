@@ -583,9 +583,23 @@ where
                             // in_flight + pushes to front of bucket).
                             // Mirrors the recovery shape of
                             // `handle_primary_peer_rejection` below.
+                            //
+                            // SendFailed (the typical `Err` shape
+                            // here) means the worker subprocess died
+                            // between tasks — the pipe is broken.
+                            // Reap so the log carries the actual
+                            // signal/code, not just "Broken pipe".
+                            // No `Disconnected` event will fire on
+                            // this path (poll_loop is only spawned
+                            // for an Assigned task), so this is the
+                            // only log line the operator sees for a
+                            // self-assign-time death.
+                            let exit_status =
+                                self.pool.workers[wid as usize].try_reap_exit();
                             tracing::warn!(
                                 worker_id = wid,
                                 error = %e,
+                                exit_status = exit_status.as_ref().map(|s| s.to_string()),
                                 "primary self-assign failed; re-queuing binary"
                             );
                             self.recover_in_flight_to_pool(&file_hash);

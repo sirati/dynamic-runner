@@ -10,4 +10,4 @@ pub use manager::{
 pub use monitor::{ProcStatmMonitor, ResourceMonitor};
 pub use pool::{WorkerPool, ResourcePressureResult};
 pub use stats::ProcessingStats;
-pub use worker::{WorkerHandle, WorkerEvent};
+pub use worker::{WorkerEvent, WorkerExitStatus, WorkerHandle};

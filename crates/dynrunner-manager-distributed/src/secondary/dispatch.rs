@@ -126,9 +126,18 @@ where
                             );
                         }
                         Err(e) => {
+                            // Worker subprocess likely died between
+                            // tasks. Reap so the log carries the
+                            // actual signal/code rather than the
+                            // pipe-level "Broken pipe" string. See
+                            // `WorkerHandle::try_reap_exit` for None
+                            // conditions.
+                            let exit_status =
+                                self.pool.workers[target_wid as usize].try_reap_exit();
                             tracing::error!(
                                 worker_id = target_wid,
                                 error = %e,
+                                exit_status = exit_status.as_ref().map(|s| s.to_string()),
                                 "failed to assign task"
                             );
                             let msg = DistributedMessage::TaskFailed {
