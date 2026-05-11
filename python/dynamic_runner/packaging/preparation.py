@@ -60,6 +60,7 @@ class SlurmPreparation:
         use_reverse_connection: bool = False,
         run_id: str = "default",
         cores_spec: str = "0",
+        max_memory_spec: str = "-2G",
     ):
         self.slurm_config = slurm_config
         self.job_manager = job_manager
@@ -74,6 +75,13 @@ class SlurmPreparation:
         # `pipeline.rs` always populates this from `args.cores`;
         # the default only applies to programmatic test fixtures.
         self.cores_spec = cores_spec
+        # Verbatim `--max-memory` spec string forwarded the same
+        # way. Defaults to "-2G" (host minus 2 GiB headroom) matching
+        # the CLI default. SLURM-only forward: --multi-computer local
+        # doesn't plumb memory through (single-host shared RAM =
+        # double-counting); SLURM secondaries are on different hosts
+        # with own RAM so per-machine semantic applies.
+        self.max_memory_spec = max_memory_spec
 
         base_log_dir = self.slurm_config.get_log_dir()
         self.run_log_dir = f"{base_log_dir}/{run_id}"
@@ -175,6 +183,7 @@ class SlurmPreparation:
                 gateway_host=gateway_host,
                 gateway_port=primary_quic_port,
                 cores_spec=self.cores_spec,
+                max_memory_spec=self.max_memory_spec,
                 reverse_connection=self.use_reverse_connection,
                 run_log_dir=self.run_log_dir,
             )
