@@ -294,8 +294,14 @@ where
                     || self.primary_retry_passes_used
                         >= self.config.retry_max_passes)
             {
+                // `primary_failed` at this point is either drained
+                // (retry passes succeeded) or still populated but
+                // the retry budget is exhausted (handled by the
+                // surrounding condition). Either way, what remains
+                // is terminal — surface as `fail_final` to match
+                // the project-wide outcome-class log shape.
                 tracing::info!(
-                    permanent_failures = self.primary_failed.len(),
+                    fail_final = self.primary_failed.len(),
                     "primary drained after live-primary disconnect; exiting"
                 );
                 break;

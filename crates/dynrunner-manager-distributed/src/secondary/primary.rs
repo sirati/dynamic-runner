@@ -211,7 +211,7 @@ where
         tracing::info!(
             pending = pending_count,
             in_flight = in_flight_count,
-            completed = self.primary_completed.len(),
+            succeeded = self.primary_completed.len(),
             "populated primary task list"
         );
     }
@@ -317,9 +317,19 @@ where
         if matches!(error_type, dynrunner_core::ErrorType::Recoverable) {
             // Stash for the retry pass. Idempotent — the same hash
             // appearing twice (e.g. after re-injection fails again)
-            // overwrites with the same binary, which is harmless.
-            self.primary_failed
-                .insert(file_hash.to_string(), item.binary);
+            // overwrites with the same binary and the latest
+            // ErrorType, which is harmless. The entry carries
+            // `error_type` so the outcome-summary breakdown can
+            // partition the ledger by class; today only Recoverable
+            // lands here (retry-pass scope), but the structure is
+            // ready when non-Recoverable accounting joins.
+            self.primary_failed.insert(
+                file_hash.to_string(),
+                crate::secondary::FailedTaskEntry {
+                    binary: item.binary,
+                    error_type: error_type.clone(),
+                },
+            );
         }
         if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id, task_id.as_deref());
@@ -380,8 +390,16 @@ where
             // emit the warning once per run rather than every drain
             // check.
             if !self.exhaustion_warning_emitted {
+                // Tasks in `primary_failed` at retry-exhaustion time
+                // are now terminal (no further passes). Surface them
+                // as `fail_final` so the operator's log-side
+                // breakdown matches the actual disposition; the
+                // class-of-error these tasks hit was Recoverable
+                // (only Recoverable lands in primary_failed today),
+                // but the run-level outcome class is "final" because
+                // the retry policy gave up.
                 tracing::warn!(
-                    permanent_failures = self.primary_failed.len(),
+                    fail_final = self.primary_failed.len(),
                     passes = self.config.retry_max_passes,
                     "primary retry budget exhausted; failed tasks are permanent"
                 );
@@ -390,9 +408,15 @@ where
             return;
         }
 
+        // Drain the failed-ledger: each entry yields its `binary`
+        // for re-injection into `primary_pending`. The `error_type`
+        // recorded on the entry is intentionally discarded here —
+        // the next pass will overwrite with whatever outcome the
+        // retry produces.
         let to_retry: Vec<TaskInfo<I>> =
             std::mem::take(&mut self.primary_failed)
                 .into_values()
+                .map(|entry| entry.binary)
                 .collect();
         let pass = self.primary_retry_passes_used + 1;
         tracing::info!(

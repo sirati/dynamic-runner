@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
@@ -159,6 +159,21 @@ pub(super) struct PrimaryInFlightItem<I: Identifier> {
     pub(super) phase_id: PhaseId,
     pub(super) target_secondary_id: String,
     pub(super) binary: TaskInfo<I>,
+}
+
+/// One entry in the secondary's `primary_failed` ledger. Carries
+/// both the original `TaskInfo` (so the secondary can re-inject the
+/// binary on a retry pass without re-fetching it from the cluster
+/// state) and the last-observed `ErrorType` (so the per-class
+/// outcome breakdown — fail_retry/fail_oom/fail_final — can be
+/// computed locally at log time).
+///
+/// On retry, the entry is overwritten with the new pass's
+/// `ErrorType`; the binary is unchanged.
+#[derive(Debug, Clone)]
+pub(super) struct FailedTaskEntry<I: Identifier> {
+    pub(super) binary: TaskInfo<I>,
+    pub(super) error_type: ErrorType,
 }
 
 /// Certificate info for peer connections, set before `run()`.
@@ -336,11 +351,17 @@ where
     /// already kept this shape for rejection-recovery; the failed
     /// ledger keeps the same shape for retry-injection.
     ///
+    /// Each entry now also carries the last-observed `ErrorType` so
+    /// the post-restructure `succeeded/fail_retry/fail_oom/fail_final`
+    /// log surface can partition failures by class. Pre-restructure
+    /// the secondary lost OOM-vs-final classification at this
+    /// boundary (the binary was carried, the failure class was not).
+    ///
     /// Closes the gap demotion introduced: post-demotion the local
     /// primary's `run_retry_passes` is a no-op, so without this
     /// primary-side ledger every Recoverable failure became
     /// terminal at the cluster level.
-    primary_failed: HashMap<String, TaskInfo<I>>,
+    primary_failed: HashMap<String, FailedTaskEntry<I>>,
 
     /// Number of retry passes consumed against `config.retry_max_passes`.
     /// Bumped by `primary_drain_check_and_retry` once per
