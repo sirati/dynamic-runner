@@ -469,46 +469,57 @@ CONTAINER_NAME="{container_name}"
 # wrapper's death and the SLURM job's termination, leaking
 # storage and worker processes on the compute node.
 #
-# Watchdog polls `squeue -j $SLURM_JOB_ID` once a second; when
-# the job is gone (squeue exit 0 + empty stdout — distinct from
-# transient query failure which exits nonzero), it issues
-# `podman kill` then `podman rm -f` on this wrapper's container
-# by name. Detached via `setsid -f` so it survives wrapper exit
-# and (where possible) cgroup teardown of the wrapper's pidtree.
+# Two trigger conditions must BOTH hold before any kill action:
 #
-# Debounced (task #40): a SINGLE rc=0-with-empty observation is
-# NOT sufficient to fire the kill. slurmctld can transiently
-# return rc=0 with empty output during RPC stalls, accounting
-# flushes, or task/cgroup view churn under workload bursts.
-# Interpreting any one such observation as "job is gone"
-# falsely kills a container whose SLURM job is still running.
-# Require KILL_THRESHOLD consecutive empty observations
-# (default 3 → 3s debounce at 1s sleep) before firing. The
-# tradeoff is false-kill latency vs true-kill reliability;
-# 3s is short enough that operators don't notice the extra
-# wait on actual teardown but long enough to ride out
-# slurmctld blips. asm-dataset-nix at run_20260511_190700
-# hit the undebounced shape: workers died mid-build with no
-# obvious kill source on the container.
+#   1. SLURM job state is no longer RUNNING. Probed via
+#      `squeue -j $JOBID -h -o "%T"` — verbose state code per
+#      `squeue(1)`. A job leaving RUNNING means slurmctld has
+#      decided to terminate it (COMPLETING after time limit /
+#      scancel, FAILED, TIMEOUT, CANCELLED) or the job has
+#      already left the queue (empty stdout). Crucially, a job
+#      in COMPLETING (CG) state — slurmctld trying to clean up
+#      a stuck cgroup, often because the container itself is
+#      blocking cleanup — is the case this watchdog exists for.
+#      Polling for state, not presence, catches that case;
+#      presence-polling would miss it because the job is still
+#      in the queue.
 #
-# The kill event is logged to the wrapper's stdout via fd 3
-# (the wrapper redirects its own stdout to the .out file
-# before the watchdog spawns; the watchdog inherits fd 3 →
-# same .out file). Operators grepping `slurm_*.out` for
-# "WATCHDOG kill" can confirm whether the watchdog killed a
-# container post-hoc.
+#   2. Container is still alive. If the dispatcher exited
+#      cleanly with the workload, the container is gone and
+#      there is nothing to tear down.
 #
-# If proctrack/cgroup is in fact tracking the watchdog too, the
-# watchdog dies alongside the rest — but in that case the
-# container is also dead, so there's nothing to clean up. Either
-# branch leaves the system in a clean state.
+# Teardown is graceful: SIGTERM first, then up to 60s for the
+# dispatcher to flush in-flight task state, peer disconnects,
+# and exit; only if the container is still alive after 60s does
+# the watchdog escalate to SIGKILL. This preserves the
+# dispatcher's ability to surface partial results when the job
+# is terminated mid-run rather than discarding them.
+#
+# Debounce: two consecutive non-running observations at 5s
+# interval (10s confirm) before triggering. slurmctld can
+# return transient state inconsistencies during RPC stalls or
+# accounting flushes; the debounce rides those out. squeue
+# command failures (rc!=0) are skipped entirely — they
+# indicate slurmctld is unreachable, not that the job ended.
+#
+# Watchdog actions log to the wrapper's stdout via fd 3 (the
+# wrapper redirects its own stdout to the .out file before the
+# watchdog spawns; the watchdog inherits fd 3 → same .out
+# file). Operators grepping `slurm_*.out` for "WATCHDOG:" can
+# attribute container teardown to the watchdog post-hoc.
+#
+# Detached via `setsid -f` so it survives wrapper exit and
+# (where possible) cgroup teardown of the wrapper's pidtree.
+# If proctrack/cgroup is in fact tracking the watchdog too,
+# the watchdog dies alongside the rest — but in that case the
+# container is also dead, so there's nothing to clean up.
 #
 # Skipped when SLURM_JOB_ID is empty (running outside SLURM):
 # squeue would never find a matching job so the watchdog could
 # never exit cleanly.
 if [ -n "${{SLURM_JOB_ID:-}}" ]; then
     # Duplicate the wrapper's stdout to fd 3 so the detached
-    # watchdog can log its kill-trigger to the .out file even
+    # watchdog can log its actions to the .out file even
     # after the wrapper exits and its main stdout chain may be
     # torn down (setsid'd subshell's stdout goes to /dev/null
     # via the spawn line). The exec is bash-local; the
@@ -519,28 +530,75 @@ if [ -n "${{SLURM_JOB_ID:-}}" ]; then
         cname="$2"
         storage="$3"
         runroot="$4"
-        kill_threshold=3
-        empty_count=0
+        # State-poll cadence and debounce. 5s sleep × 2-strike
+        # confirm = ~10s to act after a real state change, which
+        # is fast enough on the operator side and long enough to
+        # ride out slurmctld inconsistencies.
+        state_poll_seconds=5
+        state_threshold=2
+        nonrunning_count=0
+        last_state="<unknown>"
         while true; do
-            sleep 1
-            if out=$(squeue -j "$job_id" -h -o "%i" 2>/dev/null); then
-                if [ -z "$out" ]; then
-                    empty_count=$((empty_count + 1))
-                    if [ "$empty_count" -ge "$kill_threshold" ]; then
+            sleep "$state_poll_seconds"
+            # %T renders the verbose job state (RUNNING, COMPLETING,
+            # FAILED, TIMEOUT, CANCELLED, PREEMPTED, ...). Empty
+            # stdout means the job has left the queue entirely.
+            # squeue rc!=0 indicates slurmctld is unreachable, not
+            # that the job ended — skip those ticks.
+            if out=$(squeue -j "$job_id" -h -o "%T" 2>/dev/null); then
+                state=$(printf "%s" "$out" | head -n1)
+                if [ "$state" = "RUNNING" ] || [ "$state" = "R" ]; then
+                    nonrunning_count=0
+                else
+                    nonrunning_count=$((nonrunning_count + 1))
+                    if [ "$nonrunning_count" -ge "$state_threshold" ]; then
+                        last_state="${{state:-<empty>}}"
                         break
                     fi
-                else
-                    empty_count=0
                 fi
             fi
         done
-        echo "WATCHDOG kill: $kill_threshold consecutive empty squeue observations for job $job_id; killing container $cname" >&3 2>/dev/null || true
+
+        # Container already gone — workload finished, nothing
+        # to do.
+        if ! podman --root "$storage" --runroot "$runroot" container exists "$cname" 2>/dev/null; then
+            exit 0
+        fi
+
+        # Phase 2: graceful SIGTERM. The dispatcher inside gets a
+        # chance to flush in-flight state, signal peers, and exit
+        # cleanly before we force-kill.
+        grace_seconds=60
+        echo "WATCHDOG: job $job_id state=$last_state; sending SIGTERM to container $cname (${{grace_seconds}}s grace before SIGKILL)" >&3 2>/dev/null || true
         podman --root "$storage" --runroot "$runroot" kill --signal TERM "$cname" 2>/dev/null
-        sleep 5
+
+        # Phase 3: wait up to grace_seconds for graceful exit.
+        # Poll once a second so we exit promptly when the
+        # dispatcher finishes.
+        elapsed=0
+        while [ "$elapsed" -lt "$grace_seconds" ]; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+            if ! podman --root "$storage" --runroot "$runroot" container exists "$cname" 2>/dev/null; then
+                echo "WATCHDOG: container $cname exited gracefully after ${{elapsed}}s" >&3 2>/dev/null || true
+                exit 0
+            fi
+            running=$(podman --root "$storage" --runroot "$runroot" inspect --format "{{{{.State.Running}}}}" "$cname" 2>/dev/null)
+            if [ "$running" = "false" ]; then
+                echo "WATCHDOG: container $cname stopped after ${{elapsed}}s" >&3 2>/dev/null || true
+                podman --root "$storage" --runroot "$runroot" rm -f "$cname" 2>/dev/null
+                exit 0
+            fi
+        done
+
+        # Phase 4: still alive after grace — force kill.
+        echo "WATCHDOG: container $cname did not exit within ${{grace_seconds}}s of SIGTERM; force-killing (SIGKILL)" >&3 2>/dev/null || true
+        podman --root "$storage" --runroot "$runroot" kill --signal KILL "$cname" 2>/dev/null
+        sleep 2
         podman --root "$storage" --runroot "$runroot" rm -f "$cname" 2>/dev/null
     ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
         </dev/null >/dev/null 2>&1
-    echo "Spawned podman teardown watchdog for SLURM job $SLURM_JOB_ID (container $CONTAINER_NAME), kill-threshold=3"
+    echo "Spawned podman teardown watchdog for SLURM job $SLURM_JOB_ID (container $CONTAINER_NAME), state-poll=5s, debounce=2, grace=60s"
 fi
 
 echo "Starting Docker container..."
@@ -992,39 +1050,76 @@ mod tests {
         assert!(script.contains("--ulimit nproc=32768:32768"));
         // Cleanup trap covers SLURM-induced signals (commit 485629c).
         assert!(script.contains("trap cleanup EXIT TERM HUP INT"));
-        // Watchdog block (commit a12f84a + #40 debounce).
+        // Watchdog block (commit a12f84a + #40 state-aware +
+        // graceful redesign).
         assert!(script.contains("setsid -f bash -c"));
         assert!(script.contains("podman teardown watchdog"));
-        // #40: debounce — kill_threshold + empty_count machinery
-        // must be present, preventing a single transient squeue
-        // rc=0+empty observation from killing a still-running
-        // container. Pin both the literal threshold and the kill-
-        // trigger log line so future edits don't accidentally
-        // revert to the single-observation fire path.
+        // #40: state-aware polling — the watchdog must check
+        // SLURM job STATE (`squeue -o %T`), not job presence
+        // (`squeue -o %i`). Presence-polling misses the
+        // COMPLETING (CG) case where a stuck container blocks
+        // slurmctld cleanup and the job stays in queue.
         assert!(
-            script.contains("kill_threshold=3"),
-            "watchdog must declare kill_threshold=3 (debounce \
+            script.contains("squeue -j \"$job_id\" -h -o \"%T\""),
+            "watchdog must poll job state via -o %T, not presence \
+             via -o %i; render did not contain the state probe"
+        );
+        assert!(
+            script.contains("\"$state\" = \"RUNNING\""),
+            "watchdog must treat RUNNING as the only \"keep going\" \
+             state; render did not contain the state comparison"
+        );
+        // Debounce: two consecutive non-running observations.
+        // Single observation is not sufficient — slurmctld can
+        // emit transient state inconsistencies during RPC stalls.
+        assert!(
+            script.contains("state_threshold=2"),
+            "watchdog must declare state_threshold=2 (debounce \
              count); render did not contain it"
         );
         assert!(
-            script.contains("empty_count=$((empty_count + 1))"),
-            "watchdog must increment empty_count on each rc=0+empty \
-             observation, NOT break immediately; render did not \
-             contain the increment"
+            script.contains("nonrunning_count=$((nonrunning_count + 1))"),
+            "watchdog must increment nonrunning_count on each \
+             non-running observation, NOT trigger immediately; \
+             render did not contain the increment"
+        );
+        // Graceful teardown: SIGTERM then 60s grace then SIGKILL.
+        // SIGTERM gives the dispatcher a chance to flush
+        // in-flight task state before the container dies.
+        assert!(
+            script.contains("grace_seconds=60"),
+            "watchdog must declare grace_seconds=60 (SIGTERM grace \
+             before SIGKILL); render did not contain it"
         );
         assert!(
-            script.contains("WATCHDOG kill:"),
-            "watchdog must log a kill-trigger line so post-hoc \
-             diagnosis can attribute container deaths; render did \
-             not contain the log"
+            script.contains("--signal TERM"),
+            "watchdog must send SIGTERM first; render did not \
+             contain the TERM signal"
         );
-        // The kill-threshold value is also surfaced in the spawn-
-        // confirmation echo so operators see the configured
-        // threshold without reading the bash.
         assert!(
-            script.contains("kill-threshold=3"),
-            "spawn-confirmation echo must surface the kill-threshold \
-             value; render did not contain it"
+            script.contains("--signal KILL"),
+            "watchdog must escalate to SIGKILL after grace expires; \
+             render did not contain the KILL signal"
+        );
+        // Log line: operators grep "WATCHDOG:" to attribute
+        // container teardown post-hoc. Pin the SIGTERM-trigger
+        // and the SIGKILL-escalation log lines.
+        assert!(
+            script.contains("WATCHDOG: job $job_id state="),
+            "watchdog must log the SIGTERM trigger with the \
+             observed job state; render did not contain the log"
+        );
+        assert!(
+            script.contains("did not exit within ${grace_seconds}s of SIGTERM"),
+            "watchdog must log SIGKILL escalation when grace \
+             expires; render did not contain the escalation log"
+        );
+        // Spawn-confirmation echo surfaces the new tunables so
+        // operators see them without reading the bash.
+        assert!(
+            script.contains("state-poll=5s, debounce=2, grace=60s"),
+            "spawn-confirmation echo must surface the watchdog \
+             tunables; render did not contain them"
         );
         // Memory-cap block: both probes (NodeRAM + wrapper cgroup
         // memory.max) must be present so the min() logic engages on
