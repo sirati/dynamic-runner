@@ -396,6 +396,20 @@ where
                 workers_to_restart.into_iter().collect();
             restart_set.extend(self.pending_worker_restarts.drain());
             for wid in restart_set {
+                // Active SIGKILL before restart so a stuck or
+                // otherwise non-responsive worker is dead BEFORE
+                // the replacement comes up. Prior behaviour relied
+                // entirely on `pool.restart_worker` dropping the
+                // old `WorkerHandle` (closing the transport from
+                // our side) — but a worker that's wedged inside
+                // `subprocess.run` (blocking on a non-cancellable
+                // syscall) won't notice the EOF until its
+                // subprocess returns. SIGKILL is the no-graceful-
+                // shutdown lever; per CLAUDE.md the framework
+                // already decided this slot is going to be
+                // replaced, so the worker doesn't get a chance
+                // to react.
+                self.pool.workers[wid as usize].kill_subprocess();
                 if let Err(e) = self.pool.restart_worker(wid, factory, false).await {
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
@@ -672,32 +686,76 @@ where
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
 
-                    // Honour the upstream classification produced by
-                    // the worker protocol: a clean Error response on
-                    // the wire (Recoverable / NonRecoverable / OOM)
-                    // already carried `error_type`. The transport-
-                    // closed branch in `protocol-manager-worker` /
-                    // `manager-local` defaults to Recoverable so a
-                    // mid-task disconnect retries (typical cause is
-                    // an environment glitch or worker-process bug
-                    // that the retry-pass exhaustion logic catches
-                    // at `MAX_RETRY_ATTEMPTS`). Pre-Phase-D this
-                    // forwarder hardcoded NonRecoverable, masking
-                    // the upstream signal entirely.
+                    // Discriminate two Disconnected-event shapes:
+                    //
+                    //   A. Worker explicitly reported a real
+                    //      task failure on the wire — Response::
+                    //      Error(NonRecoverable, msg). The
+                    //      communication SUCCEEDED; the message
+                    //      WAS delivered. The task ran (or at
+                    //      least the worker attempted it) and
+                    //      reported a non-recoverable failure.
+                    //      → forward as TaskFailed(NonRecoverable)
+                    //        so the primary records the real
+                    //        failure (consumes retry budget if
+                    //        applicable; surfaces in fail_final
+                    //        per the outcome-class breakdown).
+                    //
+                    //   B. Pure transport-level disconnect — no
+                    //      wire-level error response, just an
+                    //      EOF on the manager's read end (the
+                    //      protocol layer at `state.rs:152`
+                    //      synthesises `Recoverable +
+                    //      "transport disconnected"` for this
+                    //      case; `worker.rs:154` synthesises
+                    //      `Recoverable + "Disconnected before
+                    //      Ready"` for the pre-Ready variant).
+                    //      The communication FAILED; the task
+                    //      may not have run at all.
+                    //      → forward as backpressure-shaped
+                    //        TaskFailed (Recoverable + the
+                    //        marker the primary's
+                    //        `is_backpressure` predicate
+                    //        recognises) so the primary REQUEUES
+                    //        the task at the pool without
+                    //        consuming retry budget. The next
+                    //        TaskRequest from the respawned
+                    //        worker (or another peer) picks it
+                    //        back up.
+                    //
+                    // Discriminator is `result.error_type`:
+                    // NonRecoverable → real failure (A); anything
+                    // else (Recoverable + transport-disconnected
+                    // synthesis) → comm failure (B).
                     let error_type = result
                         .error_type
                         .clone()
                         .unwrap_or(ErrorType::Recoverable);
+                    let is_comm_failure =
+                        !matches!(error_type, ErrorType::NonRecoverable);
+
+                    let (wire_error_type, wire_error_message) = if is_comm_failure {
+                        (
+                            ErrorType::Recoverable,
+                            "worker pipe broken; respawning".to_string(),
+                        )
+                    } else {
+                        (
+                            error_type,
+                            result
+                                .error_message
+                                .unwrap_or_else(|| "Worker disconnected".into()),
+                        )
+                    };
+
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),
                         worker_id,
                         task_hash: hash,
-                        error_type,
-                        error_message: result
-                            .error_message
-                            .unwrap_or_else(|| "Worker disconnected".into()),
+                        error_type: wire_error_type,
+                        error_message: wire_error_message,
                     };
                     let _ = self.send_to_current_primary(msg.clone()).await;
                     let _ = self.peer_transport.broadcast(msg).await;
