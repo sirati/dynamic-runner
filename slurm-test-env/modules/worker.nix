@@ -20,4 +20,24 @@
   # disk, not a small in-container tmpfs, holds large image tarballs and
   # other scratch). Letting NixOS mount tmpfs over it would mask the bind.
   boot.tmp.useTmpfs = false;
+
+  # Defensive belt-and-braces against the pthread_create EAGAIN class that
+  # killed slurmd on 2026-05-11 (ds-test, journalctl -u slurmd: "fatal:
+  # _try_service_msg: pthread_create error Resource temporarily
+  # unavailable" at 09:53:28 UTC, slurmd[419] uptime 22h34m). The
+  # TaskPlugin=task/cgroup + proctrack/cgroup change in
+  # slurm-cluster.nix is the architectural fix: batch-job processes get
+  # their own cgroup and can no longer exhaust the shared accounting.
+  # These two unit-level lifts ensure that even if a future cgroup-
+  # isolation regression slips through (or operators run a workload
+  # that probes a different limit class), slurmd's own thread/fork
+  # accounting can't be throttled by anything we control here.
+  #
+  # slurmd peaks at ~9.5 MiB RSS / ~266ms CPU over 22h+ uptime, so
+  # unbounding NPROC/TasksMax is genuinely cost-free — slurmd has no
+  # appetite for either.
+  systemd.services.slurmd.serviceConfig = {
+    LimitNPROC = "infinity";
+    TasksMax = "infinity";
+  };
 }
