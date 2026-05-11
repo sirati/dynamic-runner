@@ -332,6 +332,7 @@ impl PySecondaryCoordinator {
                     primary_link_failure_threshold: dist_primary_link_failure_threshold,
                     primary_link_failure_window: dist_primary_link_failure_window,
                     setup_deadline: dist_setup_deadline,
+                    is_observer: false,
                 };
 
                 let mut factory = SubprocessWorkerFactory {
