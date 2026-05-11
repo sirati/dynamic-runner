@@ -284,10 +284,26 @@ echo ""
 # nix-daemon socket (asm-dataset-nix T3 at 3c5f105). The min-with-
 # cgroup-max fix closes this.
 #
-# --memory-swap is set equal to --memory so podman cannot silently
-# swap-thrash under memory pressure. Falls back to no cap when both
-# probes yield empty (absurdly small node and no cgroup cap —
-# implausible on cluster).
+# --memory-swap=-1 (unlimited swap on top of the RAM cap) is the
+# explicit user policy: a worker that overshoots its RAM budget
+# should get swapped instead of OOM-killed. Reasoning: workers
+# that "waste" memory in bursts can recover under pressure
+# (swap-thrash is slow but observable) rather than dying
+# abruptly. The RAM cap (--memory) still bounds in-core usage
+# from the kernel's perspective; --memory-swap=-1 just unbounds
+# the swap component of that ceiling so the container's effective
+# memory.max becomes max(RAM cap + host swap, RAM cap). Without
+# this, podman's default `--memory-swap=2*--memory` (or
+# `--memory-swap=--memory` if we set it equal) causes the
+# kernel cgroup-OOM-killer to fire as soon as actual RAM usage
+# crosses the cap — losing the worker's progress and potentially
+# triggering the bilateral-OOM-kill-by-cgroup pattern asm-dataset-nix
+# diagnosed at afd1654. Slurm-test-env-owner's 929a7b9 does the
+# parallel change on the outer worker container; this commit
+# does it on the framework's inner secondary container.
+#
+# Falls back to no cap when both probes yield empty (absurdly
+# small node and no cgroup cap — implausible on cluster).
 MEM_BYTES_NODE=$(awk '/MemTotal:/{{val = $2*1024 - 2*1024*1024*1024; if (val > 0) print val; else print ""}}' /proc/meminfo)
 MEM_BYTES_CGROUP=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "")
 case "$MEM_BYTES_CGROUP" in
@@ -312,8 +328,8 @@ else
     MEM_BYTES=""
 fi
 if [ -n "${{MEM_BYTES}}" ]; then
-    MEM_FLAGS="--memory=${{MEM_BYTES}} --memory-swap=${{MEM_BYTES}}"
-    echo "Container memory cap: ${{MEM_BYTES}} bytes (${{MEM_SOURCE}})"
+    MEM_FLAGS="--memory=${{MEM_BYTES}} --memory-swap=-1"
+    echo "Container memory cap: ${{MEM_BYTES}} bytes RAM + unlimited swap (${{MEM_SOURCE}})"
 else
     MEM_FLAGS=""
     echo "Container memory cap: disabled (NodeRAM and cgroup probes both empty)"
@@ -950,6 +966,27 @@ mod tests {
         assert!(script.contains("MEM_BYTES_CGROUP="));
         assert!(script.contains("/sys/fs/cgroup/memory.max"));
         assert!(script.contains("${MEM_FLAGS}"));
+        // User-policy regression pin: `--memory-swap=-1` (unlimited
+        // swap on top of the RAM cap) per explicit instruction.
+        // Defends against accidental revert to `--memory-swap=<RAM>`
+        // (which would re-introduce immediate cgroup-OOM on RAM
+        // overshoot) or to `--memory-swap=<2x RAM>` (podman's
+        // unset-flag default — same OOM-on-overshoot behaviour
+        // because the swap component is bounded). The string match
+        // is exact: `--memory-swap=-1` not `--memory-swap=$<var>`.
+        assert!(
+            script.contains("--memory-swap=-1"),
+            "wrapper must emit `--memory-swap=-1` so workers swap \
+             instead of getting cgroup-OOM-killed under RAM pressure; \
+             render did not contain it"
+        );
+        // And the RAM cap must still apply — --memory=<bytes> is
+        // load-bearing for the kernel's in-core ceiling.
+        assert!(
+            script.contains("--memory=${MEM_BYTES}"),
+            "wrapper must still emit --memory=<bytes> alongside the \
+             unlimited-swap flag — RAM cap is independent of swap cap"
+        );
         // FIFO loud-error elif (commit 179afd9).
         assert!(script.contains("disappeared unexpectedly"));
         // Image-load loud-failure marker (commit 733559c).
