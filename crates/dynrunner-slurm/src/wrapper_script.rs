@@ -495,6 +495,13 @@ CONTAINER_NAME="{container_name}"
 # dispatcher's ability to surface partial results when the job
 # is terminated mid-run rather than discarding them.
 #
+# The watchdog never issues `podman rm`. The container is
+# started with `podman run --rm`, so a clean exit (whether from
+# SIGTERM, SIGKILL, or natural workload completion) auto-removes
+# it. If a container somehow survives SIGKILL that is a
+# runtime/kernel issue worth surfacing in slurm_*.out, not
+# papering over with `rm -f`.
+#
 # Debounce: two consecutive non-running observations at 5s
 # interval (10s confirm) before triggering. slurmctld can
 # return transient state inconsistencies during RPC stalls or
@@ -567,14 +574,18 @@ if [ -n "${{SLURM_JOB_ID:-}}" ]; then
 
         # Phase 2: graceful SIGTERM. The dispatcher inside gets a
         # chance to flush in-flight state, signal peers, and exit
-        # cleanly before we force-kill.
+        # cleanly before we escalate. The container was started
+        # with `podman run --rm`, so a clean exit auto-removes
+        # the container; the watchdog never issues `podman rm`.
         grace_seconds=60
         echo "WATCHDOG: job $job_id state=$last_state; sending SIGTERM to container $cname (${{grace_seconds}}s grace before SIGKILL)" >&3 2>/dev/null || true
         podman --root "$storage" --runroot "$runroot" kill --signal TERM "$cname" 2>/dev/null
 
         # Phase 3: wait up to grace_seconds for graceful exit.
         # Poll once a second so we exit promptly when the
-        # dispatcher finishes.
+        # dispatcher finishes. `container exists` returning non-
+        # zero means `--rm` has already reaped the container,
+        # which is the only termination path we care about.
         elapsed=0
         while [ "$elapsed" -lt "$grace_seconds" ]; do
             sleep 1
@@ -583,19 +594,18 @@ if [ -n "${{SLURM_JOB_ID:-}}" ]; then
                 echo "WATCHDOG: container $cname exited gracefully after ${{elapsed}}s" >&3 2>/dev/null || true
                 exit 0
             fi
-            running=$(podman --root "$storage" --runroot "$runroot" inspect --format "{{{{.State.Running}}}}" "$cname" 2>/dev/null)
-            if [ "$running" = "false" ]; then
-                echo "WATCHDOG: container $cname stopped after ${{elapsed}}s" >&3 2>/dev/null || true
-                podman --root "$storage" --runroot "$runroot" rm -f "$cname" 2>/dev/null
-                exit 0
-            fi
         done
 
-        # Phase 4: still alive after grace — force kill.
+        # Phase 4: still alive after grace — escalate to SIGKILL.
+        # SIGKILL cannot be trapped; the kernel terminates pid 1
+        # in the container namespace and --rm reaps the container.
+        # No `podman rm`: if a container somehow survives SIGKILL
+        # that is a runtime/kernel issue worth surfacing loudly,
+        # not papering over with rm -f.
+        # (Comments here must avoid ASCII apostrophes because this
+        # whole block runs inside a bash -c single-quoted string.)
         echo "WATCHDOG: container $cname did not exit within ${{grace_seconds}}s of SIGTERM; force-killing (SIGKILL)" >&3 2>/dev/null || true
         podman --root "$storage" --runroot "$runroot" kill --signal KILL "$cname" 2>/dev/null
-        sleep 2
-        podman --root "$storage" --runroot "$runroot" rm -f "$cname" 2>/dev/null
     ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
         </dev/null >/dev/null 2>&1
     echo "Spawned podman teardown watchdog for SLURM job $SLURM_JOB_ID (container $CONTAINER_NAME), state-poll=5s, debounce=2, grace=60s"
@@ -1120,6 +1130,23 @@ mod tests {
             script.contains("state-poll=5s, debounce=2, grace=60s"),
             "spawn-confirmation echo must surface the watchdog \
              tunables; render did not contain them"
+        );
+        // The watchdog must NEVER issue `podman rm`. The
+        // container is started with `podman run --rm`, so a
+        // clean exit auto-removes; `rm -f` would be both
+        // redundant and a force-escalation that masks
+        // runtime/kernel issues. Anchor by the watchdog's
+        // bash-arg variable `"$cname"` which the wrapper's
+        // other `podman` calls (run, kill) reference too — so
+        // we are specifically pinning that the kill ladder
+        // does not append a `podman rm` step.
+        assert!(
+            !script.contains("podman --root \"$storage\" --runroot \"$runroot\" rm"),
+            "watchdog must NOT issue `podman rm` — container is \
+             started with --rm; rm -f would be force-escalation \
+             that masks runtime/kernel issues. Render contained \
+             a `podman rm` call against $storage/$runroot which \
+             must be removed."
         );
         // Memory-cap block: both probes (NodeRAM + wrapper cgroup
         // memory.max) must be present so the min() logic engages on
