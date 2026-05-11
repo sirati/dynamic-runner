@@ -194,8 +194,18 @@ def _dispatch_secondary(task, args, logger) -> None:
     distributed_config = (
         _rs.DistributedConfig(disable_peer_overlay=True) if args.disable_peer_overlay else None
     )
+    # Per-machine cores: resolve the spec against THIS host's
+    # detected CPU count, not the primary's. spawn_secondary.py
+    # forwards the verbatim spec string so a heterogeneous cluster
+    # gets each node sized to its own ground truth. --max-memory
+    # is intentionally NOT plumbed through the spawn argv (see
+    # spawn_secondary.build_subprocess_spawn doc-comment); leaving
+    # the secondary's argparse default ("-2G" = host-2G headroom)
+    # in place is the right single-host behaviour.
+    num_workers = _rs.parse_cores(args.cores)
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
+        num_workers=num_workers,
         src_network=args.src_network,
         src_tmp=args.src_tmp,
         distributed_config=distributed_config,
@@ -238,10 +248,21 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         logger.info("No binaries to process")
         return
 
-    num_cores = _rs.parse_cores(args.cores)
+    # Per-machine semantic: each secondary uses the cores/memory the
+    # user asked for ON ITS HOST. In-process mode runs all secondaries
+    # in the same process (one machine), so workers_per_secondary
+    # equals parse_cores(args.cores) directly without dividing by
+    # num_secondaries. Previously this divided cluster-wide which
+    # silently halved the per-secondary worker count whenever
+    # --jobs > 1; that conflicted with the documented spec
+    # (`--cores 2` = 2 workers per machine, regardless of --jobs).
+    # Memory keeps its cluster-wide divide because in-process mode
+    # actually shares one host's RAM across all secondaries — giving
+    # each secondary the full budget would double-count.
+    num_workers = _rs.parse_cores(args.cores)
     max_memory = _rs.parse_memory(args.max_memory)
     num_secondaries = args.jobs if args.jobs else 1
-    workers_per_secondary = num_cores // num_secondaries if num_secondaries > 0 else num_cores
+    workers_per_secondary = num_workers
     ram_per_secondary = max_memory // num_secondaries if num_secondaries > 0 else max_memory
 
     logger.info(f"Secondaries: {num_secondaries}")

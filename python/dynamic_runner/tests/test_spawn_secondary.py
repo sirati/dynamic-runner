@@ -1,0 +1,170 @@
+"""Regression pins for `spawn_secondary.build_subprocess_spawn`.
+
+The bug this guards against (2026-05-11): the subprocess argv built
+by `build_subprocess_spawn` was missing `--cores`, so every secondary
+spawned by `--multi-computer local` re-auto-detected workers from
+`std::thread::available_parallelism()` and ignored the operator's
+`--cores N` request. asm-tokenizer + asm-dataset-nix both reported
+the over-spawn symptom (32 workers per secondary on a 32-core host,
+`--cores 2` silently dropped). The fix threads `--cores` into the
+subprocess argv as a verbatim spec string, so each secondary
+resolves it locally against its own detected CPU count.
+
+unittest-based — pytest is not in the dev shell, so we stay stdlib
+to keep the test runnable from any environment.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import pathlib
+import sys
+import unittest
+from unittest.mock import MagicMock, patch
+
+
+def _setup_package_stub():
+    """Register a minimal `dynamic_runner` package stub so relative
+    imports inside the modules under test resolve, without triggering
+    the real package `__init__` (which imports the PyO3 `_native`
+    extension and would require a maturin build to load).
+    """
+    here = pathlib.Path(__file__).resolve()
+    package_root = here.parent.parent  # …/python/dynamic_runner/
+    if "dynamic_runner" not in sys.modules:
+        import types
+        pkg = types.ModuleType("dynamic_runner")
+        pkg.__path__ = [str(package_root)]
+        sys.modules["dynamic_runner"] = pkg
+    return package_root
+
+
+def _load_module_direct(name: str, relpath: str):
+    """Import a single `dynamic_runner` source file by absolute path,
+    bypassing the package `__init__`. The two modules this test
+    exercises (`deployment_spec`, `spawn_secondary`) are pure-Python
+    and import nothing from `_native`, so direct file import is
+    safe. Used so the test runs in the bare `nix develop` shell
+    without a wheel build."""
+    package_root = _setup_package_stub()
+    target = package_root / relpath
+    fullname = f"dynamic_runner.{name}"
+    if fullname in sys.modules:
+        return sys.modules[fullname]
+    spec = importlib.util.spec_from_file_location(fullname, target)
+    assert spec is not None and spec.loader is not None, f"could not spec {target}"
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fullname] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_deployment_spec = _load_module_direct("deployment_spec", "deployment_spec.py")
+_spawn_secondary = _load_module_direct("spawn_secondary", "spawn_secondary.py")
+TaskDeploymentSpec = _deployment_spec.TaskDeploymentSpec
+build_subprocess_spawn = _spawn_secondary.build_subprocess_spawn
+
+
+def _make_deployment() -> TaskDeploymentSpec:
+    return TaskDeploymentSpec(
+        secondary_module="some_consumer.entrypoint",
+        image_name="test-image",
+    )
+
+
+def _make_args(**overrides) -> argparse.Namespace:
+    """argparse.Namespace mimicking the primary's parsed CLI args."""
+    defaults = dict(
+        secondary=None,
+        secondary_id=None,
+        secondary_quic_port=None,
+        source=None,
+        cores=None,
+        raw_logs=False,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _captured_argv(args: argparse.Namespace) -> list[str]:
+    """Drive `spawn_secondary` without launching a subprocess and
+    return the argv it WOULD have launched."""
+    deployment = _make_deployment()
+    spawn = build_subprocess_spawn(deployment, args)
+    with patch("dynamic_runner.spawn_secondary.subprocess.Popen") as popen:
+        popen.return_value = MagicMock()
+        spawn("ws://primary:8080", "sec-0", 4242)
+    args_list, _kwargs = popen.call_args
+    return args_list[0]
+
+
+class TestSpawnSecondaryCoresThreadThrough(unittest.TestCase):
+    def test_cores_threaded_when_set(self) -> None:
+        """argv MUST include `--cores <spec>` when the primary args
+        carry a non-None `cores` value. Pre-fix this failed — the
+        argv builder silently dropped `--cores`."""
+        argv = _captured_argv(_make_args(cores="2"))
+        self.assertIn("--cores", argv, f"--cores missing from argv: {argv}")
+        self.assertEqual(argv[argv.index("--cores") + 1], "2")
+
+    def test_cores_threaded_offset_form_verbatim(self) -> None:
+        """Offset specs (`-N`) are forwarded as the literal string,
+        not pre-resolved. This is what makes the per-machine
+        semantic work on heterogeneous clusters — each secondary
+        resolves the offset against ITS host's detected CPU count,
+        not the primary's."""
+        argv = _captured_argv(_make_args(cores="-2"))
+        self.assertIn("--cores", argv)
+        self.assertEqual(argv[argv.index("--cores") + 1], "-2")
+
+    def test_cores_omitted_when_none(self) -> None:
+        """If `cores` is absent from args (older callers,
+        programmatic invocations), don't synthesize an empty
+        `--cores ""` flag — let the secondary's argparse default
+        apply."""
+        argv = _captured_argv(_make_args(cores=None))
+        self.assertNotIn("--cores", argv, f"--cores should be absent: {argv}")
+
+    def test_cores_zero_threaded_verbatim(self) -> None:
+        """`0` is the all-cores sentinel; it must reach the
+        secondary intact (not be silently dropped as 'falsy').
+        Without this the secondary subprocess would see no
+        `--cores` and fall back to its own argparse default, which
+        historically happened to also be all-cores — but that's a
+        different code path. Defend the explicit-zero plumbing as
+        the user-facing contract."""
+        argv = _captured_argv(_make_args(cores="0"))
+        self.assertIn("--cores", argv)
+        self.assertEqual(argv[argv.index("--cores") + 1], "0")
+
+    def test_other_flags_still_forwarded(self) -> None:
+        """Negative space: adding `--cores` didn't break the
+        existing `--src-network` / `--raw-logs` thread-through."""
+        argv = _captured_argv(_make_args(
+            source="/some/path",
+            cores="4",
+            raw_logs=True,
+        ))
+        self.assertIn("--src-network", argv)
+        self.assertEqual(argv[argv.index("--src-network") + 1], "/some/path")
+        self.assertIn("--cores", argv)
+        self.assertEqual(argv[argv.index("--cores") + 1], "4")
+        self.assertIn("--raw-logs", argv)
+
+    def test_secondary_connection_args_always_present(self) -> None:
+        """Sanity: the three secondary-connection flags are still
+        the load-bearing argv — the primary URL, secondary ID, and
+        QUIC port must always be in argv regardless of which
+        optional flags are set."""
+        argv = _captured_argv(_make_args(cores="2"))
+        self.assertIn("--secondary", argv)
+        self.assertEqual(argv[argv.index("--secondary") + 1], "ws://primary:8080")
+        self.assertIn("--secondary-id", argv)
+        self.assertEqual(argv[argv.index("--secondary-id") + 1], "sec-0")
+        self.assertIn("--secondary-quic-port", argv)
+        self.assertEqual(argv[argv.index("--secondary-quic-port") + 1], "4242")
+
+
+if __name__ == "__main__":
+    unittest.main()
