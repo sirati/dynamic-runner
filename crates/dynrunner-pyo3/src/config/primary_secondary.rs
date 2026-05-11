@@ -278,6 +278,7 @@ impl PySecondaryConfig {
             primary_link_failure_window: self
                 .distributed_config
                 .primary_link_failure_window(),
+            setup_deadline: self.distributed_config.setup_deadline(),
         }
     }
 }

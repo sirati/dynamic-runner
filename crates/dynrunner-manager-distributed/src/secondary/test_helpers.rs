@@ -140,6 +140,10 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // count-axis behaviour.
         primary_link_failure_threshold: 3,
         primary_link_failure_window: Duration::from_millis(200),
+        // Tests that drive election state don't exercise setup;
+        // 60s is the production default and well outside any test's
+        // wall-clock budget, so it never fires accidentally.
+        setup_deadline: Duration::from_secs(60),
     }
 }
 
