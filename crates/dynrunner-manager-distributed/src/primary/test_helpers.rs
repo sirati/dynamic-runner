@@ -275,6 +275,7 @@ pub(super) async fn fake_secondary_with_addrs(
             }],
             worker_count: num_workers,
             hostname: "test-host".into(),
+            is_observer: false,
         })
         .unwrap();
 

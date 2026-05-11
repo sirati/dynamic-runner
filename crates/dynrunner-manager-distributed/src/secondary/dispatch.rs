@@ -192,6 +192,33 @@ where
                 Ok(())
             }
             DistributedMessage::PromotePrimary { new_primary_id, epoch, .. } => {
+                // Task #36 defensive guard: an observer MUST NOT be
+                // promoted. If we receive a PromotePrimary naming an
+                // observer (either us, or a peer in our
+                // peer_observers set), reject loud — this should not
+                // happen if all peers honour the same lowest_alive
+                // filter, but the rejection protects against a
+                // misconfigured peer or a forgery on the wire.
+                let names_observer = (self.config.is_observer
+                    && new_primary_id == self.config.secondary_id)
+                    || self.peer_observers.contains(&new_primary_id);
+                if names_observer {
+                    tracing::error!(
+                        secondary = %self.config.secondary_id,
+                        target = %new_primary_id,
+                        epoch,
+                        self_is_observer = self.config.is_observer,
+                        target_in_peer_observers = self.peer_observers.contains(&new_primary_id),
+                        "REJECTED PromotePrimary naming an observer — observers \
+                         cannot host primary role (no workers, no dispatch \
+                         authority). Likely cause: a peer's lowest_alive \
+                         computation missed the observer filter or the \
+                         PeerInfo broadcast carrying is_observer was lost. \
+                         Ignoring this PromotePrimary; the cluster's election \
+                         should retry with the observer filtered out."
+                    );
+                    return Ok(());
+                }
                 // Apply to the replicated ledger first: last-writer-
                 // wins on (epoch, primary_id) makes a stale lower-
                 // epoch broadcast a no-op against an already-installed

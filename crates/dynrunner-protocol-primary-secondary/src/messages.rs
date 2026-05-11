@@ -75,6 +75,21 @@ pub struct PeerConnectionInfo {
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub port: u16,
+    /// Observer-mode flag (task #36). When true, this peer cannot
+    /// become primary and has no workers — election code on
+    /// receiving secondaries MUST exclude it from `lowest_alive`
+    /// candidate selection. Without this filter, an observer with
+    /// a lex-low ID would be deferred-to by other peers, then
+    /// refuse self-promotion (per `secondary::election`'s observer
+    /// guard added in #35), stalling the cluster.
+    ///
+    /// `#[serde(default)]` keeps pre-#36 wire-senders compatible:
+    /// pre-#36 PeerInfo broadcasts omit the field, deserialize
+    /// defaults to `false`, regular secondaries continue to
+    /// participate as election candidates without operator-visible
+    /// change.
+    #[serde(default)]
+    pub is_observer: bool,
 }
 
 /// Binary info as serialized in distributed messages.
@@ -267,6 +282,14 @@ pub enum DistributedMessage<I> {
         resources: Vec<ResourceAmount>,
         worker_count: u32,
         hostname: String,
+        /// Observer-mode flag (task #36). The primary records this
+        /// on the per-secondary connection state and propagates it
+        /// via PeerInfo's `PeerConnectionInfo.is_observer` so other
+        /// secondaries can filter the observer from `lowest_alive`
+        /// candidate selection. `#[serde(default)]` keeps pre-#36
+        /// senders wire-compatible.
+        #[serde(default)]
+        is_observer: bool,
     },
     Entropy {
         sender_id: String,
