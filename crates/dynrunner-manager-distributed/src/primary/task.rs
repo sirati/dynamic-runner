@@ -142,14 +142,24 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                         };
                         self.transport.send_to(&sec_id, assignment_msg).await?;
 
+                        // Operator-facing INFO: which secondary/
+                        // worker just took the task. Per-task
+                        // identity (task_id / phase / type) →
+                        // DEBUG sibling.
                         tracing::info!(
+                            secondary = %sec_id,
+                            worker_id,
+                            task_hash = %task_hash,
+                            "task assigned"
+                        );
+                        tracing::debug!(
                             secondary = %sec_id,
                             worker_id,
                             task_id = ?binary.task_id,
                             phase = %binary.phase_id,
                             task_type = %binary.type_id,
                             task_hash = %task_hash,
-                            "task assigned"
+                            "task assigned: identity"
                         );
                         assigned = true;
                     }
@@ -237,19 +247,31 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
+            // Operator-facing INFO: enough to grep "did task X
+            // complete and how are aggregate counts moving?". The
+            // per-task identity fields (task_id / phase / task_type)
+            // are diagnostic noise on the routine path — they go to
+            // the DEBUG sibling below so debugging keeps the info
+            // but the operator log stays terse.
             let outcome = self.outcome_summary();
             tracing::info!(
                 secondary = %secondary_id,
                 worker_id,
-                task_id = ?completed_meta.as_ref().and_then(|(_, _, t)| t.as_deref()),
-                phase = ?completed_meta.as_ref().map(|(p, _, _)| p.to_string()),
-                task_type = ?completed_meta.as_ref().map(|(_, t, _)| t.to_string()),
                 task_hash = %task_hash,
                 succeeded = outcome.succeeded,
                 fail_retry = outcome.fail_retry,
                 fail_oom = outcome.fail_oom,
                 fail_final = outcome.fail_final,
                 "task complete"
+            );
+            tracing::debug!(
+                secondary = %secondary_id,
+                worker_id,
+                task_id = ?completed_meta.as_ref().and_then(|(_, _, t)| t.as_deref()),
+                phase = ?completed_meta.as_ref().map(|(p, _, _)| p.to_string()),
+                task_type = ?completed_meta.as_ref().map(|(_, t, _)| t.to_string()),
+                task_hash = %task_hash,
+                "task complete: identity"
             );
 
             if let Some((phase, type_id, task_id)) = completed_meta {
@@ -438,16 +460,28 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             ])
             .await;
 
+            // Operator-facing WARN: per-class for retry/policy
+            // decisions (error_type discriminates retry/oom/final);
+            // the error message itself is essential for debugging
+            // and stays on WARN. Per-task identity (task_id / phase
+            // / task_type) is diagnostic noise on this path — it
+            // moves to the DEBUG sibling below.
             tracing::warn!(
+                secondary = %secondary_id,
+                worker_id,
+                task_hash = %task_hash,
+                error_type = ?error_type,
+                error = %error_message,
+                "task failed"
+            );
+            tracing::debug!(
                 secondary = %secondary_id,
                 worker_id,
                 task_id = ?recovered_binary.as_ref().and_then(|b| b.task_id.as_deref()),
                 phase = ?recovered_binary.as_ref().map(|b| b.phase_id.to_string()),
                 task_type = ?recovered_binary.as_ref().map(|b| b.type_id.to_string()),
                 task_hash = %task_hash,
-                error_type = ?error_type,
-                error = %error_message,
-                "task failed"
+                "task failed: identity"
             );
 
             if let Some(binary) = recovered_binary {
