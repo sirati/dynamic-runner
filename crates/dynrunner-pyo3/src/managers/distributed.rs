@@ -171,6 +171,7 @@ impl PyDistributedManager {
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
+        let dist_setup_deadline = self.distributed_config.setup_deadline();
         let worker_spec = self.worker_spec.clone();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
@@ -297,6 +298,7 @@ impl PyDistributedManager {
                                 dist_primary_link_failure_threshold,
                             primary_link_failure_window:
                                 dist_primary_link_failure_window,
+                            setup_deadline: dist_setup_deadline,
                         };
 
                         let estimator = sec_estimator;

@@ -65,6 +65,32 @@ pub struct SecondaryConfig {
     /// failover latency on slow-keepalive configurations where 5
     /// probes would exceed the SLURM time budget.
     pub primary_link_failure_window: Duration,
+
+    /// Maximum wall-clock the secondary will spend in setup phases
+    /// (send_welcome + send_cert_exchange + wait_for_setup) before
+    /// concluding the cluster is dead and exiting cold. Default 60s.
+    ///
+    /// Concern: a late-arriving secondary scheduled AFTER the run
+    /// has logically completed (primary already exited) cannot reach
+    /// the now-dead primary URL. Without this deadline the transport
+    /// layer's internal connection retries hold the boot path
+    /// indefinitely (asm-dataset-nix T7 attempt 2 observed
+    /// ~345 retries × 1s = ~6min before SLURM container teardown
+    /// reaped the secondary). 60s gives a slow primary handshake
+    /// enough headroom on healthy clusters; well under SLURM's
+    /// per-job minimum so a dead-cluster boot reaps fast.
+    ///
+    /// `R1` (mid-run primary disconnect detection) deliberately
+    /// lives in the processing loop, not the setup loop — the
+    /// setup-phase `wait_for_setup` is documented as cancellation-
+    /// unsafe under tokio::select! racing of `recv()` (see
+    /// `setup.rs:79-96`), so we apply the deadline at the
+    /// orchestration boundary instead of nested inside the recv
+    /// loop. On timeout the recv future is cancelled at the outer
+    /// boundary, no subsequent iteration touches the (possibly
+    /// partial) transport state, so the cancellation hazard the
+    /// setup-loop comment warns about does not arise.
+    pub setup_deadline: Duration,
 }
 
 impl Default for SecondaryConfig {
@@ -82,6 +108,7 @@ impl Default for SecondaryConfig {
             retry_max_passes: 1,
             primary_link_failure_threshold: primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: primary_link::DEFAULT_FAILURE_WINDOW,
+            setup_deadline: Duration::from_secs(60),
         }
     }
 }
@@ -552,17 +579,73 @@ where
             "secondary starting"
         );
 
-        // Initialize workers
+        // Initialize workers (local pool — no network, no deadline).
         self.initialize_workers(factory).await?;
 
-        // Phase 1: Send welcome
-        self.send_welcome().await?;
-
-        // Phase 2: Send cert exchange
-        self.send_cert_exchange().await?;
-
-        // Phase 3+4: Wait for peer list, initial assignment, and transfer complete
-        self.wait_for_setup().await?;
+        // Network-touching setup (Phases 1-4) is bounded by
+        // `setup_deadline`. See SecondaryConfig::setup_deadline for
+        // the rationale. The deadline is applied at the orchestration
+        // boundary, NOT inside `wait_for_setup`, because the recv
+        // loop is documented as cancellation-unsafe under inner
+        // select! racing (see setup.rs:79-96). Cancelling the whole
+        // setup future on timeout is safe because we never re-enter
+        // any of these phases — we go straight to cleanup-and-exit.
+        let deadline = self.config.setup_deadline;
+        let setup = async {
+            self.send_welcome().await?;
+            self.send_cert_exchange().await?;
+            self.wait_for_setup().await?;
+            Ok::<(), String>(())
+        };
+        match tokio::time::timeout(deadline, setup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                self.stop_all_workers().await;
+                return Err(e);
+            }
+            Err(_elapsed) => {
+                let peers = self.peer_transport.peer_count();
+                self.stop_all_workers().await;
+                if peers == 0 {
+                    // The asm-dataset-nix T7 attempt 2 scenario:
+                    // primary URL unreachable AND no peers have
+                    // dialled in. The run is almost certainly
+                    // already complete and SLURM is just booting
+                    // a queued secondary against the graveyard.
+                    // Exit fast with a clear log.
+                    tracing::warn!(
+                        secondary = %self.config.secondary_id,
+                        deadline_secs = deadline.as_secs(),
+                        "setup deadline elapsed with no primary and no peers — \
+                         run appears already complete, exiting cold"
+                    );
+                    return Err(format!(
+                        "setup deadline ({}s) elapsed: no primary, no peers \
+                         (cluster appears dead, run likely complete)",
+                        deadline.as_secs()
+                    ));
+                } else {
+                    // Peers reachable but setup didn't complete. This
+                    // is a distinct scenario from cold-start (primary
+                    // unresponsive but mesh is alive — could be a
+                    // partial cluster bring-up race). Surface
+                    // separately so operators can distinguish.
+                    tracing::error!(
+                        secondary = %self.config.secondary_id,
+                        deadline_secs = deadline.as_secs(),
+                        peer_count = peers,
+                        "setup deadline elapsed despite peers reachable — \
+                         primary unresponsive, exiting"
+                    );
+                    return Err(format!(
+                        "setup deadline ({}s) elapsed: primary unresponsive \
+                         despite {} peer(s) reachable",
+                        deadline.as_secs(),
+                        peers
+                    ));
+                }
+            }
+        }
 
         // Phase 5: Process tasks
         self.process_tasks(factory).await?;

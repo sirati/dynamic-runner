@@ -61,6 +61,15 @@ pub(crate) struct DistributedConfig {
     /// configurations where 5 probes would exceed the SLURM time
     /// budget.
     primary_link_failure_window_secs: f64,
+    /// Maximum wall-clock the secondary will spend in setup phases
+    /// (welcome + cert exchange + wait_for_setup) before concluding
+    /// the cluster is dead and exiting cold. Defaults to 60s.
+    /// Bounds the asm-dataset-nix T7 late-arrival scenario: when a
+    /// SLURM-dispatched secondary boots AFTER the run has logically
+    /// completed and the primary is gone, the transport's internal
+    /// connection retries hang for ~6min before container teardown
+    /// reaps the secondary; this deadline reaps it in 60s instead.
+    setup_deadline_secs: f64,
 }
 
 impl Default for DistributedConfig {
@@ -77,6 +86,7 @@ impl Default for DistributedConfig {
             disable_peer_overlay: false,
             primary_link_failure_threshold: 5,
             primary_link_failure_window_secs: 30.0,
+            setup_deadline_secs: 60.0,
         }
     }
 }
@@ -96,6 +106,7 @@ impl DistributedConfig {
         disable_peer_overlay = None,
         primary_link_failure_threshold = None,
         primary_link_failure_window_secs = None,
+        setup_deadline_secs = None,
     ))]
     fn new(
         connect_timeout_secs: Option<f64>,
@@ -109,6 +120,7 @@ impl DistributedConfig {
         disable_peer_overlay: Option<bool>,
         primary_link_failure_threshold: Option<u32>,
         primary_link_failure_window_secs: Option<f64>,
+        setup_deadline_secs: Option<f64>,
     ) -> Self {
         let d = DistributedConfig::default();
         Self {
@@ -126,6 +138,7 @@ impl DistributedConfig {
                 .unwrap_or(d.primary_link_failure_threshold),
             primary_link_failure_window_secs: primary_link_failure_window_secs
                 .unwrap_or(d.primary_link_failure_window_secs),
+            setup_deadline_secs: setup_deadline_secs.unwrap_or(d.setup_deadline_secs),
         }
     }
 }
@@ -163,6 +176,9 @@ impl DistributedConfig {
     }
     pub(crate) fn primary_link_failure_window(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.primary_link_failure_window_secs)
+    }
+    pub(crate) fn setup_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.setup_deadline_secs)
     }
 }
 
