@@ -69,6 +69,22 @@ pub struct SshGateway {
     /// Whether GatewayPorts is enabled on the remote SSH server.
     /// `None` = unknown, `Some(true)` = enabled, `Some(false)` = disabled.
     pub gateway_ports_enabled: Option<bool>,
+    /// True when the master was ADOPTED from the
+    /// `DYNRUNNER_SSH_CONTROL_PATH` escape hatch rather than spawned
+    /// by us. Owned vs adopted determines disconnect() semantics:
+    ///   - owned: `ssh -O exit` + SIGTERM/SIGKILL daemon ladder
+    ///     (full teardown of OUR master)
+    ///   - adopted: `ssh -O cancel -R` each registered forward
+    ///     (undo our additions, leave the master alive for the
+    ///     upstream driver that spawned it)
+    /// Pre-fix disconnect() unconditionally ran `ssh -O exit`,
+    /// killing the user's pre-spawned master mid-dispatch and
+    /// stranding the reverse-forwards along with it. asm-tokenizer
+    /// Tier-2 dispatch at 394be31 hit this: SLURM jobs submitted
+    /// successfully, then every secondary's connection-back failed
+    /// with `connection refused` because the gateway no longer
+    /// listened on the forwarded port.
+    adopted: bool,
 }
 
 impl SshGateway {
@@ -83,6 +99,7 @@ impl SshGateway {
             remote_home: None,
             forwarded_ports: Vec::new(),
             gateway_ports_enabled: None,
+            adopted: false,
         }
     }
 
@@ -353,6 +370,7 @@ impl Gateway for SshGateway {
                 );
                 self.control_path = Some(external_cp.clone());
                 self.connected = true;
+                self.adopted = true;
 
                 // Add any registered reverse forwards dynamically via
                 // `ssh -O forward -R …`. The external master spawned
@@ -556,10 +574,81 @@ impl Gateway for SshGateway {
         // condition (either flag-set or daemon-gone, whichever wins).
         self.watcher_cancel.store(true, Ordering::SeqCst);
 
-        // Politely ask the master to exit via `ssh -O exit` first,
-        // which cleans up the control socket and reverse forwards in
-        // an orderly fashion. The control-socket request lands at the
-        // daemon (the launcher is long gone by now).
+        if self.adopted {
+            // Adopted master: do NOT run `ssh -O exit`, that would
+            // kill the upstream driver's master. Instead, undo the
+            // forwards WE added during connect() so the master is
+            // returned to the upstream driver in the same shape it
+            // was passed to us. `ssh -O cancel -R` removes a
+            // reverse-forward via the control socket; no other
+            // teardown is needed (no daemon_pid for adopted, no
+            // watcher_thread either).
+            //
+            // Cancel-failures are tolerated (warn + continue): the
+            // upstream master's lifetime is not the framework's
+            // concern, and a left-over forward at most consumes a
+            // port on the gateway until the upstream driver exits.
+            // We don't return an error from disconnect() because
+            // callers treat disconnect() errors as fatal cleanup
+            // failures, and that's not what an adopted-cancel
+            // mishap is.
+            let cp = self.control_path.clone();
+            for (local_port, remote_port) in self.forwarded_ports.clone() {
+                let mut cmd = Command::new("ssh");
+                for arg in self.base_ssh_args() {
+                    cmd.arg(&arg);
+                }
+                if let Some(ref cp) = cp {
+                    cmd.args(["-o", &format!("ControlPath={cp}")]);
+                }
+                cmd.args([
+                    "-O",
+                    "cancel",
+                    "-R",
+                    &format!("0.0.0.0:{remote_port}:localhost:{local_port}"),
+                ]);
+                cmd.arg(self.ssh_target());
+                match cmd.output().await {
+                    Ok(output) if output.status.success() => {
+                        tracing::info!(
+                            local_port,
+                            remote_port,
+                            "cancelled reverse forward on adopted master"
+                        );
+                    }
+                    Ok(output) => {
+                        tracing::warn!(
+                            local_port,
+                            remote_port,
+                            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                            "ssh -O cancel returned non-zero on adopted master; \
+                             upstream driver may need to clean up the forward"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            local_port,
+                            remote_port,
+                            error = %e,
+                            "ssh -O cancel failed to launch on adopted master"
+                        );
+                    }
+                }
+            }
+
+            // Mark disconnected; the rest of disconnect() (daemon
+            // kill ladder, watcher join) is a no-op for adopted
+            // because daemon_pid is None and watcher_thread is None,
+            // but skip explicitly so a future code change to either
+            // path doesn't accidentally engage on adopted.
+            self.connected = false;
+            self.control_path = None;
+            self.forwarded_ports.clear();
+            return Ok(());
+        }
+
+        // Owned master path (unchanged): polite `ssh -O exit` first,
+        // SIGTERM/SIGKILL ladder fallback.
         let mut cmd = Command::new("ssh");
         for arg in self.base_ssh_args() {
             cmd.arg(&arg);

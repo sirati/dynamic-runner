@@ -210,20 +210,45 @@ async fn walk_with<F: Filesystem + Gateway>(
 ///   - `None` or `"local"` — `LocalGateway`
 ///   - `"ssh://[user@]host[:port]"` — `SshGateway`
 ///
+/// `ssh_config_path` and `ssh_identity_file` are SSH-side overrides
+/// passed through to `SshConfig` when the URL routes to the SSH
+/// backend. Without them, `parse_gateway_url` leaves both at `None`
+/// and the gateway falls back to the user's `~/.ssh/config` (or
+/// system defaults) — which on slurm-test-env doesn't exist and
+/// the master handshake fails. This is the same plumbing pattern as
+/// `_dispatch_slurm` for the main pipeline; `find_items` was missed
+/// in that refactor (asm-tokenizer Tier-2 report at 394be31 — task
+/// #39). Both kwargs are ignored on `local` mode (no SshConfig to
+/// write to).
+///
 /// `relative_path` in each returned TaskInfo is relative to `root`.
 #[pyfunction]
-#[pyo3(signature = (task_definition, root, gateway_url=None))]
+#[pyo3(signature = (task_definition, root, gateway_url=None, ssh_config_path=None, ssh_identity_file=None))]
 pub(crate) fn find_items<'py>(
     py: Python<'py>,
     task_definition: &Bound<'py, PyAny>,
     root: &str,
     gateway_url: Option<&str>,
+    ssh_config_path: Option<&str>,
+    ssh_identity_file: Option<&str>,
 ) -> PyResult<Bound<'py, PyList>> {
     let visit_method = task_definition.getattr("visit")?.unbind();
 
     let gateway_config = match gateway_url {
         None => GatewayConfig::Local,
-        Some(url) => parse_gateway_url(url).map_err(pyo3::exceptions::PyValueError::new_err)?,
+        Some(url) => {
+            let mut cfg = parse_gateway_url(url)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?;
+            if let GatewayConfig::Ssh(ref mut ssh_cfg) = cfg {
+                if let Some(p) = ssh_config_path {
+                    ssh_cfg.config_file = Some(p.to_owned());
+                }
+                if let Some(p) = ssh_identity_file {
+                    ssh_cfg.identity_file = Some(p.to_owned());
+                }
+            }
+            cfg
+        }
     };
 
     let root_owned = root.to_owned();
