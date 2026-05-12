@@ -90,7 +90,16 @@ in
       SelectTypeParameters=CR_Core_Memory
       MpiDefault=none
       SlurmctldDebug=info
-      SlurmdDebug=info
+      # SlurmdDebug=debug2 was bumped from info on 2026-05-12 to give
+      # consumer diagnostic agents visibility into proctrack/cgroup's
+      # step-kill calls. asm-dataset-nix has a reproducible bilateral
+      # SIGTERM landing at ~T+39s into ds-test T3 runs that nothing in
+      # slurmd's info-level journal explains; debug2 logs slurmstepd's
+      # per-PID kill iteration so we can identify whether the kill
+      # originates from slurmstepd at all and, if so, what triggered it.
+      # Verbose but cheap on a test harness; revert to info once the
+      # diagnostic phase is over.
+      SlurmdDebug=debug2
     '';
   };
 
