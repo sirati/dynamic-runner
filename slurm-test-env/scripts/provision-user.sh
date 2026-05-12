@@ -237,6 +237,24 @@ for c in "${all_nodes[@]}"; do
     printf '%s:%s:%s\n' '${username}' '${SUBUID_BASE}' '${SUBUID_COUNT}' >> /etc/subuid
     printf '%s:%s:%s\n' '${username}' '${SUBUID_BASE}' '${SUBUID_COUNT}' >> /etc/subgid
   "
+  # Enable systemd-logind linger so the cluster user's user@.service
+  # survives ssh logout. Without this, every ssh-submit-then-disconnect
+  # pattern (sbatch / scp / scancel via ssh) triggers a 30s-delayed
+  # `systemctl --user stop` of the user manager, which cascades SIGTERM
+  # through every transient `libpod-<id>.scope` the user's rootless
+  # podman registered — killing any running nested container mid-job.
+  #
+  # Diagnosed end-to-end on 2026-05-12 via conmon strace: `systemd
+  # --user` (PID 35004, UID 10000) sent SIGTERM+SIGCONT to the
+  # secondary container's conmon ~30s into asm-dataset-nix's T3
+  # runs. Mechanism is standard logind behavior — real SLURM clusters
+  # enable-linger for batch users for exactly this reason; the
+  # slurm-test-env harness should do the same.
+  #
+  # `loginctl` writes /var/lib/systemd/linger/<user>, which is on the
+  # ephemeral container filesystem, so re-running provision-user on
+  # each cluster cycle is correct (no persistent state to clean up).
+  pexec "$c" loginctl enable-linger "$username"
 done
 
 # --- Materialize home + marker + authorized_keys (gateway only — /home is shared)
