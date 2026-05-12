@@ -2,10 +2,11 @@
 //!
 //! Exposes `FolderProxy` and `FileProxy` pyclasses (the per-entry handles
 //! visited Python code mutates via `enter()` / `mark()`) and the
-//! [`find_items`] pyfunction that drives a [`Filesystem`] walk through a
+//! [`find_items`] pyfunction that drives a local-filesystem walk through a
 //! Python `task_definition.visit(...)` method, returning a populated list
 //! of [`PyTaskInfo`].
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use pyo3::prelude::*;
@@ -13,9 +14,6 @@ use pyo3::types::PyList;
 
 use dynrunner_core::{PhaseId, RunnerIdentifier, TaskInfo, TypeId};
 use dynrunner_discovery::{FileInfo, FolderInfo, VisitOutcome, Visitor, WalkError, walk};
-use dynrunner_gateway::{
-    Filesystem, Gateway, GatewayConfig, LocalGateway, SshGateway, parse_gateway_url,
-};
 
 use crate::pytypes::{PyTaskInfo, identifier_from_pyobj};
 
@@ -186,97 +184,40 @@ fn pytaskinfo_from_mark(
     Ok(PyTaskInfo::from(&task))
 }
 
-/// Run the walker against a backend chosen by `gateway_config`. The
-/// gateway is connected for the duration of the walk and disconnected
-/// afterwards on either success or failure.
-async fn walk_with<F: Filesystem + Gateway>(
-    mut gw: F,
-    root: &str,
-    bridge: &mut PyVisitorBridge,
-) -> Result<Vec<dynrunner_discovery::Marked<Py<PyAny>>>, WalkError<PyErr>> {
-    gw.connect()
-        .await
-        .map_err(|e| WalkError::Fs(dynrunner_gateway::FsError::Other(format!("{e}"))))?;
-    let result = walk(&gw, root, bridge).await;
-    let _ = gw.disconnect().await;
-    result
-}
-
-/// Drive a Rust filesystem walk through the visit() method on
+/// Drive a Rust local-filesystem walk through the visit() method on
 /// `task_definition`, returning a list of populated `PyTaskInfo`s.
 ///
-/// `root` is interpreted relative to the chosen backend. The backend is
-/// selected by `gateway_url`:
-///   - `None` or `"local"` — `LocalGateway`
-///   - `"ssh://[user@]host[:port]"` — `SshGateway`
-///
-/// `ssh_config_path` and `ssh_identity_file` are SSH-side overrides
-/// passed through to `SshConfig` when the URL routes to the SSH
-/// backend. Without them, `parse_gateway_url` leaves both at `None`
-/// and the gateway falls back to the user's `~/.ssh/config` (or
-/// system defaults) — which on slurm-test-env doesn't exist and
-/// the master handshake fails. This is the same plumbing pattern as
-/// `_dispatch_slurm` for the main pipeline; `find_items` was missed
-/// in that refactor (asm-tokenizer Tier-2 report at 394be31 — task
-/// #39). Both kwargs are ignored on `local` mode (no SshConfig to
-/// write to).
+/// `root` is interpreted on the local filesystem of the process running
+/// this call. In `--source-already-staged` mode the framework arranges
+/// for that process to be the cluster secondary that has the staged
+/// path bind-mounted — no submitter-side SSH walk needed.
 ///
 /// `relative_path` in each returned TaskInfo is relative to `root`.
 #[pyfunction]
-#[pyo3(signature = (task_definition, root, gateway_url=None, ssh_config_path=None, ssh_identity_file=None))]
+#[pyo3(signature = (task_definition, root))]
 pub(crate) fn find_items<'py>(
     py: Python<'py>,
     task_definition: &Bound<'py, PyAny>,
-    root: &str,
-    gateway_url: Option<&str>,
-    ssh_config_path: Option<&str>,
-    ssh_identity_file: Option<&str>,
+    root: PathBuf,
 ) -> PyResult<Bound<'py, PyList>> {
     let visit_method = task_definition.getattr("visit")?.unbind();
 
-    let gateway_config = match gateway_url {
-        None => GatewayConfig::Local,
-        Some(url) => {
-            let mut cfg = parse_gateway_url(url)
-                .map_err(pyo3::exceptions::PyValueError::new_err)?;
-            if let GatewayConfig::Ssh(ref mut ssh_cfg) = cfg {
-                if let Some(p) = ssh_config_path {
-                    ssh_cfg.config_file = Some(p.to_owned());
-                }
-                if let Some(p) = ssh_identity_file {
-                    ssh_cfg.identity_file = Some(p.to_owned());
-                }
-            }
-            cfg
-        }
-    };
-
-    let root_owned = root.to_owned();
     let marked = py.detach(|| -> Result<_, WalkError<PyErr>> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| {
-                WalkError::Fs(dynrunner_gateway::FsError::Other(format!(
-                    "tokio runtime: {e}"
-                )))
+                WalkError::Io(std::io::Error::other(format!("tokio runtime: {e}")))
             })?;
         rt.block_on(async {
             let mut bridge = PyVisitorBridge { visit_method };
-            match gateway_config {
-                GatewayConfig::Local => {
-                    walk_with(LocalGateway::new(), &root_owned, &mut bridge).await
-                }
-                GatewayConfig::Ssh(cfg) => {
-                    walk_with(SshGateway::new(cfg), &root_owned, &mut bridge).await
-                }
-            }
+            walk(&root, &mut bridge).await
         })
     })
     .map_err(|e| match e {
         WalkError::Visitor(py_err) => py_err,
-        WalkError::Fs(fs_err) => {
-            pyo3::exceptions::PyOSError::new_err(format!("filesystem: {fs_err}"))
+        WalkError::Io(io_err) => {
+            pyo3::exceptions::PyOSError::new_err(format!("filesystem: {io_err}"))
         }
         WalkError::IndexOutOfBounds {
             kind,

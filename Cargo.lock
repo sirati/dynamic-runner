@@ -252,7 +252,7 @@ dependencies = [
 name = "dynrunner-discovery"
 version = "0.4.0"
 dependencies = [
- "dynrunner-gateway",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
