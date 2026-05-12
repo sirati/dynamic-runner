@@ -58,34 +58,57 @@ where
                     task_hash,
                     "peer task complete"
                 );
-                // When self holds primary authority post-promotion,
-                // forward the observed peer completion back to the
-                // demoted local primary. The demoted primary's
-                // `handle_task_complete` is the only site that
-                // originates `ClusterMutation::TaskCompleted` (and
-                // grows its own `completed_tasks` set) for tasks
-                // outside its own loopback path. Without this
-                // forward the demoted primary's per-task accounting
-                // is missing every cross-secondary completion the
-                // promoted primary observed via the peer mesh,
-                // surfacing as inflated `stranded` counts on a
-                // genuinely clean run (`RunError::ClusterCollapsed`
-                // at the boundary). Loopback failures are benign:
-                // post-demotion the local primary is allowed to
-                // exit before this fanout completes; in that case
-                // the run is already terminating cleanly via the
-                // RunComplete signal path.
-                if self.is_primary {
-                    let forward = DistributedMessage::TaskComplete {
-                        sender_id: self.config.secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        secondary_id,
-                        worker_id,
-                        task_hash,
-                        result_data,
-                    };
-                    let _ = self.primary_transport.send(forward).await;
-                }
+                // Forward the observed peer completion to the
+                // current primary, regardless of whether self
+                // holds primary authority. Two distinct cases
+                // converge here:
+                //
+                //   1. Post-promotion (self.is_primary == true):
+                //      forward back to the demoted local primary
+                //      so its per-task accounting catches cross-
+                //      secondary completions observed via the
+                //      peer mesh — pre-Phase-B this missed every
+                //      such event and surfaced as inflated
+                //      `stranded` counts. (Existing behaviour;
+                //      preserved via the same forward.)
+                //
+                //   2. Live-primary case (self.is_primary == false,
+                //      N>1 secondaries with active dispatcher):
+                //      forward to the dispatcher so its
+                //      `completed_tasks` accumulator has N-1
+                //      redundant paths to learn about each
+                //      completion. asm-tokenizer's persistent
+                //      "secondary success count > primary
+                //      success count by 17-37 events" wire-loss
+                //      symptom (#50) is this exact failure mode:
+                //      the direct originator→primary TaskComplete
+                //      sometimes drops, and pre-fix there was no
+                //      alternate path to the live primary
+                //      because it isn't in the peer mesh.
+                //      Post-fix every peer that observes the
+                //      broadcast also forwards via primary_link.
+                //      Primary's handle_task_complete is dedup-
+                //      gated on `completed_tasks.contains(hash)`,
+                //      and `apply_and_broadcast_cluster_mutations`
+                //      only re-broadcasts mutations the CRDT
+                //      actually changed state for (NoOp on
+                //      dupes), so the N-fold fan-in bounds at
+                //      1 broadcast per unique event regardless
+                //      of how many peer-forwards converge.
+                //
+                // Cross-link failures swallowed: a dropped
+                // forward is exactly the case the redundancy is
+                // meant to survive — peers other than this one
+                // cover it.
+                let forward = DistributedMessage::TaskComplete {
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    secondary_id,
+                    worker_id,
+                    task_hash,
+                    result_data,
+                };
+                let _ = self.send_to_current_primary(forward).await;
             }
             DistributedMessage::TaskFailed {
                 secondary_id,
@@ -164,27 +187,47 @@ where
                         error_type = ?error_type,
                         "peer task failed"
                     );
-                    // Mirror the TaskComplete arm: when self holds
-                    // primary authority post-promotion, forward the
-                    // terminal failure to the demoted local primary
-                    // so its `handle_task_failed` site grows
-                    // `failed_tasks` and broadcasts
-                    // `ClusterMutation::TaskFailed`. Backpressure-
-                    // rejection failures bypass this branch entirely
-                    // (the task never ran; nothing to record on the
-                    // ledger).
-                    if self.is_primary {
-                        let forward = DistributedMessage::TaskFailed {
-                            sender_id: self.config.secondary_id.clone(),
-                            timestamp: timestamp_now(),
-                            secondary_id,
-                            worker_id,
-                            task_hash,
-                            error_type,
-                            error_message,
-                        };
-                        let _ = self.primary_transport.send(forward).await;
-                    }
+                    // Mirror the TaskComplete-arm forward (#50
+                    // peer-forwarding redundancy): forward the
+                    // observed peer-TaskFailed to the current
+                    // primary regardless of whether self holds
+                    // primary authority. Two cases converge:
+                    //
+                    //   1. Post-promotion (self.is_primary): forward
+                    //      to the demoted local primary so its
+                    //      `failed_tasks` grows and the
+                    //      ClusterMutation::TaskFailed broadcast
+                    //      fires. (Existing behaviour.)
+                    //
+                    //   2. Live-primary case (self.is_primary
+                    //      false): forward to the dispatcher so
+                    //      its accounting has N-1 redundant paths
+                    //      for terminal failures. Pre-fix, a
+                    //      dropped originator→primary TaskFailed
+                    //      was unrecoverable on the live-primary
+                    //      path (primary isn't in the peer mesh).
+                    //      Primary's handle_task_failed is dedup-
+                    //      gated on `failed_tasks.contains_key`
+                    //      || `completed_tasks.contains`, and
+                    //      apply_and_broadcast only broadcasts
+                    //      Applied mutations, so the N-fold
+                    //      fan-in bounds at 1 broadcast per
+                    //      unique event.
+                    //
+                    // Backpressure-rejection failures bypass this
+                    // branch entirely (they're handled by the
+                    // `is_backpressure` arm above; nothing to
+                    // record on the ledger).
+                    let forward = DistributedMessage::TaskFailed {
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        secondary_id,
+                        worker_id,
+                        task_hash,
+                        error_type,
+                        error_message,
+                    };
+                    let _ = self.send_to_current_primary(forward).await;
                 }
             }
             DistributedMessage::TimeoutDetected {
