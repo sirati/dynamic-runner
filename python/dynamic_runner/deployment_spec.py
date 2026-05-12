@@ -78,16 +78,45 @@ class TaskDeploymentSpec:
     # mount-conflation bug this field exists to fix.
     dynrunner_network_dir: str | None = None
 
-    # Additional `(local_port, gateway_port)` pairs to register on
-    # the framework's connected SSH gateway, on top of the
-    # primary's QUIC port (which the framework forwards
-    # unconditionally). Each entry becomes another
-    # `ssh -R 0.0.0.0:gateway_port:localhost:local_port` flag on
-    # the same ControlMaster, so a service the consumer runs
-    # locally on `localhost:local_port` is reachable from compute
-    # nodes at `<gateway-host>:gateway_port` without a parallel
-    # SSH connection. Use cases: peer-to-peer binary-cache
-    # federation, debug-side ssh-into-container endpoints, etc.
+    # Additional `(local_port, gateway_port)` pairs the framework
+    # forwards so a service the consumer runs locally on the
+    # submitter at `localhost:local_port` is reachable from every
+    # SLURM secondary at `localhost:gateway_port`. Use cases:
+    # peer-to-peer binary-cache federation (harmonia), debug-side
+    # ssh-into-container endpoints, etc.
+    #
+    # Topology contract (ProxyJump-into-secondaries, the only
+    # SLURM auto-default since dynamic_runner commit 244ade5): each
+    # entry becomes a `-R gateway_port:localhost:local_port` flag
+    # on the per-secondary `ssh -J gateway secondary` session that
+    # the framework opens to bridge primary → secondary. The
+    # forward terminates on the secondary's loopback (sshd's
+    # default `-R` bind address). Inside the SLURM container —
+    # which runs `--network host` — `localhost:gateway_port`
+    # therefore reaches `submitter:localhost:local_port` directly.
+    #
+    # Consumers MUST advertise the service URL as
+    # `<scheme>://localhost:<gateway_port>` (not
+    # `<scheme>://<gateway_host>:<gateway_port>`). The gateway
+    # host's external interface does NOT receive a public
+    # `-R 0.0.0.0:<gateway_port>` bind in this topology — the
+    # gateway is only an SSH ProxyJump hop, not a data-plane
+    # endpoint. Using the gateway hostname would fail at
+    # GatewayPorts=no sshds (e.g. LMU `remote.cip.ifi.lmu.de`,
+    # which silently downgrades `-R *:port` to a 127.0.0.1 bind)
+    # AND at segmented-network clusters where the gateway's
+    # external IP is not routable from compute nodes.
+    #
+    # Gateway-direct topology fallback (legacy, currently
+    # unreachable for SLURM but preserved for non-SLURM dispatch
+    # callers): if `use_reverse_connection=False` is ever wired
+    # back in, the same entries are registered on the
+    # submitter→gateway ControlMaster as
+    # `-R 0.0.0.0:gateway_port:localhost:local_port`, making the
+    # service reachable at `<gateway_host>:gateway_port`. The two
+    # topologies share `(local_port, gateway_port)` pair shape so
+    # consumer config is portable between them.
+    #
     # The framework treats the values as opaque port numbers and
     # makes no other guarantees about what's listening; consumers
     # are responsible for actually starting the local listener
