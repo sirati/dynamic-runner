@@ -34,6 +34,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two independent local builds).
 
 ### Changed (BREAKING)
+- **`_native.find_items(task_definition, root)` no longer accepts the
+  `gateway_url`, `ssh_config_path`, or `ssh_identity_file` kwargs.**
+  Discovery is always local-filesystem. In `--source-already-staged`
+  mode the framework now schedules the call on the cluster secondary
+  that has the staged path bind-mounted, not on the submitter — so a
+  submitter-side SSH walk is no longer needed (or possible). Consumers
+  calling `_native.find_items(self, root, gateway_url=...)` to walk a
+  staged corpus from the submitter must delete the `gateway_url`
+  argument (and the SSH-side kwargs if they were forwarded). Known
+  caller: asm-tokenizer's `_iter_gateway_pairs`.
+  Concurrently, `dynrunner_gateway::Filesystem` (trait) +
+  `FsError` + `DirEntry` are removed from the public surface, along
+  with the `Filesystem` impls on `LocalGateway` and `SshGateway`.
+  `LocalGateway` and `SshGateway` themselves remain (upload,
+  command execution, and port-forwarding are unchanged).
 - **`run()` API**: the optional `spawn_secondary_factory` parameter is
   gone; replaced with `deployment: TaskDeploymentSpec | None`. The spec
   carries the secondary Python module name, container image identity

@@ -5,7 +5,6 @@ use tokio::process::Command;
 use tokio::time;
 use tracing;
 
-use crate::filesystem::{DirEntry, Filesystem, FsError};
 use crate::path::expand_tilde;
 use crate::traits::{CommandResult, Gateway, GatewayError};
 
@@ -190,60 +189,6 @@ impl Gateway for LocalGateway {
     ) -> Result<(), GatewayError> {
         // No-op for local gateway
         Ok(())
-    }
-}
-
-impl Filesystem for LocalGateway {
-    async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        if !self.connected {
-            return Err(FsError::NotConnected);
-        }
-
-        let expanded = self.expand(path);
-        let mut read = match tokio::fs::read_dir(&expanded).await {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(FsError::NotFound(expanded));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
-                return Err(FsError::NotADirectory(expanded));
-            }
-            Err(e) => return Err(FsError::Io(e)),
-        };
-
-        let mut entries = Vec::new();
-        while let Some(child) = read.next_entry().await? {
-            let name = match child.file_name().into_string() {
-                Ok(s) => s,
-                Err(_) => {
-                    tracing::warn!(
-                        path = %expanded,
-                        "skipping non-UTF-8 entry in directory listing"
-                    );
-                    continue;
-                }
-            };
-
-            // Follow symlinks (matches the historical Python `Path.is_file()`
-            // semantics). Broken symlinks bubble up as Err here; skip silently.
-            let meta = match tokio::fs::metadata(child.path()).await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            if meta.is_dir() {
-                entries.push(DirEntry::Dir { name });
-            } else if meta.is_file() {
-                entries.push(DirEntry::File {
-                    name,
-                    size: meta.len(),
-                });
-            }
-            // Other kinds (sockets, fifos, block/char devices) are ignored.
-        }
-
-        entries.sort_by(|a, b| a.name().cmp(b.name()));
-        Ok(entries)
     }
 }
 
