@@ -302,25 +302,43 @@ pub(crate) fn run_slurm_pipeline<'py>(
         )?;
     }
 
-    // ---- Reverse-connection mode detection. ----
+    // ---- Connection topology decision. ----
     //
-    // Equivalent to:
-    //     hasattr(gateway, "gateway_ports_enabled")
-    //         and gateway.gateway_ports_enabled is False
+    // SLURM dispatch defaults to ProxyJump-into-secondaries
+    // (`use_reverse_connection = true`): primary dials each secondary
+    // via `ssh -L localhost:RAND:node:port -J gateway node`, using
+    // only outbound SSH from the submitter. This works on every
+    // cluster because no `-R` reverse-forward is required.
+    //
+    // The alternative (gateway-direct outbound: secondaries dial
+    // `gateway:port` through an `-R` reverse-forward hosted by the
+    // gateway) saves one SSH tunnel per secondary, but requires the
+    // gateway's sshd to honour `-R *:port` against its external
+    // interface. Some clusters (e.g. LMU Krater) silently downgrade
+    // `-R *:port` to a loopback bind, which makes this mode
+    // unreachable from compute nodes. `check_gateway_ports` probes
+    // an existing forward and stores the result on
+    // `gateway.gateway_ports_enabled`; at SLURM-dispatch-decision
+    // time no forward exists yet, so the safe default applies.
+    //
+    // Explicit opt-in to gateway-direct outbound: a caller that has
+    // already probed and confirmed `gateway_ports_enabled == True`
+    // can override. None / False / missing => reverse mode.
     let use_reverse_connection: bool = match gateway.getattr("gateway_ports_enabled") {
-        Ok(v) if !v.is_none() => {
-            // `is False` (not just falsy): only the explicit boolean
-            // False signals reverse-mode. None / unset => forward.
-            v.is_instance_of::<pyo3::types::PyBool>() && !v.is_truthy()?
-        }
-        _ => false,
+        Ok(v) if v.is_instance_of::<pyo3::types::PyBool>() && v.is_truthy()? => false,
+        _ => true,
     };
-    if use_reverse_connection {
-        log.call_method1(
-            "info",
-            ("Gateway disallows public port forwarding; switching to SSH ProxyJump tunnel mode.",),
-        )?;
-    }
+    log.call_method1(
+        "info",
+        (format!(
+            "SLURM connection topology: {}",
+            if use_reverse_connection {
+                "SSH ProxyJump (primary tunnels to each secondary via gateway)"
+            } else {
+                "gateway-direct outbound (secondaries dial primary via gateway -R forward)"
+            }
+        ),),
+    )?;
 
     // ---- Clear leftover ssh tunnels from previous runs. ----
     pkill_leftover_tunnels(py)?;
