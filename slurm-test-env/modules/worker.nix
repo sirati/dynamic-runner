@@ -39,5 +39,20 @@
   systemd.services.slurmd.serviceConfig = {
     LimitNPROC = "infinity";
     TasksMax = "infinity";
+    # TEMPORARY DIAGNOSTIC (2026-05-12, revert post-investigation).
+    # asm-dataset-nix needs DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1
+    # to propagate into the framework wrapper bash for definitive
+    # watchdog rule-out. The propagation path
+    # consumer-pytest-env → ssh sbatch → slurmctld → slurmd is
+    # blocked because:
+    #   - sshd has PermitUserEnvironment=no (no ~/.ssh/environment)
+    #   - framework doesn't expose sbatch --export surface
+    #   - systemd units don't read /etc/environment
+    # Setting it directly on slurmd's unit injects into slurmd's env,
+    # which inherits to slurmstepd → wrapper bash. This is a per-
+    # cluster knob until the framework grows an --export equivalent;
+    # remove once the bilateral-SIGTERM root cause is identified and
+    # closed.
+    Environment = [ "DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1" ];
   };
 }
