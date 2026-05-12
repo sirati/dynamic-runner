@@ -58,6 +58,7 @@ impl PyPrimaryConfig {
             // that opt out do so via PyPrimaryCoordinator (which
             // reads `TaskDefinition.uses_file_based_items`).
             uses_file_based_items: true,
+            required_setup_on_promote: false,
                     max_concurrent_per_type: std::collections::HashMap::new(),
                     retry_max_passes: self.distributed_config.retry_max_passes(),
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
