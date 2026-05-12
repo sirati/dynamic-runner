@@ -854,7 +854,7 @@ where
     /// broadcast, so a duplicate `ingest_setup_discovery` call (e.g.
     /// from a wrapper retry on transport hiccup) doesn't re-broadcast
     /// the same batch.
-    pub(crate) async fn ingest_setup_discovery(
+    pub async fn ingest_setup_discovery(
         &mut self,
         binaries: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
