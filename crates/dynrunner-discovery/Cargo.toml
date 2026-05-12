@@ -12,10 +12,13 @@ categories.workspace   = true
 readme.workspace       = true
 
 [dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-dynrunner-gateway = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+tempfile = "3"
 
 [lints]
 workspace = true
