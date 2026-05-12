@@ -366,17 +366,35 @@ pub(crate) fn run_slurm_pipeline<'py>(
 
     // Discover items ONCE; reused for both pre-staging upload and
     // the coordinator-side StageFile queue.
+    //
+    // Pre-staged-source mode (`--source-already-staged <path>`): the
+    // submitter has no local view of the staged corpus — those files
+    // live on the cluster filesystem the secondaries see, not on the
+    // dispatcher. Skip the discovery walk here and hand the
+    // coordinator an empty list; the Step 6 PyO3 wrapper reads
+    // `binaries.is_empty() && source_pre_staged_root.is_some()` to
+    // derive `required_setup_on_promote = true`, which in turn makes
+    // the bootstrap `PromotePrimary` carry `required_setup=true` so
+    // the chosen secondary runs `task.discover_items` against its
+    // bind-mounted `src_network` and seeds the cluster ledger.
     let binaries = PyList::empty(py);
-    for item in task
-        .call_method1("discover_items", (&source_dir, args))?
-        .try_iter()?
-    {
-        binaries.append(item?)?;
-    }
-    if binaries.is_empty() {
+    if !attr_truthy(args, "source_already_staged") {
+        for item in task
+            .call_method1("discover_items", (&source_dir, args))?
+            .try_iter()?
+        {
+            binaries.append(item?)?;
+        }
+        if binaries.is_empty() {
+            log.call_method1(
+                "warning",
+                ("No items discovered. Pipeline will run in test/job-submission mode.",),
+            )?;
+        }
+    } else {
         log.call_method1(
-            "warning",
-            ("No items discovered. Pipeline will run in test/job-submission mode.",),
+            "info",
+            ("Pre-staged source mode: deferring task discovery to the setup-promoted secondary.",),
         )?;
     }
 

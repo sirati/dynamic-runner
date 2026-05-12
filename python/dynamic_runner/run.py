@@ -22,7 +22,7 @@ from .spawn_secondary import build_subprocess_spawn
 from .task_protocol import TaskDefinition
 
 # Import the parser-builder from the slimmed cli module.
-from .cli import build_arg_parser  # noqa: E402  (defined in same package)
+from .cli import build_arg_parser, validate_parsed_args  # noqa: E402  (defined in same package)
 
 
 def run(
@@ -45,6 +45,7 @@ def run(
     parser = build_arg_parser(description)
     task.add_task_arguments(parser)
     args = parser.parse_args()
+    validate_parsed_args(args, parser)
 
     if args.secondary:
         _dispatch_secondary(task, args, logger)
@@ -95,12 +96,32 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     prints the items the task discovered; consumers wanting richer
     formatting can implement `__str__` on their TaskInfo subclass or
     print from inside `discover_items` directly.
+
+    Pre-staged-source mode (`--source-already-staged <path>`) defers
+    discovery to the cluster secondary that has the staged path
+    bind-mounted as `src_network`. The submitter has no local view
+    of those files, so we return an empty list and let the
+    coordinator's setup-promote handshake drive `discover_items` on
+    the chosen secondary. `args._setup_deferred_to_secondary` is set
+    so dispatch helpers can distinguish "intentionally empty" from
+    "task discovered nothing" — only the latter is a useful no-op.
+    The empty-list signal is also what the Step 6 PyO3 wrapper reads
+    (together with `source_pre_staged_root.is_some()`) to flip
+    `PrimaryConfig.required_setup_on_promote` to true.
     """
     logger = logging.getLogger()
 
     print_selection_summary(config)
 
     args.resolved_output_root = str(config.output_dir)
+
+    if getattr(args, "source_already_staged", None):
+        logger.info(
+            "Pre-staged source mode: deferring task discovery to the "
+            "setup-promoted secondary."
+        )
+        args._setup_deferred_to_secondary = True
+        return []
 
     logger.info("Discovering items via task.discover_items(...)")
     binaries = list(task.discover_items(config.source_dir, args))
@@ -280,7 +301,11 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     import dynamic_runner as _rs
 
     binaries = _collect_binaries(task, args, config)
-    if not binaries:
+    # Pre-staged-source mode hands the manager an empty list on
+    # purpose; the setup-promoted secondary will run discovery and
+    # seed the cluster ledger. The "no binaries to process" no-op is
+    # only correct when discovery actually ran and found nothing.
+    if not binaries and not getattr(args, "_setup_deferred_to_secondary", False):
         logger.info("No binaries to process")
         return
 
@@ -347,7 +372,10 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
 
     config = process_selection_arguments(args)
     binaries = _collect_binaries(task, args, config)
-    if not binaries:
+    # See `_dispatch_single_process` for the pre-staged-mode rationale:
+    # an empty list in pre-staged mode is the intended setup-promote
+    # signal, not a "nothing to process" no-op.
+    if not binaries and not getattr(args, "_setup_deferred_to_secondary", False):
         logger.info("No binaries to process")
         return
 

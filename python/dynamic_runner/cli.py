@@ -271,3 +271,54 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
+def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Cross-flag validation that argparse's per-argument hooks can't express.
+
+    Today's rules — all centred on the load-bearing
+    ``--source-already-staged`` flag, which moves discovery + ledger
+    seed from the submitter to a chosen secondary:
+
+    * ``--list-files`` is a submitter-side introspection knob that
+      runs ``task.discover_items`` and prints what it found.
+      ``--source-already-staged`` deliberately defers that walk to
+      the setup-promoted secondary — the submitter has no local view
+      of the staged corpus, so it cannot list what it never
+      discovers. The two flags cannot meaningfully combine.
+    * ``--source-already-staged`` only makes sense when a secondary
+      exists to take the setup hand-off. Plain local mode
+      (``--multi-computer`` absent) runs everything in-process with
+      no peer to delegate to, so the combination is rejected here.
+      The three ``--multi-computer`` modes (``slurm``, ``local``,
+      ``single-process``) all participate in the setup-promote
+      handshake; the deprecated ``--slurm`` shorthand is treated as
+      equivalent to ``--multi-computer slurm`` for this check.
+
+    Called from ``dynamic_runner.run.run`` immediately after
+    ``parser.parse_args``. Failures route through ``parser.error``,
+    which prints usage + the message to stderr and exits 2 —
+    argparse's standard error path, so the conflicting flag names
+    surface to the operator in the same shape as a malformed CLI
+    invocation.
+    """
+    if getattr(args, "source_already_staged", None):
+        if getattr(args, "list_files", False):
+            parser.error(
+                "--list-files is incompatible with --source-already-staged: "
+                "the submitter does not discover items in pre-staged mode "
+                "(discovery runs on the setup-promoted secondary)."
+            )
+        # `--slurm` is the deprecated alias for `--multi-computer slurm`
+        # (see `dynamic_runner.run.run` which performs the equivalence
+        # rewrite); accept it here so the validation doesn't reject a
+        # combination `run()` would otherwise quietly promote.
+        has_distributed_mode = (
+            args.multi_computer is not None or getattr(args, "slurm", False)
+        )
+        if not has_distributed_mode:
+            parser.error(
+                "--source-already-staged requires a distributed mode "
+                "(--multi-computer slurm|local|single-process); plain "
+                "local mode has no secondary to delegate setup to."
+            )
+
+
