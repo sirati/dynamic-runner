@@ -88,29 +88,29 @@ class ReverseModeScenario(Scenario):
         except OSError as e:
             return (False, [f"could not read dispatch log: {e}"])
 
-        # Hard assertion (task #3): the framework must auto-detect
-        # GatewayPorts=no and announce the ProxyJump fall-back. This
-        # is the user-visible signal that the auto-detect logic in
-        # ``dynrunner-gateway::ssh::check_gateway_ports`` flipped
-        # ``gateway_ports_enabled`` to Some(false), and that
-        # ``dynrunner-pyo3::slurm::pipeline::use_reverse_connection``
-        # picked up on it. Without this assertion the scenario would
-        # silently pass even if the auto-detect regressed (a future
-        # change e.g. always-true could go unnoticed: the workload
-        # completes either way on a GatewayPorts=no cluster — the
-        # cluster refuses the public bind, which the reverse-forward
-        # path falls back to localhost anyway, so outputs are the same).
+        # Hard assertion: the framework must announce the SSH
+        # ProxyJump topology for SLURM dispatch. Reverse mode is now
+        # the SLURM-dispatch default (safe everywhere; gateway-direct
+        # outbound requires explicit opt-in via
+        # ``gateway_ports_enabled is True`` on a non-LMU cluster
+        # where ``-R *:port`` is known-good). Without this assertion
+        # the scenario would silently pass even if the default
+        # regressed back to gateway-direct outbound: on a
+        # GatewayPorts=no cluster the workload still happens to
+        # complete because the cluster refuses the public bind and
+        # the reverse-forward path falls back to localhost, so
+        # outputs match either way.
         proxy_jump_marker = (
-            "Gateway disallows public port forwarding; switching to SSH "
-            "ProxyJump tunnel mode."
+            "SLURM connection topology: SSH ProxyJump "
+            "(primary tunnels to each secondary via gateway)"
         )
         if proxy_jump_marker not in log_text:
             return (
                 False,
                 [
-                    "ProxyJump auto-detect message missing — framework did "
-                    "NOT report flipping to ProxyJump despite running "
-                    "against a GatewayPorts=no cluster. Expected log line: "
+                    "ProxyJump topology message missing — framework did "
+                    "NOT report SSH ProxyJump as the SLURM connection "
+                    "topology. Expected log line: "
                     f'"{proxy_jump_marker}"'
                 ],
             )
