@@ -524,7 +524,28 @@ CONTAINER_NAME="{container_name}"
 # Skipped when SLURM_JOB_ID is empty (running outside SLURM):
 # squeue would never find a matching job so the watchdog could
 # never exit cleanly.
-if [ -n "${{SLURM_JOB_ID:-}}" ]; then
+#
+# Operator escape hatch: setting `DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1`
+# in the wrapper's environment skips spawning the watchdog
+# entirely. Two use cases:
+#   - **A/B diagnostic** when an operator suspects the watchdog
+#     is the source of a phantom SIGTERM (the kill target is
+#     PID 1 of the container, but operators inspecting a
+#     cross-cluster signal source may want to rule it out
+#     definitively).
+#   - **Healthy proctrack/cgroup clusters** where SLURM's own
+#     cgroup teardown reliably reaps conmon's double-forked
+#     containers and the watchdog is redundant. Pre-2026-04-29
+#     watchdog's only purpose was the conmon-escape-cgroup
+#     fallback; on a cluster where proctrack/cgroup catches
+#     that case (confirmed working on slurm-test-env per
+#     2bf8410), the watchdog is belt-and-suspenders only.
+#
+# Default behaviour (env var unset or set to "0") is
+# unchanged — watchdog spawns and runs the state-aware
+# polling.
+if [ -n "${{SLURM_JOB_ID:-}}" ] \
+   && [ "${{DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG:-0}}" != "1" ]; then
     # Duplicate the wrapper's stdout to fd 3 so the detached
     # watchdog can log its actions to the .out file even
     # after the wrapper exits and its main stdout chain may be
@@ -609,6 +630,8 @@ if [ -n "${{SLURM_JOB_ID:-}}" ]; then
     ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
         </dev/null >/dev/null 2>&1
     echo "Spawned podman teardown watchdog (poll=5s debounce=2 grace=60s)"
+elif [ "${{DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG:-0}}" = "1" ]; then
+    echo "Skipped podman teardown watchdog (DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1)"
 fi
 
 echo "Starting Docker container..."
