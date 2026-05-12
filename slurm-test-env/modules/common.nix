@@ -105,5 +105,13 @@
     gnugrep
     gnused
     procps
+    # General-purpose diagnostic; useful for any peer attaching to
+    # in-container processes (conmon, slurmstepd, the framework's
+    # wrapper bash, secondary container PID 1) when the failure mode
+    # is a signal arriving from an unexpected sender. Added 2026-05-12
+    # for asm-dataset-nix's bilateral-SIGTERM investigation; kept
+    # permanently since the diagnostic value generalizes — no test
+    # harness should require an image rebuild to attach an strace.
+    strace
   ];
 }
