@@ -130,6 +130,21 @@ pub struct PrimaryConfig {
     /// `true` outside the opt-out (default).
     pub uses_file_based_items: bool,
 
+    /// Setup-promote intent for the bootstrap `PromotePrimary` this
+    /// coordinator emits. When `true`, the submitter has deferred
+    /// task discovery / upload / ledger seeding to the chosen
+    /// secondary (the `--source-already-staged` path: files live on
+    /// the cluster, not on the submitter) and the wire's
+    /// `PromotePrimary.required_setup` is forwarded accordingly.
+    /// This is the *intent* flag; the wire field is the discriminator
+    /// the secondary actually keys off (see
+    /// `DistributedMessage::PromotePrimary.required_setup` for the
+    /// three-reason classification — legacy bootstrap, setup-promote,
+    /// failover). Failover election deliberately ignores this field:
+    /// at election time the local ledger is already non-empty, so
+    /// re-running discovery would double-seed.
+    pub required_setup_on_promote: bool,
+
     /// Per-type global concurrency caps. When a `TypeId` is present
     /// with capacity `N`, the scheduler refuses to dispatch more than
     /// `N` items of that type concurrently across all workers.
@@ -264,6 +279,7 @@ impl Default for PrimaryConfig {
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
             uses_file_based_items: true,
+            required_setup_on_promote: false,
             max_concurrent_per_type: HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
