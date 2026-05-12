@@ -466,6 +466,28 @@ where
     /// last drain (set was emptied) or is still queued (no-op
     /// already in flight).
     pub(super) pending_worker_restarts: HashSet<WorkerId>,
+
+    /// Set true by the `PromotePrimary { required_setup: true }` arm
+    /// in `dispatch.rs` when this secondary is promoted into the
+    /// setup-secondary role (the submitter deferred all run-setup work
+    /// to us — no `TaskAdded` batch was pre-seeded on the cluster
+    /// ledger). The outer process-tasks loop yields back to the PyO3
+    /// wrapper when this is true so Python's `task.discover_items` can
+    /// run on this node (which has the staged source filesystem
+    /// bind-mounted locally). The wrapper then calls
+    /// `ingest_setup_discovery`, which seeds the ledger with
+    /// `PhaseDepsSet` + `TaskAdded` mutations, broadcasts them to
+    /// every peer, clears this flag, and hydrates the primary pool
+    /// from the now-populated `cluster_state`.
+    ///
+    /// Never set on the legacy bootstrap promotion path
+    /// (`required_setup: false` from the local submitter — ledger is
+    /// pre-seeded) nor on the failover-election path (the ledger has
+    /// content from the CRDT broadcasts that ran during the live-
+    /// primary phase). The wire-level `required_setup` flag is the
+    /// only discriminator; "ledger empty" is NOT a proxy because
+    /// failover-at-startup can legitimately observe an empty ledger.
+    pub(super) setup_pending: bool,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -529,6 +551,7 @@ where
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
             pending_worker_restarts: HashSet::new(),
+            setup_pending: false,
         }
     }
 
