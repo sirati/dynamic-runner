@@ -234,27 +234,105 @@ pub(crate) fn run_slurm_pipeline<'py>(
         .getattr("create_gateway")?
         .call1((gateway_config,))?;
 
-    // ---- QUIC port pick + master-side port forwarding. ----
+    // ---- Connection topology decision. ----
     //
-    // `forwarded_ports` MUST be set up BEFORE `gateway.connect()`:
-    // SSHGateway.connect() reads the list to build its
-    // `-R 0.0.0.0:remote:localhost:local` flags, and the
-    // gateway-ports preflight short-circuits when the list is empty.
+    // SLURM dispatch unconditionally uses ProxyJump-into-secondaries
+    // (`use_reverse_connection = true`): primary dials each secondary
+    // via `ssh -J gateway secondary -R tunnel_port:localhost:primary_quic`,
+    // using only outbound SSH from the submitter. This works on every
+    // cluster because no `-R` reverse-forward on the gateway is required.
+    //
+    // The gateway-direct alternative (secondaries dial `gateway:port`
+    // through an `-R` reverse-forward hosted by the gateway) would
+    // save one SSH tunnel per secondary, but is not safe to enable
+    // automatically. Two distinct things must hold for it to work:
+    //   1. The gateway's sshd must honour `-R *:port` against its
+    //      external interface (not silently downgrade to loopback).
+    //   2. The gateway's external IP/interface must be TCP-reachable
+    //      from compute nodes (not on a separate network segment).
+    // The `check_gateway_ports` probe in `dynrunner-gateway::ssh`
+    // confirms (1) by reading `ss` output on the gateway after a
+    // forward exists, but cannot prove (2) — and "binds publicly
+    // on the gateway" is necessary-but-not-sufficient for cluster
+    // reachability. LMU Krater is the load-bearing counter-example:
+    // brasilianit.cip.ifi.lmu.de happily binds 0.0.0.0:port, but
+    // kraterNN compute nodes cannot route to brasilianit's external
+    // IP (segmented network). The framework cannot validate (2)
+    // without actually issuing a sacrificial sbatch against the
+    // target partition, which is too heavy to gate every dispatch on.
+    //
+    // So: ProxyJump is the only auto-default that works everywhere.
+    // Anyone who has hand-verified that their cluster supports
+    // gateway-direct outbound can introduce an explicit opt-in
+    // (CLI flag / SlurmConfig field) later — but the framework
+    // must not infer that opt-in from any subset of the available
+    // probes. The decision is computed here (before the port-forward
+    // registration) because gateway-side `-R` registration is itself
+    // topology-dependent (see below).
+    let use_reverse_connection: bool = true;
+    log.call_method1(
+        "info",
+        ("SLURM connection topology: SSH ProxyJump (primary tunnels to each secondary via gateway)",),
+    )?;
+
+    // ---- QUIC port pick + topology-conditional master-side port forwarding. ----
+    //
+    // The gateway ControlMaster's `-R 0.0.0.0:remote:localhost:local`
+    // flags exist for the gateway-direct topology: they let compute
+    // nodes dial the gateway on a public-bound port and reach
+    // services on the submitter. In ProxyJump topology those
+    // forwards are redundant — every per-secondary
+    // `ssh -J gateway secondary -R <tunnel>:localhost:<primary>` from
+    // `dynrunner-slurm::preparation::build_ssh_argv` carries the QUIC
+    // forward AND the `extra_port_forwards` fan-out on the SAME ssh
+    // session, terminating on each secondary's loopback. From the
+    // secondary's POV, `localhost:<gateway_port>` reaches the
+    // submitter's `localhost:<local_port>` via that per-secondary
+    // tunnel — no gateway-side bind needed.
+    //
+    // Why this matters beyond redundancy: at GatewayPorts=no sshds
+    // (LMU's `remote.cip.ifi.lmu.de` being the canonical example),
+    // the gateway-side `-R 0.0.0.0:port:localhost:port` silently
+    // downgrades to a 127.0.0.1 bind, and `check_gateway_ports`
+    // logs a "GatewayPorts likely disabled" warning. In ProxyJump
+    // topology that warning is a false alarm — the working path is
+    // the per-secondary one — but the warning has historically
+    // misled consumers into building substituter / peer URLs
+    // against `<gateway_host>:<port>`, which is unreachable from
+    // compute nodes. Skipping the gateway-side `-R` in ProxyJump
+    // topology removes the false alarm and the misleading
+    // implication that `<gateway>:<port>` is a valid endpoint.
+    //
+    // `forwarded_ports` MUST be set up BEFORE `gateway.connect()`
+    // because `SSHGateway.connect()` reads the list once to build
+    // its master-spawn argv; registering after connect would be a
+    // no-op for the master argv.
     let runner_module = py.import("dynamic_runner")?;
     let primary_quic_port: u16 = runner_module
         .getattr("pick_free_port")?
         .call0()?
         .extract()?;
-    gateway.call_method1("setup_port_forwarding", (primary_quic_port, primary_quic_port))?;
+    if !use_reverse_connection {
+        // Gateway-direct topology: secondaries dial `gateway:primary_quic_port`,
+        // so the gateway ControlMaster must hold the `-R` for it.
+        gateway.call_method1("setup_port_forwarding", (primary_quic_port, primary_quic_port))?;
 
-    // Consumer-supplied extra `-R local:gateway` forwards.
-    let extra_forwards = deployment.getattr("extra_port_forwards")?;
-    let iter = extra_forwards.try_iter()?;
-    for pair in iter {
-        let pair = pair?;
-        let (local_port, gw_port): (u16, u16) = pair.extract()?;
-        gateway.call_method1("setup_port_forwarding", (local_port, gw_port))?;
+        // Consumer-supplied extra `-R local:gateway` forwards on the
+        // ControlMaster, same gateway-direct topology rationale.
+        let extra_forwards = deployment.getattr("extra_port_forwards")?;
+        let iter = extra_forwards.try_iter()?;
+        for pair in iter {
+            let pair = pair?;
+            let (local_port, gw_port): (u16, u16) = pair.extract()?;
+            gateway.call_method1("setup_port_forwarding", (local_port, gw_port))?;
+        }
     }
+    // In ProxyJump topology, `extra_port_forwards` is plumbed via
+    // `deployment` into `SlurmPreparation` (Python) → `RustSlurmPreparation`
+    // (PyO3) → `dynrunner-slurm::preparation::build_ssh_argv` (Rust),
+    // which adds them as `-R gateway_port:localhost:local_port` on
+    // each per-secondary ssh-with-ProxyJump. That's the only forward
+    // the secondary needs.
 
     gateway.call_method0("connect")?;
 
@@ -301,45 +379,6 @@ pub(crate) fn run_slurm_pipeline<'py>(
             ("No items discovered. Pipeline will run in test/job-submission mode.",),
         )?;
     }
-
-    // ---- Connection topology decision. ----
-    //
-    // SLURM dispatch unconditionally uses ProxyJump-into-secondaries
-    // (`use_reverse_connection = true`): primary dials each secondary
-    // via `ssh -L localhost:RAND:node:port -J gateway node`, using
-    // only outbound SSH from the submitter. This works on every
-    // cluster because no `-R` reverse-forward is required.
-    //
-    // The gateway-direct alternative (secondaries dial `gateway:port`
-    // through an `-R` reverse-forward hosted by the gateway) would
-    // save one SSH tunnel per secondary, but is not safe to enable
-    // automatically. Two distinct things must hold for it to work:
-    //   1. The gateway's sshd must honour `-R *:port` against its
-    //      external interface (not silently downgrade to loopback).
-    //   2. The gateway's external IP/interface must be TCP-reachable
-    //      from compute nodes (not on a separate network segment).
-    // The `check_gateway_ports` probe in `dynrunner-gateway::ssh`
-    // confirms (1) by reading `ss` output on the gateway after a
-    // forward exists, but cannot prove (2) — and "binds publicly
-    // on the gateway" is necessary-but-not-sufficient for cluster
-    // reachability. LMU Krater is the load-bearing counter-example:
-    // brasilianit.cip.ifi.lmu.de happily binds 0.0.0.0:port, but
-    // kraterNN compute nodes cannot route to brasilianit's external
-    // IP (segmented network). The framework cannot validate (2)
-    // without actually issuing a sacrificial sbatch against the
-    // target partition, which is too heavy to gate every dispatch on.
-    //
-    // So: ProxyJump is the only auto-default that works everywhere.
-    // Anyone who has hand-verified that their cluster supports
-    // gateway-direct outbound can introduce an explicit opt-in
-    // (CLI flag / SlurmConfig field) later — but the framework
-    // must not infer that opt-in from any subset of the available
-    // probes.
-    let use_reverse_connection: bool = true;
-    log.call_method1(
-        "info",
-        ("SLURM connection topology: SSH ProxyJump (primary tunnels to each secondary via gateway)",),
-    )?;
 
     // ---- Clear leftover ssh tunnels from previous runs. ----
     pkill_leftover_tunnels(py)?;
