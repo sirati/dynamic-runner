@@ -344,6 +344,14 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         num_workers=workers_per_secondary,
         max_resources=_rs.ResourceMap({"memory": ram_per_secondary}),
     )
+    # Pre-staged-source plumbing: `_collect_binaries` already returned
+    # `[]` and set `args._setup_deferred_to_secondary` when
+    # `args.source_already_staged` is set. The string path goes
+    # through to the Rust pyfunction's `Option<PathBuf>` kwarg
+    # uniformly with the SLURM and local-multi-computer paths so the
+    # in-process manager's `PrimaryConfig.required_setup_on_promote`
+    # flips to `True` and the chosen secondary owns discovery +
+    # ledger-seed.
     result = _rs.run_distributed(
         primary_cfg,
         secondary_template,
@@ -353,6 +361,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         str(config.output_dir),
         binaries,
         skip_existing=args.skip_existing,
+        source_pre_staged_root=args.source_already_staged,
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
@@ -393,12 +402,20 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         num_secondaries=num_secondaries,
         distributed_config=distributed_config,
     )
+    # Pre-staged-source plumbing — see `_dispatch_single_process` for
+    # the rationale; `run_primary` forwards the kwarg into the inner
+    # `RustPrimaryCoordinator(source_pre_staged_root=...)` whose
+    # `run()` derives `required_setup_on_promote` from
+    # `source_pre_staged_root.is_some() && binaries.is_empty()` (the
+    # `_collect_binaries` helper guarantees the empty list in pre-
+    # staged mode, so both halves of the gate agree).
     result = _rs.run_primary(
         primary_cfg,
         task,
         spawn_secondary,
         binaries,
         source_dir=str(config.source_dir),
+        source_pre_staged_root=args.source_already_staged,
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
