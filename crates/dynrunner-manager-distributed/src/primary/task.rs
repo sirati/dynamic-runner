@@ -223,6 +223,26 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             ..
         } = &msg
         {
+            // Dedup gate (#50 peer-forwarding redundancy):
+            // peers forward observed-via-peer-mesh TaskCompletes
+            // to the primary so wire-loss on the originator's
+            // direct send is covered by N-1 redundant paths.
+            // First receipt does all side-effects (counter
+            // updates, type-slot release, phase cascade, kickstart
+            // dispatch, secondary forward); subsequent receipts
+            // are no-ops. Without this gate, type_slot would
+            // double-decrement, `note_item_completed` would
+            // double-fire on the phase machine, and the log line
+            // would emit N times per task.
+            //
+            // `completed_tasks` is the dedup key: it's only
+            // populated below (and from `mirror_mutation_to_accounting`
+            // on cluster_state broadcasts the primary RECEIVES,
+            // which the live primary doesn't normally — see
+            // `peer.rs` comment chain). Idempotent via HashSet.
+            if self.completed_tasks.contains(task_hash) {
+                return;
+            }
             let secondary_id = secondary_id.clone();
             let worker_id = *worker_id;
             // A TaskComplete supersedes a prior TaskFailed for the
@@ -402,6 +422,35 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             ..
         } = &msg
         {
+            // Dedup gate (#50 peer-forwarding redundancy):
+            // Same shape as `handle_task_complete`'s dedup —
+            // peers forward observed peer-TaskFailed events to
+            // the primary; the first receipt does all the
+            // bookkeeping, subsequent ones are no-ops. Without
+            // this, `note_item_failed` would double-fire (phase
+            // counter goes wrong) and `type_slot` would double-
+            // decrement.
+            //
+            // `failed_tasks` is the dedup key for non-superseded
+            // failures. The `completed_tasks` check covers the
+            // separate case "TaskFailed arrives late after the
+            // task already TaskComplete'd" (the existing
+            // line-538 invariant: never regress
+            // completed → failed). Backpressure-shaped
+            // TaskFailed bypasses both checks since it's a re-
+            // queue signal, not a terminal state — handled
+            // below at the `is_backpressure` arm where the
+            // re-queue is idempotent (the binary either gets
+            // requeued or has already been requeued by an
+            // earlier landing).
+            let dedup_is_backpressure = error_message == "No idle worker available"
+                || error_message == "worker pipe broken; respawning";
+            if !dedup_is_backpressure
+                && (self.completed_tasks.contains(task_hash)
+                    || self.failed_tasks.contains_key(task_hash))
+            {
+                return;
+            }
             let secondary_id = secondary_id.clone();
             let worker_id = *worker_id;
             let task_hash = task_hash.clone();
