@@ -414,6 +414,39 @@ pub enum DistributedMessage<I> {
         /// that re-elects with a higher epoch supersedes the
         /// previous identity unconditionally.
         epoch: u64,
+        /// "You also own setup". Set by the submitter primary when
+        /// it skipped its own discovery/upload/seed pass (because
+        /// `--source-already-staged` told it the source data is on
+        /// the cluster-shared filesystem, not on its local host).
+        /// The receiving secondary, when it becomes primary, runs
+        /// `task.discover_items` against its own bind-mounted
+        /// source path, broadcasts the resulting `TaskAdded`
+        /// mutations, and only then hydrates its pending pool from
+        /// the now-seeded ledger.
+        ///
+        /// This is the SOLE wire signal that distinguishes the
+        /// three reasons a secondary becomes primary:
+        ///   1. Legacy bootstrap (submitter did setup):
+        ///      `required_setup=false`, ledger already seeded.
+        ///   2. Setup-promote (this field set):
+        ///      `required_setup=true`, secondary runs discovery.
+        ///   3. Failover after primary loss (election emits the
+        ///      PromotePrimary from a peer): `required_setup=false`,
+        ///      ledger is CRDT-merged from in-flight broadcasts.
+        ///
+        /// "Is `cluster_state` empty?" is NOT a sufficient
+        /// discriminator: failover-at-startup can legitimately
+        /// observe an empty ledger and must not be misclassified
+        /// as a setup promotion. The wire flag is the only
+        /// reliable signal because only the submitter primary knows
+        /// at promote-time whether it skipped its own setup pass.
+        ///
+        /// `#[serde(default)]` keeps pre-fix wire-senders forward-
+        /// compatible: their `PromotePrimary` decodes with
+        /// `required_setup=false` and takes the legacy path
+        /// unchanged.
+        #[serde(default)]
+        required_setup: bool,
     },
     /// Secondary -> Primary: "my peer-mesh has finished forming
     /// (or was empty / fully failed to form)". Emitted once per

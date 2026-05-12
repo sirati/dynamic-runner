@@ -794,6 +794,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 timestamp: timestamp_now(),
                 new_primary_id: first_id.clone(),
                 epoch: new_epoch,
+                required_setup: false,
             };
             // Broadcast to every secondary, not unicast to the elected
             // node: every secondary needs the role-change to update
