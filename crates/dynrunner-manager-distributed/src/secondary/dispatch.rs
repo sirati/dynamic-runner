@@ -223,7 +223,7 @@ where
                 self.stage_and_register(&file_hash, &content_hash, &src_path, &dest_path);
                 Ok(())
             }
-            DistributedMessage::PromotePrimary { new_primary_id, epoch, .. } => {
+            DistributedMessage::PromotePrimary { new_primary_id, epoch, required_setup, .. } => {
                 // Task #36 defensive guard: an observer MUST NOT be
                 // promoted. If we receive a PromotePrimary naming an
                 // observer (either us, or a peer in our
@@ -286,17 +286,45 @@ where
                 // workers silent for the residual window.
                 self.primary_link.on_primary_changed(new_primary_id.clone());
                 if became_primary {
-                    // Atomic role-flip on continuously-replicated
-                    // state: the new primary's pending pool is
-                    // hydrated from `cluster_state` directly, no
-                    // wire round-trip. Pre-Phase-B this happened
-                    // either via FullTaskList arrival (race-prone:
-                    // the trace at `feb1052` showed dispatch silence
-                    // for 1.6s because PromotePrimary preceded the
-                    // payload) or via a cached snapshot
-                    // (`populate_primary_from_cache`, which had its
-                    // own consume-once footgun).
-                    self.populate_primary_from_cluster_state();
+                    if required_setup {
+                        // Setup-promote path: the submitter deferred
+                        // all run-setup work (discovery, ledger seed,
+                        // initial assignment) to us. The cluster ledger
+                        // is intentionally empty at this point —
+                        // there's nothing to hydrate from. Set the
+                        // setup_pending flag so the outer process-tasks
+                        // loop yields back to the PyO3 wrapper, which
+                        // re-acquires the GIL, runs Python's
+                        // `task.discover_items` against our locally
+                        // bind-mounted staged source, and calls
+                        // `ingest_setup_discovery` to feed the result
+                        // back into the ledger. Hydration is deferred
+                        // until that call clears the flag.
+                        //
+                        // NOTE: do NOT call
+                        // `populate_primary_from_cluster_state` here —
+                        // there is no state to populate from yet, and
+                        // a no-op pool would set `primary_pending =
+                        // None` which is indistinguishable from
+                        // "pool build failed" downstream.
+                        self.setup_pending = true;
+                        tracing::info!(
+                            epoch,
+                            "promoted with required_setup=true — yielding to wrapper for discovery"
+                        );
+                    } else {
+                        // Atomic role-flip on continuously-replicated
+                        // state: the new primary's pending pool is
+                        // hydrated from `cluster_state` directly, no
+                        // wire round-trip. Pre-Phase-B this happened
+                        // either via FullTaskList arrival (race-prone:
+                        // the trace at `feb1052` showed dispatch silence
+                        // for 1.6s because PromotePrimary preceded the
+                        // payload) or via a cached snapshot
+                        // (`populate_primary_from_cache`, which had its
+                        // own consume-once footgun).
+                        self.populate_primary_from_cluster_state();
+                    }
                 }
                 if self.is_primary {
                     // Sync the election state machine with the role
