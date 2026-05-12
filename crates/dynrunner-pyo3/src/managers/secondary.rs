@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
-use dynrunner_core::{ResourceKind, ResourceMap};
-use dynrunner_manager_distributed::{SecondaryConfig, SecondaryCoordinator};
+use dynrunner_core::{PhaseId, ResourceKind, ResourceMap};
+use dynrunner_manager_distributed::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkClient;
 
@@ -15,6 +17,7 @@ use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::RunnerIdentifier;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
+use crate::pytypes::extract_binaries;
 use crate::subprocess_factory::SubprocessWorkerFactory;
 use crate::task_def::{LoadedTaskDefinition, TypeRegistry};
 
@@ -40,8 +43,28 @@ pub(crate) struct PySecondaryCoordinator {
     /// `db_secondary_<id>` (the historical default).
     src_tmp: Option<PathBuf>,
     types: TypeRegistry,
+    /// Phase dependency graph extracted from
+    /// `LoadedTaskDefinition::from_python`. Retained on the wrapper
+    /// (rather than left to drop after construction like the legacy
+    /// path did) because the setup-promote yield needs it: the Python
+    /// `task.discover_items` call resolves the per-task list but not
+    /// the graph metadata, and the Rust core seeds both as a single
+    /// mutation batch via `ingest_setup_discovery`.
+    phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
     estimator: PyMemoryEstimatorBridge,
+    /// Held for the setup-promote outer loop. When the Rust core
+    /// signals `RunOutcome::SetupPending`, the wrapper re-acquires the
+    /// GIL and invokes `task_definition_py.discover_items(<root>,
+    /// task_args_py)` to enumerate the staged corpus. Kept as a
+    /// `Py<PyAny>` (not `Bound<'py, _>`) because the wrapper outlives
+    /// any single `Python<'py>` lifetime; `bind(py)` re-materialises a
+    /// `Bound` at each call site.
+    task_definition_py: Py<PyAny>,
+    /// Held for the same reason as `task_definition_py`: the second
+    /// positional argument to `discover_items`. Originates from the
+    /// `task_args` Python object passed into the constructor.
+    task_args_py: Py<PyAny>,
     completed: u32,
 }
 
@@ -131,8 +154,19 @@ impl PySecondaryCoordinator {
             src_network,
             src_tmp,
             types: task.types,
+            // `from_python` already extracted phase_deps off the
+            // TaskDefinition's `get_phases()`; we keep it on the
+            // wrapper for the setup-promote yield path. Legacy
+            // (non-pre-staged) runs never inspect this field.
+            phase_deps: task.phase_deps,
             skip_existing,
             estimator: task.estimator,
+            // Bump the refcount and unbind to a `Py<PyAny>` so the
+            // handle outlives the constructor's `Bound` lifetime. The
+            // setup-promote yield re-binds each iteration under a
+            // fresh `Python::attach` scope.
+            task_definition_py: task_definition.clone().unbind(),
+            task_args_py: task_args.clone().unbind(),
             completed: 0,
         })
     }
@@ -177,6 +211,25 @@ impl PySecondaryCoordinator {
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
+
+        // Setup-promote yield captures: cloned here so the `py.detach`
+        // closure (which runs without the GIL) owns its own handles
+        // without borrowing `self`. `task_definition_py` /
+        // `task_args_py` are `Send`-safe `Py<PyAny>` reference bumps;
+        // `phase_deps_for_ingest` / `setup_discover_root` are plain
+        // owned values.
+        //
+        // `setup_discover_root` mirrors `cfg_src_network`: in pre-staged
+        // mode the Python pipeline guarantees it's `Some` (the bind-
+        // mount root the staged corpus lives under). In legacy /
+        // failover modes the secondary never observes
+        // `RunOutcome::SetupPending`, so the `None` arm of the yield
+        // handler can surface a programmer-error rather than
+        // pretending to walk a non-existent root.
+        let task_definition_py = self.task_definition_py.clone_ref(py);
+        let task_args_py = self.task_args_py.clone_ref(py);
+        let phase_deps_for_ingest = self.phase_deps.clone();
+        let setup_discover_root = self.src_network.clone();
 
         let mut completed = 0u32;
 
@@ -378,12 +431,132 @@ impl PySecondaryCoordinator {
                     },
                 );
 
-                match secondary.run(&mut factory).await {
-                    Ok(()) => {
-                        tracing::info!("secondary finished successfully");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "secondary failed");
+                // Setup-promote outer loop: drive
+                // `run_until_setup_or_done` to a terminal state,
+                // bouncing back through Python's `discover_items` on
+                // every `SetupPending` yield. The Rust core enforces
+                // that `SetupPending` only ever arises from a
+                // `PromotePrimary { required_setup: true }` wire
+                // arrival, which only the submitter's pre-staged-mode
+                // configuration emits — so legacy / failover runs
+                // observe `Done` on the first iteration and the loop
+                // exits cleanly without re-entering Python.
+                //
+                // GIL discipline: this entire async block runs inside
+                // `py.detach` (GIL released). Each Python excursion
+                // re-acquires via `Python::attach`, makes the single
+                // `discover_items` call, converts the iterable into
+                // `Vec<TaskInfo<RunnerIdentifier>>` through the
+                // workspace-shared `extract_binaries` helper, then
+                // returns — yielding the GIL back so the next Rust
+                // async tick can proceed. The Python-side time on the
+                // GIL is bounded by the cost of one user-defined
+                // generator drain plus the per-item attribute reads
+                // `extract_binaries` performs; in particular the
+                // Rust transport state, worker pool, and `select!`
+                // loop are NOT held while Python is running.
+                //
+                // Cancel-safety: `run_until_setup_or_done` documents
+                // its `process_tasks` `select!` arms as cancel-safe
+                // (mpsc recv + tokio interval ticks; see
+                // `secondary/processing.rs:57-65`). The `SetupPending`
+                // early return abandons the in-flight `select!`
+                // future and reentry rebuilds it from scratch on the
+                // next loop iteration's `run_until_setup_or_done`
+                // call. No coordinator state is dropped across the
+                // yield (`setup_phase_completed` is latched, workers
+                // stay running, transports remain connected).
+                loop {
+                    let outcome = match secondary
+                        .run_until_setup_or_done(&mut factory)
+                        .await
+                    {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::error!(error = %e, "secondary failed");
+                            break;
+                        }
+                    };
+                    match outcome {
+                        RunOutcome::Done => {
+                            tracing::info!("secondary finished successfully");
+                            break;
+                        }
+                        RunOutcome::SetupPending => {
+                            // Re-acquire the GIL ONLY for the duration
+                            // of `task.discover_items` + the typed
+                            // conversion. Held resources released back
+                            // to the runtime when this block returns.
+                            let discovered = Python::attach(|py| -> PyResult<
+                                Vec<dynrunner_core::TaskInfo<RunnerIdentifier>>,
+                            > {
+                                let root = setup_discover_root
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        pyo3::exceptions::PyRuntimeError::new_err(
+                                            "RunOutcome::SetupPending observed but \
+                                             src_network is None — the wrapper has no \
+                                             root to pass to task.discover_items; this \
+                                             is a programmer error (only pre-staged \
+                                             mode emits the SetupPending yield, and \
+                                             that mode always supplies src_network)",
+                                        )
+                                    })?;
+                                let task_def = task_definition_py.bind(py);
+                                let args = task_args_py.bind(py);
+                                let root_py = root.clone().into_pyobject(py)?;
+                                // Buffer the discover_items iterable
+                                // into a `PyList` so the workspace's
+                                // existing `extract_binaries` helper
+                                // (used by primary.rs::run and the
+                                // SLURM pipeline) handles the typed
+                                // conversion uniformly — no parallel
+                                // extraction logic introduced here.
+                                let py_list = PyList::empty(py);
+                                let iter = task_def.call_method1(
+                                    "discover_items",
+                                    (root_py, args),
+                                )?;
+                                for item in iter.try_iter()? {
+                                    py_list.append(item?)?;
+                                }
+                                extract_binaries(&py_list)
+                            });
+                            let discovered = match discovered {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "task.discover_items raised during \
+                                         setup-promote; aborting secondary"
+                                    );
+                                    break;
+                                }
+                            };
+                            tracing::info!(
+                                tasks = discovered.len(),
+                                "setup-promote discovery complete; \
+                                 ingesting into Rust core"
+                            );
+                            if let Err(e) = secondary
+                                .ingest_setup_discovery(
+                                    discovered,
+                                    phase_deps_for_ingest.clone(),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    error = %e,
+                                    "ingest_setup_discovery failed; aborting secondary"
+                                );
+                                break;
+                            }
+                            // Loop continues; the next
+                            // `run_until_setup_or_done` call short-
+                            // circuits the setup handshake (its
+                            // `setup_phase_completed` latch is true)
+                            // and re-enters `process_tasks` directly.
+                        }
                     }
                 }
 
