@@ -279,6 +279,73 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         Ok(())
     }
 
+    /// Setup-defer mode handshake (replaces `perform_initial_assignment`
+    /// when the submitter has chosen to delegate task discovery + ledger
+    /// seed to the chosen secondary). Emits one degenerate
+    /// `InitialAssignment` per connected secondary — empty `zip_files`,
+    /// empty `workers_ready`, empty `staged_files`, `pre_staged_mode =
+    /// true`, `uses_file_based_items` carried through — so each
+    /// secondary's `wait_for_setup` loop sees the expected
+    /// PeerInfo + InitialAssignment + TransferComplete triple and falls
+    /// through to operational mode. The chosen-secondary's
+    /// `PromotePrimary { required_setup: true }` (broadcast by
+    /// `lifecycle::promote_primary`) is the discriminator that flips
+    /// the post-handshake secondary into setup-pending mode instead of
+    /// the usual hydrate-from-cluster-state path.
+    ///
+    /// Also performs the InitialAssigning → Operational typestate
+    /// transition and seeds the per-secondary keepalive clock — the
+    /// same bookkeeping `perform_initial_assignment` does on the legacy
+    /// path. Without those, the local primary's heartbeat monitor
+    /// would never observe its secondaries as `Operational` (it gates
+    /// dead-detection on that variant) and post-demote keepalive
+    /// timestamps would start unset.
+    ///
+    /// No pool / worker allocation: in setup-defer mode the local
+    /// primary's `all_binaries` is empty, no `self.workers` are built,
+    /// and assignment decisions are deferred to the promoted secondary
+    /// after it broadcasts its `TaskAdded` mutations.
+    pub(super) async fn emit_setup_defer_handshake(&mut self) -> Result<(), String> {
+        tracing::info!("emitting setup-defer handshake (empty InitialAssignment per secondary)");
+
+        let mut secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
+        secondary_ids.sort();
+
+        for secondary_id in &secondary_ids {
+            let msg = DistributedMessage::InitialAssignment {
+                sender_id: self.config.node_id.clone(),
+                timestamp: timestamp_now(),
+                secondary_id: secondary_id.clone(),
+                zip_files: Vec::new(),
+                workers_ready: Vec::new(),
+                staged_files: Vec::new(),
+                pre_staged_mode: true,
+                uses_file_based_items: self.config.uses_file_based_items,
+            };
+            self.transport.send_to(secondary_id, msg).await?;
+        }
+
+        // InitialAssigning → Operational + seed keepalive, identical to
+        // the legacy `perform_initial_assignment` tail. The connection
+        // states must reach Operational so the heartbeat monitor (which
+        // gates dead-detection on this variant) can observe per-secondary
+        // liveness from this point onward.
+        for secondary_id in &secondary_ids {
+            if let Some(state) = self.secondaries.remove(secondary_id) {
+                let new_state = match state {
+                    SecondaryConnectionState::InitialAssigning(conn) => {
+                        SecondaryConnectionState::Operational(conn.assignments_sent())
+                    }
+                    other => other,
+                };
+                self.secondaries.insert(secondary_id.clone(), new_state);
+            }
+            self.seed_keepalive(secondary_id);
+        }
+
+        Ok(())
+    }
+
     // ── Phase 6: Transfer Complete ──
 
 }

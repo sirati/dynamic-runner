@@ -645,9 +645,44 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// the accounting side.
     pub(super) async fn handle_cluster_mutation(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+            // Note whether any TaskAdded rides in this batch BEFORE
+            // moving the mutations into apply. Only `TaskAdded` grows
+            // the cluster ledger; refreshing `total_tasks` for any
+            // other variant would be a wasted read on the hot terminal-
+            // mutation path (TaskCompleted / TaskFailed).
+            let has_task_added = mutations
+                .iter()
+                .any(|m| matches!(m, ClusterMutation::TaskAdded { .. }));
             for m in mutations {
                 self.mirror_mutation_to_accounting(&m);
                 self.cluster_state.apply(m);
+            }
+            if has_task_added {
+                // Refresh from the post-apply CRDT view. In setup-defer
+                // mode the demoted submitter starts with
+                // `total_tasks = 0` (no local `all_binaries`, no
+                // `seed_cluster_state` ever ran on this node) and only
+                // learns the run's task count from the promoted
+                // secondary's broadcast `TaskAdded` batch; without
+                // this refresh the operational-loop exit check
+                // (`completed + failed >= total_tasks`) trips at
+                // `0 + 0 >= 0` the moment the demoted primary enters
+                // the loop — before the chosen secondary has
+                // broadcast its first TaskAdded — and the local
+                // primary exits prematurely, taking the whole run
+                // down with it.
+                //
+                // Legacy bootstrap path: `total_tasks` was set in
+                // `run()` from `binaries.len()` before any mutation is
+                // mirrored. The local `seed_cluster_state` batch
+                // applies to the same count, so `task_count()`
+                // converges to the same value the field already
+                // holds — the refresh is a no-op write. Idempotent
+                // against duplicate-Add via the CRDT's presence
+                // semantics: re-applying a TaskAdded for a hash
+                // already in the ledger leaves `task_count`
+                // unchanged.
+                self.total_tasks = self.cluster_state.task_count();
             }
         }
     }
@@ -661,6 +696,9 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// counter check ignores, `PrimaryChanged` / `PhaseDepsSet` are
     /// orthogonal, and `RunComplete` flows through `cluster_state`'s
     /// own `run_complete` flag which the loop reads separately.
+    /// (`total_tasks` is refreshed by the caller — see
+    /// `handle_cluster_mutation` — after the batch applies, not per
+    /// mutation here.)
     ///
     /// Terminal mutations preserve the same single-bucket invariant
     /// `handle_task_complete` / `handle_task_failed` enforce: a hash
