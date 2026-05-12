@@ -208,6 +208,22 @@ impl PyPrimaryCoordinator {
         let source_dir = self.source_dir.clone();
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
+        // Load-bearing flip for the setup-deferred run path. When
+        // `--source-already-staged` is set on the submitter (so
+        // `source_pre_staged_root.is_some()`) AND the Python pipeline
+        // has not supplied any pre-discovered binaries (the pipeline
+        // skips its own `task.discover_items` walk in pre-staged mode
+        // and hands an empty list to `run()`), the submitter primary
+        // owes no setup work. The bootstrap `PromotePrimary` it emits
+        // carries `required_setup=true`, and the chosen secondary
+        // runs discovery + ledger-seed on its bind-mounted
+        // `src_network` instead. Either signal alone is insufficient:
+        // an empty-binaries run with `source_pre_staged_root=None` is
+        // a legitimate empty-corpus run, and a non-empty-binaries run
+        // with the staged flag means the pipeline already discovered
+        // and the local primary should seed normally.
+        let required_setup_on_promote =
+            source_pre_staged_root.is_some() && rust_binaries.is_empty();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -312,7 +328,7 @@ impl PyPrimaryCoordinator {
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     source_pre_staged_root,
                     uses_file_based_items,
-                    required_setup_on_promote: false,
+                    required_setup_on_promote,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
                     retry_max_passes: dist_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
