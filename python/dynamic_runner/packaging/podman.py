@@ -57,9 +57,28 @@ logger = logging.getLogger(__name__)
 # root so different projects' caches don't collide.
 DEFAULT_LAYER_CACHE_REL = ".docker-layer-cache.json"
 
-# Path to the nix script that extracts a built image's layer
-# assignment. Resolved relative to the project root at call time.
+# Legacy in-tree location for the layer-assignment extractor
+# script. Used as the fallback when neither the explicit
+# `layer_extractor_script_path` ctor arg nor the
+# `DYNRUNNER_LAYER_EXTRACTOR_SCRIPT` env var is set.
+#
+# Pre-2026-04-29 every consumer kept a copy at
+# `<project_root>/nix/extract-layer-assignment.py`. Then the
+# script moved upstream to nix-docker-layered-image
+# (`pkgs/extract-layer-assignment/extract-layer-assignment.py`)
+# and is now exposed via that flake's `packages.<system>.
+# extract-layer-assignment` derivation and its default overlay.
+# Consumers using the upstream package point at the resolved
+# store path via the explicit arg or the env var below; the
+# legacy convention path is kept so consumers that still ship
+# a vendored copy keep working.
 LAYER_EXTRACTOR_SCRIPT_REL = Path("nix") / "extract-layer-assignment.py"
+
+# Env var consumers set to point at the upstream
+# `extract-layer-assignment` script. Resolution order in
+# `_resolve_layer_extractor_script`: explicit ctor arg →
+# env var → legacy in-tree path → not found.
+LAYER_EXTRACTOR_ENV_VAR = "DYNRUNNER_LAYER_EXTRACTOR_SCRIPT"
 
 # Env var name read by flake.nix's previousAssignment hook.
 LAYER_CACHE_ENV_VAR = "NIX_DOCKER_LAYER_CACHE"
@@ -108,6 +127,7 @@ class PodmanPackaging:
         *,
         layered_transfer: bool = True,
         layer_cache_path: Path | str | None = None,
+        layer_extractor_script_path: Path | str | None = None,
     ) -> None:
         self.deployment = deployment
         # Layered transfer is opt-out (defaults on). Disable for
@@ -118,6 +138,17 @@ class PodmanPackaging:
         # at build time. Pass an explicit path (or False to disable
         # entirely) to override.
         self._layer_cache_path = layer_cache_path
+        # Absolute path to the layer-assignment extractor script.
+        # Resolution order in `_resolve_layer_extractor_script`:
+        #   1. this explicit arg (when set)
+        #   2. `DYNRUNNER_LAYER_EXTRACTOR_SCRIPT` env var
+        #   3. legacy `<project_root>/nix/extract-layer-assignment.py`
+        # Consumers using the upstream `nix-docker-layered-image`
+        # flake set this to the resolved store path (e.g. via
+        # `pkgs.extract-layer-assignment.outPath + "/bin/..."` in
+        # their flake / dispatch wrapper). See module-level
+        # `LAYER_EXTRACTOR_ENV_VAR` doc for the env-var alternative.
+        self._layer_extractor_script_path = layer_extractor_script_path
 
     @property
     def image_name(self) -> str:
@@ -144,6 +175,40 @@ class PodmanPackaging:
         if self._layer_cache_path is None:
             return local_project_root / DEFAULT_LAYER_CACHE_REL
         return Path(self._layer_cache_path)
+
+    def _resolve_layer_extractor_script(
+        self, local_project_root: Path
+    ) -> Path | None:
+        """Resolve the absolute path to the layer-assignment
+        extractor script. Returns None when no plausible path is
+        configured — caller (`_refresh_layer_cache`) treats that as
+        "skip cache refresh, next build is cold".
+
+        Resolution order:
+          1. The `layer_extractor_script_path` ctor arg (when set).
+             Wins unconditionally — consumers that know exactly
+             where their script lives pass this.
+          2. The `DYNRUNNER_LAYER_EXTRACTOR_SCRIPT` env var. Lets a
+             consumer point at the upstream nix-docker-layered-image
+             store path via its flake / dispatch wrapper without
+             threading the value through every framework
+             construction call.
+          3. The legacy in-tree convention
+             `<project_root>/nix/extract-layer-assignment.py`.
+             Pre-2026-04-29 every consumer kept a vendored copy
+             there; consumers that still ship one keep working.
+
+        Existence is checked by the caller — this method just
+        returns the resolved Path. Returning None (no configured
+        path at all) is a separate signal from "configured but
+        missing" so the warning is specific.
+        """
+        if self._layer_extractor_script_path is not None:
+            return Path(self._layer_extractor_script_path)
+        env = os.environ.get(LAYER_EXTRACTOR_ENV_VAR)
+        if env:
+            return Path(env)
+        return local_project_root / LAYER_EXTRACTOR_SCRIPT_REL
 
     def _build_nix_target(self, local_project_root: Path, target: str, out_link: str) -> Path:
         """Build a nix target. If a layer-assignment cache from a
@@ -209,12 +274,21 @@ class PodmanPackaging:
         temp + rename so an interrupted refresh can't leave a
         half-written cache that breaks the next build.
         """
-        extractor = local_project_root / LAYER_EXTRACTOR_SCRIPT_REL
-        if not extractor.exists():
+        extractor = self._resolve_layer_extractor_script(local_project_root)
+        if extractor is None or not extractor.exists():
             logger.warning(
                 "Layer extractor not found at %s; skipping cache refresh. "
-                "Next build will be cold.",
+                "Next build will be cold (full ~1.5GB re-upload on cache "
+                "miss). The script moved upstream to nix-docker-layered-image "
+                "(pkgs.extract-layer-assignment) post-2026-04-29; consumers "
+                "using that flake point at the resolved store path via the "
+                "%s env var or `layer_extractor_script_path=` ctor arg on "
+                "PodmanPackaging. The legacy in-tree path "
+                "`%s/nix/extract-layer-assignment.py` is checked as a "
+                "fallback for consumers that vendor a copy.",
                 extractor,
+                LAYER_EXTRACTOR_ENV_VAR,
+                local_project_root,
             )
             return
 
