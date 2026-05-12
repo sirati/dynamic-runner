@@ -66,13 +66,31 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         if mutations.is_empty() {
             return;
         }
-        for m in &mutations {
-            self.cluster_state.apply(m.clone());
+        // Apply locally and keep only mutations the CRDT actually
+        // changed state for. Pre-fix every mutation was re-broadcast
+        // unconditionally; under #50's peer-forwarding redundancy
+        // (every peer secondary forwards observed-via-peer-mesh
+        // terminal events to the primary), that would amplify each
+        // unique TaskComplete into N re-broadcasts to N secondaries
+        // = N² messages per event. The CRDT's terminal-lock semantics
+        // turn duplicate applies into NoOp; skipping the NoOp arm
+        // keeps the wire fan-out at one broadcast per genuinely-new
+        // state transition regardless of how many peer-forward
+        // paths converge on us.
+        let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
+        for m in mutations {
+            let outcome = self.cluster_state.apply(m.clone());
+            if outcome == crate::cluster_state::ApplyOutcome::Applied {
+                applied.push(m);
+            }
+        }
+        if applied.is_empty() {
+            return;
         }
         let msg = DistributedMessage::ClusterMutation {
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
-            mutations,
+            mutations: applied,
         };
         if let Err(failures) = self.transport.broadcast(msg).await {
             for (secondary_id, error) in &failures {
