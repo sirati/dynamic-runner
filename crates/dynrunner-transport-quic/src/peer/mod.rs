@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, Router};
+use dynrunner_protocol_primary_secondary::{
+    new_role_cache, DistributedMessage, PeerConnectionInfo, RoleCache, Router,
+};
 use tokio::sync::mpsc;
 
 use crate::certs::CertPair;
@@ -91,6 +93,19 @@ pub struct PeerNetwork<I: Identifier> {
     /// the tracker stays an implementation detail; callers don't
     /// see (or depend on) the milestone schedule directly.
     pub(super) reconnect_tracker: reconnect::ReconnectTracker,
+    /// Write-through cache of `Role → peer_id` populated by the
+    /// hook registered via
+    /// [`dynrunner_protocol_primary_secondary::PeerTransport::register_with_cluster_state`].
+    /// Read on the send hot path by `peer_for_role`. `Arc<RwLock<_>>`
+    /// so the hook (`'static` closure stored on `ClusterState`)
+    /// shares mutation with the transport's reads; see
+    /// `dynrunner_protocol_primary_secondary::install_role_change_hook`
+    /// for the lock-poisoning recovery rationale.
+    ///
+    /// Visibility is `pub(super)` because the `transport_impl.rs`
+    /// `PeerTransport` impl needs to read it; production callers
+    /// reach the same value through `PeerTransport::peer_for_role`.
+    pub(super) role_cache: RoleCache,
 }
 
 impl<I: Identifier> PeerNetwork<I> {
@@ -174,6 +189,7 @@ impl<I: Identifier> PeerNetwork<I> {
             peer_dial_info: HashMap::new(),
             reconnect_tick_rx: Some(reconnect_tick_rx),
             reconnect_tracker: reconnect::ReconnectTracker::new(),
+            role_cache: new_role_cache(),
         })
     }
 

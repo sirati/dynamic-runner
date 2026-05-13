@@ -17,7 +17,9 @@
 //! socket, no QUIC accept loops.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerConnectionInfo, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerConnectionInfo, PeerTransport, Role, RoleChangeHookRegistrar,
+};
 
 use super::{NoPeerTransport, PeerNetwork};
 
@@ -76,6 +78,25 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
         match self {
             Self::Real(p) => <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(p, peers).await,
             Self::Disabled(p) => PeerTransport::<I>::connect_to_peers(p, peers).await,
+        }
+    }
+
+    fn register_with_cluster_state(&self, registrar: &mut dyn RoleChangeHookRegistrar) {
+        // Forward to the inner arm. `NoPeerTransport` keeps the
+        // trait default (no-op): a disabled peer overlay has no
+        // cache to populate, and `peer_for_role` will keep
+        // returning `None` on that side — the safe answer for
+        // single-secondary deployments.
+        match self {
+            Self::Real(p) => PeerTransport::<I>::register_with_cluster_state(p, registrar),
+            Self::Disabled(p) => PeerTransport::<I>::register_with_cluster_state(p, registrar),
+        }
+    }
+
+    fn peer_for_role(&self, role: &Role) -> Option<String> {
+        match self {
+            Self::Real(p) => PeerTransport::<I>::peer_for_role(p, role),
+            Self::Disabled(p) => PeerTransport::<I>::peer_for_role(p, role),
         }
     }
 }

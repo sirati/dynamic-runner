@@ -20,9 +20,12 @@
 //! late `TaskAssigned` arrives next.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
-use dynrunner_protocol_primary_secondary::ClusterMutation;
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, RoleChangeHookRegistrar, RoleTable,
+};
 use serde::{Deserialize, Serialize};
 
 /// Per-task state in the replicated ledger.
@@ -77,8 +80,17 @@ pub struct StateCounts {
     pub failed: usize,
 }
 
+/// Callback fired (synchronously, inside `apply`) after the
+/// [`RoleTable`] mutates. Stored on `ClusterState`; the
+/// [`crate::transport`]-layer write-through cache is the single
+/// expected registrant in production. Boxed `Fn` so multiple
+/// independent observers can coexist if a future feature needs them
+/// (Vec storage is future-proof at trivial cost — one hook is enough
+/// today). The callback receives a borrow of the *post*-mutation
+/// table; never the pre-mutation snapshot.
+pub type RoleChangeHook = Arc<dyn Fn(&RoleTable) + Send + Sync + 'static>;
+
 /// The replicated cluster-state CRDT.
-#[derive(Debug, Clone)]
 pub struct ClusterState<I> {
     tasks: HashMap<String, TaskState<I>>,
     current_primary: Option<String>,
@@ -94,6 +106,59 @@ pub struct ClusterState<I> {
     /// exit. Read by the secondary's operational loop to break out
     /// even when peers haven't disconnected.
     run_complete: bool,
+    /// Replicated role bookkeeping. Updated in lockstep with
+    /// `current_primary` on every `PrimaryChanged` apply so the
+    /// transport-layer cache (registered via `role_change_hooks`)
+    /// always observes a coherent snapshot.
+    role_table: RoleTable,
+    /// Hooks fired AFTER a `RoleTable` mutation. The cluster_state
+    /// owns the hooks; transports register their write-through
+    /// cache here at construction time. Stored as `Vec` for future-
+    /// proofing — a single registrant covers today's `PeerTransport`
+    /// cache use case.
+    ///
+    /// Skipped from `Clone` (and reset on snapshot/restore paths): a
+    /// cloned `ClusterState` is conceptually a separate replica and
+    /// has no transport attached, so carrying the source replica's
+    /// hooks would fire a remote transport's cache from a state it
+    /// does not own. Tests that need hooks on a cloned state must
+    /// re-register on the clone.
+    role_change_hooks: Vec<RoleChangeHook>,
+}
+
+impl<I> Clone for ClusterState<I>
+where
+    I: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            tasks: self.tasks.clone(),
+            current_primary: self.current_primary.clone(),
+            primary_epoch: self.primary_epoch,
+            phase_deps: self.phase_deps.clone(),
+            run_complete: self.run_complete,
+            role_table: self.role_table.clone(),
+            // Deliberately not cloned — see field doc.
+            role_change_hooks: Vec::new(),
+        }
+    }
+}
+
+impl<I> std::fmt::Debug for ClusterState<I>
+where
+    I: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterState")
+            .field("tasks", &self.tasks)
+            .field("current_primary", &self.current_primary)
+            .field("primary_epoch", &self.primary_epoch)
+            .field("phase_deps", &self.phase_deps)
+            .field("run_complete", &self.run_complete)
+            .field("role_table", &self.role_table)
+            .field("role_change_hooks", &self.role_change_hooks.len())
+            .finish()
+    }
 }
 
 impl<I> Default for ClusterState<I> {
@@ -104,6 +169,8 @@ impl<I> Default for ClusterState<I> {
             primary_epoch: 0,
             phase_deps: HashMap::new(),
             run_complete: false,
+            role_table: RoleTable::default(),
+            role_change_hooks: Vec::new(),
         }
     }
 }
@@ -235,6 +302,29 @@ impl<I: Identifier> ClusterState<I> {
         &self.phase_deps
     }
 
+    /// Snapshot of the replicated [`RoleTable`]. Borrowed for the
+    /// lifetime of `&self`; callers wanting an owned copy should
+    /// `.clone()` the returned reference. The transport-side
+    /// write-through cache (registered via the
+    /// [`RoleChangeHookRegistrar`] impl) is the expected reader on
+    /// the hot path — `role_table()` is for cluster-state inspect
+    /// callers like tests / metrics.
+    pub fn role_table(&self) -> &RoleTable {
+        &self.role_table
+    }
+
+    /// Fire every registered hook against the current [`RoleTable`].
+    /// Invoked from `apply` immediately AFTER any mutation that
+    /// touches the table, so registrants see post-state values.
+    /// Private — `apply` is the only legitimate caller; external
+    /// triggering would let a hook fire on a state it does not
+    /// describe.
+    fn fire_role_change_hooks(&self) {
+        for hook in &self.role_change_hooks {
+            hook(&self.role_table);
+        }
+    }
+
     /// Take a snapshot of the whole state. The snapshot is a deep
     /// clone — applying further mutations to `self` after this call
     /// does not affect the returned snapshot. Used as the response
@@ -276,7 +366,16 @@ impl<I: Identifier> ClusterState<I> {
         }
         if snap.primary_epoch > self.primary_epoch {
             self.primary_epoch = snap.primary_epoch;
-            self.current_primary = snap.current_primary;
+            self.current_primary = snap.current_primary.clone();
+            // Keep the replicated `RoleTable` in lockstep with
+            // `current_primary` even when the new value lands via
+            // the snapshot-merge path (late joiner / reconnect),
+            // not just via live `PrimaryChanged` mutations. The
+            // role-change hook fires AFTER the table update so any
+            // registered write-through cache stays coherent with
+            // the post-merge state.
+            self.role_table.primary = snap.current_primary;
+            self.fire_role_change_hooks();
         }
         if self.phase_deps.is_empty() {
             self.phase_deps = snap.phase_deps;
@@ -361,8 +460,15 @@ impl<I: Identifier> ClusterState<I> {
                 if epoch == self.primary_epoch && self.current_primary.as_deref() == Some(&new) {
                     return ApplyOutcome::NoOp;
                 }
-                self.current_primary = Some(new);
+                self.current_primary = Some(new.clone());
                 self.primary_epoch = epoch;
+                // Replicated `RoleTable` mutation: kept in lockstep
+                // with `current_primary` so the transport-layer
+                // write-through cache (Step 2) observes a coherent
+                // snapshot. Hook fires AFTER the field update, so
+                // registrants see the post-mutation value.
+                self.role_table.primary = Some(new);
+                self.fire_role_change_hooks();
                 ApplyOutcome::Applied
             }
             ClusterMutation::PhaseDepsSet { deps } => {
@@ -389,6 +495,23 @@ impl<I: Identifier> ClusterState<I> {
     /// when the peer mesh is still up but the run is genuinely over.
     pub fn run_complete(&self) -> bool {
         self.run_complete
+    }
+}
+
+/// `ClusterState` is the authoritative role-table owner; transports
+/// register their write-through cache through this boundary trait.
+///
+/// The implementation appends to the internal `Vec<RoleChangeHook>`;
+/// hooks accumulate across calls and are fired (in registration
+/// order) by `apply` whenever a mutation actually changes the table.
+/// Today the only registrant is the `PeerTransport` write-through
+/// cache, one per node.
+impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
+    fn register_role_change_hook(
+        &mut self,
+        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
+    ) {
+        self.role_change_hooks.push(Arc::from(hook));
     }
 }
 
@@ -873,5 +996,124 @@ mod tests {
         let counts_once = joiner.counts();
         joiner.restore(snap);
         assert_eq!(joiner.counts(), counts_once);
+    }
+
+    // ── RoleTable + role-change hook tests ──
+    //
+    // These pin the Step 2 contract: every `PrimaryChanged` that
+    // returns `Applied` mutates the replicated `RoleTable` AND fires
+    // every registered hook against the post-mutation table — never
+    // the pre-mutation snapshot. NoOp paths (lower epoch, same value
+    // at same epoch) must NOT fire hooks; otherwise a transport-side
+    // cache could observe spurious updates on idempotent re-delivery.
+
+    /// `PrimaryChanged` mutation updates the replicated `RoleTable`
+    /// in lockstep with `current_primary`. Pins the cross-field
+    /// invariant the transport-side cache will rely on.
+    #[test]
+    fn role_table_updates_on_primary_changed() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert_eq!(s.role_table().primary, None);
+
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-2".into(),
+            epoch: 1,
+        });
+        assert_eq!(s.role_table().primary, Some("sec-2".to_string()));
+
+        // Higher epoch wins → table tracks the new holder.
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-7".into(),
+            epoch: 5,
+        });
+        assert_eq!(s.role_table().primary, Some("sec-7".to_string()));
+
+        // Lower epoch is a NoOp and must NOT regress the table.
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-stale".into(),
+            epoch: 2,
+        });
+        assert_eq!(s.role_table().primary, Some("sec-7".to_string()));
+    }
+
+    /// Hook callbacks fire AFTER each `Applied` `PrimaryChanged`,
+    /// observing the post-mutation `RoleTable`. NoOp applies (lower
+    /// epoch / duplicate at same epoch) must NOT fire the hook —
+    /// the transport cache would otherwise see spurious updates on
+    /// idempotent re-delivery and could trigger needless cache
+    /// invalidation downstream.
+    #[test]
+    fn role_change_hook_fires_after_apply() {
+        use std::sync::Mutex;
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let observed: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = Arc::clone(&observed);
+            s.register_role_change_hook(Box::new(move |table: &RoleTable| {
+                observed.lock().unwrap().push(table.primary.clone());
+            }));
+        }
+
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 1,
+        });
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-b".into(),
+            epoch: 2,
+        });
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-c".into(),
+            epoch: 3,
+        });
+
+        // Three Applied mutations → three callback fires, in order.
+        let obs = observed.lock().unwrap().clone();
+        assert_eq!(
+            obs,
+            vec![
+                Some("sec-a".to_string()),
+                Some("sec-b".to_string()),
+                Some("sec-c".to_string())
+            ],
+        );
+
+        // A NoOp re-delivery (same holder at same epoch) does NOT
+        // fire the hook.
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "sec-c".into(),
+            epoch: 3,
+        });
+        let obs_after_noop = observed.lock().unwrap().clone();
+        assert_eq!(obs_after_noop.len(), 3, "NoOp must not fire hook");
+    }
+
+    /// `restore` going through the snapshot-merge path also mutates
+    /// the `RoleTable` AND fires hooks when `current_primary` flips.
+    /// Pins the late-joiner / reconnect path; without this, a node
+    /// that learns its first primary identity via snapshot RPC
+    /// would leave the transport cache stuck at `None`.
+    #[test]
+    fn role_change_hook_fires_on_restore_when_primary_advances() {
+        use std::sync::Mutex;
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        let observed: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = Arc::clone(&observed);
+            joiner.register_role_change_hook(Box::new(move |table: &RoleTable| {
+                observed.lock().unwrap().push(table.primary.clone());
+            }));
+        }
+
+        let mut peer = ClusterState::<RunnerIdentifier>::new();
+        peer.apply(ClusterMutation::PrimaryChanged {
+            new: "lead".into(),
+            epoch: 7,
+        });
+        joiner.restore(peer.snapshot());
+
+        assert_eq!(joiner.role_table().primary, Some("lead".to_string()));
+        let obs = observed.lock().unwrap().clone();
+        assert_eq!(obs, vec![Some("lead".to_string())]);
     }
 }

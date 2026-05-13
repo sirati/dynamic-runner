@@ -9,6 +9,15 @@
 //! the transport-unification refactor lands its role-resolution cache
 //! (Step 2) and `Role(_)` dispatch (Step 3).
 //!
+//! [`RoleTable`] and [`RoleChangeHookRegistrar`] live here too because
+//! they are the role-vocabulary's *replicated state* shape — they
+//! describe **who holds which role** in a form that transports can
+//! mirror without depending on the manager-distributed crate (which
+//! owns the actual replication mechanics via `ClusterState`). The
+//! registrar trait is the boundary `ClusterState` implements; the
+//! `PeerTransport` impl on each node uses it to subscribe a write-
+//! through cache.
+//!
 //! # Design decisions
 //!
 //! - **Runtime enum, not type-system parameter.** The address is
@@ -78,6 +87,115 @@ pub enum Address {
     Role(Role),
     /// Fan out to a scope of peers.
     Broadcast(Scope),
+}
+
+/// Replicated role bookkeeping. The authoritative owner is the
+/// downstream `ClusterState`; transports keep a write-through cache
+/// populated via [`RoleChangeHookRegistrar::register_role_change_hook`].
+///
+/// `observers` is reserved for the future observer story (Steps 7–9
+/// of the unification refactor); no current mutation populates it.
+/// Keeping the field present here means the cache + registrar API
+/// shapes stay stable when `Role::Observer` lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleTable {
+    pub primary: Option<String>,
+    pub observers: std::collections::HashSet<String>,
+}
+
+/// Boundary trait that downstream replicated-state owners implement
+/// so transports can attach a write-through cache without depending
+/// on the manager crate's concrete `ClusterState`. The single
+/// implementer in production is `dynrunner_manager_distributed::
+/// ClusterState`; test fixtures may also implement it.
+///
+/// The trait deliberately exposes only **hook registration** — not
+/// table read access. Readers go through the transport's cache
+/// (lock-free hot path) or through `ClusterState::role_table()`
+/// directly. This way the trait stays a one-method boundary that
+/// doesn't leak the replicated-state internals to the protocol
+/// crate.
+pub trait RoleChangeHookRegistrar {
+    /// Register a callback fired (synchronously, from inside the
+    /// state's apply loop) AFTER any [`RoleTable`] mutation. The
+    /// callback observes the *post*-mutation table.
+    ///
+    /// Hooks accumulate; implementers must NOT clear prior
+    /// registrants. Today the only registrant is the `PeerTransport`
+    /// write-through cache (one per node).
+    fn register_role_change_hook(
+        &mut self,
+        hook: Box<dyn Fn(&RoleTable) + Send + Sync + 'static>,
+    );
+}
+
+// ── Shared write-through cache plumbing for PeerTransport impls ──
+//
+// Every `PeerTransport` impl that owns a role cache uses the same
+// `Arc<RwLock<HashMap<Role, String>>>` shape, the same hook body,
+// and the same read helper. Pulling the trio into the protocol
+// crate prevents drift between the QUIC, channel, and future
+// `EitherPeerTransport` paths: a bug fixed here lands everywhere.
+
+/// Shared `Role → peer_id` write-through cache, populated by the
+/// hook installed via [`install_role_change_hook`] and read on the
+/// send hot path via [`read_role_cache`].
+///
+/// `Arc<RwLock<...>>` so the hook (`Send + Sync + 'static` closure
+/// stored on the registrar / `ClusterState`) can mutate the same
+/// map the transport reads. The map stays small (at most
+/// `Role`-cardinality entries) so RwLock contention is negligible;
+/// the registration happens once at coordinator construct time and
+/// the read path is cache-style — lock, clone the `String`,
+/// release.
+pub type RoleCache = std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Role, String>>>;
+
+/// Construct an empty role cache. Convenience constructor so
+/// transport impls don't need to thread the `Arc::new(RwLock::new(
+/// HashMap::new()))` boilerplate at every `new`-style entry point.
+pub fn new_role_cache() -> RoleCache {
+    std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Install a hook on the registrar that writes through to the
+/// cache. The hook captures a strong `Arc<RwLock<_>>` handle to the
+/// cache; both the transport and the hook hold one, so the cache
+/// outlives whichever side drops first. When the registrar is
+/// dropped the hook is dropped — releasing the registrar's
+/// `Arc<RoleCache>` handle — and the transport's handle keeps the
+/// cache alive for as long as the transport itself lives.
+///
+/// `Role::Primary` is the only role today (per `Role` enum:
+/// `Self_` is a sender-side intent, not a holder). Observers will
+/// land here when Step 7+ populates `RoleTable::observers`.
+pub fn install_role_change_hook(cache: RoleCache, registrar: &mut dyn RoleChangeHookRegistrar) {
+    registrar.register_role_change_hook(Box::new(move |table: &RoleTable| {
+        let mut guard = match cache.write() {
+            Ok(g) => g,
+            // Lock poisoning means a hook panicked mid-write on a
+            // prior call. Recovering the inner map is the right
+            // call: we'd rather take the latest write-through over
+            // a stale prior value than block the apply loop on an
+            // unrecoverable state.
+            Err(p) => p.into_inner(),
+        };
+        guard.remove(&Role::Primary);
+        if let Some(ref id) = table.primary {
+            guard.insert(Role::Primary, id.clone());
+        }
+    }));
+}
+
+/// Lock the cache and clone out the holder id for `role`. Wraps
+/// the `RwLock::read` + `Option::cloned` dance so every transport
+/// impl produces the same observable result. On lock poisoning we
+/// recover the inner — same rationale as the hook write path.
+pub fn read_role_cache(cache: &RoleCache, role: &Role) -> Option<String> {
+    let guard = match cache.read() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard.get(role).cloned()
 }
 
 #[cfg(test)]
