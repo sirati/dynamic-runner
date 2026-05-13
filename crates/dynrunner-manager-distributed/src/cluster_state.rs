@@ -392,6 +392,42 @@ impl<I: Identifier> ClusterState<I> {
     }
 }
 
+/// Apply each mutation to `state` locally and return the subset that
+/// actually changed state (`ApplyOutcome::Applied`). `NoOp` mutations
+/// are dropped — under the CRDT's idempotency contract a re-application
+/// against the post-state is silent, and re-broadcasting a NoOp would
+/// amplify under peer-forward redundancy (every peer forwarding observed
+/// terminal events to the primary would turn one TaskComplete into N
+/// re-broadcasts = N² messages).
+///
+/// Single concern: apply-locally + filter to applied. The broadcast
+/// step is transport-specific (primary uses `SecondaryTransport`,
+/// promoted-secondary uses `PeerTransport`; the two have different
+/// error shapes) so it stays at the call site. This free function is
+/// the canonical place to perform the apply+filter so the two
+/// originator paths can't drift on the filter semantics.
+///
+/// Callers:
+///   - `primary::lifecycle::apply_and_broadcast_cluster_mutations`
+///     (the live primary's originator path).
+///   - `secondary::primary::apply_and_broadcast_mutations` (the
+///     promoted-secondary's originator path, used by
+///     `ingest_setup_discovery` to seed the ledger with the
+///     discovery-time `TaskAdded` batch + `PhaseDepsSet`).
+pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
+    state: &mut ClusterState<I>,
+    mutations: Vec<ClusterMutation<I>>,
+) -> Vec<ClusterMutation<I>> {
+    let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
+    for m in mutations {
+        let outcome = state.apply(m.clone());
+        if outcome == ApplyOutcome::Applied {
+            applied.push(m);
+        }
+    }
+    applied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

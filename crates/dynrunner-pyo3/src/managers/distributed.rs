@@ -46,6 +46,18 @@ pub(crate) struct PyDistributedManager {
     /// PyO3 getter so the Python in-process distributed entrypoint
     /// can include it in the result dict.
     stranded: u32,
+    /// Pre-staged-source mode (`--source-already-staged`) signal.
+    /// Mirrors `PyPrimaryCoordinator.source_pre_staged_root`: when
+    /// `Some`, the submitter has no local view of the corpus and
+    /// the `_dispatch_single_process` helper has handed us an empty
+    /// `binaries` list on purpose. The primary's bootstrap
+    /// `PromotePrimary` then carries `required_setup=true` so the
+    /// chosen secondary runs discovery + ledger-seed on its bind-
+    /// mounted source root. Threaded through to `PrimaryConfig`
+    /// uniformly with the SLURM / network-primary paths so
+    /// `--source-already-staged` works in every multi-computer mode
+    /// without per-caller special casing.
+    source_pre_staged_root: Option<PathBuf>,
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B). The
     /// distributed in-process pipeline drives a primary; secondaries
@@ -69,6 +81,7 @@ impl PyDistributedManager {
         worker_spec = None,
         distributed_config = None,
         max_resources_per_secondary = None,
+        source_pre_staged_root = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -84,6 +97,7 @@ impl PyDistributedManager {
         worker_spec: Option<WorkerSpec>,
         distributed_config: Option<DistributedConfig>,
         max_resources_per_secondary: Option<PyResourceMap>,
+        source_pre_staged_root: Option<PathBuf>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -123,6 +137,7 @@ impl PyDistributedManager {
             completed: 0,
             failed: 0,
             stranded: 0,
+            source_pre_staged_root,
             task_definition: task_definition.clone().unbind(),
         })
     }
@@ -188,6 +203,21 @@ impl PyDistributedManager {
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         let phase_deps = self.phase_deps.clone();
+        let source_pre_staged_root = self.source_pre_staged_root.clone();
+        // Pre-staged mode: the submitter has no local view of the
+        // staged corpus, so `_dispatch_single_process` handed us an
+        // empty binaries list and the bootstrap `PromotePrimary` must
+        // tell the chosen secondary to run discovery + ledger-seed on
+        // its bind-mounted `src_network`. The Python dispatch layer is
+        // the single source of truth for "binaries empty" here — when
+        // `source_pre_staged_root.is_some()` the helper has already
+        // ensured the empty-list invariant, so we mirror the
+        // submitter-side pipeline gate without re-checking on the
+        // binaries (the `PyPrimaryCoordinator::run` gate that pairs
+        // `is_some()` with `binaries.is_empty()` defends against the
+        // SLURM pipeline path where binaries may legitimately be non-
+        // empty; that case does not exist for the in-process manager).
+        let required_setup_on_promote = source_pre_staged_root.is_some();
 
         // Phase 5B: re-acquire the GIL from the coordinator's LocalSet
         // and dispatch to the Python TaskDefinition's `on_phase_*`
@@ -350,11 +380,21 @@ impl PyDistributedManager {
                     peer_timeout: dist_peer_timeout,
                     keepalive_interval: dist_keepalive,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
-                    // In-process distributed manager doesn't run the
-                    // SLURM packaging pipeline, so pre-staged mode
-                    // doesn't apply here.
-                    source_pre_staged_root: None,
+                    // `--source-already-staged` is a dispatch-layer
+                    // discriminator, not a SLURM-only signal: the
+                    // Python `_dispatch_single_process` helper threads
+                    // `args.source_already_staged` into the
+                    // constructor's `source_pre_staged_root` kwarg, we
+                    // hoist it onto the PrimaryConfig, and derive
+                    // `required_setup_on_promote` from
+                    // `source_pre_staged_root.is_some()`. The dispatch
+                    // helper has already returned an empty
+                    // `binaries` list in pre-staged mode, so the
+                    // chosen secondary owns the discovery + ledger-
+                    // seed via the bootstrap `PromotePrimary`.
+                    source_pre_staged_root: source_pre_staged_root.clone(),
                     uses_file_based_items,
+                    required_setup_on_promote,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
                     retry_max_passes: dist_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),

@@ -1,17 +1,78 @@
 //! Rust-driven directory traversal with a generic visitor.
 //!
-//! The [`Filesystem`](dynrunner_gateway::Filesystem) backend supplies the
-//! per-directory listing; the [`Visitor`] decides which subfolders to descend
-//! into and which files to mark for processing. Marks accumulate in the
-//! driver, not in the visitor — visitors stay stateless w.r.t. the result
-//! set and only carry whatever per-subtree context they want via `Payload`.
+//! Reads the local filesystem directly via [`tokio::fs::read_dir`]; the
+//! [`Visitor`] decides which subfolders to descend into and which files to
+//! mark for processing. Marks accumulate in the driver, not in the visitor
+//! — visitors stay stateless w.r.t. the result set and only carry whatever
+//! per-subtree context they want via `Payload`.
 //!
 //! See [`walk`] for the entry point.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use dynrunner_gateway::{DirEntry, Filesystem, FsError};
+/// Internal directory entry — the per-listing intermediate before the
+/// driver splits subfolders from files for the visitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirEntry {
+    File { name: String, size: u64 },
+    Dir { name: String },
+}
+
+impl DirEntry {
+    fn name(&self) -> &str {
+        match self {
+            DirEntry::File { name, .. } | DirEntry::Dir { name } => name.as_str(),
+        }
+    }
+}
+
+/// Read one directory's entries, resolving symlinks (a symlink to a regular
+/// file appears as [`DirEntry::File`], a symlink to a directory as
+/// [`DirEntry::Dir`]), skipping broken symlinks and non-UTF-8 names
+/// silently, and returning entries sorted alphabetically by name.
+///
+/// Lifted from `dynrunner_gateway::local::LocalGateway::list_dir`: the
+/// previous `Filesystem` trait had this same body behind one impl. Since
+/// the SSH-side impl is also being deleted (discovery now always runs on
+/// whichever process owns the data), the trait is gone too.
+async fn list_dir(path: &Path) -> std::io::Result<Vec<DirEntry>> {
+    let mut read = tokio::fs::read_dir(path).await?;
+
+    let mut entries = Vec::new();
+    while let Some(child) = read.next_entry().await? {
+        let name = match child.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "skipping non-UTF-8 entry in directory listing"
+                );
+                continue;
+            }
+        };
+
+        // Follow symlinks (matches the historical Python `Path.is_file()`
+        // semantics). Broken symlinks bubble up as Err here; skip silently.
+        let meta = match tokio::fs::metadata(child.path()).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if meta.is_dir() {
+            entries.push(DirEntry::Dir { name });
+        } else if meta.is_file() {
+            entries.push(DirEntry::File {
+                name,
+                size: meta.len(),
+            });
+        }
+        // Other kinds (sockets, fifos, block/char devices) are ignored.
+    }
+
+    entries.sort_by(|a, b| a.name().cmp(b.name()));
+    Ok(entries)
+}
 
 /// Per-directory subfolder slot handed to the visitor.
 #[derive(Debug, Clone)]
@@ -73,8 +134,8 @@ pub trait Visitor: Send {
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalkError<E> {
-    #[error("filesystem: {0}")]
-    Fs(#[from] FsError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("visitor returned an out-of-bounds {kind} index {index} (len={len}) at {path}")]
     IndexOutOfBounds {
         kind: &'static str,
@@ -86,25 +147,24 @@ pub enum WalkError<E> {
     Visitor(E),
 }
 
-/// Depth-first walk of `root` on `fs`, calling `visitor` once per directory.
+/// Depth-first walk of `root` on the local filesystem, calling `visitor`
+/// once per directory.
 ///
 /// Returns the full list of marked files in visit order (parents before
 /// children, alphabetical among siblings).
-pub async fn walk<F, V>(
-    fs: &F,
-    root: &str,
+pub async fn walk<V>(
+    root: &Path,
     visitor: &mut V,
 ) -> Result<Vec<Marked<V::Payload>>, WalkError<V::Error>>
 where
-    F: Filesystem,
     V: Visitor,
 {
     let mut marked: Vec<Marked<V::Payload>> = Vec::new();
-    let mut stack: Vec<(String, PathBuf, Option<V::Payload>)> = Vec::new();
-    stack.push((root.to_owned(), PathBuf::new(), None));
+    let mut stack: Vec<(PathBuf, PathBuf, Option<V::Payload>)> = Vec::new();
+    stack.push((root.to_path_buf(), PathBuf::new(), None));
 
     while let Some((abs, rel, parent_payload)) = stack.pop() {
-        let listing = fs.list_dir(&abs).await?;
+        let listing = list_dir(&abs).await?;
 
         let mut subfolders: Vec<FolderInfo> = Vec::new();
         let mut files: Vec<FileInfo> = Vec::new();
@@ -127,7 +187,7 @@ where
                     kind: "file",
                     index: idx,
                     len: files.len(),
-                    path: abs.clone(),
+                    path: abs.display().to_string(),
                 })?;
             marked.push(Marked {
                 relative_path: rel.join(&f.name),
@@ -148,13 +208,9 @@ where
                     kind: "folder",
                     index: idx,
                     len: subfolders.len(),
-                    path: abs.clone(),
+                    path: abs.display().to_string(),
                 })?;
-            let child_abs = if abs.ends_with('/') {
-                format!("{abs}{}", d.name)
-            } else {
-                format!("{abs}/{}", d.name)
-            };
+            let child_abs = abs.join(&d.name);
             let child_rel = rel.join(&d.name);
             stack.push((child_abs, child_rel, Some(payload)));
         }
@@ -166,21 +222,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::Mutex;
-
-    struct StubFs {
-        entries: HashMap<String, Vec<DirEntry>>,
-    }
-
-    impl Filesystem for StubFs {
-        async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-            self.entries
-                .get(path)
-                .cloned()
-                .ok_or_else(|| FsError::NotFound(path.to_owned()))
-        }
-    }
 
     /// Visitor that descends into every subfolder, marks every file with its
     /// path, and threads the parent path through `Payload` so we can assert
@@ -226,34 +268,20 @@ mod tests {
         }
     }
 
-    fn fs(entries: &[(&str, Vec<DirEntry>)]) -> StubFs {
-        StubFs {
-            entries: entries
-                .iter()
-                .map(|(p, v)| ((*p).to_owned(), v.clone()))
-                .collect(),
-        }
-    }
-
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn walks_one_level() {
-        let fs = fs(&[(
-            "/root",
-            vec![
-                DirEntry::File {
-                    name: "a.bin".into(),
-                    size: 10,
-                },
-                DirEntry::File {
-                    name: "b.bin".into(),
-                    size: 20,
-                },
-            ],
-        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("a.bin"), vec![0u8; 10])
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("b.bin"), vec![0u8; 20])
+            .await
+            .unwrap();
+
         let mut v = EveryFile {
             seen_payloads: Mutex::new(Vec::new()),
         };
-        let marked = walk(&fs, "/root", &mut v).await.unwrap();
+        let marked = walk(tmp.path(), &mut v).await.unwrap();
         let names: Vec<_> = marked
             .iter()
             .map(|m| m.relative_path.to_string_lossy().to_string())
@@ -263,39 +291,26 @@ mod tests {
         assert_eq!(marked[1].size, 20);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn descends_and_propagates_payload() {
-        let fs = fs(&[
-            (
-                "/root",
-                vec![
-                    DirEntry::Dir { name: "x86".into() },
-                    DirEntry::Dir { name: "x64".into() },
-                    DirEntry::File {
-                        name: "top.bin".into(),
-                        size: 1,
-                    },
-                ],
-            ),
-            (
-                "/root/x86",
-                vec![DirEntry::File {
-                    name: "a.bin".into(),
-                    size: 2,
-                }],
-            ),
-            (
-                "/root/x64",
-                vec![DirEntry::File {
-                    name: "b.bin".into(),
-                    size: 3,
-                }],
-            ),
-        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::create_dir(root.join("x86")).await.unwrap();
+        tokio::fs::create_dir(root.join("x64")).await.unwrap();
+        tokio::fs::write(root.join("top.bin"), vec![0u8; 1])
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("x86/a.bin"), vec![0u8; 2])
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("x64/b.bin"), vec![0u8; 3])
+            .await
+            .unwrap();
+
         let mut v = EveryFile {
             seen_payloads: Mutex::new(Vec::new()),
         };
-        let marked = walk(&fs, "/root", &mut v).await.unwrap();
+        let marked = walk(root, &mut v).await.unwrap();
         let mut names: Vec<_> = marked
             .iter()
             .map(|m| m.relative_path.to_string_lossy().to_string())
@@ -310,17 +325,17 @@ mod tests {
         assert!(seen.contains(&Some("x64".into())));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn skips_unentered_subfolder() {
-        let fs = fs(&[
-            (
-                "/root",
-                vec![DirEntry::Dir {
-                    name: "skip".into(),
-                }],
-            ),
-            // /root/skip not in the stub — would error if walker descended.
-        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Create a subfolder we expect the walker NOT to descend into.
+        // Populate it with a file that would show up if descent leaked.
+        tokio::fs::create_dir(root.join("skip")).await.unwrap();
+        tokio::fs::write(root.join("skip/should-not-see"), b"x")
+            .await
+            .unwrap();
+
         struct NoEnter;
         impl Visitor for NoEnter {
             type Payload = ();
@@ -334,13 +349,14 @@ mod tests {
                 Ok(VisitOutcome::default())
             }
         }
-        let marked = walk(&fs, "/root", &mut NoEnter).await.unwrap();
+        let marked = walk(root, &mut NoEnter).await.unwrap();
         assert!(marked.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn out_of_bounds_index_is_an_error() {
-        let fs = fs(&[("/root", vec![])]);
+        let tmp = tempfile::tempdir().unwrap();
+        // Empty dir: visitor's enter=[(99, ...)] is unconditionally OOB.
         struct Bad;
         impl Visitor for Bad {
             type Payload = ();
@@ -357,10 +373,31 @@ mod tests {
                 })
             }
         }
-        let err = walk(&fs, "/root", &mut Bad).await.unwrap_err();
+        let err = walk(tmp.path(), &mut Bad).await.unwrap_err();
         assert!(matches!(
             err,
             WalkError::IndexOutOfBounds { kind: "folder", .. }
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_root_yields_io_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        struct AnyVisitor;
+        impl Visitor for AnyVisitor {
+            type Payload = ();
+            type Error = std::convert::Infallible;
+            async fn visit(
+                &mut self,
+                _: Option<&()>,
+                _: &[FolderInfo],
+                _: &[FileInfo],
+            ) -> Result<VisitOutcome<()>, std::convert::Infallible> {
+                Ok(VisitOutcome::default())
+            }
+        }
+        let err = walk(&missing, &mut AnyVisitor).await.unwrap_err();
+        assert!(matches!(err, WalkError::Io(_)));
     }
 }

@@ -1,6 +1,8 @@
 //! Shared test fixtures for secondary-side tests. Compiled only under
 //! `#[cfg(test)]` so it never enters the production binary.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
@@ -83,6 +85,69 @@ impl<I: Identifier> PeerTransport<I> for FixedPeerCount {
     }
     fn peer_count(&self) -> usize {
         self.0
+    }
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+}
+
+/// PeerTransport that captures every `broadcast` and `send_to_peer`
+/// call into a shared `Rc<RefCell<Vec<_>>>` so a test that drives the
+/// secondary's promoted-primary side (e.g. `ingest_setup_discovery`)
+/// can assert on the messages that would have gone over the peer mesh.
+///
+/// `recv_peer` blocks forever — these tests synthesize their own
+/// inbound messages via `dispatch_message` / `handle_peer_message`
+/// rather than driving them through the transport.
+///
+/// `peer_count` is configurable so the same recorder serves both the
+/// "healthy mesh, broadcasts go out" and "no peers, broadcasts are
+/// best-effort" branches without two near-identical recorders.
+pub(super) struct RecordingPeer<I: Identifier> {
+    pub(super) broadcasts: Rc<RefCell<Vec<DistributedMessage<I>>>>,
+    pub(super) peer_count: usize,
+}
+
+impl<I: Identifier> RecordingPeer<I> {
+    pub(super) fn new(peer_count: usize) -> Self {
+        Self {
+            broadcasts: Rc::new(RefCell::new(Vec::new())),
+            peer_count,
+        }
+    }
+
+    /// Clone of the shared broadcast log. The recorder is moved into
+    /// `SecondaryCoordinator::new` so callers need the handle they keep
+    /// before that move.
+    pub(super) fn log_handle(&self) -> Rc<RefCell<Vec<DistributedMessage<I>>>> {
+        self.broadcasts.clone()
+    }
+}
+
+impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        self.broadcasts.borrow_mut().push(msg);
+        Ok(())
+    }
+    async fn send_to_peer(
+        &mut self,
+        _peer_id: &str,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        // Unicast goes into the same log as broadcasts for these tests;
+        // none of the four setup-promote scenarios distinguish the two
+        // (ingest_setup_discovery only uses broadcast). Recording both
+        // means a future variant that switches to unicast still gets
+        // captured rather than being silently dropped.
+        self.broadcasts.borrow_mut().push(msg);
+        Ok(())
+    }
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        std::future::pending().await
+    }
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        None
+    }
+    fn peer_count(&self) -> usize {
+        self.peer_count
     }
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }

@@ -11,7 +11,7 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 
-use super::SecondaryCoordinator;
+use super::{RunOutcome, SecondaryCoordinator};
 use super::wire::timestamp_now;
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -23,7 +23,10 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub(super) async fn process_tasks(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
+    pub(super) async fn process_tasks(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<RunOutcome, String> {
         tracing::info!("entering task processing loop");
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
@@ -276,6 +279,41 @@ where
                 return Err(reason);
             }
 
+            // Setup-promote yield: the `PromotePrimary { required_setup:
+            // true }` arm in `dispatch.rs` flipped `setup_pending` true
+            // during the message dispatch this tick. The cluster ledger
+            // is intentionally empty (the submitter deferred discovery
+            // to us) and we cannot seed it from Rust because
+            // `task.discover_items` lives on the Python side. Yield
+            // back to the caller (the PyO3 secondary wrapper) so it
+            // can re-acquire the GIL, run Python discovery against the
+            // locally-mounted staged source, and feed the result back
+            // via `ingest_setup_discovery` — which clears this flag
+            // and hydrates the primary pool from the now-populated
+            // ledger. On re-entry the next iteration of this same loop
+            // sees `setup_pending == false` and proceeds normally.
+            //
+            // Placed AFTER `fatal_exit` (genuine errors take priority)
+            // but BEFORE the drain-down / run-complete checks. Those
+            // checks would all be no-ops here anyway — the ledger is
+            // empty, the primary is still alive, there's nothing to
+            // drain — but the explicit ordering makes "setup-pending
+            // is the reason we're leaving" obvious from the source.
+            //
+            // Cancel-safety: every awaiting arm in the `select!` above
+            // is cancel-safe (mpsc recv + tokio interval ticks), so
+            // breaking out here just abandons whichever in-flight
+            // future was being awaited. On re-entry the loop rebuilds
+            // a fresh `select!` future from scratch; no state is lost.
+            if self.setup_pending {
+                tracing::info!(
+                    "setup_pending observed; yielding from process_tasks \
+                     so caller can run discovery and call \
+                     ingest_setup_discovery"
+                );
+                return Ok(RunOutcome::SetupPending);
+            }
+
             // primary drain-down exit: when the live primary
             // disconnected (we suppressed the eager break above) and
             // every per-task ledger on this node has settled — pool
@@ -418,7 +456,12 @@ where
             }
         }
 
-        Ok(())
+        // All `break` statements above represent terminal exits
+        // (RunComplete observed, drain-down complete after primary
+        // disconnect, single-secondary clean shutdown). The
+        // SetupPending yield uses `return Ok(RunOutcome::SetupPending)`
+        // directly, so reaching here means we're done.
+        Ok(RunOutcome::Done)
     }
 
     /// Tick-driven re-check of the primary-link failover threshold.

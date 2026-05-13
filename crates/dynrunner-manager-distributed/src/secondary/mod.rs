@@ -16,6 +16,31 @@ use crate::zip_extract::ExtractionCache;
 
 use self::primary_link::PrimaryLink;
 
+/// Outcome reported by `SecondaryCoordinator::run_until_setup_or_done`.
+///
+/// The PyO3 wrapper drives the secondary in a loop and inspects this
+/// value to decide whether to run Python-side setup discovery before
+/// re-entering, or to break out and shut down. The Rust-only callers
+/// (tests, the existing `run` entry point) only ever observe `Done` —
+/// `SetupPending` requires a `required_setup: true` wire promotion,
+/// which never happens in those contexts.
+///
+/// - `SetupPending`: the secondary was promoted with `required_setup =
+///   true` and the process-tasks loop yielded so the caller can run
+///   Python's `task.discover_items` against the locally-mounted staged
+///   source and feed the result back via `ingest_setup_discovery`. The
+///   worker pool is left running; re-entering `run_until_setup_or_done`
+///   resumes the loop.
+/// - `Done`: the loop reached one of its normal terminations
+///   (RunComplete observed, drain-down after primary disconnect, or
+///   single-secondary clean exit). The worker pool has been stopped
+///   and the secondary is finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    SetupPending,
+    Done,
+}
+
 /// Configuration for the secondary coordinator.
 pub struct SecondaryConfig {
     pub secondary_id: String,
@@ -466,6 +491,47 @@ where
     /// last drain (set was emptied) or is still queued (no-op
     /// already in flight).
     pub(super) pending_worker_restarts: HashSet<WorkerId>,
+
+    /// Set true by the `PromotePrimary { required_setup: true }` arm
+    /// in `dispatch.rs` when this secondary is promoted into the
+    /// setup-secondary role (the submitter deferred all run-setup work
+    /// to us — no `TaskAdded` batch was pre-seeded on the cluster
+    /// ledger). The outer process-tasks loop yields back to the PyO3
+    /// wrapper when this is true so Python's `task.discover_items` can
+    /// run on this node (which has the staged source filesystem
+    /// bind-mounted locally). The wrapper then calls
+    /// `ingest_setup_discovery`, which seeds the ledger with
+    /// `PhaseDepsSet` + `TaskAdded` mutations, broadcasts them to
+    /// every peer, clears this flag, and hydrates the primary pool
+    /// from the now-populated `cluster_state`.
+    ///
+    /// Never set on the legacy bootstrap promotion path
+    /// (`required_setup: false` from the local submitter — ledger is
+    /// pre-seeded) nor on the failover-election path (the ledger has
+    /// content from the CRDT broadcasts that ran during the live-
+    /// primary phase). The wire-level `required_setup` flag is the
+    /// only discriminator; "ledger empty" is NOT a proxy because
+    /// failover-at-startup can legitimately observe an empty ledger.
+    pub(super) setup_pending: bool,
+
+    /// Re-entry guard for `run_until_setup_or_done`. The first call
+    /// runs `initialize_workers`, the setup-handshake (`send_welcome`,
+    /// `send_cert_exchange`, `wait_for_setup`) and then enters
+    /// `process_tasks`. If `process_tasks` returns early with
+    /// `RunOutcome::SetupPending`, the caller (the PyO3 wrapper) runs
+    /// Python discovery and re-enters this same method to resume.
+    /// On that second entry the per-secondary setup phase must NOT
+    /// run again — `initialize_workers` would race against the
+    /// already-spawned worker pool and `wait_for_setup` would block
+    /// on wire messages that have already been consumed. This flag
+    /// is set the moment setup completes successfully and gates the
+    /// setup block on every subsequent entry.
+    ///
+    /// Always false on the legacy bootstrap and failover paths; the
+    /// existing `run` wrapper only calls `run_until_setup_or_done`
+    /// once, so the flag transition is `false → true (mid-call) →
+    /// (method returns Done)` for those callers.
+    pub(super) setup_phase_completed: bool,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -529,6 +595,8 @@ where
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
             pending_worker_restarts: HashSet::new(),
+            setup_pending: false,
+            setup_phase_completed: false,
         }
     }
 
@@ -660,95 +728,165 @@ where
     /// 2. Send welcome and cert exchange to primary
     /// 3. Wait for peer list, initial assignment, transfer complete
     /// 4. Process tasks: receive assignments, run on local workers, report back
+    ///
+    /// Convenience wrapper around `run_until_setup_or_done` for callers
+    /// that don't participate in the setup-promote handshake (every
+    /// caller other than the PyO3 secondary wrapper, which has to
+    /// re-enter the loop after running Python `task.discover_items`).
+    /// The outcome can only be `Done` here, because `SetupPending`
+    /// requires a `PromotePrimary { required_setup: true }` wire arrival
+    /// and no test/non-pyo3 setup ever sends one.
     pub async fn run(&mut self, factory: &mut impl WorkerFactory<M>) -> Result<(), String> {
-        tracing::info!(
-            secondary = %self.config.secondary_id,
-            workers = self.config.num_workers,
-            resources = %self.config.max_resources,
-            "secondary starting"
-        );
+        match self.run_until_setup_or_done(factory).await? {
+            RunOutcome::Done => Ok(()),
+            RunOutcome::SetupPending => Err(
+                "secondary yielded SetupPending but caller is the legacy run() \
+                 wrapper which cannot drive setup discovery — programming error \
+                 (only the PyO3 secondary wrapper should invoke a secondary that \
+                 may be promoted with required_setup=true)"
+                    .to_string(),
+            ),
+        }
+    }
 
-        // Initialize workers (local pool — no network, no deadline).
-        self.initialize_workers(factory).await?;
+    /// Drive the secondary coordination loop until it either yields
+    /// for setup discovery (`RunOutcome::SetupPending`) or reaches a
+    /// terminal state (`RunOutcome::Done`).
+    ///
+    /// First invocation: runs `initialize_workers`, the setup handshake
+    /// (welcome / cert exchange / wait_for_setup) under
+    /// `config.setup_deadline`, then enters `process_tasks`.
+    ///
+    /// Subsequent invocations (only reached on the `SetupPending`
+    /// caller-loop re-entry): skip the setup phase — workers are still
+    /// alive and the handshake messages have already been consumed —
+    /// and re-enter `process_tasks` directly. The re-entry guard is
+    /// `self.setup_phase_completed`, set the moment the first
+    /// invocation finishes the handshake successfully.
+    ///
+    /// Cleanup (`stop_all_workers` + the "secondary finished" log)
+    /// fires only on the `Done` branch. On `SetupPending` the worker
+    /// pool is intentionally left running so the caller's re-entry
+    /// finds it in the same state `process_tasks` yielded from.
+    ///
+    /// Cancel-safety: `process_tasks` already documents that every
+    /// arm of its `select!` is cancel-safe (mpsc recv + tokio
+    /// interval ticks); the early break on `setup_pending` simply
+    /// abandons the in-flight future of whichever arm was awaiting,
+    /// and the next entry rebuilds a fresh `select!`. No state is
+    /// dropped except those in-flight recv futures, which are
+    /// cancel-safe by construction.
+    pub async fn run_until_setup_or_done(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<RunOutcome, String> {
+        if !self.setup_phase_completed {
+            tracing::info!(
+                secondary = %self.config.secondary_id,
+                workers = self.config.num_workers,
+                resources = %self.config.max_resources,
+                "secondary starting"
+            );
 
-        // Network-touching setup (Phases 1-4) is bounded by
-        // `setup_deadline`. See SecondaryConfig::setup_deadline for
-        // the rationale. The deadline is applied at the orchestration
-        // boundary, NOT inside `wait_for_setup`, because the recv
-        // loop is documented as cancellation-unsafe under inner
-        // select! racing (see setup.rs:79-96). Cancelling the whole
-        // setup future on timeout is safe because we never re-enter
-        // any of these phases — we go straight to cleanup-and-exit.
-        let deadline = self.config.setup_deadline;
-        let setup = async {
-            self.send_welcome().await?;
-            self.send_cert_exchange().await?;
-            self.wait_for_setup().await?;
-            Ok::<(), String>(())
-        };
-        match tokio::time::timeout(deadline, setup).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.stop_all_workers().await;
-                return Err(e);
-            }
-            Err(_elapsed) => {
-                let peers = self.peer_transport.peer_count();
-                self.stop_all_workers().await;
-                if peers == 0 {
-                    // The asm-dataset-nix T7 attempt 2 scenario:
-                    // primary URL unreachable AND no peers have
-                    // dialled in. The run is almost certainly
-                    // already complete and SLURM is just booting
-                    // a queued secondary against the graveyard.
-                    // Exit fast with a clear log.
-                    tracing::warn!(
-                        secondary = %self.config.secondary_id,
-                        deadline_secs = deadline.as_secs(),
-                        "setup deadline elapsed with no primary and no peers — \
-                         run appears already complete, exiting cold"
-                    );
-                    return Err(format!(
-                        "setup deadline ({}s) elapsed: no primary, no peers \
-                         (cluster appears dead, run likely complete)",
-                        deadline.as_secs()
-                    ));
-                } else {
-                    // Peers reachable but setup didn't complete. This
-                    // is a distinct scenario from cold-start (primary
-                    // unresponsive but mesh is alive — could be a
-                    // partial cluster bring-up race). Surface
-                    // separately so operators can distinguish.
-                    tracing::error!(
-                        secondary = %self.config.secondary_id,
-                        deadline_secs = deadline.as_secs(),
-                        peer_count = peers,
-                        "setup deadline elapsed despite peers reachable — \
-                         primary unresponsive, exiting"
-                    );
-                    return Err(format!(
-                        "setup deadline ({}s) elapsed: primary unresponsive \
-                         despite {} peer(s) reachable",
-                        deadline.as_secs(),
-                        peers
-                    ));
+            // Initialize workers (local pool — no network, no deadline).
+            self.initialize_workers(factory).await?;
+
+            // Network-touching setup (Phases 1-4) is bounded by
+            // `setup_deadline`. See SecondaryConfig::setup_deadline for
+            // the rationale. The deadline is applied at the orchestration
+            // boundary, NOT inside `wait_for_setup`, because the recv
+            // loop is documented as cancellation-unsafe under inner
+            // select! racing (see setup.rs:79-96). Cancelling the whole
+            // setup future on timeout is safe because we never re-enter
+            // any of these phases — we go straight to cleanup-and-exit.
+            let deadline = self.config.setup_deadline;
+            let setup = async {
+                self.send_welcome().await?;
+                self.send_cert_exchange().await?;
+                self.wait_for_setup().await?;
+                Ok::<(), String>(())
+            };
+            match tokio::time::timeout(deadline, setup).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.stop_all_workers().await;
+                    return Err(e);
                 }
+                Err(_elapsed) => {
+                    let peers = self.peer_transport.peer_count();
+                    self.stop_all_workers().await;
+                    if peers == 0 {
+                        // The asm-dataset-nix T7 attempt 2 scenario:
+                        // primary URL unreachable AND no peers have
+                        // dialled in. The run is almost certainly
+                        // already complete and SLURM is just booting
+                        // a queued secondary against the graveyard.
+                        // Exit fast with a clear log.
+                        tracing::warn!(
+                            secondary = %self.config.secondary_id,
+                            deadline_secs = deadline.as_secs(),
+                            "setup deadline elapsed with no primary and no peers — \
+                             run appears already complete, exiting cold"
+                        );
+                        return Err(format!(
+                            "setup deadline ({}s) elapsed: no primary, no peers \
+                             (cluster appears dead, run likely complete)",
+                            deadline.as_secs()
+                        ));
+                    } else {
+                        // Peers reachable but setup didn't complete. This
+                        // is a distinct scenario from cold-start (primary
+                        // unresponsive but mesh is alive — could be a
+                        // partial cluster bring-up race). Surface
+                        // separately so operators can distinguish.
+                        tracing::error!(
+                            secondary = %self.config.secondary_id,
+                            deadline_secs = deadline.as_secs(),
+                            peer_count = peers,
+                            "setup deadline elapsed despite peers reachable — \
+                             primary unresponsive, exiting"
+                        );
+                        return Err(format!(
+                            "setup deadline ({}s) elapsed: primary unresponsive \
+                             despite {} peer(s) reachable",
+                            deadline.as_secs(),
+                            peers
+                        ));
+                    }
+                }
+            }
+
+            // Latch BEFORE entering process_tasks so a SetupPending
+            // yield doesn't trigger a redo on re-entry.
+            self.setup_phase_completed = true;
+        }
+
+        // Phase 5: Process tasks. May yield with SetupPending or
+        // run to completion.
+        let outcome = self.process_tasks(factory).await?;
+
+        match outcome {
+            RunOutcome::Done => {
+                // Normal termination — stop workers and log finish.
+                self.stop_all_workers().await;
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    completed = self.completed_tasks.len(),
+                    "secondary finished"
+                );
+            }
+            RunOutcome::SetupPending => {
+                // Workers stay alive; the caller's re-entry resumes
+                // the loop in `process_tasks`. No final log line yet —
+                // the run isn't actually finished.
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    "secondary yielding for setup discovery"
+                );
             }
         }
 
-        // Phase 5: Process tasks
-        self.process_tasks(factory).await?;
-
-        // Stop workers
-        self.stop_all_workers().await;
-
-        tracing::info!(
-            secondary = %self.config.secondary_id,
-            completed = self.completed_tasks.len(),
-            "secondary finished"
-        );
-
-        Ok(())
+        Ok(outcome)
     }
 
     fn max_resources(&self) -> dynrunner_core::ResourceMap {

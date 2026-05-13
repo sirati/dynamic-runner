@@ -794,6 +794,18 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 timestamp: timestamp_now(),
                 new_primary_id: first_id.clone(),
                 epoch: new_epoch,
+                // Bootstrap-promote discriminator: when this primary
+                // skipped `seed_cluster_state` + `perform_initial_assignment`
+                // (setup-defer mode driven by `--source-already-staged`),
+                // the chosen secondary needs to know it's the one
+                // doing discovery + ledger seed after promotion. The
+                // election/failover sites in `secondary/election.rs`
+                // unconditionally pass `false` because, by election
+                // time, the local ledger is already non-empty (seeded
+                // either by the original setup-defer secondary or by
+                // a legacy submitter), so re-running discovery would
+                // double-seed.
+                required_setup: self.config.required_setup_on_promote,
             };
             // Broadcast to every secondary, not unicast to the elected
             // node: every secondary needs the role-change to update

@@ -754,6 +754,7 @@ mod tests {
             timestamp: 0.0,
             new_primary_id: "sec-a".into(),
             epoch: 1,
+            required_setup: false,
         };
         sec.dispatch_message(promote)
             .await
@@ -799,6 +800,7 @@ mod tests {
             timestamp: 0.0,
             new_primary_id: "sec-a".into(),
             epoch: 1,
+            required_setup: false,
         };
         sec.dispatch_message(promote)
             .await
@@ -839,6 +841,7 @@ mod tests {
             timestamp: 0.0,
             new_primary_id: "sec-a".into(),
             epoch: 1,
+            required_setup: false,
         };
         sec.dispatch_message(promote)
             .await
@@ -863,6 +866,7 @@ mod tests {
             timestamp: 0.0,
             new_primary_id: "sec-c".into(),
             epoch: 5,
+            required_setup: false,
         };
         sec.dispatch_message(high).await.unwrap();
         assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
@@ -876,6 +880,7 @@ mod tests {
             timestamp: 0.0,
             new_primary_id: "sec-a".into(),
             epoch: 2,
+            required_setup: false,
         };
         sec.dispatch_message(stale).await.unwrap();
         assert_eq!(
@@ -1102,6 +1107,7 @@ mod observer_peer_side_tests {
             timestamp: 0.0,
             new_primary_id: "obs-a".into(),
             epoch: 1,
+            required_setup: false,
         };
         let result = sec.dispatch_message(promote).await;
 
