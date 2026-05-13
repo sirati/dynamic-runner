@@ -4,8 +4,9 @@ use std::time::Instant;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    install_role_change_hook, new_role_cache, read_role_cache, Clocks, DistributedMessage,
-    InboundOutcome, PeerConnectionInfo, PeerTransport, Role, RoleCache,
+    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
+    new_role_cache, read_role_cache, seed_self_role, Clocks, DistributedMessage, InboundOutcome,
+    PeerConnectionInfo, PeerTransport, Role, RoleAddressedAction, RoleCache,
     RoleChangeHookRegistrar, Router, SecondaryTransport, SendOutcome,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -232,12 +233,16 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
             let msg = self.incoming_rx.recv().await?;
             clocks = now_clocks();
             self.router.prune(clocks.now);
-            match self
+            let delivered = match self
                 .router
                 .process_inbound(msg, &mut self.outgoing, clocks)
             {
-                InboundOutcome::Deliver { msg, .. } => return Some(msg),
+                InboundOutcome::Deliver { msg, .. } => msg,
                 InboundOutcome::Handled { .. } => continue,
+            };
+            match self.handle_role_layer(delivered, clocks) {
+                Some(payload) => return Some(payload),
+                None => continue,
             }
         }
     }
@@ -247,9 +252,13 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         self.router.prune(clocks.now);
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
-            match self.router.process_inbound_sync(msg, clocks) {
-                InboundOutcome::Deliver { msg, .. } => return Some(msg),
+            let delivered = match self.router.process_inbound_sync(msg, clocks) {
+                InboundOutcome::Deliver { msg, .. } => msg,
                 InboundOutcome::Handled { .. } => continue,
+            };
+            match self.handle_role_layer(delivered, clocks) {
+                Some(payload) => return Some(payload),
+                None => continue,
             }
         }
     }
@@ -284,6 +293,105 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
 }
 
 impl<I: Identifier> ChannelPeerTransport<I> {
+    /// Role-layer interceptor: handle [`DistributedMessage::RoleAddressed`]
+    /// (Case A unwrap / Case B relay-and-hint / Cases C, D drop) and
+    /// [`DistributedMessage::RoleMisaddressHint`] (silent cache-warm).
+    ///
+    /// Returns `Some(payload)` when the caller should yield a message
+    /// to the application layer (Case A or "not a role-layer
+    /// envelope"); returns `None` when the envelope was consumed
+    /// internally (Cases B/C/D, or hint absorbed) — caller loops.
+    ///
+    /// The relay-and-hint sends bypass `PeerTransport::send_to_peer`
+    /// and go straight to `self.router.send_to_peer`: the trait method
+    /// would update `last_outcome` and surface NoRoute as a hard
+    /// error, neither of which is appropriate for transport-internal
+    /// bookkeeping sends. NoRoute on a Case-B relay falls back to a
+    /// warn-and-drop — the originator's `attempts` counter and the
+    /// next periodic role-table refresh together bound the failure
+    /// horizon.
+    fn handle_role_layer(
+        &mut self,
+        msg: DistributedMessage<I>,
+        clocks: Clocks,
+    ) -> Option<DistributedMessage<I>> {
+        match msg {
+            DistributedMessage::RoleAddressed {
+                sender_id,
+                intended_role,
+                payload,
+                attempts,
+                ..
+            } => {
+                let decision = decide_role_addressed_with_cache(
+                    &self.local_id,
+                    &self.role_cache,
+                    sender_id,
+                    intended_role,
+                    payload,
+                    attempts,
+                );
+                match decision {
+                    RoleAddressedAction::Unwrap(inner) => Some(inner),
+                    RoleAddressedAction::Relay {
+                        forward_to,
+                        forwarded,
+                        hint_to,
+                        hint,
+                    } => {
+                        // Both sends are fire-and-forget at the
+                        // role-routing layer. Router::send_to_peer
+                        // emits its own warn on NoRoute / dispatch
+                        // failure; we add a target-tagged warn to
+                        // make role-relay failures distinguishable
+                        // from raw direct-send failures in operator
+                        // logs.
+                        if let Err(e) = self.router.send_to_peer(
+                            &forward_to,
+                            forwarded,
+                            &mut self.outgoing,
+                            clocks,
+                        ) {
+                            tracing::warn!(
+                                forward_to = %forward_to,
+                                error = %e,
+                                "RoleAddressed relay forward failed",
+                            );
+                        }
+                        if let Err(e) = self.router.send_to_peer(
+                            &hint_to,
+                            hint,
+                            &mut self.outgoing,
+                            clocks,
+                        ) {
+                            tracing::warn!(
+                                hint_to = %hint_to,
+                                error = %e,
+                                "RoleMisaddressHint send failed",
+                            );
+                        }
+                        None
+                    }
+                    RoleAddressedAction::Drop { reason } => {
+                        tracing::warn!(reason, "RoleAddressed dropped");
+                        None
+                    }
+                }
+            }
+            DistributedMessage::RoleMisaddressHint {
+                role, holder_id, ..
+            } => {
+                // Cache-warming only — never surfaced to the
+                // application layer (per Step 4 design rationale:
+                // senders that issued an Address::Role(_) send are
+                // not awaiting a hint reply).
+                apply_role_misaddress_hint(&self.role_cache, role, holder_id);
+                None
+            }
+            other => Some(other),
+        }
+    }
+
     /// Remove a peer's outbox so a subsequent send finds no direct
     /// channel — the Router will then route via relay (or no-route)
     /// just as if the underlying network link had broken. Used by
@@ -406,13 +514,20 @@ pub fn peer_mesh_with_adjacency<I: Identifier>(
         let outgoing_for_peer = outgoing
             .remove(id)
             .expect("outgoing table allocated for every id");
+        let role_cache = new_role_cache();
+        // Self_ is a strictly local fact — the role-table hook
+        // populates Primary only. Seeding at construction so the
+        // receiver-side RoleAddressed handling (Step 4) treats
+        // `intended_role == Self_` envelopes as Case A (local
+        // unwrap) rather than Case C (no cached holder → drop).
+        seed_self_role(&role_cache, id);
         transports.push(ChannelPeerTransport {
             local_id: id.clone(),
             incoming_rx,
             outgoing: outgoing_for_peer,
             router: Router::new(id.clone()),
             last_outcome: None,
-            role_cache: new_role_cache(),
+            role_cache,
         });
     }
     transports
@@ -633,14 +748,15 @@ mod tests {
         assert!(transports[2].try_recv_peer().is_some());
     }
 
-    /// Post-Step 3: `send(Address::Role(_), msg)` against a cold
-    /// role-table cache returns an `Err` that names "Role" and the
-    /// missing cache state. Pins the cache-cold shape of the
-    /// contract for BOTH `Role::Primary` and `Role::Self_` (neither
-    /// holder is in the cache; `Self_` specifically is never
-    /// populated by the role-table hook today). Pre-Step-3 this
-    /// test asserted "not yet supported"; the assertion shifted to
-    /// the new contract when the real dispatch landed.
+    /// Post-Step 3: `send(Address::Role(Role::Primary), msg)`
+    /// against a cold role-table cache returns an `Err` that names
+    /// "Role" and the missing cache state. Pins the cache-cold
+    /// contract for `Role::Primary`; `Role::Self_` has its own
+    /// cache-seeded behavior (Step 4 — see
+    /// [`role_self_cache_populated_at_init`]) and is covered there.
+    /// Pre-Step-3 this test asserted "not yet supported"; the
+    /// assertion shifted to the new contract when the real
+    /// dispatch landed.
     #[tokio::test]
     async fn send_address_role_returns_err() {
         use dynrunner_protocol_primary_secondary::{Address, Role};
@@ -660,15 +776,6 @@ mod tests {
             err.contains("cache"),
             "error must reference cache state; got: {err}"
         );
-
-        // Self_ variant must error symmetrically — the role-table
-        // hook never populates Self_, so it's always cold.
-        let err_self = transports[0]
-            .send(Address::Role(Role::Self_), keepalive("a"))
-            .await
-            .expect_err("Role(Self_) with cold cache must error");
-        assert!(err_self.contains("Role"));
-        assert!(err_self.contains("cache"));
 
         // No message must have been delivered to any peer's inbox.
         assert!(transports[0].try_recv_peer().is_none());
@@ -834,10 +941,14 @@ mod tests {
     // calls `send_to_peer` — exactly the Step 3 contract.
 
     /// `send(Address::Role(Role::Primary), msg)` with a populated
-    /// role cache routes the envelope to the cached holder. The
-    /// recipient observes a `RoleAddressed` wrapper around the
-    /// original message; the wrapper is NOT unwrapped on the
-    /// recv path yet — that's Step 4 (receiver-side relay-and-hint).
+    /// role cache routes the envelope to the cached holder. Post-
+    /// Step 4 the receiver unwraps the envelope when its own cache
+    /// agrees on the holder (Case A); the inner payload — not the
+    /// wrapper — is what reaches `try_recv_peer`. The wire-frame
+    /// shape (`RoleAddressed { sender_id, attempts: 0, … }`) is
+    /// pinned by the codec round-trip tests in `codec_tests.rs`
+    /// (the only place that observes the wrapper, since both
+    /// transports now unwrap on receipt).
     #[tokio::test]
     async fn send_role_primary_routes_via_cache() {
         use dynrunner_protocol_primary_secondary::{Address, Role, RoleTable};
@@ -845,13 +956,19 @@ mod tests {
         let ids = vec!["A".to_string(), "B".to_string()];
         let mut transports = peer_mesh::<SendTestId>(&ids);
 
-        // Populate A's cache so Role::Primary -> "B".
-        let mut registrar = TestRegistrar::default();
-        transports[0].register_with_cluster_state(&mut registrar);
-        registrar.fire(&RoleTable {
-            primary: Some("B".to_string()),
-            ..Default::default()
-        });
+        // Populate BOTH A's and B's caches so Role::Primary -> "B".
+        // A's cache drives the send-time route (envelope ships to B);
+        // B's cache drives the recv-time decision (Case A unwrap).
+        let mut registrar_a = TestRegistrar::default();
+        let mut registrar_b = TestRegistrar::default();
+        transports[0].register_with_cluster_state(&mut registrar_a);
+        transports[1].register_with_cluster_state(&mut registrar_b);
+        for r in [&registrar_a, &registrar_b] {
+            r.fire(&RoleTable {
+                primary: Some("B".to_string()),
+                ..Default::default()
+            });
+        }
 
         // Sanity: cache populated.
         assert_eq!(
@@ -865,27 +982,13 @@ mod tests {
             .await
             .expect("Role(Primary) send must succeed with populated cache");
 
-        // B receives the role-addressed envelope, not the raw inner.
+        // Case A: B's cache agrees on the holder, so the recv-side
+        // intercept unwraps the envelope. B sees the inner payload
+        // — not the RoleAddressed wrapper.
         let received = transports[1].try_recv_peer().expect("B must receive");
-        match received {
-            DistributedMessage::RoleAddressed {
-                intended_role,
-                payload,
-                attempts,
-                ..
-            } => {
-                assert_eq!(intended_role, Role::Primary);
-                assert_eq!(attempts, 0, "sender always starts at attempts=0");
-                // Inner payload identity preserved through the box.
-                assert_eq!(payload.sender_id(), inner.sender_id());
-                assert_eq!(payload.msg_type(), inner.msg_type());
-            }
-            other => panic!(
-                "B expected RoleAddressed envelope, got {:?}",
-                other.msg_type()
-            ),
-        }
-        // C... no third peer here; assert no stray traffic into A.
+        assert_eq!(received.sender_id(), inner.sender_id());
+        assert_eq!(received.msg_type(), inner.msg_type());
+        // No stray loopback to A.
         assert!(
             transports[0].try_recv_peer().is_none(),
             "sender must not loopback the envelope"
@@ -921,21 +1024,205 @@ mod tests {
         assert!(transports[1].try_recv_peer().is_none());
     }
 
-    /// The `RoleAddressed` envelope carries the sender's `local_id`
-    /// in `sender_id` so Step 4's misaddress-hint can travel back.
-    /// Pins the `local_id` plumbing: A's id propagates from the
-    /// `peer_mesh` constructor through the transport's `local_id`
-    /// override into the wrapped envelope.
+    /// Pins the `local_id` plumbing end-to-end: A's id propagates
+    /// from the `peer_mesh` constructor through the transport's
+    /// `local_id` override into the `RoleAddressed.sender_id` wire
+    /// field, and through Step 4's Case-A unwrap path the
+    /// receiver's recv loop returns the inner payload unmodified.
+    /// Wire-shape detail of the wrapper's sender_id is covered by
+    /// the codec round-trip tests; the assertion here is the
+    /// observable end-to-end behavior under Case A (B's cache
+    /// agrees it holds Primary, so it unwraps).
     #[tokio::test]
-    async fn send_role_envelope_includes_sender_id() {
+    async fn send_role_envelope_round_trips_inner_payload() {
         use dynrunner_protocol_primary_secondary::{Address, Role, RoleTable};
 
         let ids = vec!["A".to_string(), "B".to_string()];
         let mut transports = peer_mesh::<SendTestId>(&ids);
 
-        let mut registrar = TestRegistrar::default();
-        transports[0].register_with_cluster_state(&mut registrar);
-        registrar.fire(&RoleTable {
+        let mut registrar_a = TestRegistrar::default();
+        let mut registrar_b = TestRegistrar::default();
+        transports[0].register_with_cluster_state(&mut registrar_a);
+        transports[1].register_with_cluster_state(&mut registrar_b);
+        for r in [&registrar_a, &registrar_b] {
+            r.fire(&RoleTable {
+                primary: Some("B".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let inner = keepalive("A");
+        transports[0]
+            .send(Address::Role(Role::Primary), inner.clone())
+            .await
+            .unwrap();
+
+        let received = transports[1].try_recv_peer().expect("B must receive");
+        assert_eq!(received.sender_id(), "A");
+        assert_eq!(received.msg_type(), inner.msg_type());
+    }
+
+    // ── Step 4: receiver-side relay-and-hint + Role::Self_ seeding ──
+    //
+    // These pin the four cases (A/B/C/D) of `decide_role_addressed`
+    // through the channel transport's `recv_peer` integration plus the
+    // construction-time seed of `Role::Self_` into the role cache.
+    //
+    // The recv-side intercept lives in `ChannelPeerTransport::
+    // handle_role_layer` (which calls `decide_role_addressed_with_cache`
+    // in the protocol crate). The decision module's own unit tests
+    // (`crates/dynrunner-protocol-primary-secondary/src/role_routing.rs`)
+    // exercise the pure decision; these tests exercise the wired
+    // path end-to-end.
+
+    /// Case A: a `RoleAddressed { intended_role: Primary }` envelope
+    /// addressed to a peer whose cache agrees that it holds Primary
+    /// is unwrapped — `recv_peer` returns the inner payload, not the
+    /// wrapper. The Step-3 sender-side wire shape is unchanged; what
+    /// changes here is the recv-side intercept.
+    #[tokio::test]
+    async fn role_addressed_case_a_unwraps_to_inner_payload() {
+        use dynrunner_protocol_primary_secondary::{Address, Role, RoleTable};
+
+        let ids = vec!["A".to_string(), "B".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        // BOTH caches agree Primary=B; B's recv hits Case A.
+        let mut reg_a = TestRegistrar::default();
+        let mut reg_b = TestRegistrar::default();
+        transports[0].register_with_cluster_state(&mut reg_a);
+        transports[1].register_with_cluster_state(&mut reg_b);
+        for r in [&reg_a, &reg_b] {
+            r.fire(&RoleTable {
+                primary: Some("B".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let inner = keepalive("A");
+        transports[0]
+            .send(Address::Role(Role::Primary), inner.clone())
+            .await
+            .unwrap();
+
+        let received = transports[1].try_recv_peer().expect("B receives");
+        // Unwrapped: NOT the RoleAddressed wrapper, just the inner.
+        assert!(
+            matches!(received, DistributedMessage::Keepalive { .. }),
+            "Case A must yield the inner payload, not the wrapper",
+        );
+        assert_eq!(received.sender_id(), inner.sender_id());
+        // No additional traffic — no relay, no hint.
+        assert!(transports[0].try_recv_peer().is_none());
+    }
+
+    /// Case B: A sends `Address::Role(Primary)` with its cache
+    /// saying Primary=B; B's cache says Primary=C; C's cache also
+    /// agrees Primary=C. Assert:
+    ///   1. C receives the forwarded envelope with `attempts=1`
+    ///      (Case A then unwraps for C, so C's `try_recv_peer`
+    ///      yields the inner). To pin `attempts=1` we observe at
+    ///      C's cache state pre-send vs. post-send is not enough,
+    ///      so we additionally make C's cache empty for Primary so
+    ///      the forwarded envelope lands at C as Case C (drop) and
+    ///      we can intercept via C's `try_recv_peer` returning
+    ///      nothing. But that loses the attempts-1 assertion.
+    ///
+    /// Compromise: configure C's cache to agree (Primary=C) so the
+    /// payload reaches C unwrapped (Case A at C); the cache-warming
+    /// hint must arrive at A (decoded into A's role cache as
+    /// Primary=C). Then we verify A's Primary cache was updated
+    /// from B to C — pinning the hint round-trip.
+    ///
+    /// To pin `attempts=1` on the forwarded envelope we additionally
+    /// inspect the protocol-crate's `decide_role_addressed` unit
+    /// test (which checks the attempts field directly).
+    #[tokio::test]
+    async fn role_addressed_case_b_relays_and_hints() {
+        use dynrunner_protocol_primary_secondary::{Address, Role, RoleTable};
+
+        let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        // A thinks Primary=B; B thinks Primary=C; C thinks Primary=C.
+        let mut reg_a = TestRegistrar::default();
+        let mut reg_b = TestRegistrar::default();
+        let mut reg_c = TestRegistrar::default();
+        transports[0].register_with_cluster_state(&mut reg_a);
+        transports[1].register_with_cluster_state(&mut reg_b);
+        transports[2].register_with_cluster_state(&mut reg_c);
+        reg_a.fire(&RoleTable {
+            primary: Some("B".to_string()),
+            ..Default::default()
+        });
+        reg_b.fire(&RoleTable {
+            primary: Some("C".to_string()),
+            ..Default::default()
+        });
+        reg_c.fire(&RoleTable {
+            primary: Some("C".to_string()),
+            ..Default::default()
+        });
+        // Sanity: caches set as designed.
+        assert_eq!(
+            transports[0].peer_for_role(&Role::Primary),
+            Some("B".to_string())
+        );
+
+        let inner = keepalive("A");
+        transports[0]
+            .send(Address::Role(Role::Primary), inner.clone())
+            .await
+            .unwrap();
+
+        // B receives the wrapper, intercepts it (Case B): forwards
+        // to C AND sends a hint back to A. Both internal sends
+        // happen synchronously inside B's recv loop. Drive B's
+        // recv with try_recv_peer; it should return None because
+        // Case B never yields to the application layer.
+        assert!(
+            transports[1].try_recv_peer().is_none(),
+            "B intercepts the envelope at recv-time; nothing surfaces to caller",
+        );
+
+        // C receives the forwarded envelope and (Case A on C)
+        // unwraps it — try_recv_peer yields the inner.
+        let at_c = transports[2].try_recv_peer().expect("C receives forwarded");
+        assert!(
+            matches!(at_c, DistributedMessage::Keepalive { .. }),
+            "C must unwrap (Case A): {at_c:?}",
+        );
+        assert_eq!(at_c.sender_id(), inner.sender_id());
+
+        // A receives the misaddress-hint and absorbs it into its
+        // cache; nothing surfaces to A's caller.
+        assert!(
+            transports[0].try_recv_peer().is_none(),
+            "hint is consumed at recv-time; never surfaced",
+        );
+        assert_eq!(
+            transports[0].peer_for_role(&Role::Primary),
+            Some("C".to_string()),
+            "A's cache must be updated from B to C by the hint",
+        );
+    }
+
+    /// Case C: receiver has no cached holder for the role → drop,
+    /// no relay, no hint.
+    #[tokio::test]
+    async fn role_addressed_case_c_no_holder_drops() {
+        use dynrunner_protocol_primary_secondary::{Address, Role, RoleTable};
+
+        let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        // A thinks Primary=B; B has no Primary in cache; C has no
+        // Primary in cache. (Step 4's Role::Self_ seed populates
+        // each cache with Self_=self, but Primary stays empty
+        // without a hook fire.)
+        let mut reg_a = TestRegistrar::default();
+        transports[0].register_with_cluster_state(&mut reg_a);
+        reg_a.fire(&RoleTable {
             primary: Some("B".to_string()),
             ..Default::default()
         });
@@ -945,15 +1232,98 @@ mod tests {
             .await
             .unwrap();
 
-        let received = transports[1].try_recv_peer().expect("B must receive");
-        match received {
-            DistributedMessage::RoleAddressed { sender_id, .. } => {
-                assert_eq!(
-                    sender_id, "A",
-                    "envelope sender_id must equal the local transport's id"
-                );
-            }
-            other => panic!("expected RoleAddressed, got {:?}", other.msg_type()),
-        }
+        // B intercepts the envelope; no cached holder → drop.
+        assert!(
+            transports[1].try_recv_peer().is_none(),
+            "B should consume the envelope at recv-time (Case C drop)",
+        );
+        // C must not have received any relay.
+        assert!(
+            transports[2].try_recv_peer().is_none(),
+            "no relay forwarded — no known holder to relay to",
+        );
+        // A must not have received any hint.
+        assert!(
+            transports[0].try_recv_peer().is_none(),
+            "no hint sent back — Case C is a silent drop",
+        );
+        // A's cache stays at its pre-send value: Primary=B.
+        assert_eq!(
+            transports[0].peer_for_role(&Role::Primary),
+            Some("B".to_string()),
+            "Case C drops silently — sender's cache stays at the stale value",
+        );
+    }
+
+    /// Case D: a forwarded envelope already at the relay-hop cap
+    /// (`MAX_ROLE_RELAY_ATTEMPTS`) must NOT be forwarded further,
+    /// even if the receiver knows a different holder. We bypass the
+    /// sender path here (`PeerTransport::send` only ever emits
+    /// `attempts=0`) and feed the envelope through B's inbox
+    /// directly by sending it from A using `send_to_peer` — A's
+    /// direct send carries whatever envelope we wrap manually.
+    #[tokio::test]
+    async fn role_addressed_case_d_max_attempts_drops() {
+        use dynrunner_protocol_primary_secondary::{
+            Role, RoleTable, MAX_ROLE_RELAY_ATTEMPTS,
+        };
+
+        let ids = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        // Configure B's cache so it WOULD be a Case-B candidate
+        // (Primary=C != self). Without the attempts cap, B would
+        // forward to C and hint back to A.
+        let mut reg_b = TestRegistrar::default();
+        transports[1].register_with_cluster_state(&mut reg_b);
+        reg_b.fire(&RoleTable {
+            primary: Some("C".to_string()),
+            ..Default::default()
+        });
+
+        // Hand-craft an envelope at the cap. Sent A→B via direct
+        // send_to_peer so it lands at B's inbox unaltered.
+        let envelope = DistributedMessage::RoleAddressed {
+            sender_id: "A".into(),
+            timestamp: 1.0,
+            intended_role: Role::Primary,
+            payload: Box::new(keepalive("A")),
+            attempts: MAX_ROLE_RELAY_ATTEMPTS,
+        };
+        transports[0].send_to_peer("B", envelope).await.unwrap();
+
+        // B intercepts, Case D drops — nothing forwarded, no hint.
+        assert!(transports[1].try_recv_peer().is_none());
+        assert!(transports[2].try_recv_peer().is_none());
+        assert!(transports[0].try_recv_peer().is_none());
+    }
+
+    /// Step 4 cache-init fix: `Role::Self_` must be populated with
+    /// the local peer id immediately at construction time, before
+    /// any `register_with_cluster_state` runs. Without this seed,
+    /// a `RoleAddressed { intended_role: Self_ }` envelope would
+    /// fall into Case C at the receiver (no cached holder → drop),
+    /// which contradicts the role's semantics ("the receiver IS by
+    /// definition the holder of Self_").
+    #[tokio::test]
+    async fn role_self_cache_populated_at_init() {
+        use dynrunner_protocol_primary_secondary::Role;
+
+        let ids = vec!["A".to_string(), "B".to_string()];
+        let transports = peer_mesh::<SendTestId>(&ids);
+
+        // Self_ resolves to local_id with no hook ever fired.
+        assert_eq!(
+            transports[0].peer_for_role(&Role::Self_),
+            Some("A".to_string()),
+        );
+        assert_eq!(
+            transports[1].peer_for_role(&Role::Self_),
+            Some("B".to_string()),
+        );
+
+        // Primary, by contrast, stays cold until a hook fires.
+        assert_eq!(transports[0].peer_for_role(&Role::Primary), None);
+        assert_eq!(transports[1].peer_for_role(&Role::Primary), None);
     }
 }
