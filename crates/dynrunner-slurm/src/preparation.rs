@@ -464,10 +464,27 @@ fn build_ssh_argv(
         "UserKnownHostsFile=/dev/null".into(),
         "-o".into(),
         "ExitOnForwardFailure=yes".into(),
+        // Keepalive tolerance for the per-secondary `-R` reverse-tunnel.
+        // ServerAliveInterval=60 + CountMax=1080 = 18h ceiling before
+        // SSH considers the session dead — matches the gateway
+        // ControlMaster's floor at `dynrunner_gateway::ssh:132-134`.
+        // The pre-fix values (30 × 3 = 90 s) killed the tunnel
+        // mid-stream during multi-MB nar-file transfers when the
+        // worker's sshd was too busy serving the transfer to PONG
+        // ServerAlive within the window (asm-dataset-nix R8 LMU repro:
+        // 225 MB narfile starts at HTTP 200, dies partway, retries
+        // hit "Could not connect" because the `-R` listener is gone
+        // — no auto-reconnect path on the SSH side).
+        //
+        // Detection of genuinely-dead secondaries is the framework's
+        // own `primary_link_failure_threshold/_window` (cf.
+        // `dynrunner-manager-distributed::secondary::mod.rs:84,92`),
+        // not the ssh tunnel's keepalive. Decoupling here just means
+        // the ssh tunnel doesn't get killed by transient unresponsive
+        // periods that the framework wouldn't have considered fatal.
+        "ServerAliveInterval=60".into(),
         "-o".into(),
-        "ServerAliveInterval=30".into(),
-        "-o".into(),
-        "ServerAliveCountMax=3".into(),
+        "ServerAliveCountMax=1080".into(),
         "-o".into(),
         "TCPKeepAlive=yes".into(),
     ]);
