@@ -1,6 +1,7 @@
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
 use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
+use crate::messages::timestamp_now;
 use crate::DistributedMessage;
 
 /// Transport trait for the primary side: can send to specific secondaries, receive from any.
@@ -87,13 +88,20 @@ pub trait PeerTransport<I: Identifier> {
     /// the existing primitives:
     ///   - `Address::Peer(id)` → `send_to_peer(id, msg)`
     ///   - `Address::Broadcast(Scope::Mesh)` → `broadcast(msg)`
+    ///   - `Address::Role(role)` → resolve `role` through the transport's
+    ///     write-through cache (Step 2), wrap `msg` in a
+    ///     [`DistributedMessage::RoleAddressed`] envelope, ship via
+    ///     `send_to_peer` to the resolved holder. The wrapper is what
+    ///     lets the receiver detect misaddress and relay-and-hint in
+    ///     Step 4 — the receiver inspects `intended_role` against its
+    ///     own cache. Cache-cold lookups return `Err`: a sender that
+    ///     hasn't yet observed `PromotePrimary` cannot route by role,
+    ///     and silently fanning out would mask the design defect.
     ///
-    /// `Address::Role(_)` and `Address::Broadcast(Scope::AllSecondaries)`
-    /// return `Err` with a clear "not yet supported" message — Steps 2-3
-    /// of the unification refactor will implement them on top of the
-    /// `RoleTable` cache. Until then, callers MUST keep using the
-    /// existing send_to_peer/broadcast for their concerns; this entry
-    /// point is the migration target, not yet load-bearing.
+    /// `Address::Broadcast(Scope::AllSecondaries)` still returns `Err`
+    /// pending Step 5 (primary-side migration); the error message
+    /// names the step so anyone reading a log during the migration
+    /// window understands the cause.
     fn send(
         &mut self,
         addr: Address,
@@ -103,13 +111,42 @@ pub trait PeerTransport<I: Identifier> {
             match addr {
                 Address::Peer(id) => self.send_to_peer(&id, msg).await,
                 Address::Broadcast(Scope::Mesh) => self.broadcast(msg).await,
-                Address::Role(role) => Err(format!(
-                    "Address::Role({role:?}) not yet supported (Step 3 of unification refactor); \
-                     callers must continue using send_to_peer/broadcast"
-                )),
+                Address::Role(role) => {
+                    // Resolve via the write-through cache (Step 2).
+                    // Cache-cold is a hard error here: Step 4 lands
+                    // the receiver-side relay-and-hint that warms
+                    // the cache through observation; until the
+                    // sender's `ClusterState` has fired its first
+                    // `PromotePrimary` hook, the safe behaviour is
+                    // to surface "no route" to the caller rather
+                    // than broadcast or guess.
+                    let holder = self.peer_for_role(&role).ok_or_else(|| {
+                        format!(
+                            "Address::Role({role:?}) unresolvable: role-table cache empty for \
+                             this role; cluster_state has not yet observed PromotePrimary \
+                             (or the equivalent role-assignment mutation)"
+                        )
+                    })?;
+                    // Wrap in the role-addressed envelope so the
+                    // receiver can detect misaddress and relay
+                    // (Step 4). `sender_id` lets a misaddress hint
+                    // travel back; we read it through `local_id`
+                    // rather than threading it through every send
+                    // call site (see trait doc for the design
+                    // tradeoff).
+                    let envelope = DistributedMessage::RoleAddressed {
+                        sender_id: self.local_id().to_owned(),
+                        timestamp: timestamp_now(),
+                        intended_role: role,
+                        payload: Box::new(msg),
+                        attempts: 0,
+                    };
+                    self.send_to_peer(&holder, envelope).await
+                }
                 Address::Broadcast(Scope::AllSecondaries) => Err(
-                    "Address::Broadcast(AllSecondaries) not yet supported (Step 3); \
-                     callers must continue using SecondaryTransport::broadcast"
+                    "Address::Broadcast(AllSecondaries) not yet supported (Step 5 of \
+                     unification refactor); callers must continue using \
+                     SecondaryTransport::broadcast"
                         .into(),
                 ),
             }
@@ -148,5 +185,33 @@ pub trait PeerTransport<I: Identifier> {
     /// the minimum window.
     fn peer_for_role(&self, _role: &Role) -> Option<String> {
         None
+    }
+
+    /// The local node's own peer-id, used as the `sender_id` field
+    /// of envelopes the transport constructs internally — currently
+    /// the `RoleAddressed` wrapper produced by [`Self::send`] when
+    /// dispatching an `Address::Role(_)` send.
+    ///
+    /// Default impl returns the empty string. The reason for the
+    /// default (over making this a required method) is that not
+    /// every `PeerTransport` impl exercises role addressing — the
+    /// `NoPeerTransport` arm is the canonical example — and forcing
+    /// them to plumb an id just to satisfy the trait would be
+    /// noise. Real impls (`ChannelPeerTransport`, `PeerNetwork`,
+    /// `EitherPeerTransport`) override; both already stash the
+    /// local id (channel transport via `peer_mesh`'s id parameter,
+    /// `PeerNetwork.peer_id` field).
+    ///
+    /// The alternative — threading `sender_id` as a parameter on
+    /// every `send` call site — was rejected because every call
+    /// site would have to know about it; the transport already
+    /// knows. The empty-string default is only observable on the
+    /// role-addressing path, and a misaddress hint travelling back
+    /// to an empty-string sender id is a no-op (the receiver's
+    /// `send_to_peer("")` errors out cleanly) — the failure mode
+    /// is contained to "cache stays cold", not "cluster
+    /// corruption".
+    fn local_id(&self) -> &str {
+        ""
     }
 }

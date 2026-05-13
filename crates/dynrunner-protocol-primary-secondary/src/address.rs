@@ -56,7 +56,17 @@
 ///
 /// Variants are open to extension as the protocol grows (e.g., a
 /// future `Coordinator` role for multi-primary setups).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// **Serde derives** carry `Role` into the `RoleAddressed` /
+/// `RoleMisaddressHint` wire frames (Step 3) — the receiver decodes
+/// `intended_role` from the envelope and checks it against its own
+/// role-table cache. `rename_all = "snake_case"` keeps the JSON
+/// representation in lockstep with the rest of the protocol crate
+/// (`msg_type`, `MessageType` variants), so a future cross-language
+/// peer sees `"primary"` / `"self_"` rather than `"Primary"` /
+/// `"Self_"`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     Primary,
     Self_,
