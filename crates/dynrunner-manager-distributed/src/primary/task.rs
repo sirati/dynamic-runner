@@ -205,8 +205,25 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
-            // If no local assignment was made, relay to primary
-            if !assigned {
+            // If no local assignment was made, relay to primary —
+            // but only while this coordinator is still the authoritative
+            // primary. After demotion, `self.primary_id` points at the
+            // promoted peer, which we reach only via the (now-stale)
+            // server-side outgoing channel that the promoted peer no
+            // longer drains in primary role. Sending into that channel
+            // races its writer-task shutdown and surfaces as
+            // `channel closed`. Pre-fix that error escalated through
+            // `?` and terminated the demoted submitter's coordinator
+            // mid-run (operator-facing: "primary coordinator failed
+            // error=channel closed" within two keepalive intervals
+            // of promotion). The requesting secondary's `primary_link`
+            // re-routes TaskRequest to the peer-mesh path once it
+            // applies the `PromotePrimary` broadcast we just sent;
+            // dropping the request here is benign — the secondary
+            // retries on its next backoff tick. See
+            // `feedback_mesh_independent_of_role_and_membership.md`:
+            // promotion-induced channel-closed must not be fatal.
+            if !assigned && !self.demoted {
                 if let Some(pid) = self.primary_id.clone() {
                     self.transport.send_to(&pid, msg).await?;
                 }
