@@ -117,6 +117,37 @@ pub enum ConnectionMode<'a> {
     },
 }
 
+/// In-container bind-mount path for the cluster-wide source-binaries
+/// network drive. The wrapper renders TWO references to this path:
+///
+///   1. The `-v "{srcbins_network}:{path}:ro"` bind-mount line, so the
+///      gateway-side staged corpus is visible to the secondary process.
+///   2. The `--src-network {path}` flag on the secondary's container
+///      command, so the secondary's argparse stores it as
+///      `args.src_network` and `_dispatch_secondary` forwards it
+///      verbatim into `SecondaryConfig(src_network=...)` without
+///      relying on `PySecondaryConfig.__new__`'s path-exists auto-
+///      detect.
+///
+/// Centralising the literal here keeps the two references in lockstep:
+/// any future change to the bind-mount path (`/app/src-network` →
+/// `/srv/staged-bins`, etc.) updates both sites atomically.
+///
+/// Cross-crate note: `crates/dynrunner-pyo3/src/config/primary_secondary.rs`
+/// has an independent constant `WRAPPER_SRC_NETWORK` with the same
+/// literal value. That copy serves the auto-detect path
+/// (`Path::exists(...)` returns `true` inside the wrapper container);
+/// keeping them as two separate constants avoids a circular crate
+/// dependency (dynrunner-pyo3 already depends on dynrunner-slurm, so
+/// the auto-detect could import this constant, but the inverse is
+/// fine and the literal duplication is a single line). The explicit
+/// `--src-network` flag added by this generator makes the auto-detect
+/// redundant for SLURM secondaries; the auto-detect now serves only
+/// as a defence-in-depth fallback for callers that omit the flag
+/// (e.g. operators invoking `python -m <module> --secondary <url>`
+/// manually outside the SLURM wrapper).
+pub const WRAPPER_SRC_NETWORK_CONTAINER_PATH: &str = "/app/src-network";
+
 /// Generate the bash wrapper script for a SLURM job.
 ///
 /// The script sets up scratch /tmp dirs, podman storage, the FIFO
@@ -660,6 +691,14 @@ echo "  Secondary ID: {secondary_id}"
     let container_command = cfg.container_command;
     let cores_spec = cfg.cores_spec;
     let max_memory_spec = cfg.max_memory_spec;
+    // Container-internal bind-mount path for the staged-source drive.
+    // Forwarded as `--src-network={path}` so the secondary's argparse
+    // stores it on `args.src_network` and the dispatcher hands it to
+    // `SecondaryConfig(src_network=...)` without relying on the auto-
+    // detect path-exists check (which silently falls back to `None`
+    // when the bind-mount appears late, the path is inaccessible to
+    // the user, or any other transient filesystem-visibility issue).
+    let src_network_path = WRAPPER_SRC_NETWORK_CONTAINER_PATH;
     let (mode_banner, secondary_url) = match &cfg.connection {
         ConnectionMode::Reverse { .. } => (
             "echo \"  Mode: SSH ProxyJump (primary tunnels to secondary via gateway)\""
@@ -728,7 +767,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
     -v "{log_network}:/app/log-network" \
 {dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_ref} \
-    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec}"##
+    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec} --src-network={src_network_path}"##
     ));
 
     script.push_str(
@@ -1054,6 +1093,65 @@ mod tests {
             mem_idx > cores_idx,
             "--max-memory must appear after --cores in the secondary's argv \
              (currently at byte {mem_idx}, cores at {cores_idx})"
+        );
+    }
+
+    #[test]
+    fn script_forwards_src_network_container_path() {
+        // The wrapper bind-mounts the gateway's staged-source drive at
+        // `/app/src-network` inside the secondary container (the `-v`
+        // line above). The secondary subprocess MUST also receive
+        // `--src-network=/app/src-network` so its argparse stores the
+        // container-internal path on `args.src_network`; `_dispatch_
+        // secondary` then forwards it into `SecondaryConfig(
+        // src_network=...)` directly, instead of relying on
+        // `PySecondaryConfig.__new__`'s `Path::exists("/app/src-network")`
+        // auto-detect.
+        //
+        // The auto-detect is a leaky pattern: a transient filesystem-
+        // visibility issue (delayed bind-mount, permission denied on
+        // the path's existence check, race with the wrapper's own
+        // `mkdir -p` of the parent dir) makes `Path::exists` return
+        // `false`, `src_network` falls back to `None`, and the
+        // setup-promoted secondary's discover_items call hits the
+        // `RunOutcome::SetupPending observed but src_network is None`
+        // programmer-error path (or silently uses the wrong root).
+        // Explicit `--src-network=` removes that failure mode by
+        // making the wrapper-secondary contract symbolic, not
+        // path-existence-dependent.
+        //
+        // Asserted invariants:
+        //   1. The flag is present in `=` form (mandatory under task
+        //      #32's argparse-collision rule: leading-dash values
+        //      need `--flag=value`).
+        //   2. It carries the container path `/app/src-network`,
+        //      matching the bind-mount destination on the
+        //      `-v "{srcbins_network}:/app/src-network:ro"` line.
+        //   3. The flag lands in the container_command suffix AFTER
+        //      `--max-memory` (argv-build order); a regression that
+        //      moves it into the `podman run` flags block would still
+        //      pass invariant 1 but fail this position check.
+        let config = SlurmConfig::default();
+        let cfg = standard_cfg(&config, &[]);
+        let script = generate_wrapper_script(&cfg);
+        assert!(
+            script.contains("--src-network=/app/src-network"),
+            "wrapper script must forward `--src-network=/app/src-network` to \
+             secondary so its argparse stores the container-internal bind-\
+             mount path on `args.src_network`; render did not contain it"
+        );
+        let mem_idx = script
+            .find("--max-memory=")
+            .expect("--max-memory= must be present");
+        let srcnet_idx = script
+            .find("--src-network=")
+            .expect("--src-network= must be present");
+        assert!(
+            srcnet_idx > mem_idx,
+            "--src-network must appear after --max-memory in the secondary's \
+             argv (currently at byte {srcnet_idx}, max-memory at {mem_idx}) — \
+             a flag in the wrong position likely landed in the podman-run \
+             flags block instead of the container_command suffix"
         );
     }
 
