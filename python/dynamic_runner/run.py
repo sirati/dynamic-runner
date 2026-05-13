@@ -259,6 +259,11 @@ def _dispatch_secondary(task, args, logger) -> None:
     # single-process` (which divides cluster-wide).
     num_workers = _rs.parse_cores(args.cores)
     max_memory_bytes = _rs.parse_memory(args.max_memory)
+    logger.info(
+        f"resolved per-machine resources: args.cores={args.cores!r} → "
+        f"num_workers={num_workers}, args.max_memory={args.max_memory!r} → "
+        f"max_memory_bytes={max_memory_bytes}"
+    )
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
         num_workers=num_workers,
