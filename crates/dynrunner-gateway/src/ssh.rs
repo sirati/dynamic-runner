@@ -6,7 +6,6 @@ use tokio::process::Command;
 use tracing;
 
 use crate::config::SshConfig;
-use crate::filesystem::{DirEntry, Filesystem, FsError};
 use crate::path::expand_tilde;
 use crate::shell::shell_quote;
 use crate::traits::{CommandResult, Gateway, GatewayError};
@@ -877,80 +876,6 @@ fn build_master_argv(
     argv
 }
 
-/// Parse the null-delimited output of
-/// `find <dir> -mindepth 1 -maxdepth 1 -L -printf "%y\t%s\t%P\0"`
-/// into [`DirEntry`] values. The `-L` flag dereferences symlinks so `%y`
-/// reports the target kind; broken symlinks come back as `%y=l` and are
-/// skipped silently.
-fn parse_find_printf(stdout: &str) -> Vec<DirEntry> {
-    let mut out = Vec::new();
-    for record in stdout.split('\0') {
-        if record.is_empty() {
-            continue;
-        }
-        let mut fields = record.splitn(3, '\t');
-        let kind = fields.next().unwrap_or("");
-        let size_str = fields.next().unwrap_or("0");
-        let name = match fields.next() {
-            Some(n) if !n.is_empty() => n.to_owned(),
-            _ => continue,
-        };
-        match kind {
-            "d" => out.push(DirEntry::Dir { name }),
-            "f" => {
-                let size: u64 = size_str.parse().unwrap_or(0);
-                out.push(DirEntry::File { name, size });
-            }
-            // 'l' = broken symlink (under -L); other kinds (sockets, fifos,
-            // block/char devices) are filtered out the same way.
-            _ => {}
-        }
-    }
-    out.sort_by(|a, b| a.name().cmp(b.name()));
-    out
-}
-
-impl Filesystem for SshGateway {
-    async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        if !self.connected {
-            return Err(FsError::NotConnected);
-        }
-        let expanded = self.expand_remote_path(path);
-        let quoted = shell_quote(&expanded);
-
-        // -L follows symlinks for stat: %y reports the target's kind.
-        // It's a global option and MUST appear before the path (POSIX +
-        // GNU) — placed after the path it parses as a predicate and
-        // find exits 1 with "unknown predicate `-L'".
-        // %P is the path relative to the find root, which with maxdepth=1
-        // is just the entry's basename. \0 separator survives names with
-        // newlines/tabs.
-        let cmd = format!(
-            "find -L {quoted} -mindepth 1 -maxdepth 1 -printf '%y\\t%s\\t%P\\0'"
-        );
-        let result = self
-            .ssh_command(&cmd, None)
-            .await
-            .map_err(|e| FsError::Other(format!("ssh exec failed: {e}")))?;
-
-        if !result.success() {
-            let stderr = result.stderr.trim();
-            if stderr.contains("No such file or directory") {
-                return Err(FsError::NotFound(expanded));
-            }
-            if stderr.contains("Not a directory") {
-                return Err(FsError::NotADirectory(expanded));
-            }
-            return Err(FsError::ListingFailed(format!(
-                "find exited {}: {stderr}",
-                result.return_code,
-            )));
-        }
-
-        Ok(parse_find_printf(&result.stdout))
-    }
-}
-
 // ---------------------------------------------------------------------
 // Daemon-PID helpers — single concern: track the OpenSSH ControlPersist
 // daemon (not the launcher) as the SSH master lifetime anchor. See the
@@ -1153,39 +1078,6 @@ fn terminate_daemon_blocking(daemon_pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_find_printf_basic() {
-        let stdout = "f\t100\tfile.bin\0d\t4096\tsubdir\0l\t0\tbroken\0";
-        let entries = parse_find_printf(stdout);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0], DirEntry::File { name: "file.bin".into(), size: 100 });
-        assert_eq!(entries[1], DirEntry::Dir { name: "subdir".into() });
-    }
-
-    #[test]
-    fn parse_find_printf_alphabetical() {
-        let stdout = "f\t1\tz\0f\t2\ta\0d\t0\tm\0";
-        let entries = parse_find_printf(stdout);
-        let names: Vec<_> = entries.iter().map(|e| e.name()).collect();
-        assert_eq!(names, vec!["a", "m", "z"]);
-    }
-
-    #[test]
-    fn parse_find_printf_handles_tabs_in_names() {
-        // Tabs inside names: splitn(3) means everything after the second
-        // tab is the name. So a name with a tab is preserved.
-        let stdout = "f\t10\tname\twith\ttab\0";
-        let entries = parse_find_printf(stdout);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name(), "name\twith\ttab");
-    }
-
-    #[test]
-    fn parse_find_printf_empty() {
-        assert!(parse_find_printf("").is_empty());
-        assert!(parse_find_printf("\0\0").is_empty());
-    }
 
     fn ssh_config_with(
         identity_file: Option<&str>,

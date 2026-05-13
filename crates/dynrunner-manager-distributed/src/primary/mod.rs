@@ -130,6 +130,21 @@ pub struct PrimaryConfig {
     /// `true` outside the opt-out (default).
     pub uses_file_based_items: bool,
 
+    /// Setup-promote intent for the bootstrap `PromotePrimary` this
+    /// coordinator emits. When `true`, the submitter has deferred
+    /// task discovery / upload / ledger seeding to the chosen
+    /// secondary (the `--source-already-staged` path: files live on
+    /// the cluster, not on the submitter) and the wire's
+    /// `PromotePrimary.required_setup` is forwarded accordingly.
+    /// This is the *intent* flag; the wire field is the discriminator
+    /// the secondary actually keys off (see
+    /// `DistributedMessage::PromotePrimary.required_setup` for the
+    /// three-reason classification — legacy bootstrap, setup-promote,
+    /// failover). Failover election deliberately ignores this field:
+    /// at election time the local ledger is already non-empty, so
+    /// re-running discovery would double-seed.
+    pub required_setup_on_promote: bool,
+
     /// Per-type global concurrency caps. When a `TypeId` is present
     /// with capacity `N`, the scheduler refuses to dispatch more than
     /// `N` items of that type concurrently across all workers.
@@ -264,6 +279,7 @@ impl Default for PrimaryConfig {
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
             uses_file_based_items: true,
+            required_setup_on_promote: false,
             max_concurrent_per_type: HashMap::new(),
             retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
@@ -858,25 +874,28 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // Phase 4: Wait for peer connections (skip for single secondary)
         self.wait_for_peer_connections().await?;
 
-        // Phase 4.5: Seed the replicated cluster ledger with `TaskAdded`
-        // for every binary in the run. Every secondary applies the
-        // batch and now mirrors the same `Pending` set the primary
-        // sees, so subsequent CRDT broadcasts (TaskCompleted, TaskFailed,
-        // and post-Phase-L TaskAssigned) compose against a coherent
-        // baseline on every node.
-        self.seed_cluster_state().await;
-
-        // Phase 5: Initial assignment.
-        // `perform_initial_assignment` now drains
-        // `self.pending_stage_files` and inlines them into each
-        // recipient's `InitialAssignment.staged_files`, so the
-        // secondary registers them in its ExtractionCache atomically
-        // with processing the per-task assignments. Replaces the
-        // earlier separate `flush_pending_stage_files()` step, which
-        // sent `DistributedMessage::StageFile` messages that
-        // `wait_for_setup` then dropped (its match had no arm for
-        // them), wedging every dispatch.
-        self.perform_initial_assignment().await?;
+        // Phase 4.5 + Phase 5: Seed the replicated cluster ledger and
+        // perform the initial per-secondary assignment. Both steps are
+        // skipped when this primary is operating in setup-defer mode
+        // (`required_setup_on_promote` — i.e. the submitter was
+        // launched with `--source-already-staged` and has no local
+        // view of the corpus to discover or seed); in that mode the
+        // chosen secondary runs task discovery + ledger seed after the
+        // bootstrap promotion (see `PromotePrimary { required_setup:
+        // true }` below). To keep the secondaries' `wait_for_setup`
+        // loop unchanged in either mode, `emit_setup_defer_handshake`
+        // sends the degenerate InitialAssignment + state transitions
+        // the legacy path would have sent — empty payloads but the
+        // same wire-frame triple. The non-defer path keeps the
+        // legacy `seed_cluster_state` (TaskAdded fan-out, PhaseDepsSet)
+        // + `perform_initial_assignment` (round-robin worker
+        // assignments, staged-files inline) pairing.
+        if self.config.required_setup_on_promote {
+            self.emit_setup_defer_handshake().await?;
+        } else {
+            self.seed_cluster_state().await;
+            self.perform_initial_assignment().await?;
+        }
 
         // Phase 6: Send transfer complete
         self.send_transfer_complete().await?;

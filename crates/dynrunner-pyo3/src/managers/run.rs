@@ -157,6 +157,16 @@ pub(crate) fn run_local<'py>(
 /// the staging orchestration. `None` is the right default for pre-
 /// staged-source mode, `uses_file_based_items=False`, and remote-
 /// only primaries.
+///
+/// `source_pre_staged_root` (optional) carries the
+/// `--source-already-staged` signal for the `--multi-computer local`
+/// path: when `Some`, the Python dispatch helper has already returned
+/// an empty `binaries` list and `RustPrimaryCoordinator::run` will
+/// flip `required_setup_on_promote=true` so the chosen secondary runs
+/// discovery + ledger-seed on its bind-mounted `src_network`.
+/// Mirrors the SLURM pipeline's direct construction of
+/// `RustPrimaryCoordinator(source_pre_staged_root=...)` so all three
+/// multi-computer modes use the same setup-promote handshake.
 #[pyfunction]
 #[pyo3(signature = (
     config,
@@ -164,6 +174,7 @@ pub(crate) fn run_local<'py>(
     spawn_secondary,
     binaries,
     source_dir = None,
+    source_pre_staged_root = None,
 ))]
 pub(crate) fn run_primary<'py>(
     py: Python<'py>,
@@ -172,11 +183,15 @@ pub(crate) fn run_primary<'py>(
     spawn_secondary: Py<PyAny>,
     binaries: &Bound<'py, PyList>,
     source_dir: Option<std::path::PathBuf>,
+    source_pre_staged_root: Option<std::path::PathBuf>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
     if let Some(sd) = source_dir.as_ref() {
         kwargs.set_item("source_dir", sd)?;
+    }
+    if let Some(root) = source_pre_staged_root.as_ref() {
+        kwargs.set_item("source_pre_staged_root", root)?;
     }
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;
@@ -293,6 +308,18 @@ pub(crate) fn run_secondary<'py>(
 /// Run the in-process distributed pipeline (primary + N secondaries
 /// connected via in-memory channels). Useful for single-node multi-worker
 /// runs without real networking.
+///
+/// `source_pre_staged_root` (optional) carries the
+/// `--source-already-staged` signal for the `--multi-computer
+/// single-process` path: forwarded to `RustDistributedManager` which
+/// threads it into its `PrimaryConfig` and derives
+/// `required_setup_on_promote = source_pre_staged_root.is_some()`.
+/// The Python dispatch helper has already returned an empty
+/// `binaries` list in pre-staged mode, so the bootstrap
+/// `PromotePrimary` defers discovery + ledger-seed to the chosen
+/// secondary. Mirrors the kwarg on `run_primary` and the SLURM
+/// pipeline's direct `RustPrimaryCoordinator` construction so all
+/// three multi-computer modes share one signal.
 #[pyfunction]
 #[pyo3(signature = (
     primary_config,
@@ -305,6 +332,7 @@ pub(crate) fn run_secondary<'py>(
     skip_existing = false,
     log_paths = None,
     worker_spec = None,
+    source_pre_staged_root = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_distributed<'py>(
@@ -319,6 +347,7 @@ pub(crate) fn run_distributed<'py>(
     skip_existing: bool,
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
+    source_pre_staged_root: Option<std::path::PathBuf>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_per_secondary` retained for back-compat; the
     // typed path passes the full multi-resource map via the
@@ -346,6 +375,9 @@ pub(crate) fn run_distributed<'py>(
         "max_resources_per_secondary",
         secondary_template.max_resources.clone(),
     )?;
+    if let Some(root) = source_pre_staged_root.as_ref() {
+        kwargs.set_item("source_pre_staged_root", root)?;
+    }
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
     let args = (
