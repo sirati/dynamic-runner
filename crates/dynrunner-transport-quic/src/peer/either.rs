@@ -99,4 +99,15 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
             Self::Disabled(p) => PeerTransport::<I>::peer_for_role(p, role),
         }
     }
+
+    fn local_id(&self) -> &str {
+        // Forward to the inner arm. `NoPeerTransport` keeps the
+        // trait default of `""` — a disabled peer overlay has no
+        // role envelopes to construct and no misaddress hints can
+        // reach it, so the empty default is safe here.
+        match self {
+            Self::Real(p) => PeerTransport::<I>::local_id(p),
+            Self::Disabled(p) => PeerTransport::<I>::local_id(p),
+        }
+    }
 }
