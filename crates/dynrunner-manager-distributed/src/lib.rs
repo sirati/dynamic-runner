@@ -17,4 +17,7 @@ pub use state::{
     InitialAssigning, Operational, ShuttingDown, SecondaryConnectionState,
 };
 pub use message_router::{MessageRouter, RoutedMessage};
-pub use cluster_state::{ApplyOutcome, ClusterState, StateCounts, TaskState};
+pub use cluster_state::{ApplyOutcome, ClusterState, RoleChangeHook, StateCounts, TaskState};
+// Re-export the role-table types so downstream crates don't have to
+// reach into the protocol crate to type the cache shape.
+pub use dynrunner_protocol_primary_secondary::{RoleChangeHookRegistrar, RoleTable};

@@ -5,7 +5,10 @@ pub mod codec;
 pub mod relay;
 pub mod transport;
 
-pub use address::{Address, Role, Scope};
+pub use address::{
+    install_role_change_hook, new_role_cache, read_role_cache, Address, Role, RoleCache,
+    RoleChangeHookRegistrar, RoleTable, Scope,
+};
 pub use cluster_mutation::ClusterMutation;
 pub use messages::*;
 pub use codec::{serialize_message, deserialize_message, decode_frame};
