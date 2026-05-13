@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    new_role_cache, DistributedMessage, PeerConnectionInfo, RoleCache, Router,
+    new_role_cache, seed_self_role, DistributedMessage, PeerConnectionInfo, RoleCache, Router,
 };
 use tokio::sync::mpsc;
 
@@ -176,6 +176,13 @@ impl<I: Identifier> PeerNetwork<I> {
 
         tracing::info!(peer_id, port, "peer network listening (QUIC/UDP + WSS/TCP)");
 
+        let role_cache = new_role_cache();
+        // Self_ is a strictly local fact — the role-table hook
+        // populates Primary only. Seeding at construction so the
+        // receiver-side RoleAddressed handling (Step 4) treats
+        // `intended_role == Self_` envelopes as Case A (local
+        // unwrap) rather than Case C (no cached holder → drop).
+        seed_self_role(&role_cache, peer_id);
         Ok(Self {
             peer_id: peer_id.to_string(),
             cert,
@@ -189,7 +196,7 @@ impl<I: Identifier> PeerNetwork<I> {
             peer_dial_info: HashMap::new(),
             reconnect_tick_rx: Some(reconnect_tick_rx),
             reconnect_tracker: reconnect::ReconnectTracker::new(),
-            role_cache: new_role_cache(),
+            role_cache,
         })
     }
 
