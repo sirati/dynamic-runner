@@ -532,4 +532,121 @@ mod tests {
         assert!(transports[2].try_recv_peer().is_none());
         assert!(transports[0].try_recv_peer().is_none());
     }
+
+    // ── PeerTransport::send default-impl contract tests ──
+    //
+    // These pin the Step 1 default impl so Step 3 (which will replace
+    // the Role/AllSecondaries error arms with real dispatch) has a
+    // regression net. Each test exercises exactly one Address variant
+    // through the trait's default body — the channel transport itself
+    // does not override `send`, so what we observe here is the protocol-
+    // crate default routing through `send_to_peer` / `broadcast`.
+
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct SendTestId(String);
+
+    fn keepalive(sender: &str) -> DistributedMessage<SendTestId> {
+        DistributedMessage::Keepalive {
+            sender_id: sender.into(),
+            timestamp: 1.0,
+            secondary_id: sender.into(),
+            active_workers: 0,
+        }
+    }
+
+    /// `send(Address::Peer(id), msg)` routes through the default impl
+    /// to `send_to_peer` and reaches exactly that peer.
+    #[tokio::test]
+    async fn send_address_peer_reaches_recipient() {
+        use dynrunner_protocol_primary_secondary::Address;
+
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        transports[0]
+            .send(Address::Peer("b".to_string()), keepalive("a"))
+            .await
+            .unwrap();
+
+        assert!(transports[1].try_recv_peer().is_some());
+        assert!(transports[2].try_recv_peer().is_none());
+        assert!(transports[0].try_recv_peer().is_none());
+    }
+
+    /// `send(Address::Broadcast(Scope::Mesh), msg)` routes through the
+    /// default impl to `broadcast` and fans out to every other peer.
+    #[tokio::test]
+    async fn send_address_broadcast_mesh_fans_out() {
+        use dynrunner_protocol_primary_secondary::{Address, Scope};
+
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        transports[0]
+            .send(Address::Broadcast(Scope::Mesh), keepalive("a"))
+            .await
+            .unwrap();
+
+        assert!(transports[0].try_recv_peer().is_none());
+        assert!(transports[1].try_recv_peer().is_some());
+        assert!(transports[2].try_recv_peer().is_some());
+    }
+
+    /// `send(Address::Role(_), msg)` is rejected by the Step 1 default
+    /// impl — Step 3 will replace this arm with role-table lookup.
+    /// The error string must mention "Step 3" so anyone reading a log
+    /// during the migration window understands the cause.
+    #[tokio::test]
+    async fn send_address_role_returns_err() {
+        use dynrunner_protocol_primary_secondary::{Address, Role};
+
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        let err = transports[0]
+            .send(Address::Role(Role::Primary), keepalive("a"))
+            .await
+            .expect_err("Role(_) addressing must error in Step 1");
+        assert!(
+            err.contains("Step 3"),
+            "error message must reference Step 3 migration target; got: {err}"
+        );
+
+        // Self_ variant must error symmetrically.
+        let err_self = transports[0]
+            .send(Address::Role(Role::Self_), keepalive("a"))
+            .await
+            .expect_err("Role(Self_) addressing must error in Step 1");
+        assert!(err_self.contains("Step 3"));
+
+        // No message must have been delivered to any peer's inbox.
+        assert!(transports[0].try_recv_peer().is_none());
+        assert!(transports[1].try_recv_peer().is_none());
+    }
+
+    /// `send(Address::Broadcast(Scope::AllSecondaries), msg)` is rejected
+    /// by the Step 1 default impl — Step 3 will plumb this through the
+    /// role table to exclude the current primary.
+    #[tokio::test]
+    async fn send_address_broadcast_all_secondaries_returns_err() {
+        use dynrunner_protocol_primary_secondary::{Address, Scope};
+
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let mut transports = peer_mesh::<SendTestId>(&ids);
+
+        let err = transports[0]
+            .send(Address::Broadcast(Scope::AllSecondaries), keepalive("a"))
+            .await
+            .expect_err("Broadcast(AllSecondaries) must error in Step 1");
+        assert!(
+            err.contains("Step 3"),
+            "error message must reference Step 3 migration target; got: {err}"
+        );
+
+        // No message delivered.
+        assert!(transports[0].try_recv_peer().is_none());
+        assert!(transports[1].try_recv_peer().is_none());
+    }
 }

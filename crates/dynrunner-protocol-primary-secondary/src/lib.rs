@@ -1,9 +1,11 @@
+pub mod address;
 pub mod cluster_mutation;
 pub mod messages;
 pub mod codec;
 pub mod relay;
 pub mod transport;
 
+pub use address::{Address, Role, Scope};
 pub use cluster_mutation::ClusterMutation;
 pub use messages::*;
 pub use codec::{serialize_message, deserialize_message, decode_frame};
