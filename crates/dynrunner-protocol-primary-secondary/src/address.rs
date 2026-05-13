@@ -167,6 +167,28 @@ pub fn new_role_cache() -> RoleCache {
     std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
 }
 
+/// Seed `Role::Self_` with the transport's `local_id`. The role-
+/// table hook (`install_role_change_hook`) never touches `Self_`
+/// — it's not a replicated fact, it's a strictly local "who am I"
+/// answer — so transports populate it themselves at construction.
+///
+/// The receiver-side `RoleAddressed` decision (Step 4) uses
+/// `read_role_cache(.., Role::Self_)` as the holder lookup when an
+/// envelope's `intended_role == Self_`; without this seed the
+/// receiver would observe a cache-cold `Self_` and drop the
+/// envelope as Case C, even though `Self_` is by definition
+/// always-resolved-to-self.
+///
+/// Idempotent on subsequent calls. On lock poisoning we recover
+/// the inner — same rationale as the rest of the cache helpers.
+pub fn seed_self_role(cache: &RoleCache, local_id: &str) {
+    let mut guard = match cache.write() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard.insert(Role::Self_, local_id.to_string());
+}
+
 /// Install a hook on the registrar that writes through to the
 /// cache. The hook captures a strong `Arc<RwLock<_>>` handle to the
 /// cache; both the transport and the hook hold one, so the cache
