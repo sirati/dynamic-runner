@@ -11,6 +11,7 @@ use dynrunner_scheduler_api::{
 };
 
 
+use crate::cluster_state::apply_locally_for_broadcast;
 use super::{PrimaryCoordinator, RemoteWorkerState};
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
@@ -76,14 +77,13 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // turn duplicate applies into NoOp; skipping the NoOp arm
         // keeps the wire fan-out at one broadcast per genuinely-new
         // state transition regardless of how many peer-forward
-        // paths converge on us.
-        let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
-        for m in mutations {
-            let outcome = self.cluster_state.apply(m.clone());
-            if outcome == crate::cluster_state::ApplyOutcome::Applied {
-                applied.push(m);
-            }
-        }
+        // paths converge on us. The apply+filter primitive lives in
+        // `cluster_state::apply_locally_for_broadcast` so this
+        // originator path and the promoted-secondary's mirror
+        // (`secondary::primary::apply_and_broadcast_mutations`) share
+        // one canonical filter; the broadcast step stays at each call
+        // site because the two transports have different error shapes.
+        let applied = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
         if applied.is_empty() {
             return;
         }
