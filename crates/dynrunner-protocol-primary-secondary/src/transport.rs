@@ -1,5 +1,6 @@
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
+use crate::address::{Address, Scope};
 use crate::DistributedMessage;
 
 /// Transport trait for the primary side: can send to specific secondaries, receive from any.
@@ -79,4 +80,39 @@ pub trait PeerTransport<I: Identifier> {
         &mut self,
         peers: &[crate::PeerConnectionInfo],
     ) -> impl std::future::Future<Output = ()>;
+
+    /// Send a message via role-aware addressing.
+    ///
+    /// Default implementation routes the well-known address shapes to
+    /// the existing primitives:
+    ///   - `Address::Peer(id)` → `send_to_peer(id, msg)`
+    ///   - `Address::Broadcast(Scope::Mesh)` → `broadcast(msg)`
+    ///
+    /// `Address::Role(_)` and `Address::Broadcast(Scope::AllSecondaries)`
+    /// return `Err` with a clear "not yet supported" message — Steps 2-3
+    /// of the unification refactor will implement them on top of the
+    /// `RoleTable` cache. Until then, callers MUST keep using the
+    /// existing send_to_peer/broadcast for their concerns; this entry
+    /// point is the migration target, not yet load-bearing.
+    fn send(
+        &mut self,
+        addr: Address,
+        msg: DistributedMessage<I>,
+    ) -> impl std::future::Future<Output = Result<(), String>> {
+        async move {
+            match addr {
+                Address::Peer(id) => self.send_to_peer(&id, msg).await,
+                Address::Broadcast(Scope::Mesh) => self.broadcast(msg).await,
+                Address::Role(role) => Err(format!(
+                    "Address::Role({role:?}) not yet supported (Step 3 of unification refactor); \
+                     callers must continue using send_to_peer/broadcast"
+                )),
+                Address::Broadcast(Scope::AllSecondaries) => Err(
+                    "Address::Broadcast(AllSecondaries) not yet supported (Step 3); \
+                     callers must continue using SecondaryTransport::broadcast"
+                        .into(),
+                ),
+            }
+        }
+    }
 }
