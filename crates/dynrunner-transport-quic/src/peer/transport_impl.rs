@@ -9,12 +9,13 @@
 //! `new_conn_rx` in `recv_peer` — stay here because they are QUIC's
 //! mechanics, not routing decisions.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport,
-    SendOutcome,
+    install_role_change_hook, read_role_cache, Clocks, DistributedMessage, InboundOutcome,
+    PeerConnectionInfo, PeerTransport, Role, RoleChangeHookRegistrar, SendOutcome,
 };
 
 use super::PeerNetwork;
@@ -209,5 +210,18 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         // immediately; the trait stays async because other PeerTransport
         // impls (channel, no-op) keep their async signatures.
         PeerNetwork::connect_to_peers(self, peers);
+    }
+
+    fn register_with_cluster_state(&self, registrar: &mut dyn RoleChangeHookRegistrar) {
+        // Same write-through-cache plumbing as the channel transport
+        // — both delegate to the protocol-crate helper so the hook
+        // body never drifts between transport kinds. The Arc clone
+        // is what the hook captures; the transport's own handle
+        // keeps the cache alive for as long as PeerNetwork lives.
+        install_role_change_hook(Arc::clone(&self.role_cache), registrar);
+    }
+
+    fn peer_for_role(&self, role: &Role) -> Option<String> {
+        read_role_cache(&self.role_cache, role)
     }
 }

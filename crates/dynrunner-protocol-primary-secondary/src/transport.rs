@@ -1,6 +1,6 @@
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
-use crate::address::{Address, Scope};
+use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
 use crate::DistributedMessage;
 
 /// Transport trait for the primary side: can send to specific secondaries, receive from any.
@@ -114,5 +114,39 @@ pub trait PeerTransport<I: Identifier> {
                 ),
             }
         }
+    }
+
+    /// Attach this transport's write-through role cache to the
+    /// authoritative [`RoleTable`] owner. The registrar is the
+    /// downstream `ClusterState` (or a test fixture implementing
+    /// [`RoleChangeHookRegistrar`]).
+    ///
+    /// Default impl is a no-op: transports that don't keep a
+    /// role-cache (e.g. `NoPeerTransport`, or the channel transport
+    /// in tests that never exercise role addressing) compile cleanly
+    /// without overriding. Real transports override to register a
+    /// hook that writes their local `HashMap<Role, String>` cache
+    /// whenever the authoritative table mutates — that's how Step 3
+    /// gets a lock-free read of "who is primary now" on the send
+    /// hot path.
+    ///
+    /// The registration is one-shot; callers invoke this once at
+    /// coordinator construction.
+    fn register_with_cluster_state(&self, _registrar: &mut dyn RoleChangeHookRegistrar) {}
+
+    /// Look up the current id of whoever holds `role` per this
+    /// transport's local write-through cache.
+    ///
+    /// Default impl returns `None` — transports without a cache
+    /// silently report "no holder", which is the safe answer
+    /// upstream (Step 3's role dispatch will surface `None` as a
+    /// no-route error, not a mis-send).
+    ///
+    /// Real transports override to read their cached map populated
+    /// by the hook registered via [`Self::register_with_cluster_state`].
+    /// The returned `String` is a clone — the cache stays locked for
+    /// the minimum window.
+    fn peer_for_role(&self, _role: &Role) -> Option<String> {
+        None
     }
 }

@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{
-    Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo, PeerTransport, Router,
-    SecondaryTransport, SendOutcome,
+    install_role_change_hook, new_role_cache, read_role_cache, Clocks, DistributedMessage,
+    InboundOutcome, PeerConnectionInfo, PeerTransport, Role, RoleCache,
+    RoleChangeHookRegistrar, Router, SecondaryTransport, SendOutcome,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
 use tokio::sync::mpsc;
@@ -171,6 +173,13 @@ pub struct ChannelPeerTransport<I: Identifier> {
     /// assertions per `M5` of the relay-routing plan. Not part of the
     /// stable public API; production callers should ignore it.
     pub last_outcome: Option<SendOutcome>,
+    /// Write-through cache of `Role → peer_id`. Populated by the
+    /// hook registered via
+    /// [`PeerTransport::register_with_cluster_state`]; read by
+    /// [`PeerTransport::peer_for_role`] on the send hot path. Empty
+    /// until registration runs — transports that never register
+    /// observe `None` for every lookup.
+    role_cache: RoleCache,
 }
 
 impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
@@ -243,6 +252,20 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         // No-op: peers are pre-wired via `peer_mesh` /
         // `peer_mesh_with_adjacency`. Test drivers simulate partition
         // heal via `connect_to` directly.
+    }
+
+    fn register_with_cluster_state(&self, registrar: &mut dyn RoleChangeHookRegistrar) {
+        // Hand the shared cache handle to the protocol-crate helper
+        // that installs the hook on the registrar. The hook captures
+        // a clone of the `Arc<RwLock<_>>` and writes through to the
+        // same map `peer_for_role` reads. See
+        // `install_role_change_hook` for the lock-poisoning recovery
+        // rationale.
+        install_role_change_hook(Arc::clone(&self.role_cache), registrar);
+    }
+
+    fn peer_for_role(&self, role: &Role) -> Option<String> {
+        read_role_cache(&self.role_cache, role)
     }
 }
 
@@ -374,6 +397,7 @@ pub fn peer_mesh_with_adjacency<I: Identifier>(
             outgoing: outgoing_for_peer,
             router: Router::new(id.clone()),
             last_outcome: None,
+            role_cache: new_role_cache(),
         });
     }
     transports
@@ -648,5 +672,128 @@ mod tests {
         // No message delivered.
         assert!(transports[0].try_recv_peer().is_none());
         assert!(transports[1].try_recv_peer().is_none());
+    }
+
+    // ── Step 2: role-table write-through cache tests ──
+    //
+    // These exercise the channel transport's `register_with_cluster_state`
+    // + `peer_for_role` pair through a minimal in-test registrar (the
+    // trait owner — `ClusterState` — lives in a downstream crate; we
+    // mimic only the part of its contract the transport actually
+    // touches). Step 3 will couple this to live `ClusterState` flow;
+    // for now the registrar fires the hook directly so the cache's
+    // write-through path is the single thing under test.
+
+    /// Minimal in-test `RoleChangeHookRegistrar` implementation that
+    /// holds onto the registered hook and exposes a `fire` method
+    /// driving it against an arbitrary `RoleTable`. Strictly enough
+    /// to test the transport's cache plumbing without taking a
+    /// dev-dep on the cluster-state crate.
+    #[derive(Default)]
+    struct TestRegistrar {
+        hooks: Vec<Box<dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync>>,
+    }
+
+    impl TestRegistrar {
+        fn fire(&self, table: &dynrunner_protocol_primary_secondary::RoleTable) {
+            for h in &self.hooks {
+                h(table);
+            }
+        }
+    }
+
+    impl RoleChangeHookRegistrar for TestRegistrar {
+        fn register_role_change_hook(
+            &mut self,
+            hook: Box<
+                dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static,
+            >,
+        ) {
+            self.hooks.push(hook);
+        }
+    }
+
+    /// After `register_with_cluster_state` runs and the registrar
+    /// fires with a `RoleTable { primary: Some(id), .. }`, the
+    /// transport's `peer_for_role(Role::Primary)` returns the same
+    /// id. Pins the basic write-through path.
+    #[tokio::test]
+    async fn peer_transport_role_cache_populates_via_hook() {
+        use dynrunner_protocol_primary_secondary::{Role, RoleTable};
+
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let transports = peer_mesh::<SendTestId>(&ids);
+        let transport = &transports[0];
+
+        assert_eq!(
+            transport.peer_for_role(&Role::Primary),
+            None,
+            "cache empty before registration"
+        );
+
+        let mut registrar = TestRegistrar::default();
+        transport.register_with_cluster_state(&mut registrar);
+
+        // Still None until the hook actually fires — registration
+        // alone does not seed; the authoritative table has to send
+        // a `RoleTable` snapshot through.
+        assert_eq!(transport.peer_for_role(&Role::Primary), None);
+
+        let table = RoleTable {
+            primary: Some("sec-7".to_string()),
+            ..Default::default()
+        };
+        registrar.fire(&table);
+
+        assert_eq!(
+            transport.peer_for_role(&Role::Primary),
+            Some("sec-7".to_string()),
+        );
+    }
+
+    /// A subsequent `PrimaryChanged` (modelled here as a second
+    /// registrar.fire with a different holder) overwrites the
+    /// cache. Pins the overwrite contract — Step 3's dispatch will
+    /// silently misroute if the cache holds a stale id across a
+    /// promotion.
+    #[tokio::test]
+    async fn peer_transport_role_cache_overwrites_on_subsequent_promote() {
+        use dynrunner_protocol_primary_secondary::{Role, RoleTable};
+
+        let ids = vec!["a".to_string(), "b".to_string()];
+        let transports = peer_mesh::<SendTestId>(&ids);
+        let transport = &transports[0];
+
+        let mut registrar = TestRegistrar::default();
+        transport.register_with_cluster_state(&mut registrar);
+
+        registrar.fire(&RoleTable {
+            primary: Some("first-leader".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            transport.peer_for_role(&Role::Primary),
+            Some("first-leader".to_string()),
+        );
+
+        registrar.fire(&RoleTable {
+            primary: Some("second-leader".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            transport.peer_for_role(&Role::Primary),
+            Some("second-leader".to_string()),
+            "second fire must overwrite first leader",
+        );
+
+        // Clearing the primary (e.g. an unset table) clears the
+        // cache entry — `peer_for_role` returns None again. This
+        // is the contract the protocol-crate helper enforces by
+        // `remove(&Role::Primary)` ahead of the conditional insert.
+        registrar.fire(&RoleTable {
+            primary: None,
+            ..Default::default()
+        });
+        assert_eq!(transport.peer_for_role(&Role::Primary), None);
     }
 }
