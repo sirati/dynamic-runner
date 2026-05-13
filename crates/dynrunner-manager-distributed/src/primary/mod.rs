@@ -561,10 +561,38 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     /// (idempotent under repetition + reorder within the per-task
     /// happens-before constraint) live in `cluster_state.rs`.
     pub(super) cluster_state: ClusterState<I>,
+
+    /// Gate the operational-loop counter-based exit check while a
+    /// setup-promoted secondary is still discovering items and seeding
+    /// the cluster ledger. Initialised from
+    /// `config.required_setup_on_promote` at `run()` start; cleared the
+    /// moment either (1) the first `ClusterMutation::TaskAdded` arrives
+    /// via the mirror path (proves discovery happened and seeded at
+    /// least one task) or (2) `ClusterMutation::RunComplete` arrives
+    /// (proves the chosen secondary legitimately discovered zero items
+    /// and finished the run cleanly).
+    ///
+    /// Without this gate, the setup-promote path's
+    /// `emit_setup_defer_handshake` leaves `total_tasks = 0` on the
+    /// demoted submitter; the operational loop's exit-check
+    /// (`completed + failed >= total_tasks && active_workers == 0`)
+    /// trips at `0 + 0 >= 0` the moment the demoted primary enters the
+    /// loop — BEFORE the chosen secondary has had a chance to run
+    /// `discover_items` and broadcast its first `TaskAdded`. Step 3's
+    /// reactive `total_tasks` refresh in
+    /// `task::mirror_mutation_to_accounting` only fires WHEN a
+    /// `TaskAdded` arrives; this gate covers the window before that
+    /// first arrival. Legacy bootstrap (`required_setup_on_promote =
+    /// false`) starts with `setup_pending = false`, so the gate is a
+    /// strict superset of the historical exit semantics — no
+    /// regression on the path where `seed_cluster_state` ran locally
+    /// and `total_tasks` is non-zero at startup.
+    pub(super) setup_pending: bool,
 }
 
 impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
     pub fn new(config: PrimaryConfig, transport: T, scheduler: S, estimator: E) -> Self {
+        let setup_pending = config.required_setup_on_promote;
         Self {
             config,
             transport,
@@ -594,6 +622,7 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             demoted: false,
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
+            setup_pending,
         }
     }
 
@@ -775,6 +804,15 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
         // can't leak into this one. Populated below after both loops
         // drain; the structured-error path consults it.
         self.stranded_count = 0;
+
+        // Refresh the setup-pending gate from the current config so a
+        // reused coordinator (or one whose config was mutated between
+        // runs) starts each run with the correct exit-gate state. In
+        // setup-promote mode this defers the counter-based exit-check
+        // until the chosen secondary has either broadcast its first
+        // `TaskAdded` (discovery succeeded) or `RunComplete` (no items
+        // to discover) — see the `setup_pending` field doc.
+        self.setup_pending = self.config.required_setup_on_promote;
 
         // Discover the phase set: union of (1) every phase referenced
         // by an item, (2) every phase mentioned as a key or parent in
