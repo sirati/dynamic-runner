@@ -559,7 +559,7 @@ where
             config.primary_link_failure_threshold,
             config.primary_link_failure_window,
         );
-        Self {
+        let mut this = Self {
             config,
             primary_transport,
             peer_transport,
@@ -597,7 +597,17 @@ where
             pending_worker_restarts: HashSet::new(),
             setup_pending: false,
             setup_phase_completed: false,
-        }
+        };
+        // Attach the transport's write-through role cache to our
+        // authoritative `cluster_state.role_table`. The hook fires
+        // on every applied `PrimaryChanged` mutation; the cache
+        // serves Step 3's `Address::Role(_)` dispatch on the send
+        // hot path. Transports that don't override
+        // `register_with_cluster_state` (e.g. `NoPeerTransport`,
+        // test stubs) get the default no-op — safe by construction.
+        this.peer_transport
+            .register_with_cluster_state(&mut this.cluster_state);
+        this
     }
 
     /// Whether the run is in pre-staged-source mode (set from the
