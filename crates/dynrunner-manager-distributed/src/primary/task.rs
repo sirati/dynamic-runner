@@ -722,11 +722,20 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                     self.failed_tasks.insert(hash.clone(), kind.clone());
                 }
             }
-            ClusterMutation::TaskAdded { .. }
-            | ClusterMutation::TaskAssigned { .. }
+            // `TaskAdded` proves the chosen secondary has run discovery
+            // and seeded at least one task; `RunComplete` proves it
+            // legitimately finished (including the zero-items case).
+            // Either is the signal that the operational-loop exit-check
+            // can safely re-enable on a demoted setup-promote submitter
+            // — see the `setup_pending` field doc on
+            // `PrimaryCoordinator`. Idempotent flip (a no-op on the
+            // legacy path where the field is already `false`).
+            ClusterMutation::TaskAdded { .. } | ClusterMutation::RunComplete => {
+                self.setup_pending = false;
+            }
+            ClusterMutation::TaskAssigned { .. }
             | ClusterMutation::PrimaryChanged { .. }
-            | ClusterMutation::PhaseDepsSet { .. }
-            | ClusterMutation::RunComplete => {}
+            | ClusterMutation::PhaseDepsSet { .. } => {}
         }
     }
 }

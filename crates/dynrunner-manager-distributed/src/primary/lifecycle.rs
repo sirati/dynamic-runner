@@ -190,7 +190,19 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // guarantees we only exit when every dispatched
             // assignment has been reconciled.
             let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            if self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
+            // `setup_pending` blocks this counter-based exit while a
+            // setup-promoted secondary hasn't yet broadcast its first
+            // `TaskAdded` (`total_tasks == 0` and no work has even
+            // been advertised yet, so `0 + 0 >= 0` would trip
+            // immediately). Cleared on the first `TaskAdded` (proves
+            // discovery seeded ≥1 task) or on `RunComplete` (proves
+            // the setup-secondary legitimately found zero items and
+            // finished cleanly) — see `mirror_mutation_to_accounting`
+            // and the `setup_pending` field doc on `PrimaryCoordinator`.
+            // Legacy bootstrap starts `setup_pending = false`, so this
+            // arm is a strict superset of the historical exit semantics.
+            if !self.setup_pending
+                && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
                 && active_workers == 0
             {
                 tracing::info!("all tasks completed or failed");
@@ -203,7 +215,17 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             // where in-flight is zero but a worker hasn't reported
             // completion yet (mostly defensive — `on_item_finished`
             // runs synchronously off the wire message).
-            if self.pool().is_run_complete() && active_workers == 0 {
+            //
+            // Gated on `!setup_pending` for the same reason as the
+            // counter-based exit above: in setup-promote mode the
+            // demoted submitter starts with an empty pool and (often)
+            // an empty phase_set — `is_run_complete()` would return
+            // true immediately, before the chosen secondary has had a
+            // chance to broadcast `TaskAdded` (which is mirrored only
+            // into `cluster_state`, not into this pool — the local
+            // pool stays empty on the demoted submitter). Cleared by
+            // the same mirror-path hooks as `setup_pending` itself.
+            if !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
                 tracing::info!("pool drained and no active workers");
                 break;
             }

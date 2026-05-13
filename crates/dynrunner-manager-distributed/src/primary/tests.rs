@@ -3720,3 +3720,290 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
         })
         .await;
 }
+
+// ── setup-promote operational-loop exit gate ──
+//
+// Regression pair pinning the `setup_pending` exit-check gate. In
+// setup-promote mode (`required_setup_on_promote = true`) the submitter
+// primary skips `seed_cluster_state`, so it enters the operational loop
+// with `total_tasks = 0`. Pre-fix the counter-based exit check
+// (`completed + failed >= total_tasks && active_workers == 0`) tripped
+// at `0 + 0 >= 0` on the very first loop iteration — BEFORE the
+// promoted setup-secondary had a chance to run discovery and broadcast
+// its first `ClusterMutation::TaskAdded`. The submitter exited with
+// `total=0` (the "primary finished succeeded=0 fail_retry=0 fail_oom=0
+// fail_final=0 total=0" log line) and tore down the run before any task
+// could dispatch.
+//
+// Post-fix: `setup_pending = config.required_setup_on_promote` at
+// startup gates BOTH the counter-based exit (line ~193) AND the pool-
+// drained exit (line ~206) in `operational_loop`. The flag is cleared
+// when the first `TaskAdded` or `RunComplete` mutation arrives via
+// `mirror_mutation_to_accounting`, re-enabling the historical exit
+// checks for the rest of the run. Legacy bootstrap
+// (`required_setup_on_promote = false`) starts the flag at `false`, so
+// existing behaviour is unchanged — pinned by the second test below.
+
+/// T1 — setup-promote: operational loop does NOT exit at the first
+/// tick when `setup_pending = true` and `total_tasks = 0`, even though
+/// the counter check `0 + 0 >= 0` is satisfied. After a `TaskAdded`
+/// mutation arrives via the mirror path the flag clears, `total_tasks`
+/// refreshes to 1, and a subsequent `TaskCompleted` lets the counter
+/// check fire cleanly. Pre-fix this test would observe the loop exit
+/// before the TaskAdded message was even consumed off the transport.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+        let (_sec_id, _to_sec_rx, incoming_tx) =
+            secondary_ends.into_iter().next().unwrap();
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            // Setup-promote intent: the submitter has deferred
+            // discovery + ledger seed to the promoted secondary, so
+            // `total_tasks` starts at 0 and the operational loop must
+            // wait for the secondary's TaskAdded broadcast.
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Sanity: `PrimaryCoordinator::new` must initialise
+        // `setup_pending` from the config (the field's invariant). If
+        // this fails the rest of the test's reasoning is wrong.
+        assert!(
+            primary.setup_pending,
+            "setup_pending must be initialised from config.required_setup_on_promote at construction"
+        );
+
+        // Mirror what `run()` would set up: empty pool, default phase
+        // tracked, no binaries, `total_tasks = 0`. demoted=true puts
+        // the loop in observer mode so the heartbeat tick doesn't
+        // race on dead-secondary detection in this synthetic state.
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        primary.total_tasks = 0;
+        primary.demoted = true;
+
+        // Pre-load the transport: a TaskAdded mutation followed by a
+        // TaskCompleted for the same hash. The loop's first iteration
+        // MUST NOT exit (setup_pending blocks the counter check at
+        // `0+0 >= 0`); on the recv tick it consumes the TaskAdded,
+        // which (a) clears `setup_pending` via the mirror path and
+        // (b) refreshes `total_tasks` from `cluster_state.task_count()`
+        // = 1. On the next iteration the counter check is `0+0 >= 1`
+        // = false, so the loop stays alive. The TaskCompleted then
+        // arrives, advancing `completed_tasks` to 1; the iteration
+        // after that observes `1+0 >= 1 && active_workers == 0` and
+        // exits "all tasks completed or failed".
+        let bin = make_binary("setup-discovered-task", 100);
+        let hash = super::wire::compute_task_hash(&bin);
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::TaskAdded {
+                    hash: hash.clone(),
+                    task: bin.clone(),
+                }],
+            })
+            .unwrap();
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
+                    hash: hash.clone(),
+                }],
+            })
+            .unwrap();
+        // Hold the sender open so the loop's exit MUST come from the
+        // counter check, not the transport-closed fallback. Asserting
+        // on `setup_pending == false` post-exit pins that the
+        // TaskAdded mirror path actually cleared the gate.
+        let _hold = incoming_tx;
+
+        // Bounded wait. Pre-fix the loop exits on iteration 1 (the
+        // counter check fires at `0+0 >= 0` before any recv runs).
+        // Post-fix the loop must process both mutations before the
+        // counter check trips; that completes in single-digit ms on
+        // an in-process channel transport. 5s ceiling for CI flake
+        // tolerance — matches the existing
+        // `demoted_primary_exits_on_run_complete_broadcast` test.
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+
+        match exit {
+            Ok(Ok(())) => {
+                // Pin the post-fix invariants:
+                // (1) `setup_pending` cleared by the TaskAdded mirror.
+                assert!(
+                    !primary.setup_pending,
+                    "setup_pending must be cleared by the TaskAdded mirror; \
+                     if this fails the gate never lifted and the loop \
+                     exited via some other branch we did not intend"
+                );
+                // (2) `total_tasks` refreshed from cluster_state to 1.
+                assert_eq!(
+                    primary.total_tasks, 1,
+                    "total_tasks must refresh from cluster_state.task_count() \
+                     after the TaskAdded batch applies"
+                );
+                // (3) The TaskCompleted mirror landed.
+                assert!(
+                    primary.completed_tasks.contains(&hash),
+                    "completed_tasks must include the hash from the second \
+                     mirrored ClusterMutation::TaskCompleted"
+                );
+            }
+            Ok(Err(e)) => panic!(
+                "operational_loop returned Err in setup-promote scenario: {e}"
+            ),
+            Err(_) => panic!(
+                "operational_loop did not exit within 5s after the \
+                 TaskAdded + TaskCompleted mirrored mutations — the \
+                 setup_pending gate may be stuck, or the counter check \
+                 is not re-enabling on the cleared flag"
+            ),
+        }
+    }).await;
+}
+
+/// T2 — legacy bootstrap exit semantics unchanged: with
+/// `required_setup_on_promote = false`, `setup_pending` starts at
+/// `false` and the counter-based exit at line ~193 of
+/// `operational_loop` fires immediately when
+/// `completed + failed >= total_tasks && active_workers == 0`. Pins
+/// that the gate added in T1 is a strict superset of historical
+/// behaviour — no regression on the path where `seed_cluster_state`
+/// ran locally and `total_tasks` was non-zero at startup.
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_bootstrap_counter_exit_unchanged() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+        let (_sec_id, _to_sec_rx, _incoming_tx) =
+            secondary_ends.into_iter().next().unwrap();
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            // Legacy bootstrap: `seed_cluster_state` ran locally, so
+            // `total_tasks` is set by `run()` from `binaries.len()`
+            // and the counter-based exit must fire on the very first
+            // iteration once completions cover the total.
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Pin invariant: legacy path leaves `setup_pending = false`.
+        assert!(
+            !primary.setup_pending,
+            "setup_pending must default to false when required_setup_on_promote = false"
+        );
+
+        // Legacy mid-run state: 2 tasks total, both already in the
+        // completed set (mirrors what would normally arrive via
+        // TaskComplete handlers). No active workers. The counter
+        // check on the first iteration is `2+0 >= 2 && 0 == 0` —
+        // must trip immediately.
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        primary.total_tasks = 2;
+        primary.completed_tasks.insert("h-legacy-1".into());
+        primary.completed_tasks.insert("h-legacy-2".into());
+        primary.demoted = true; // observer mode, no heartbeat side-effects
+
+        // Bounded wait. The counter-check exit should fire on
+        // iteration 1 of the loop — well under 1s. A 5s ceiling is
+        // overkill but stays consistent with the other operational-
+        // loop tests in this file.
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+
+        match exit {
+            Ok(Ok(())) => {
+                // Exit path pinning: still on the legacy counter-based
+                // exit. `setup_pending` stayed false the entire time
+                // (no TaskAdded / RunComplete arrived to clear it),
+                // and `cluster_state.run_complete()` was never set.
+                assert!(
+                    !primary.setup_pending,
+                    "legacy bootstrap must not flip setup_pending true at any point"
+                );
+                assert!(
+                    !primary.cluster_state_for_test().run_complete(),
+                    "legacy bootstrap exit must be via the counter check, \
+                     not via the cluster_state.run_complete() branch"
+                );
+            }
+            Ok(Err(e)) => panic!(
+                "operational_loop returned Err in legacy bootstrap scenario: {e}"
+            ),
+            Err(_) => panic!(
+                "legacy bootstrap operational_loop did not exit within 5s \
+                 despite the counter check `2+0 >= 2 && active_workers == 0` \
+                 being satisfied on the first iteration — regression on the \
+                 historical exit semantics"
+            ),
+        }
+    }).await;
+}
