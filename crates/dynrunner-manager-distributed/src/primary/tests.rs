@@ -2259,6 +2259,169 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
     }).await;
 }
 
+/// Regression: a demoted primary that receives a `TaskRequest` from any
+/// secondary must NOT relay it to `self.primary_id` via `transport.send_to`.
+/// The promoted peer's outgoing channel on the demoted side is the
+/// server-side writer the new primary no longer drains in its post-flip
+/// role, so the next `send_to` after promotion fails with `channel closed`.
+/// Pre-fix the `?` on that send escalated to `run()`'s error path and the
+/// demoted submitter process exited within two keepalive intervals of
+/// promotion — operator-facing tokenizer setup-promote regression
+/// (04:48:38 promote → 04:48:48 "primary coordinator failed").
+///
+/// Per `feedback_mesh_independent_of_role_and_membership.md`, transport-
+/// level channel-closed to a promoted peer must NOT be fatal: the peer
+/// mesh stays as-is and the requesting secondary will re-route to peer-
+/// transport once it applies the `PromotePrimary` broadcast we sent.
+/// Dropping the relayed TaskRequest is benign on the demoted side; the
+/// secondary retries on its next backoff tick.
+///
+/// Setup mirrors `promote_primary_demotes_local_and_disables_dispatch`
+/// but adds the failure injection: after `promote_primary` flips
+/// `demoted = true`, we drop the receiver end of the promoted peer's
+/// outgoing channel so the next `transport.send_to(promoted_id, ..)`
+/// surfaces `channel closed`. Then we feed a synthesized TaskRequest
+/// through `dispatch_message`; pre-fix this returns Err and would
+/// torpedo the demoted submitter's `run()`. Post-fix it returns Ok and
+/// a subsequent `ClusterMutation::RunComplete` continues to apply on
+/// the demoted primary's mirror — the failover/run-done path is intact.
+#[tokio::test(flavor = "current_thread")]
+async fn demoted_primary_suppresses_taskrequest_relay_after_promotion() {
+    use crate::state::{SecondaryConnection, SecondaryConnectionState};
+    use dynrunner_scheduler_api::PendingPool;
+
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // Single-secondary fixture; `setup_test(1)` registers `sec-0` in
+        // the outgoing map. Hold the receiver in `_ends` and explicitly
+        // drop it below to trigger the channel-closed condition on the
+        // primary's `send_to(sec-0, ..)`.
+        let (transport, mut ends) = setup_test(1);
+        // `required_setup_on_promote=true` is the setup-promote mode
+        // that exercises the demoted-submitter path in production
+        // (matches the tokenizer trace's PrimaryConfig). The local
+        // primary skips initial assignment and lives only as an
+        // observer post-promotion.
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Install an empty default-phase pool so `dispatch_message`
+        // doesn't trip on a missing pool when it threads through
+        // unrelated handlers. The setup-promote submitter starts
+        // with an empty pool by design.
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+
+        // Register `sec-0` at Operational state — same handshake
+        // chain the production code drives. No workers are pushed:
+        // setup-promote mode skips `perform_initial_assignment`, so
+        // the demoted primary's `workers` list stays empty.
+        let conn = SecondaryConnection::new("sec-0".into())
+            .receive_welcome(1, vec![], "host".into(), 0, None, false)
+            .receive_cert_exchange(String::new(), None, None, 0)
+            .begin_peer_discovery()
+            .peers_ready()
+            .assignments_sent();
+        primary.secondaries.insert(
+            "sec-0".into(),
+            SecondaryConnectionState::Operational(conn),
+        );
+
+        // Promote `sec-0` — sets `self.demoted = true` and
+        // `self.primary_id = Some("sec-0")`. Mirrors what the
+        // operational path does after `wait_for_mesh_ready`.
+        primary.promote_primary().await.unwrap();
+        assert!(primary.demoted, "promote_primary must demote local");
+        assert_eq!(primary.primary_id.as_deref(), Some("sec-0"));
+
+        // Failure injection: drop the receiver end of `sec-0`'s
+        // outgoing channel. The next `transport.send_to(sec-0, ..)`
+        // will return `Err("channel closed")` — exactly the wire-
+        // level condition the tokenizer trace surfaced.
+        let (sec_id, _drop_rx, _tx) = ends.remove(0);
+        assert_eq!(sec_id, "sec-0");
+        // `_drop_rx` goes out of scope here; the unbounded mpsc's
+        // SendError surfaces "channel closed" as the Display.
+
+        // Feed a TaskRequest as if it arrived from `sec-0` —
+        // `handle_task_request` would try to relay it to
+        // `primary_id` (= `sec-0`) and hit the closed channel.
+        let request = DistributedMessage::TaskRequest {
+            sender_id: "sec-0".into(),
+            timestamp: 0.0,
+            secondary_id: "sec-0".into(),
+            worker_id: 0,
+            available_resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 1024 * 1024 * 1024,
+            }],
+        };
+        let result = primary.dispatch_message(request).await;
+        assert!(
+            result.is_ok(),
+            "dispatch_message on a demoted primary must not propagate \
+             channel-closed from a relay attempt to the promoted peer; \
+             pre-fix this returned Err and killed the demoted submitter \
+             within two keepalive intervals of promotion. Got: {:?}",
+            result.err()
+        );
+
+        // The failover/run-done path is intact: a
+        // `ClusterMutation::RunComplete` from the promoted peer still
+        // applies on the demoted primary's mirror so the operational
+        // loop's exit cue fires. Without this, our fix would have
+        // broken the run-done signaling and we'd just trade one hang
+        // for another.
+        let run_complete = DistributedMessage::ClusterMutation {
+            sender_id: "sec-0".into(),
+            timestamp: 0.0,
+            mutations: vec![
+                dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::RunComplete,
+            ],
+        };
+        primary
+            .dispatch_message(run_complete)
+            .await
+            .expect("ClusterMutation::RunComplete must still apply on demoted primary");
+        assert!(
+            primary.cluster_state_for_test().run_complete(),
+            "RunComplete signal must reach cluster_state mirror post-fix; \
+             confirms the demoted primary remains a functioning observer \
+             after a relay-suppressed TaskRequest"
+        );
+    })
+    .await;
+}
+
 // ── Backlog L2: load-aware dispatch ordering ──
 
 fn make_remote_worker(
