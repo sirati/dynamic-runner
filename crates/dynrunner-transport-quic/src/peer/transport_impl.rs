@@ -224,4 +224,13 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
     fn peer_for_role(&self, role: &Role) -> Option<String> {
         read_role_cache(&self.role_cache, role)
     }
+
+    fn local_id(&self) -> &str {
+        // `PeerNetwork.peer_id` is already the local node's id —
+        // surfaced through the trait so the protocol crate's `send`
+        // default impl can populate `RoleAddressed.sender_id`
+        // (Step 3) without the transport-specific call sites
+        // needing to know about role envelopes.
+        &self.peer_id
+    }
 }

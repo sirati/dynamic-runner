@@ -1,7 +1,27 @@
 use dynrunner_core::{ErrorType, Identifier, ResourceAmount, TaskInfo};
 use serde::{Deserialize, Serialize};
 
+use crate::address::Role;
 use crate::cluster_mutation::ClusterMutation;
+
+/// Unix-epoch wall-clock seconds for use as a wire-frame `timestamp`
+/// field. Single source for envelope construction inside this crate
+/// (e.g. the `RoleAddressed` / `RoleMisaddressHint` envelopes wrapped
+/// by `PeerTransport::send`).
+///
+/// Manager-side `wire.rs` helpers (`secondary/wire.rs`,
+/// `primary/wire.rs`) and the per-transport `timestamp_secs` helpers
+/// in `transport-quic` / `transport-channel` predate this one and
+/// remain in place. Consolidating them is a separate cleanup
+/// (single concern, easily grep-driven) — keeping this helper
+/// scoped to envelope construction inside the protocol crate avoids
+/// a four-call-site refactor riding along with Step 3.
+pub fn timestamp_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
 
 /// All distributed message types.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,6 +78,20 @@ pub enum MessageType {
     /// "I couldn't forward your relay; mark me tried and pick
     /// another." Identified by `(original_sender, relay_id)`.
     RelayBackoff,
+    /// Wire envelope produced by `PeerTransport::send(Address::Role(_), _)`:
+    /// the sender resolved `intended_role` via its local role-table
+    /// cache and shipped the wrapped `payload` to whoever the cache
+    /// pointed at. Receivers cross-check their own cache; agreement
+    /// means unwrap and process, disagreement means relay-and-hint
+    /// (Step 4). The receiver-side handling is wired in a subsequent
+    /// step; this variant is the sender-side wire shape only.
+    RoleAddressed,
+    /// Wire envelope produced by a receiver who got a `RoleAddressed`
+    /// envelope addressed to a role it doesn't hold. Sent back to the
+    /// original sender to warm its role-table cache — purely cache-
+    /// warming, no payload re-send (the relaying receiver already
+    /// forwarded the inner payload to the actual holder).
+    RoleMisaddressHint,
 }
 
 /// Worker readiness information.
@@ -618,6 +652,50 @@ pub enum DistributedMessage<I> {
         original_sender: String,
         relay_id: u64,
     },
+    /// Envelope used for role-based addressing. The sender resolves
+    /// `intended_role` to a specific peer-id via its local RoleTable
+    /// cache and ships this envelope to that peer. The receiver checks
+    /// its OWN cache; if it agrees it holds `intended_role`, it unwraps
+    /// and processes `payload`. If not, the receiver's relay-and-hint
+    /// path (Step 4) forwards `payload` to whoever IT thinks holds the
+    /// role AND sends a `RoleMisaddressHint` back to `sender_id` to
+    /// warm the sender's cache.
+    ///
+    /// `attempts` is the relay-hop counter — if it exceeds a safety
+    /// bound (e.g. 3), the receiver drops the envelope rather than
+    /// relay further. This caps relay storms when the cluster is in
+    /// disagreement about who holds the role.
+    ///
+    /// `payload` is boxed because `DistributedMessage` is variant-
+    /// sized; an unboxed recursive enum would blow up the
+    /// discriminant size and force every other variant to carry the
+    /// max-variant overhead. Same pattern as `Relay { inner: Box<_> }`.
+    ///
+    /// `attempts` carries `#[serde(default)]` so pre-Step-3 wire
+    /// senders that omit the field decode as `attempts=0` — same
+    /// backcompat shape we use for `is_observer`, `required_setup`,
+    /// and the Phase-4b binary-info tags.
+    RoleAddressed {
+        sender_id: String,
+        timestamp: f64,
+        intended_role: Role,
+        payload: Box<DistributedMessage<I>>,
+        #[serde(default)]
+        attempts: u8,
+    },
+    /// Sent back to a `RoleAddressed` sender whose cache was stale.
+    /// The receiver tells the sender "you thought I was `role`, but the
+    /// actual holder is `holder_id`". The sender writes `holder_id` into
+    /// its own RoleTable cache for `role`, so the next send via
+    /// `Address::Role(role)` routes correctly on the first hop. Purely
+    /// cache-warming; the original payload was already forwarded by the
+    /// relaying receiver (Step 4), so the sender does NOT re-send.
+    RoleMisaddressHint {
+        sender_id: String,
+        timestamp: f64,
+        role: Role,
+        holder_id: String,
+    },
 }
 
 impl<I> DistributedMessage<I> {
@@ -647,7 +725,9 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { sender_id, .. }
             | Self::ClusterMutation { sender_id, .. }
             | Self::Relay { sender_id, .. }
-            | Self::RelayBackoff { sender_id, .. } => sender_id,
+            | Self::RelayBackoff { sender_id, .. }
+            | Self::RoleAddressed { sender_id, .. }
+            | Self::RoleMisaddressHint { sender_id, .. } => sender_id,
         }
     }
 
@@ -677,7 +757,9 @@ impl<I> DistributedMessage<I> {
             | Self::SecondaryFatalError { timestamp, .. }
             | Self::ClusterMutation { timestamp, .. }
             | Self::Relay { timestamp, .. }
-            | Self::RelayBackoff { timestamp, .. } => *timestamp,
+            | Self::RelayBackoff { timestamp, .. }
+            | Self::RoleAddressed { timestamp, .. }
+            | Self::RoleMisaddressHint { timestamp, .. } => *timestamp,
         }
     }
 
@@ -708,6 +790,8 @@ impl<I> DistributedMessage<I> {
             Self::ClusterMutation { .. } => MessageType::ClusterMutation,
             Self::Relay { .. } => MessageType::RelayMessage,
             Self::RelayBackoff { .. } => MessageType::RelayBackoff,
+            Self::RoleAddressed { .. } => MessageType::RoleAddressed,
+            Self::RoleMisaddressHint { .. } => MessageType::RoleMisaddressHint,
         }
     }
 }
