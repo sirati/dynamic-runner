@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    install_role_change_hook, read_role_cache, Clocks, DistributedMessage, InboundOutcome,
-    PeerConnectionInfo, PeerTransport, Role, RoleChangeHookRegistrar, SendOutcome,
+    apply_role_misaddress_hint, decide_role_addressed_with_cache, install_role_change_hook,
+    read_role_cache, Clocks, DistributedMessage, InboundOutcome, PeerConnectionInfo,
+    PeerTransport, Role, RoleAddressedAction, RoleChangeHookRegistrar, SendOutcome,
 };
 
 use super::PeerNetwork;
@@ -34,6 +35,98 @@ fn now_clocks() -> Clocks {
     Clocks {
         now: Instant::now(),
         wire: timestamp_secs(),
+    }
+}
+
+impl<I: Identifier> PeerNetwork<I> {
+    /// Role-layer interceptor for the receiver side. Mirrors the
+    /// channel transport's `handle_role_layer` (single concern lives
+    /// in the protocol crate's `role_routing` module; both transports
+    /// are thin glue).
+    ///
+    /// Returns `Some(payload)` when the caller should yield to the
+    /// application layer (Case A unwrap, or "not a role-layer
+    /// envelope" passthrough); returns `None` when the envelope was
+    /// consumed internally (Case B relay-and-hint, Case C / D drop,
+    /// or hint cache-warm absorption).
+    ///
+    /// Internal sends bypass the `PeerTransport::send_to_peer` trait
+    /// method and call `self.router.send_to_peer` directly: trait-
+    /// level send-failure surfaces NoRoute as `Err`, which is not
+    /// the right contract for transport-internal bookkeeping sends.
+    /// The router-level path returns an outcome we log on failure
+    /// without propagating.
+    fn handle_role_layer(
+        &mut self,
+        msg: DistributedMessage<I>,
+        clocks: Clocks,
+    ) -> Option<DistributedMessage<I>> {
+        match msg {
+            DistributedMessage::RoleAddressed {
+                sender_id,
+                intended_role,
+                payload,
+                attempts,
+                ..
+            } => {
+                let decision = decide_role_addressed_with_cache(
+                    &self.peer_id,
+                    &self.role_cache,
+                    sender_id,
+                    intended_role,
+                    payload,
+                    attempts,
+                );
+                match decision {
+                    RoleAddressedAction::Unwrap(inner) => Some(inner),
+                    RoleAddressedAction::Relay {
+                        forward_to,
+                        forwarded,
+                        hint_to,
+                        hint,
+                    } => {
+                        if let Err(e) = self.router.send_to_peer(
+                            &forward_to,
+                            forwarded,
+                            &mut self.connections,
+                            clocks,
+                        ) {
+                            tracing::warn!(
+                                forward_to = %forward_to,
+                                error = %e,
+                                "RoleAddressed relay forward failed",
+                            );
+                        }
+                        if let Err(e) = self.router.send_to_peer(
+                            &hint_to,
+                            hint,
+                            &mut self.connections,
+                            clocks,
+                        ) {
+                            tracing::warn!(
+                                hint_to = %hint_to,
+                                error = %e,
+                                "RoleMisaddressHint send failed",
+                            );
+                        }
+                        None
+                    }
+                    RoleAddressedAction::Drop { reason } => {
+                        tracing::warn!(reason, "RoleAddressed dropped");
+                        None
+                    }
+                }
+            }
+            DistributedMessage::RoleMisaddressHint {
+                role, holder_id, ..
+            } => {
+                // Cache-warming only — never surfaced to the
+                // application layer.
+                apply_role_misaddress_hint(&self.role_cache, role, holder_id);
+                None
+            }
+            other => Some(other),
+        }
     }
 }
 
@@ -111,7 +204,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
             // `reconnect_tick_rx = None`; that branch resolves to
             // `pending::<Option<()>>().await` and never fires.
             let mut tick_rx = self.reconnect_tick_rx.take();
-            tokio::select! {
+            let delivered_from_router = tokio::select! {
                 msg = self.incoming_rx.recv() => {
                     self.reconnect_tick_rx = tick_rx;
                     self.drain_new_connections();
@@ -127,13 +220,13 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             if let Some(id) = redial_target {
                                 self.spawn_redial(&id);
                             }
-                            return Some(msg);
+                            Some(msg)
                         }
                         InboundOutcome::Handled { redial_target } => {
                             if let Some(id) = redial_target {
                                 self.spawn_redial(&id);
                             }
-                            continue;
+                            None
                         }
                     }
                 }
@@ -156,6 +249,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                                 .insert(accepted.peer_id, accepted.outgoing_tx);
                         }
                     }
+                    None
                 }
                 _ = async {
                     match tick_rx.as_mut() {
@@ -173,6 +267,15 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     // against `connections` so duplicate dials on
                     // a freshly-restored peer are harmless.
                     self.process_reconnect_tick();
+                    None
+                }
+            };
+            // Role-layer intercept: RoleAddressed (Case A/B/C/D)
+            // and RoleMisaddressHint (silent cache-warm). See
+            // `handle_role_layer` for the four-case decision.
+            if let Some(msg) = delivered_from_router {
+                if let Some(payload) = self.handle_role_layer(msg, clocks) {
+                    return Some(payload);
                 }
             }
         }
@@ -184,12 +287,12 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         self.router.prune(clocks.now);
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
-            match self.router.process_inbound_sync(msg, clocks) {
+            let delivered = match self.router.process_inbound_sync(msg, clocks) {
                 InboundOutcome::Deliver { msg, redial_target } => {
                     if let Some(id) = redial_target {
                         self.spawn_redial(&id);
                     }
-                    return Some(msg);
+                    msg
                 }
                 InboundOutcome::Handled { redial_target } => {
                     if let Some(id) = redial_target {
@@ -197,6 +300,9 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                     continue;
                 }
+            };
+            if let Some(payload) = self.handle_role_layer(delivered, clocks) {
+                return Some(payload);
             }
         }
     }
