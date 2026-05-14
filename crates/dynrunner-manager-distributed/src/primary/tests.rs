@@ -3769,6 +3769,361 @@ async fn demoted_primary_exits_on_clean_completion() {
     }).await;
 }
 
+// ── Step 6 — demoted primary ingests ClusterMutation broadcasts via
+// `peer_transport.recv_peer()`. Pins bug-class #1 (asm-tokenizer
+// "succeeded=0 + 235 CSVs landed") and #79 (chain-gate reading stale
+// 0/0/0 because the demoted local's accounting was blind to cross-
+// secondary completions on the new primary's pool).
+//
+// Pre-Step-6 the demoted primary's run-loop only read from
+// `self.transport.recv()` (the legacy `SecondaryTransport` channel),
+// which closes for the promoted secondary post-PromotePrimary. The
+// new primary's broadcasts via the mesh landed in
+// `peer_transport.recv_peer()`'s queue but went unread; per-task
+// accounting (`completed_tasks`) and the cluster-state mirror's
+// `run_complete()` flag stayed frozen at the pre-promotion view.
+//
+// Step 6 adds the `peer_transport.recv_peer()` arm to the operational
+// loop's `select!` (forwarding to the same `dispatch_message` the
+// legacy arm uses; the CRDT `apply` + the HashSet inserts make
+// duplicate delivery a no-op). It also relaxes the
+// transport-closed→break gate when `peer_transport.peer_count() > 0`,
+// so the demoted local stays in the loop as long as the mesh is alive.
+//
+// The two tests below pin:
+//   T-D: a ClusterMutation::TaskCompleted arriving via the tunneled
+//        peer view (production wiring: per-secondary forwarder taps
+//        each inbound frame into the peer queue) lands in the
+//        demoted primary's `completed_tasks` and `cluster_state`.
+//        Closes bug #79's "chain-gate reading stale 0/0/0".
+//   T-E: when the legacy transport is closed but the tunneled peer
+//        view still has connections, the loop stays alive on the
+//        peer arm — does NOT trip the historical transport-closed
+//        break. RunComplete delivered via the peer arm cleanly exits.
+
+/// T-D — unit contract via TunneledPeerTransport. Build a primary
+/// wired with a `TunneledPeerTransport` (the same setup
+/// `crates/dynrunner-pyo3/src/managers/distributed.rs` uses in
+/// production post-Step-5b). Stage a `ClusterMutation::TaskAdded` then
+/// `ClusterMutation::TaskCompleted` into the per-secondary forwarder's
+/// inbound-tap (the production wire shape: the legacy `transport`
+/// recv-side clones each frame into `inbound_tap`). Run
+/// `operational_loop` briefly; assert the demoted primary's
+/// `completed_tasks` grows and `cluster_state.run_complete()` fires
+/// once a RunComplete mutation rides the same path.
+#[tokio::test(flavor = "current_thread")]
+async fn step6_demoted_primary_observes_cluster_mutation_via_recv_peer_arm() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    use dynrunner_transport_tunnel::TunneledPeerTransport;
+
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // Build the tunneled peer view first so the per-secondary
+        // forwarder below can tap inbound frames into the peer queue
+        // — same wiring shape as the production in-process
+        // distributed PyO3 path (`distributed.rs::fwd_tap`).
+        let (peer_transport, shared_outgoing, inbound_tap) =
+            TunneledPeerTransport::<TestId>::new("primary".into());
+
+        // Legacy transport with one secondary registered in BOTH the
+        // legacy outgoing HashMap AND the shared writer table —
+        // exactly how production registers a secondary post-Step-5b.
+        let (incoming_tx, incoming_rx) =
+            tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+        let (pri_to_sec_tx, _pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+        shared_outgoing
+            .borrow_mut()
+            .insert("sec-promoted".into(), pri_to_sec_tx.clone());
+        let mut outgoing = HashMap::new();
+        outgoing.insert("sec-promoted".to_string(), pri_to_sec_tx);
+        let transport = ChannelSecondaryTransportEnd {
+            outgoing,
+            incoming_rx,
+        };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            peer_transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Demoted-observer state: the loop will run in observer mode,
+        // mirroring the post-promotion submitter-host primary in the
+        // production scenario. `total_tasks=1` makes the counter-
+        // based exit unreachable from completed=0, so only the
+        // `cluster_state.run_complete()` exit can break the loop.
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        // Seed `total_tasks=2` BEFORE entering the loop. Without
+        // this the first top-of-loop counter check trips immediately
+        // (`0 + 0 >= 0`) and the loop exits before reading any
+        // mutation. The two staged TaskAdded mutations only refresh
+        // total_tasks on the first dispatch — by that time the
+        // pre-loop check has already broken out. The TaskAdded
+        // mutations remain useful (they let cluster_state.apply
+        // accept the subsequent TaskCompleted, which requires the
+        // entry to exist per CRDT-happens-before).
+        //
+        // With `total_tasks = 2` and ONE TaskCompleted (`completed +
+        // failed = 1 < 2`), the counter-based exit stays
+        // unreachable; only the RunComplete-driven exit can break
+        // the loop. This pins BOTH halves of the regression:
+        //   (a) the new arm dispatched the TaskCompleted mutation
+        //       (completed_tasks grew — bug #79's chain-gate fix);
+        //   (b) the same arm later dispatched the RunComplete
+        //       (cluster_state.run_complete() flipped — bug class
+        //       #1's demoted-primary exit-cue fix).
+        primary.total_tasks = 2;
+        primary.demoted = true;
+
+        // Stage the mutations into the peer view's inbound queue
+        // (NOT the legacy transport's `incoming_tx`). This is the
+        // exact path the production forwarder feeds: a frame
+        // arriving on the SSH tunnel gets cloned into `inbound_tap`
+        // first, then forwarded to the legacy `incoming_tx`. Here
+        // we only feed the peer view, to prove the new `select!`
+        // arm IS the one applying the mutation (any leakage via the
+        // legacy arm would mask the regression).
+        let bin_a = make_binary("step6-arm-task-a", 100);
+        let hash_a = super::wire::compute_task_hash(&bin_a);
+        let bin_b = make_binary("step6-arm-task-b", 100);
+        let hash_b = super::wire::compute_task_hash(&bin_b);
+        inbound_tap
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![
+                    ClusterMutation::<TestId>::TaskAdded {
+                        hash: hash_a.clone(),
+                        task: bin_a,
+                    },
+                    ClusterMutation::<TestId>::TaskAdded {
+                        hash: hash_b.clone(),
+                        task: bin_b,
+                    },
+                ],
+            })
+            .expect("tap accepts TaskAdded batch");
+        inbound_tap
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
+                    hash: hash_a.clone(),
+                }],
+            })
+            .expect("tap accepts TaskCompleted");
+        inbound_tap
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::RunComplete],
+            })
+            .expect("tap accepts RunComplete");
+        // Hold the legacy incoming channel OPEN — we want the
+        // peer_transport arm to be the one driving exit, not the
+        // legacy-transport-closed fallback. Asserting on
+        // `cluster_state.run_complete()` post-loop distinguishes
+        // the two paths.
+        let _hold_legacy = incoming_tx;
+        // Drop the tap clone we used to send so the peer view's
+        // recv eventually yields None after draining (loop's
+        // run_complete exit fires first; this is just sanity).
+        drop(inbound_tap);
+
+        // Bounded wait. Pre-Step-6 the loop is unbounded (the
+        // mutations on the peer view are never read). Post-Step-6
+        // the new arm dispatches each mutation through
+        // `dispatch_message`, the CRDT apply updates the mirror,
+        // and the top-of-loop `cluster_state.run_complete()` check
+        // breaks within microseconds. 5s ceiling for CI flake
+        // tolerance.
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+
+        match exit {
+            Ok(Ok(())) => {
+                assert!(
+                    primary.completed_tasks.contains(&hash_a),
+                    "ClusterMutation::TaskCompleted received via the new \
+                     `peer_transport.recv_peer()` arm must populate \
+                     `completed_tasks`; this is the fix for bug #79 \
+                     (chain-gate reading stale 0/0/0 because the demoted \
+                     primary's accounting was blind to cross-secondary \
+                     completions)"
+                );
+                assert!(
+                    !primary.completed_tasks.contains(&hash_b),
+                    "hash_b was never TaskCompleted; presence here would \
+                     indicate accounting drift independent of the arm \
+                     fix under test"
+                );
+                assert!(
+                    primary.cluster_state_for_test().run_complete(),
+                    "cluster_state.run_complete() must be set after \
+                     the RunComplete mutation rides the peer arm; \
+                     distinguishes from a stale transport-closed exit \
+                     and from the counter-based exit (counter is \
+                     unreachable here: 1 < 2)"
+                );
+            }
+            Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
+            Err(_) => panic!(
+                "operational_loop did not exit within 5s — the \
+                 `peer_transport.recv_peer()` arm is missing or not \
+                 forwarding to dispatch_message (Step 6 regression)"
+            ),
+        }
+    }).await;
+}
+
+/// T-E — transport-closed gate relaxation. When the legacy
+/// `transport.recv()` returns None (the demoted-primary case: per-
+/// secondary writer-task exits post-PromotePrimary) but the tunneled
+/// peer view still has connected peers, the operational loop must NOT
+/// fall through the historical "transport closed → break" path.
+/// Otherwise the demoted local exits prematurely, takes the local-
+/// primary process down, and the asm-tokenizer "succeeded=0 + 235
+/// CSVs landed" symptom returns.
+///
+/// Setup: drop the legacy `incoming_tx` BEFORE entering the loop so
+/// `transport.recv()` resolves None immediately. The peer view stays
+/// connected (one secondary in `shared_outgoing`, `peer_count() == 1`).
+/// A RunComplete mutation arrives ONLY via the peer-tap; the new arm
+/// must drive the run_complete exit.
+#[tokio::test(flavor = "current_thread")]
+async fn step6_demoted_primary_stays_alive_when_legacy_transport_closes_but_peer_mesh_alive() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    use dynrunner_transport_tunnel::TunneledPeerTransport;
+
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (peer_transport, shared_outgoing, inbound_tap) =
+            TunneledPeerTransport::<TestId>::new("primary".into());
+
+        let (incoming_tx, incoming_rx) =
+            tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
+        let (pri_to_sec_tx, _pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+        shared_outgoing
+            .borrow_mut()
+            .insert("sec-promoted".into(), pri_to_sec_tx.clone());
+        let mut outgoing = HashMap::new();
+        outgoing.insert("sec-promoted".to_string(), pri_to_sec_tx);
+        let transport = ChannelSecondaryTransportEnd {
+            outgoing,
+            incoming_rx,
+        };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            peer_transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        primary.total_tasks = 1;
+        primary.demoted = true;
+
+        // Close the legacy channel BEFORE entering the loop — the
+        // very first `transport.recv()` poll returns None. With
+        // peer_count() > 0 the loop must `continue` past the break,
+        // gate the legacy arm off, and await the peer arm for the
+        // RunComplete signal.
+        drop(incoming_tx);
+
+        // RunComplete rides ONLY the peer view's inbound-tap.
+        inbound_tap
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::RunComplete],
+            })
+            .expect("tap accepts RunComplete");
+
+        let exit = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+
+        match exit {
+            Ok(Ok(())) => {
+                assert!(
+                    primary.cluster_state_for_test().run_complete(),
+                    "cluster_state.run_complete() must be set: the exit \
+                     fired via the peer arm's RunComplete, not via the \
+                     transport-closed break (which would re-introduce \
+                     bug class #1)"
+                );
+            }
+            Ok(Err(e)) => panic!("operational_loop returned Err: {e}"),
+            Err(_) => panic!(
+                "operational_loop did not exit within 5s — the peer-arm \
+                 RunComplete path is broken or the transport-closed gate \
+                 is not relaxed (Step 6 regression)"
+            ),
+        }
+    }).await;
+}
+
 /// T-#33: initial assignment is round-robin across secondaries AND
 /// secondary iteration order is deterministic (sorted by name).
 ///
