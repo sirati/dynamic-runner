@@ -17,11 +17,41 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for NetworkServer<I> 
             tokio::select! {
                 msg = self.incoming_rx.recv() => {
                     self.drain_new_connections();
+                    // Inbound fan-out: when paired with a
+                    // `TunneledPeerTransport` via `attach_tunnel`,
+                    // clone-forward each message into the peer
+                    // view's queue. This is the SOLE site that
+                    // taps inbound — `transport.recv()` callers
+                    // remain the canonical inbound consumer
+                    // (Step 5b leaves that contract intact); the
+                    // peer queue accumulates harmlessly until
+                    // Step 6 lands the demoted-primary
+                    // `select! { peer_transport.recv_peer() }`
+                    // arm that drains it.
+                    if let (Some(m), Some(tap)) = (msg.as_ref(), self.inbound_tap()) {
+                        // `Clone` is bounded on the impl so this is
+                        // a plain message clone (one mpsc-frame
+                        // allocation); `DistributedMessage` is the
+                        // same shape every other peer-mesh transport
+                        // already clones on broadcast.
+                        let _ = tap.send(DistributedMessage::clone(m));
+                    }
                     return msg;
                 }
                 accepted = self.new_conn_rx.recv() => {
                     if let Some(accepted) = accepted {
                         tracing::info!(secondary = %accepted.secondary_id, "secondary registered (during recv)");
+                        // Mirror into the shared peer view's
+                        // writer table when paired — same
+                        // contract as `drain_new_connections`,
+                        // applied to the in-recv accept path so
+                        // the two registration sites stay in
+                        // lockstep.
+                        if let Some(shared) = self.shared_outgoing_for_tap() {
+                            shared
+                                .borrow_mut()
+                                .insert(accepted.secondary_id.clone(), accepted.outgoing_tx.clone());
+                        }
                         self.connections.insert(accepted.secondary_id, accepted.outgoing_tx);
                     }
                 }

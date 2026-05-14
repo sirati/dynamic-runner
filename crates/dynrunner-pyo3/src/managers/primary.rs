@@ -304,7 +304,7 @@ impl PyPrimaryCoordinator {
                 // Bind the network server to the port we already picked.
                 let bind_addr: std::net::SocketAddr =
                     format!("127.0.0.1:{}", port).parse().unwrap();
-                let server: NetworkServer<RunnerIdentifier> =
+                let mut server: NetworkServer<RunnerIdentifier> =
                     match NetworkServer::bind(bind_addr).await {
                         Ok(s) => s,
                         Err(e) => {
@@ -313,6 +313,23 @@ impl PyPrimaryCoordinator {
                         }
                     };
                 tracing::info!(port, "primary network server listening");
+
+                // Step 5b: pair the legacy `NetworkServer` (the
+                // submitter primary's per-secondary tunnel writers
+                // + demuxed inbound) with a `TunneledPeerTransport`
+                // so the primary participates in the peer mesh as
+                // a real member. Same wire — different trait
+                // surface. The PeerCoordinator gets the role-aware
+                // mesh view; the legacy `SecondaryTransport::send_to`
+                // path keeps working unchanged. `NoPeerTransport`
+                // disappears from this call site (it stays valid
+                // on the SECONDARY side for the
+                // `disable_peer_overlay` firewalled-fabric path).
+                let (peer_transport, shared_outgoing, inbound_tap) =
+                    dynrunner_transport_tunnel::TunneledPeerTransport::<
+                        RunnerIdentifier,
+                    >::new("primary".into());
+                server.attach_tunnel(shared_outgoing, inbound_tap);
 
                 // Secondaries retry-connect on their own; the accept loop in
                 // PrimaryCoordinator::run handles connections that arrive
@@ -352,7 +369,7 @@ impl PyPrimaryCoordinator {
                     PrimaryCoordinator::new(
                         config,
                         server,
-                        dynrunner_transport_quic::NoPeerTransport,
+                        peer_transport,
                         ResourceStealingScheduler::memory(),
                         estimator,
                     );
