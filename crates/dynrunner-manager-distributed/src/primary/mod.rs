@@ -3,7 +3,9 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{resolve_against_root, ErrorType, TaskInfo, Identifier, PhaseId, ResourceMap};
-use dynrunner_protocol_primary_secondary::{ClusterMutation, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::{
+    ClusterMutation, PeerTransport, SecondaryTransport,
+};
 use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
@@ -411,11 +413,24 @@ impl<I: Identifier> RemoteWorkerState<I> {
 
 /// The primary coordinator: orchestrates work across secondaries.
 ///
-/// Generic over `T: SecondaryTransport<I>` so it works with both QUIC connections
-/// and in-process channels for testing.
-pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
+/// Generic over `T: SecondaryTransport<I>` for the per-secondary
+/// writer-based path (handshake, initial assignment, task fan-out) AND
+/// over `P: PeerTransport<I>` for role-aware addressing that survives
+/// promotion (TaskRequest relay after demotion, keepalive fan-out as
+/// `Scope::AllSecondaries`). The two transports coexist for the
+/// duration of the unification refactor; `transport` retires in Step
+/// 11 once every call site has migrated through `peer_transport`.
+pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
     pub(super) config: PrimaryConfig,
     pub(super) transport: T,
+    /// Role-aware mesh transport. Owns the write-through `RoleTable`
+    /// cache attached to `cluster_state` at construction. Used today
+    /// only for primary-bound sends after promotion (relay arm in
+    /// `task::handle_task_request`) and the operational-keepalive fan-
+    /// out via `Address::Broadcast(Scope::AllSecondaries)`; future
+    /// steps migrate the remaining per-secondary writers off
+    /// `transport`.
+    pub(super) peer_transport: P,
     pub(super) scheduler: S,
     pub(super) estimator: E,
 
@@ -590,12 +605,19 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, S: Scheduler<I>, E: Reso
     pub(super) setup_pending: bool,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
-    pub fn new(config: PrimaryConfig, transport: T, scheduler: S, estimator: E) -> Self {
+impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+    pub fn new(
+        config: PrimaryConfig,
+        transport: T,
+        peer_transport: P,
+        scheduler: S,
+        estimator: E,
+    ) -> Self {
         let setup_pending = config.required_setup_on_promote;
-        Self {
+        let mut this = Self {
             config,
             transport,
+            peer_transport,
             scheduler,
             estimator,
             secondaries: HashMap::new(),
@@ -623,7 +645,22 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
             setup_pending,
-        }
+        };
+        // Mirror `SecondaryCoordinator::new`'s registration: attach the
+        // peer transport's write-through `RoleTable` cache to the
+        // authoritative `cluster_state.role_table`. The hook fires on
+        // every applied `PrimaryChanged` mutation; the cache serves
+        // Step 3's `Address::Role(_)` dispatch on the send hot path.
+        // Transports that don't override `register_with_cluster_state`
+        // (`NoPeerTransport`, the `NoPeers` test stub) get the default
+        // no-op — safe by construction. `Role::Self_` is seeded by
+        // the transport's own constructor (`new_role_cache` +
+        // `seed_self_role` for `ChannelPeerTransport` and
+        // `PeerNetwork`), not here, because that's a strictly
+        // transport-local fact.
+        this.peer_transport
+            .register_with_cluster_state(&mut this.cluster_state);
+        this
     }
 
     /// True iff `secondary_id` is currently in backpressure backoff

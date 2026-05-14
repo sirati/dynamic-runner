@@ -417,6 +417,7 @@ impl PyDistributedManager {
                 let mut primary = PrimaryCoordinator::new(
                     config,
                     transport,
+                    dynrunner_transport_quic::NoPeerTransport,
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );

@@ -782,30 +782,32 @@ mod tests {
         assert!(transports[1].try_recv_peer().is_none());
     }
 
-    /// `send(Address::Broadcast(Scope::AllSecondaries), msg)` is still
-    /// rejected post-Step 3 — the primary-side migration that turns
-    /// the role-table into a full role-aware fanout is Step 5. The
-    /// error string names "Step 5" so anyone reading a log during the
-    /// migration window understands the cause.
+    /// Post-Step 5: `send(Address::Broadcast(Scope::AllSecondaries), msg)`
+    /// fans out via the default impl's `broadcast` delegation. From a
+    /// primary caller's vantage (the only Step-5 caller), every
+    /// peer-mesh member is by definition a secondary, so `AllSecondaries`
+    /// and `Mesh` produce the same wire effect today; the Scope variant
+    /// is preserved for the future case of a secondary broadcasting
+    /// only-to-non-primary peers (which would override the default
+    /// impl with a per-impl `outgoing.iter().filter(|id| id !=
+    /// primary_holder)` walk).
     #[tokio::test]
-    async fn send_address_broadcast_all_secondaries_returns_err() {
+    async fn send_address_broadcast_all_secondaries_fans_out() {
         use dynrunner_protocol_primary_secondary::{Address, Scope};
 
-        let ids = vec!["a".to_string(), "b".to_string()];
+        let ids = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let mut transports = peer_mesh::<SendTestId>(&ids);
 
-        let err = transports[0]
+        transports[0]
             .send(Address::Broadcast(Scope::AllSecondaries), keepalive("a"))
             .await
-            .expect_err("Broadcast(AllSecondaries) must error pre-Step-5");
-        assert!(
-            err.contains("Step 5"),
-            "error message must reference Step 5 migration target; got: {err}"
-        );
+            .unwrap();
 
-        // No message delivered.
+        // Same delivery pattern as `Scope::Mesh`: peer 0 keeps nothing,
+        // peers 1 and 2 both received.
         assert!(transports[0].try_recv_peer().is_none());
-        assert!(transports[1].try_recv_peer().is_none());
+        assert!(transports[1].try_recv_peer().is_some());
+        assert!(transports[2].try_recv_peer().is_some());
     }
 
     // ── Step 2: role-table write-through cache tests ──
