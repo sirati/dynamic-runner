@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport, PrimaryTransport,
+    ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -16,7 +16,7 @@ use super::wire::timestamp_now;
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
-    PT: PrimaryTransport<I>,
+    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,

@@ -43,20 +43,31 @@
 //!
 //! # Lifetime
 //!
-//! Lives here for the duration of Step 9 (late-joiner CLI) through
-//! Step 11 (PrimaryTransport / SecondaryTransport trait deletion in
-//! the transport-unification refactor). Once Step 11 lands, the
-//! observer's `SecondaryCoordinator` no longer carries a generic
-//! `PT: PrimaryTransport<I>` parameter at all and this stub becomes
-//! unreachable code — at which point it deletes alongside the trait.
+//! Step 11 of the transport-unification refactor retired the
+//! `PrimaryTransport<I>` marker trait but the observer's
+//! `SecondaryCoordinator` still carries a generic `PT:
+//! MessageSender<DistributedMessage<I>> +
+//! MessageReceiver<DistributedMessage<I>>` parameter — the wait-loops
+//! on the setup-phase recv path consume non-setup frames that the
+//! narrow [`SetupBootstrap`] shape doesn't expose, so the broader
+//! bidirectional shape stays. This stub satisfies that bound for the
+//! late-joiner observer (which never speaks the submitter-bound
+//! wire). Final deletion follows whenever the recv-side of setup
+//! phase migrates to a narrower interleaved-frames API.
+//!
+//! [`SetupBootstrap`]: dynrunner_protocol_primary_secondary::SetupBootstrap
 
 use std::future;
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 
-/// No-op stand-in for a [`PrimaryTransport`] when the node participates
-/// in the cluster purely via the peer mesh (late-joining observer).
+/// No-op stand-in for the submitter-bound `MessageSender +
+/// MessageReceiver` shape on the secondary side, used when the node
+/// participates in the cluster purely via the peer mesh (late-joining
+/// observer). Pre-Step-11 this satisfied a marker trait
+/// `PrimaryTransport`; that trait retired but the underlying
+/// bidirectional message-channel contract is unchanged.
 ///
 /// # Behaviour
 ///
@@ -83,8 +94,6 @@ use dynrunner_protocol_primary_secondary::DistributedMessage;
 /// transitions — dropping it on `select!` arm cancellation is a no-op,
 /// satisfying the [`MessageReceiver`] cancel-safety contract by
 /// vacuous truth.
-///
-/// [`PrimaryTransport`]: dynrunner_protocol_primary_secondary::PrimaryTransport
 pub struct NoPrimaryTransport;
 
 impl<I: Identifier> MessageSender<DistributedMessage<I>> for NoPrimaryTransport {

@@ -10,7 +10,7 @@ use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
 
-use crate::cluster_state::ClusterState;
+use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
 
 /// Outcome of a `PrimaryCoordinator::run()` invocation.
@@ -344,45 +344,6 @@ pub(super) struct PendingMassDeath {
     /// arrived AFTER we deferred, not just that the old one is
     /// still around.
     pub(super) last_keepalive_at_defer: Instant,
-}
-
-/// Per-class outcome breakdown the primary emits on every
-/// counter-bearing log line. Replaces the older single-number
-/// `completed=N failed=N` shape: `succeeded` is the unique-hash
-/// completion count, and the three `fail_*` fields partition the
-/// `failed_tasks` ledger by ErrorType.
-///
-/// Mapping from ErrorType:
-///   - `Recoverable`                       → `fail_retry`
-///   - `ResourceExhausted("memory")`       → `fail_oom`
-///   - `ResourceExhausted(other)` |
-///     `NonRecoverable`                    → `fail_final`
-///
-/// Semantics note: classification is by the task's last-observed
-/// ErrorType, not by retry-eligibility. A Recoverable failure
-/// that exhausts the retry budget stays in `fail_retry` at
-/// terminal report — the operator reads the bucket name as
-/// "what class of error did this task hit", not "is this
-/// task going to retry". Retry-budget exhaustion is reported
-/// via the existing "retry budget exhausted" log line; the
-/// numeric breakdown is class-of-failure.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OutcomeSummary {
-    pub succeeded: usize,
-    pub fail_retry: usize,
-    pub fail_oom: usize,
-    pub fail_final: usize,
-}
-
-impl OutcomeSummary {
-    /// Sum across all four buckets — the total tasks that reached
-    /// a terminal state (success or failure). Distinct from
-    /// `total_tasks` on the coordinator, which counts the input
-    /// batch; `total_terminal()` reaches `total_tasks` exactly
-    /// when the run is fully accounted for.
-    pub fn total_terminal(&self) -> usize {
-        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final
-    }
 }
 
 /// Virtual worker tracked by the authoritative primary for each remote worker.
@@ -753,36 +714,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.failed_tasks.len()
     }
 
-    /// Per-class outcome breakdown. Iterates `failed_tasks` once and
-    /// partitions by ErrorType. Returned snapshot is consumed by
-    /// every log site that previously emitted `completed=N failed=N`,
-    /// so the operator sees the 4-class state instead of a single
-    /// failure count.
+    /// Per-class outcome breakdown for the coordinator-facing log
+    /// lines (`succeeded=… fail_retry=… fail_oom=… fail_final=…`).
     ///
-    /// O(n) over `failed_tasks` — the dispatcher emits this at most
-    /// once per task-terminal event and once per heartbeat tick, so
-    /// the cost is bounded.
+    /// Reads through `cluster_state.outcome_counts()` so the count is
+    /// the CRDT-authoritative tally rather than the per-node
+    /// `completed_tasks`/`failed_tasks` HashSets. The HashSets stay
+    /// authoritative for per-task identity decisions (dedup on a
+    /// re-applied TaskComplete, the operational-loop exit gate, the
+    /// kickstart-suppression check); cross-class *counts* live one
+    /// layer up, on the replicated ledger every replica converges
+    /// to. Without this routing the demoted primary's terminal log
+    /// undercounted whenever a cross-secondary completion's mirror
+    /// hop (`mirror_mutation_to_accounting`) was bypassed (#88).
+    ///
+    /// O(n) over the cluster_state task ledger — same bound as the
+    /// older `failed_tasks`-only walk; the additional Completed/
+    /// Pending/InFlight inspections are constant-time per entry.
     pub fn outcome_summary(&self) -> OutcomeSummary {
-        let mut retry = 0usize;
-        let mut oom = 0usize;
-        let mut final_ = 0usize;
-        for err in self.failed_tasks.values() {
-            match err {
-                ErrorType::Recoverable => retry += 1,
-                ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
-                    oom += 1
-                }
-                ErrorType::ResourceExhausted(_) | ErrorType::NonRecoverable => {
-                    final_ += 1
-                }
-            }
-        }
-        OutcomeSummary {
-            succeeded: self.completed_tasks.len(),
-            fail_retry: retry,
-            fail_oom: oom,
-            fail_final: final_,
-        }
+        self.cluster_state.outcome_counts()
     }
 
     /// Tasks the run loop never accounted for (neither completed nor
