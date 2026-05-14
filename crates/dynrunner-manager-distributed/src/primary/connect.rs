@@ -1,7 +1,7 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, MessageType,
+    DistributedMessage, MessageType, PeerTransport,
     SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
@@ -12,7 +12,7 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
     pub(super) async fn wait_for_connections(&mut self) -> Result<(), String> {
         tracing::info!("waiting for {} secondaries", self.config.num_secondaries);
 
