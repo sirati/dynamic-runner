@@ -426,6 +426,7 @@ dependencies = [
  "dynrunner-protocol-manager-worker",
  "dynrunner-protocol-primary-secondary",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
