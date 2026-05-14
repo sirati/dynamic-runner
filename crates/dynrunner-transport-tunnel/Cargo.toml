@@ -1,12 +1,12 @@
 [package]
-name             = "dynrunner-transport-quic"
+name             = "dynrunner-transport-tunnel"
 version.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 homepage.workspace     = true
-description            = "QUIC transport with optional WebSocket fallback."
+description            = "Tunneled peer transport: a PeerTransport over the primary's per-secondary SSH-tunneled connections, exposing the existing per-secondary writer + inbound channel as a mesh-level PeerTransport so the submitter primary participates as a real peer."
 keywords.workspace     = true
 categories.workspace   = true
 readme.workspace       = true
@@ -14,16 +14,8 @@ readme.workspace       = true
 [dependencies]
 dynrunner-core = { workspace = true }
 dynrunner-protocol-primary-secondary = { workspace = true }
-dynrunner-transport-tunnel = { workspace = true }
-quinn = { workspace = true }
-rustls = { workspace = true }
-rcgen = { workspace = true }
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-base64 = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }
