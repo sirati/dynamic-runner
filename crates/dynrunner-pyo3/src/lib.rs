@@ -29,6 +29,7 @@ use gateway::local::PyLocalGateway;
 use managers::distributed::PyDistributedManager;
 use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFactory};
 use managers::local::PyLocalManager;
+use managers::observer_late_joiner::{run_observer_late_joiner, PyObserverLateJoiner};
 use managers::primary::PyPrimaryCoordinator;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
 use system_resources::{parse_cores, parse_memory, pick_free_port};
@@ -71,6 +72,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPrimaryCoordinator>()?;
     m.add_class::<PyRustSlurmJobManager>()?;
     m.add_class::<PySecondaryCoordinator>()?;
+    m.add_class::<PyObserverLateJoiner>()?;
     m.add_class::<gateway::ssh::PySshGateway>()?;
     m.add_class::<PyCallbackWorkerFactory>()?;
     m.add_class::<PyCallbackResourceMonitor>()?;
@@ -78,6 +80,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_primary, m)?)?;
     m.add_function(wrap_pyfunction!(run_secondary, m)?)?;
     m.add_function(wrap_pyfunction!(run_distributed, m)?)?;
+    m.add_function(wrap_pyfunction!(run_observer_late_joiner, m)?)?;
     m.add_function(wrap_pyfunction!(compute_task_hash, m)?)?;
     m.add_function(wrap_pyfunction!(parse_cores, m)?)?;
     m.add_function(wrap_pyfunction!(parse_memory, m)?)?;
