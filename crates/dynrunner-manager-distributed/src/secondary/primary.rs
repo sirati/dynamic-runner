@@ -381,14 +381,15 @@ where
         {
             return;
         }
-        if self.primary_retry_passes_used >= self.config.retry_max_passes {
-            // Budget exhausted: the residual entries are permanent
-            // failures. Keep them in the ledger so test fixtures (and
-            // future operator-visible probes) can count permanent
-            // failures from the primary's perspective; the
-            // log-spam guard is `exhaustion_warning_emitted` so we
-            // emit the warning once per run rather than every drain
-            // check.
+        if !self.primary_retry_budget.should_retry() {
+            // Budget exhausted on either axis (attempt-count cap OR
+            // SLURM-wallclock deadline minus safety margin): the
+            // residual entries are permanent failures. Keep them in
+            // the ledger so test fixtures (and future operator-
+            // visible probes) can count permanent failures from the
+            // primary's perspective; the log-spam guard is
+            // `exhaustion_warning_emitted` so we emit the warning
+            // once per run rather than every drain check.
             if !self.exhaustion_warning_emitted {
                 // Tasks in `primary_failed` at retry-exhaustion time
                 // are now terminal (no further passes). Surface them
@@ -398,6 +399,14 @@ where
                 // (only Recoverable lands in primary_failed today),
                 // but the run-level outcome class is "final" because
                 // the retry policy gave up.
+                //
+                // `passes` reflects the legacy attempt-count cap; if
+                // the cliff was the SLURM-wallclock side, the actual
+                // attempts-used will be < retry_max_passes — operators
+                // chasing "why didn't I get all my retries?" should
+                // cross-reference `$SLURM_JOB_END_TIME` and the run
+                // duration. Single log shape kept stable for
+                // back-compat with the existing operator dashboards.
                 tracing::warn!(
                     fail_final = self.primary_failed.len(),
                     passes = self.config.retry_max_passes,
@@ -418,7 +427,7 @@ where
                 .into_values()
                 .map(|entry| entry.binary)
                 .collect();
-        let pass = self.primary_retry_passes_used + 1;
+        let pass = self.primary_retry_budget.attempts_used() + 1;
         tracing::info!(
             pass,
             count = to_retry.len(),
@@ -429,7 +438,7 @@ where
                 pool.reinject(binary);
             }
         }
-        self.primary_retry_passes_used += 1;
+        self.primary_retry_budget.record_attempt();
 
         // Kick our own idle workers — see method-level doc. Peer
         // workers self-recover on their next keepalive-driven repoll.
