@@ -89,6 +89,24 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         help="Run in secondary mode, connecting to primary at specified URL (e.g., tcp://host:port)",
     )
     parser.add_argument(
+        "--observer-join-from-peer-info-dir",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Late-joiner OBSERVER mode (transport-unification Step 9): join "
+            "an already-running cluster as a peer-mesh-only observer that "
+            "performs no work (num_workers=0) and is excluded from "
+            "primary-election candidates. DIR is the SLURM wrapper's "
+            "<run_log_dir>/connection_info directory — every v2 *.info file "
+            "in it becomes a seed entry for the bootstrap-snapshot RPC "
+            "(`peer_transport.join_running_cluster`). On success the "
+            "observer restores the snapshot, joins steady-state broadcasts, "
+            "and exits when the cluster broadcasts RunComplete. Mutually "
+            "exclusive with --secondary (a secondary is not a late-joiner)."
+        ),
+    )
+    parser.add_argument(
         "--secondary-id",
         type=str,
         help="Unique identifier for this secondary (required with --secondary)",
@@ -319,6 +337,27 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
                 "--source-already-staged requires a distributed mode "
                 "(--multi-computer slurm|local|single-process); plain "
                 "local mode has no secondary to delegate setup to."
+            )
+
+    # --observer-join-from-peer-info-dir is a late-joiner-OBSERVER role
+    # (transport-unification Step 9). It joins an already-running
+    # cluster via the peer mesh and runs zero workers. Combining it
+    # with --secondary is a category error: a `--secondary` invocation
+    # IS the welcome / cert-exchange / wait-for-setup handshake the
+    # late-joiner intentionally skips (via the Rust-side
+    # `restore_from_snapshot_and_skip_setup` latch on the secondary
+    # coordinator). Reject up-front rather than silently letting one
+    # flag take precedence — the operator's intent is ambiguous.
+    if getattr(args, "observer_join_from_peer_info_dir", None):
+        if getattr(args, "secondary", None):
+            parser.error(
+                "--observer-join-from-peer-info-dir is incompatible with "
+                "--secondary: a late-joiner observer is a peer-mesh-only "
+                "participant that does NOT speak the primary-secondary "
+                "handshake. Pick one: --observer-join-from-peer-info-dir "
+                "to attach a passive observer to an already-running "
+                "cluster, OR --secondary to be a regular worker-bearing "
+                "secondary that connects to the primary URL."
             )
 
 
