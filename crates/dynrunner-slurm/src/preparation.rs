@@ -38,6 +38,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinSet;
 
+use crate::peer_info::{parse as parse_peer_info, PeerInfoRecord};
+
 /// Single-method bridge for reading the contents of a connection-info
 /// file on the gateway. Returns the raw stdout of `cat <path>` (with
 /// trailing newline) on success, or `None` if the file does not yet
@@ -346,15 +348,32 @@ async fn drive_one_watcher<R: InfoFileReader>(
                 message: e.to_string(),
             })?;
         if let Some(text) = stdout {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                let (h, p) = parse_connection_uri(trimmed).map_err(|m| {
+            let trimmed = text.trim_end_matches('\u{0}');
+            // Treat blank/whitespace-only files as "not yet" (writer
+            // mkdir's and printfs are not atomic; an empty placeholder
+            // can appear before the actual content).
+            if !trimmed.trim().is_empty() {
+                // Step 7: parse the full v1+v2 record through the
+                // canonical `peer_info` module. The watcher only needs
+                // the line-1 `(host, port)` to drive the SSH reverse
+                // tunnel; the v2 envelope (cert, quic_port, …) is
+                // produced for late-joiner consumers (Step 8) and
+                // ignored here.
+                let record = parse_peer_info(trimmed).map_err(|e| {
                     PrepError::InfoParse {
                         secondary_id: secondary_id.to_owned(),
-                        message: m,
+                        message: e.to_string(),
                     }
                 })?;
-                tracing::info!(secondary_id, host = %h, port = p, "found connection info");
+                let h = record.legacy_uri.host.clone();
+                let p = record.legacy_uri.port;
+                tracing::info!(
+                    secondary_id,
+                    host = %h,
+                    port = p,
+                    version = ?record.version,
+                    "found connection info"
+                );
                 break (h, p);
             }
         }
@@ -592,17 +611,39 @@ async fn terminate_child(child: &mut Child) {
 
 /// Parse a connection-info URI line. Accepts `<scheme>://<host>:<port>`
 /// (post-L1.7 wire format). Returns `(host, port)`.
+///
+/// Thin shim around [`crate::peer_info::parse_v1_uri`] kept here so
+/// existing in-crate tests keep their assertion shape; production
+/// callers route through `peer_info` directly.
+#[cfg(test)]
 fn parse_connection_uri(line: &str) -> Result<(String, u16), String> {
-    let line = line.trim();
-    let url = url::Url::parse(line).map_err(|e| format!("not a valid URL: {line}: {e}"))?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| format!("URL missing host: {line}"))?
-        .to_owned();
-    let port = url
-        .port()
-        .ok_or_else(|| format!("URL missing port: {line}"))?;
-    Ok((host, port))
+    let uri = crate::peer_info::parse_v1_uri(line).map_err(|e| e.to_string())?;
+    Ok((uri.host, uri.port))
+}
+
+/// Read a connection-info file from `path` via the supplied
+/// [`InfoFileReader`] and parse it as a full v1/v2 [`PeerInfoRecord`].
+///
+/// Returns `Ok(None)` if the file does not exist yet (matching the
+/// watcher's polling semantics). Used by Step 8's late-joiner
+/// bootstrap to harvest a directory of records without re-implementing
+/// the format. Pure relative to the reader trait — no direct fs/IO.
+pub async fn read_peer_info_file<R: InfoFileReader>(
+    reader: &R,
+    path: String,
+) -> Result<Option<PeerInfoRecord>, PrepError> {
+    let stdout = reader.read(path.clone()).await?;
+    let Some(text) = stdout else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let record = parse_peer_info(&text).map_err(|e| PrepError::InfoParse {
+        secondary_id: path,
+        message: e.to_string(),
+    })?;
+    Ok(Some(record))
 }
 
 #[cfg(test)]
@@ -679,7 +720,10 @@ mod tests {
     #[test]
     fn parse_uri_garbage() {
         let err = parse_connection_uri("not a uri at all").unwrap_err();
-        assert!(err.contains("not a valid URL"), "got {err}");
+        // Post-Step-7: error message comes from `peer_info::parse_v1_uri`
+        // (the shim delegates), shape is `line 1 is not a valid URI: …`
+        // — the substring "not a valid URI" is the load-bearing marker.
+        assert!(err.contains("not a valid URI"), "got {err}");
     }
 
     /// Bench reader for the timeout/cancel path: returns Ok(None)

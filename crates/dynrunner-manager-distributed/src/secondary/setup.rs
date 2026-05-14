@@ -119,16 +119,26 @@ where
                                 .filter(|p| p.secondary_id != self.config.secondary_id)
                                 .count();
                             tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
-                            // Task #36: extract observer flag per peer so
-                            // election.rs's `lowest_alive` can filter
-                            // observers from candidate selection. Empty
-                            // set is harmless — without observers, the
-                            // filter is a no-op.
-                            for p in peers.iter() {
-                                if p.is_observer {
-                                    self.peer_observers.insert(p.secondary_id.clone());
-                                }
-                            }
+                            // Step 7 (Decision G): publish the
+                            // observer set into the replicated
+                            // `RoleTable.observers`. Every peer in the
+                            // broadcast that advertises
+                            // `is_observer=true` lands in the set;
+                            // anyone absent or `is_observer=false` is
+                            // implicitly a candidate. The set is
+                            // Replace-shaped (`set_observers` clears
+                            // before insert) so a re-broadcast that
+                            // drops a peer correctly removes it. Reads
+                            // from this set are the source of truth for
+                            // `election.rs::lowest_alive` filtering and
+                            // for the defensive PromotePrimary rejection
+                            // in `dispatch.rs`.
+                            let observers: std::collections::HashSet<String> = peers
+                                .iter()
+                                .filter(|p| p.is_observer)
+                                .map(|p| p.secondary_id.clone())
+                                .collect();
+                            self.cluster_state.set_observers(observers);
                             // Non-blocking: per-peer dials run as
                             // spawn_local tasks; returns immediately.
                             self.peer_transport.connect_to_peers(peers).await;
