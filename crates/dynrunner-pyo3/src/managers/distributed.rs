@@ -11,6 +11,7 @@ use dynrunner_manager_distributed::{
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
 
+use crate::identifier::RunnerIdentifier;
 use crate::config::connection::ConnectionMode;
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
@@ -259,19 +260,71 @@ impl PyDistributedManager {
                 let mut sec_handles = Vec::new();
                 let mut all_child_processes: Vec<Option<std::process::Child>> = Vec::new();
 
+                // Step 5b: build the primary's peer-mesh view first
+                // so the per-secondary forwarder below can tap inbound
+                // messages into the peer queue. The
+                // `shared_outgoing` handle receives the same sender
+                // clones we put into the legacy `outgoing` HashMap,
+                // so role-addressed sends through `peer_transport`
+                // reach the same wire as legacy `transport.send_to`.
+                // See `dynrunner_transport_tunnel` crate docs.
+                let (peer_transport, shared_outgoing, inbound_tap) =
+                    dynrunner_transport_tunnel::TunneledPeerTransport::<
+                        RunnerIdentifier,
+                    >::new("primary".into());
+
                 for (secondary_id, sec_log) in sec_log_dirs.into_iter() {
                     // primary→secondary channel
                     let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
                     // secondary→primary channel
                     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
 
+                    // Register the per-secondary writer in BOTH the
+                    // legacy `outgoing` HashMap (drives
+                    // `transport.send_to(sec_id, ..)`) AND the
+                    // tunneled peer view's shared writer table
+                    // (drives `peer_transport.send_to_peer(sec_id, ..)`
+                    // and `Address::Role(_)` dispatch after the
+                    // role-cache resolves). Pre-Step-5b the legacy
+                    // path was the only consumer; Step 5b makes the
+                    // primary a real mesh member by adding the
+                    // second registration.
+                    shared_outgoing
+                        .borrow_mut()
+                        .insert(secondary_id.clone(), pri_to_sec_tx.clone());
                     outgoing.insert(secondary_id.clone(), pri_to_sec_tx);
 
                     // Forward secondary→primary messages
                     let fwd_tx = incoming_tx.clone();
+                    let fwd_tap = inbound_tap.clone();
                     tokio::task::spawn_local(async move {
-                        let mut rx = sec_to_pri_rx;
+                        // Explicit type annotation: with the tap
+                        // fan-out and the legacy forwarder both
+                        // calling `send(msg)`-shaped methods the
+                        // inferrer can no longer disambiguate the
+                        // single-channel path it used pre-tap.
+                        // Both sides receive `DistributedMessage<RunnerIdentifier>`
+                        // (the wire shape the primary speaks).
+                        let mut rx: tokio_mpsc::UnboundedReceiver<
+                            dynrunner_protocol_primary_secondary::DistributedMessage<
+                                RunnerIdentifier,
+                            >,
+                        > = sec_to_pri_rx;
                         while let Some(msg) = rx.recv().await {
+                            // Fan-out tap: clone each inbound
+                            // message into the peer view's queue so
+                            // `peer_transport.recv_peer()` can
+                            // observe it. The legacy `fwd_tx` send
+                            // below is the canonical inbound
+                            // consumer; the peer queue is currently
+                            // drainless (Step 5b doesn't add the
+                            // demoted-primary read arm — Step 6
+                            // does). On send failure of the tap
+                            // we continue silently: a dropped tap
+                            // means the peer view was torn down
+                            // first, but the legacy inbound path
+                            // must keep flowing.
+                            let _ = fwd_tap.send(msg.clone());
                             if fwd_tx.send(msg).is_err() {
                                 break;
                             }
@@ -417,7 +470,7 @@ impl PyDistributedManager {
                 let mut primary = PrimaryCoordinator::new(
                     config,
                     transport,
-                    dynrunner_transport_quic::NoPeerTransport,
+                    peer_transport,
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );
