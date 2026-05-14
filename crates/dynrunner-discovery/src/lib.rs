@@ -1,14 +1,19 @@
 //! Rust-driven directory traversal with a generic visitor.
 //!
-//! Reads the local filesystem directly via [`tokio::fs::read_dir`]; the
+//! Reads the local filesystem directly via [`std::fs::read_dir`]; the
 //! [`Visitor`] decides which subfolders to descend into and which files to
 //! mark for processing. Marks accumulate in the driver, not in the visitor
 //! — visitors stay stateless w.r.t. the result set and only carry whatever
 //! per-subtree context they want via `Payload`.
 //!
+//! The walk is fully synchronous: the per-directory work is dominated by
+//! blocking `read_dir`/`metadata` syscalls, and embedding an async runtime
+//! on top of that only buys complexity (and a panic when the caller is
+//! already inside one). Callers that need to keep an async executor
+//! responsive should run [`walk`] under `spawn_blocking` / `block_in_place`.
+//!
 //! See [`walk`] for the entry point.
 
-use std::future::Future;
 use std::path::{Path, PathBuf};
 
 /// Internal directory entry — the per-listing intermediate before the
@@ -36,11 +41,12 @@ impl DirEntry {
 /// previous `Filesystem` trait had this same body behind one impl. Since
 /// the SSH-side impl is also being deleted (discovery now always runs on
 /// whichever process owns the data), the trait is gone too.
-async fn list_dir(path: &Path) -> std::io::Result<Vec<DirEntry>> {
-    let mut read = tokio::fs::read_dir(path).await?;
+fn list_dir(path: &Path) -> std::io::Result<Vec<DirEntry>> {
+    let read = std::fs::read_dir(path)?;
 
     let mut entries = Vec::new();
-    while let Some(child) = read.next_entry().await? {
+    for child in read {
+        let child = child?;
         let name = match child.file_name().into_string() {
             Ok(s) => s,
             Err(_) => {
@@ -54,7 +60,7 @@ async fn list_dir(path: &Path) -> std::io::Result<Vec<DirEntry>> {
 
         // Follow symlinks (matches the historical Python `Path.is_file()`
         // semantics). Broken symlinks bubble up as Err here; skip silently.
-        let meta = match tokio::fs::metadata(child.path()).await {
+        let meta = match std::fs::metadata(child.path()) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -120,16 +126,16 @@ pub struct Marked<P> {
 ///
 /// `parent_payload` is the payload that the parent's `enter` produced for
 /// this subdirectory. At the root call it is `None`.
-pub trait Visitor: Send {
-    type Payload: Send;
-    type Error: Send;
+pub trait Visitor {
+    type Payload;
+    type Error;
 
     fn visit(
         &mut self,
         parent_payload: Option<&Self::Payload>,
         subfolders: &[FolderInfo],
         files: &[FileInfo],
-    ) -> impl Future<Output = Result<VisitOutcome<Self::Payload>, Self::Error>> + Send;
+    ) -> Result<VisitOutcome<Self::Payload>, Self::Error>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -152,7 +158,7 @@ pub enum WalkError<E> {
 ///
 /// Returns the full list of marked files in visit order (parents before
 /// children, alphabetical among siblings).
-pub async fn walk<V>(
+pub fn walk<V>(
     root: &Path,
     visitor: &mut V,
 ) -> Result<Vec<Marked<V::Payload>>, WalkError<V::Error>>
@@ -164,7 +170,7 @@ where
     stack.push((root.to_path_buf(), PathBuf::new(), None));
 
     while let Some((abs, rel, parent_payload)) = stack.pop() {
-        let listing = list_dir(&abs).await?;
+        let listing = list_dir(&abs)?;
 
         let mut subfolders: Vec<FolderInfo> = Vec::new();
         let mut files: Vec<FileInfo> = Vec::new();
@@ -177,7 +183,6 @@ where
 
         let outcome = visitor
             .visit(parent_payload.as_ref(), &subfolders, &files)
-            .await
             .map_err(WalkError::Visitor)?;
 
         for (idx, payload) in outcome.mark {
@@ -235,7 +240,7 @@ mod tests {
         type Payload = String;
         type Error = std::convert::Infallible;
 
-        async fn visit(
+        fn visit(
             &mut self,
             parent_payload: Option<&Self::Payload>,
             subfolders: &[FolderInfo],
@@ -268,20 +273,16 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn walks_one_level() {
+    #[test]
+    fn walks_one_level() {
         let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join("a.bin"), vec![0u8; 10])
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("b.bin"), vec![0u8; 20])
-            .await
-            .unwrap();
+        std::fs::write(tmp.path().join("a.bin"), vec![0u8; 10]).unwrap();
+        std::fs::write(tmp.path().join("b.bin"), vec![0u8; 20]).unwrap();
 
         let mut v = EveryFile {
             seen_payloads: Mutex::new(Vec::new()),
         };
-        let marked = walk(tmp.path(), &mut v).await.unwrap();
+        let marked = walk(tmp.path(), &mut v).unwrap();
         let names: Vec<_> = marked
             .iter()
             .map(|m| m.relative_path.to_string_lossy().to_string())
@@ -291,26 +292,20 @@ mod tests {
         assert_eq!(marked[1].size, 20);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn descends_and_propagates_payload() {
+    #[test]
+    fn descends_and_propagates_payload() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        tokio::fs::create_dir(root.join("x86")).await.unwrap();
-        tokio::fs::create_dir(root.join("x64")).await.unwrap();
-        tokio::fs::write(root.join("top.bin"), vec![0u8; 1])
-            .await
-            .unwrap();
-        tokio::fs::write(root.join("x86/a.bin"), vec![0u8; 2])
-            .await
-            .unwrap();
-        tokio::fs::write(root.join("x64/b.bin"), vec![0u8; 3])
-            .await
-            .unwrap();
+        std::fs::create_dir(root.join("x86")).unwrap();
+        std::fs::create_dir(root.join("x64")).unwrap();
+        std::fs::write(root.join("top.bin"), vec![0u8; 1]).unwrap();
+        std::fs::write(root.join("x86/a.bin"), vec![0u8; 2]).unwrap();
+        std::fs::write(root.join("x64/b.bin"), vec![0u8; 3]).unwrap();
 
         let mut v = EveryFile {
             seen_payloads: Mutex::new(Vec::new()),
         };
-        let marked = walk(root, &mut v).await.unwrap();
+        let marked = walk(root, &mut v).unwrap();
         let mut names: Vec<_> = marked
             .iter()
             .map(|m| m.relative_path.to_string_lossy().to_string())
@@ -325,22 +320,20 @@ mod tests {
         assert!(seen.contains(&Some("x64".into())));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn skips_unentered_subfolder() {
+    #[test]
+    fn skips_unentered_subfolder() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Create a subfolder we expect the walker NOT to descend into.
         // Populate it with a file that would show up if descent leaked.
-        tokio::fs::create_dir(root.join("skip")).await.unwrap();
-        tokio::fs::write(root.join("skip/should-not-see"), b"x")
-            .await
-            .unwrap();
+        std::fs::create_dir(root.join("skip")).unwrap();
+        std::fs::write(root.join("skip/should-not-see"), b"x").unwrap();
 
         struct NoEnter;
         impl Visitor for NoEnter {
             type Payload = ();
             type Error = std::convert::Infallible;
-            async fn visit(
+            fn visit(
                 &mut self,
                 _: Option<&()>,
                 _: &[FolderInfo],
@@ -349,19 +342,19 @@ mod tests {
                 Ok(VisitOutcome::default())
             }
         }
-        let marked = walk(root, &mut NoEnter).await.unwrap();
+        let marked = walk(root, &mut NoEnter).unwrap();
         assert!(marked.is_empty());
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn out_of_bounds_index_is_an_error() {
+    #[test]
+    fn out_of_bounds_index_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         // Empty dir: visitor's enter=[(99, ...)] is unconditionally OOB.
         struct Bad;
         impl Visitor for Bad {
             type Payload = ();
             type Error = std::convert::Infallible;
-            async fn visit(
+            fn visit(
                 &mut self,
                 _: Option<&()>,
                 _: &[FolderInfo],
@@ -373,22 +366,22 @@ mod tests {
                 })
             }
         }
-        let err = walk(tmp.path(), &mut Bad).await.unwrap_err();
+        let err = walk(tmp.path(), &mut Bad).unwrap_err();
         assert!(matches!(
             err,
             WalkError::IndexOutOfBounds { kind: "folder", .. }
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn missing_root_yields_io_error() {
+    #[test]
+    fn missing_root_yields_io_error() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("nope");
         struct AnyVisitor;
         impl Visitor for AnyVisitor {
             type Payload = ();
             type Error = std::convert::Infallible;
-            async fn visit(
+            fn visit(
                 &mut self,
                 _: Option<&()>,
                 _: &[FolderInfo],
@@ -397,7 +390,7 @@ mod tests {
                 Ok(VisitOutcome::default())
             }
         }
-        let err = walk(&missing, &mut AnyVisitor).await.unwrap_err();
+        let err = walk(&missing, &mut AnyVisitor).unwrap_err();
         assert!(matches!(err, WalkError::Io(_)));
     }
 }
