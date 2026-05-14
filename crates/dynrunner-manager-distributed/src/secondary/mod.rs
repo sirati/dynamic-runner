@@ -275,13 +275,6 @@ where
     // Peer keepalive tracking: peer_id -> last_seen timestamp
     peer_keepalives: HashMap<String, f64>,
 
-    /// Task #36: per-peer observer-mode flag, populated from each
-    /// PeerInfo broadcast's `PeerConnectionInfo.is_observer`.
-    /// Election's `lowest_alive` filters peers in this set so other
-    /// secondaries don't defer to an observer (which would refuse
-    /// self-promotion and stall the cluster).
-    pub(super) peer_observers: HashSet<String>,
-
     // Primary keepalive tracking for failover detection (F2). `None` until
     // the first primary message arrives. Updated on every primary message,
     // not just `Keepalive`, so an actively-routing primary doesn't get
@@ -573,7 +566,6 @@ where
             is_primary: false,
             extraction_cache,
             peer_keepalives: HashMap::new(),
-            peer_observers: HashSet::new(),
             primary_last_seen: None,
             primary_disconnected: false,
             election: election::ElectionState::Normal,

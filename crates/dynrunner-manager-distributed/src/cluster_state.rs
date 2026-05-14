@@ -313,6 +313,31 @@ impl<I: Identifier> ClusterState<I> {
         &self.role_table
     }
 
+    /// Replace the replicated `observers` set with the given peers.
+    /// Fires registered role-change hooks if the set actually changed
+    /// so the transport-layer cache stays coherent (Step 7+ of the
+    /// transport-unification refactor; Decision G option α).
+    ///
+    /// Observer-membership rides the `PeerInfo` wire frame, not a
+    /// dedicated `ClusterMutation` — the receiver's PeerInfo handler
+    /// (`secondary/setup.rs`) calls this method when it processes
+    /// the incoming peers vector. The set is `Replace`-shaped (not
+    /// incremental insert/remove) so a re-broadcast that drops a
+    /// peer correctly removes it from the local view; observers
+    /// joining mid-run still appear because PeerInfo is broadcast
+    /// every time the primary's peer set changes.
+    ///
+    /// Idempotent: no-op + no hook fire when the new set equals the
+    /// current set. Hooks fire AFTER the field update so registrants
+    /// see the post-mutation table.
+    pub fn set_observers(&mut self, observers: std::collections::HashSet<String>) {
+        if self.role_table.observers == observers {
+            return;
+        }
+        self.role_table.observers = observers;
+        self.fire_role_change_hooks();
+    }
+
     /// Fire every registered hook against the current [`RoleTable`].
     /// Invoked from `apply` immediately AFTER any mutation that
     /// touches the table, so registrants see post-state values.
@@ -1086,6 +1111,70 @@ mod tests {
         });
         let obs_after_noop = observed.lock().unwrap().clone();
         assert_eq!(obs_after_noop.len(), 3, "NoOp must not fire hook");
+    }
+
+    /// Step 7 (Decision G): `set_observers` replaces the replicated
+    /// observer set and fires role-change hooks when (and only when)
+    /// the set actually changes. Idempotent re-application is silent.
+    /// Pins the "observer-set replicated through RoleTable" contract
+    /// that election filtering and PromotePrimary defense both rely on.
+    #[test]
+    fn set_observers_updates_role_table_and_fires_hooks_on_change() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert!(s.role_table().observers.is_empty());
+
+        let observed: Arc<Mutex<Vec<HashSet<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = Arc::clone(&observed);
+            s.register_role_change_hook(Box::new(move |table: &RoleTable| {
+                observed.lock().unwrap().push(table.observers.clone());
+            }));
+        }
+
+        // First insert fires the hook with the new set.
+        s.set_observers(HashSet::from(["obs-1".to_string()]));
+        assert_eq!(
+            s.role_table().observers,
+            HashSet::from(["obs-1".to_string()])
+        );
+
+        // Re-apply with the same set: idempotent, no hook fire.
+        s.set_observers(HashSet::from(["obs-1".to_string()]));
+
+        // Add a second observer: hook fires with the union.
+        s.set_observers(HashSet::from(["obs-1".to_string(), "obs-2".to_string()]));
+        assert_eq!(
+            s.role_table().observers,
+            HashSet::from(["obs-1".to_string(), "obs-2".to_string()])
+        );
+
+        // Remove obs-1 (Replace-shape): hook fires with the
+        // contracted set. Pins the "PeerInfo broadcast that drops
+        // a peer correctly removes it" path.
+        s.set_observers(HashSet::from(["obs-2".to_string()]));
+        assert_eq!(
+            s.role_table().observers,
+            HashSet::from(["obs-2".to_string()])
+        );
+
+        // Clear: hook fires with empty set.
+        s.set_observers(HashSet::new());
+        assert!(s.role_table().observers.is_empty());
+
+        // Hook history: 4 actual changes (insert, union, contract,
+        // clear); the no-op re-apply was silent.
+        let obs = observed.lock().unwrap().clone();
+        assert_eq!(obs.len(), 4, "expected 4 fires, got {}", obs.len());
+        assert_eq!(obs[0], HashSet::from(["obs-1".to_string()]));
+        assert_eq!(
+            obs[1],
+            HashSet::from(["obs-1".to_string(), "obs-2".to_string()])
+        );
+        assert_eq!(obs[2], HashSet::from(["obs-2".to_string()]));
+        assert!(obs[3].is_empty());
     }
 
     /// `restore` going through the snapshot-merge path also mutates
