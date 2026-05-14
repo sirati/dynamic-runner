@@ -189,6 +189,17 @@ impl<I> Default for ClusterState<I> {
 /// - `(current_primary, primary_epoch)`: higher epoch wins.
 /// - `phase_deps`: replaced if local is empty, otherwise kept (the
 ///   graph is static for the run's lifetime).
+/// - `observers`: replaced if local is empty, otherwise kept. The
+///   live mutation path (PeerInfo broadcasts → `set_observers`)
+///   replaces the set atomically, so a snapshot is authoritative for
+///   the late-joiner's first-bootstrap and inert thereafter. A
+///   broader merge rule (union, or epoch-tagged replace) would be
+///   over-engineering today — the live PeerInfo broadcast that
+///   arrives shortly after the snapshot supersedes the snapshot's
+///   `observers` anyway. `#[serde(default)]` keeps wire compat with
+///   pre-Step-8 senders (snapshots from a peer running an older
+///   crate omit the field; deserialize defaults to an empty set,
+///   identical to the pre-Step-8 shape).
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -203,6 +214,15 @@ pub struct ClusterStateSnapshot<I> {
     pub current_primary: Option<String>,
     pub primary_epoch: u64,
     pub phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+    /// Replicated observer set (Step 7's `RoleTable.observers`). A
+    /// late-joiner needs this immediately to apply the election
+    /// filter (`secondary::election::lowest_alive` skips observers);
+    /// the live PeerInfo broadcast that arrives shortly after will
+    /// supersede it, but in the gap between snapshot-restore and
+    /// the next PeerInfo broadcast, the joiner would otherwise
+    /// promote an observer candidate.
+    #[serde(default)]
+    pub observers: std::collections::HashSet<String>,
 }
 
 fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
@@ -360,6 +380,12 @@ impl<I: Identifier> ClusterState<I> {
             current_primary: self.current_primary.clone(),
             primary_epoch: self.primary_epoch,
             phase_deps: self.phase_deps.clone(),
+            // Carry the replicated observer set through the snapshot
+            // so a late-joiner can populate `RoleTable.observers`
+            // before the next PeerInfo broadcast arrives. The set is
+            // the same one `set_observers` writes; the snapshot is
+            // authoritative for first-bootstrap and inert thereafter.
+            observers: self.role_table.observers.clone(),
         }
     }
 
@@ -404,6 +430,18 @@ impl<I: Identifier> ClusterState<I> {
         }
         if self.phase_deps.is_empty() {
             self.phase_deps = snap.phase_deps;
+        }
+        // Observer set: replace if local is empty (first-bootstrap
+        // case), otherwise keep local. The live PeerInfo broadcast
+        // path (`set_observers`) is the steady-state writer; this
+        // branch only fires on the late-joiner's very first restore,
+        // before any PeerInfo arrives. Firing the role-change hooks
+        // when the set actually changes keeps the transport's
+        // write-through cache coherent on the snapshot path the same
+        // way `set_observers` does on the live path.
+        if self.role_table.observers.is_empty() && !snap.observers.is_empty() {
+            self.role_table.observers = snap.observers;
+            self.fire_role_change_hooks();
         }
     }
 
@@ -919,6 +957,56 @@ mod tests {
             joiner.task_state("c"),
             Some(TaskState::Completed { .. })
         ));
+    }
+
+    /// Pins the Step 8 contract that `ClusterStateSnapshot` carries
+    /// the replicated observer set so a late-joiner's first restore
+    /// populates `RoleTable.observers` before the next PeerInfo
+    /// broadcast arrives. Without this the joiner's election filter
+    /// (`secondary::election::lowest_alive` skips observers) could
+    /// fire against an empty set and promote an observer candidate
+    /// in the gap between snapshot-restore and the next PeerInfo.
+    #[test]
+    fn snapshot_round_trip_preserves_observers() {
+        use std::collections::HashSet;
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.set_observers(HashSet::from([
+            "obs-1".to_string(),
+            "obs-2".to_string(),
+        ]));
+
+        let snap = s.snapshot();
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        // Joiner is empty: snapshot's observers REPLACE the empty
+        // local set per the first-bootstrap branch in `restore`.
+        joiner.restore(snap);
+        assert_eq!(
+            joiner.role_table().observers,
+            HashSet::from(["obs-1".to_string(), "obs-2".to_string()])
+        );
+    }
+
+    /// Pins the Step 8 "first-bootstrap only" branch on `restore`:
+    /// a joiner that has already observed a live PeerInfo broadcast
+    /// (so `observers` is non-empty) keeps its local set rather than
+    /// overwriting from a (possibly stale) snapshot. Mirrors the
+    /// `phase_deps` "replaced if local empty, else kept" shape.
+    #[test]
+    fn restore_keeps_local_observers_when_already_populated() {
+        use std::collections::HashSet;
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        joiner.set_observers(HashSet::from(["live-obs".to_string()]));
+
+        let mut peer = ClusterState::<RunnerIdentifier>::new();
+        peer.set_observers(HashSet::from(["stale-obs".to_string()]));
+
+        joiner.restore(peer.snapshot());
+        // Local set wins (live PeerInfo path is authoritative once it
+        // has fired); snapshot's observers field is inert.
+        assert_eq!(
+            joiner.role_table().observers,
+            HashSet::from(["live-obs".to_string()])
+        );
     }
 
     #[test]

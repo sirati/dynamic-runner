@@ -1,8 +1,64 @@
+use std::time::Duration;
+
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
 use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
 use crate::messages::timestamp_now;
 use crate::DistributedMessage;
+
+/// Default bootstrap-RPC budget for [`PeerTransport::join_running_cluster`].
+///
+/// 10 s matches the pre-Step-8 per-peer QUIC dial budget (cf.
+/// `transport-quic/src/peer/dial.rs`'s happy-eyeballs total) plus
+/// rendezvous slack: a healthy responder hands back a snapshot in
+/// milliseconds once the QUIC handshake completes; the entire
+/// budget is for the rendezvous + handshake to land. Shorter
+/// budgets (5 s) round-tripped fine on a LAN but were tight on
+/// fabric where the first dial attempt's UDP must traverse a
+/// firewall before falling back to WSS — both consumer teams hit
+/// this on Krater (cf. lower-id-dials commentary in
+/// `transport-quic/src/peer/mod.rs`). Longer budgets (>15 s) start
+/// to mask transport bugs (a peer that never replies should be
+/// caller-observable, not silently retried).
+///
+/// Caller-overridable via the `timeout` parameter on
+/// [`PeerTransport::join_running_cluster`].
+pub const DEFAULT_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Error from [`PeerTransport::join_running_cluster`].
+#[derive(Debug)]
+pub enum JoinError {
+    /// `connect_to_peers` ran but no peer became reachable within
+    /// the per-peer-connect slice of the bootstrap budget.
+    NoReachablePeer,
+    /// At least one peer was reachable and we sent the snapshot
+    /// request, but no `ClusterSnapshot` reply arrived within the
+    /// budget. The transport may have received other live messages
+    /// during the window — those are dropped (logged at `warn`).
+    /// Bootstrap is a single-RPC contract; the caller drives any
+    /// retry policy.
+    Timeout,
+    /// `send_to_peer` returned an error while delivering the
+    /// snapshot request. The wrapped string is the transport's
+    /// error message verbatim.
+    SendFailed(String),
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoReachablePeer => f.write_str(
+                "join_running_cluster: no seed peer became reachable within the connect window",
+            ),
+            Self::Timeout => f.write_str(
+                "join_running_cluster: no ClusterSnapshot reply within the bootstrap timeout",
+            ),
+            Self::SendFailed(e) => write!(f, "join_running_cluster: failed to send request: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
 
 /// Transport trait for the primary side: can send to specific secondaries, receive from any.
 ///
@@ -216,5 +272,190 @@ pub trait PeerTransport<I: Identifier> {
     /// corruption".
     fn local_id(&self) -> &str {
         ""
+    }
+
+    /// Bootstrap-from-snapshot orchestration for a late-joiner / fresh
+    /// observer.
+    ///
+    /// Semantics — single-RPC contract:
+    /// 1. Wire up the peer mesh by calling [`Self::connect_to_peers`]
+    ///    with `seed`. Transports that pre-wire (channel,
+    ///    [`crate::PeerTransport`] mocks) treat this as a no-op.
+    /// 2. Wait briefly for at least one peer to register as connected
+    ///    by polling [`Self::peer_count`] up to a small slice of the
+    ///    total budget. If no peer is reachable, surface
+    ///    [`JoinError::NoReachablePeer`] — the caller decides between
+    ///    abort vs. retry-with-a-different-seed.
+    /// 3. Construct a [`DistributedMessage::RequestClusterSnapshot`]
+    ///    envelope tagged with [`Self::local_id`] as the responder's
+    ///    return address.
+    /// 4. Send it via [`Self::send`] with `Address::Peer(<first
+    ///    reachable seed id>)`. The receiver-side handler in
+    ///    `secondary/dispatch.rs` accepts the request from any peer
+    ///    (`cluster_state` is replicated, so any responder's snapshot
+    ///    is valid bootstrap material) and replies with a unicast
+    ///    [`DistributedMessage::ClusterSnapshot`].
+    ///
+    ///    NOTE: the original plan called for `Address::Role(Role::Primary)`
+    ///    dispatch here so the receiver-side relay (Step 4) would
+    ///    forward to whichever peer holds the primary role. That
+    ///    shape doesn't work for a cold-start joiner — its role
+    ///    cache is empty (no `PromotePrimary` mutation has been
+    ///    observed yet), so the Step-3 `Address::Role(_)` dispatch
+    ///    surfaces "role-table cache empty" and the request never
+    ///    leaves the wire. Sending unicast to the first reachable
+    ///    seed peer is equivalent semantically (any peer can
+    ///    answer per the dispatch.rs comment) and works regardless
+    ///    of cache state. The role cache is then warmed by the
+    ///    `restore` path on the cluster state once the joiner
+    ///    deserialises the returned snapshot — by `current_primary`
+    ///    triggering [`crate::address::RoleTable.primary`] update +
+    ///    role-change-hook fire.
+    ///
+    /// 5. Drive [`Self::recv_peer`] inside a `tokio::time::timeout`
+    ///    until a [`DistributedMessage::ClusterSnapshot`] arrives, or
+    ///    the bootstrap budget expires. Messages OTHER than
+    ///    `ClusterSnapshot` received in the bootstrap window are
+    ///    logged at `warn` and dropped — bootstrap is a one-shot
+    ///    rendezvous, the cluster's CRDT-merge guarantees the next
+    ///    live broadcast (or a follow-up snapshot) covers anything
+    ///    dropped here.
+    ///
+    /// Returns the snapshot's serialized JSON payload (the
+    /// `snapshot_json` field on the wire frame). The caller decodes
+    /// it into their own concrete `ClusterStateSnapshot<I>` and
+    /// passes that to `ClusterState::restore`. The protocol crate
+    /// stays free of `ClusterStateSnapshot<I>` — the wire-side
+    /// `String` keeps `I` erased at the transport boundary; see
+    /// the dispatch.rs commentary on the same direction-of-
+    /// dependency point.
+    ///
+    /// **Single concern**: bootstrap rendezvous + snapshot RPC. The
+    /// caller's concern is cluster-state restoration (one `restore`
+    /// call) and any retry policy if `Err` comes back. The 5-step
+    /// loop above never touches `ClusterState` directly — the
+    /// dependency edge is preserved (protocol crate does not depend
+    /// on manager-distributed).
+    fn join_running_cluster(
+        &mut self,
+        seed: &[crate::PeerConnectionInfo],
+        timeout: Duration,
+    ) -> impl std::future::Future<Output = Result<String, JoinError>>
+    where
+        I: 'static,
+    {
+        async move {
+            // Step 1: dial. No-op for pre-wired transports (channel
+            // mesh, tests); real work for `PeerNetwork`.
+            self.connect_to_peers(seed).await;
+
+            // Step 2: rendezvous gate. Walk the seed list, pick the
+            // first id whose connection registered. Bound by a
+            // fraction of the total budget so the snapshot recv
+            // gets the lion's share. Polling cadence is 25 ms —
+            // tight enough that a ~100 ms QUIC handshake is observed
+            // within ~4 ticks; loose enough that the busy-wait cost
+            // is negligible on the bootstrap path.
+            let connect_budget = timeout / 4;
+            let connect_deadline = tokio::time::Instant::now() + connect_budget;
+            let local_id = self.local_id().to_owned();
+            // Wait for the mesh to register at least one connection.
+            // For pre-wired transports (channel mesh) this is true
+            // synchronously after connect_to_peers returns; for
+            // PeerNetwork the dial races land asynchronously through
+            // new_conn_rx and the next peer_count > 0 observation is
+            // the proxy for "at least one peer is up". The transport
+            // doesn't expose a per-id "is THIS id connected?"
+            // predicate today (only peer_count, the cardinality),
+            // so we drive the rendezvous on cardinality and then
+            // attempt the unicast send against each non-self seed
+            // id in order until one succeeds. Any peer can answer
+            // per dispatch.rs's RequestClusterSnapshot handler, so
+            // first-success-wins is correct on the join flow.
+            loop {
+                if self.peer_count() > 0 {
+                    break;
+                }
+                if tokio::time::Instant::now() >= connect_deadline {
+                    return Err(JoinError::NoReachablePeer);
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+
+            // Step 3+4: send the request. We use Address::Peer
+            // (unicast to a reachable seed) rather than Address::Role
+            // (Role::Primary) — see method-doc rationale (cold-start
+            // role cache is empty). Iterate seed in order; the first
+            // send_to_peer that returns Ok stops the loop. Send-side
+            // errors (`no route`, `outgoing channel closed`) are
+            // tolerated and we move on to the next candidate so a
+            // partially-stale seed (one of the peers retired between
+            // file-write and this dial) still bootstraps via the
+            // remaining live peers.
+            let mut send_err: Option<String> = None;
+            let mut sent_to: Option<String> = None;
+            for peer in seed {
+                if peer.secondary_id == local_id {
+                    continue;
+                }
+                let request = DistributedMessage::RequestClusterSnapshot {
+                    sender_id: local_id.clone(),
+                    timestamp: timestamp_now(),
+                };
+                match self
+                    .send(Address::Peer(peer.secondary_id.clone()), request)
+                    .await
+                {
+                    Ok(()) => {
+                        sent_to = Some(peer.secondary_id.clone());
+                        break;
+                    }
+                    Err(e) => {
+                        send_err = Some(e);
+                    }
+                }
+            }
+            if sent_to.is_none() {
+                return Err(JoinError::SendFailed(
+                    send_err.unwrap_or_else(|| "no seed peer accepted send".into()),
+                ));
+            }
+
+            // Step 5: wait for the ClusterSnapshot reply. Non-
+            // ClusterSnapshot frames received in this window are
+            // dropped with a warn log — see method-doc.
+            let recv_budget = timeout.saturating_sub(connect_budget);
+            let recv_deadline = tokio::time::Instant::now() + recv_budget;
+            loop {
+                let remaining =
+                    recv_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(JoinError::Timeout);
+                }
+                let recv = tokio::time::timeout(remaining, self.recv_peer()).await;
+                match recv {
+                    Err(_) => return Err(JoinError::Timeout),
+                    Ok(None) => {
+                        // Transport's inbound channel closed: no more
+                        // messages will ever arrive. Surface as
+                        // timeout — the operator-visible signal is
+                        // identical ("no snapshot in window") and the
+                        // cause shows up in the transport's own
+                        // teardown logs.
+                        return Err(JoinError::Timeout);
+                    }
+                    Ok(Some(DistributedMessage::ClusterSnapshot { snapshot_json, .. })) => {
+                        return Ok(snapshot_json);
+                    }
+                    Ok(Some(other)) => {
+                        tracing::warn!(
+                            kind = ?other.msg_type(),
+                            "join_running_cluster: dropped non-ClusterSnapshot frame in bootstrap window"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
     }
 }
