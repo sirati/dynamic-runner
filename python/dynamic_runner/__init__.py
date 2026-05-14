@@ -40,6 +40,7 @@ from ._native import (
     RustDistributedManager,
     RustLocalGateway,
     RustLocalManager,
+    RustObserverLateJoiner,
     RustPrimaryCoordinator,
     RustSecondaryCoordinator,
     RustSlurmJobManager,
@@ -53,6 +54,7 @@ from ._native import (
     pick_free_port,
     run_distributed,
     run_local,
+    run_observer_late_joiner,
     run_primary,
     run_secondary,
 )
@@ -77,6 +79,7 @@ __all__ = [
     "RustDistributedManager",
     "RustLocalGateway",
     "RustLocalManager",
+    "RustObserverLateJoiner",
     "RustPrimaryCoordinator",
     "RustSecondaryCoordinator",
     "RustSlurmJobManager",
@@ -90,6 +93,7 @@ __all__ = [
     "pick_free_port",
     "run_distributed",
     "run_local",
+    "run_observer_late_joiner",
     "run_primary",
     "run_secondary",
 ]

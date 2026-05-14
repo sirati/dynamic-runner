@@ -63,6 +63,17 @@ def run(
         _dispatch_secondary(task, args, logger)
         return
 
+    # Late-joiner observer (transport-unification Step 9). The flag
+    # is mutually exclusive with `--secondary` (validated in
+    # `validate_parsed_args`); routed before the multi-computer
+    # branch so the observer never touches the SLURM / local /
+    # single-process dispatch helpers — those construct a primary
+    # AND spawn secondaries, neither of which the observer wants
+    # (it joins an EXISTING cluster).
+    if args.observer_join_from_peer_info_dir:
+        _dispatch_late_joiner(task, args, logger)
+        return
+
     if args.slurm and not args.multi_computer:
         args.multi_computer = "slurm"
         logger.warning("--slurm is deprecated, use --multi-computer slurm instead")
@@ -311,6 +322,60 @@ def _dispatch_secondary(task, args, logger) -> None:
         str(cfg.output_dir),
         skip_existing=args.skip_existing,
     )
+
+
+def _dispatch_late_joiner(task, args, logger) -> None:
+    """Late-joiner observer dispatcher (transport-unification Step 9).
+
+    Reads peer-info files from `args.observer_join_from_peer_info_dir`,
+    starts a real `PeerNetwork` on this host, dials in via
+    `peer_transport.join_running_cluster`, restores the snapshot, and
+    drives the secondary run loop with `is_observer=true` and
+    `num_workers=0`. The Rust-side coordinator handles every detail
+    of the bootstrap; the Python dispatcher's only job is to surface
+    the configured peer-info-dir and forward the task_definition (so
+    the Rust side can pull the resource estimator off it).
+
+    No primary URL is required: a late-joiner is a peer-mesh-only
+    participant. It reaches the primary (a TunneledPeerTransport mesh
+    member since Step 5b) via `Address::Role(Role::Primary)`
+    dispatch over the peer mesh once the snapshot's `current_primary`
+    warms the role-cache during `cluster_state.restore`. The
+    coordinator's `primary_transport` slot is filled with a
+    `NoPrimaryTransport` stub (see Rust `no_primary.rs`) so the
+    setup-skip latch is the single source of truth for "this node
+    doesn't speak primary protocol".
+    """
+    import dynamic_runner as _rs
+
+    # `--disable-peer-overlay` would tell the secondary to install
+    # `NoPeerTransport`; a late-joiner relies on the peer mesh as its
+    # ONLY transport (no primary URL is dialed — see Rust
+    # `no_primary.rs` for the design contract). The validator
+    # short-circuited the obvious-error case (`--secondary` +
+    # `--observer-join-from-peer-info-dir`); here we tolerate
+    # `--disable-peer-overlay` but skip applying it so the observer
+    # actually gets a working peer transport. The warning makes the
+    # silent override visible to the operator.
+    distributed_config = None
+    if args.disable_peer_overlay:
+        logger.warning(
+            "--disable-peer-overlay is ignored under "
+            "--observer-join-from-peer-info-dir: the observer relies on "
+            "the peer mesh as its ONLY transport. Constructing the "
+            "observer with the real PeerNetwork; rerun without "
+            "--disable-peer-overlay to silence this warning."
+        )
+
+    logger.info(
+        f"Late-joiner observer: peer-info-dir={args.observer_join_from_peer_info_dir}"
+    )
+    result = _rs.run_observer_late_joiner(
+        args.observer_join_from_peer_info_dir,
+        task,
+        distributed_config=distributed_config,
+    )
+    logger.info(f"Observer Completed (observed): {result['completed']}")
 
 
 def _dispatch_single_process(task, args, config, logger) -> None:

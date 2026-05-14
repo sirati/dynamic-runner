@@ -699,6 +699,55 @@ where
         self.peer_cert_info = Some(info);
     }
 
+    /// Late-joiner bootstrap entry: install a snapshot received from a
+    /// peer's `RequestClusterSnapshot` response, then mark setup as
+    /// completed so the next `run_until_setup_or_done` invocation
+    /// skips the welcome / cert-exchange / wait-for-setup phases and
+    /// enters `process_tasks` directly.
+    ///
+    /// # Concern
+    ///
+    /// Single helper for "the late-joining observer dispatcher already
+    /// owns its cluster view (it called `join_running_cluster` before
+    /// constructing this coordinator), so the existing run loop should
+    /// pick up from the live-processing phase rather than re-run the
+    /// primary-handshake setup". Mirrors what
+    /// `run_until_setup_or_done`'s second-iteration branch does on the
+    /// `SetupPending` re-entry path — that branch's `if !self
+    /// .setup_phase_completed { … }` guard is the single source of
+    /// truth for "skip setup". We just set the latch.
+    ///
+    /// # Why a dedicated entry-point (not an inline `cluster_state` +
+    /// `setup_phase_completed` writer on the caller)
+    ///
+    /// `cluster_state` and `setup_phase_completed` are intentionally
+    /// `pub(super)` — the secondary module owns the latch's lifecycle
+    /// and external callers were forbidden from poking it directly so
+    /// the legacy run-loop invariants stay enforced. The Step 9
+    /// late-joiner path is the first legitimate external caller that
+    /// needs to set both atomically; expressing it as one named method
+    /// keeps the latch's exposure scoped to that single use case.
+    ///
+    /// # When to call
+    ///
+    /// After
+    /// [`crate::PeerTransport::join_running_cluster`] returns the
+    /// snapshot JSON, the caller deserializes it into a
+    /// `ClusterStateSnapshot<I>` and passes it here. Subsequent
+    /// `run_until_setup_or_done` calls observe `setup_phase_completed
+    /// = true` and route straight to `process_tasks`. The role-change
+    /// hook the transport registered in `new()` fires from inside
+    /// `cluster_state.restore` so the peer-mesh role-cache is warmed
+    /// (e.g. `current_primary` is now resolvable for
+    /// `Address::Role(Role::Primary)` sends).
+    pub fn restore_from_snapshot_and_skip_setup(
+        &mut self,
+        snap: crate::cluster_state::ClusterStateSnapshot<I>,
+    ) {
+        self.cluster_state.restore(snap);
+        self.setup_phase_completed = true;
+    }
+
     pub fn completed_count(&self) -> usize {
         self.completed_tasks.len()
     }
