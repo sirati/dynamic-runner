@@ -451,6 +451,163 @@ fn decode_b64(s: &str) -> Result<String, PeerInfoError> {
     String::from_utf8(out).map_err(|e| PeerInfoError::InvalidCert(format!("utf8: {e}")))
 }
 
+/// Error returned by [`read_dir_v2`] when the late-joiner bootstrap
+/// cannot produce a usable seed list from a peer-info directory.
+///
+/// Each variant carries the operator-visible context an observer
+/// dispatcher needs to fail loudly instead of silently hanging on
+/// `join_running_cluster`'s connect-budget. Per the late-joiner
+/// design rule "If the seed is empty or all peer-info files are v1
+/// (no observer-bootstrap data), fail loud with a clear error message".
+#[derive(Debug, thiserror::Error)]
+pub enum ReadDirError {
+    /// `std::fs::read_dir` failed — typically the directory does not
+    /// exist, or the process lacks read permission. Wraps the
+    /// underlying `io::Error` so the operator sees the OS-level cause.
+    #[error("failed to read peer-info directory `{dir}`: {source}")]
+    Io {
+        dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// A specific file under the directory failed to parse. The file
+    /// path is included so the operator can inspect / repair it
+    /// without re-running discovery.
+    #[error("failed to parse peer-info file `{path}`: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: PeerInfoError,
+    },
+    /// The directory was readable but produced zero v2 records. Either
+    /// the dir is empty, contains only non-`*.info` files, or every
+    /// `*.info` file is v1 (legacy-URI-only) — none of which carry the
+    /// `(secondary_id, cert, ipv4/ipv6, quic_port)` quad a late-joiner
+    /// needs to dial back into the mesh.
+    #[error(
+        "peer-info directory `{dir}` produced no v2 records — \
+         either the dir is empty / has no `*.info` files, or every \
+         file is legacy v1 (pre-Step-7 wrapper). Late-joiner bootstrap \
+         requires the v2 envelope (`secondary_id`, `cert_pem_b64`, \
+         `quic_port`); re-run the cluster with a Step-7-or-newer SLURM \
+         wrapper, or supply a directory containing v2 records."
+    )]
+    NoV2Records { dir: String },
+}
+
+/// Scan a directory of peer-info files, parse each, and return only
+/// the v2 records — the shape a late-joiner bootstrap needs.
+///
+/// # Concern
+///
+/// Single-source helper for "harvest a directory of `<secondary_id>.info`
+/// files written by the SLURM wrapper into the bootstrap seed list a
+/// late-joining observer feeds into
+/// [`crate::PeerTransport::join_running_cluster`]". The filename
+/// convention (`*.info`) is defined by `wrapper_script.rs:450`; this
+/// helper consults the same constant indirectly via the file-extension
+/// filter so a future filename change (e.g. `.peer-info`) only needs
+/// to be threaded here once. Non-matching files (logs, temp files,
+/// editor backups) are silently skipped — the dir is shared with the
+/// SLURM `connection_info` namespace and the parser must not error on
+/// neighbours it does not own.
+///
+/// # Filter logic
+///
+/// - Only regular files whose name ends with `.info` are considered.
+///   Directories, symlinks-to-dirs, and other extensions are skipped.
+/// - Each candidate is read into memory and passed through [`parse`].
+///   A parse failure on any single candidate surfaces a `Parse` error
+///   — the operator's seed dir is malformed and silently dropping
+///   would let a typo hide.
+/// - Records with `version == V1` are discarded (no cert / no quic_port,
+///   so the joiner cannot dial them at the QUIC layer). The set of
+///   surviving records is returned in directory-enumeration order
+///   (whatever the OS reports). Ordering is irrelevant to the joiner
+///   — `join_running_cluster` iterates the seed and first-success-wins
+///   on `send_to_peer`.
+/// - If the surviving set is empty, return `NoV2Records` rather than
+///   an empty `Vec`. An empty vec would cause `join_running_cluster`
+///   to wait its entire connect-budget on `peer_count() > 0` (channel
+///   transports pre-wire but real PeerNetwork has nothing to dial) —
+///   the diagnostic value of "your seed produced 0 records" outranks
+///   the consistency of "Ok(empty vec) is the same as no-op".
+///
+/// # Module boundary
+///
+/// Pure file-system I/O + parse delegation. The caller (Step 9
+/// dispatcher) is responsible for converting `PeerInfoRecord` →
+/// `PeerConnectionInfo` (the wire-frame shape `join_running_cluster`
+/// accepts); that translation lives in the caller because it depends
+/// on the `Identifier`-generic wire type, which this crate does not
+/// see.
+pub fn read_dir_v2<P: AsRef<std::path::Path>>(
+    dir: P,
+) -> Result<Vec<PeerInfoRecord>, ReadDirError> {
+    let dir_ref = dir.as_ref();
+    let dir_display = dir_ref.display().to_string();
+    let entries = std::fs::read_dir(dir_ref).map_err(|source| ReadDirError::Io {
+        dir: dir_display.clone(),
+        source,
+    })?;
+
+    let mut out: Vec<PeerInfoRecord> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| ReadDirError::Io {
+            dir: dir_display.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        // File-extension gate: the SLURM wrapper writes
+        // `<secondary_id>.info`. Skipping non-matching neighbours
+        // keeps the helper tolerant of a shared dir (logs, tunnel
+        // PID files, etc.).
+        let is_info_file = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e == "info");
+        if !is_info_file {
+            continue;
+        }
+        // file_type() avoids a separate stat call vs. is_file() and
+        // is robust against dangling symlinks the SLURM wrapper would
+        // never produce but a manual operator might.
+        let file_type = entry.file_type().map_err(|source| ReadDirError::Io {
+            dir: dir_display.clone(),
+            source,
+        })?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let contents = std::fs::read_to_string(&path).map_err(|source| ReadDirError::Io {
+            dir: dir_display.clone(),
+            source,
+        })?;
+        let record = parse(&contents).map_err(|source| ReadDirError::Parse {
+            path: path.display().to_string(),
+            source,
+        })?;
+        // v1 files predate the late-joiner envelope and lack the
+        // `(cert, quic_port)` pair the QUIC dial needs. They are
+        // legitimate for the gateway's reverse-SSH-tunnel path
+        // (line-1-only consumers) but useless to a snapshot joiner;
+        // silently drop without erroring so a mid-upgrade dir
+        // (some v1, some v2) still yields the usable subset.
+        if record.version == PeerInfoVersion::V1 {
+            continue;
+        }
+        out.push(record);
+    }
+
+    if out.is_empty() {
+        return Err(ReadDirError::NoV2Records {
+            dir: dir_display,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,5 +781,126 @@ is_observer=true
         let contents = "tcp://h:1\nversion=2\nipv4=10.0.0.1\nfuture_v3_key=value\n";
         let r = parse(contents).unwrap();
         assert_eq!(r.ipv4.as_deref(), Some("10.0.0.1"));
+    }
+
+    /// `read_dir_v2` returns every v2 `*.info` file in the directory.
+    /// Drives the Step 9 late-joiner bootstrap: each surviving record
+    /// is a candidate seed for `join_running_cluster`.
+    #[test]
+    fn read_dir_v2_collects_v2_records() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("sec-01.info"),
+            "tcp://compute1:40001\nversion=2\nsecondary_id=sec-01\nquic_port=51200\nipv4=10.0.0.1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("sec-02.info"),
+            "tcp://compute2:40002\nversion=2\nsecondary_id=sec-02\nquic_port=51201\nipv6=fd00::2\n",
+        )
+        .unwrap();
+
+        let mut records = read_dir_v2(tmp.path()).unwrap();
+        // Directory enumeration order is OS-dependent; sort by
+        // secondary_id so the assertion is deterministic.
+        records.sort_by(|a, b| a.secondary_id.cmp(&b.secondary_id));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].secondary_id.as_deref(), Some("sec-01"));
+        assert_eq!(records[0].quic_port, Some(51200));
+        assert_eq!(records[1].secondary_id.as_deref(), Some("sec-02"));
+        assert_eq!(records[1].quic_port, Some(51201));
+    }
+
+    /// v1 files in the dir are silently dropped — they carry no cert /
+    /// quic_port, so a snapshot joiner cannot dial them. The mixed
+    /// case (some v1, some v2) yields the v2 subset, matching the
+    /// mid-upgrade scenario the parser docs call out.
+    #[test]
+    fn read_dir_v2_filters_v1_records() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Legacy v1 file: line-1 URI only.
+        std::fs::write(tmp.path().join("legacy.info"), "tcp://oldnode:40000\n").unwrap();
+        // v2 file: full envelope.
+        std::fs::write(
+            tmp.path().join("modern.info"),
+            "tcp://newnode:40001\nversion=2\nsecondary_id=modern\nquic_port=51200\n",
+        )
+        .unwrap();
+
+        let records = read_dir_v2(tmp.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].secondary_id.as_deref(), Some("modern"));
+        assert_eq!(records[0].version, PeerInfoVersion::V2);
+    }
+
+    /// Non-`.info` files (a stray log, a backup) are silently skipped —
+    /// the SLURM connection-info dir may share space with other
+    /// per-run artefacts; the helper must not error on neighbours.
+    #[test]
+    fn read_dir_v2_ignores_non_info_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("README.txt"), "ignore me\n").unwrap();
+        std::fs::write(tmp.path().join("backup.info.bak"), "garbage\n").unwrap();
+        std::fs::write(
+            tmp.path().join("sec.info"),
+            "tcp://h:1\nversion=2\nsecondary_id=sec\nquic_port=51200\n",
+        )
+        .unwrap();
+
+        let records = read_dir_v2(tmp.path()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].secondary_id.as_deref(), Some("sec"));
+    }
+
+    /// All-v1 dir surfaces `NoV2Records` rather than returning an
+    /// empty Vec — fails loud so the late-joiner doesn't silently hang
+    /// on `join_running_cluster`'s connect window.
+    #[test]
+    fn read_dir_v2_all_v1_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.info"), "tcp://h1:1\n").unwrap();
+        std::fs::write(tmp.path().join("b.info"), "tcp://h2:2\n").unwrap();
+
+        let err = read_dir_v2(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, ReadDirError::NoV2Records { .. }),
+            "expected NoV2Records, got {err:?}"
+        );
+    }
+
+    /// Empty dir → `NoV2Records`. Same operator-visible signal as
+    /// all-v1 case.
+    #[test]
+    fn read_dir_v2_empty_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = read_dir_v2(tmp.path()).unwrap_err();
+        assert!(matches!(err, ReadDirError::NoV2Records { .. }));
+    }
+
+    /// Non-existent dir surfaces `Io { NotFound, .. }` rather than the
+    /// generic "no v2 records" — operator sees the underlying OS
+    /// error.
+    #[test]
+    fn read_dir_v2_missing_dir_io_error() {
+        let err = read_dir_v2("/this/path/does/not/exist/peerinfodir").unwrap_err();
+        assert!(matches!(err, ReadDirError::Io { .. }));
+    }
+
+    /// A malformed v2 file is a typed `Parse` error carrying the
+    /// offending file path — operator can `vim` straight to it
+    /// without re-discovering which file fails.
+    #[test]
+    fn read_dir_v2_malformed_file_parse_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("good.info"), "tcp://h:1\nversion=2\n").unwrap();
+        std::fs::write(tmp.path().join("bad.info"), "not-a-uri\n").unwrap();
+
+        let err = read_dir_v2(tmp.path()).unwrap_err();
+        match err {
+            ReadDirError::Parse { path, .. } => {
+                assert!(path.ends_with("bad.info"), "got path {path}");
+            }
+            other => panic!("expected Parse error, got {other:?}"),
+        }
     }
 }
