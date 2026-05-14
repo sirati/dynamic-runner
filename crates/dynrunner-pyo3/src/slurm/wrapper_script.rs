@@ -62,6 +62,7 @@ fn build_slurm_config(root_folder: &str) -> SlurmConfig {
     gateway_port = None,
     reverse_connection = false,
     connection_info_dir = None,
+    is_observer = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_wrapper_script(
@@ -85,6 +86,7 @@ pub fn generate_wrapper_script(
     gateway_port: Option<u16>,
     reverse_connection: bool,
     connection_info_dir: Option<&str>,
+    is_observer: bool,
 ) -> PyResult<String> {
     let slurm_config = build_slurm_config(root_folder);
 
@@ -135,6 +137,7 @@ pub fn generate_wrapper_script(
         output_dir: Some(output_dir),
         extra_run_args: &extra_run_args,
         forwarded_argv: &forwarded_argv,
+        is_observer,
     };
     Ok(rust_generate_wrapper_script(&cfg))
 }

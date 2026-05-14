@@ -37,10 +37,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 ipv4: s.ipv4().map(|s| s.to_string()),
                 ipv6: s.ipv6().map(|s| s.to_string()),
                 port: s.quic_port(),
-                // Task #36: fan out per-peer observer status so each
-                // receiving secondary can populate its peer_observers
-                // set and filter observers from `lowest_alive`
-                // candidate selection in `election.rs`.
+                // Task #36 / Step 7: fan out per-peer observer status
+                // so each receiving secondary can populate its
+                // replicated `RoleTable.observers` (via
+                // `ClusterState::set_observers` in the secondary's
+                // PeerInfo handler) and filter observers from
+                // `lowest_alive` candidate selection in `election.rs`.
                 is_observer: s.is_observer(),
             })
             .collect();
