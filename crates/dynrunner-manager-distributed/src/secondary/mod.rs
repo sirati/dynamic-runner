@@ -381,13 +381,15 @@ where
     /// terminal at the cluster level.
     primary_failed: HashMap<String, FailedTaskEntry<I>>,
 
-    /// Number of retry passes consumed against `config.retry_max_passes`.
-    /// Bumped by `primary_drain_check_and_retry` once per
-    /// re-injection event. The retry budget is exhausted when this
-    /// counter reaches `retry_max_passes`; subsequent main-pass drains
-    /// with `primary_failed` non-empty terminate the run with
-    /// the residual entries marked permanently failed.
-    primary_retry_passes_used: u32,
+    /// Retry budget for the primary-side re-injection loop. Owns
+    /// both the attempt counter (originally `retry_max_passes`) and
+    /// the optional SLURM-wallclock deadline (read once at
+    /// construction from `$SLURM_JOB_END_TIME`). Consulted via
+    /// `RetryBudget::should_retry()` from `primary_drain_check_and_retry`
+    /// and the two drain-down exit predicates in `processing.rs`;
+    /// bumped via `record_attempt()` once per completed re-injection
+    /// cycle. See `retry_budget.rs` for the dual-axis design.
+    primary_retry_budget: retry_budget::RetryBudget,
 
     /// One-shot guard for the budget-exhausted WARN emitted by
     /// `primary_drain_check_and_retry`. The drain-check fires
@@ -552,6 +554,16 @@ where
             config.primary_link_failure_threshold,
             config.primary_link_failure_window,
         );
+        // RetryBudget consumes `config.retry_max_passes` as the
+        // attempt-count cap and reads `$SLURM_JOB_END_TIME` ONCE
+        // here (startup) for the wallclock deadline. The
+        // env-var is documented as Unix-epoch seconds; absence is
+        // the legacy non-SLURM path (silent), parse failure logs WARN.
+        // See `retry_budget.rs` for the dual-axis design.
+        let primary_retry_budget = retry_budget::RetryBudget::from_env_and_legacy(
+            config.retry_max_passes,
+            retry_budget::DEFAULT_SAFETY_MARGIN,
+        );
         let mut this = Self {
             config,
             primary_transport,
@@ -578,7 +590,7 @@ where
             primary_completed: HashSet::new(),
             primary_in_flight: HashMap::new(),
             primary_failed: HashMap::new(),
-            primary_retry_passes_used: 0,
+            primary_retry_budget,
             exhaustion_warning_emitted: false,
             backpressured_secondaries: HashMap::new(),
             pre_staged_mode: false,
@@ -697,10 +709,10 @@ where
     /// re-injection because the test fixture fixed the worker
     /// behaviour after one pass anyway). Public-but-test-gated so
     /// production callers don't depend on this internal counter
-    /// shape.
+    /// shape. Forwards through the encapsulated `RetryBudget`.
     #[cfg(test)]
     pub fn primary_retry_passes_used_for_test(&self) -> u32 {
-        self.primary_retry_passes_used
+        self.primary_retry_budget.attempts_used()
     }
 
     /// Test-only inspector for the primary's residual
@@ -903,6 +915,7 @@ mod primary_link;
 mod processing;
 mod resource;
 mod primary;
+mod retry_budget;
 mod setup;
 mod staging;
 mod wire;
