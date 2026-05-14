@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::{Identifier, MessageReceiver};
 
 use crate::address::{Address, Role, RoleChangeHookRegistrar, Scope};
 use crate::messages::timestamp_now;
@@ -60,10 +60,34 @@ impl std::fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
-/// Transport trait for the primary side: can send to specific secondaries, receive from any.
+/// Primary-side transport for the legacy per-secondary writer fan-out.
 ///
-/// The addressing (`send_to` with a secondary ID) is a protocol-level concern
-/// that sits on top of the base `MessageSender`/`MessageReceiver` traits.
+/// # Status — Step 11 audit
+///
+/// Kept alive on the recv side because the setup-phase recv loops on
+/// both ends (`primary/connect.rs::wait_for_connections` and
+/// `primary/lifecycle.rs::wait_for_mesh_ready`) interleave setup
+/// frames (`SecondaryWelcome`, `CertExchange`) with runtime frames
+/// (`MeshReady`, `Keepalive`, `ClusterMutation`, etc.) during the
+/// setup window. The narrow-typed `SetupBootstrap` (Step 10) covers
+/// the setup-frame send side only; the recv-side filter still needs
+/// the full `DistributedMessage` shape that this trait carries, plus
+/// the per-secondary `send_to` for `InitialAssignment` / `StageFile`
+/// / `TaskAssignment` / broadcasts that aren't part of `SetupBootstrap`.
+///
+/// Sibling `PrimaryTransport` (the secondary-side legacy unicast +
+/// recv shape) deleted in Step 11; it was a zero-method marker over
+/// `MessageSender + MessageReceiver` and disappeared cleanly. This
+/// trait carries real methods (`send_to`, `broadcast`) backed by
+/// production impls (`NetworkServer` and `ChannelSecondaryTransportEnd`),
+/// so it stays — deleting it would require a recv-loop redesign.
+///
+/// # Concern
+///
+/// Addressing-by-secondary-id (`send_to`) sits on top of the base
+/// `MessageSender`/`MessageReceiver` shape; the trait keeps it as a
+/// protocol-level addition without leaking the transport-level
+/// `connections: HashMap` into call sites.
 pub trait SecondaryTransport<I: Identifier>:
     MessageReceiver<DistributedMessage<I>>
 {
@@ -89,21 +113,13 @@ pub trait SecondaryTransport<I: Identifier>:
     ) -> impl std::future::Future<Output = Result<(), Vec<(String, String)>>>;
 }
 
-/// Transport trait for the secondary side: send to / receive from the primary.
-///
-/// This is a simple bidirectional channel, equivalent to
-/// `MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>`.
-pub trait PrimaryTransport<I: Identifier>:
-    MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>
-{
-}
-
-impl<T, I> PrimaryTransport<I> for T
-where
-    I: Identifier,
-    T: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-{
-}
+// `PrimaryTransport<I>` (secondary-side legacy unicast + recv shape)
+// deleted in Step 11 of the transport-unification refactor. It was a
+// zero-method marker over `MessageSender<DistributedMessage<I>> +
+// MessageReceiver<DistributedMessage<I>>` with a blanket impl; the
+// bound now expresses itself directly at every former call site.
+// `SecondaryTransport` (above) stays because it carries real methods
+// (`send_to`, `broadcast`).
 
 /// Transport trait for peer-to-peer communication between secondaries.
 ///

@@ -4,8 +4,11 @@
 //!
 //! Step 10 of the transport-unification refactor (per
 //! `rosy-weaving-cascade.md`, Decision D). The legacy
-//! [`PrimaryTransport`] / [`SecondaryTransport`] traits served two
-//! distinct purposes:
+//! [`SecondaryTransport`] trait — together with the
+//! `MessageSender + MessageReceiver` shape that today's secondary holds
+//! for its submitter-bound channel (formerly a marker-trait
+//! `PrimaryTransport`, retired in Step 11) — served two distinct
+//! purposes:
 //!   1. **Bootstrap channel** for the setup-phase frames
 //!      ([`DistributedMessage::SecondaryWelcome`],
 //!      [`DistributedMessage::CertExchange`],
@@ -45,7 +48,8 @@
 //!
 //! Step 10 does not rewrite the underlying connection. The same
 //! per-secondary writer / inbound channel today's
-//! [`SecondaryTransport`] / [`PrimaryTransport`] already owns gets a
+//! [`SecondaryTransport`] (primary side) / `MessageSender +
+//! MessageReceiver` (secondary side) already owns gets a
 //! **narrower-typed view** via [`SecondarySetupBootstrap`] /
 //! [`PrimarySetupBootstrap`]. The adapter wraps a `&mut T` of the
 //! existing transport, converts between [`SetupBootstrapMessage`] and
@@ -54,14 +58,13 @@
 //! wire, narrower API).
 //!
 //! [`PeerTransport`]: crate::PeerTransport
-//! [`PrimaryTransport`]: crate::PrimaryTransport
 //! [`SecondaryTransport`]: crate::SecondaryTransport
 //! [`TunneledPeerTransport`]: ../../../dynrunner-transport-tunnel/index.html
 //! [`DistributedMessage`]: crate::DistributedMessage
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender, ResourceAmount};
 
-use crate::{DistributedMessage, PeerConnectionInfo, PrimaryTransport, SecondaryTransport};
+use crate::{DistributedMessage, PeerConnectionInfo, SecondaryTransport};
 
 /// The three setup-phase wire frames the bootstrap channel handles.
 ///
@@ -327,14 +330,17 @@ pub trait SetupBootstrapBroadcast<I: Identifier> {
     ) -> impl std::future::Future<Output = Option<SetupBootstrapMessage>>;
 }
 
-/// Secondary-side adapter: wraps a `&mut T: PrimaryTransport<I>` and
-/// narrows its message type to [`SetupBootstrapMessage`].
+/// Secondary-side adapter: wraps a `&mut T` (any
+/// `MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>`)
+/// and narrows its message type to [`SetupBootstrapMessage`].
 ///
 /// Construction is cheap — just a mutable borrow — so the call site
 /// builds an adapter for the duration of a single `send` / `recv` and
 /// drops it. The underlying transport stays available for operational
-/// messaging through its original [`PrimaryTransport`] surface (until
-/// Step 11 retires the trait entirely).
+/// messaging through its original sender/receiver shape (the legacy
+/// `PrimaryTransport` marker trait retired in Step 11; the underlying
+/// `MessageSender + MessageReceiver` carries every former `PrimaryTransport`
+/// impl unchanged via the same blanket the marker used).
 ///
 /// # Why a borrow, not an owned value?
 ///
@@ -360,7 +366,7 @@ impl<'a, T> SecondarySetupBootstrap<'a, T> {
 impl<T, I> SetupBootstrap<I> for SecondarySetupBootstrap<'_, T>
 where
     I: Identifier,
-    T: PrimaryTransport<I>,
+    T: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
 {
     async fn send(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
         // Step 1: lossless conversion to the wire-shape.

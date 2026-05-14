@@ -1,11 +1,11 @@
 
 use std::time::Instant;
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
-    DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, PrimaryTransport,
+    DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport,
     SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -16,7 +16,7 @@ use super::wire::{distributed_to_binary, timestamp_now};
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
-    PT: PrimaryTransport<I>,
+    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,

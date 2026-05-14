@@ -80,6 +80,56 @@ pub struct StateCounts {
     pub failed: usize,
 }
 
+/// Per-class outcome breakdown the primary emits on every
+/// counter-bearing log line. Replaces the older single-number
+/// `completed=N failed=N` shape: `succeeded` is the unique-hash
+/// completion count, and the three `fail_*` fields partition the
+/// failed-task ledger by ErrorType.
+///
+/// Mapping from ErrorType:
+///   - `Recoverable`                       → `fail_retry`
+///   - `ResourceExhausted("memory")`       → `fail_oom`
+///   - `ResourceExhausted(other)` |
+///     `NonRecoverable`                    → `fail_final`
+///
+/// Semantics note: classification is by the task's last-observed
+/// ErrorType, not by retry-eligibility. A Recoverable failure
+/// that exhausts the retry budget stays in `fail_retry` at
+/// terminal report — the operator reads the bucket name as
+/// "what class of error did this task hit", not "is this
+/// task going to retry". Retry-budget exhaustion is reported
+/// via the existing "retry budget exhausted" log line; the
+/// numeric breakdown is class-of-failure.
+///
+/// Lives on `ClusterState` because the CRDT-replicated `tasks` ledger
+/// is the authoritative source: every node converges to the same
+/// `(Completed, Failed { kind, .. })` view via mutation broadcast, so
+/// reading the counts from `cluster_state` gives every observer
+/// (live primary, demoted primary, late-joining observer) the same
+/// answer. Pre-this-move the counter was assembled from per-node
+/// `completed_tasks`/`failed_tasks` HashSets the coordinator
+/// maintained alongside `cluster_state` — those sets are still kept
+/// for per-task identity / dedup decisions, but the *count*-shaped
+/// reads route here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutcomeSummary {
+    pub succeeded: usize,
+    pub fail_retry: usize,
+    pub fail_oom: usize,
+    pub fail_final: usize,
+}
+
+impl OutcomeSummary {
+    /// Sum across all four buckets — the total tasks that reached
+    /// a terminal state (success or failure). Distinct from
+    /// `total_tasks` on the coordinator, which counts the input
+    /// batch; `total_terminal()` reaches `total_tasks` exactly
+    /// when the run is fully accounted for.
+    pub fn total_terminal(&self) -> usize {
+        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final
+    }
+}
+
 /// Callback fired (synchronously, inside `apply`) after the
 /// [`RoleTable`] mutates. Stored on `ClusterState`; the
 /// [`crate::transport`]-layer write-through cache is the single
@@ -282,6 +332,47 @@ impl<I: Identifier> ClusterState<I> {
             }
         }
         c
+    }
+
+    /// Per-ErrorType partition of terminal-state tasks, in the shape
+    /// the operator-facing log lines consume (`succeeded` / `fail_retry`
+    /// / `fail_oom` / `fail_final`). Iterates the CRDT-replicated
+    /// `tasks` map once; `O(n)` over the ledger.
+    ///
+    /// Distinguished from [`Self::counts`] by the failure-class
+    /// breakdown: `counts().failed` collapses every `Failed { kind, .. }`
+    /// into a single number, whereas `outcome_counts()` partitions
+    /// the same set by `kind` per the [`OutcomeSummary`] mapping rules.
+    /// `counts()` stays the small-and-fast accessor for tests / state-
+    /// machine assertions; `outcome_counts()` is the operator-readable
+    /// shape.
+    ///
+    /// CRDT-authoritative: every replica observes the same partition
+    /// after the same mutation set lands, so this is the correct read
+    /// for any "what did the cluster as a whole achieve" log line —
+    /// including the demoted primary's terminal log, which the
+    /// per-node `completed_tasks`/`failed_tasks` HashSets historically
+    /// undercounted whenever cross-secondary completions reached the
+    /// CRDT but not the local mirror (the asm-tokenizer "0/0/0/0/0"
+    /// post-Step-6 cosmetic).
+    pub fn outcome_counts(&self) -> OutcomeSummary {
+        let mut o = OutcomeSummary::default();
+        for s in self.tasks.values() {
+            match s {
+                TaskState::Completed { .. } => o.succeeded += 1,
+                TaskState::Failed { kind, .. } => match kind {
+                    ErrorType::Recoverable => o.fail_retry += 1,
+                    ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
+                        o.fail_oom += 1
+                    }
+                    ErrorType::ResourceExhausted(_) | ErrorType::NonRecoverable => {
+                        o.fail_final += 1
+                    }
+                },
+                TaskState::Pending { .. } | TaskState::InFlight { .. } => {}
+            }
+        }
+        o
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for every entry in the
@@ -716,6 +807,82 @@ mod tests {
             ApplyOutcome::NoOp
         );
         assert!(matches!(s.task_state("h"), Some(TaskState::Failed { .. })));
+    }
+
+    /// Cosmetic #88 regression pin: a demoted-primary terminal log
+    /// line reads `cluster_state.outcome_counts()` to get the
+    /// CRDT-authoritative per-class tally. Mixed Completed +
+    /// Failed-by-kind population must partition into the four
+    /// `OutcomeSummary` buckets per the documented mapping
+    /// (`Recoverable → fail_retry`, `ResourceExhausted("memory") →
+    /// fail_oom`, other `ResourceExhausted` + `NonRecoverable` →
+    /// `fail_final`); Pending / InFlight entries contribute to neither.
+    #[test]
+    fn outcome_counts_partitions_terminal_states_by_error_class() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        // 2 succeeded
+        for hash in ["a", "b"] {
+            s.apply(ClusterMutation::TaskAdded {
+                hash: hash.into(),
+                task: mk_task(hash),
+            });
+            s.apply(ClusterMutation::TaskCompleted { hash: hash.into() });
+        }
+        // 1 fail_retry (Recoverable)
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "c".into(),
+            task: mk_task("c"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "c".into(),
+            kind: ErrorType::Recoverable,
+            error: "x".into(),
+        });
+        // 1 fail_oom (ResourceExhausted("memory"))
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "d".into(),
+            task: mk_task("d"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "d".into(),
+            kind: ErrorType::ResourceExhausted("memory".into()),
+            error: "oom".into(),
+        });
+        // 1 fail_final (ResourceExhausted("disk") falls through)
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "e".into(),
+            task: mk_task("e"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "e".into(),
+            kind: ErrorType::ResourceExhausted("disk".into()),
+            error: "no space".into(),
+        });
+        // 1 fail_final (NonRecoverable)
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "f".into(),
+            task: mk_task("f"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "f".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "panic".into(),
+        });
+        // 1 Pending (uncounted)
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "g".into(),
+            task: mk_task("g"),
+        });
+
+        let o = s.outcome_counts();
+        assert_eq!(o.succeeded, 2, "two TaskCompleted entries");
+        assert_eq!(o.fail_retry, 1, "Recoverable → fail_retry");
+        assert_eq!(o.fail_oom, 1, "ResourceExhausted(\"memory\") → fail_oom");
+        assert_eq!(
+            o.fail_final, 2,
+            "ResourceExhausted(other) + NonRecoverable → fail_final"
+        );
+        assert_eq!(o.total_terminal(), 6, "sum across all four buckets");
     }
 
     #[test]
