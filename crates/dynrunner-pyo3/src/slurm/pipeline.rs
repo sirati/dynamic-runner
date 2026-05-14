@@ -456,6 +456,20 @@ pub(crate) fn run_slurm_pipeline<'py>(
         .and_then(|v| v.extract::<String>().ok())
         .unwrap_or_else(|| "-2G".into());
 
+    // `args.forwarded_argv` is the dispatcher's `sys.argv[1:]` minus
+    // the framework-regenerated flags (`--secondary`, `--cores`, …)
+    // that the wrapper emits afresh per job. Threaded opaquely through
+    // SlurmPreparation → SlurmJobManager → the Rust wrapper-script
+    // generator, which bash-quotes each entry into the secondary's
+    // container-command argv. Empty default keeps the field optional
+    // for legacy callers constructing SlurmPreparation directly
+    // (programmatic test fixtures); `run.py` always populates it.
+    let forwarded_argv: Vec<String> = args
+        .getattr("forwarded_argv")
+        .ok()
+        .and_then(|v| v.extract::<Vec<String>>().ok())
+        .unwrap_or_default();
+
     let preparation_module = py.import("dynamic_runner.packaging.preparation")?;
     let preparation_cls = preparation_module.getattr("SlurmPreparation")?;
     let prep_kwargs = PyDict::new(py);
@@ -467,6 +481,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
     prep_kwargs.set_item("run_id", &run_id)?;
     prep_kwargs.set_item("cores_spec", cores_spec)?;
     prep_kwargs.set_item("max_memory_spec", max_memory_spec)?;
+    prep_kwargs.set_item("forwarded_argv", forwarded_argv)?;
     let preparation = preparation_cls.call((), Some(&prep_kwargs))?;
 
     // ---- try/finally guard. Owns gateway + (post-prep) preparation. ----
