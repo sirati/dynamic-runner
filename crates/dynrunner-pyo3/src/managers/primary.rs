@@ -348,10 +348,11 @@ impl PyPrimaryCoordinator {
                     source_dir,
                 };
 
-                let mut primary: PrimaryCoordinator<_, _, _, RunnerIdentifier> =
+                let mut primary: PrimaryCoordinator<_, _, _, _, RunnerIdentifier> =
                     PrimaryCoordinator::new(
                         config,
                         server,
+                        dynrunner_transport_quic::NoPeerTransport,
                         ResourceStealingScheduler::memory(),
                         estimator,
                     );
