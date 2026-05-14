@@ -154,6 +154,7 @@ async fn e2e_primary_secondary_over_wss() {
         let mut primary = PrimaryCoordinator::new(
             config,
             server,
+            NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -269,6 +270,7 @@ async fn e2e_primary_secondary_over_quic() {
         let mut primary = PrimaryCoordinator::new(
             config,
             server,
+            NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

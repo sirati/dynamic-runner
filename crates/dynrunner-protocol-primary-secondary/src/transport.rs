@@ -98,10 +98,18 @@ pub trait PeerTransport<I: Identifier> {
     ///     hasn't yet observed `PromotePrimary` cannot route by role,
     ///     and silently fanning out would mask the design defect.
     ///
-    /// `Address::Broadcast(Scope::AllSecondaries)` still returns `Err`
-    /// pending Step 5 (primary-side migration); the error message
-    /// names the step so anyone reading a log during the migration
-    /// window understands the cause.
+    /// Step 5 lifts `Address::Broadcast(Scope::AllSecondaries)` from the
+    /// pre-migration `Err`-return to the same fan-out shape as
+    /// `Scope::Mesh`: a primary calling `send(Broadcast(AllSecondaries))`
+    /// from its peer-mesh vantage already has every-peer-is-a-secondary
+    /// (the primary is not its own peer), so the wire effect is
+    /// identical to `broadcast(msg)`. The semantic distinction the
+    /// `Scope` enum encodes — "exclude the current primary holder" —
+    /// only matters for a SECONDARY caller (who'd otherwise broadcast
+    /// to a peer set that includes the primary); no such caller exists
+    /// today, so the default delegates to `broadcast` and the
+    /// per-impl override path stays open for the future
+    /// secondary-broadcasts-to-non-primary-peers use case.
     fn send(
         &mut self,
         addr: Address,
@@ -110,7 +118,8 @@ pub trait PeerTransport<I: Identifier> {
         async move {
             match addr {
                 Address::Peer(id) => self.send_to_peer(&id, msg).await,
-                Address::Broadcast(Scope::Mesh) => self.broadcast(msg).await,
+                Address::Broadcast(Scope::Mesh)
+                | Address::Broadcast(Scope::AllSecondaries) => self.broadcast(msg).await,
                 Address::Role(role) => {
                     // Resolve via the write-through cache (Step 2).
                     // Cache-cold is a hard error here: Step 4 lands
@@ -143,12 +152,6 @@ pub trait PeerTransport<I: Identifier> {
                     };
                     self.send_to_peer(&holder, envelope).await
                 }
-                Address::Broadcast(Scope::AllSecondaries) => Err(
-                    "Address::Broadcast(AllSecondaries) not yet supported (Step 5 of \
-                     unification refactor); callers must continue using \
-                     SecondaryTransport::broadcast"
-                        .into(),
-                ),
             }
         }
     }

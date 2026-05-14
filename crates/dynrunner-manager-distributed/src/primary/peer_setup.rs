@@ -1,7 +1,7 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo,
+    DistributedMessage, PeerConnectionInfo, PeerTransport,
     SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
@@ -13,7 +13,7 @@ use crate::state::SecondaryConnectionState;
 use super::PrimaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
     pub(super) async fn send_peer_lists(&mut self) -> Result<(), String> {
         tracing::info!("sending peer lists");
 

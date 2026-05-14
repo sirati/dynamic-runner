@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage,
+    ClusterMutation, DistributedMessage, PeerTransport,
     SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
@@ -54,7 +54,7 @@ pub(super) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) ->
     idle
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
     /// Apply each mutation locally and broadcast the same batch so every
     /// secondary mirrors the change. Per-secondary delivery failures are
     /// logged at warn — the CRDT is idempotent, so a missed mutation is

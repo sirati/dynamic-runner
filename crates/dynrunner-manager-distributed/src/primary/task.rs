@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage,
+    Address, ClusterMutation, DistributedMessage, PeerTransport, Role,
     SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
@@ -14,7 +14,7 @@ use dynrunner_scheduler_api::{
 use super::PrimaryCoordinator;
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, S, E, I> {
+impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
     pub(super) async fn handle_task_request(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
             ref secondary_id,
@@ -205,28 +205,48 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
                 }
             }
 
-            // If no local assignment was made, relay to primary —
-            // but only while this coordinator is still the authoritative
-            // primary. After demotion, `self.primary_id` points at the
-            // promoted peer, which we reach only via the (now-stale)
-            // server-side outgoing channel that the promoted peer no
-            // longer drains in primary role. Sending into that channel
-            // races its writer-task shutdown and surfaces as
-            // `channel closed`. Pre-fix that error escalated through
-            // `?` and terminated the demoted submitter's coordinator
-            // mid-run (operator-facing: "primary coordinator failed
-            // error=channel closed" within two keepalive intervals
-            // of promotion). The requesting secondary's `primary_link`
-            // re-routes TaskRequest to the peer-mesh path once it
-            // applies the `PromotePrimary` broadcast we just sent;
-            // dropping the request here is benign — the secondary
-            // retries on its next backoff tick. See
-            // `feedback_mesh_independent_of_role_and_membership.md`:
-            // promotion-induced channel-closed must not be fatal.
-            if !assigned && !self.demoted {
-                if let Some(pid) = self.primary_id.clone() {
-                    self.transport.send_to(&pid, msg).await?;
-                }
+            // If no local assignment was made, relay to whoever
+            // currently holds the primary role. Pre-Step-5 this branch
+            // dispatched via `self.transport.send_to(&self.primary_id,
+            // msg)` — but `self.primary_id` is the post-promotion
+            // PROMOTED-PEER's id while the writer-task on the other
+            // side of that per-secondary channel exits the moment it
+            // observes `PromotePrimary`. The pre-Step-5 hotfix
+            // (commit 7845851) guarded this branch with
+            // `!self.demoted` to drop the relay outright after
+            // demotion — benign but lossy: the requesting secondary
+            // re-issues on its next backoff tick, but until then the
+            // request is silently dropped.
+            //
+            // Step 5 collapses the guard structurally: addressing by
+            // role (`Address::Role(Role::Primary)`) resolves through
+            // the `peer_transport`'s write-through `RoleTable` cache,
+            // which `cluster_state` updates on every `PrimaryChanged`
+            // apply (post-promotion the cache points at the promoted
+            // peer's id; pre-promotion it's cold and `send` returns
+            // Err, which we silently swallow — same observable
+            // behaviour as the pre-Step-5 `self.primary_id.is_none()`
+            // skip). The wire frame is `RoleAddressed { intended_role:
+            // Primary, payload: msg, .. }`; the receiver's Step-4
+            // relay-and-hint absorbs the rare case where THIS sender's
+            // cache is stale relative to the receiver's view.
+            //
+            // The demoted-primary path stays correct without a
+            // `self.demoted` special case: role addressing routes via
+            // the mesh-level peer link (still alive across promotion
+            // per `feedback_mesh_independent_of_role_and_membership.md`)
+            // regardless of who's authoritative.
+            if !assigned
+                && let Err(e) = self
+                    .peer_transport
+                    .send(Address::Role(Role::Primary), msg)
+                    .await
+            {
+                tracing::debug!(
+                    error = %e,
+                    "primary-bound relay via Address::Role(Primary) dropped; \
+                     secondary will retry on its next backoff tick"
+                );
             }
         }
         Ok(())

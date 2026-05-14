@@ -55,6 +55,7 @@ async fn single_secondary_processes_all_tasks() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -110,6 +111,7 @@ async fn two_secondaries_distribute_work() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -202,6 +204,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -343,6 +346,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -464,6 +468,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -550,6 +555,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -659,6 +665,7 @@ async fn retry_max_passes_zero_disables_retry() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -925,6 +932,7 @@ async fn e2e_primary_and_secondary_single_node() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -1004,6 +1012,7 @@ async fn e2e_primary_and_two_secondaries() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -1079,6 +1088,7 @@ async fn live_distribution_continues_past_initial_batch() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -1136,10 +1146,11 @@ async fn notify_stage_file_emits_wire_message() {
             source_dir: None,
         };
 
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
             PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -1277,6 +1288,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -1426,6 +1438,7 @@ async fn e2e_pre_staged_source_mode() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -1507,6 +1520,7 @@ async fn e2e_uses_file_based_items_false() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -1606,6 +1620,7 @@ async fn e2e_per_type_max_concurrent() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -1754,6 +1769,7 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -2034,6 +2050,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -2167,9 +2184,10 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -2320,9 +2338,10 @@ async fn demoted_primary_suppresses_taskrequest_relay_after_promotion() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -2581,6 +2600,7 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -2716,6 +2736,7 @@ async fn run_with_initial_staging_succeeds() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -2796,6 +2817,7 @@ async fn stranded_count_is_zero_on_clean_run() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -2989,6 +3011,7 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3100,9 +3123,10 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3214,9 +3238,10 @@ async fn drain_pending_messages_updates_completed_set() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3307,6 +3332,7 @@ async fn clean_run_does_not_false_positive_stranded() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3412,9 +3438,10 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3540,9 +3567,10 @@ async fn demoted_primary_exits_on_run_complete_broadcast() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3658,9 +3686,10 @@ async fn demoted_primary_exits_on_clean_completion() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -3787,6 +3816,7 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
+                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -3944,9 +3974,10 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -4100,9 +4131,10 @@ async fn legacy_bootstrap_counter_exit_unchanged() {
             mass_death_min_count: 2,
             source_dir: None,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
+            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

@@ -13,7 +13,9 @@
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, ResourceMap};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerTransport, SecondaryTransport,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::{PendingMassDeath, PrimaryCoordinator};
@@ -31,8 +33,8 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
-impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<T, S, E, I>
+impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<T, P, S, E, I>
 {
     /// Update the keepalive timestamp for a known secondary. No-op if the
     /// secondary id isn't registered (e.g. a stray message after death).
@@ -98,6 +100,28 @@ impl<T: SecondaryTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Iden
     /// keepalives for `keepalive_miss_threshold` intervals, it kicks off the
     /// failover election. Called from the operational loop on the same
     /// cadence as `collect_heartbeat_report`.
+    ///
+    /// Keepalive still rides the legacy `self.transport.broadcast` (per-
+    /// secondary writer fan-out) in Step 5. The "migrate to
+    /// `peer_transport.send(Address::Broadcast(Scope::AllSecondaries),
+    /// msg)`" line item in the unification plan is structurally blocked
+    /// on the primary becoming a real peer-mesh member (steps 6/7/10 of
+    /// the plan), which it isn't yet today: the primary owns a
+    /// `SecondaryTransport` for the per-secondary writers but its
+    /// `peer_transport` is `NoPeerTransport` in every production
+    /// constructor. Routing the F2 keepalive through a no-op transport
+    /// silently breaks the secondary-side `primary_last_seen` refresh
+    /// and trips a false failover election within
+    /// `keepalive_miss_threshold * keepalive_interval` of the migration.
+    /// The cosmetic noise (bug #3 — dead per-secondary writer to the
+    /// promoted peer post-demotion) is a debug-level annoyance, not a
+    /// correctness issue, so we leave the legacy fan-out in place
+    /// until the same step that wires the primary into the peer mesh
+    /// retires it. The relay-arm in `task::handle_task_request` is the
+    /// only Step-5 site that DOES migrate, because role-addressing
+    /// works even with a stub `peer_transport`: cache-cold or no-route
+    /// fails the send cleanly, matching the pre-Step-5 silent-drop
+    /// behaviour for the demoted-primary case.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
         if self.secondaries.is_empty() {
             return;
@@ -412,10 +436,11 @@ mod tests {
     /// production; tests that exercise post-initialisation paths
     /// (heartbeat re-queue, etc.) need this so `pool_mut()` doesn't
     /// panic.
-    fn install_default_pool<T, S, E>(
-        primary: &mut PrimaryCoordinator<T, S, E, TestId>,
+    fn install_default_pool<T, P, S, E>(
+        primary: &mut PrimaryCoordinator<T, P, S, E, TestId>,
     ) where
         T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
+        P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
         S: dynrunner_scheduler_api::Scheduler<TestId>,
         E: ResourceEstimator<TestId>,
     {
@@ -491,9 +516,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn dead_secondary_requeues_in_flight_task() {
         let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config(Duration::from_millis(50), 2),
             transport,
+            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -590,13 +616,14 @@ mod tests {
     /// in-flight task. Mirrors the setup pattern of
     /// `dead_secondary_requeues_in_flight_task` but parametrised by id
     /// so the mass-death tests can stage two of them.
-    fn register_operational_secondary<T, S, E>(
-        primary: &mut PrimaryCoordinator<T, S, E, TestId>,
+    fn register_operational_secondary<T, P, S, E>(
+        primary: &mut PrimaryCoordinator<T, P, S, E, TestId>,
         secondary_id: &str,
         worker_id: u32,
         in_flight_label: &str,
     ) where
         T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
+        P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
         S: dynrunner_scheduler_api::Scheduler<TestId>,
         E: ResourceEstimator<TestId>,
     {
@@ -656,7 +683,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mass_death_defers_requeue_when_all_secondaries_silent() {
         let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
             PrimaryCoordinator::new(
                 config_with_mass_death(
                     Duration::from_millis(50),
@@ -665,6 +692,7 @@ mod tests {
                     2,
                 ),
                 transport,
+                dynrunner_transport_quic::NoPeerTransport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator,
             );
@@ -695,7 +723,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mass_death_recovery_during_grace_undefers_secondary() {
         let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
             PrimaryCoordinator::new(
                 config_with_mass_death(
                     Duration::from_millis(50),
@@ -704,6 +732,7 @@ mod tests {
                     2,
                 ),
                 transport,
+                dynrunner_transport_quic::NoPeerTransport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator,
             );
@@ -733,7 +762,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
         let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
             PrimaryCoordinator::new(
                 config_with_mass_death(
                     Duration::from_millis(50),
@@ -742,6 +771,7 @@ mod tests {
                     2,
                 ),
                 transport,
+                dynrunner_transport_quic::NoPeerTransport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator,
             );
@@ -770,7 +800,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn mass_death_disabled_when_grace_is_zero() {
         let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
             PrimaryCoordinator::new(
                 config_with_mass_death(
                     Duration::from_millis(50),
@@ -779,6 +809,7 @@ mod tests {
                     2,
                 ),
                 transport,
+                dynrunner_transport_quic::NoPeerTransport,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator,
             );
@@ -801,9 +832,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn live_secondary_is_not_falsely_declared_dead() {
         let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
-        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config(Duration::from_millis(50), 2),
             transport,
+            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
