@@ -6,6 +6,7 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport, PrimaryTransport,
+    SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -39,7 +40,16 @@ where
     }
 
     pub(super) async fn send_welcome(&mut self) -> Result<(), String> {
-        let msg = DistributedMessage::SecondaryWelcome {
+        // Step 10: route the setup-phase frame through the narrow
+        // `SetupBootstrap` surface. The underlying wire stays the
+        // same `primary_transport`; the call-site type is what
+        // changed — `SetupBootstrapMessage` accepts only the three
+        // setup variants, so a refactor that accidentally adds a
+        // runtime frame here fails at compile time. The adapter is
+        // built fresh for this single send + dropped, releasing the
+        // borrow before the next phase's call site claims
+        // `&mut self.primary_transport` again.
+        let msg = SetupBootstrapMessage::SecondaryWelcome {
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
@@ -54,7 +64,8 @@ where
             // `lowest_alive` candidate selection in election.
             is_observer: self.config.is_observer,
         };
-        self.primary_transport.send(msg).await
+        let mut bootstrap = SecondarySetupBootstrap::new(&mut self.primary_transport);
+        SetupBootstrap::<I>::send(&mut bootstrap, msg).await
     }
 
     pub(super) async fn send_cert_exchange(&mut self) -> Result<(), String> {
@@ -68,7 +79,7 @@ where
             None => (String::new(), Some("127.0.0.1".into()), None, 0),
         };
 
-        let msg = DistributedMessage::CertExchange {
+        let msg = SetupBootstrapMessage::CertExchange {
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.secondary_id.clone(),
@@ -77,7 +88,8 @@ where
             ipv6_address: ipv6,
             quic_port: port,
         };
-        self.primary_transport.send(msg).await
+        let mut bootstrap = SecondarySetupBootstrap::new(&mut self.primary_transport);
+        SetupBootstrap::<I>::send(&mut bootstrap, msg).await
     }
 
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
