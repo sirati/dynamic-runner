@@ -23,4 +23,6 @@ pub use role_routing::{
     apply_role_misaddress_hint, decide_role_addressed, decide_role_addressed_with_cache,
     RoleAddressedAction, MAX_ROLE_RELAY_ATTEMPTS,
 };
-pub use transport::{PeerTransport, PrimaryTransport, SecondaryTransport};
+pub use transport::{
+    JoinError, PeerTransport, PrimaryTransport, SecondaryTransport, DEFAULT_JOIN_TIMEOUT,
+};

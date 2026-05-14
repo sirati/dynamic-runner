@@ -20,6 +20,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 dynrunner-protocol-primary-secondary = { workspace = true, features = ["test-utils"] }
 tracing-subscriber = { workspace = true }
 
