@@ -4,6 +4,7 @@ pub mod messages;
 pub mod codec;
 pub mod relay;
 pub mod role_routing;
+pub mod setup_bootstrap;
 pub mod transport;
 
 pub use address::{
@@ -22,6 +23,10 @@ pub use relay::{
 pub use role_routing::{
     apply_role_misaddress_hint, decide_role_addressed, decide_role_addressed_with_cache,
     RoleAddressedAction, MAX_ROLE_RELAY_ATTEMPTS,
+};
+pub use setup_bootstrap::{
+    PrimarySetupBootstrap, SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapBroadcast,
+    SetupBootstrapMessage,
 };
 pub use transport::{
     JoinError, PeerTransport, PrimaryTransport, SecondaryTransport, DEFAULT_JOIN_TIMEOUT,

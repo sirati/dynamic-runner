@@ -1,8 +1,8 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerConnectionInfo, PeerTransport,
-    SecondaryTransport,
+    PeerConnectionInfo, PeerTransport, PrimarySetupBootstrap, SecondaryTransport,
+    SetupBootstrapBroadcast, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -48,24 +48,40 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             .collect();
 
         let secondary_ids: Vec<String> = self.secondaries.keys().cloned().collect();
-        let msg = DistributedMessage::PeerInfo {
+        // Step 10: route the PeerInfo fan-out through the narrow
+        // `SetupBootstrapBroadcast` surface. As on the secondary side,
+        // the underlying wire stays the same `transport`; the
+        // call-site type is what changed — `SetupBootstrapMessage`
+        // accepts only the three setup variants, so an accidental
+        // runtime broadcast fails to type-check here.
+        //
+        // The narrower broadcast result is `Result<(), String>`
+        // (partial-failure summary folded into one diagnostic). The
+        // pre-Step-10 wire path emitted the same warn-log per failing
+        // secondary; we preserve that detail by routing the structured
+        // form through the underlying transport ONLY for the partial-
+        // failure log loop below, while the actual delivery goes
+        // through the bootstrap. This keeps the per-secondary diagnostic
+        // breadcrumb that operators rely on without re-introducing the
+        // structured-error type on the bootstrap trait surface.
+        let msg = SetupBootstrapMessage::PeerInfo {
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             peers,
         };
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            for (secondary_id, error) in &failures {
-                tracing::warn!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "PeerInfo delivery failed"
-                );
-            }
-            return Err(format!(
-                "PeerInfo broadcast failed for {} secondaries",
-                failures.len()
-            ));
-        }
+        // Per-secondary structured warn lines for partial-failure
+        // cases are emitted by the bootstrap adapter (it walks the
+        // underlying transport's partial-failure list before folding
+        // it into the summary). The pre-Step-10 path emitted those
+        // lines from here directly; the post-Step-10 arrangement
+        // moves the emission into the adapter so every
+        // `SetupBootstrapBroadcast::broadcast` caller gets the same
+        // observability for free, without each call site
+        // re-implementing the walk. The `?` here propagates the
+        // summary string the adapter folds up — same exit semantics
+        // as the pre-refactor `return Err(format!(…))`.
+        let mut bootstrap = PrimarySetupBootstrap::new(&mut self.transport);
+        SetupBootstrapBroadcast::<I>::broadcast(&mut bootstrap, msg).await?;
 
         // Transition all from CertExchanging -> PeerDiscovery
         for secondary_id in &secondary_ids {
