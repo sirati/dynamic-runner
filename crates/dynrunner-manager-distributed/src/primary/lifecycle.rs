@@ -979,9 +979,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // their parallel dispatch paths race for the same
             // workers. See `demoted` doc on `PrimaryCoordinator`.
             self.demoted = true;
+            // The demoted local primary is NOT an observer — observers
+            // are first-class members of `RoleTable.observers` (Step 7,
+            // Decision G) with `is_observer=true` set at startup. A
+            // demoted primary stays a regular member; it just no
+            // longer drives dispatch. Prior log wording conflated the
+            // two concepts.
             tracing::info!(
                 primary = %first_id,
-                "local primary demoted to observer; promoted secondary is sole authoritative primary"
+                "local primary demoted; promoted secondary is sole authoritative primary"
             );
         }
         Ok(())

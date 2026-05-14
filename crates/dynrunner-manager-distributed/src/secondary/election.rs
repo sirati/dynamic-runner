@@ -273,23 +273,29 @@ where
                     );
                     return actions;
                 }
-                // Task #36: filter observer peers from candidate
-                // selection. An observer in the alive set with a
-                // lex-low ID would otherwise be deferred-to by
+                // Task #36 / Step 7: filter observer peers from
+                // candidate selection. An observer in the alive set
+                // with a lex-low ID would otherwise be deferred-to by
                 // non-observer peers; the observer would then refuse
                 // self-promotion (#35 self-skip), stalling the
                 // cluster. Filtering at the peer-side complements
                 // the observer's self-exclusion: both sides agree
                 // observers can't be candidates. The #35 self-only
                 // guard below (`is_observer && we_lead`) becomes
-                // belt-and-suspenders once peer_observers is correctly
-                // populated, but stays in place to handle the case
-                // where peer_observers is empty (e.g. observer's
-                // PeerInfo broadcast was lost or pre-#36 senders).
+                // belt-and-suspenders once `RoleTable.observers` is
+                // populated end-to-end, but stays in place for the
+                // pre-PeerInfo window (election can run before the
+                // first PeerInfo arrives in adversarial timings).
+                //
+                // Read source: `cluster_state.role_table().observers`
+                // is the replicated single source of truth (Step 7,
+                // Decision G). Populated by `secondary/setup.rs`'s
+                // PeerInfo handler via `ClusterState::set_observers`.
+                let observers = &self.cluster_state.role_table().observers;
                 let lowest_alive = self
                     .peer_keepalives
                     .keys()
-                    .filter(|id| !self.peer_observers.contains(*id))
+                    .filter(|id| !observers.contains(*id))
                     .chain(
                         std::iter::once(&self.config.secondary_id)
                             .filter(|_| !self.config.is_observer),
@@ -1039,15 +1045,17 @@ mod observer_peer_side_tests {
     /// observer as candidate and the cluster would stall (observer
     /// refuses self-promotion per #35).
     ///
-    /// Setup: sec-b (non-observer) sees obs-a (in peer_observers).
-    /// obs-a is lex-lowest. After primary silence + quorum, sec-b
-    /// must SELF-PROMOTE (since the only other peer is filtered).
+    /// Setup: sec-b (non-observer) sees obs-a (recorded in the
+    /// replicated `RoleTable.observers` via `set_observers`). obs-a
+    /// is lex-lowest. After primary silence + quorum, sec-b must
+    /// SELF-PROMOTE (since the only other peer is filtered).
     #[tokio::test(flavor = "current_thread")]
     async fn non_observer_filters_observer_from_lowest_alive() {
         let mut sec = make_secondary(election_config("sec-b"));
         // obs-a is registered as a peer AND marked observer.
         sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
-        sec.peer_observers.insert("obs-a".into());
+        sec.cluster_state
+            .set_observers(std::collections::HashSet::from(["obs-a".to_string()]));
         sec.record_primary_message();
 
         tokio::time::sleep(PAST_DEATH).await;
@@ -1098,7 +1106,8 @@ mod observer_peer_side_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn promote_primary_naming_observer_is_rejected() {
         let mut sec = make_secondary(election_config("sec-b"));
-        sec.peer_observers.insert("obs-a".into());
+        sec.cluster_state
+            .set_observers(std::collections::HashSet::from(["obs-a".to_string()]));
 
         let promote = DistributedMessage::PromotePrimary::<
             super::super::test_helpers::TestId,
@@ -1135,6 +1144,91 @@ mod observer_peer_side_tests {
         assert!(
             !sec.is_primary,
             "sec-b should NOT have flipped to primary role"
+        );
+    }
+
+    /// Step 7 / Decision G end-to-end: PeerInfo apply via
+    /// `set_observers` is the SAME source of truth that both
+    /// `lowest_alive` filtering and the defensive PromotePrimary
+    /// rejection read. Without storage relocation, the deleted
+    /// `peer_observers` HashSet would have produced identical
+    /// results; with it, callers consult `cluster_state.role_table().
+    /// observers` instead.
+    ///
+    /// This test pins:
+    ///   (a) Reads via the role-table see the observer set populated
+    ///       by `set_observers` (the production path is
+    ///       `secondary/setup.rs`'s PeerInfo handler).
+    ///   (b) `lowest_alive` filter excludes the observer just as the
+    ///       deleted `peer_observers` HashSet would have.
+    ///   (c) The defensive PromotePrimary rejection also reads from
+    ///       the role-table, refusing to install an observer as
+    ///       primary even if the broadcast tries to.
+    ///
+    /// Concrete behaviour-preservation gate for the
+    /// peer_observers→role_table.observers migration: same inputs
+    /// produce the same outputs as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn role_table_observers_drives_filter_and_promote_rejection() {
+        use std::collections::HashSet;
+
+        let mut sec = make_secondary(election_config("sec-b"));
+        // Production path: PeerInfo arrival populates role_table.
+        sec.cluster_state
+            .set_observers(HashSet::from(["obs-a".to_string()]));
+        sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
+        sec.record_primary_message();
+
+        // (a) Role-table read sees the observer.
+        assert!(sec
+            .cluster_state
+            .role_table()
+            .observers
+            .contains("obs-a"));
+
+        // (b) Election filter excludes the observer from
+        // lowest_alive — sec-b ends up self-promoting after the
+        // primary times out (the only other peer is filtered).
+        tokio::time::sleep(PAST_DEATH).await;
+        sec.run_election_tick();
+        tokio::time::sleep(ONE_INTERVAL).await;
+        sec.record_timeout_response("obs-a".into(), None);
+        let actions = sec.run_election_tick();
+        assert!(
+            matches!(sec.election, ElectionState::Candidate { .. }),
+            "sec-b should self-promote (lowest_alive filter dropped obs-a)"
+        );
+        assert!(
+            actions
+                .broadcast
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::PromotionVote {
+                    candidate_id, ..
+                } if candidate_id == "sec-b")),
+            "expected PromotionVote naming sec-b"
+        );
+
+        // (c) Defensive PromotePrimary rejection: a spurious
+        // PromotePrimary naming the observer is silently rejected
+        // (logged at error level) without flipping role.
+        let promote = DistributedMessage::PromotePrimary::<
+            super::super::test_helpers::TestId,
+        > {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "obs-a".into(),
+            epoch: 99,
+            required_setup: false,
+        };
+        sec.dispatch_message(promote)
+            .await
+            .expect("PromotePrimary handler returns Ok even when rejecting");
+        assert!(
+            sec.cluster_state
+                .current_primary()
+                .map(|s| s != "obs-a")
+                .unwrap_or(true),
+            "observer must NOT be installed as primary"
         );
     }
 }

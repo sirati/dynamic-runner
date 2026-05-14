@@ -115,6 +115,14 @@ pub struct WrapperScriptConfig<'a> {
     /// path discovers `tasks=0` whenever the user supplied any
     /// task-side filter on the dispatcher CLI.
     pub forwarded_argv: &'a [String],
+    /// Whether the secondary launched by this wrapper script is an
+    /// observer (Task #36 / Step 7 of the transport-unification
+    /// refactor): no workers, non-promotable. The flag is written
+    /// into the v2 peer-info file (`is_observer=true|false`) so a
+    /// late-joining peer reading the connection-info directory can
+    /// see that this peer cannot host the primary role. Defaults to
+    /// `false` at the callers; observer-mode is opted into explicitly.
+    pub is_observer: bool,
 }
 
 /// How the secondary connects to the primary.
@@ -406,6 +414,7 @@ echo ""
     match &cfg.connection {
         ConnectionMode::Reverse { connection_info_dir } => {
             let sid = cfg.secondary_id;
+            let is_observer = if cfg.is_observer { "true" } else { "false" };
             script.push_str(&format!(
                 r##"
 echo "Finding free ports on compute node..."
@@ -416,12 +425,29 @@ echo "Using QUIC port: $QUIC_PORT"
 
 HOSTNAME=$(hostname -f)
 mkdir -p "{connection_info_dir}"
-# Wire format: single-line `<scheme>://<host>:<port>` URI parsed by
-# the Rust-side `parse_connection_uri` in dynrunner-slurm/preparation.
-# Aligns with the framework's `Primary URL: tcp://...` convention and
-# leaves room for future extension (path/query) without re-spinning
-# the parser.
-printf 'tcp://%s:%s\n' "$HOSTNAME" "$TUNNEL_PORT" > "{connection_info_dir}/{sid}.info"
+# Peer-info file format (dynrunner-slurm/src/peer_info.rs):
+#   Line 1 — legacy `<scheme>://<host>:<port>` URI for the SSH
+#            reverse-tunnel target (back-compat: a v1 reader that
+#            only knows about line 1 keeps working unchanged).
+#   Lines 2+ — `key=value` envelope (v2). Consumed by a late-joining
+#              observer's bootstrap reader (`peer_info::parse`) which
+#              needs more than just the tunnel host:port to dial
+#              the peer mesh.
+#
+# `cert_pem_b64` is intentionally omitted here: the cert is generated
+# inside the secondary container at startup (during CertExchange),
+# not at wrapper-render time. The secondary itself rewrites this
+# file post-cert via the `dynrunner_slurm::peer_info::Builder` API
+# (Step 8 of the transport-unification refactor).
+{{
+    printf 'tcp://%s:%s\n' "$HOSTNAME" "$TUNNEL_PORT"
+    printf 'version=2\n'
+    printf 'secondary_id=%s\n' '{sid}'
+    if [ -n "${{PRIMARY_NODE_IPV4}}" ]; then printf 'ipv4=%s\n' "$PRIMARY_NODE_IPV4"; fi
+    if [ -n "${{PRIMARY_NODE_IPV6}}" ]; then printf 'ipv6=%s\n' "$PRIMARY_NODE_IPV6"; fi
+    printf 'quic_port=%s\n' "$QUIC_PORT"
+    printf 'is_observer={is_observer}\n'
+}} > "{connection_info_dir}/{sid}.info"
 echo "Connection info written to: {connection_info_dir}/{sid}.info"
 "##
             ));
@@ -1030,6 +1056,7 @@ mod tests {
             output_dir: None,
             extra_run_args,
             forwarded_argv: &[],
+            is_observer: false,
         }
     }
 
@@ -1364,6 +1391,7 @@ mod tests {
             output_dir: None,
             extra_run_args: &extra,
             forwarded_argv: &[],
+            is_observer: false,
         };
         let script = generate_wrapper_script(&cfg);
         assert!(script.contains("TUNNEL_PORT"));
@@ -1371,14 +1399,56 @@ mod tests {
         assert!(script.contains("localhost:$TUNNEL_PORT"));
         assert!(script.contains("my_runner --secondary"));
         // Reverse-mode connection-info file is the post-L1.7 URI
-        // wire format: a single `<scheme>://<host>:<port>\n` line
-        // parsed by `parse_connection_uri` on the primary side.
+        // wire format on line 1; the Step-7 v2 envelope adds keys
+        // on subsequent lines. Line 1 stays `tcp://%s:%s\n` so v1
+        // readers (gateway preparation) keep working unchanged.
         assert!(script.contains(r#"printf 'tcp://%s:%s\n' "$HOSTNAME" "$TUNNEL_PORT""#));
-        // The legacy `key=value` shape must not reappear — guards
-        // against an accidental revert that the URI parser would
-        // reject at runtime.
+        // v2 envelope marker MUST be present so late-joiner readers
+        // (Step 8+) can detect this is a v2 record.
+        assert!(script.contains("printf 'version=2\\n'"));
+        // is_observer key MUST be present with the rendered literal
+        // value. The default-`false` test config drives the
+        // false branch — toggling `is_observer = true` on the cfg
+        // and re-rendering should emit `is_observer=true` instead.
+        assert!(script.contains("printf 'is_observer=false\\n'"));
+        // The legacy `key=value` shape on line 1 must not reappear —
+        // guards against an accidental revert that the URI parser
+        // would reject at runtime.
         assert!(!script.contains("hostname=$HOSTNAME"));
         assert!(!script.contains("tunnel_port=$TUNNEL_PORT"));
+    }
+
+    /// `is_observer = true` propagates into the v2 envelope.
+    /// Companion to `reverse_mode_script_contains_tunnel_port` which
+    /// pins the false case.
+    #[test]
+    fn reverse_mode_script_renders_is_observer_true() {
+        let config = SlurmConfig::default();
+        let extra: [String; 0] = [];
+        let cfg = WrapperScriptConfig {
+            slurm_config: &config,
+            image_path: "/images/test.tar",
+            secondary_id: "obs-01",
+            image_name: "test-app",
+            image_tag: "latest",
+            image_tar_basename: "test-app.tar",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            container_command: "my_runner",
+            cores_spec: "0",
+            max_memory_spec: "-2G",
+            connection: ConnectionMode::Reverse {
+                connection_info_dir: "/logs/connection_info",
+            },
+            run_log_dir: Some("/logs/run_001"),
+            dynrunner_network_dir: None,
+            srcbins_mount_source: None,
+            output_dir: None,
+            extra_run_args: &extra,
+            forwarded_argv: &[],
+            is_observer: true,
+        };
+        let script = generate_wrapper_script(&cfg);
+        assert!(script.contains("printf 'is_observer=true\\n'"));
     }
 
     #[test]

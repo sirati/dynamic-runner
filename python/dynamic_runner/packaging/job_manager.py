@@ -174,6 +174,7 @@ class SlurmJobManager:
         forwarded_argv: list[str] | None = None,
         reverse_connection: bool = False,
         run_log_dir: str | None = None,
+        is_observer: bool = False,
     ) -> str:
         """Generate the bash wrapper script for a SLURM job.
 
@@ -248,6 +249,7 @@ class SlurmJobManager:
             gateway_port=gateway_port,
             reverse_connection=reverse_connection,
             connection_info_dir=connection_info_dir,
+            is_observer=is_observer,
         )
 
     def generate_test_wrapper_script(self, image_metadata: PodmanImageMetadata) -> str:

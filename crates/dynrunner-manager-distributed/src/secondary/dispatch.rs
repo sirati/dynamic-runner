@@ -224,30 +224,36 @@ where
                 Ok(())
             }
             DistributedMessage::PromotePrimary { new_primary_id, epoch, required_setup, .. } => {
-                // Task #36 defensive guard: an observer MUST NOT be
-                // promoted. If we receive a PromotePrimary naming an
-                // observer (either us, or a peer in our
-                // peer_observers set), reject loud — this should not
-                // happen if all peers honour the same lowest_alive
-                // filter, but the rejection protects against a
-                // misconfigured peer or a forgery on the wire.
+                // Task #36 / Step 7 defensive guard: an observer MUST
+                // NOT be promoted. If we receive a PromotePrimary
+                // naming an observer (either us, or a peer in the
+                // replicated `RoleTable.observers` set), reject loud
+                // — this should not happen now that `is_observer`
+                // rides PeerInfo end-to-end into `role_table.observers`
+                // (Step 7 closed the wire-level race window the
+                // prior comment flagged: "PeerInfo broadcast carrying
+                // is_observer was lost"). The rejection remains as
+                // belt-and-suspenders against a misconfigured peer
+                // or a forged PromotePrimary on the wire.
+                let observers = &self.cluster_state.role_table().observers;
                 let names_observer = (self.config.is_observer
                     && new_primary_id == self.config.secondary_id)
-                    || self.peer_observers.contains(&new_primary_id);
+                    || observers.contains(&new_primary_id);
                 if names_observer {
                     tracing::error!(
                         secondary = %self.config.secondary_id,
                         target = %new_primary_id,
                         epoch,
                         self_is_observer = self.config.is_observer,
-                        target_in_peer_observers = self.peer_observers.contains(&new_primary_id),
+                        target_in_role_table_observers = observers.contains(&new_primary_id),
                         "REJECTED PromotePrimary naming an observer — observers \
                          cannot host primary role (no workers, no dispatch \
-                         authority). Likely cause: a peer's lowest_alive \
-                         computation missed the observer filter or the \
-                         PeerInfo broadcast carrying is_observer was lost. \
-                         Ignoring this PromotePrimary; the cluster's election \
-                         should retry with the observer filtered out."
+                         authority). With Step 7's `is_observer` ride-along on \
+                         PeerInfo, this should only fire for a forged \
+                         PromotePrimary or a peer that promoted before \
+                         processing the latest PeerInfo broadcast. Ignoring; \
+                         the cluster's election should retry with the observer \
+                         filtered out."
                     );
                     return Ok(());
                 }
@@ -461,6 +467,33 @@ where
             }
             DistributedMessage::ClusterMutation { mutations, .. } => {
                 self.apply_cluster_mutations(mutations);
+                Ok(())
+            }
+            DistributedMessage::PeerInfo { peers, .. } => {
+                // Step 7 (Decision G): a runtime PeerInfo re-broadcast
+                // (the only way observers join a running cluster
+                // post-Step 8) lands the updated observer set into
+                // the replicated `RoleTable.observers`. Source-of-
+                // truth is identical to the setup-time path in
+                // `secondary/setup.rs::wait_for_setup` — both call
+                // `cluster_state.set_observers(_)` with the union of
+                // `is_observer=true` peers from the broadcast. The
+                // set is Replace-shaped so a re-broadcast that drops
+                // a peer correctly removes it from observers.
+                //
+                // We deliberately do NOT call
+                // `peer_transport.connect_to_peers(peers)` here —
+                // mid-run mesh expansion is Step 8/9 territory and
+                // adds the dial path through a different entry
+                // point. For Step 7's scope, the observer-set
+                // replication is the only piece runtime PeerInfo
+                // needs to perform.
+                let observers: std::collections::HashSet<String> = peers
+                    .iter()
+                    .filter(|p| p.is_observer)
+                    .map(|p| p.secondary_id.clone())
+                    .collect();
+                self.cluster_state.set_observers(observers);
                 Ok(())
             }
             DistributedMessage::TaskRequest {
