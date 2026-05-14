@@ -330,8 +330,7 @@ where
                 && self.active_tasks.is_empty()
                 && self.primary_pending_is_empty()
                 && (self.primary_failed.is_empty()
-                    || self.primary_retry_passes_used
-                        >= self.config.retry_max_passes)
+                    || !self.primary_retry_budget.should_retry())
             {
                 // `primary_failed` at this point is either drained
                 // (retry passes succeeded) or still populated but
@@ -363,8 +362,7 @@ where
                 && self.active_tasks.is_empty()
                 && self.primary_pending_is_empty()
                 && (self.primary_failed.is_empty()
-                    || self.primary_retry_passes_used
-                        >= self.config.retry_max_passes)
+                    || !self.primary_retry_budget.should_retry())
                 && !self.cluster_state.run_complete()
             {
                 tracing::info!(
