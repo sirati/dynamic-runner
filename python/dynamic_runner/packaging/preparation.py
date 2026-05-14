@@ -61,6 +61,7 @@ class SlurmPreparation:
         run_id: str = "default",
         cores_spec: str = "0",
         max_memory_spec: str = "-2G",
+        forwarded_argv: list[str] | None = None,
     ):
         self.slurm_config = slurm_config
         self.job_manager = job_manager
@@ -82,6 +83,17 @@ class SlurmPreparation:
         # double-counting); SLURM secondaries are on different hosts
         # with own RAM so per-machine semantic applies.
         self.max_memory_spec = max_memory_spec
+        # Dispatcher's task-specific argv (already filtered to remove
+        # the framework-regenerated flags `--secondary`, `--cores`, …
+        # by `dynamic_runner._forwarded_argv.filter_framework_argv`).
+        # Forwarded opaquely to ``generate_wrapper_script`` which
+        # bash-quotes each token into the secondary's container-command
+        # argv. The setup-promoted secondary's argparse then re-parses
+        # these (it shares the same parser as the dispatcher) so
+        # task-side filter flags (e.g. `--platform`, `--compiler`,
+        # `--name-regex`) reach ``task.discover_items`` on the secondary.
+        # Defaults to an empty list for programmatic test fixtures.
+        self.forwarded_argv = list(forwarded_argv) if forwarded_argv else []
 
         base_log_dir = self.slurm_config.get_log_dir()
         self.run_log_dir = f"{base_log_dir}/{run_id}"
@@ -184,6 +196,7 @@ class SlurmPreparation:
                 gateway_port=primary_quic_port,
                 cores_spec=self.cores_spec,
                 max_memory_spec=self.max_memory_spec,
+                forwarded_argv=self.forwarded_argv,
                 reverse_connection=self.use_reverse_connection,
                 run_log_dir=self.run_log_dir,
             )

@@ -11,6 +11,7 @@ import logging
 import sys
 from pathlib import Path
 
+from ._forwarded_argv import filter_framework_argv
 from ._shared import (
     print_selection_summary,
     process_selection_arguments,
@@ -46,6 +47,17 @@ def run(
     task.add_task_arguments(parser)
     args = parser.parse_args()
     validate_parsed_args(args, parser)
+
+    # Stash the dispatcher's argv-minus-framework-regenerated-flags so
+    # the SLURM wrapper can forward task-specific filter args
+    # (e.g. `--platform`, `--compiler`, `--name-regex`) verbatim to
+    # the setup-promoted secondary. Filtering is centralised in
+    # `_forwarded_argv.filter_framework_argv`; every layer below this
+    # is a dumb data carrier. Computed unconditionally — `args` already
+    # carries other dispatch-time-only attributes (`resolved_output_root`,
+    # `_setup_deferred_to_secondary`) and the non-SLURM dispatch paths
+    # simply ignore the field.
+    args.forwarded_argv = filter_framework_argv(sys.argv[1:])
 
     if args.secondary:
         _dispatch_secondary(task, args, logger)
