@@ -175,7 +175,7 @@ impl PyObserverLateJoiner {
         let observer_id = self.observer_id.clone();
         let estimator = self.topology.estimator.clone();
         // `connect_timeout` is intentionally NOT plumbed: it gates
-        // the PrimaryTransport `NetworkClient` dial loop in the
+        // the submitter-bound `NetworkClient` dial loop in the
         // regular-secondary path, which an observer doesn't have
         // (we hand SecondaryCoordinator a `NoPrimaryTransport` stub
         // — see `no_primary.rs`). The observer's analogous budget

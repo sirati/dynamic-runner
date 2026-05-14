@@ -21,9 +21,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport, PrimaryTransport};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::SecondaryCoordinator;
@@ -65,7 +65,7 @@ impl ElectionState {
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
-    PT: PrimaryTransport<I>,
+    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
