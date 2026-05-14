@@ -23,6 +23,7 @@ dynrunner-manager-local = { workspace = true }
 dynrunner-manager-distributed = { workspace = true }
 dynrunner-protocol-primary-secondary = { workspace = true }
 dynrunner-transport-quic = { workspace = true }
+dynrunner-transport-tunnel = { workspace = true }
 dynrunner-protocol-manager-worker = { workspace = true }
 dynrunner-transport-socket = { workspace = true }
 dynrunner-transport-channel = { workspace = true }

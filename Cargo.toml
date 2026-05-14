@@ -9,6 +9,7 @@ members = [
     "crates/dynrunner-transport-socket",
     "crates/dynrunner-transport-channel",
     "crates/dynrunner-transport-quic",
+    "crates/dynrunner-transport-tunnel",
     "crates/dynrunner-worker",
     "crates/dynrunner-manager-local",
     "crates/dynrunner-manager-distributed",
@@ -60,6 +61,7 @@ dynrunner-scheduler = { path = "crates/dynrunner-scheduler" }
 dynrunner-transport-socket = { path = "crates/dynrunner-transport-socket" }
 dynrunner-transport-channel = { path = "crates/dynrunner-transport-channel" }
 dynrunner-transport-quic = { path = "crates/dynrunner-transport-quic" }
+dynrunner-transport-tunnel = { path = "crates/dynrunner-transport-tunnel" }
 dynrunner-worker = { path = "crates/dynrunner-worker" }
 dynrunner-manager-local = { path = "crates/dynrunner-manager-local" }
 dynrunner-manager-distributed = { path = "crates/dynrunner-manager-distributed" }
