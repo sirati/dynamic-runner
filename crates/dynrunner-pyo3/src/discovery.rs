@@ -73,7 +73,7 @@ impl Visitor for PyVisitorBridge {
     type Payload = Py<PyAny>;
     type Error = PyErr;
 
-    async fn visit(
+    fn visit(
         &mut self,
         parent_payload: Option<&Py<PyAny>>,
         subfolders: &[FolderInfo],
@@ -203,16 +203,8 @@ pub(crate) fn find_items<'py>(
     let visit_method = task_definition.getattr("visit")?.unbind();
 
     let marked = py.detach(|| -> Result<_, WalkError<PyErr>> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                WalkError::Io(std::io::Error::other(format!("tokio runtime: {e}")))
-            })?;
-        rt.block_on(async {
-            let mut bridge = PyVisitorBridge { visit_method };
-            walk(&root, &mut bridge).await
-        })
+        let mut bridge = PyVisitorBridge { visit_method };
+        walk(&root, &mut bridge)
     })
     .map_err(|e| match e {
         WalkError::Visitor(py_err) => py_err,

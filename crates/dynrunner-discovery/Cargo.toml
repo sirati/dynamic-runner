@@ -12,12 +12,10 @@ categories.workspace   = true
 readme.workspace       = true
 
 [dependencies]
-tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
 tempfile = "3"
 
 [lints]
