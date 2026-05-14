@@ -231,13 +231,22 @@ impl PySecondaryCoordinator {
         let phase_deps_for_ingest = self.phase_deps.clone();
         let setup_discover_root = self.src_network.clone();
 
-        let mut completed = 0u32;
-
-        py.detach(|| {
+        // Errors produced inside the async block — including
+        // `task.discover_items` raising in setup-promote — must surface
+        // as `PyErr` here so the Python-side `run()` returns non-zero.
+        // Previously every error path `break`d out of the loop and
+        // `self.completed` was set from a zero counter, causing the
+        // secondary to exit `0` despite the work never starting; the
+        // dispatcher then chained the next task on a missing input.
+        let result: Result<u32, PyErr> = py.detach(|| -> Result<u32, PyErr> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("failed to create tokio runtime");
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "failed to create tokio runtime: {e}"
+                    ))
+                })?;
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
@@ -257,12 +266,16 @@ impl PySecondaryCoordinator {
                         Some(a) => a,
                         None => {
                             tracing::error!(url = %primary_url, "DNS lookup returned no addresses for primary URL");
-                            return;
+                            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                "DNS lookup returned no addresses for primary URL {primary_url}"
+                            )));
                         }
                     },
                     Err(e) => {
                         tracing::error!(url = %primary_url, error = %e, "failed to resolve primary URL");
-                        return;
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to resolve primary URL {primary_url}: {e}"
+                        )));
                     }
                 };
 
@@ -281,7 +294,10 @@ impl PySecondaryCoordinator {
                             "failed to connect to primary after {:.0}s",
                             connect_timeout.as_secs_f64()
                         );
-                        return;
+                        return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "failed to connect to primary at {addr} after {:.0}s ({attempt} attempts)",
+                            connect_timeout.as_secs_f64()
+                        )));
                     }
                     match NetworkClient::connect_wss_only(addr).await {
                         Ok(c) => {
@@ -305,7 +321,9 @@ impl PySecondaryCoordinator {
                                 tokio::time::sleep(retry_delay).await;
                             } else {
                                 tracing::error!(addr = %addr, error = %e, "failed to connect to primary");
-                                return;
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "failed to connect to primary at {addr}: {e}"
+                                )));
                             }
                         }
                     }
@@ -466,7 +484,7 @@ impl PySecondaryCoordinator {
                 // call. No coordinator state is dropped across the
                 // yield (`setup_phase_completed` is latched, workers
                 // stay running, transports remain connected).
-                loop {
+                let loop_result: Result<(), PyErr> = loop {
                     let outcome = match secondary
                         .run_until_setup_or_done(&mut factory)
                         .await
@@ -474,13 +492,15 @@ impl PySecondaryCoordinator {
                         Ok(o) => o,
                         Err(e) => {
                             tracing::error!(error = %e, "secondary failed");
-                            break;
+                            break Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                format!("secondary failed: {e}"),
+                            ));
                         }
                     };
                     match outcome {
                         RunOutcome::Done => {
                             tracing::info!("secondary finished successfully");
-                            break;
+                            break Ok(());
                         }
                         RunOutcome::SetupPending => {
                             // Re-acquire the GIL ONLY for the duration
@@ -530,7 +550,7 @@ impl PySecondaryCoordinator {
                                         "task.discover_items raised during \
                                          setup-promote; aborting secondary"
                                     );
-                                    break;
+                                    break Err(e);
                                 }
                             };
                             tracing::info!(
@@ -549,7 +569,9 @@ impl PySecondaryCoordinator {
                                     error = %e,
                                     "ingest_setup_discovery failed; aborting secondary"
                                 );
-                                break;
+                                break Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    format!("ingest_setup_discovery: {e}"),
+                                ));
                             }
                             // Loop continues; the next
                             // `run_until_setup_or_done` call short-
@@ -558,9 +580,9 @@ impl PySecondaryCoordinator {
                             // and re-enters `process_tasks` directly.
                         }
                     }
-                }
+                };
 
-                completed = secondary.completed_count() as u32;
+                let completed = secondary.completed_count() as u32;
 
                 // Clean up child processes
                 for child in &mut factory.child_processes {
@@ -569,10 +591,12 @@ impl PySecondaryCoordinator {
                         let _ = c.wait();
                     }
                 }
-            }));
+
+                loop_result.map(|()| completed)
+            }))
         });
 
-        self.completed = completed;
+        self.completed = result?;
         Ok(())
     }
 
