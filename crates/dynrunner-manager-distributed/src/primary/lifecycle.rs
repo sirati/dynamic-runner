@@ -175,6 +175,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;
 
+        // One-shot gates on the two recv arms. Each flips true the
+        // first time its channel returns `None`. Mirrors
+        // `SecondaryCoordinator.primary_disconnected` (see
+        // `secondary/processing.rs:75`): a closed mpsc receiver
+        // resolves immediately on every subsequent poll, so leaving
+        // an arm enabled after the first None would hot-loop the
+        // select!. The timer arms still drive every subsequent loop
+        // iteration so the top-of-loop exit checks (counter-based,
+        // pool-drained, `cluster_state.run_complete()`) can still
+        // trip. Resets are intentionally absent — once a bridge has
+        // exited it cannot re-open mid-run.
+        let mut transport_closed = false;
+        let mut peer_transport_closed = false;
+
         loop {
             // Check termination: all tasks accounted for AND no
             // worker is mid-dispatch. Both halves of the check are
@@ -302,6 +316,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 self.fleet_dead_since = None;
             }
 
+            // Both inbound paths closed: no further mutations can
+            // arrive on either source, so the demoted-primary view is
+            // frozen. The pre-Step-6 behaviour (transport-closed →
+            // immediate break) is preserved structurally for the
+            // pathological "every channel died" case. The
+            // `cluster_state.run_complete()` check above is the
+            // happy-path exit; this guard is only reached when the
+            // mesh itself has collapsed.
+            if transport_closed && peer_transport_closed {
+                tracing::info!(
+                    "both transport and peer_transport closed; exiting operational loop"
+                );
+                break;
+            }
+
             // Use a timeout on recv to avoid stalling indefinitely if a
             // secondary disconnects while processing a task. The timeout
             // is generous — if no message arrives in 5 minutes and there
@@ -309,15 +338,104 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             //
             // Cancellation safety: `transport.recv` is the mpsc-bridged
             // `NetworkServer::recv` (cancel-safe — see `MessageReceiver`
-            // doc). The two timer arms (heartbeat tick + 5-min sleep)
-            // are tokio time primitives which are themselves cancel-safe.
+            // doc). `peer_transport.recv_peer` is the mpsc-backed
+            // tunneled inbound queue (also cancel-safe — see
+            // `TunneledPeerTransport::recv_peer`). The two timer arms
+            // (heartbeat tick + 5-min sleep) are tokio time primitives
+            // which are themselves cancel-safe.
             tokio::select! {
-                msg = self.transport.recv() => {
+                msg = self.transport.recv(), if !transport_closed => {
                     match msg {
                         Some(m) => self.dispatch_message(m).await?,
                         None => {
+                            // Legacy `transport.recv()` returned None —
+                            // the per-secondary SecondaryTransport bridge
+                            // exited. Two structural cases:
+                            //
+                            // 1. Pre-demotion / no mesh: the legacy
+                            //    transport is the only inbound path. The
+                            //    historical "transport close = end of
+                            //    run" semantics apply; exit cleanly.
+                            //
+                            // 2. Post-demotion (`self.demoted == true`)
+                            //    with a live peer mesh: the legacy
+                            //    transport's writer task to the promoted
+                            //    secondary has shut down per the
+                            //    PromotePrimary contract, but the demoted
+                            //    local is still a real mesh member (Step
+                            //    5b `TunneledPeerTransport`). The new
+                            //    primary's ClusterMutation /
+                            //    Keepalive / TaskCompleted broadcasts
+                            //    arrive on the peer_transport arm below;
+                            //    the loop's exit cues (counter check,
+                            //    pool-drained, RunComplete) are all
+                            //    driven by mutations the peer arm feeds
+                            //    through `dispatch_message`. Breaking
+                            //    here would re-introduce bug class #1
+                            //    (asm-tokenizer "succeeded=0 + 235 CSVs
+                            //    landed") and #79 (chain-gate reading
+                            //    stale 0/0/0).
+                            //
+                            // The architectural invariant
+                            // (`feedback_mesh_independent_of_role_and_membership`):
+                            // mesh state is transport-independent of any
+                            // single legacy channel.
+                            transport_closed = true;
+                            if self.peer_transport.peer_count() > 0 {
+                                tracing::info!(
+                                    peer_count = self.peer_transport.peer_count(),
+                                    demoted = self.demoted,
+                                    "legacy transport closed; staying in operational \
+                                     loop — peer mesh still active, mutations and \
+                                     RunComplete will arrive via peer_transport"
+                                );
+                                continue;
+                            }
                             tracing::info!("transport closed");
                             break;
+                        }
+                    }
+                }
+                peer_msg = self.peer_transport.recv_peer(), if !peer_transport_closed => {
+                    match peer_msg {
+                        Some(m) => {
+                            // Same dispatcher the legacy arm uses. Post-
+                            // demotion the new primary's broadcasts
+                            // (`ClusterMutation::TaskCompleted`,
+                            // `ClusterMutation::RunComplete`, Keepalive,
+                            // etc.) arrive here; threading them through
+                            // `dispatch_message` keeps a single source
+                            // of truth for wire-shape handling.
+                            //
+                            // Idempotency: every mutation a peer might
+                            // also forward via `transport` is dedup-
+                            // gated downstream — `cluster_state.apply`
+                            // is CRDT-idempotent, the `completed_tasks`
+                            // / `failed_tasks` HashSet inserts are
+                            // idempotent, and `handle_task_complete`
+                            // already short-circuits on
+                            // `completed_tasks.contains(hash)`. Safe
+                            // by construction; no extra dedup needed
+                            // at this layer.
+                            self.dispatch_message(m).await?;
+                        }
+                        None => {
+                            // Peer transport closed (only when every
+                            // TunneledPeerTransport writer has gone
+                            // away, or for `NoPeerTransport` the future
+                            // never resolves so this branch is
+                            // unreachable). Gate the arm so subsequent
+                            // select! iterations don't hot-poll a
+                            // permanently-resolved future. The legacy
+                            // arm and the timer arms still drive exit
+                            // conditions; the top-of-loop checks
+                            // (`run_complete`, counter-based) can still
+                            // break.
+                            peer_transport_closed = true;
+                            tracing::debug!(
+                                "peer_transport.recv_peer() returned None; \
+                                 disabling the arm for the remainder of the loop"
+                            );
                         }
                     }
                 }

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport, SecondaryTransport,
+    Address, DistributedMessage, PeerTransport, Scope, SecondaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -101,27 +101,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// failover election. Called from the operational loop on the same
     /// cadence as `collect_heartbeat_report`.
     ///
-    /// Keepalive still rides the legacy `self.transport.broadcast` (per-
-    /// secondary writer fan-out) in Step 5. The "migrate to
-    /// `peer_transport.send(Address::Broadcast(Scope::AllSecondaries),
-    /// msg)`" line item in the unification plan is structurally blocked
-    /// on the primary becoming a real peer-mesh member (steps 6/7/10 of
-    /// the plan), which it isn't yet today: the primary owns a
-    /// `SecondaryTransport` for the per-secondary writers but its
-    /// `peer_transport` is `NoPeerTransport` in every production
-    /// constructor. Routing the F2 keepalive through a no-op transport
-    /// silently breaks the secondary-side `primary_last_seen` refresh
-    /// and trips a false failover election within
-    /// `keepalive_miss_threshold * keepalive_interval` of the migration.
-    /// The cosmetic noise (bug #3 — dead per-secondary writer to the
-    /// promoted peer post-demotion) is a debug-level annoyance, not a
-    /// correctness issue, so we leave the legacy fan-out in place
-    /// until the same step that wires the primary into the peer mesh
-    /// retires it. The relay-arm in `task::handle_task_request` is the
-    /// only Step-5 site that DOES migrate, because role-addressing
-    /// works even with a stub `peer_transport`: cache-cold or no-route
-    /// fails the send cleanly, matching the pre-Step-5 silent-drop
-    /// behaviour for the demoted-primary case.
+    /// Keepalive rides `peer_transport.send(Address::Broadcast(
+    /// Scope::AllSecondaries), msg)` since Step 6 — the Step 5b
+    /// `TunneledPeerTransport` made the primary a real mesh member, so
+    /// the mesh-level broadcast reaches every connected secondary
+    /// (over the same per-secondary tunnel writers the legacy
+    /// `transport.broadcast` previously used directly, just routed via
+    /// the mesh abstraction now). Bug class #3 collapses by virtue of
+    /// the dead per-peer writer to the promoted peer no longer being
+    /// invoked: post-demotion the new primary's writer is gone from
+    /// the shared writer table, so the broadcast iterates over the
+    /// LIVE peers only.
+    ///
+    /// `Scope::AllSecondaries` is the right scope (not `Scope::Mesh`):
+    /// the primary itself is not in its own writer table — every
+    /// shared-outgoing entry is a secondary — so the two scopes resolve
+    /// identically in the current `TunneledPeerTransport` impl. The
+    /// distinction is semantic: "AllSecondaries" is what F2 actually
+    /// needs, regardless of which `PeerTransport` impl carries it.
     pub(super) async fn broadcast_primary_keepalive(&mut self) {
         if self.secondaries.is_empty() {
             return;
@@ -132,18 +129,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             secondary_id: self.config.node_id.clone(),
             active_workers: self.workers.iter().filter(|w| !w.is_idle).count() as u32,
         };
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            // Keepalive failures are debug-level: a secondary mid-disconnect
-            // generates one of these per tick until the heartbeat-monitor
-            // declares it dead. Surfacing each at warn would spam the log on
-            // an already-handled state transition.
-            for (secondary_id, error) in &failures {
-                tracing::debug!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "primary keepalive delivery failed"
-                );
-            }
+        if let Err(error) = self
+            .peer_transport
+            .send(Address::Broadcast(Scope::AllSecondaries), msg)
+            .await
+        {
+            // Keepalive failures are debug-level: a secondary mid-
+            // disconnect generates one of these per tick until the
+            // heartbeat-monitor declares it dead. Surfacing each at
+            // warn would spam the log on an already-handled state
+            // transition. (Pre-Step-6 the legacy
+            // `transport.broadcast` returned per-secondary failure
+            // tuples; `peer_transport.send` collapses them into a
+            // single Err — the heartbeat-monitor is the
+            // per-secondary signal, not this log line.)
+            tracing::debug!(
+                error = %error,
+                "primary keepalive delivery failed"
+            );
         }
     }
 
