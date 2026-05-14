@@ -1,0 +1,69 @@
+"""Filter ``sys.argv[1:]`` for forwarding to a setup-promoted secondary.
+
+Single concern: given the dispatcher's argv, return the subset the
+secondary's argparse should re-parse on its own. The secondary uses
+the same parser (``build_arg_parser + task.add_task_arguments``) so
+anything that parsed on the dispatcher will re-parse identically on
+the secondary — *except* the framework-regenerated flags
+(``--secondary``, ``--secondary-id``, ``--secondary-quic-port``,
+``--src-network``, ``--cores``, ``--max-memory``) which the SLURM
+wrapper emits afresh per-job. Forwarding those would duplicate
+arguments and confuse argparse; this filter drops them.
+
+The result is opaque to all downstream layers (SlurmPreparation,
+SlurmJobManager, the Rust wrapper-script generator). Only this
+module owns the filtering rule; everyone else carries the list.
+"""
+
+from __future__ import annotations
+
+
+# Framework flags the SLURM wrapper regenerates from per-job state
+# (gateway-derived URL, secondary index, host-detected cores/memory,
+# container-internal bind-mount path). Forwarding these as well would
+# duplicate the flag and confuse the secondary's argparse.
+FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
+    {
+        "--secondary",
+        "--secondary-id",
+        "--secondary-quic-port",
+        "--src-network",
+        "--cores",
+        "--max-memory",
+    }
+)
+
+
+def filter_framework_argv(argv: list[str]) -> list[str]:
+    """Drop framework-regenerated ``(flag, value)`` pairs from ``argv``.
+
+    Each flag in :data:`FRAMEWORK_REGENERATED_FLAGS` takes a value, so
+    it appears either as the two-token ``--flag VALUE`` form or the
+    single-token ``--flag=VALUE`` form. Both shapes are recognised and
+    elided; every other token is preserved verbatim.
+
+    The input is assumed to be a well-formed argv slice (the result
+    of ``sys.argv[1:]`` on a successfully-parsed invocation). No
+    interpretation of unknown flags is attempted — they pass through
+    unchanged for the secondary's argparse to handle.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(argv)
+    while i < n:
+        token = argv[i]
+        # `--flag=VALUE` form: single token, drop it whole.
+        if "=" in token:
+            head, _ = token.split("=", 1)
+            if head in FRAMEWORK_REGENERATED_FLAGS:
+                i += 1
+                continue
+        # `--flag VALUE` form: two tokens, drop both. Guarded by
+        # bounds-check so a trailing bare flag (malformed argv) drops
+        # only the flag itself rather than walking off the end.
+        if token in FRAMEWORK_REGENERATED_FLAGS:
+            i += 2 if i + 1 < n else 1
+            continue
+        out.append(token)
+        i += 1
+    return out

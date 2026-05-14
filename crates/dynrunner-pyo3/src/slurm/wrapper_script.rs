@@ -54,6 +54,7 @@ fn build_slurm_config(root_folder: &str) -> SlurmConfig {
     output_dir,
     cores_spec,
     max_memory_spec,
+    forwarded_argv = Vec::new(),
     run_log_dir = None,
     dynrunner_network_dir = None,
     extra_run_args = Vec::new(),
@@ -76,6 +77,7 @@ pub fn generate_wrapper_script(
     output_dir: &str,
     cores_spec: &str,
     max_memory_spec: &str,
+    forwarded_argv: Vec<String>,
     run_log_dir: Option<&str>,
     dynrunner_network_dir: Option<&str>,
     extra_run_args: Vec<String>,
@@ -132,6 +134,7 @@ pub fn generate_wrapper_script(
         srcbins_mount_source: Some(srcbins_mount_source),
         output_dir: Some(output_dir),
         extra_run_args: &extra_run_args,
+        forwarded_argv: &forwarded_argv,
     };
     Ok(rust_generate_wrapper_script(&cfg))
 }
