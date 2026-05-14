@@ -8,7 +8,10 @@
 //!
 //! - [`NetworkClient`] — secondary-side transport. Connects to a peer (primary
 //!   or another secondary) via QUIC, falling back to WSS if QUIC fails.
-//!   Implements `PrimaryTransport<I>` via the blanket impl.
+//!   Carries the bidirectional `MessageSender<DistributedMessage<I>> +
+//!   MessageReceiver<DistributedMessage<I>>` shape (pre-Step-11 this
+//!   was satisfied via a marker trait `PrimaryTransport<I>`; the
+//!   trait retired, the underlying contract is unchanged).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

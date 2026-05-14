@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
+use dynrunner_core::{
+    ErrorType, Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo, WorkerId,
+};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
-use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport, PrimaryTransport,
-};
+use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::ClusterState;
@@ -224,7 +224,7 @@ pub struct PeerCertInfo {
 /// - `I`: identifier type
 pub struct SecondaryCoordinator<PT, P, M, S, E, I>
 where
-    PT: PrimaryTransport<I>,
+    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
     M: ManagerEndpoint,
     S: Scheduler<I>,
@@ -531,7 +531,7 @@ where
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
-    PT: PrimaryTransport<I>,
+    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,

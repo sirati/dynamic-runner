@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, PhaseId, TaskInfo, WorkerId};
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedBinaryInfo, DistributedMessage, PeerTransport, PrimaryTransport,
+    ClusterMutation, DistributedBinaryInfo, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
@@ -22,7 +22,7 @@ const PRIMARY_BACKPRESSURE_WINDOW: Duration = Duration::from_millis(500);
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
-    PT: PrimaryTransport<I>,
+    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,

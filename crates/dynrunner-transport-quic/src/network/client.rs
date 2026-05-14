@@ -1,10 +1,11 @@
 //! Secondary-side network client: connects to a peer via QUIC, falling
 //! back to WSS if QUIC fails.
 //!
-//! Implements `PrimaryTransport<I>` via the blanket impl in
-//! `dynrunner_protocol_primary_secondary::transport` (since it implements both
-//! `MessageSender<DistributedMessage<I>>` and
-//! `MessageReceiver<DistributedMessage<I>>`).
+//! Carries the submitter-bound `MessageSender<DistributedMessage<I>>` +
+//! `MessageReceiver<DistributedMessage<I>>` shape (formerly satisfied
+//! the `PrimaryTransport<I>` marker trait via blanket impl; that trait
+//! retired in Step 11 of the transport-unification refactor — the
+//! underlying bidirectional contract is unchanged).
 //!
 //! ## Cancel-safety
 //!
