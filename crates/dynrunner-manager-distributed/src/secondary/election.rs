@@ -289,8 +289,12 @@ where
                 //
                 // Read source: `cluster_state.role_table().observers`
                 // is the replicated single source of truth (Step 7,
-                // Decision G). Populated by `secondary/setup.rs`'s
-                // PeerInfo handler via `ClusterState::set_observers`.
+                // Decision G). Populated by the `ClusterMutation::
+                // PeerJoined { is_observer: true }` apply rule —
+                // originated by the primary in
+                // `primary/peer_setup.rs::send_peer_lists` and
+                // replicated to every node via the standard CRDT
+                // broadcast path.
                 let observers = &self.cluster_state.role_table().observers;
                 let lowest_alive = self
                     .peer_keepalives
@@ -1046,16 +1050,19 @@ mod observer_peer_side_tests {
     /// refuses self-promotion per #35).
     ///
     /// Setup: sec-b (non-observer) sees obs-a (recorded in the
-    /// replicated `RoleTable.observers` via `set_observers`). obs-a
-    /// is lex-lowest. After primary silence + quorum, sec-b must
-    /// SELF-PROMOTE (since the only other peer is filtered).
+    /// replicated `RoleTable.observers` via `PeerJoined { is_observer:
+    /// true }`). obs-a is lex-lowest. After primary silence + quorum,
+    /// sec-b must SELF-PROMOTE (since the only other peer is filtered).
     #[tokio::test(flavor = "current_thread")]
     async fn non_observer_filters_observer_from_lowest_alive() {
+        use dynrunner_protocol_primary_secondary::ClusterMutation;
         let mut sec = make_secondary(election_config("sec-b"));
         // obs-a is registered as a peer AND marked observer.
         sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
-        sec.cluster_state
-            .set_observers(std::collections::HashSet::from(["obs-a".to_string()]));
+        sec.cluster_state.apply(ClusterMutation::PeerJoined {
+            peer_id: "obs-a".into(),
+            is_observer: true,
+        });
         sec.record_primary_message();
 
         tokio::time::sleep(PAST_DEATH).await;
@@ -1105,9 +1112,12 @@ mod observer_peer_side_tests {
     /// rejection protects against forgeries and misconfigured peers.
     #[tokio::test(flavor = "current_thread")]
     async fn promote_primary_naming_observer_is_rejected() {
+        use dynrunner_protocol_primary_secondary::ClusterMutation;
         let mut sec = make_secondary(election_config("sec-b"));
-        sec.cluster_state
-            .set_observers(std::collections::HashSet::from(["obs-a".to_string()]));
+        sec.cluster_state.apply(ClusterMutation::PeerJoined {
+            peer_id: "obs-a".into(),
+            is_observer: true,
+        });
 
         let promote = DistributedMessage::PromotePrimary::<
             super::super::test_helpers::TestId,
@@ -1147,18 +1157,19 @@ mod observer_peer_side_tests {
         );
     }
 
-    /// Step 7 / Decision G end-to-end: PeerInfo apply via
-    /// `set_observers` is the SAME source of truth that both
-    /// `lowest_alive` filtering and the defensive PromotePrimary
-    /// rejection read. Without storage relocation, the deleted
-    /// `peer_observers` HashSet would have produced identical
-    /// results; with it, callers consult `cluster_state.role_table().
-    /// observers` instead.
+    /// Step 7 / Decision G end-to-end: the `ClusterMutation::
+    /// PeerJoined { is_observer: true }` apply rule is the SAME
+    /// source of truth that both `lowest_alive` filtering and the
+    /// defensive PromotePrimary rejection read. Without storage
+    /// relocation, the deleted `peer_observers` HashSet would have
+    /// produced identical results; with it, callers consult
+    /// `cluster_state.role_table().observers` instead.
     ///
     /// This test pins:
     ///   (a) Reads via the role-table see the observer set populated
-    ///       by `set_observers` (the production path is
-    ///       `secondary/setup.rs`'s PeerInfo handler).
+    ///       by `PeerJoined` (the production path is
+    ///       `primary/peer_setup.rs::send_peer_lists` originating the
+    ///       mutation alongside the PeerInfo broadcast).
     ///   (b) `lowest_alive` filter excludes the observer just as the
     ///       deleted `peer_observers` HashSet would have.
     ///   (c) The defensive PromotePrimary rejection also reads from
@@ -1170,12 +1181,15 @@ mod observer_peer_side_tests {
     /// produce the same outputs as before.
     #[tokio::test(flavor = "current_thread")]
     async fn role_table_observers_drives_filter_and_promote_rejection() {
-        use std::collections::HashSet;
+        use dynrunner_protocol_primary_secondary::ClusterMutation;
 
         let mut sec = make_secondary(election_config("sec-b"));
-        // Production path: PeerInfo arrival populates role_table.
-        sec.cluster_state
-            .set_observers(HashSet::from(["obs-a".to_string()]));
+        // Production path: `PeerJoined { is_observer: true }` apply
+        // populates the role table.
+        sec.cluster_state.apply(ClusterMutation::PeerJoined {
+            peer_id: "obs-a".into(),
+            is_observer: true,
+        });
         sec.peer_keepalives.insert("obs-a".into(), timestamp_now());
         sec.record_primary_message();
 

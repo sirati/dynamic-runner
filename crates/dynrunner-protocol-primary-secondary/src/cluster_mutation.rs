@@ -55,4 +55,23 @@ pub enum ClusterMutation<I> {
     /// drained` so the post-promotion residual peers all exit
     /// shortly after the primary returns.
     RunComplete,
+    /// A peer has joined the cluster. The minimal apply rule for
+    /// this variant updates *only* the replicated observer set:
+    /// when `is_observer = true`, `peer_id` is inserted into
+    /// `RoleTable.observers` (idempotent — set semantics);
+    /// `is_observer = false` is a no-op at this stage of the
+    /// unification refactor.
+    ///
+    /// TODO(Batch D): widen this variant's apply semantics to
+    /// cover the full peer-lifecycle apply rule (member roster,
+    /// liveness window, etc.). The narrow observer-only apply
+    /// here is the single-writer cutover for `RoleTable.observers`
+    /// — replacing the legacy `ClusterState::set_observers` write
+    /// path so observer membership flows through one CRDT path
+    /// only. Removal of an observer (or any peer) waits on the
+    /// matching `PeerRemoved` variant that Batch D will introduce.
+    PeerJoined {
+        peer_id: String,
+        is_observer: bool,
+    },
 }

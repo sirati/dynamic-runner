@@ -252,16 +252,17 @@ impl<I> Default for ClusterState<I> {
 /// - `phase_deps`: replaced if local is empty, otherwise kept (the
 ///   graph is static for the run's lifetime).
 /// - `observers`: replaced if local is empty, otherwise kept. The
-///   live mutation path (PeerInfo broadcasts → `set_observers`)
-///   replaces the set atomically, so a snapshot is authoritative for
-///   the late-joiner's first-bootstrap and inert thereafter. A
-///   broader merge rule (union, or epoch-tagged replace) would be
-///   over-engineering today — the live PeerInfo broadcast that
-///   arrives shortly after the snapshot supersedes the snapshot's
-///   `observers` anyway. `#[serde(default)]` keeps wire compat with
-///   pre-Step-8 senders (snapshots from a peer running an older
-///   crate omit the field; deserialize defaults to an empty set,
-///   identical to the pre-Step-8 shape).
+///   live mutation path (`ClusterMutation::PeerJoined { is_observer
+///   = true }` broadcasts) inserts into the set with set semantics,
+///   so a snapshot is authoritative for the late-joiner's first-
+///   bootstrap and inert thereafter. A broader merge rule (union,
+///   or epoch-tagged replace) would be over-engineering today —
+///   subsequent `PeerJoined` broadcasts converge any divergence
+///   between snapshot-restored and live-applied observers via the
+///   apply rule's idempotent insert. `#[serde(default)]` keeps wire
+///   compat with pre-Step-8 senders (snapshots from a peer running
+///   an older crate omit the field; deserialize defaults to an
+///   empty set, identical to the pre-Step-8 shape).
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -445,31 +446,6 @@ impl<I: Identifier> ClusterState<I> {
         &self.role_table
     }
 
-    /// Replace the replicated `observers` set with the given peers.
-    /// Fires registered role-change hooks if the set actually changed
-    /// so the transport-layer cache stays coherent (Step 7+ of the
-    /// transport-unification refactor; Decision G option α).
-    ///
-    /// Observer-membership rides the `PeerInfo` wire frame, not a
-    /// dedicated `ClusterMutation` — the receiver's PeerInfo handler
-    /// (`secondary/setup.rs`) calls this method when it processes
-    /// the incoming peers vector. The set is `Replace`-shaped (not
-    /// incremental insert/remove) so a re-broadcast that drops a
-    /// peer correctly removes it from the local view; observers
-    /// joining mid-run still appear because PeerInfo is broadcast
-    /// every time the primary's peer set changes.
-    ///
-    /// Idempotent: no-op + no hook fire when the new set equals the
-    /// current set. Hooks fire AFTER the field update so registrants
-    /// see the post-mutation table.
-    pub fn set_observers(&mut self, observers: std::collections::HashSet<String>) {
-        if self.role_table.observers == observers {
-            return;
-        }
-        self.role_table.observers = observers;
-        self.fire_role_change_hooks();
-    }
-
     /// Fire every registered hook against the current [`RoleTable`].
     /// Invoked from `apply` immediately AFTER any mutation that
     /// touches the table, so registrants see post-state values.
@@ -494,9 +470,10 @@ impl<I: Identifier> ClusterState<I> {
             phase_deps: self.phase_deps.clone(),
             // Carry the replicated observer set through the snapshot
             // so a late-joiner can populate `RoleTable.observers`
-            // before the next PeerInfo broadcast arrives. The set is
-            // the same one `set_observers` writes; the snapshot is
-            // authoritative for first-bootstrap and inert thereafter.
+            // before any `PeerJoined` mutation arrives. The set is
+            // the same one the `PeerJoined { is_observer = true }`
+            // apply rule writes; the snapshot is authoritative for
+            // first-bootstrap and inert thereafter.
             observers: self.role_table.observers.clone(),
         }
     }
@@ -544,13 +521,14 @@ impl<I: Identifier> ClusterState<I> {
             self.phase_deps = snap.phase_deps;
         }
         // Observer set: replace if local is empty (first-bootstrap
-        // case), otherwise keep local. The live PeerInfo broadcast
-        // path (`set_observers`) is the steady-state writer; this
-        // branch only fires on the late-joiner's very first restore,
-        // before any PeerInfo arrives. Firing the role-change hooks
-        // when the set actually changes keeps the transport's
-        // write-through cache coherent on the snapshot path the same
-        // way `set_observers` does on the live path.
+        // case), otherwise keep local. The live `PeerJoined` apply
+        // path is the steady-state writer (set-semantics insert);
+        // this branch only fires on the late-joiner's very first
+        // restore, before any `PeerJoined` mutation arrives. Firing
+        // the role-change hooks when the set actually changes keeps
+        // the transport's write-through cache coherent on the
+        // snapshot path the same way `PeerJoined` does on the live
+        // path.
         if self.role_table.observers.is_empty() && !snap.observers.is_empty() {
             self.role_table.observers = snap.observers;
             self.fire_role_change_hooks();
@@ -688,6 +666,35 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 }
                 self.run_complete = true;
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::PeerJoined {
+                peer_id,
+                is_observer,
+            } => {
+                // Minimal apply rule for the unification refactor:
+                // observer membership only. `is_observer = true`
+                // inserts `peer_id` into `RoleTable.observers` with
+                // set semantics — re-application against an already-
+                // present id is a silent NoOp (no double-fire of
+                // role-change hooks). `is_observer = false` is a
+                // no-op at this stage: only the matching
+                // `PeerRemoved` variant (Batch D) removes peers from
+                // the set, so a stale broadcast that flips the flag
+                // back to false MUST NOT mutate the observer set.
+                //
+                // TODO(Batch D): extend this arm to manage the full
+                // peer-lifecycle roster (member set, liveness
+                // window, etc.). The current narrow shape is the
+                // single-writer cutover that retires the legacy
+                // `ClusterState::set_observers` write path.
+                if !is_observer {
+                    return ApplyOutcome::NoOp;
+                }
+                if !self.role_table.observers.insert(peer_id) {
+                    return ApplyOutcome::NoOp;
+                }
+                self.fire_role_change_hooks();
                 ApplyOutcome::Applied
             }
         }
@@ -1215,19 +1222,23 @@ mod tests {
 
     /// Pins the Step 8 contract that `ClusterStateSnapshot` carries
     /// the replicated observer set so a late-joiner's first restore
-    /// populates `RoleTable.observers` before the next PeerInfo
-    /// broadcast arrives. Without this the joiner's election filter
+    /// populates `RoleTable.observers` before any `PeerJoined`
+    /// mutation arrives. Without this the joiner's election filter
     /// (`secondary::election::lowest_alive` skips observers) could
     /// fire against an empty set and promote an observer candidate
-    /// in the gap between snapshot-restore and the next PeerInfo.
+    /// in the gap between snapshot-restore and the next live broadcast.
     #[test]
     fn snapshot_round_trip_preserves_observers() {
         use std::collections::HashSet;
         let mut s = ClusterState::<RunnerIdentifier>::new();
-        s.set_observers(HashSet::from([
-            "obs-1".to_string(),
-            "obs-2".to_string(),
-        ]));
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "obs-1".into(),
+            is_observer: true,
+        });
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "obs-2".into(),
+            is_observer: true,
+        });
 
         let snap = s.snapshot();
         let mut joiner = ClusterState::<RunnerIdentifier>::new();
@@ -1241,22 +1252,29 @@ mod tests {
     }
 
     /// Pins the Step 8 "first-bootstrap only" branch on `restore`:
-    /// a joiner that has already observed a live PeerInfo broadcast
-    /// (so `observers` is non-empty) keeps its local set rather than
-    /// overwriting from a (possibly stale) snapshot. Mirrors the
-    /// `phase_deps` "replaced if local empty, else kept" shape.
+    /// a joiner that has already observed a live `PeerJoined`
+    /// broadcast (so `observers` is non-empty) keeps its local set
+    /// rather than overwriting from a (possibly stale) snapshot.
+    /// Mirrors the `phase_deps` "replaced if local empty, else kept"
+    /// shape.
     #[test]
     fn restore_keeps_local_observers_when_already_populated() {
         use std::collections::HashSet;
         let mut joiner = ClusterState::<RunnerIdentifier>::new();
-        joiner.set_observers(HashSet::from(["live-obs".to_string()]));
+        joiner.apply(ClusterMutation::PeerJoined {
+            peer_id: "live-obs".into(),
+            is_observer: true,
+        });
 
         let mut peer = ClusterState::<RunnerIdentifier>::new();
-        peer.set_observers(HashSet::from(["stale-obs".to_string()]));
+        peer.apply(ClusterMutation::PeerJoined {
+            peer_id: "stale-obs".into(),
+            is_observer: true,
+        });
 
         joiner.restore(peer.snapshot());
-        // Local set wins (live PeerInfo path is authoritative once it
-        // has fired); snapshot's observers field is inert.
+        // Local set wins (live `PeerJoined` path is authoritative
+        // once it has fired); snapshot's observers field is inert.
         assert_eq!(
             joiner.role_table().observers,
             HashSet::from(["live-obs".to_string()])
@@ -1455,13 +1473,15 @@ mod tests {
         assert_eq!(obs_after_noop.len(), 3, "NoOp must not fire hook");
     }
 
-    /// Step 7 (Decision G): `set_observers` replaces the replicated
-    /// observer set and fires role-change hooks when (and only when)
-    /// the set actually changes. Idempotent re-application is silent.
-    /// Pins the "observer-set replicated through RoleTable" contract
-    /// that election filtering and PromotePrimary defense both rely on.
+    /// `ClusterMutation::PeerJoined { is_observer: true }` inserts
+    /// the peer into the replicated observer set with set semantics
+    /// (idempotent) and fires role-change hooks when (and only when)
+    /// the set actually changes. Pins the "observer-set replicated
+    /// through RoleTable" contract that election filtering and
+    /// PromotePrimary defense both rely on, now flowing through the
+    /// single-writer CRDT apply path.
     #[test]
-    fn set_observers_updates_role_table_and_fires_hooks_on_change() {
+    fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
         use std::collections::HashSet;
         use std::sync::Mutex;
 
@@ -1477,46 +1497,97 @@ mod tests {
         }
 
         // First insert fires the hook with the new set.
-        s.set_observers(HashSet::from(["obs-1".to_string()]));
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-1".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::Applied
+        );
         assert_eq!(
             s.role_table().observers,
             HashSet::from(["obs-1".to_string()])
         );
 
-        // Re-apply with the same set: idempotent, no hook fire.
-        s.set_observers(HashSet::from(["obs-1".to_string()]));
+        // Re-apply the same `PeerJoined { is_observer: true }`:
+        // set-semantics NoOp, no hook fire.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-1".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::NoOp
+        );
 
         // Add a second observer: hook fires with the union.
-        s.set_observers(HashSet::from(["obs-1".to_string(), "obs-2".to_string()]));
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-2".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::Applied
+        );
         assert_eq!(
             s.role_table().observers,
             HashSet::from(["obs-1".to_string(), "obs-2".to_string()])
         );
 
-        // Remove obs-1 (Replace-shape): hook fires with the
-        // contracted set. Pins the "PeerInfo broadcast that drops
-        // a peer correctly removes it" path.
-        s.set_observers(HashSet::from(["obs-2".to_string()]));
-        assert_eq!(
-            s.role_table().observers,
-            HashSet::from(["obs-2".to_string()])
-        );
-
-        // Clear: hook fires with empty set.
-        s.set_observers(HashSet::new());
-        assert!(s.role_table().observers.is_empty());
-
-        // Hook history: 4 actual changes (insert, union, contract,
-        // clear); the no-op re-apply was silent.
+        // Hook history: 2 actual changes (two distinct inserts);
+        // the duplicate `PeerJoined` was a silent NoOp.
         let obs = observed.lock().unwrap().clone();
-        assert_eq!(obs.len(), 4, "expected 4 fires, got {}", obs.len());
+        assert_eq!(obs.len(), 2, "expected 2 fires, got {}", obs.len());
         assert_eq!(obs[0], HashSet::from(["obs-1".to_string()]));
         assert_eq!(
             obs[1],
             HashSet::from(["obs-1".to_string(), "obs-2".to_string()])
         );
-        assert_eq!(obs[2], HashSet::from(["obs-2".to_string()]));
-        assert!(obs[3].is_empty());
+    }
+
+    /// `ClusterMutation::PeerJoined { is_observer: false }` for a
+    /// peer NOT currently in `RoleTable.observers` is a no-op under
+    /// the minimal apply rule — only the matching `PeerRemoved`
+    /// variant (Batch D) removes peers from the set. This pins the
+    /// "stale flip-back does not regress the observer set" guarantee
+    /// the receiver-side relies on (a delayed broadcast that
+    /// re-asserts a peer's non-observer status MUST NOT delete a
+    /// genuine observer that arrived through a separate writer
+    /// ordering).
+    #[test]
+    fn peer_joined_non_observer_does_not_remove_existing_observer() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-1".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(s.role_table().observers.contains("obs-1"));
+
+        // `is_observer: false` arrives later: minimal apply rule
+        // treats this as a no-op (only `PeerRemoved` may remove).
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-1".into(),
+                is_observer: false,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert!(
+            s.role_table().observers.contains("obs-1"),
+            "obs-1 must remain in role_table.observers (only PeerRemoved \
+             removes peers under the minimal apply rule)"
+        );
+
+        // `is_observer: false` for a peer never seen is also a no-op.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "never-joined".into(),
+                is_observer: false,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert!(!s.role_table().observers.contains("never-joined"));
     }
 
     /// `restore` going through the snapshot-merge path also mutates

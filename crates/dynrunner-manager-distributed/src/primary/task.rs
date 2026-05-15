@@ -772,7 +772,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
             ClusterMutation::TaskAssigned { .. }
             | ClusterMutation::PrimaryChanged { .. }
-            | ClusterMutation::PhaseDepsSet { .. } => {}
+            | ClusterMutation::PhaseDepsSet { .. }
+            | ClusterMutation::PeerJoined { .. } => {}
         }
     }
 }
