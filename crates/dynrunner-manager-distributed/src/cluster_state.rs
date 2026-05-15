@@ -18,6 +18,18 @@
 //! transitions, so a `TaskCompleted` that lands before the matching
 //! `TaskAssigned` correctly leaves the entry terminal even when the
 //! late `TaskAssigned` arrives next.
+//!
+//! Asymmetry between the two terminal states: `Completed` is the
+//! strongest terminal (success). A `TaskCompleted` superseding a prior
+//! `Failed { Recoverable }` is the retry-pass mechanism's normal
+//! shape — the same binary is re-injected, re-dispatched, and runs
+//! to success. The CRDT must propagate that supersession or the
+//! `outcome_counts()` partition stays stuck reporting the retry-
+//! succeeded task as `fail_retry`. `Completed` never regresses: a
+//! `TaskFailed` against a `Completed` entry is a NoOp (the late
+//! failure from a redundant dispatch path can't undo a recorded
+//! success). Commutativity is preserved — see `apply`'s TaskCompleted
+//! arm doc.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -570,9 +582,38 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 };
                 let task = match state {
-                    TaskState::Completed { .. } | TaskState::Failed { .. } => {
-                        return ApplyOutcome::NoOp;
-                    }
+                    // Idempotent dedup on a redundant TaskCompleted (the
+                    // same hash arrives twice via peer-forwarding
+                    // redundancy or snapshot replay).
+                    TaskState::Completed { .. } => return ApplyOutcome::NoOp,
+                    // Retry-success supersedes a prior Recoverable
+                    // failure: the retry pass re-injects the binary,
+                    // a worker picks it up, and the next TaskCompleted
+                    // for the same hash legitimately transitions
+                    // Failed → Completed. Pre-fix this branch NoOp'd,
+                    // leaving the ledger stuck at `Failed { Recoverable }`
+                    // even though the task ultimately succeeded — so
+                    // `outcome_counts().succeeded` undercounted the
+                    // retry-successes and the run-done logic that reads
+                    // it never saw the cluster reach "all terminal as
+                    // succeeded". The HashSet-side bookkeeping in
+                    // `primary/task.rs::handle_task_complete` already
+                    // implements this same supersession; this arm
+                    // brings the CRDT into agreement so cross-node
+                    // mirrors converge to the right terminal state.
+                    //
+                    // Commutativity: if peer A observes
+                    // (TaskFailed, TaskCompleted) for the same hash and
+                    // peer B observes (TaskCompleted, TaskFailed), both
+                    // converge to `Completed` — A applies Failed then
+                    // transitions to Completed here; B applies Completed
+                    // then NoOps the late TaskFailed (the Completed
+                    // arm in `TaskFailed` below). Success is the
+                    // strongest terminal regardless of arrival order;
+                    // the prior `attempts` / `last_error` are dropped
+                    // because the cluster's authoritative outcome for
+                    // this hash is now success.
+                    TaskState::Failed { task, .. } => task.clone(),
                     TaskState::Pending { task } | TaskState::InFlight { task, .. } => task.clone(),
                 };
                 *state = TaskState::Completed { task };
@@ -788,10 +829,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_then_completed_is_noop_completed_locked_out() {
-        // Once a node observes Failed for a task, a later TaskCompleted
-        // for the same hash must not flip it back to success.
-        // Symmetric to the Completed-locks-out-Failed direction.
+    fn failed_then_completed_transitions_to_completed_retry_success() {
+        // Retry-success path: the retry pass re-injects a previously
+        // Recoverable-failed binary, a worker picks it up, runs to
+        // success, and emits TaskCompleted for the same hash. The CRDT
+        // must transition Failed → Completed (success is the strongest
+        // terminal); pre-fix this branch NoOp'd, leaving the ledger
+        // stuck reporting the retry-succeeded task as `fail_retry` and
+        // breaking the asm-tokenizer LMU run-done detection (2-of-235
+        // retried successes hung the demoted primary in RunComplete-
+        // wait). Asymmetric with the `Completed`-locks-out-`Failed`
+        // direction below: a late TaskFailed against a Completed entry
+        // is still NoOp (success never regresses).
         let mut s = ClusterState::<RunnerIdentifier>::new();
         s.apply(ClusterMutation::TaskAdded {
             hash: "h".into(),
@@ -804,9 +853,38 @@ mod tests {
         });
         assert_eq!(
             s.apply(ClusterMutation::TaskCompleted { hash: "h".into() }),
+            ApplyOutcome::Applied
+        );
+        assert!(matches!(s.task_state("h"), Some(TaskState::Completed { .. })));
+    }
+
+    #[test]
+    fn completed_then_failed_stays_completed_success_never_regresses() {
+        // Symmetric inverse of the retry-success path: once a node has
+        // observed `TaskCompleted`, a late `TaskFailed` for the same
+        // hash (typically a stale redundant-dispatch path that lost the
+        // race) must not regress the ledger. `Completed` is the
+        // strongest terminal; the late `TaskFailed` is the NoOp side.
+        //
+        // Together with `failed_then_completed_transitions_to_completed_retry_success`
+        // these two pins prove the lattice converges to `Completed`
+        // regardless of (TaskFailed, TaskCompleted) arrival order —
+        // commutativity is preserved across the asymmetric transition.
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("a"),
+        });
+        s.apply(ClusterMutation::TaskCompleted { hash: "h".into() });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskFailed {
+                hash: "h".into(),
+                kind: ErrorType::Recoverable,
+                error: "late".into(),
+            }),
             ApplyOutcome::NoOp
         );
-        assert!(matches!(s.task_state("h"), Some(TaskState::Failed { .. })));
+        assert!(matches!(s.task_state("h"), Some(TaskState::Completed { .. })));
     }
 
     /// Cosmetic #88 regression pin: a demoted-primary terminal log
