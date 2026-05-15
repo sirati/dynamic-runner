@@ -530,31 +530,21 @@ where
                 self.apply_cluster_mutations(mutations);
                 Ok(())
             }
-            DistributedMessage::PeerInfo { peers, .. } => {
-                // Step 7 (Decision G): a runtime PeerInfo re-broadcast
-                // (the only way observers join a running cluster
-                // post-Step 8) lands the updated observer set into
-                // the replicated `RoleTable.observers`. Source-of-
-                // truth is identical to the setup-time path in
-                // `secondary/setup.rs::wait_for_setup` — both call
-                // `cluster_state.set_observers(_)` with the union of
-                // `is_observer=true` peers from the broadcast. The
-                // set is Replace-shaped so a re-broadcast that drops
-                // a peer correctly removes it from observers.
-                //
-                // We deliberately do NOT call
-                // `peer_transport.connect_to_peers(peers)` here —
-                // mid-run mesh expansion is Step 8/9 territory and
-                // adds the dial path through a different entry
-                // point. For Step 7's scope, the observer-set
-                // replication is the only piece runtime PeerInfo
-                // needs to perform.
-                let observers: std::collections::HashSet<String> = peers
-                    .iter()
-                    .filter(|p| p.is_observer)
-                    .map(|p| p.secondary_id.clone())
-                    .collect();
-                self.cluster_state.set_observers(observers);
+            DistributedMessage::PeerInfo { peers: _, .. } => {
+                // Observer-set replication no longer rides PeerInfo:
+                // the primary originates one
+                // `ClusterMutation::PeerJoined { is_observer: true }`
+                // per observer secondary alongside its PeerInfo
+                // broadcast, and the standard `apply_cluster_mutations`
+                // path on the `ClusterMutation` arm above is the
+                // sole writer to `RoleTable.observers`. A runtime
+                // PeerInfo re-broadcast therefore has nothing to do
+                // at the receiver in this step's scope: mid-run mesh
+                // expansion (Step 8/9) and any wider peer-lifecycle
+                // handling (Batch D) will route through their own
+                // paths. The `PeerConnectionInfo.is_observer` field
+                // remains on the wire frame for backwards
+                // compatibility but is not consumed here.
                 Ok(())
             }
             DistributedMessage::TaskRequest {

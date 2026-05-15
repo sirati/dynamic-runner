@@ -1,8 +1,8 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    PeerConnectionInfo, PeerTransport, PrimarySetupBootstrap, SecondaryTransport,
-    SetupBootstrapBroadcast, SetupBootstrapMessage,
+    ClusterMutation, PeerConnectionInfo, PeerTransport, PrimarySetupBootstrap,
+    SecondaryTransport, SetupBootstrapBroadcast, SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -38,12 +38,37 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 ipv6: s.ipv6().map(|s| s.to_string()),
                 port: s.quic_port(),
                 // Task #36 / Step 7: fan out per-peer observer status
-                // so each receiving secondary can populate its
-                // replicated `RoleTable.observers` (via
-                // `ClusterState::set_observers` in the secondary's
-                // PeerInfo handler) and filter observers from
-                // `lowest_alive` candidate selection in `election.rs`.
+                // so each receiving secondary can apply
+                // `ClusterMutation::PeerJoined { is_observer: true }`
+                // (originated below from this same view) to populate
+                // its replicated `RoleTable.observers` and filter
+                // observers from `lowest_alive` candidate selection
+                // in `election.rs`.
                 is_observer: s.is_observer(),
+            })
+            .collect();
+
+        // Originate one `PeerJoined { is_observer: true }` mutation
+        // per observer secondary, applied locally and broadcast over
+        // the same CRDT path as `seed_cluster_state`'s `PhaseDepsSet`
+        // / `TaskAdded` batch. This is the single writer to
+        // `RoleTable.observers` — receivers no longer derive the set
+        // from their PeerInfo handler, so a single ordered apply path
+        // owns the field. `is_observer = false` peers don't need a
+        // mutation under the minimal apply rule (non-observer
+        // membership is Batch D's `PeerRemoved`/`PeerJoined { is_observer
+        // = false }` semantics). `send_peer_lists` is the earliest
+        // call site where the primary's view of observers is being
+        // shared with secondaries; gathering the originator here
+        // means the setup-defer path (`emit_setup_defer_handshake`)
+        // inherits observer replication without a parallel call site.
+        let observer_mutations: Vec<ClusterMutation<I>> = self
+            .secondaries
+            .values()
+            .filter(|s| s.is_observer())
+            .map(|s| ClusterMutation::PeerJoined {
+                peer_id: s.id().to_string(),
+                is_observer: true,
             })
             .collect();
 
@@ -82,6 +107,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // as the pre-refactor `return Err(format!(…))`.
         let mut bootstrap = PrimarySetupBootstrap::new(&mut self.transport);
         SetupBootstrapBroadcast::<I>::broadcast(&mut bootstrap, msg).await?;
+
+        // Broadcast the observer-join CRDT batch immediately after
+        // the PeerInfo fan-out. Secondaries' `wait_for_setup` accepts
+        // `ClusterMutation` frames during setup, and the apply rule
+        // for `PeerJoined { is_observer: true }` is set-semantics
+        // idempotent — a re-application against an already-populated
+        // role table is a silent NoOp.
+        self.apply_and_broadcast_cluster_mutations(observer_mutations).await;
 
         // Transition all from CertExchanging -> PeerDiscovery
         for secondary_id in &secondary_ids {
