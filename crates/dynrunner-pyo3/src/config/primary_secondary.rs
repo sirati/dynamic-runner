@@ -70,6 +70,15 @@ impl PyPrimaryConfig {
                     // own constructor takes that kwarg directly
                     // for the SLURM and network-primary paths).
                     source_dir: None,
+                    // PyPrimaryCoordinator surfaces this on its own
+                    // `__init__` kwarg (and via the
+                    // `set_unfulfillable_reinject_max_per_task`
+                    // setter). The plain `PyPrimaryConfig` shim,
+                    // which only the in-process distributed
+                    // pipeline routes through, defaults to
+                    // unbounded; consumers that need a cap go via
+                    // `PyPrimaryCoordinator`.
+                    unfulfillable_reinject_max_per_task: None,
         }
     }
 }

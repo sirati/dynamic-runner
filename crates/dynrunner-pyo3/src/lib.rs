@@ -32,6 +32,7 @@ use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFact
 use managers::local::PyLocalManager;
 use managers::observer_late_joiner::{run_observer_late_joiner, PyObserverLateJoiner};
 use managers::primary::PyPrimaryCoordinator;
+use managers::primary_handle::PyPrimaryHandle;
 use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, run_secondary};
 use system_resources::{parse_cores, parse_memory, pick_free_port};
 use managers::secondary::PySecondaryCoordinator;
@@ -71,6 +72,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyLocalManager>()?;
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
+    m.add_class::<PyPrimaryHandle>()?;
     m.add_class::<PyRustSlurmJobManager>()?;
     m.add_class::<PySecondaryCoordinator>()?;
     m.add_class::<PyObserverLateJoiner>()?;
