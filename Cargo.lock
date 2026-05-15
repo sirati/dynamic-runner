@@ -420,8 +420,10 @@ dependencies = [
 name = "dynrunner-slurm"
 version = "0.4.0"
 dependencies = [
+ "async-trait",
  "dynrunner-core",
  "dynrunner-gateway",
+ "dynrunner-manager-distributed",
  "serde",
  "serde_json",
  "tempfile",
