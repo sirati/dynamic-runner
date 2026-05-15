@@ -964,6 +964,365 @@ async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete
     }).await;
 }
 
+/// Regression for the asm-tokenizer Tier-2 RunComplete-writer-flush race
+/// (post-`cd729fe`).
+///
+/// Scenario: same multi-secondary natural-quiesce shape as
+/// `setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete`,
+/// but with each secondary's `primary_transport` wrapped in a
+/// `BufferedPrimaryTransport` that mimics the production
+/// `NetworkClient`'s bridge pattern:
+///
+///   - Outgoing messages enter an internal mpsc; a `spawn_local` writer
+///     task drains the mpsc to the inner channel transport with a
+///     deliberate `yield_now().await` per message so the runtime has
+///     a chance to drop the wrapper before the message is forwarded.
+///   - `Drop` aborts the writer task — identical to
+///     `BridgedConnection::Drop` in
+///     `dynrunner-transport-quic::network::client`.
+///
+/// Pre-fix wire-flow (race):
+///   1. Promoted secondary's natural-quiesce branch enqueues
+///      `ClusterMutation::RunComplete` via
+///      `primary_transport.send.await`. The send returns as soon as
+///      the wrapper's mpsc enqueue succeeds — the writer task has not
+///      yet picked it up.
+///   2. The exit-check on the SAME loop iteration sees
+///      `cluster_state.run_complete() == true` (the local
+///      `cluster_state.apply` flipped the flag before broadcast) and
+///      breaks out of `process_tasks`.
+///   3. `process_tasks` returns; the spawn_local task running the
+///      secondary completes; `SecondaryCoordinator` drops;
+///      `BufferedPrimaryTransport` drops; writer task aborts before
+///      forwarding the RunComplete.
+///   4. The workstation primary never observes RunComplete; the
+///      demoted-local operational loop's partial-CRDT-view guard
+///      keeps it waiting; `primary.run()` hangs past the timeout.
+///
+/// Post-fix invariant: after the broadcast, the natural-quiesce branch
+/// awaits `primary_transport.flush()` (bounded by `FLUSH_DEADLINE`).
+/// The flush rendezvous round-trips through the writer task; the
+/// writer therefore drains the RunComplete to the inner channel before
+/// signalling the oneshot, after which the secondary is free to exit
+/// and the workstation primary observes RunComplete normally.
+#[tokio::test(flavor = "current_thread")]
+async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exit() {
+    use crate::secondary::RunOutcome;
+    use dynrunner_core::{MessageReceiver, MessageSender};
+    use dynrunner_protocol_primary_secondary::DistributedMessage;
+    use dynrunner_transport_channel::{peer_mesh, ChannelPeerTransport, ChannelPrimaryTransportEnd};
+    use tokio::sync::oneshot;
+
+    // Outgoing-channel payload mirroring the production
+    // `NetworkClient`'s Outgoing enum: messages and flush markers
+    // share one FIFO, so a flush only fires AFTER every preceding
+    // message has been forwarded.
+    enum BufOut {
+        Msg(DistributedMessage<TestId>),
+        Flush(oneshot::Sender<()>),
+    }
+
+    /// Buffered wrapper around an inner primary transport that
+    /// forwards via a `spawn_local` writer task, with `Drop`
+    /// aborting the writer. Mimics
+    /// `dynrunner-transport-quic::network::client::BridgedConnection`.
+    struct BufferedPrimaryTransport {
+        outgoing_tx: tokio_mpsc::UnboundedSender<BufOut>,
+        // Inner recv is decoupled from the writer — we just
+        // forward the receive side directly. The race lives on
+        // the SEND path only.
+        rx: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        writer: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for BufferedPrimaryTransport {
+        fn drop(&mut self) {
+            // Identical to BridgedConnection::Drop — abort the
+            // writer task immediately. Any messages still in the
+            // mpsc are silently lost. This is the very behaviour
+            // the production fix exists to defend against.
+            self.writer.abort();
+        }
+    }
+
+    impl MessageSender<DistributedMessage<TestId>> for BufferedPrimaryTransport {
+        async fn send(
+            &mut self,
+            msg: DistributedMessage<TestId>,
+        ) -> Result<(), String> {
+            self.outgoing_tx
+                .send(BufOut::Msg(msg))
+                .map_err(|_| "buffered transport writer task exited".to_string())
+        }
+
+        async fn flush(&mut self) -> Result<(), String> {
+            let (tx, rx) = oneshot::channel();
+            self.outgoing_tx
+                .send(BufOut::Flush(tx))
+                .map_err(|_| "buffered transport writer task exited".to_string())?;
+            rx.await
+                .map_err(|_| "buffered transport writer task exited before flush ack".to_string())
+        }
+    }
+
+    impl MessageReceiver<DistributedMessage<TestId>> for BufferedPrimaryTransport {
+        async fn recv(&mut self) -> Option<DistributedMessage<TestId>> {
+            self.rx.recv().await
+        }
+    }
+
+    fn wrap_buffered(
+        inner: ChannelPrimaryTransportEnd<TestId>,
+    ) -> BufferedPrimaryTransport {
+        let ChannelPrimaryTransportEnd {
+            tx: inner_tx,
+            rx: inner_rx,
+        } = inner;
+        let (outgoing_tx, mut outgoing_rx) = tokio_mpsc::unbounded_channel::<BufOut>();
+        let writer = tokio::task::spawn_local(async move {
+            while let Some(item) = outgoing_rx.recv().await {
+                match item {
+                    BufOut::Msg(msg) => {
+                        // Sleep BEFORE forwarding to make the race
+                        // deterministic in `current_thread`-flavour
+                        // tests: a plain `yield_now` would race with
+                        // whatever order the scheduler picks tasks
+                        // in, but a timer puts us back on the queue
+                        // strictly after a wall-clock delay, giving
+                        // the secondary's exit path time to drop
+                        // the wrapper (and abort us) BEFORE the
+                        // forward fires — exactly the production
+                        // SSH-tunnel-latency shape on the
+                        // RunComplete-after-natural-quiesce path.
+                        //
+                        // Without flush(): drop happens during the
+                        // sleep, the abort kills this task, the
+                        // inner_tx.send below never runs, the
+                        // workstation primary never receives the
+                        // message. With flush(): the secondary
+                        // awaits its flush rendezvous before
+                        // returning, so we observe the Flush marker
+                        // AFTER all preceding Msg writes have
+                        // forwarded (FIFO contract).
+                        tokio::time::sleep(
+                            std::time::Duration::from_millis(50),
+                        )
+                        .await;
+                        if inner_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    BufOut::Flush(ack) => {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+        BufferedPrimaryTransport {
+            outgoing_tx,
+            rx: inner_rx,
+            writer,
+        }
+    }
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        const N_SECONDARIES: usize = 4;
+        let secondary_ids: Vec<String> =
+            (0..N_SECONDARIES).map(|i| format!("sec-{i}")).collect();
+
+        let mut peer_transports: Vec<ChannelPeerTransport<TestId>> =
+            peer_mesh(&secondary_ids);
+
+        let discovered: Vec<TaskInfo<TestId>> = (0..5)
+            .map(|i| make_binary(&format!("bin-{i}"), 50 + i * 10))
+            .collect();
+        let total = discovered.len();
+        let phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>
+            = HashMap::new();
+
+        let mut pri_to_sec_txs: HashMap<String, _> = HashMap::new();
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        // Keep an extra incoming_tx clone alive in the test scope for the
+        // entire run. Production's `NetworkServer` does NOT report its
+        // receive end as closed merely because one WSS connection drops —
+        // it keeps the underlying mpsc open for the lifetime of the
+        // primary process. The default channel-transport test fixture
+        // (which `drop(incoming_tx)` after spawning forwarders) collapses
+        // the receive end the moment every secondary exits, masking the
+        // RunComplete-writer-flush race because the primary's
+        // operational loop exits via the "transport closed" arm instead
+        // of waiting on a `cluster_state.run_complete()` mirror update.
+        // Pinning the tx here makes the fixture model match production:
+        // the primary can only exit via the RunComplete branch, so the
+        // race is observable.
+        let _incoming_tx_pin = incoming_tx.clone();
+        let mut sec_handles: Vec<tokio::task::JoinHandle<(String, usize)>> = Vec::new();
+
+        for (idx, secondary_id) in secondary_ids.iter().enumerate() {
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            pri_to_sec_txs.insert(secondary_id.clone(), pri_to_sec_tx);
+
+            let tx = incoming_tx.clone();
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let peer_transport = peer_transports.remove(0);
+            let discovered_local = discovered.clone();
+            let phase_deps_local = phase_deps.clone();
+            let secondary_id_local = secondary_id.clone();
+            let max_res = dynrunner_core::ResourceMap::from(
+                [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+            );
+
+            let handle = tokio::task::spawn_local(async move {
+                let inner = ChannelPrimaryTransportEnd {
+                    tx: sec_to_pri_tx,
+                    rx: pri_to_sec_rx,
+                };
+                // Buffered wrap — every secondary's primary_transport
+                // now has a writer-task / Drop-aborts shape, so the
+                // RunComplete-writer-flush race is observable here.
+                let transport = wrap_buffered(inner);
+                let config = SecondaryConfig {
+                    secondary_id: secondary_id_local.clone(),
+                    num_workers: 2,
+                    max_resources: max_res,
+                    hostname: "test-host".into(),
+                    keepalive_interval: std::time::Duration::from_millis(50),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: std::time::Duration::from_secs(120),
+                    keepalive_miss_threshold: 3,
+                    retry_max_passes: 1,
+                    primary_link_failure_threshold: 5,
+                    primary_link_failure_window: std::time::Duration::from_secs(30),
+                    setup_deadline: std::time::Duration::from_secs(60),
+                    is_observer: false,
+                };
+                let mut secondary = SecondaryCoordinator::new(
+                    config,
+                    transport,
+                    peer_transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let mut factory = FakeWorkerFactory;
+                loop {
+                    match secondary.run_until_setup_or_done(&mut factory).await {
+                        Ok(RunOutcome::Done) => break,
+                        Ok(RunOutcome::SetupPending) => {
+                            secondary
+                                .ingest_setup_discovery(
+                                    discovered_local.clone(),
+                                    phase_deps_local.clone(),
+                                )
+                                .await
+                                .expect("ingest_setup_discovery succeeds");
+                        }
+                        Err(e) => panic!("sec-{idx}.run_until_setup_or_done: {e}"),
+                    }
+                }
+                (secondary_id_local, secondary.completed_count())
+            });
+            sec_handles.push(handle);
+        }
+        drop(incoming_tx);
+
+        let transport = ChannelSecondaryTransportEnd {
+            outgoing: pri_to_sec_txs,
+            incoming_rx,
+        };
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: N_SECONDARIES as u32,
+            connect_timeout: std::time::Duration::from_secs(10),
+            peer_timeout: std::time::Duration::from_secs(10),
+            keepalive_interval: std::time::Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: false,
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let (deps, ops, ope) = noop_phase_args();
+        let run_outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            primary.run(vec![], deps, ops, ope),
+        )
+        .await;
+
+        match run_outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "primary.run() returned an error on the buffered \
+                 multi-secondary natural-quiesce flow: {e}"
+            ),
+            Err(_elapsed) => panic!(
+                "primary.run() did not return within 10s — \
+                 RunComplete-writer-flush race regressed: the \
+                 promoted secondary exited before its buffered \
+                 primary_transport's writer task forwarded \
+                 RunComplete, the workstation primary never \
+                 observed run_complete=true on its CRDT mirror, \
+                 and the demoted-local operational loop's \
+                 partial-view guard held it indefinitely. \
+                 Expected: secondary awaits primary_transport.flush() \
+                 after broadcast, writer drains, primary observes \
+                 RunComplete, primary returns Ok(())."
+            ),
+        }
+
+        // The primary's `cluster_state` mirror must observe
+        // `run_complete()` — the direct assertion that the
+        // RunComplete actually crossed `primary_transport` and
+        // wasn't lost in the writer-task abort.
+        assert!(
+            primary.cluster_state_for_test().run_complete(),
+            "primary.cluster_state.run_complete() must be true: \
+             the promoted secondary's flush() must rendezvous with \
+             its primary_transport writer task BEFORE \
+             process_tasks returns, so the RunComplete reaches \
+             this primary's CRDT mirror across the buffered \
+             writer-task hop."
+        );
+
+        let outcome = primary.outcome_summary();
+        assert_eq!(
+            outcome.succeeded, total,
+            "every binary should reach Completed across the \
+             buffered-transport natural-quiesce run; outcome={outcome:?}"
+        );
+
+        drop(primary);
+        for handle in sec_handles {
+            let _ = handle.await;
+        }
+    }).await;
+}
+
 /// Regression for the asm-tokenizer `--jobs 4` 20/0/0/0 dispatch bias.
 ///
 /// Scenario: multi-secondary setup-promote on a real peer mesh,

@@ -495,6 +495,61 @@ where
                 // the same idempotency rationale.
                 let _ = self.primary_transport.send(msg.clone()).await;
                 let _ = self.peer_transport.broadcast(msg).await;
+                // Write-task termination race (asm-tokenizer Tier-2):
+                // for bridged transports (production `NetworkClient`),
+                // `send.await` only confirms the mpsc enqueue; the
+                // wire write happens asynchronously in the writer task
+                // and the `BridgedConnection::Drop` (triggered when
+                // `process_tasks` returns and the runtime tears down
+                // `SecondaryCoordinator`) aborts that writer
+                // mid-flush. The 20 prior TaskCompletes survived
+                // because subsequent loop iterations kept the runtime
+                // alive long enough for the writer to drain; the
+                // RunComplete is uniquely the FINAL message before
+                // exit, so the race always fires on it. The
+                // workstation primary then never sees `run_complete`
+                // and the submitter's operational loop hangs past
+                // its bounded timeout.
+                //
+                // `flush()` is the rendezvous primitive on the
+                // transport — for `NetworkClient` it round-trips a
+                // FIFO marker through the writer task and only
+                // returns after every previously-enqueued message
+                // has been pushed to the underlying socket. For
+                // direct-wire transports (channel transports, in-
+                // process WSS) the default no-op is correct.
+                //
+                // Bounded so a wedged writer task can't deadlock
+                // exit: indefinite/idle wait is the load-bearing
+                // bug class to eliminate, so any finite ceiling
+                // beats none. 10 s is comfortable headroom over
+                // worst-case TCP-over-SSH-tunnel flush latency
+                // (single-digit ms typical, hundreds of ms under
+                // network stress) while still bounded enough that
+                // a wedged writer task surfaces operationally
+                // rather than hangs the dispatch.
+                const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+                match tokio::time::timeout(
+                    FLUSH_DEADLINE,
+                    self.primary_transport.flush(),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        error = %e,
+                        "primary_transport.flush after RunComplete \
+                         broadcast returned an error; writer task may \
+                         have already torn down — proceeding to exit"
+                    ),
+                    Err(_) => tracing::warn!(
+                        deadline_s = FLUSH_DEADLINE.as_secs_f64(),
+                        "primary_transport.flush after RunComplete \
+                         broadcast did not return within deadline; \
+                         proceeding to exit anyway to avoid blocking \
+                         on a wedged writer"
+                    ),
+                }
             }
 
             // Run-complete exit: the primary broadcast
