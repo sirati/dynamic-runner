@@ -4600,7 +4600,7 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
 // drained exit (line ~206) in `operational_loop`. The flag is cleared
 // when the first `TaskAdded` or `RunComplete` mutation arrives via
 // `mirror_mutation_to_accounting`, re-enabling the historical exit
-// checks for the rest of the run. Legacy bootstrap
+// checks for the rest of the run. Pre-seeded bootstrap
 // (`required_setup_on_promote = false`) starts the flag at `false`, so
 // existing behaviour is unchanged — pinned by the second test below.
 
@@ -4769,7 +4769,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
     }).await;
 }
 
-/// T2 — legacy bootstrap exit semantics unchanged: with
+/// T2 — pre-seeded bootstrap exit semantics unchanged: with
 /// `required_setup_on_promote = false`, `setup_pending` starts at
 /// `false` and the counter-based exit at line ~193 of
 /// `operational_loop` fires immediately when
@@ -4778,7 +4778,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
 /// behaviour — no regression on the path where `seed_cluster_state`
 /// ran locally and `total_tasks` was non-zero at startup.
 #[tokio::test(flavor = "current_thread")]
-async fn legacy_bootstrap_counter_exit_unchanged() {
+async fn pre_seeded_counter_exit_unchanged() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let (transport, secondary_ends) = setup_test(1);
@@ -4794,7 +4794,7 @@ async fn legacy_bootstrap_counter_exit_unchanged() {
             keepalive_miss_threshold: 3,
             source_pre_staged_root: None,
             uses_file_based_items: true,
-            // Legacy bootstrap: `seed_cluster_state` ran locally, so
+            // Pre-seeded bootstrap: `seed_cluster_state` ran locally, so
             // `total_tasks` is set by `run()` from `binaries.len()`
             // and the counter-based exit must fire on the very first
             // iteration once completions cover the total.
@@ -4815,13 +4815,13 @@ async fn legacy_bootstrap_counter_exit_unchanged() {
             FixedEstimator(100),
         );
 
-        // Pin invariant: legacy path leaves `setup_pending = false`.
+        // Pin invariant: pre-seeded path leaves `setup_pending = false`.
         assert!(
             !primary.setup_pending,
             "setup_pending must default to false when required_setup_on_promote = false"
         );
 
-        // Legacy mid-run state: 2 tasks total, both already in the
+        // Pre-seeded mid-run state: 2 tasks total, both already in the
         // completed set (mirrors what would normally arrive via
         // TaskComplete handlers). No active workers. The counter
         // check on the first iteration is `2+0 >= 2 && 0 == 0` —
@@ -4852,25 +4852,25 @@ async fn legacy_bootstrap_counter_exit_unchanged() {
 
         match exit {
             Ok(Ok(())) => {
-                // Exit path pinning: still on the legacy counter-based
+                // Exit path pinning: still on the pre-seeded counter-based
                 // exit. `setup_pending` stayed false the entire time
                 // (no TaskAdded / RunComplete arrived to clear it),
                 // and `cluster_state.run_complete()` was never set.
                 assert!(
                     !primary.setup_pending,
-                    "legacy bootstrap must not flip setup_pending true at any point"
+                    "pre-seeded bootstrap must not flip setup_pending true at any point"
                 );
                 assert!(
                     !primary.cluster_state_for_test().run_complete(),
-                    "legacy bootstrap exit must be via the counter check, \
+                    "pre-seeded bootstrap exit must be via the counter check, \
                      not via the cluster_state.run_complete() branch"
                 );
             }
             Ok(Err(e)) => panic!(
-                "operational_loop returned Err in legacy bootstrap scenario: {e}"
+                "operational_loop returned Err in pre-seeded bootstrap scenario: {e}"
             ),
             Err(_) => panic!(
-                "legacy bootstrap operational_loop did not exit within 5s \
+                "pre-seeded bootstrap operational_loop did not exit within 5s \
                  despite the counter check `2+0 >= 2 && active_workers == 0` \
                  being satisfied on the first iteration — regression on the \
                  historical exit semantics"

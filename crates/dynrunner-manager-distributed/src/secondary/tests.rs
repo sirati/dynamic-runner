@@ -1831,14 +1831,16 @@ mod setup_promote_discriminator {
             .await;
     }
 
-    /// Reason 1: legacy bootstrap. The submitter pre-seeded the local
-    /// ledger before sending PromotePrimary. `required_setup` is false
-    /// (the new field defaults to false on missing-wire-field shapes
-    /// too via `#[serde(default)]`, so this is byte-compatible with
-    /// pre-Step-10 senders). The handler hydrates the pool from
-    /// cluster_state at promotion time; no discovery, no broadcasts.
+    /// Reason 1: pre-seeded bootstrap (`required_setup_on_promote =
+    /// false` — submitter did discovery + pre-seeded the local
+    /// ledger before sending PromotePrimary). `required_setup` is
+    /// false (the new field defaults to false on missing-wire-field
+    /// shapes too via `#[serde(default)]`, so this is byte-
+    /// compatible with pre-Step-10 senders). The handler hydrates
+    /// the pool from cluster_state at promotion time; no discovery,
+    /// no broadcasts.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_legacy_bootstrap_promote_does_not_run_discovery() {
+    async fn test_pre_seeded_promote_does_not_run_discovery() {
         let _ = tracing_subscriber::fmt::try_init();
         let local = tokio::task::LocalSet::new();
         local
@@ -1888,11 +1890,11 @@ mod setup_promote_discriminator {
                 let new_task_added = count_task_added_mutations(&peer_log);
                 assert_eq!(
                     new_task_added, 0,
-                    "legacy bootstrap path must NOT originate new TaskAdded broadcasts"
+                    "pre-seeded promotion path must NOT originate new TaskAdded broadcasts"
                 );
                 assert_eq!(
                     broadcasts_before, broadcasts_after,
-                    "no peer-side traffic from a legacy-bootstrap promotion"
+                    "no peer-side traffic from a pre-seeded promotion"
                 );
             })
             .await;

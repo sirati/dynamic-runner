@@ -141,8 +141,9 @@ pub struct PrimaryConfig {
     /// This is the *intent* flag; the wire field is the discriminator
     /// the secondary actually keys off (see
     /// `DistributedMessage::PromotePrimary.required_setup` for the
-    /// three-reason classification — legacy bootstrap, setup-promote,
-    /// failover). Failover election deliberately ignores this field:
+    /// three-reason classification — pre-seeded bootstrap, setup-
+    /// promote, failover). Failover election deliberately ignores
+    /// this field:
     /// at election time the local ledger is already non-empty, so
     /// re-running discovery would double-seed.
     pub required_setup_on_promote: bool,
