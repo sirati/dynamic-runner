@@ -357,6 +357,67 @@ where
                         "another secondary promoted to primary"
                     );
                 }
+                // Immediate repoll: every idle worker re-issues its
+                // pending TaskRequest at the freshly-identified
+                // primary instead of waiting up to a keepalive
+                // interval for the periodic `repoll_idle_workers`
+                // tick. The race this closes:
+                //
+                //   1. Process-tasks entry's for-loop sends an
+                //      initial TaskRequest for each idle worker. At
+                //      that point `primary_link.current_primary() ==
+                //      None`, so the request routes via
+                //      `primary_transport.send` to the original
+                //      submitter (the still-live demoted local
+                //      primary).
+                //   2. The demoted local's `handle_task_request`
+                //      skips the local-assign branch (`!self.demoted`
+                //      gate) and tries to relay via
+                //      `peer_transport.send(Address::Role(Primary),
+                //      msg)`. Pre-PromotePrimary the role-table cache
+                //      is empty — the relay drops with the warn line
+                //      "Address::Role(Primary) unresolvable:
+                //      role-table cache empty for this role".
+                //   3. `note_request_sent` already bumped the
+                //      requesting worker's backoff window; the
+                //      worker is now silent until the next
+                //      `repoll_idle_workers` tick — up to a full
+                //      `keepalive_interval` (5s on the production
+                //      default).
+                //   4. Meanwhile the promoted secondary's own two
+                //      workers self-assign synchronously from its
+                //      newly-hydrated `primary_pending` in the same
+                //      process-tasks for-loop and burn through small
+                //      workloads (e.g. 20 binaries × ~0.1s each)
+                //      well inside the 5s window — peer secondaries
+                //      observe zero TaskAssignments.
+                //
+                // Repolling here (after `on_primary_changed` has
+                // cleared per-worker backoff AND installed the new
+                // routing target) gives every idle worker an
+                // immediate retry against the fresh route. For the
+                // promoted secondary the repoll self-assigns from
+                // its own pool; for peers it routes via
+                // `peer_transport.send_to_peer(promoted_id, msg)`.
+                //
+                // Gated on `!self.setup_pending` because the
+                // setup-promote-promoted path is about to yield to
+                // the wrapper for discovery — the local pool is
+                // empty and there's no primary to poll yet. The
+                // wrapper-driven re-entry into `process_tasks`
+                // will run the entry for-loop (`request_task_for_worker`
+                // for every idle worker) after the pool hydrates,
+                // covering that case without needing a repoll here.
+                //
+                // 20/0/0/0-style distribution on small workloads was
+                // a pre-existing efficiency artifact masked by the
+                // larger run-completion bug in `a78c89c` — see
+                // `b1ecc53`'s commit message for the run-complete
+                // hang fix. This repoll closes the structural race
+                // independent of that fix.
+                if !self.setup_pending {
+                    self.repoll_idle_workers().await;
+                }
                 Ok(())
             }
             DistributedMessage::TaskComplete {
