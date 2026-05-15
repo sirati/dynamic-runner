@@ -107,6 +107,14 @@ pub(crate) struct PyObserverLateJoiner {
     /// build them would be a wasted excursion.
     topology: LoadedTopology,
     distributed_config: DistributedConfig,
+    /// Optional Python peer-lifecycle listener supplied at `__init__`.
+    /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;
+    /// bridged through
+    /// `crate::peer_lifecycle_bridge::PyPeerLifecycleListener` and
+    /// registered on the inner observer-mode `SecondaryCoordinator`
+    /// at `run()` start. Constructor-only; see the matching field
+    /// on `PyPrimaryCoordinator` for the rationale.
+    peer_lifecycle_listener: Option<Py<PyAny>>,
     completed: u32,
 }
 
@@ -118,12 +126,14 @@ impl PyObserverLateJoiner {
         task_definition,
         observer_id = None,
         distributed_config = None,
+        peer_lifecycle_listener = None,
     ))]
     fn new(
         peer_info_dir: PathBuf,
         task_definition: &Bound<'_, PyAny>,
         observer_id: Option<String>,
         distributed_config: Option<DistributedConfig>,
+        peer_lifecycle_listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         // Default observer-id includes a small random suffix so two
@@ -146,6 +156,7 @@ impl PyObserverLateJoiner {
             peer_info_dir,
             topology,
             distributed_config: distributed_config.unwrap_or_default(),
+            peer_lifecycle_listener,
             completed: 0,
         })
     }
@@ -193,6 +204,16 @@ impl PyObserverLateJoiner {
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
         let dist_setup_deadline = self.distributed_config.setup_deadline();
+        // Take the Python peer-lifecycle listener (if any) out of
+        // `self` so it can move into the detached tokio runtime.
+        // Wrapped through `PyPeerLifecycleListener::new` into a
+        // `Box<dyn LifecycleListener>` at the boundary so the
+        // manager-distributed registration API stays
+        // PyO3-agnostic.
+        let peer_lifecycle_listener =
+            self.peer_lifecycle_listener
+                .take()
+                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         let result: Result<u32, PyErr> = py.detach(|| -> Result<u32, PyErr> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -323,6 +344,16 @@ impl PyObserverLateJoiner {
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );
+
+                // Register the Python peer-lifecycle listener (if any)
+                // BEFORE `run_until_setup_or_done` enters — the
+                // coordinator's `register_lifecycle_listener` contract
+                // requires pre-run registration because the listener
+                // vector is `mem::take`-d into the spawned dispatcher
+                // on first entry.
+                if let Some(listener) = peer_lifecycle_listener {
+                    secondary.register_lifecycle_listener(listener);
+                }
 
                 // CertExchange path is skipped (setup_phase_completed
                 // latched true), but PeerInfo broadcasts that arrive

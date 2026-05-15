@@ -12,9 +12,10 @@
 
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_core::{BoundedString, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
-    Address, DistributedMessage, PeerTransport, Scope, SecondaryTransport,
+    Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
+    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -151,11 +152,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     /// Take in-flight tasks back, drop the secondary from the routable set,
-    /// and broadcast a `TimeoutDetected` to every surviving secondary so
-    /// they can prune the dead peer from their own peer maps.
+    /// originate a `ClusterMutation::PeerRemoved` carrying `cause` (the
+    /// primary is the sole authoritative author of `PeerRemoved` — every
+    /// invocation of this hook fires the mutation post-`secondaries.remove`
+    /// so receivers learn about the death via the replicated ledger), and
+    /// broadcast a `TimeoutDetected` to every surviving secondary so they
+    /// can prune the dead peer from their own peer maps.
     pub(super) async fn requeue_dead_secondary(
         &mut self,
         dead: DeadSecondary,
+        cause: RemovalCause,
     ) -> Result<(), String> {
         let DeadSecondary {
             secondary_id,
@@ -207,6 +213,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
+
+        // Authoritative origination: the primary is the sole writer of
+        // `PeerRemoved` for a dead secondary. Goes through the canonical
+        // `apply_and_broadcast_cluster_mutations` helper so the local
+        // CRDT mirror flips in the same call as the wire fan-out and
+        // the apply+filter semantics stay consistent with every other
+        // primary-originated mutation. Secondaries do NOT broadcast
+        // `PeerRemoved`; they observe and apply ours.
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerRemoved {
+            id: secondary_id.clone(),
+            cause,
+        }])
+        .await;
 
         if self
             .primary_id
@@ -323,7 +342,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "mass-death grace expired without keepalive recovery; \
                  escalating to actual death"
             );
-            self.requeue_dead_secondary(dead).await?;
+            self.requeue_dead_secondary(dead, RemovalCause::MassDeathEscalation)
+                .await?;
         }
 
         // Step 2: process newly-dead secondaries (fresh entries from
@@ -369,7 +389,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // Independent / partial death. Per-secondary requeue as
             // before — these really are dead, not a correlated blip.
             for dead in new_dead {
-                self.requeue_dead_secondary(dead).await?;
+                self.requeue_dead_secondary(dead, RemovalCause::KeepaliveMiss)
+                    .await?;
             }
         }
         Ok(())
@@ -414,7 +435,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             secondary_id,
             last_keepalive,
         };
-        self.requeue_dead_secondary(dead).await
+        // `BoundedString::from` truncates oversized inputs at the
+        // 1 KiB cap that `RemovalCause::FatalError` carries, so a
+        // misbehaving secondary cannot force unbounded allocation on
+        // receivers via the cause payload.
+        let cause = RemovalCause::FatalError(BoundedString::from(error));
+        self.requeue_dead_secondary(dead, cause).await
     }
 }
 
@@ -423,8 +449,8 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use dynrunner_core::{TaskInfo, PhaseId, ResourceMap, TypeId};
-    use dynrunner_protocol_primary_secondary::DistributedMessage;
+    use dynrunner_core::{BoundedString, TaskInfo, PhaseId, ResourceMap, TypeId};
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, RemovalCause};
     use dynrunner_scheduler::ResourceStealingScheduler;
     use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
     use serde::{Deserialize, Serialize};
@@ -578,7 +604,10 @@ mod tests {
         assert_eq!(report.dead[0].secondary_id, "dead-sec");
 
         for dead in report.dead {
-            primary.requeue_dead_secondary(dead).await.unwrap();
+            primary
+                .requeue_dead_secondary(dead, RemovalCause::KeepaliveMiss)
+                .await
+                .unwrap();
         }
 
         assert_eq!(primary.workers.len(), 0, "dead worker should be evicted");
@@ -829,6 +858,268 @@ mod tests {
         assert_eq!(primary.workers.len(), 0, "all workers evicted");
         assert_eq!(primary.pool().len(), 2, "both tasks requeued");
         assert!(primary.secondaries.is_empty());
+    }
+
+    /// Drain `rx` non-blockingly and return every `PeerRemoved` mutation
+    /// observed in any `DistributedMessage::ClusterMutation` batch. The
+    /// primary's `apply_and_broadcast_cluster_mutations` helper fans the
+    /// broadcast across the transport's outgoing channel map, so any
+    /// receiver wired to that map sees the same payload. Used by the
+    /// PeerRemoved-origination tests to inspect the mutation primary
+    /// authored on death.
+    fn collect_peer_removed(
+        rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    ) -> Vec<(String, RemovalCause)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                for m in mutations {
+                    if let ClusterMutation::PeerRemoved { id, cause } = m {
+                        out.push((id, cause));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Independent / partial-death path: a single secondary misses the
+    /// keepalive threshold while peers stay alive. The primary
+    /// originates one `PeerRemoved { cause: KeepaliveMiss }` per dead
+    /// secondary. Pins the call-site cause wiring (`process_heartbeat_tick`
+    /// else-branch).
+    #[tokio::test(flavor = "current_thread")]
+    async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
+        let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            PrimaryCoordinator::new(
+                config_with_mass_death(
+                    Duration::from_millis(50),
+                    2,
+                    Duration::from_secs(60),
+                    2,
+                ),
+                transport,
+                dynrunner_transport_quic::NoPeerTransport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+        install_default_pool(&mut primary);
+        register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+        register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
+
+        // Only sec-a misses the deadline (sec-b is refreshed below), so
+        // the mass-death rule does NOT trip and the else-branch runs.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        primary.record_keepalive("sec-b");
+        primary.process_heartbeat_tick().await.unwrap();
+
+        // Drain BOTH receivers — broadcast goes to every entry in the
+        // outgoing map. Either drain sees the same PeerRemoved payload;
+        // we read sec-b's because the dead one's channel may still be
+        // sending its TimeoutDetected first.
+        let removed_a = collect_peer_removed(&mut sec_rxs[0]);
+        let removed_b = collect_peer_removed(&mut sec_rxs[1]);
+        let merged = if !removed_b.is_empty() { removed_b } else { removed_a };
+        assert_eq!(
+            merged.len(),
+            1,
+            "exactly one PeerRemoved must originate per single death; got {merged:?}",
+        );
+        assert_eq!(merged[0].0, "sec-a");
+        assert_eq!(merged[0].1, RemovalCause::KeepaliveMiss);
+    }
+
+    /// Mass-death finalize path: every connected secondary goes silent
+    /// at the same tick → defer; after the grace window elapses without
+    /// recovery, the primary escalates each deferred entry to actual
+    /// death and originates `PeerRemoved { cause: MassDeathEscalation }`.
+    /// Pins the call-site cause wiring (mass-death finalize loop).
+    ///
+    /// Real-time sleeps (not paused tokio time) because the heartbeat
+    /// path measures via `std::time::Instant::now`, which
+    /// `tokio::time::advance` doesn't move.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_cause() {
+        let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            PrimaryCoordinator::new(
+                config_with_mass_death(
+                    Duration::from_millis(50),
+                    2,
+                    Duration::from_millis(200),
+                    2,
+                ),
+                transport,
+                dynrunner_transport_quic::NoPeerTransport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+        install_default_pool(&mut primary);
+        register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+        register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
+
+        // First tick: both silent past the deadline → deferred, no
+        // PeerRemoved authored yet (the entry-deferral path is silent
+        // per the operative rule).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        primary.process_heartbeat_tick().await.unwrap();
+        assert_eq!(primary.pending_mass_death.len(), 2, "both deferred");
+        assert!(
+            collect_peer_removed(&mut sec_rxs[0]).is_empty(),
+            "entry-deferral must not author PeerRemoved (operative rule)"
+        );
+        assert!(
+            collect_peer_removed(&mut sec_rxs[1]).is_empty(),
+            "entry-deferral must not author PeerRemoved (operative rule)"
+        );
+
+        // Sleep past the grace window without recovery → finalize.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        primary.process_heartbeat_tick().await.unwrap();
+
+        // One PeerRemoved per finalized secondary, all carrying
+        // MassDeathEscalation. Both receivers receive each broadcast
+        // (broadcast iterates the outgoing map), so reading either is
+        // sufficient — drain both and merge.
+        let mut removed = collect_peer_removed(&mut sec_rxs[0]);
+        removed.extend(collect_peer_removed(&mut sec_rxs[1]));
+        // De-dup by id (each finalize broadcasts once; both channels
+        // see the same broadcast).
+        removed.sort_by(|a, b| a.0.cmp(&b.0));
+        removed.dedup();
+        assert_eq!(
+            removed.len(),
+            2,
+            "one PeerRemoved per finalized secondary; got {removed:?}"
+        );
+        for (_, cause) in &removed {
+            assert_eq!(*cause, RemovalCause::MassDeathEscalation);
+        }
+        let ids: std::collections::HashSet<&str> =
+            removed.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(ids.contains("sec-a"));
+        assert!(ids.contains("sec-b"));
+    }
+
+    /// Fatal-error path: a secondary explicitly reports a fatal error.
+    /// The primary originates `PeerRemoved { cause: FatalError(<msg>) }`
+    /// using `BoundedString::from(error)`. Oversized error strings are
+    /// truncated at the 1 KiB cap that `RemovalCause::FatalError`
+    /// carries, so a misbehaving secondary can't force unbounded
+    /// allocation on receivers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
+        let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            PrimaryCoordinator::new(
+                config(Duration::from_millis(50), 2),
+                transport,
+                dynrunner_transport_quic::NoPeerTransport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+        install_default_pool(&mut primary);
+        register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+        register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
+
+        // Build an oversized error payload so the truncation guarantee
+        // is exercised end-to-end (not just in the BoundedString unit
+        // test).
+        let huge = "x".repeat(4096);
+        let fatal = DistributedMessage::<TestId>::SecondaryFatalError {
+            sender_id: "sec-a".into(),
+            timestamp: 0.0,
+            secondary_id: "sec-a".into(),
+            error: huge,
+        };
+        primary.handle_secondary_fatal_error(fatal).await.unwrap();
+
+        let mut removed = collect_peer_removed(&mut sec_rxs[0]);
+        removed.extend(collect_peer_removed(&mut sec_rxs[1]));
+        removed.sort_by(|a, b| a.0.cmp(&b.0));
+        removed.dedup();
+        assert_eq!(removed.len(), 1, "exactly one PeerRemoved authored");
+        assert_eq!(removed[0].0, "sec-a");
+        match &removed[0].1 {
+            RemovalCause::FatalError(s) => {
+                // BoundedString<1024> truncates at construction; the
+                // oversized input must be capped on the wire payload.
+                assert_eq!(
+                    s.as_ref().len(),
+                    1024,
+                    "FatalError diagnostic must be truncated to 1024 bytes; \
+                     got {} bytes",
+                    s.as_ref().len()
+                );
+                let expected: String = std::iter::repeat('x').take(1024).collect();
+                assert_eq!(s.as_ref(), expected);
+            }
+            other => panic!("expected FatalError cause; got {other:?}"),
+        }
+        // Silence unused-import warning for BoundedString — the
+        // truncation invariant is checked via length above, but the
+        // type itself is the load-bearing piece for that invariant.
+        let _: BoundedString<1024> = BoundedString::from("anchor");
+    }
+
+    /// Negative pin (operative rule: "PeerRemoved fires only post-
+    /// mass-death-grace"): while a secondary is deferred during the
+    /// mass-death grace window, NO `PeerRemoved` mutation is authored.
+    /// The hook fires only on the finalize path (covered by the
+    /// `MassDeathEscalation` test above); a recovery during the grace
+    /// window drops the deferred entry silently.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
+        let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            PrimaryCoordinator::new(
+                config_with_mass_death(
+                    Duration::from_millis(50),
+                    2,
+                    Duration::from_secs(60),
+                    2,
+                ),
+                transport,
+                dynrunner_transport_quic::NoPeerTransport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator,
+            );
+        install_default_pool(&mut primary);
+        register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+        register_operational_secondary(&mut primary, "sec-b", 1, "victim-b");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        primary.process_heartbeat_tick().await.unwrap();
+        assert_eq!(
+            primary.pending_mass_death.len(),
+            2,
+            "both deferred — neither requeued nor evicted"
+        );
+
+        // The entry-deferral path is silent: no PeerRemoved on EITHER
+        // receiver. If one ever fires here we'd duplicate-author with
+        // the finalize path AND break the recovery contract (a peer
+        // that recovers during grace must look as if it never died).
+        let from_a = collect_peer_removed(&mut sec_rxs[0]);
+        let from_b = collect_peer_removed(&mut sec_rxs[1]);
+        assert!(
+            from_a.is_empty() && from_b.is_empty(),
+            "entry-deferral must not author PeerRemoved; a={from_a:?} b={from_b:?}"
+        );
+
+        // Recovery during grace also stays silent: drop the pending
+        // entry, no PeerRemoved on either channel.
+        primary.record_keepalive("sec-a");
+        primary.process_heartbeat_tick().await.unwrap();
+        assert!(!primary.pending_mass_death.contains_key("sec-a"));
+        let from_a = collect_peer_removed(&mut sec_rxs[0]);
+        let from_b = collect_peer_removed(&mut sec_rxs[1]);
+        assert!(
+            from_a.is_empty() && from_b.is_empty(),
+            "grace-window recovery must not author PeerRemoved; \
+             a={from_a:?} b={from_b:?}"
+        );
     }
 
     /// A secondary that's still sending keepalives stays in the routable

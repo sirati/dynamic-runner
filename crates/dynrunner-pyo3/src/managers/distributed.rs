@@ -64,6 +64,20 @@ pub(crate) struct PyDistributedManager {
     /// distributed in-process pipeline drives a primary; secondaries
     /// don't fire user-visible phase hooks.
     task_definition: Py<PyAny>,
+    /// Optional Python peer-lifecycle listener supplied at `__init__`.
+    /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;
+    /// bridged through
+    /// `crate::peer_lifecycle_bridge::PyPeerLifecycleListener` and
+    /// registered on the in-process primary at `run()` start. The
+    /// in-process secondaries do NOT get the listener — the manager
+    /// pyclass represents one cluster's worth of events, and the
+    /// primary's `cluster_state` apply path is the canonical
+    /// emitter (the per-secondary mirrors fire the same events from
+    /// their own apply paths; routing them all to the same listener
+    /// would deliver N+1 copies of each peer membership change).
+    /// Constructor-only — see the matching field on
+    /// `PyPrimaryCoordinator` for the rationale.
+    peer_lifecycle_listener: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -83,6 +97,7 @@ impl PyDistributedManager {
         distributed_config = None,
         max_resources_per_secondary = None,
         source_pre_staged_root = None,
+        peer_lifecycle_listener = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -99,6 +114,7 @@ impl PyDistributedManager {
         distributed_config: Option<DistributedConfig>,
         max_resources_per_secondary: Option<PyResourceMap>,
         source_pre_staged_root: Option<PathBuf>,
+        peer_lifecycle_listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -140,6 +156,7 @@ impl PyDistributedManager {
             stranded: 0,
             source_pre_staged_root,
             task_definition: task_definition.clone().unbind(),
+            peer_lifecycle_listener,
         })
     }
 
@@ -234,6 +251,19 @@ impl PyDistributedManager {
                 self.task_definition.clone_ref(py),
             ),
         );
+
+        // Take the Python peer-lifecycle listener (if any) out of
+        // `self` so it can move into the detached tokio runtime.
+        // Wrapped through `PyPeerLifecycleListener::new` into a
+        // `Box<dyn LifecycleListener>` at the boundary so the
+        // manager-distributed registration API stays
+        // PyO3-agnostic. The in-process secondaries do NOT receive
+        // the listener (see the field doc on
+        // `peer_lifecycle_listener`).
+        let peer_lifecycle_listener =
+            self.peer_lifecycle_listener
+                .take()
+                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -475,6 +505,15 @@ impl PyDistributedManager {
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );
+
+                // Register the Python peer-lifecycle listener (if any)
+                // BEFORE the primary's `run()` enters — the
+                // coordinator's `register_lifecycle_listener` contract
+                // requires pre-run registration because the listener
+                // vector is `mem::take`-d into the spawned dispatcher.
+                if let Some(listener) = peer_lifecycle_listener {
+                    primary.register_lifecycle_listener(listener);
+                }
 
                 // Initial staging is now driven by
                 // `PrimaryCoordinator::run` itself: with
