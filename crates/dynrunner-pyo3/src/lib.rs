@@ -32,6 +32,7 @@ use gateway::local::PyLocalGateway;
 use managers::distributed::PyDistributedManager;
 use managers::factory_callback::{PyCallbackResourceMonitor, PyCallbackWorkerFactory};
 use managers::local::PyLocalManager;
+use managers::multi_process_respawner::PyMultiProcessSpawner;
 use managers::observer_late_joiner::{run_observer_late_joiner, PyObserverLateJoiner};
 use managers::primary::PyPrimaryCoordinator;
 use managers::primary_handle::PyPrimaryHandle;
@@ -78,6 +79,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDistributedManager>()?;
     m.add_class::<PyPrimaryCoordinator>()?;
     m.add_class::<PyPrimaryHandle>()?;
+    m.add_class::<PyMultiProcessSpawner>()?;
     m.add_class::<PyRustSlurmJobManager>()?;
     m.add_class::<PySecondaryCoordinator>()?;
     m.add_class::<PyObserverLateJoiner>()?;

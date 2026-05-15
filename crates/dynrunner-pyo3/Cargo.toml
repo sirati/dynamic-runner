@@ -13,7 +13,21 @@ readme.workspace       = true
 
 [lib]
 name = "_native"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Default for the maturin/cdylib build: the host Python interpreter
+# provides the C-API symbols at import time, so the cdylib must NOT
+# link against `libpython` (that's what `pyo3/extension-module` does).
+# Production wheel builds keep the default features.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+# Opt-in for `cargo test`: drop `extension-module` (which strips the
+# `libpython` link) and add `auto-initialize` so PyO3 brings up a
+# CPython interpreter on first `Python::attach`. Run as
+# `cargo test -p dynrunner-pyo3 --lib --no-default-features
+#   --features test-with-python <pattern>`.
+test-with-python = ["pyo3/auto-initialize"]
 
 [dependencies]
 dynrunner-core = { workspace = true }
@@ -39,6 +53,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 nix = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
