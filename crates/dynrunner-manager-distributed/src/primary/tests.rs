@@ -50,6 +50,7 @@ async fn single_secondary_processes_all_tasks() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -106,6 +107,7 @@ async fn two_secondaries_distribute_work() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -199,6 +201,7 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -341,6 +344,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -584,6 +588,7 @@ async fn setup_promote_run_with_retry_success_completes_via_runcomplete() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -887,6 +892,7 @@ async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary = PrimaryCoordinator::new(
             config,
@@ -1258,6 +1264,7 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary = PrimaryCoordinator::new(
             config,
@@ -1502,6 +1509,7 @@ async fn setup_promote_multi_secondary_distributes_to_idle_peers_on_promote() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary = PrimaryCoordinator::new(
             config,
@@ -1641,6 +1649,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -1728,6 +1737,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -1838,6 +1848,7 @@ async fn retry_max_passes_zero_disables_retry() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -2105,6 +2116,7 @@ async fn e2e_primary_and_secondary_single_node() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -2185,6 +2197,7 @@ async fn e2e_primary_and_two_secondaries() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -2261,6 +2274,7 @@ async fn live_distribution_continues_past_initial_batch() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -2322,6 +2336,7 @@ async fn notify_stage_file_emits_wire_message() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
@@ -2462,6 +2477,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 mass_death_grace: std::time::Duration::ZERO,
                 mass_death_min_count: 2,
                 source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -2612,6 +2628,7 @@ async fn e2e_pre_staged_source_mode() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -2694,6 +2711,7 @@ async fn e2e_uses_file_based_items_false() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -2794,6 +2812,7 @@ async fn e2e_per_type_max_concurrent() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -2942,6 +2961,7 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 mass_death_grace: std::time::Duration::ZERO,
                 mass_death_min_count: 2,
                 source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -3223,6 +3243,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -3361,6 +3382,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -3515,6 +3537,7 @@ async fn demoted_primary_suppresses_taskrequest_relay_after_promotion() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -3773,6 +3796,7 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -3909,6 +3933,7 @@ async fn run_with_initial_staging_succeeds() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -3990,6 +4015,7 @@ async fn stranded_count_is_zero_on_clean_run() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -4184,6 +4210,7 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -4300,6 +4327,7 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -4415,6 +4443,7 @@ async fn drain_pending_messages_updates_completed_set() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -4505,6 +4534,7 @@ async fn clean_run_does_not_false_positive_stranded() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -4615,6 +4645,7 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -4744,6 +4775,7 @@ async fn demoted_primary_exits_on_run_complete_broadcast() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -4863,6 +4895,7 @@ async fn demoted_primary_exits_on_clean_completion() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -5036,6 +5069,7 @@ async fn step6_demoted_primary_observes_cluster_mutation_via_recv_peer_arm() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -5239,6 +5273,7 @@ async fn step6_demoted_primary_stays_alive_when_legacy_transport_closes_but_peer
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -5344,6 +5379,7 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
                 mass_death_grace: std::time::Duration::ZERO,
                 mass_death_min_count: 2,
                 source_dir: None,
+                unfulfillable_reinject_max_per_task: None,
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -5506,6 +5542,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -5672,6 +5709,7 @@ async fn pre_seeded_counter_exit_unchanged() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -5814,6 +5852,7 @@ async fn demoted_primary_ignores_partial_crdt_view_waits_for_run_complete() {
             mass_death_grace: std::time::Duration::ZERO,
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,

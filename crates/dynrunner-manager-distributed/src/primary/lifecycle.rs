@@ -189,6 +189,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         let mut transport_closed = false;
         let mut peer_transport_closed = false;
 
+        // Cross-thread command-channel receiver. Owned locally for the
+        // duration of the loop so the `&mut self.command_rx` borrow
+        // doesn't conflict with the per-arm handlers' `&mut self`. Put
+        // back on `self` at loop exit so subsequent operational-loop
+        // entries (retry passes) re-attach to the same channel — the
+        // PyO3 `PrimaryHandle` only clones the sender once before
+        // `run()` starts and expects its commands to keep being
+        // serviced across retry pass boundaries.
+        let mut command_rx = self.command_rx.take();
+
         loop {
             // Check termination: all tasks accounted for AND no
             // worker is mid-dispatch. Both halves of the check are
@@ -453,6 +463,45 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         }
                     }
                 }
+                cmd = async {
+                    match command_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // No command channel attached — park forever
+                        // so this arm never fires. A `None` from the
+                        // `recv()` future would otherwise hot-loop the
+                        // select! the same way a closed mpsc would.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match cmd {
+                        Some(command) => {
+                            // Delegate to the per-variant handler.
+                            // Each handler owns its CRDT broadcast and
+                            // its oneshot reply, so the call site stays
+                            // a single line and the operational loop's
+                            // arm shape stays transport-pure.
+                            super::command_channel::handle_primary_command(
+                                self,
+                                command,
+                            )
+                            .await;
+                        }
+                        None => {
+                            // All senders dropped. Drop the receiver
+                            // locally; the loop's other arms keep
+                            // driving exit conditions. Pre-Step-N this
+                            // arm didn't exist, so a `None` here is
+                            // semantically the same as the pre-Step-N
+                            // behaviour (no external control plane).
+                            command_rx = None;
+                            tracing::debug!(
+                                "command channel closed; disabling \
+                                 PrimaryCommand arm for the remainder \
+                                 of the loop"
+                            );
+                        }
+                    }
+                }
                 peer_msg = self.peer_transport.recv_peer(), if !peer_transport_closed => {
                     match peer_msg {
                         Some(m) => {
@@ -553,6 +602,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 }
             }
         }
+
+        // Return the command-channel receiver to `self` so subsequent
+        // operational-loop entries (retry passes) re-attach. Without
+        // this, the second pass would see `command_rx = None` and the
+        // PyO3 `PrimaryHandle` calls would be silently dropped from the
+        // moment the first pass exits.
+        self.command_rx = command_rx;
 
         Ok(())
     }

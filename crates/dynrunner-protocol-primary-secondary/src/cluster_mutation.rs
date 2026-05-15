@@ -55,4 +55,37 @@ pub enum ClusterMutation<I> {
     /// drained` so the post-promotion residual peers all exit
     /// shortly after the primary returns.
     RunComplete,
+    /// External-control reinjection: the primary's
+    /// `PrimaryHandle::reinject_task` accepts a hash whose ledger
+    /// state is `Failed { NonRecoverable, ... }` (the
+    /// "operator-resolvable failure" class, e.g. unfulfillable
+    /// resource request) and transitions the task back to `Pending`
+    /// so the next dispatch tick re-attempts it. Broadcast so every
+    /// node's CRDT mirror moves the entry off `Failed` synchronously
+    /// with the originator; the live primary's pool then picks the
+    /// hash up via the standard reinject path.
+    ///
+    /// Re-application is a no-op when the local state isn't
+    /// `Failed`. Carries no error/attempts payload: the entry's
+    /// previous `last_error`/`attempts` belong to the pre-reinject
+    /// failure attempt and are reset.
+    TaskReinjected { hash: String },
+    /// External-control update of the per-task preferred-secondaries
+    /// list. The Phase-4 dispatch policy consults this field when
+    /// picking a worker; this mutation lets external control planes
+    /// (PyO3 `PrimaryHandle::update_preferred_secondaries`, future
+    /// scheduler advisories) update it mid-run.
+    ///
+    /// NOTE: the per-task `preferred_secondaries` storage on
+    /// `TaskInfo` and the dispatch-side consumer of this mutation
+    /// land with the Phase-4 preferred-secondaries field. This
+    /// variant exists today so the command-channel ingress is
+    /// wireable end-to-end; the apply side is a typed NoOp until
+    /// Phase-4 lands.
+    // TODO(phase-4): consume on the apply side once
+    // `TaskInfo.preferred_secondaries` exists.
+    TaskPreferredSecondariesUpdated {
+        hash: String,
+        secondaries: Vec<String>,
+    },
 }

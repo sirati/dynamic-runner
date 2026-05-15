@@ -681,6 +681,38 @@ impl<I: Identifier> ClusterState<I> {
                 self.run_complete = true;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::TaskReinjected { hash } => {
+                // External-control reinjection moves a
+                // `Failed { NonRecoverable, .. }` entry back to
+                // `Pending`. Any other state is a NoOp so out-of-
+                // order delivery and post-completion re-applies
+                // can't regress the ledger.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                let task = match state {
+                    TaskState::Failed { kind, task, .. }
+                        if matches!(kind, ErrorType::NonRecoverable) =>
+                    {
+                        task.clone()
+                    }
+                    _ => return ApplyOutcome::NoOp,
+                };
+                *state = TaskState::Pending { task };
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries: _ } => {
+                // TODO(phase-4): apply onto
+                // `TaskInfo.preferred_secondaries` once the field
+                // exists. Today the variant exists so the command
+                // channel can broadcast it end-to-end; the storage
+                // side is part of the Phase-4 preferred-secondaries
+                // landing.
+                if !self.tasks.contains_key(&hash) {
+                    return ApplyOutcome::NoOp;
+                }
+                ApplyOutcome::Applied
+            }
         }
     }
 

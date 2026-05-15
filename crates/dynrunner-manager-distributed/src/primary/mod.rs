@@ -9,6 +9,9 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
 };
+use tokio::sync::mpsc as tokio_mpsc;
+
+pub use command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
@@ -269,6 +272,25 @@ pub struct PrimaryConfig {
     /// `local_path` opaque; tests with absolute on-disk paths and
     /// fake workers that never open them).
     pub source_dir: Option<std::path::PathBuf>,
+
+    /// Per-task budget cap for `PrimaryCommand::ReinjectTask` (the
+    /// `PrimaryHandle::reinject_task` PyO3 entry point). `None`
+    /// (the default) means unbounded — a control plane that
+    /// keeps observing operator-resolvable failures can re-inject
+    /// the same hash as often as it wants. `Some(N)` allows at
+    /// most N successful reinjects per task; the (N+1)-th call
+    /// returns `Err` to the caller and emits the structured-log
+    /// event `unfulfillable_reinject_budget_exhausted` so an
+    /// observability pipeline can alert.
+    ///
+    /// The counter is per-task (keyed by hash), not per-run-pass.
+    /// It is NOT consumed by the retry-pass infrastructure
+    /// (`retry_max_passes`) — those two retry channels are
+    /// independent: `retry_max_passes` is the framework's auto-
+    /// retry budget for Recoverable failures; this field is the
+    /// external-control-plane budget for the
+    /// operator-resolvable-failure (`Unfulfillable`) class.
+    pub unfulfillable_reinject_max_per_task: Option<u32>,
 }
 
 impl Default for PrimaryConfig {
@@ -290,6 +312,7 @@ impl Default for PrimaryConfig {
             mass_death_grace: Duration::from_secs(60),
             mass_death_min_count: 2,
             source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         }
     }
 }
@@ -565,6 +588,37 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// regression on the path where `seed_cluster_state` ran locally
     /// and `total_tasks` is non-zero at startup.
     pub(super) setup_pending: bool,
+
+    /// Cross-thread / cross-runtime ingress for the
+    /// `PrimaryHandle` PyO3 surface. Each handler is co-located
+    /// with the coordinator's per-mutation semantics; the receiver
+    /// is read inside the operational loop's `select!` and the
+    /// sender is cloned out via `command_sender()` before `run()`
+    /// starts.
+    ///
+    /// Held as `Option` so the operational loop can take the
+    /// receiver out for the duration of the select-driven phase
+    /// (Rust's borrow checker won't let us hold a `&mut Receiver`
+    /// inside the same `&mut self` that the per-arm handlers need)
+    /// and put it back when the loop exits. Outside the loop, the
+    /// option is `Some` so cloned senders keep working between runs.
+    pub(super) command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand>>,
+
+    /// Sender side of the command channel, cloned to consumers via
+    /// `command_sender()`. Stored on `Self` so the lifetime is tied
+    /// to the coordinator — when the coordinator is dropped, all
+    /// cloned senders return `SendError` on subsequent `send()`
+    /// calls and the PyO3 side surfaces that as a Python exception.
+    pub(super) command_tx: tokio_mpsc::Sender<PrimaryCommand>,
+
+    /// Per-task reinject counter, paired with
+    /// `PrimaryConfig::unfulfillable_reinject_max_per_task`. Lazily
+    /// initialised on first reinject for a hash; counts DOWN from
+    /// the configured cap (so 0 means "exhausted, refuse"). The
+    /// map is keyed by task hash, not task_id, because external-
+    /// control callers use the hash as the canonical identifier
+    /// (mirroring the rest of the wire protocol).
+    pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -576,6 +630,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         estimator: E,
     ) -> Self {
         let setup_pending = config.required_setup_on_promote;
+        let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         let mut this = Self {
             config,
             transport,
@@ -607,6 +662,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
             setup_pending,
+            command_rx: Some(command_rx),
+            command_tx,
+            unfulfillable_reinject_remaining: HashMap::new(),
         };
         // Mirror `SecondaryCoordinator::new`'s registration: attach the
         // peer transport's write-through `RoleTable` cache to the
@@ -623,6 +681,55 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         this.peer_transport
             .register_with_cluster_state(&mut this.cluster_state);
         this
+    }
+
+    /// Clone of the cross-thread `PrimaryCommand` sender. Callers
+    /// (PyO3 `PrimaryHandle`, future Rust-side control planes)
+    /// clone this BEFORE invoking `run()` so they have an ingress
+    /// for "from outside the operational loop, please apply this
+    /// mutation". The sender itself is `Clone` and `Send` so the
+    /// returned handle is freely passable across threads / async
+    /// runtimes.
+    pub fn command_sender(&self) -> tokio_mpsc::Sender<PrimaryCommand> {
+        self.command_tx.clone()
+    }
+
+    /// Swap the internal command-channel pair for an externally-
+    /// supplied one. The PyO3 layer uses this so the
+    /// `PrimaryHandle` it exposes to Python at `__init__` time is
+    /// the same channel the (later-constructed) `PrimaryCoordinator`
+    /// reads from — without this, the channel created in `new()`
+    /// can't be reached from Python before `run()` starts because
+    /// the coordinator itself is built inside the detached tokio
+    /// runtime.
+    ///
+    /// Must be called BEFORE `run()` enters the operational loop;
+    /// calling it after the loop has taken the receiver out (via
+    /// `command_rx.take()`) replaces the stored-back receiver but
+    /// the loop has already moved on to the local copy. The PyO3
+    /// surface enforces this with the
+    /// `set_unfulfillable_reinject_max_per_task` setter's
+    /// "before run() only" contract; the channel-swap is on the
+    /// same contract.
+    pub fn replace_command_channel(
+        &mut self,
+        tx: tokio_mpsc::Sender<PrimaryCommand>,
+        rx: tokio_mpsc::Receiver<PrimaryCommand>,
+    ) {
+        self.command_tx = tx;
+        self.command_rx = Some(rx);
+    }
+
+    /// Set the per-task budget cap for
+    /// `PrimaryCommand::ReinjectTask` after construction. The CLI
+    /// + PyO3 surfaces wire this through to the underlying
+    /// `PrimaryConfig` field so the live coordinator and the
+    /// CLI-supplied `--unfulfillable-reinject-max-per-task=N` flag
+    /// stay in lockstep. Idempotent if the existing value matches;
+    /// callable any time before `run()` enters the operational
+    /// loop (the loop's `select!` reads the field directly).
+    pub fn set_unfulfillable_reinject_max_per_task(&mut self, max: Option<u32>) {
+        self.config.unfulfillable_reinject_max_per_task = max;
     }
 
     /// True iff `secondary_id` is currently in backpressure backoff
@@ -1144,6 +1251,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 }
 
 mod assignment;
+mod command_channel;
 mod connect;
 mod heartbeat;
 mod lifecycle;

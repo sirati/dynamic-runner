@@ -770,9 +770,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             ClusterMutation::TaskAdded { .. } | ClusterMutation::RunComplete => {
                 self.setup_pending = false;
             }
+            ClusterMutation::TaskReinjected { hash } => {
+                // External-control reinject moves the entry off
+                // `Failed` in the CRDT; the per-pass `failed_tasks`
+                // ledger must mirror so the operational-loop exit
+                // check (`completed + failed >= total`) doesn't trip
+                // on a hash that's been re-armed for dispatch.
+                self.failed_tasks.remove(hash);
+            }
             ClusterMutation::TaskAssigned { .. }
             | ClusterMutation::PrimaryChanged { .. }
-            | ClusterMutation::PhaseDepsSet { .. } => {}
+            | ClusterMutation::PhaseDepsSet { .. }
+            | ClusterMutation::TaskPreferredSecondariesUpdated { .. } => {
+                // Routing/role hints with no impact on terminal-state
+                // accounting.
+            }
         }
     }
 }
