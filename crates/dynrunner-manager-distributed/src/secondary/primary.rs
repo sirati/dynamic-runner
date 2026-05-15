@@ -852,10 +852,11 @@ where
     ///   3. Clear `setup_pending` so the outer loop's next iteration
     ///      doesn't yield again.
     ///   4. Hydrate `primary_pending` from the now-populated
-    ///      `cluster_state`. This is the same call the legacy bootstrap
-    ///      path makes in the `PromotePrimary` handler; here it runs
-    ///      after `setup_pending` clears so operational dispatch can
-    ///      begin on the next tick.
+    ///      `cluster_state`. This is the same call the pre-seeded
+    ///      (`required_setup_on_promote = false`) path makes in the
+    ///      `PromotePrimary` handler; here it runs after
+    ///      `setup_pending` clears so operational dispatch can begin
+    ///      on the next tick.
     ///
     /// Idempotency: `ClusterMutation::TaskAdded` is no-op-on-duplicate
     /// (the CRDT silently drops it via the `apply` filter), and

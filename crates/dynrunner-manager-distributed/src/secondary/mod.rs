@@ -500,13 +500,14 @@ where
     /// every peer, clears this flag, and hydrates the primary pool
     /// from the now-populated `cluster_state`.
     ///
-    /// Never set on the legacy bootstrap promotion path
-    /// (`required_setup: false` from the local submitter — ledger is
-    /// pre-seeded) nor on the failover-election path (the ledger has
-    /// content from the CRDT broadcasts that ran during the live-
-    /// primary phase). The wire-level `required_setup` flag is the
-    /// only discriminator; "ledger empty" is NOT a proxy because
-    /// failover-at-startup can legitimately observe an empty ledger.
+    /// Never set on the pre-seeded promotion path (`required_setup:
+    /// false` from the local submitter — local did discovery and the
+    /// ledger is pre-seeded) nor on the failover-election path (the
+    /// ledger has content from the CRDT broadcasts that ran during
+    /// the live-primary phase). The wire-level `required_setup` flag
+    /// is the only discriminator; "ledger empty" is NOT a proxy
+    /// because failover-at-startup can legitimately observe an
+    /// empty ledger.
     pub(super) setup_pending: bool,
 
     /// Re-entry guard for `run_until_setup_or_done`. The first call
@@ -522,10 +523,11 @@ where
     /// is set the moment setup completes successfully and gates the
     /// setup block on every subsequent entry.
     ///
-    /// Always false on the legacy bootstrap and failover paths; the
-    /// existing `run` wrapper only calls `run_until_setup_or_done`
-    /// once, so the flag transition is `false → true (mid-call) →
-    /// (method returns Done)` for those callers.
+    /// Always false on the pre-seeded (`required_setup_on_promote =
+    /// false`) and failover paths; the existing `run` wrapper only
+    /// calls `run_until_setup_or_done` once, so the flag transition
+    /// is `false → true (mid-call) → (method returns Done)` for
+    /// those callers.
     pub(super) setup_phase_completed: bool,
 }
 
