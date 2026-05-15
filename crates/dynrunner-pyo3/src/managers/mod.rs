@@ -2,6 +2,7 @@ pub(crate) mod distributed;
 pub(crate) mod factory_callback;
 pub(crate) mod lifecycle;
 pub(crate) mod local;
+pub(crate) mod multi_process_respawner;
 pub(crate) mod observer_late_joiner;
 pub(crate) mod primary;
 pub(crate) mod primary_handle;

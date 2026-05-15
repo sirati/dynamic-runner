@@ -48,7 +48,7 @@ from .deployment_spec import TaskDeploymentSpec
 from .subprocess_spec import SubprocessSpec
 
 
-SpawnSecondary = Callable[[str, str, int], "SubprocessSpec | None"]
+SpawnSecondary = Callable[..., "SubprocessSpec | None"]
 
 
 def build_subprocess_spawn(
@@ -92,7 +92,18 @@ def build_subprocess_spawn(
     policy decision.
     """
 
-    def spawn_secondary(primary_url: str, secondary_id: str, quic_port: int) -> SubprocessSpec:
+    def spawn_secondary(
+        primary_url: str,
+        secondary_id: str,
+        quic_port: int,
+        **_kwargs: object,
+    ) -> SubprocessSpec:
+        # ``**_kwargs`` absorbs additive arguments the Rust caller may
+        # supply (e.g. ``primary_pubkey_pem`` from the multi-process
+        # respawner). The local-subprocess argv builder does not need
+        # them today, but accepting them keeps the callback signature
+        # forward-compatible with the in-progress respawn pipeline
+        # without forcing every callsite to thread the kwargs in.
         cmd = [sys.executable, "-m", deployment.secondary_module]
         cmd += ["--secondary", primary_url]
         cmd += ["--secondary-id", secondary_id]
