@@ -182,6 +182,44 @@ pub trait CleanupSteps: Send + 'static {
 /// `CleanupSteps` impl) so the future pure-Rust preparation impl can
 /// call the same primitive — single source of truth for the kill
 /// regex when preparation gains its own reverse-tunnel spawning logic.
+/// Scale-aware default for the per-secondary setup-deadline (seconds).
+///
+/// Single source of truth for the formula
+/// `max(60, num_secondaries * 15)` that the SLURM pipeline applies
+/// when the operator did not pass `--slurm-setup-deadline-secs`.
+///
+/// Why a scale-aware default at all: the secondary's setup phase
+/// (welcome + cert exchange + wait-for-setup) is bounded by
+/// `SecondaryConfig.setup_deadline`. The primary today waits for ALL
+/// secondaries to connect before broadcasting the setup-bootstrap;
+/// when a slow cluster takes >60s to schedule + boot every node, the
+/// first-arriving secondaries hit the (default 60s) deadline and
+/// cold-exit BEFORE the late ones have connected, by which point the
+/// primary's broadcast lands on closed channels and the cluster
+/// collapses with `channel closed`. The architectural fix (primary
+/// fires on quorum + late-arrivers use `join_running_cluster`) is a
+/// separate follow-up; this knob is the operator-facing band-aid.
+///
+/// Why `num_secondaries * 15`: empirically, LMU Krater (the load-
+/// bearing repro at 2026-05) saw ~15s between consecutive sbatch-
+/// dispatched secondaries reaching the primary; the linear scaling
+/// keeps `--jobs 1..4` at the historical 60s floor (no behaviour
+/// change for small runs) while letting `--jobs 15` ramp to 225s
+/// and `--jobs 32` to 480s. The formula is a heuristic, not a
+/// derivation — operators on faster or slower clusters override
+/// with `--slurm-setup-deadline-secs N`.
+///
+/// `explicit_override = Some(n)` always wins regardless of
+/// `num_secondaries`; the formula only applies when the operator
+/// left the knob unset.
+pub fn compute_setup_deadline_secs(explicit_override: Option<u64>, num_secondaries: u32) -> u64 {
+    if let Some(n) = explicit_override {
+        return n;
+    }
+    let scaled = u64::from(num_secondaries).saturating_mul(15);
+    scaled.max(60)
+}
+
 pub async fn pkill_residual_reverse_tunnels(uid: u32) -> std::io::Result<()> {
     let status = tokio::process::Command::new("pkill")
         .arg("-u")
@@ -264,6 +302,54 @@ mod tests {
         let recorder = Recorder { calls: calls.clone() };
         run_cleanup(recorder).await;
         assert_eq!(*calls.lock().unwrap(), vec![1u8, 2, 3]);
+    }
+
+    /// The scale-aware setup-deadline default keeps the historical
+    /// 60s floor for small runs (`--jobs 1..4`) — matching the
+    /// pre-2026-05 behaviour so existing operators see no diff.
+    #[test]
+    fn setup_deadline_default_keeps_60s_floor_for_small_jobs() {
+        assert_eq!(compute_setup_deadline_secs(None, 1), 60);
+        assert_eq!(compute_setup_deadline_secs(None, 2), 60);
+        assert_eq!(compute_setup_deadline_secs(None, 3), 60);
+        assert_eq!(compute_setup_deadline_secs(None, 4), 60);
+    }
+
+    /// At `num_secondaries == 4` the formula's linear term equals
+    /// the floor (4 * 15 == 60); from 5+ secondaries the linear
+    /// term dominates. Documented examples from the task brief:
+    /// 15 -> 225, 32 -> 480.
+    #[test]
+    fn setup_deadline_scales_linearly_above_floor() {
+        assert_eq!(compute_setup_deadline_secs(None, 5), 75);
+        assert_eq!(compute_setup_deadline_secs(None, 15), 225);
+        assert_eq!(compute_setup_deadline_secs(None, 32), 480);
+    }
+
+    /// An explicit override always wins, regardless of whether the
+    /// scaled formula would produce a smaller OR larger value. This
+    /// is the load-bearing escape hatch for clusters with their own
+    /// scheduling characteristics.
+    #[test]
+    fn setup_deadline_explicit_override_wins() {
+        // Override below the floor: operator knows their cluster
+        // boots fast; we respect that.
+        assert_eq!(compute_setup_deadline_secs(Some(30), 1), 30);
+        // Override below the scaled value: operator knows their
+        // cluster boots fast even at scale.
+        assert_eq!(compute_setup_deadline_secs(Some(120), 15), 120);
+        // Override above the scaled value: operator knows their
+        // cluster boots slow; we respect that.
+        assert_eq!(compute_setup_deadline_secs(Some(600), 32), 600);
+    }
+
+    /// `num_secondaries = 0` is a defensive bound. The SLURM
+    /// pipeline never actually invokes with zero (run.py validates
+    /// `--jobs` defaults to 1), but the function must not panic.
+    /// The floor takes over.
+    #[test]
+    fn setup_deadline_zero_secondaries_yields_floor() {
+        assert_eq!(compute_setup_deadline_secs(None, 0), 60);
     }
 
     /// Even when each step errors, all three still run (try/finally
