@@ -233,14 +233,27 @@ pub struct ClusterState<I> {
     /// alive or dead-forever" answer.
     ///
     /// Skipped from `Clone`, snapshot, and restore — same rationale
-    /// as `role_change_hooks`: the map is paired with a node-local
-    /// dispatcher channel (the sibling subtask wires the real mpsc;
-    /// today the channel is the stub `emit_lifecycle_event`) and a
-    /// cloned replica has neither the channel nor any reason to
-    /// inherit the source's runtime peer view. Receivers rebuild the
-    /// map by re-applying broadcast `PeerJoined`/`PeerRemoved`
-    /// mutations after restore.
+    /// as `role_change_hooks`: the map is paired with the node-local
+    /// `lifecycle_tx` dispatcher channel and a cloned replica has
+    /// neither the channel nor any reason to inherit the source's
+    /// runtime peer view. Receivers rebuild the map by re-applying
+    /// broadcast `PeerJoined`/`PeerRemoved` mutations after restore.
     peer_state: HashMap<String, PeerEntry>,
+    /// Sender end of the peer-lifecycle dispatcher mpsc. Installed
+    /// via [`Self::install_lifecycle_sender`] when the coordinator
+    /// wires its dispatcher task; `None` while no coordinator has
+    /// attached (tests that exercise the apply path in isolation
+    /// observe the same `None` state and the emit becomes a silent
+    /// drop). The receiver end is owned by
+    /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`].
+    ///
+    /// Skipped from `Clone`, snapshot, and restore — same rationale
+    /// as `role_change_hooks` and `peer_state`: a cloned replica is
+    /// a fresh node-local view and inheriting the source's sender
+    /// would route this replica's events into the source's
+    /// dispatcher, violating the CCD-9 "apply path never crosses
+    /// node boundaries" invariant.
+    lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<PeerLifecycleEvent>>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -259,6 +272,8 @@ where
             role_change_hooks: Vec::new(),
             // Deliberately not cloned — see field doc.
             peer_state: HashMap::new(),
+            // Deliberately not cloned — see field doc.
+            lifecycle_tx: None,
         }
     }
 }
@@ -277,6 +292,7 @@ where
             .field("role_table", &self.role_table)
             .field("role_change_hooks", &self.role_change_hooks.len())
             .field("peer_state", &self.peer_state)
+            .field("lifecycle_tx", &self.lifecycle_tx.is_some())
             .finish()
     }
 }
@@ -292,6 +308,7 @@ impl<I> Default for ClusterState<I> {
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),
             peer_state: HashMap::new(),
+            lifecycle_tx: None,
         }
     }
 }
@@ -519,15 +536,47 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Enqueue a [`PeerLifecycleEvent`] onto the dispatcher channel.
     ///
-    /// TODO(peer-lifecycle dispatcher): a sibling subtask replaces
-    /// this stub with the real `mpsc::Sender<PeerLifecycleEvent>`
-    /// enqueue. The wire-side mutation apply rules already call this
-    /// method at the correct point in the state transition so the
-    /// downstream consumer plumbing is the only piece that needs to
-    /// land — the call sites are stable. Until then the event is
-    /// discarded; no consumer is listening.
-    pub(crate) fn emit_lifecycle_event(&self, _event: PeerLifecycleEvent) {
-        // Stub: future subtask wires the mpsc sender here.
+    /// Non-blocking, infallible (errors are silently dropped): the
+    /// receiver-gone case happens during clean shutdown when the
+    /// coordinator's dispatcher task has already exited, and the
+    /// no-sender-installed case happens in unit tests that exercise
+    /// the apply path in isolation. Both are non-events from the
+    /// apply path's perspective — it MUST NOT panic, block, or
+    /// surface a user-visible error on emit, because the broadcast
+    /// happens-before observation is the only contract the CRDT
+    /// promises and the dispatcher channel is strictly best-effort
+    /// observation on top.
+    ///
+    /// CCD-9 invariant: this method must never invoke a listener
+    /// directly. Listener invocation happens off the apply task on
+    /// the dispatcher; the channel is the only synchronization
+    /// crossing.
+    pub(crate) fn emit_lifecycle_event(&self, event: PeerLifecycleEvent) {
+        if let Some(tx) = &self.lifecycle_tx {
+            // `send` on `UnboundedSender` only fails when the
+            // receiver is dropped; silent drop matches the
+            // "best-effort observation" contract documented above.
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Attach the dispatcher's sender end so subsequent
+    /// `emit_lifecycle_event` calls route events through the
+    /// coordinator's dispatcher task.
+    ///
+    /// Called by the coordinator at `new()` time after building the
+    /// (sender, receiver) pair; the receiver is then handed to
+    /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`] when
+    /// the coordinator's tokio runtime is live. Re-installation
+    /// replaces the prior sender silently — the only legitimate
+    /// caller is the owning coordinator, and a coordinator that
+    /// re-installs is signalling "the prior dispatcher is gone, use
+    /// the new one"; we have no use case for stacking dispatchers.
+    pub fn install_lifecycle_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<PeerLifecycleEvent>,
+    ) {
+        self.lifecycle_tx = Some(tx);
     }
 
     /// Take a snapshot of the whole state. The snapshot is a deep
@@ -2020,5 +2069,52 @@ mod tests {
             vec![0],
             "role-change hook must fire once with the shrunk set"
         );
+    }
+
+    /// End-to-end: a state-changing `PeerJoined` apply, with a
+    /// dispatcher sender installed, MUST deliver a corresponding
+    /// `PeerLifecycleEvent::Added` on the channel. This pins the
+    /// "apply emits, dispatcher rx receives" contract — the
+    /// boundary that replaces the prior stub `emit_lifecycle_event`.
+    #[tokio::test]
+    async fn apply_peer_joined_emits_event_through_dispatcher() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.install_lifecycle_sender(tx);
+
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "peer-x".into(),
+                is_observer: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        // The receiver MUST observe exactly one event with the
+        // matching id / observer flag. `try_recv` confirms the
+        // emit was non-blocking from the apply path's side.
+        match rx.try_recv() {
+            Ok(crate::peer_lifecycle::PeerLifecycleEvent::Added { id, is_observer }) => {
+                assert_eq!(id, "peer-x");
+                assert!(!is_observer);
+            }
+            other => panic!("expected Added event, got {other:?}"),
+        }
+
+        // Apply a removal as well to confirm the channel keeps
+        // accepting subsequent events.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerRemoved {
+                id: "peer-x".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            }),
+            ApplyOutcome::Applied
+        );
+        match rx.try_recv() {
+            Ok(crate::peer_lifecycle::PeerLifecycleEvent::Removed { id, cause }) => {
+                assert_eq!(id, "peer-x");
+                assert_eq!(cause, RemovalCause::KeepaliveMiss);
+            }
+            other => panic!("expected Removed event, got {other:?}"),
+        }
     }
 }
