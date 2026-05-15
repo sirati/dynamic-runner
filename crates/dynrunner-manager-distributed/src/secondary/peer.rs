@@ -331,6 +331,38 @@ where
                     );
                 }
             }
+            // Peer-mesh CRDT replication: any node may originate a
+            // `ClusterMutation` batch on the peer bus (the promoted
+            // secondary's `apply_and_broadcast_mutations` does this
+            // for `TaskAdded` during `ingest_setup_discovery` and
+            // for `RunComplete` in the `processing.rs` natural-
+            // quiesce branch). Receiver-side apply is symmetric
+            // with the `primary_transport` path in `dispatch.rs`:
+            // both route through the same `apply_cluster_mutations`
+            // helper, which is the single-concern API for "apply a
+            // wire-arrived batch to the local CRDT mirror". CRDT
+            // idempotency makes duplicate applies (e.g. a mutation
+            // arriving both via `primary_transport` from the
+            // demoted submitter and via `peer_transport` from the
+            // originating peer) a no-op.
+            //
+            // Pre-fix this arm was absent and the message fell into
+            // the `_` catch-all below. Concrete regression — the
+            // promoted secondary's natural-quiesce
+            // `peer_transport.broadcast(ClusterMutation::RunComplete)`
+            // landed at peer secondaries but never updated their
+            // `cluster_state.run_complete()` flag, so their
+            // `processing.rs` run-complete exit cue never tripped
+            // and they hung indefinitely (Tier-2 asm-tokenizer hang
+            // post-`a78c89c`). The same gap also silently dropped
+            // the `TaskAdded` peer broadcasts during
+            // `ingest_setup_discovery`, leaving peer secondaries'
+            // `cluster_state` empty for the lifetime of the run —
+            // a CRDT-replication gap that was masked pre-`a78c89c`
+            // because no run-complete exit cue rode the peer bus.
+            DistributedMessage::ClusterMutation { mutations, .. } => {
+                self.apply_cluster_mutations(mutations);
+            }
             _ => {
                 tracing::debug!(msg_type = ?msg.msg_type(), "unhandled peer message");
             }
