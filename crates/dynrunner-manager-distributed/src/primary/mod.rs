@@ -1,5 +1,7 @@
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{resolve_against_root, ErrorType, TaskInfo, Identifier, PhaseId, ResourceMap};
@@ -667,6 +669,33 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     pub(super) fulfillability_matcher: Option<
         Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>,
     >,
+
+    /// Monotonic identity allocator for newly spawned secondaries.
+    /// Initialised to `config.num_secondaries` so the IDs the
+    /// preparation phase already minted (`secondary-0..secondary-N-1`)
+    /// are reserved; the first respawn returns `secondary-N`.
+    ///
+    /// Single concern: hand out a never-before-used secondary id.
+    /// Dead secondaries stay dead in the CRDT — IDs are never reused,
+    /// so this counter only ever advances. Mutated exclusively from
+    /// the operational loop via [`Self::mint_secondary_id`]; callers
+    /// must NOT mint from spawned tasks (would race on the `&mut`
+    /// path; the operational loop is the single writer).
+    pub(super) next_secondary_id: u32,
+
+    /// Optional opaque handle to the deployment-mode job manager
+    /// (today: `Arc<Mutex<SlurmJobManager<…>>>` parked here by the
+    /// SLURM PyO3 pipeline). `None` for the in-process / local-channel
+    /// pipelines that don't have a backing batch system.
+    ///
+    /// Stored as `Arc<dyn Any + Send + Sync>` so the `manager-distributed`
+    /// crate stays decoupled from `dynrunner-slurm` (and any future
+    /// alternative deployment mode); the SLURM-aware respawn caller
+    /// downcasts back to the concrete type at the call site. Setter
+    /// is callable AFTER the preparation phase returns but BEFORE
+    /// `run()` enters — the respawn path reads the field from inside
+    /// the operational loop.
+    pub(super) slurm_job_manager: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -696,6 +725,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `crate::fulfillability_matcher::drain_matcher_batch`.
         let (matcher_trigger_tx, matcher_trigger_rx) =
             tokio::sync::mpsc::unbounded_channel();
+        // Seed the monotonic id allocator past the IDs the prep phase
+        // already minted (`secondary-0..secondary-{num_secondaries - 1}`)
+        // so the first respawn lands on `secondary-{num_secondaries}`.
+        let next_secondary_id = config.num_secondaries;
         let mut this = Self {
             config,
             transport,
@@ -734,6 +767,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             peer_lifecycle_listeners: Vec::new(),
             matcher_trigger_rx: Some(matcher_trigger_rx),
             fulfillability_matcher: None,
+            next_secondary_id,
+            slurm_job_manager: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -797,6 +832,46 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         matcher: Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>,
     ) {
         self.fulfillability_matcher = Some(matcher);
+    }
+
+    /// Hand out a never-before-used secondary id and advance the
+    /// monotonic counter. The first call on a freshly-constructed
+    /// coordinator returns `secondary-{num_secondaries}` (the prep
+    /// phase owns `secondary-0..secondary-{num_secondaries - 1}`).
+    ///
+    /// Single concern: identity allocation. The caller is responsible
+    /// for invoking this from the operational loop (the single
+    /// `&mut self` writer); minting from a spawned task would race
+    /// against the loop's own borrow and is rejected by the borrow
+    /// checker anyway — the doc-line is a reminder for future maintainers
+    /// who might be tempted to clone the coordinator into a task.
+    pub fn mint_secondary_id(&mut self) -> String {
+        let n = self.next_secondary_id;
+        self.next_secondary_id += 1;
+        format!("secondary-{}", n)
+    }
+
+    /// Park the deployment-mode job manager on the coordinator so the
+    /// respawn path can submit a fresh secondary job from inside the
+    /// operational loop. Must be called AFTER the preparation phase
+    /// returns (so the job manager is live) and BEFORE `run()` enters
+    /// (so the operational loop sees `Some(_)` from the first iteration).
+    ///
+    /// Stored type-erased through `Arc<dyn Any + Send + Sync>` to keep
+    /// `manager-distributed` decoupled from any specific batch-system
+    /// crate. The respawn caller downcasts via
+    /// [`Self::slurm_job_manager`] back to the concrete handle it parked.
+    pub fn set_slurm_job_manager(&mut self, jm: Arc<dyn Any + Send + Sync>) {
+        self.slurm_job_manager = Some(jm);
+    }
+
+    /// Read the parked deployment-mode job manager. Returns `None`
+    /// outside the SLURM-pipeline path (in-process / local-channel
+    /// pipelines never call [`Self::set_slurm_job_manager`]); the
+    /// respawn caller downcasts the inner `Arc<dyn Any + Send + Sync>`
+    /// back to its concrete type at the call site.
+    pub fn slurm_job_manager(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
+        self.slurm_job_manager.as_ref()
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers

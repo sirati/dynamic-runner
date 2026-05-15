@@ -1,4 +1,6 @@
+use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
@@ -132,6 +134,19 @@ pub(crate) struct PyPrimaryCoordinator {
     /// requires pre-`run()` registration (the matcher trait object
     /// is owned by `self` and read in the operational `select!`).
     fulfillability_matcher: Option<Py<PyAny>>,
+
+    /// Optional opaque handle to the deployment-mode job manager,
+    /// installed by the SLURM pipeline after `run_preparation` returns
+    /// and BEFORE `run()` enters. Stored as `Arc<dyn Any + Send + Sync>`
+    /// so this crate stays decoupled from any specific batch-system
+    /// crate; the respawn caller (inside the manager-distributed
+    /// operational loop) downcasts to the concrete handle.
+    ///
+    /// Threaded into the inner `PrimaryCoordinator` via
+    /// `set_slurm_job_manager` at `run()` start. `None` for the
+    /// in-process / network-primary callers that don't drive a SLURM
+    /// submit-loop.
+    slurm_job_manager: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 #[pymethods]
@@ -208,6 +223,7 @@ impl PyPrimaryCoordinator {
             command_rx: Some(command_rx),
             peer_lifecycle_listener,
             fulfillability_matcher,
+            slurm_job_manager: None,
         })
     }
 
@@ -294,6 +310,11 @@ impl PyPrimaryCoordinator {
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let source_dir = self.source_dir.clone();
+        // Take the parked deployment-mode job-manager handle (if any)
+        // out for the detached runtime so the inner coordinator can
+        // park it on itself before `run()` enters. `None` for the
+        // in-process / network-primary paths that never wire it.
+        let slurm_job_manager = self.slurm_job_manager.take();
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         // Read the cap value the handle (or constructor kwarg) most
@@ -535,6 +556,16 @@ impl PyPrimaryCoordinator {
                 // receiver the operational loop reads from.
                 primary.replace_command_channel(command_tx, command_rx);
 
+                // Relay the SLURM-pipeline-parked deployment-mode job
+                // manager onto the inner coordinator BEFORE `run()`
+                // enters. Same pre-run contract as the other registration
+                // setters on `PrimaryCoordinator`: the respawn path
+                // reads the field from inside the operational loop, so
+                // late installs would be invisible.
+                if let Some(jm) = slurm_job_manager {
+                    primary.set_slurm_job_manager(jm);
+                }
+
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE `run()` enters — the coordinator's
                 // `register_lifecycle_listener` contract requires
@@ -622,6 +653,29 @@ impl PyPrimaryCoordinator {
     #[getter]
     fn stranded(&self) -> u32 {
         self.stranded
+    }
+}
+
+// Rust-only surface for the SLURM-pipeline orchestrator. Not exposed
+// to Python because the parked handle is the in-process Rust
+// `SlurmJobManager` instance — it travels Rust-to-Rust across the
+// pipeline → coordinator boundary, never through Python identity.
+impl PyPrimaryCoordinator {
+    /// Park the deployment-mode job-manager handle so the inner
+    /// `PrimaryCoordinator` sees it at `run()` start. Called by
+    /// `slurm::pipeline::drive_rust_primary` after `run_preparation`
+    /// returns and BEFORE `run()` enters.
+    ///
+    /// Single concern: relay the opaque handle into the
+    /// manager-distributed coordinator. The PyO3 wrapper holds it
+    /// between construction and `run()` because the inner
+    /// `PrimaryCoordinator` does not exist yet at the call site —
+    /// it's built inside the detached tokio runtime.
+    pub(crate) fn set_slurm_job_manager_from_rust(
+        &mut self,
+        jm: Arc<dyn Any + Send + Sync>,
+    ) {
+        self.slurm_job_manager = Some(jm);
     }
 }
 

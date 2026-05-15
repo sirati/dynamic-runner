@@ -6077,6 +6077,85 @@ fn make_test_primary_config(num_secondaries: u32) -> PrimaryConfig {
     }
 }
 
+// ── Secondary-id allocator + slurm-job-manager parking. ─────────────
+//
+// `mint_secondary_id` is the monotonic source of truth for fresh
+// secondary ids on the respawn path; `set_slurm_job_manager` /
+// `slurm_job_manager` round-trip the opaque deployment-mode handle
+// the SLURM PyO3 pipeline parks for the respawn caller. The two
+// concerns are independent — they share a section here only because
+// they're both small "operational-loop hands me X" surfaces.
+
+#[test]
+fn mint_secondary_id_returns_sequential() {
+    let (transport, _ends) = setup_test(1);
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        make_test_primary_config(1),
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    // num_secondaries = 1, so the initial id `secondary-0` is reserved
+    // for the prep phase; the first respawn returns `secondary-1` and
+    // each subsequent mint advances the counter by one.
+    let first = primary.mint_secondary_id();
+    let second = primary.mint_secondary_id();
+    assert_eq!(first, "secondary-1");
+    assert_eq!(second, "secondary-2");
+}
+
+#[test]
+fn mint_secondary_id_starts_at_num_secondaries() {
+    let (transport, _ends) = setup_test(4);
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        make_test_primary_config(4),
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    // num_secondaries = 4 reserves `secondary-0..secondary-3`; the
+    // first mint must land at `secondary-4`.
+    let first = primary.mint_secondary_id();
+    assert_eq!(first, "secondary-4");
+}
+
+#[test]
+fn set_slurm_job_manager_stores_arc() {
+    use std::sync::Arc;
+
+    let (transport, _ends) = setup_test(1);
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        make_test_primary_config(1),
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    // No parking yet → accessor returns `None`.
+    assert!(primary.slurm_job_manager().is_none());
+
+    // Park a marker payload (the type itself doesn't matter here —
+    // `manager-distributed` only stores the `Arc` opaquely; downcasting
+    // back is the respawn caller's responsibility).
+    #[derive(Debug, PartialEq, Eq)]
+    struct Marker(u32);
+    let marker: Arc<dyn std::any::Any + Send + Sync> = Arc::new(Marker(0x42));
+    primary.set_slurm_job_manager(marker);
+
+    // Round-trip via the accessor: the parked Arc must be retrievable
+    // and downcast cleanly to the original concrete type.
+    let parked = primary
+        .slurm_job_manager()
+        .expect("parked Arc must be present after set_slurm_job_manager");
+    let downcast = parked
+        .clone()
+        .downcast::<Marker>()
+        .expect("parked Arc must downcast to the original concrete type");
+    assert_eq!(*downcast, Marker(0x42));
+}
+
 /// Assemble the welcome envelope the primary receives on the
 /// `SecondaryWelcome` arm of `dispatch_message`. Centralised so the
 /// three handle_welcome tests stay focused on what they're asserting

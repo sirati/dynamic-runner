@@ -338,3 +338,18 @@ impl PyRustSlurmJobManager {
         }))
     }
 }
+
+// Rust-only surface: hands the Arc-wrapped inner manager out so the
+// SLURM-pipeline orchestrator can park it on the `PrimaryCoordinator`
+// for the respawn path. Not exposed to Python — the parked handle is
+// the in-process Rust object, never crosses the Python boundary again
+// after the SLURM-pipeline grabs it.
+impl PyRustSlurmJobManager {
+    /// Clone the shared `Arc` wrapping the inner Rust `SlurmJobManager`.
+    /// Single concern: lend the manager to other Rust-side owners (today:
+    /// `PrimaryCoordinator::set_slurm_job_manager` so the respawn path
+    /// can call `submit_job` from inside the operational loop).
+    pub(crate) fn arc_handle(&self) -> Arc<Mutex<SlurmJobManager<PyGatewayAdapter>>> {
+        self.inner.clone()
+    }
+}
