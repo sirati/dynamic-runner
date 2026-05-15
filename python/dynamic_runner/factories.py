@@ -1,46 +1,60 @@
-"""Reference Python implementations of `WorkerFactory` and
-`ResourceMonitor` using the Rust callback wrappers from M4.
+# =====================================================================
+# WARNING — PYTHON BRIDGE ONLY. NO LOGIC HERE.
+# =====================================================================
+# This file is a thin PyO3 / CLI / config bridge. ALL business logic,
+# lifecycle, state-tracking, async orchestration, and process management
+# lives in Rust under `crates/dynrunner-<crate>/src/<corresponding>.rs`.
+# If you find yourself adding logic here — STOP. Put it in Rust and
+# call it from this file via PyO3.
+# =====================================================================
+"""Config-bridge helpers for unusual worker deployments.
 
 The defaults shipped from Rust (`SubprocessWorkerFactory`,
 `ProcStatmMonitor`) cover the common case: launch a Python subprocess,
-read RSS from `/proc/[pid]/statm`. The classes here are escape hatches
-for unusual deployments — they're examples task packages can copy
-or subclass when the defaults don't fit.
+read RSS from `/proc/[pid]/statm`. The helpers here are CLI-bridges for
+deployments where the worker launch needs special argv composition or
+the resource probe needs a different data source. They are NOT
+runtime objects — they synthesise a typed config (`WorkerSpec`,
+`PyCallbackResourceMonitor`) that the Rust manager consumes.
 
-- `PodmanExecWorkerFactory`: launches the worker inside a podman
-  container, useful when the worker has system-level dependencies the
-  host environment can't provide.
-- `CgroupResourceMonitor`: reads memory (and CPU when available) from
-  the v2 cgroup hierarchy, so it sees container-effective limits
-  rather than host-process RSS.
+- `PodmanExecWorkerFactory`: builds the `podman run ...` argv template
+  as a `WorkerSpec`. The Rust `SubprocessWorkerFactory` then spawns,
+  tracks, and tears down the resulting subprocess — Python never holds
+  a `subprocess.Popen` handle.
+- `CgroupResourceMonitor`: reads `memory.current` from cgroup v2 in a
+  callback that Rust invokes once per resource-poll tick.
 
-Use these by passing them through the typed configs:
+Usage:
 
     factory = PodmanExecWorkerFactory(image="myimage:latest", ...)
-    rs.run_local(config, task=..., factory=factory, ...)
-
-(The current `run_local` doesn't yet accept a factory kwarg; pass via
-the legacy `RustLocalManager` constructor or wrap them in
-`dynamic_runner.PyCallbackWorkerFactory` directly.)
+    rs.run_local(config, task=..., worker_spec=factory.to_worker_spec(), ...)
 """
 
 from __future__ import annotations
 
-import os
-import shlex
-import subprocess
-from collections.abc import Callable
+from collections.abc import Sequence
 from pathlib import Path
 
 import dynamic_runner as _rs
 
 
 class PodmanExecWorkerFactory:
-    """Spawn each worker inside a fresh podman container.
+    """Build the `podman run` argv template for a containerised worker.
 
-    The container shares the manager-side socketpair fd via
-    `--add-host` and pass-through of the FD. The image must contain
-    the Python worker module on PYTHONPATH and a `python3` interpreter.
+    The class is pure config: it composes a `WorkerSpec` from the
+    image, worker module, mount points, and connection mode. The
+    resulting `WorkerSpec` is passed verbatim into the Rust manager
+    (e.g. `RustLocalManager(worker_spec=...)`) which spawns the
+    subprocess, tracks the PID via the in-Rust subprocess factory, and
+    tears down with the shared SIGTERM-then-SIGKILL ladder.
+
+    `connection_mode` MUST match the value passed to the manager. In
+    socketpair mode, the template injects `--dynamic_queue {COMM_FD}`;
+    in named-socket mode, it injects `--socket-path {SOCKET_PATH}`.
+    Rust substitutes the runtime value at spawn time.
+
+    The image must contain the Python worker module on PYTHONPATH and
+    a `python3` interpreter.
     """
 
     def __init__(
@@ -50,21 +64,32 @@ class PodmanExecWorkerFactory:
         source_dir: Path | str,
         output_dir: Path | str,
         log_dir: Path | str,
-        extra_podman_args: list[str] | None = None,
+        connection_mode: str = "socketpair",
+        extra_podman_args: Sequence[str] | None = None,
         runtime: str | None = None,
     ) -> None:
+        if connection_mode not in ("socketpair", "named"):
+            raise ValueError(
+                f"PodmanExecWorkerFactory: connection_mode must be "
+                f"'socketpair' or 'named', got {connection_mode!r}"
+            )
         self.image = image
         self.worker_module = worker_module
         self.source_dir = Path(source_dir)
         self.output_dir = Path(output_dir)
         self.log_dir = Path(log_dir)
+        self.connection_mode = connection_mode
         self.extra_podman_args = list(extra_podman_args or [])
         self.runtime = runtime
-        self._children: list[subprocess.Popen] = []
 
-    def spawn(self, worker_id: int, comm_fd: int | None, socket_path: str | None) -> int | None:
-        """Launch the worker. Returns the spawned PID."""
-        argv = ["podman"]
+    def to_worker_spec(self) -> _rs.WorkerSpec:
+        """Render the podman argv template as a `WorkerSpec`.
+
+        Rust substitutes `{COMM_FD}` / `{SOCKET_PATH}` / `{WORKER_ID}`
+        / `{LOG_FILE}` per spawn; see `crates/dynrunner-pyo3/src/
+        config/worker_spec.rs`.
+        """
+        argv: list[str] = ["podman"]
         if self.runtime is not None:
             argv += ["--runtime", self.runtime]
         argv += [
@@ -81,40 +106,31 @@ class PodmanExecWorkerFactory:
             "python3",
             "-m",
             self.worker_module,
+        ]
+        # Connection-mode dispatch: exactly ONE of the flag pairs goes
+        # into the template. WorkerSpec.render() will substitute the
+        # corresponding placeholder; the other placeholder would render
+        # to an empty string, but it never lands in argv because we
+        # only emit the flag pair that matches the configured mode.
+        argv += _CONNECTION_MODE_ARGV[self.connection_mode]
+        argv += [
             "--source",
             "/app/src",
             "--output",
             "/app/out",
             "--log-file",
-            f"/app/log/worker_{worker_id}.log",
+            "/app/log/worker_{WORKER_ID}.log",
         ]
-        if comm_fd is not None:
-            argv += ["--dynamic_queue", str(comm_fd)]
-            pass_fds = (comm_fd,)
-        elif socket_path is not None:
-            argv += ["--socket-path", socket_path]
-            pass_fds = ()
-        else:
-            raise ValueError("PodmanExecWorkerFactory: need either comm_fd or socket_path")
+        return _rs.WorkerSpec(argv=argv)
 
-        proc = subprocess.Popen(argv, pass_fds=pass_fds)
-        self._children.append(proc)
-        return proc.pid
 
-    def into_callback_factory(self) -> _rs.PyCallbackWorkerFactory:
-        """Wrap as the Rust-side PyCallbackWorkerFactory."""
-        return _rs.PyCallbackWorkerFactory(self.spawn)
-
-    def cleanup(self) -> None:
-        """SIGTERM and reap any still-alive containers."""
-        for proc in self._children:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+# Connection-mode → comm-arg pair. Dispatching through a table keeps the
+# argv-builder free of `if mode == "socketpair"` branches; adding a new
+# transport later means one new table entry, not a new call-site branch.
+_CONNECTION_MODE_ARGV: dict[str, list[str]] = {
+    "socketpair": ["--dynamic_queue", "{COMM_FD}"],
+    "named": ["--socket-path", "{SOCKET_PATH}"],
+}
 
 
 class CgroupResourceMonitor:

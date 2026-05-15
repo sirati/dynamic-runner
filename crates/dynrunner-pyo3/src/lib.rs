@@ -8,6 +8,7 @@ mod gateway;
 mod identifier;
 mod managers;
 mod network;
+mod protocol_manager_worker;
 mod publish;
 mod pytypes;
 mod slurm;
@@ -111,6 +112,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     driver_mod.add_function(wrap_pyfunction!(driver::py_write_ssh_config, &driver_mod)?)?;
     m.add_submodule(&driver_mod)?;
+
+    // `dynamic_runner._native.protocol_manager_worker` submodule —
+    // single source of truth for the manager-worker line-delimited
+    // text codec. The Python re-export module at
+    // `python/dynamic_runner/comm/proto/messages.py` imports from
+    // here so existing callers (`from dynamic_runner.comm.proto
+    // import Command, ...`) see the same names without changes.
+    protocol_manager_worker::register(m)?;
 
     Ok(())
 }
