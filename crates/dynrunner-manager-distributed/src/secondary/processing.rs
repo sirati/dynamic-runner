@@ -667,6 +667,13 @@ where
                 binary,
                 ..
             } => {
+                // Test-only: track tasks run on this secondary's own
+                // workers. See `local_tasks_run` doc on
+                // `SecondaryCoordinator`.
+                #[cfg(test)]
+                {
+                    self.local_tasks_run += 1;
+                }
                 // Reclaim protocol state from the spawned poll task
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
