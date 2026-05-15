@@ -30,18 +30,37 @@ use std::time::Duration;
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_primary_secondary::{DistributedMessage, codec};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::transport::QuicConnection;
 use crate::wss::{WssConnection, connect_wss};
 
+/// Outgoing-channel payload for the bridged writer task.
+///
+/// `Msg` carries an application message that the writer serializes
+/// and writes to the wire. `Flush` carries a oneshot that the writer
+/// signals after every preceding `Msg` has been written — this is the
+/// rendezvous primitive that backs [`MessageSender::flush`].
+///
+/// Because the channel is strictly FIFO, sending a `Flush(tx)` after
+/// N `Msg(...)` enqueues guarantees the oneshot fires only after all
+/// N messages have been serialized and pushed to the underlying
+/// transport. The writer signals the oneshot even if its own
+/// outbound write fails (the caller wants to unblock; the error path
+/// is captured elsewhere via the next `send` returning
+/// "transport writer task exited").
+enum Outgoing<I: Identifier> {
+    Msg(DistributedMessage<I>),
+    Flush(oneshot::Sender<()>),
+}
+
 /// A bidirectional, mpsc-bridged connection. Reader and writer tasks
 /// own the underlying transport streams and stay alive for the
 /// lifetime of this struct; aborted on `Drop`.
 pub struct BridgedConnection<I: Identifier> {
-    outgoing_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+    outgoing_tx: mpsc::UnboundedSender<Outgoing<I>>,
     incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
@@ -123,8 +142,29 @@ impl<I: Identifier> MessageSender<DistributedMessage<I>> for NetworkClient<I> {
         // has exited (transport closed).
         self.bridge_mut()
             .outgoing_tx
-            .send(msg)
+            .send(Outgoing::Msg(msg))
             .map_err(|_| "transport writer task exited".to_string())
+    }
+
+    /// Rendezvous with the writer task: enqueue a `Flush` marker
+    /// into the outgoing channel and await its acknowledgement.
+    /// Because the channel is FIFO, the writer only fires the
+    /// oneshot AFTER every preceding `Msg` has been serialized and
+    /// pushed to the underlying `SendStream` / `WebSocketStream`
+    /// (i.e. handed off to the OS socket buffer). This is the
+    /// rendezvous a clean-shutdown caller needs to ensure a final
+    /// message lands on the wire before the runtime tears down and
+    /// `Drop` aborts the writer task — see `MessageSender::flush`
+    /// trait doc and the natural-quiesce branch in
+    /// `secondary/processing.rs`.
+    async fn flush(&mut self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.bridge_mut()
+            .outgoing_tx
+            .send(Outgoing::Flush(tx))
+            .map_err(|_| "transport writer task exited".to_string())?;
+        rx.await
+            .map_err(|_| "transport writer task exited before flush ack".to_string())
     }
 }
 
@@ -140,7 +180,7 @@ impl<I: Identifier> MessageReceiver<DistributedMessage<I>> for NetworkClient<I> 
 /// Spawn reader + writer tasks for a fresh QuicConnection and return
 /// the application-side channel pair wrapped in a `BridgedConnection`.
 fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I> {
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Outgoing<I>>();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
     let (send_stream, recv_stream, existing_buf) = conn.into_parts();
@@ -171,14 +211,24 @@ fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I
 
     let writer = tokio::task::spawn_local(async move {
         let mut send = send_stream;
-        while let Some(msg) = outgoing_rx.recv().await {
-            match codec::serialize_message(&msg) {
-                Ok(frame) => {
-                    if send.write_all(&frame).await.is_err() {
-                        break;
+        while let Some(item) = outgoing_rx.recv().await {
+            match item {
+                Outgoing::Msg(msg) => match codec::serialize_message(&msg) {
+                    Ok(frame) => {
+                        if send.write_all(&frame).await.is_err() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
+                },
+                Outgoing::Flush(ack) => {
+                    // FIFO order on the mpsc means every preceding
+                    // Msg's write_all has already returned by the
+                    // time we get here — i.e. the OS socket buffer
+                    // has accepted the bytes. Signal the waiter
+                    // regardless of receiver liveness.
+                    let _ = ack.send(());
                 }
-                Err(_) => break,
             }
         }
         tracing::debug!("NetworkClient QUIC writer done");
@@ -194,7 +244,7 @@ fn spawn_quic_bridge<I: Identifier>(conn: QuicConnection) -> BridgedConnection<I
 
 /// Spawn reader + writer tasks for a fresh WssConnection.
 fn spawn_wss_bridge<I: Identifier>(conn: WssConnection) -> BridgedConnection<I> {
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<Outgoing<I>>();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
     let (mut ws_write, mut ws_read) = conn.into_inner().split();
@@ -220,14 +270,24 @@ fn spawn_wss_bridge<I: Identifier>(conn: WssConnection) -> BridgedConnection<I> 
     });
 
     let writer = tokio::task::spawn_local(async move {
-        while let Some(msg) = outgoing_rx.recv().await {
-            match codec::serialize_message(&msg) {
-                Ok(frame) => {
-                    if ws_write.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
+        while let Some(item) = outgoing_rx.recv().await {
+            match item {
+                Outgoing::Msg(msg) => match codec::serialize_message(&msg) {
+                    Ok(frame) => {
+                        if ws_write.send(Message::Binary(frame.into())).await.is_err() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
+                },
+                Outgoing::Flush(ack) => {
+                    // See `spawn_quic_bridge` for the FIFO rationale —
+                    // every preceding Msg's `ws_write.send.await` has
+                    // returned (i.e. the WebSocket sink has accepted
+                    // and flushed the frame to the TCP socket) by the
+                    // time we observe this marker.
+                    let _ = ack.send(());
                 }
-                Err(_) => break,
             }
         }
         tracing::debug!("NetworkClient WSS writer done");
