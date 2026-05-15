@@ -544,6 +544,22 @@ where
     /// is `false → true (mid-call) → (method returns Done)` for
     /// those callers.
     pub(super) setup_phase_completed: bool,
+
+    /// Peer-lifecycle dispatcher channel receiver, paired with the
+    /// `lifecycle_tx` installed on `cluster_state` at construction.
+    /// Taken out at `run_until_setup_or_done`'s first entry and
+    /// handed to
+    /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`] inside
+    /// the LocalSet running the secondary's operational loop.
+    pub(super) lifecycle_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>,
+    >,
+    /// Consumers of peer-lifecycle events; same single-shot
+    /// `mem::take`-at-run semantics as on `PrimaryCoordinator`. See
+    /// `PrimaryCoordinator::peer_lifecycle_listeners` for the
+    /// rationale.
+    pub(super) peer_lifecycle_listeners:
+        Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -581,6 +597,14 @@ where
             config.retry_max_passes,
             retry_budget::DEFAULT_SAFETY_MARGIN,
         );
+        // Peer-lifecycle dispatcher channel. Built at construction so
+        // the `cluster_state` apply path has an installed sender
+        // from the first `PeerJoined`/`PeerRemoved` mutation; the
+        // receiver waits on `self` until `run_until_setup_or_done`
+        // hands it to the dispatcher task. Events emitted before the
+        // dispatcher is spawned queue on the unbounded channel and
+        // drain on first poll.
+        let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut this = Self {
             config,
             primary_transport,
@@ -620,7 +644,18 @@ where
             pending_worker_restarts: HashSet::new(),
             setup_pending: false,
             setup_phase_completed: false,
+            lifecycle_rx: Some(lifecycle_rx),
+            peer_lifecycle_listeners: Vec::new(),
         };
+        // Install the peer-lifecycle sender on `cluster_state` so the
+        // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
+        // through the dispatcher channel from this point onward.
+        // Done before any other registration so a mutation that
+        // somehow lands during construction still has a sender to
+        // enqueue against (defensive: today no mutation is applied
+        // pre-`run_until_setup_or_done()`, but the contract should
+        // not depend on that).
+        this.cluster_state.install_lifecycle_sender(lifecycle_tx);
         // Attach the transport's write-through role cache to our
         // authoritative `cluster_state.role_table`. The hook fires
         // on every applied `PrimaryChanged` mutation; the cache
@@ -631,6 +666,23 @@ where
         this.peer_transport
             .register_with_cluster_state(&mut this.cluster_state);
         this
+    }
+
+    /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
+    /// invoked off the apply path for every `PeerJoined`/`PeerRemoved`
+    /// state transition. Must be called BEFORE
+    /// `run_until_setup_or_done` enters; calls afterwards are dropped
+    /// silently (the field is `mem::take`-d into the dispatcher on
+    /// the first invocation).
+    ///
+    /// Single concern: own the registration surface; the dispatcher
+    /// task in `crate::peer_lifecycle::dispatcher` owns the
+    /// invocation semantics.
+    pub fn register_lifecycle_listener(
+        &mut self,
+        listener: Box<dyn crate::peer_lifecycle::LifecycleListener>,
+    ) {
+        self.peer_lifecycle_listeners.push(listener);
     }
 
     /// Whether the run is in pre-staged-source mode (set from the
@@ -874,6 +926,20 @@ where
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<RunOutcome, String> {
+        // Spawn the peer-lifecycle dispatcher on first entry (idempotent
+        // on `SetupPending` re-entry: the receiver was already taken,
+        // so this branch is a no-op the second time around). The
+        // sender end was installed on `cluster_state` in `new()` so
+        // any apply that lands before the dispatcher polls queues on
+        // the unbounded channel and drains here. `spawn_local`
+        // matches the rest of the secondary's LocalSet-bound spawn
+        // pattern.
+        if let Some(rx) = self.lifecycle_rx.take() {
+            let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
+            tokio::task::spawn_local(
+                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
+            );
+        }
         if !self.setup_phase_completed {
             tracing::info!(
                 secondary = %self.config.secondary_id,
