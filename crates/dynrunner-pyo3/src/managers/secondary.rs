@@ -584,13 +584,12 @@ impl PySecondaryCoordinator {
 
                 let completed = secondary.completed_count() as u32;
 
-                // Clean up child processes
-                for child in &mut factory.child_processes {
-                    if let Some(mut c) = child.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
-                }
+                // Tear down tracked worker subprocesses via the shared
+                // SIGTERM → grace → SIGKILL primitive. See
+                // `subprocess_factory::terminate_children` for why
+                // straight SIGKILL is the wrong default for
+                // podman-launched workers.
+                factory.cleanup_all();
 
                 loop_result.map(|()| completed)
             }))
