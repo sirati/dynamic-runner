@@ -4,6 +4,7 @@ pub mod packaging;
 pub mod peer_info;
 pub mod pipeline;
 pub mod preparation;
+pub mod respawn;
 pub mod wrapper_script;
 
 pub use config::SlurmConfig;
@@ -16,6 +17,10 @@ pub use peer_info::{
 };
 pub use pipeline::{pkill_residual_reverse_tunnels, CleanupSteps, PipelineGuard, PipelineSteps};
 pub use preparation::{InfoFileReader, PrepError, PreparationOptions, SlurmPreparation};
+pub use respawn::{
+    SlurmPreparationTunnelEstablisher, SlurmSecondarySpawner, TunnelEstablisher,
+    WrapperScriptGenerator,
+};
 pub use wrapper_script::{
     generate_test_wrapper_script, generate_wrapper_script, ConnectionMode,
     TestWrapperScriptConfig, WrapperScriptConfig,

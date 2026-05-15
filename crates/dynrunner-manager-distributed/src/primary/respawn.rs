@@ -49,7 +49,19 @@ pub enum SpawnError {
 
 /// Async trait for the per-provider spawner. Multi-process and SLURM
 /// implementations live in sibling files.
-#[async_trait::async_trait]
+///
+/// `#[async_trait(?Send)]` because the SLURM impl drives
+/// `ssh -N -R` subprocess spawn through a closure whose future is not
+/// `Send` (the closure returns `Pin<Box<dyn Future + 'static>>` — see
+/// `dynrunner_slurm::preparation::production_spawner`). The operational
+/// loop on `PrimaryCoordinator` already runs inside a
+/// `tokio::task::LocalSet` for the same reason (the SLURM preparation
+/// pipeline uses `spawn_local` for per-tunnel watchers), so dropping
+/// the `Send` bound on the returned future does not constrain the
+/// integration site — it just lifts a constraint the provider physics
+/// can't satisfy. The trait object itself stays `Send + Sync` so
+/// `Arc<dyn SecondarySpawner>` is moveable across `select!` arms.
+#[async_trait::async_trait(?Send)]
 pub trait SecondarySpawner: Send + Sync {
     async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError>;
 }

@@ -117,7 +117,7 @@ fn invoke_python_callback(
     .map_err(|e| SpawnError::Other(e.to_string()))
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SecondarySpawner for PyMultiProcessSpawner {
     async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError> {
         // Snapshot the bits the blocking task needs. Cloning is cheap
