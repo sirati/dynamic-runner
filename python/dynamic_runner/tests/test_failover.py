@@ -18,8 +18,6 @@ end-to-end run.
 from __future__ import annotations
 
 import os
-import signal
-import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -139,9 +137,15 @@ def _make_binaries(n: int) -> list[_StubTaskInfo]:
 def _spawn_secondary_factory(args, kill_marker_dir: Path):
     """Returns a spawn_secondary callback the test can introspect.
 
-    The kill_marker_dir is shared with the secondaries so the
+    The kill_marker_dir is shared with the secondaries (via the
+    ``DB_FAILOVER_TEST_KILL_MARKER`` env var) so the
     `_failover_stub_worker` can check whether it should self-terminate
     early (simulating the killed-secondary scenario).
+
+    Post-refactor the callback returns a
+    :class:`dynamic_runner.SubprocessSpec` instead of a live
+    ``subprocess.Popen``; Rust spawns the child and owns its lifetime
+    (see ``crates/dynrunner-pyo3/src/managers/primary.rs``).
     """
 
     def spawn_secondary(primary_url: str, secondary_id: str, quic_port: int):
@@ -158,7 +162,7 @@ def _spawn_secondary_factory(args, kill_marker_dir: Path):
             "--secondary-quic-port",
             str(quic_port),
         ]
-        return subprocess.Popen(cmd, env=env)
+        return _rs.SubprocessSpec(argv=cmd, env=env)
 
     return spawn_secondary
 

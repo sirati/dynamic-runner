@@ -263,20 +263,51 @@ impl PyPrimaryCoordinator {
         let primary_url = format!("tcp://127.0.0.1:{}", port);
 
         // Call the Python spawn_secondary callback for each secondary.
-        // The callback receives (primary_url, secondary_id, quic_port) and
-        // should return a subprocess.Popen (or compatible object with kill/wait).
-        let mut child_processes: Vec<Py<PyAny>> = Vec::new();
+        // Contract (post-refactor): the callback receives
+        // `(primary_url, secondary_id, quic_port)` and returns either
+        // `None` (SLURM mode: the wrapper script already spawned the
+        // secondary; Rust owns no child here) or a `SubprocessSpec`
+        // carrying argv (+ optional env). Rust then spawns the
+        // `std::process::Child` itself and OWNS its lifetime — kill +
+        // wait at end of `run()` run against the Rust-side `Child`
+        // handles, never re-entering Python for subprocess control.
+        // This is the Rust-side enforcement of
+        // `feedback_features_in_rust_python_is_bridge`: Python
+        // assembles argv (legitimate CLI/config concern), Rust owns the
+        // resulting process tree.
+        let mut child_processes: Vec<std::process::Child> = Vec::new();
         for i in 0..num_secondaries {
             let secondary_id = format!("secondary-{i}");
-            let process = self.spawn_secondary.call1(
+            let spec_obj = self.spawn_secondary.call1(
                 py,
                 (&primary_url, &secondary_id, 0u16),
             )?;
+            // `None` → SLURM no-op path (`_slurm_already_spawned`).
+            // Anything else MUST be a `SubprocessSpec`-shaped object
+            // (the Python `dynamic_runner.SubprocessSpec` dataclass);
+            // we refuse the legacy `subprocess.Popen` shape loudly
+            // rather than fall back to Python-side ownership.
+            if spec_obj.is_none(py) {
+                tracing::info!(
+                    secondary_id = %secondary_id,
+                    "spawn_secondary returned None; assuming external spawn (SLURM-style)"
+                );
+                continue;
+            }
+            let spec = crate::managers::subprocess_spec::SubprocessSpec::from_pyany(
+                spec_obj.bind(py),
+            )?;
+            let child = spec.spawn().map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "failed to spawn secondary {secondary_id}: {e}"
+                ))
+            })?;
             tracing::info!(
                 secondary_id = %secondary_id,
-                "spawned secondary process via callback"
+                pid = child.id(),
+                "spawned secondary process (Rust-owned Child)"
             );
-            child_processes.push(process);
+            child_processes.push(child);
         }
 
         let mut completed = 0u32;
@@ -397,10 +428,18 @@ impl PyPrimaryCoordinator {
             }));
         });
 
-        // Back with the GIL — terminate secondary processes via the Python objects.
-        for process in &child_processes {
-            let _ = process.call_method0(py, "kill");
-            let _ = process.call_method0(py, "wait");
+        // Back with the GIL — terminate secondary processes through
+        // the Rust-owned `Child` handles. No re-entry into Python for
+        // subprocess control: lifecycle is fully Rust-side after the
+        // initial `SubprocessSpec` handoff.
+        for mut child in child_processes {
+            let pid = child.id();
+            if let Err(e) = child.kill() {
+                tracing::debug!(pid, error = %e, "child.kill() failed (already exited?)");
+            }
+            if let Err(e) = child.wait() {
+                tracing::debug!(pid, error = %e, "child.wait() failed");
+            }
         }
 
         self.completed = completed;
