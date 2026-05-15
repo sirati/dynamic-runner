@@ -23,6 +23,7 @@ Public surface:
 
 from .deployment_spec import TaskDeploymentSpec
 from .run import run
+from .subprocess_spec import SubprocessSpec
 from .task_protocol import PhaseSpec, TaskDefinition, TaskTypeSpec
 
 from ._native import (
@@ -86,6 +87,7 @@ __all__ = [
     "SchedulerConfig",
     "SecondaryConfig",
     "SlurmConfig",
+    "SubprocessSpec",
     "WorkerSpec",
     "compute_task_hash",
     "parse_cores",
