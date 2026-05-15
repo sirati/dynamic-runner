@@ -10,10 +10,53 @@ fn error_type_wire_roundtrip() {
         ErrorType::ResourceExhausted(ResourceKind::memory()),
         ErrorType::NonRecoverable,
         ErrorType::Recoverable,
+        ErrorType::Unfulfillable {
+            reason: "toolchain outpath /nix/store/abc-foo missing".to_string().into(),
+        },
     ] {
         let wire = et.wire_value();
         let parsed = ErrorType::from_wire(&wire).unwrap();
         assert_eq!(et, parsed);
+    }
+}
+
+#[test]
+fn error_type_unfulfillable_wire_format() {
+    let et = ErrorType::Unfulfillable {
+        reason: "missing dep".to_string().into(),
+    };
+    assert_eq!(et.wire_value(), "unfulfillable:missing dep");
+}
+
+#[test]
+fn error_type_unfulfillable_json_roundtrip() {
+    // serde-derive of `ErrorType` uses external tagging for variants
+    // with payloads (the existing convention, matching how
+    // `ResourceExhausted` already serialises). The wire JSON for
+    // `Unfulfillable` is the same shape: a single-key object whose
+    // key is the variant name and value is the struct body.
+    let et = ErrorType::Unfulfillable {
+        reason: "fail".to_string().into(),
+    };
+    let json = serde_json::to_string(&et).unwrap();
+    let parsed: ErrorType = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, et);
+}
+
+#[test]
+fn error_type_unfulfillable_deserialise_caps_oversize_reason() {
+    // A peer that sends an oversized `reason` must not be able to
+    // make the receiver hold an unbounded buffer. The cap lives in
+    // the `BoundedString<2048>` deserialiser, which trims to a
+    // UTF-8 boundary on the way in.
+    let body = "x".repeat(4097);
+    let json = format!("{{\"Unfulfillable\":{{\"reason\":\"{}\"}}}}", body);
+    let parsed: ErrorType = serde_json::from_str(&json).unwrap();
+    match parsed {
+        ErrorType::Unfulfillable { reason } => {
+            assert_eq!(reason.as_str().len(), 2048);
+        }
+        other => panic!("expected Unfulfillable, got {other:?}"),
     }
 }
 

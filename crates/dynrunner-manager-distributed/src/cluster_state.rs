@@ -377,9 +377,18 @@ impl<I: Identifier> ClusterState<I> {
                     ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
                         o.fail_oom += 1
                     }
-                    ErrorType::ResourceExhausted(_) | ErrorType::NonRecoverable => {
-                        o.fail_final += 1
-                    }
+                    // `Unfulfillable` is a resource-availability failure
+                    // that *will* become reinjectable once future phases
+                    // wire up the matcher state-filter + reinject command
+                    // path. Until that lands it terminates the task in the
+                    // ledger, so the outcome summary tallies it under
+                    // `fail_final` — same bucket as `NonRecoverable`,
+                    // which is the closest existing semantics. Revisit
+                    // when the reinject path arrives: the count may need
+                    // to move to a dedicated reinject/blocked bucket.
+                    ErrorType::ResourceExhausted(_)
+                    | ErrorType::NonRecoverable
+                    | ErrorType::Unfulfillable { .. } => o.fail_final += 1,
                 },
                 TaskState::Pending { .. } | TaskState::InFlight { .. } => {}
             }
