@@ -22,7 +22,7 @@ use pyo3::types::PyDict;
 
 use dynrunner_gateway::shell::shell_quote;
 use dynrunner_slurm::preparation::{
-    InfoFileReader, PrepError, PreparationOptions, SlurmPreparation,
+    EstablishmentPolicy, InfoFileReader, PrepError, PreparationOptions, SlurmPreparation,
 };
 
 /// Bridge that calls back into a Python gateway's
@@ -135,6 +135,10 @@ impl PySlurmPreparation {
         gateway_user = None,
         setup_timeout_secs = 600.0,
         poll_interval_secs = 2.0,
+        establishment_max_concurrent = None,
+        establishment_attempts = None,
+        establishment_backoff_secs = None,
+        establishment_per_tunnel_timeout_secs = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -147,6 +151,10 @@ impl PySlurmPreparation {
         gateway_user: Option<String>,
         setup_timeout_secs: f64,
         poll_interval_secs: f64,
+        establishment_max_concurrent: Option<usize>,
+        establishment_attempts: Option<usize>,
+        establishment_backoff_secs: Option<Vec<f64>>,
+        establishment_per_tunnel_timeout_secs: Option<f64>,
     ) -> PyResult<Self> {
         let mut opts = PreparationOptions::new(
             run_log_dir,
@@ -158,6 +166,27 @@ impl PySlurmPreparation {
         );
         opts.setup_timeout = Duration::from_secs_f64(setup_timeout_secs);
         opts.poll_interval = Duration::from_secs_f64(poll_interval_secs);
+        // Establishment-policy overrides. `None` for any field keeps
+        // the Rust-side default — operator-friendly: callers that
+        // don't care pass nothing and get the safe 4-concurrent /
+        // 3-attempt / 5+15s / 90s defaults.
+        let mut est = EstablishmentPolicy::default();
+        if let Some(n) = establishment_max_concurrent {
+            est.max_concurrent = n;
+        }
+        if let Some(n) = establishment_attempts {
+            est.attempts = n;
+        }
+        if let Some(backoff) = establishment_backoff_secs {
+            est.backoff = backoff
+                .into_iter()
+                .map(Duration::from_secs_f64)
+                .collect();
+        }
+        if let Some(t) = establishment_per_tunnel_timeout_secs {
+            est.per_tunnel_timeout = Duration::from_secs_f64(t);
+        }
+        opts.establishment = est;
         Ok(Self {
             inner: SlurmPreparation::new(opts),
             gateway,

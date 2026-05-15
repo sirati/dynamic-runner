@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use dynrunner_gateway::shell::shell_join;
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 use crate::peer_info::{parse as parse_peer_info, PeerInfoRecord};
@@ -83,6 +83,85 @@ pub struct PreparationOptions {
     pub setup_timeout: Duration,
     /// Watcher polling cadence; default 2s matches Python.
     pub poll_interval: Duration,
+    /// Policy for the establishment-phase rate-limiter + retry. See
+    /// [`EstablishmentPolicy`] for field meanings; default values are
+    /// safe for the LMU CIP gateway load-balancer (max 4 concurrent
+    /// handshakes, 3 attempts at [0, 5s, 15s] backoff, 90s per-tunnel
+    /// wall-clock cap).
+    pub establishment: EstablishmentPolicy,
+}
+
+/// Policy governing one tunnel's establishment phase — the window
+/// between "info file shows up" and "ssh -R verified alive past the
+/// 3s gate". Owns:
+///
+/// 1. **Concurrency cap** (`max_concurrent`): how many `ssh -N -R`
+///    handshakes may be in flight at the same instant across all
+///    watchers in a single `setup_ssh_tunnels` call. The coordinator
+///    materialises this as a [`Semaphore`] shared across watchers;
+///    each watcher acquires one permit just before `Command::spawn`
+///    and releases it once the 3s verify gate has resolved (success
+///    or failure).
+///
+///    Why: LMU's gateway is a load-balancer alias dispatching across
+///    several physical hosts, each running OpenSSH with `MaxStartups`
+///    typically defaulting to 10:30:100 (random-drop above 10 unauth'd
+///    handshakes). With 15 secondaries all racing to handshake
+///    simultaneously, ~1/15 ssh subprocesses intermittently sees
+///    `Connection closed by ... rc=255` because the gateway sshd
+///    randomly dropped the connection. Capping at 4 keeps the
+///    in-flight handshake count well below the default budget while
+///    still parallelising the bulk of setup.
+///
+/// 2. **Retry budget** (`attempts`, `backoff`): per-tunnel retry on
+///    handshake-time failure. Only `PrepError::TunnelFailed` is
+///    retried (info-parse / IO errors are non-recoverable). After
+///    `attempts` total tries the last failure surfaces unchanged.
+///    `backoff[i]` is the sleep BEFORE attempt `i+1` (so `backoff[0]`
+///    sits between attempts 1 and 2).
+///
+/// 3. **Per-tunnel wall-clock cap** (`per_tunnel_timeout`): a single
+///    establishment (across all retries + their inter-attempt sleeps)
+///    is bounded by this deadline so a single chronically-failing
+///    tunnel can't soak the whole 600s outer budget. Default 90s
+///    matches the consumer requirement.
+#[derive(Debug, Clone)]
+pub struct EstablishmentPolicy {
+    pub max_concurrent: usize,
+    pub attempts: usize,
+    /// Inter-attempt sleeps. `len() = attempts - 1` is the canonical
+    /// shape; if shorter the policy reuses the last entry, if longer
+    /// the tail is ignored. Empty disables retry waits.
+    pub backoff: Vec<Duration>,
+    pub per_tunnel_timeout: Duration,
+}
+
+impl EstablishmentPolicy {
+    /// Backoff sleep BEFORE attempt index `attempt` (0-based). Returns
+    /// `None` for `attempt == 0` (no pre-sleep on the first try).
+    /// Indexing semantics: `attempt = i` sleeps `backoff[i - 1]`,
+    /// clamping at the last element if `backoff` is shorter.
+    pub fn backoff_before(&self, attempt: usize) -> Option<Duration> {
+        if attempt == 0 {
+            return None;
+        }
+        let idx = attempt - 1;
+        self.backoff
+            .get(idx)
+            .or_else(|| self.backoff.last())
+            .copied()
+    }
+}
+
+impl Default for EstablishmentPolicy {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 4,
+            attempts: 3,
+            backoff: vec![Duration::from_secs(5), Duration::from_secs(15)],
+            per_tunnel_timeout: Duration::from_secs(90),
+        }
+    }
 }
 
 impl PreparationOptions {
@@ -103,6 +182,7 @@ impl PreparationOptions {
             extra_port_forwards,
             setup_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_secs(2),
+            establishment: EstablishmentPolicy::default(),
         }
     }
 }
@@ -191,6 +271,20 @@ impl SlurmPreparation {
 
         let connection_info_dir = format!("{}/connection_info", self.opts.run_log_dir);
 
+        // Shared establishment-phase permit pool. Bounds the number
+        // of in-flight `ssh -N -R` handshakes across all watchers in
+        // this `setup_ssh_tunnels` call. Acquired inside `establish_tunnel`
+        // immediately before `Command::spawn`, released as soon as the
+        // 3s verify gate resolves — info-file polling is NOT permit-gated
+        // (it's I/O-bound on the gateway `cat`, not on the target sshd's
+        // MaxStartups budget). Without this cap, all N watchers race to
+        // spawn ssh in the same ~10ms window once their info files land,
+        // and OpenSSH's default `MaxStartups 10:30:100` random-drops
+        // handshakes above 10 in flight — manifesting as `Connection
+        // closed by <host> port 22, rc=255` on the load-balanced LMU
+        // gateway.
+        let establish_pool = Arc::new(Semaphore::new(self.opts.establishment.max_concurrent.max(1)));
+
         // Each watcher signals completion via its own oneshot. Using
         // `JoinSet` for spawn-local + abort-on-drop semantics: when
         // we return from this function (success OR timeout), JoinSet
@@ -212,6 +306,7 @@ impl SlurmPreparation {
                 opts: self.opts.clone(),
                 reader: reader.clone(),
                 tunnels: Arc::clone(&self.ssh_tunnels),
+                establish_pool: Arc::clone(&establish_pool),
                 done: tx,
             };
             watchers.spawn_local(watcher.run());
@@ -294,6 +389,10 @@ struct TunnelWatcher<R: InfoFileReader> {
     opts: PreparationOptions,
     reader: R,
     tunnels: Arc<Mutex<Vec<Child>>>,
+    /// Shared rate-limiter permit pool — see `setup_ssh_tunnels` for
+    /// why it exists. Cloned per-watcher; the establish helper
+    /// acquires/releases on each attempt.
+    establish_pool: Arc<Semaphore>,
     done: oneshot::Sender<Result<WatcherOutcome, PrepError>>,
 }
 
@@ -306,6 +405,7 @@ impl<R: InfoFileReader> TunnelWatcher<R> {
             opts,
             reader,
             tunnels,
+            establish_pool,
             done,
         } = self;
 
@@ -316,6 +416,7 @@ impl<R: InfoFileReader> TunnelWatcher<R> {
             &opts,
             reader,
             &tunnels,
+            &establish_pool,
         )
         .await;
         // Send result. If receiver was dropped (coordinator timed
@@ -335,6 +436,7 @@ async fn drive_one_watcher<R: InfoFileReader>(
     opts: &PreparationOptions,
     reader: R,
     tunnels: &Arc<Mutex<Vec<Child>>>,
+    establish_pool: &Arc<Semaphore>,
 ) -> Result<WatcherOutcome, PrepError> {
     // Poll until the info file appears. The outer timeout guards
     // total runtime; this loop has no inner deadline by design —
@@ -380,27 +482,25 @@ async fn drive_one_watcher<R: InfoFileReader>(
         tokio::time::sleep(opts.poll_interval).await;
     };
 
-    let mut child = spawn_reverse_tunnel(
+    // Delegate spawn + verify + rate-limit + retry to a single
+    // helper that owns the establishment concern (see
+    // `EstablishmentPolicy` doc-comment). Returns the verified Child
+    // already past the 3s alive-gate; the caller (this function) is
+    // responsible for moving it into the shared tunnels Vec for
+    // cleanup() to reap.
+    //
+    // Cancel-safety: the `Command::spawn` inside `spawn_reverse_tunnel`
+    // sets `kill_on_drop(true)`, so an outer-timeout abort drops the
+    // in-progress Child and SIGKILL fires. The acquired Semaphore
+    // permit is released on drop — no need to manually re-balance
+    // the pool on cancellation.
+    let child = establish_tunnel(
         secondary_id,
-        &host,
-        tunnel_port,
-        primary_quic_port,
-        opts,
+        &opts.establishment,
+        establish_pool,
+        || spawn_reverse_tunnel(secondary_id, &host, tunnel_port, primary_quic_port, opts),
     )
     .await?;
-
-    // Verify against the locally-owned `Child` — no shared-Vec
-    // `last_mut()`. With ≥2 concurrent watchers, the previous
-    // push-then-`last_mut()` shape raced: watcher A could verify
-    // watcher B's child as soon as their push order interleaved.
-    //
-    // Cancel-safety while we hold `child` locally: the spawning
-    // `Command` had `kill_on_drop(true)` set, so if the outer
-    // timeout aborts this watcher mid-verify, `child` is dropped
-    // and SIGKILL fires automatically — cleanup() doesn't need to
-    // see this child. On verify failure, `child` likewise drops
-    // here (process already exited, drop is a no-op).
-    verify_tunnel_alive(secondary_id, &mut child).await?;
 
     // Commit to the shared tunnel set only after verification —
     // cleanup() now only sees established tunnels.
@@ -413,6 +513,121 @@ async fn drive_one_watcher<R: InfoFileReader>(
         secondary_id: secondary_id.to_owned(),
         tunnel_port,
     })
+}
+
+/// Establish a single SSH reverse tunnel: acquire a semaphore permit,
+/// spawn (via the caller-supplied spawner), verify the resulting
+/// child survives the 3s alive-gate. On
+/// `PrepError::TunnelFailed` (rc=255-class handshake failure), retry
+/// up to [`EstablishmentPolicy::attempts`] total times with
+/// [`EstablishmentPolicy::backoff`] sleeps in between. The overall
+/// per-tunnel deadline is bounded by
+/// [`EstablishmentPolicy::per_tunnel_timeout`] so a single chronically
+/// failing tunnel can't soak the whole outer `setup_timeout`.
+///
+/// Single concern: tunnel-establishment policy. The watcher knows
+/// nothing about the semaphore or retries — it sees only "give me a
+/// verified Child or a terminal error". The `spawner` parameter is
+/// pure DI for testability: production passes a closure that builds
+/// `ssh -N -R` argv and runs `Command::spawn`; tests can pass a
+/// closure that returns a `/bin/sh` child with a configurable
+/// success/failure sequence, exercising the rate-limit and retry
+/// control flow without ever touching ssh.
+///
+/// Permit lifetime: acquired before each spawn attempt, released
+/// when the per-attempt `_permit` binding drops at the end of each
+/// loop iteration (success path: just after verify returns Ok;
+/// retry/terminal path: just before the inter-attempt sleep or
+/// return). This ensures the 3s verify gate counts against the
+/// in-flight handshake budget — without the verify window, a long
+/// sequence of failing handshakes would each free their permit
+/// instantly and the rate cap would only limit `Command::spawn`
+/// turnover, not actual sshd-facing handshake concurrency.
+async fn establish_tunnel<F, Fut>(
+    secondary_id: &str,
+    policy: &EstablishmentPolicy,
+    establish_pool: &Arc<Semaphore>,
+    mut spawner: F,
+) -> Result<Child, PrepError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Child, PrepError>>,
+{
+    let attempts = policy.attempts.max(1);
+
+    let attempt_all = async {
+        let mut last_err: Option<PrepError> = None;
+        for attempt in 0..attempts {
+            if let Some(sleep) = policy.backoff_before(attempt) {
+                tracing::info!(
+                    secondary_id,
+                    attempt = attempt + 1,
+                    total = attempts,
+                    backoff_secs = sleep.as_secs_f64(),
+                    "retrying SSH tunnel establishment after backoff"
+                );
+                tokio::time::sleep(sleep).await;
+            }
+
+            // Acquire a permit just before the handshake. `acquire`
+            // is cancel-safe; the returned permit auto-releases on
+            // drop at the end of this loop iteration. `.unwrap()` is
+            // sound: the Semaphore is never closed (it lives for the
+            // duration of `setup_ssh_tunnels`).
+            let _permit = establish_pool.acquire().await.expect("semaphore not closed");
+
+            let mut child = match spawner().await {
+                Ok(c) => c,
+                // Spawn-time IO error is not a handshake failure —
+                // surface immediately without retry; nothing the
+                // backoff would help with (binary missing, fd
+                // exhaustion, …).
+                Err(e) => return Err(e),
+            };
+
+            match verify_tunnel_alive(secondary_id, &mut child).await {
+                Ok(()) => return Ok(child),
+                Err(e @ PrepError::TunnelFailed { .. }) => {
+                    // Retryable: log + record, fall through to next
+                    // iteration's pre-sleep (if any).
+                    tracing::warn!(
+                        secondary_id,
+                        attempt = attempt + 1,
+                        total = attempts,
+                        error = %e,
+                        "SSH tunnel attempt failed; will retry if budget remains"
+                    );
+                    last_err = Some(e);
+                }
+                // Non-retryable verify error (IO etc.) — surface as-is.
+                Err(other) => return Err(other),
+            }
+            // _permit dropped here → release before backoff sleep.
+        }
+        // Exhausted attempts. last_err is Some(TunnelFailed{..}) by
+        // construction (the only path that loops back is the retryable
+        // branch above).
+        Err(last_err.expect("retry loop ran at least once with TunnelFailed"))
+    };
+
+    match tokio::time::timeout(policy.per_tunnel_timeout, attempt_all).await {
+        Ok(inner) => inner,
+        Err(_) => {
+            tracing::error!(
+                secondary_id,
+                budget_secs = policy.per_tunnel_timeout.as_secs_f64(),
+                "SSH tunnel establishment exceeded per-tunnel wall-clock budget"
+            );
+            Err(PrepError::TunnelFailed {
+                secondary_id: secondary_id.to_owned(),
+                rc: None,
+                stderr: format!(
+                    "per-tunnel establishment budget {:?} exhausted before success",
+                    policy.per_tunnel_timeout
+                ),
+            })
+        }
+    }
 }
 
 /// Build the argv for `ssh -N -R <tunnel_port>:localhost:<primary> ...`
@@ -966,6 +1181,320 @@ mod tests {
                 other => panic!("expected TunnelFailed, got {other}"),
             }
         }
+    }
+
+    // ─── Establishment policy: rate-limit + retry coverage ──────────
+    //
+    // These tests bypass the watcher's info-file polling and exercise
+    // `establish_tunnel` directly via dependency injection on the
+    // `spawner` closure. The watcher path is covered by the existing
+    // `timeout_when_no_secondary_ready` + e2e tests; here we pin the
+    // policy-engine semantics (semaphore concurrency cap, retry
+    // attempts, terminal-failure surface, per-tunnel wall-clock cap)
+    // without launching a real ssh subprocess.
+
+    /// Build a `/bin/sh` child whose stderr emits `marker` and whose
+    /// exit code is `rc`. Returns a `Child` that mirrors what
+    /// `verify_tunnel_alive` will observe — fast-exit (≪ 3s) ensures
+    /// the failure branch trips immediately.
+    fn fail_child(marker: &str, rc: i32) -> Child {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("printf '%s' '{marker}' >&2; exit {rc}"));
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        cmd.spawn().expect("spawn /bin/sh")
+    }
+
+    /// A child that survives the 3s verify gate. We use `sleep 60`
+    /// (and `kill_on_drop(true)` reaps it when the test drops the
+    /// Child returned from `establish_tunnel`).
+    fn alive_child() -> Child {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 60");
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        cmd.spawn().expect("spawn /bin/sh sleep")
+    }
+
+    /// Establishment-policy test fixture: zero-backoff, 1s per-tunnel
+    /// budget so tests stay fast.
+    fn fast_policy(max_concurrent: usize, attempts: usize) -> EstablishmentPolicy {
+        EstablishmentPolicy {
+            max_concurrent,
+            attempts,
+            backoff: vec![Duration::from_millis(10)],
+            per_tunnel_timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// Retry semantics: a spawner that returns rc=255 on the first
+    /// attempt and a long-lived (sleep-60) child on the second must
+    /// surface success on the second attempt. Pins option-1: per-
+    /// tunnel retry-on-handshake-failure.
+    #[test]
+    fn establish_tunnel_retries_then_succeeds() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let result: Result<(), PrepError> = rt.block_on(local.run_until(async {
+            let pool = Arc::new(Semaphore::new(1));
+            let policy = fast_policy(1, 3);
+            let attempt_counter = Arc::new(AtomicUsize::new(0));
+            let attempts_ref = Arc::clone(&attempt_counter);
+
+            let res = establish_tunnel(
+                "secondary-0",
+                &policy,
+                &pool,
+                move || {
+                    let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if i == 0 {
+                            // First attempt: simulate rc=255 (LMU
+                            // gateway random-drop on overloaded sshd).
+                            Ok(fail_child("kex_exchange_identification: Connection closed by remote host", 255))
+                        } else {
+                            // Second attempt: lives past 3s gate.
+                            Ok(alive_child())
+                        }
+                    }
+                },
+            )
+            .await;
+
+            match res {
+                Ok(_child) => {
+                    assert_eq!(
+                        attempt_counter.load(Ordering::SeqCst),
+                        2,
+                        "expected exactly 2 spawn attempts (1 fail + 1 success)"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        }));
+        result.expect("retry-then-success path must yield Ok");
+    }
+
+    /// Retry exhaustion: a spawner that always returns rc=255 hits
+    /// `attempts` total tries, then surfaces the LAST `TunnelFailed`
+    /// — never aborts early, never retries forever.
+    #[test]
+    fn establish_tunnel_exhausts_attempts_then_fails_loud() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let (err, attempts) = rt.block_on(local.run_until(async {
+            let pool = Arc::new(Semaphore::new(1));
+            let policy = fast_policy(1, 3);
+            let attempt_counter = Arc::new(AtomicUsize::new(0));
+            let attempts_ref = Arc::clone(&attempt_counter);
+
+            let res = establish_tunnel(
+                "secondary-0",
+                &policy,
+                &pool,
+                move || {
+                    let i = attempts_ref.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        Ok(fail_child(&format!("ATTEMPT-{i}-FAIL"), 255))
+                    }
+                },
+            )
+            .await;
+
+            let err = res.expect_err("3 failing attempts must surface TunnelFailed");
+            (err, attempt_counter.load(Ordering::SeqCst))
+        }));
+        assert_eq!(attempts, 3, "must hit attempts cap exactly");
+        match err {
+            PrepError::TunnelFailed { secondary_id, rc, stderr } => {
+                assert_eq!(secondary_id, "secondary-0");
+                // /bin/sh `exit 255` → POSIX raw exit code 255. The
+                // exact rc isn't load-bearing (load-bearing is "did
+                // we surface the LAST attempt's stderr, not the
+                // first?"); pin to a non-None value so a regression
+                // that drops rc is caught.
+                assert!(rc.is_some(), "rc must be present for spawn-time exit");
+                // The surfaced stderr MUST come from the LAST attempt
+                // (the latest in the sequence), proving we surface
+                // the final failure rather than the first.
+                assert_eq!(stderr, "ATTEMPT-2-FAIL");
+            }
+            other => panic!("expected TunnelFailed, got {other}"),
+        }
+    }
+
+    /// Stagger semantics: with `max_concurrent = 2` and N=4 concurrent
+    /// `establish_tunnel` calls, no more than 2 spawner invocations
+    /// may be in flight at any instant. Pins option-2: the semaphore
+    /// rate-cap.
+    ///
+    /// Mechanism: the spawner holds for a fixed wait window before
+    /// resolving its future, during which the in-flight counter is
+    /// observable. We assert the peak counter stays ≤ max_concurrent
+    /// across the whole test.
+    #[test]
+    fn establish_tunnel_caps_in_flight_spawns_at_max_concurrent() {
+        const N: usize = 4;
+        const MAX: usize = 2;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let peak: usize = rt.block_on(local.run_until(async {
+            let pool = Arc::new(Semaphore::new(MAX));
+            // Slightly slower than the verify gate so the permit
+            // really IS held during the verify window — the test
+            // would still pass with a sub-millisecond spawner but
+            // the spirit of the cap is "limit handshake concurrency",
+            // not "limit Command::spawn turnover".
+            let policy = EstablishmentPolicy {
+                max_concurrent: MAX,
+                attempts: 1,
+                backoff: vec![],
+                per_tunnel_timeout: Duration::from_secs(30),
+            };
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+
+            let mut set: JoinSet<Result<(), PrepError>> = JoinSet::new();
+            for i in 0..N {
+                let pool = Arc::clone(&pool);
+                let policy = policy.clone();
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak);
+                let id = format!("secondary-{i}");
+                set.spawn_local(async move {
+                    let in_flight_for_spawner = Arc::clone(&in_flight);
+                    let peak_for_spawner = Arc::clone(&peak);
+                    let res = establish_tunnel(
+                        &id,
+                        &policy,
+                        &pool,
+                        move || {
+                            let in_flight = Arc::clone(&in_flight_for_spawner);
+                            let peak = Arc::clone(&peak_for_spawner);
+                            async move {
+                                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                                // Update the peak watermark with the
+                                // post-increment value — load-bearing
+                                // for the assertion below.
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                // Hold the permit window long enough to
+                                // overlap with sibling spawns. 50ms ×
+                                // ceil(N/MAX) = 100ms total run.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
+                                // Return a long-lived child so verify
+                                // passes — we're testing the permit
+                                // gating, not the verify branch.
+                                Ok(alive_child())
+                            }
+                        },
+                    )
+                    .await;
+                    res.map(|_| ())
+                });
+            }
+
+            // Drain all spawned tasks.
+            while let Some(joined) = set.join_next().await {
+                joined.expect("watcher join").expect("watcher Ok");
+            }
+            peak.load(Ordering::SeqCst)
+        }));
+        assert!(
+            peak <= MAX,
+            "in-flight spawn count exceeded max_concurrent: peak={peak}, max={MAX}"
+        );
+        // Sanity: at least MAX must have been simultaneously in
+        // flight — otherwise the spawner was so fast the test
+        // never actually exercised the cap.
+        assert!(
+            peak >= MAX,
+            "test failed to demonstrate parallelism: peak={peak} < max={MAX}"
+        );
+    }
+
+    /// Per-tunnel wall-clock cap: a spawner that hangs forever past
+    /// the `per_tunnel_timeout` budget must surface `TunnelFailed`
+    /// with a budget-exhaustion stderr message.
+    #[test]
+    fn establish_tunnel_enforces_per_tunnel_wall_clock_budget() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let err: PrepError = rt.block_on(local.run_until(async {
+            let pool = Arc::new(Semaphore::new(1));
+            let policy = EstablishmentPolicy {
+                max_concurrent: 1,
+                attempts: 5,
+                // Long backoff that the budget should cut short.
+                backoff: vec![Duration::from_secs(10)],
+                per_tunnel_timeout: Duration::from_millis(200),
+            };
+
+            establish_tunnel(
+                "secondary-0",
+                &policy,
+                &pool,
+                move || async move {
+                    // Each attempt fails fast; the long backoff +
+                    // 200ms budget means the timeout fires before
+                    // attempt 2 even starts.
+                    Ok(fail_child("FAIL", 255))
+                },
+            )
+            .await
+            .expect_err("budget exhaustion must surface error")
+        }));
+        match err {
+            PrepError::TunnelFailed { secondary_id, rc, stderr } => {
+                assert_eq!(secondary_id, "secondary-0");
+                assert_eq!(rc, None, "budget-exhaustion has no spawn rc");
+                assert!(
+                    stderr.contains("budget"),
+                    "expected budget-exhaustion message, got {stderr:?}"
+                );
+            }
+            other => panic!("expected TunnelFailed, got {other}"),
+        }
+    }
+
+    /// Default policy sanity: the operator-friendly defaults are the
+    /// numbers documented in the design (4 concurrent, 3 attempts,
+    /// [5s, 15s] backoff, 90s per-tunnel cap). Pinned here so a
+    /// careless default-change in `EstablishmentPolicy::default` gets
+    /// noticed at review time.
+    #[test]
+    fn establishment_policy_defaults_match_consumer_contract() {
+        let p = EstablishmentPolicy::default();
+        assert_eq!(p.max_concurrent, 4);
+        assert_eq!(p.attempts, 3);
+        assert_eq!(p.backoff, vec![Duration::from_secs(5), Duration::from_secs(15)]);
+        assert_eq!(p.per_tunnel_timeout, Duration::from_secs(90));
+        // Backoff indexing: attempt 0 has no pre-sleep, attempts 1
+        // and 2 use backoff[0] and backoff[1] respectively, anything
+        // beyond saturates at the last element.
+        assert_eq!(p.backoff_before(0), None);
+        assert_eq!(p.backoff_before(1), Some(Duration::from_secs(5)));
+        assert_eq!(p.backoff_before(2), Some(Duration::from_secs(15)));
+        assert_eq!(p.backoff_before(3), Some(Duration::from_secs(15)));
     }
 
     /// LocalDirReader smoke test: when the file exists, the reader
