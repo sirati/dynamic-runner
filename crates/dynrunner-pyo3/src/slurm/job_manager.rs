@@ -254,4 +254,80 @@ impl PyRustSlurmJobManager {
         })?;
         job_status_to_dict(py, &info)
     }
+
+    /// Submit a SLURM job by writing `wrapper_script` to
+    /// `<root_folder>/job_<job_name>.sh` on the gateway and invoking
+    /// `sbatch --parsable …`.
+    ///
+    /// `run_log_dir` must already be tilde-expanded by the caller — the
+    /// Python shim's `_expand_path(run_log_dir or
+    /// slurm_config.get_log_dir())` lives at the bridge boundary because
+    /// `~/…` resolution depends on the Python gateway's `remote_home`
+    /// attribute (a `PosixPath` for `LocalGateway`, `str | None` for
+    /// `SSHGateway`). Tilde-bearing paths reach the Rust core only after
+    /// the shim resolves them; `submit_job` itself takes the string
+    /// verbatim. See the doc-comment on
+    /// `dynrunner_slurm::SlurmJobManager::submit_job` for the rationale
+    /// (sbatch flag-value tilde is NOT shell-expanded).
+    ///
+    /// Returns the submitted job ID (the `--parsable` stdout). The
+    /// returned ID is also appended to the Rust-side `job_ids` vector
+    /// so a later `cancel_all_jobs` call can drain it.
+    fn submit_job(
+        &self,
+        py: Python<'_>,
+        wrapper_script: String,
+        job_name: String,
+        nodes: u32,
+        run_log_dir: String,
+    ) -> PyResult<String> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .submit_job(&wrapper_script, &job_name, nodes, &run_log_dir)
+                    .await
+                    .map_err(slurm_err_to_py)
+            })
+        })
+    }
+
+    /// Cancel every job tracked by the Rust manager (via `scancel`) and
+    /// clear the tracked job-id list. Idempotent: a second call with no
+    /// intervening `submit_job` is a no-op.
+    ///
+    /// Mirrors the legacy Python `SlurmJobManager.cancel_all_jobs`
+    /// shape (iterate + clear). Individual `scancel` failures are
+    /// logged on the Rust side and do not abort the loop, so a partial
+    /// failure still drains the remaining IDs.
+    fn cancel_all_jobs(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .cancel_all_jobs()
+                    .await
+                    .map_err(slurm_err_to_py)
+            })
+        })
+    }
+
+    /// Read-only view of the Rust-tracked job-id list. Returns a fresh
+    /// Python `list[str]` snapshot — mutations on the returned list do
+    /// NOT propagate back to the Rust state.
+    ///
+    /// Exposed so the Python thin shim can preserve the historical
+    /// `SlurmJobManager.job_ids` attribute on its public surface
+    /// without holding a duplicate Python-side list.
+    #[getter]
+    fn job_ids(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let inner = self.inner.clone();
+        Ok(py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner).await.job_ids().to_vec()
+            })
+        }))
+    }
 }

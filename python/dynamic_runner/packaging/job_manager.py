@@ -1,14 +1,24 @@
+# =====================================================================
+# WARNING — PYTHON BRIDGE ONLY. NO LOGIC HERE.
+# =====================================================================
+# This file is a thin PyO3 / CLI / config bridge. ALL business logic,
+# lifecycle, state-tracking, async orchestration, and process management
+# lives in Rust under `crates/dynrunner-slurm/`. If you find yourself
+# adding logic here — STOP. Put it in Rust and call it from this file
+# via PyO3.
+# =====================================================================
 """Python-facing SLURM job manager.
 
 Thin shim over `dynamic_runner._native.RustSlurmJobManager` for the
-SLURM lifecycle primitives the Rust `dynrunner_slurm::SlurmJobManager`
-already owns (directory prep, single-job cancel, status query). The
-remaining methods — submit, source-binary upload, image build/transfer,
-bash wrapper-script generation — keep their Python implementations
-until their dedicated migration units (L1.7 / L1.8 / L1.9 / L2.E)
-land and reconcile the Python ↔ Rust semantic gaps. The public class
-name and method signatures are preserved across the cutover so
-callers don't see the move.
+SLURM job lifecycle primitives the Rust `dynrunner_slurm::SlurmJobManager`
+owns (directory prep, job submit, per-job cancel, cancel-all, status
+query, tracked job-id list). The remaining methods — source-binary
+upload, image build/transfer, bash wrapper-script generation — keep
+their Python implementations until their dedicated migration units
+(L1.7 / L1.8 / L1.9) land and reconcile the Python ↔ Rust semantic
+gaps. The public class name, attribute surface (`job_ids`), and method
+signatures are preserved across the cutover so callers don't see the
+move.
 """
 
 from __future__ import annotations
@@ -39,17 +49,32 @@ class SlurmJobManager:
         self.slurm_config = slurm_config
         self.packaging = packaging_method
         self.deployment = deployment
-        self.job_ids: list[str] = []
-        # Rust-side delegate for the lifecycle primitives that have
-        # already migrated. The remaining Python methods on this
-        # class don't need it; they're still using ``gateway`` /
-        # ``slurm_config`` / ``packaging`` directly.
+        # Rust-side delegate. Owns every SLURM lifecycle primitive
+        # (prepare_directories, submit_job, cancel_job, cancel_all_jobs,
+        # get_job_status) and the tracked-job-id list. The remaining
+        # non-migrated methods on this class (wrapper-script generation,
+        # image transfer, source-binary upload) still use the Python
+        # ``gateway`` / ``slurm_config`` / ``packaging`` references
+        # directly; those references stay on this object as part of
+        # the public bridge surface.
         self._rust = RustSlurmJobManager(
             gateway,
             slurm_config,
             packaging_method,
             deployment,
         )
+
+    @property
+    def job_ids(self) -> list[str]:
+        """Snapshot of the Rust-tracked SLURM job IDs.
+
+        Preserves the historical attribute name so existing callers
+        (today: just `cancel_all_jobs`; tests inspect the list as a
+        public surface). Returns a fresh list each call — the
+        authoritative state lives in Rust and is mutated by
+        ``submit_job`` / ``cancel_all_jobs``.
+        """
+        return self._rust.job_ids
 
     def _normalize_path(self, path: str | Path) -> Path:
         if isinstance(path, Path):
@@ -277,57 +302,39 @@ class SlurmJobManager:
         nodes: int = 1,
         run_log_dir: str | None = None,
     ) -> str:
-        """Submit SLURM job."""
-        logger.info("Submitting SLURM job: %s", job_name)
+        """Submit SLURM job — pure delegation to Rust.
 
-        script_path = f"{self.slurm_config.root_folder}/job_{job_name}.sh"
-        write_cmd = f"cat > {script_path} << 'EOFSCRIPT'\n{wrapper_script}\nEOFSCRIPT"
-        returncode, _, stderr = self.gateway.execute_command(write_cmd)
-        if returncode != 0:
-            raise RuntimeError(f"Failed to write job script: {stderr}")
+        The only Python-side responsibility is resolving the two
+        gateway-specific path concerns the Rust core stays agnostic of:
 
-        self.gateway.execute_command(f"chmod +x {script_path}")
-
-        log_dir = self._expand_path(run_log_dir or self.slurm_config.get_log_dir())
-        sbatch_cmd_parts = [
-            "sbatch",
-            "--parsable",
-            f"--job-name={job_name}",
-            f"--nodes={nodes}",
-            "--ntasks=1",
-            f"--cpus-per-task={self.slurm_config.cpus_per_task}",
-            f"--partition={self.slurm_config.partition}",
-            f"--time={self.slurm_config.time_limit}",
-            f"--output={log_dir}/slurm_%j.out",
-            f"--error={log_dir}/slurm_%j.err",
-        ]
-
-        if self.slurm_config.notify_email:
-            sbatch_cmd_parts.extend(["--mail-type=ALL", f"--mail-user={self.slurm_config.notify_email}"])
-
-        sbatch_cmd_parts.append(str(script_path))
-        sbatch_cmd = " ".join(sbatch_cmd_parts)
-
-        returncode, stdout, stderr = self.gateway.execute_command(sbatch_cmd)
-        if returncode != 0:
-            raise RuntimeError(f"Job submission failed: {stderr}")
-
-        job_id = stdout.strip()
-        self.job_ids.append(job_id)
-        logger.info("Job submitted successfully: %s", job_id)
-        return job_id
+        * ``run_log_dir is None`` → fall back to
+          ``slurm_config.get_log_dir()``. The Rust ``submit_job``
+          requires a non-optional path; the None-fallback is bridge
+          ergonomics (preserves the historical Python default-arg
+          shape).
+        * Tilde expansion of the resolved ``run_log_dir``. Bash does
+          not expand ``~`` in ``--output=~/foo`` style arguments, so
+          a tilde-bearing path must be resolved before being handed to
+          sbatch. ``_expand_path`` consults the Python gateway's
+          ``remote_home`` attribute (a ``PosixPath`` for
+          ``LocalGateway``, ``str | None`` for ``SSHGateway``) — a
+          shape the Rust core can't see through ``PyGatewayAdapter``.
+        """
+        return self._rust.submit_job(
+            wrapper_script,
+            job_name,
+            nodes,
+            self._expand_path(run_log_dir or self.slurm_config.get_log_dir()),
+        )
 
     def cancel_job(self, job_id: str) -> None:
-        """Cancel SLURM job."""
-        logger.info("Cancelling job: %s", job_id)
+        """Cancel a single SLURM job — pure delegation to Rust."""
         self._rust.cancel_job(job_id)
 
     def cancel_all_jobs(self) -> None:
-        """Cancel all submitted jobs."""
-        for job_id in self.job_ids:
-            self.cancel_job(job_id)
-        self.job_ids.clear()
+        """Cancel every tracked SLURM job — pure delegation to Rust."""
+        self._rust.cancel_all_jobs()
 
     def get_job_status(self, job_id: str) -> dict[str, str]:
-        """Get status of SLURM job."""
+        """Get status of SLURM job — pure delegation to Rust."""
         return self._rust.get_job_status(job_id)
