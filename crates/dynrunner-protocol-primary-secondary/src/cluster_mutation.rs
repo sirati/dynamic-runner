@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use dynrunner_core::{ErrorType, PhaseId, WorkerId, TaskInfo};
 use serde::{Deserialize, Serialize};
 
+use crate::removal_cause::RemovalCause;
+
 /// One CRDT mutation. Idempotent under repetition; safe under reorder
 /// within the per-task happens-before constraint that the dispatcher
 /// emits `TaskAdded` before any subsequent mutation for the same hash.
@@ -85,21 +87,48 @@ pub enum ClusterMutation<I> {
         hash: String,
         secondaries: Vec<String>,
     },
-    /// A peer has joined the cluster. The minimal apply rule for
-    /// this variant updates *only* the replicated observer set:
-    /// when `is_observer = true`, `peer_id` is inserted into
-    /// `RoleTable.observers` (idempotent — set semantics);
-    /// `is_observer = false` is a no-op at this stage of the
-    /// unification refactor.
+    /// A peer has joined the cluster. The apply rule maintains the
+    /// replicated `peer_state` map on `ClusterState` and the legacy
+    /// `RoleTable.observers` projection that election filtering reads.
     ///
-    /// The narrow observer-only apply here is the single-writer
-    /// cutover for `RoleTable.observers` — replacing the legacy
-    /// `ClusterState::set_observers` write path so observer
-    /// membership flows through one CRDT path only. Removal of an
-    /// observer (or any peer) waits on the matching `PeerRemoved`
-    /// variant that the peer-lifecycle work will introduce.
+    /// Receiver semantics (see `ClusterState::apply`):
+    ///
+    /// - If the peer is currently `Dead` in `peer_state` the
+    ///   broadcast is a NoOp; ids never resurrect, fresh ids must be
+    ///   minted for respawn.
+    /// - Otherwise the entry is marked `Alive` (insert-or-update,
+    ///   preserving any existing pubkey/endpoint metadata) and a
+    ///   `PeerLifecycleEvent::Added` is enqueued on the dispatcher
+    ///   channel.
+    /// - When `is_observer = true` and the id was not already in
+    ///   `RoleTable.observers`, the set is widened and role-change
+    ///   hooks fire. `is_observer = false` is a no-op against the
+    ///   observer set — only the matching `PeerRemoved` removes peers
+    ///   from it.
+    ///
+    /// This variant is the single-writer cutover for
+    /// `RoleTable.observers` and the authoritative source of "this
+    /// peer is alive" in the replicated ledger.
     PeerJoined {
         peer_id: String,
         is_observer: bool,
+    },
+    /// A peer has been removed from the cluster (authoritative
+    /// observation by the primary; `cause` carries the reason — see
+    /// [`RemovalCause`]).
+    ///
+    /// Sticky-per-id semantics: once a peer's `peer_state` entry is
+    /// `Dead`, every subsequent mutation for the same id is a NoOp
+    /// (re-`PeerRemoved` and any later `PeerJoined`). Respawning a
+    /// secondary requires a fresh id; this prevents a late-arriving
+    /// stale `PeerJoined` from undoing an authoritative removal.
+    ///
+    /// When the removed peer was an observer the entry is dropped
+    /// from `RoleTable.observers` and role-change hooks fire. The
+    /// apply emits a `PeerLifecycleEvent::Removed` on the dispatcher
+    /// channel for downstream consumers (scheduler / telemetry).
+    PeerRemoved {
+        id: String,
+        cause: RemovalCause,
     },
 }
