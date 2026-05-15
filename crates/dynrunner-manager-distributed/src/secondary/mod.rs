@@ -310,6 +310,54 @@ where
     /// transport closed at the phase boundary.
     primary_disconnected: bool,
 
+    /// Set by the natural-quiesce branch in `processing.rs` after this
+    /// secondary originates `ClusterMutation::RunComplete` and fans it
+    /// out over `primary_transport.send` (loopback to the alive
+    /// demoted submitter) + `peer_transport.broadcast` (peer mesh).
+    ///
+    /// Why this exists: `primary_transport.send` enqueues into the
+    /// underlying `NetworkClient`'s writer-task mpsc; the actual TCP
+    /// write happens on a separate spawned task. If the originating
+    /// secondary exits `process_tasks` (and shortly thereafter its
+    /// runtime) BEFORE the writer task has CPU time to drain that
+    /// mpsc and flush the bytes, the runtime tear-down aborts the
+    /// writer mid-flight and the RunComplete is lost on the wire —
+    /// the submitter's `operational_loop` then sits forever waiting
+    /// for the `cluster_state.run_complete()` exit cue.
+    ///
+    /// Concretely: the `Drop` impl on
+    /// `dynrunner-transport-quic::BridgedConnection` calls
+    /// `self.writer.abort()` as "belt-and-suspenders" cleanup, but
+    /// `tokio::task::JoinHandle::abort` actively kills the writer
+    /// task rather than letting it drain its mpsc receiver. The
+    /// 20 prior TaskCompletes flushed fine because each was
+    /// interleaved with worker-event ticks that yielded the runtime
+    /// long enough for the writer to drain; the RunComplete is the
+    /// FINAL send before exit, with no further yields.
+    ///
+    /// The originator must therefore wait for the submitter to
+    /// acknowledge receipt before exiting. The acknowledgment shape
+    /// is "the demoted submitter applied RunComplete locally,
+    /// exited `operational_loop`, returned from `run()`, dropped its
+    /// `NetworkServer`-side transport, and closed the per-secondary
+    /// WSS — at which point THIS secondary's `primary_transport.recv()`
+    /// returns `None` and the recv-None branch in `process_tasks`
+    /// sets `primary_disconnected = true`". The run-complete exit at
+    /// `processing.rs::process_tasks` then gates on `(!run_complete_originated
+    /// || primary_disconnected)`: followers (peer secondaries that
+    /// merely observed the RunComplete broadcast on their inbound
+    /// mesh arm) take the fast path; the originator waits for the
+    /// submitter's ack signal.
+    ///
+    /// Set once and never cleared — once we originate the broadcast,
+    /// the only reasonable resolution is "wait for the submitter to
+    /// finish receiving it". On the symmetric path (the dead-demoted
+    /// `primary_disconnected`-gated RunComplete broadcast in
+    /// `processing.rs:358-395`), the field is irrelevant because
+    /// `primary_disconnected` is already true — the gate fires
+    /// regardless of this flag's value.
+    run_complete_originated: bool,
+
     // Failover election state (F2). Defaults to Normal until the primary
     // misses keepalives.
     election: election::ElectionState,
@@ -599,6 +647,7 @@ where
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,
             primary_disconnected: false,
+            run_complete_originated: false,
             election: election::ElectionState::Normal,
             pending_peer_messages: Vec::new(),
             primary_link,

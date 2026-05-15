@@ -495,6 +495,13 @@ where
                 // the same idempotency rationale.
                 let _ = self.primary_transport.send(msg.clone()).await;
                 let _ = self.peer_transport.broadcast(msg).await;
+                // Latch the originator flag so the run-complete exit
+                // below waits for the submitter's ack (its WSS close
+                // after applying RunComplete) instead of breaking
+                // immediately and racing the writer-task flush. See
+                // `run_complete_originated` doc on `SecondaryCoordinator`
+                // for the full rationale.
+                self.run_complete_originated = true;
             }
 
             // Run-complete exit: the primary broadcast
@@ -507,10 +514,36 @@ where
             // finishes — they have no way to distinguish "run is
             // genuinely over" from "primary just crashed", so they
             // hold their SLURM job slots indefinitely.
+            //
+            // `run_complete_originated` gate: when THIS node fired
+            // the natural-quiesce branch above, the broadcast is
+            // enqueued in `primary_transport`'s writer-task mpsc but
+            // hasn't necessarily hit the wire yet. Exiting here
+            // immediately would drop the SecondaryCoordinator,
+            // triggering `BridgedConnection::drop` which `abort`s
+            // the writer task and loses the in-flight RunComplete —
+            // the demoted submitter then sits forever in its
+            // operational_loop waiting for an exit cue that never
+            // arrives. Wait for `primary_disconnected` (set by the
+            // recv-None branch when the submitter exits and closes
+            // its WSS) before exiting; that confirms the submitter
+            // observed and processed the broadcast. The
+            // `select!.await` during the wait gives the writer task
+            // its needed CPU slice to drain its mpsc and flush.
+            //
+            // Followers (peer secondaries that merely OBSERVED the
+            // broadcast on their inbound mesh arm) take the fast
+            // path — `run_complete_originated` stays false on them
+            // and the gate collapses to the original check. They
+            // were never the originator of the broadcast and have
+            // nothing in flight on their side to drain.
             if self.cluster_state.run_complete()
                 && self.active_tasks.is_empty()
+                && (!self.run_complete_originated || self.primary_disconnected)
             {
                 tracing::info!(
+                    originator = self.run_complete_originated,
+                    primary_disconnected = self.primary_disconnected,
                     "RunComplete signal received from primary; exiting"
                 );
                 break;
