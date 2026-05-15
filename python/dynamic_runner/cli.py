@@ -217,6 +217,17 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--slurm-mem",
+        type=str,
+        default=None,
+        help=(
+            "Per-secondary SLURM memory request (sbatch --mem, e.g. '60G'). "
+            "When unset, no --mem flag is emitted and SLURM falls back to "
+            "DefMemPerNode — which on some clusters (notably LMU Krater) is "
+            "1 MB and instantly OOMs every worker."
+        ),
+    )
+    parser.add_argument(
         "--slurm-cpus-per-task",
         type=int,
         default=None,

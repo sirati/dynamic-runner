@@ -71,21 +71,35 @@ pub enum ClusterMutation<I> {
     /// failure attempt and are reset.
     TaskReinjected { hash: String },
     /// External-control update of the per-task preferred-secondaries
-    /// list. The Phase-4 dispatch policy consults this field when
+    /// list. The future dispatch policy consults this field when
     /// picking a worker; this mutation lets external control planes
     /// (PyO3 `PrimaryHandle::update_preferred_secondaries`, future
     /// scheduler advisories) update it mid-run.
     ///
     /// NOTE: the per-task `preferred_secondaries` storage on
     /// `TaskInfo` and the dispatch-side consumer of this mutation
-    /// land with the Phase-4 preferred-secondaries field. This
-    /// variant exists today so the command-channel ingress is
-    /// wireable end-to-end; the apply side is a typed NoOp until
-    /// Phase-4 lands.
-    // TODO(phase-4): consume on the apply side once
-    // `TaskInfo.preferred_secondaries` exists.
+    /// land with the preferred-secondaries field. This variant exists
+    /// today so the command-channel ingress is wireable end-to-end;
+    /// the apply side is a typed NoOp until the field lands.
     TaskPreferredSecondariesUpdated {
         hash: String,
         secondaries: Vec<String>,
+    },
+    /// A peer has joined the cluster. The minimal apply rule for
+    /// this variant updates *only* the replicated observer set:
+    /// when `is_observer = true`, `peer_id` is inserted into
+    /// `RoleTable.observers` (idempotent — set semantics);
+    /// `is_observer = false` is a no-op at this stage of the
+    /// unification refactor.
+    ///
+    /// The narrow observer-only apply here is the single-writer
+    /// cutover for `RoleTable.observers` — replacing the legacy
+    /// `ClusterState::set_observers` write path so observer
+    /// membership flows through one CRDT path only. Removal of an
+    /// observer (or any peer) waits on the matching `PeerRemoved`
+    /// variant that the peer-lifecycle work will introduce.
+    PeerJoined {
+        peer_id: String,
+        is_observer: bool,
     },
 }

@@ -104,6 +104,15 @@ impl PyErrorType {
             CoreErrorType::ResourceExhausted(_) => None,
             CoreErrorType::NonRecoverable => Some(PyErrorType::NonRecoverable),
             CoreErrorType::Recoverable => Some(PyErrorType::Recoverable),
+            // `Unfulfillable` has no representation in the legacy
+            // 3-variant Python enum. Returning `None` mirrors how
+            // non-memory `ResourceExhausted` collapses — callers that
+            // unwrap-or to a default (see `unwrap_or(Recoverable)` at
+            // line ~516) will get the same conservative fallback. A
+            // future Python-side enum extension can plumb this through
+            // properly; for the wire-protocol commit it stays out of
+            // the legacy bridge.
+            CoreErrorType::Unfulfillable { .. } => None,
         }
     }
 }

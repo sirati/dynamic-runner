@@ -131,26 +131,22 @@ where
                                 .filter(|p| p.secondary_id != self.config.secondary_id)
                                 .count();
                             tracing::info!(peers = peer_count, "received peer list, kicking off peer dials");
-                            // Step 7 (Decision G): publish the
-                            // observer set into the replicated
-                            // `RoleTable.observers`. Every peer in the
-                            // broadcast that advertises
-                            // `is_observer=true` lands in the set;
-                            // anyone absent or `is_observer=false` is
-                            // implicitly a candidate. The set is
-                            // Replace-shaped (`set_observers` clears
-                            // before insert) so a re-broadcast that
-                            // drops a peer correctly removes it. Reads
-                            // from this set are the source of truth for
-                            // `election.rs::lowest_alive` filtering and
-                            // for the defensive PromotePrimary rejection
-                            // in `dispatch.rs`.
-                            let observers: std::collections::HashSet<String> = peers
-                                .iter()
-                                .filter(|p| p.is_observer)
-                                .map(|p| p.secondary_id.clone())
-                                .collect();
-                            self.cluster_state.set_observers(observers);
+                            // Observer-set replication no longer rides
+                            // PeerInfo: the primary originates one
+                            // `ClusterMutation::PeerJoined { is_observer:
+                            // true }` per observer secondary
+                            // immediately after this PeerInfo broadcast
+                            // (`primary/peer_setup.rs::send_peer_lists`),
+                            // and the receiver applies them via the
+                            // standard `apply_cluster_mutations` path —
+                            // the same single-writer CRDT channel that
+                            // serves every other replicated field. The
+                            // `PeerConnectionInfo.is_observer` flag on
+                            // the wire frame is retained for backwards
+                            // compatibility (Batch D's wider peer-
+                            // lifecycle plumbing will consume it) but
+                            // is no longer the source of truth for
+                            // `RoleTable.observers`.
                             // Non-blocking: per-peer dials run as
                             // spawn_local tasks; returns immediately.
                             self.peer_transport.connect_to_peers(peers).await;
