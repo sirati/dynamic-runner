@@ -499,6 +499,28 @@ where
                         "failed to deliver ClusterSnapshot response"
                     );
                 }
+                // Explicit `PeerJoined` origination on late-joiner accept.
+                //
+                // Late-joiners enter the cluster by sending
+                // `RequestClusterSnapshot`; the responder is the first
+                // existing member to observe the joiner. By current
+                // design late-joiners are observers (`is_observer =
+                // true`), so the CRDT mutation carries that flag. Apply
+                // locally and broadcast over the same canonical path the
+                // post-promotion originator uses — receivers learn about
+                // the joiner via the widened `apply_peer_joined` rule
+                // (`peer_state` entry + observer-set projection),
+                // idempotent under duplicate broadcasts from concurrent
+                // responders. The CRDT-merge contract handles the rare
+                // race where two peers both answered the same join.
+                let _ = self
+                    .apply_and_broadcast_mutations(vec![
+                        ClusterMutation::PeerJoined {
+                            peer_id: sender_id,
+                            is_observer: true,
+                        },
+                    ])
+                    .await;
                 Ok(())
             }
             DistributedMessage::ClusterSnapshot { snapshot_json, .. } => {

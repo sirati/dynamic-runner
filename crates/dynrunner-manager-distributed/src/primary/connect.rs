@@ -1,7 +1,7 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, MessageType, PeerTransport,
+    ClusterMutation, DistributedMessage, MessageType, PeerTransport,
     SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
@@ -127,7 +127,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.record_keepalive(msg.sender_id());
 
         match msg.msg_type() {
-            MessageType::SecondaryWelcome => self.handle_welcome(msg),
+            MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
             MessageType::TaskRequest => self.handle_task_request(msg).await?,
             MessageType::TaskComplete => self.handle_task_complete(msg).await,
@@ -171,7 +171,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         }
     }
 
-    pub(super) fn handle_welcome(&mut self, msg: DistributedMessage<I>) {
+    pub(super) async fn handle_welcome(&mut self, msg: DistributedMessage<I>) {
         if let DistributedMessage::SecondaryWelcome {
             secondary_id,
             resources,
@@ -207,6 +207,29 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 SecondaryConnectionState::Handshaking(conn),
             );
             self.seed_keepalive(&secondary_id);
+
+            // Explicit `PeerJoined` origination on accept.
+            //
+            // The widened apply rule (`apply_peer_joined`) tracks full
+            // peer-lifecycle in `peer_state` and ratchets the observer
+            // projection from `is_observer = true` broadcasts. Prior to
+            // this site, non-observer secondary membership was implicit
+            // (everyone learned from the `PeerInfo` broadcast in
+            // `send_peer_lists`); observer membership was originated from
+            // the same site. Making the welcome accept originate the
+            // `PeerJoined` mutation gives the CRDT a per-join entry the
+            // moment a secondary is recorded as connected, regardless of
+            // its observer flag — `send_peer_lists` continues to emit
+            // its observer batch idempotently (the `apply_peer_joined`
+            // rule short-circuits NoOp on re-applies for an already-
+            // alive id whose observer projection isn't changing).
+            self.apply_and_broadcast_cluster_mutations(vec![
+                ClusterMutation::PeerJoined {
+                    peer_id: secondary_id,
+                    is_observer,
+                },
+            ])
+            .await;
         }
     }
 
