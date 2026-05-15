@@ -522,13 +522,11 @@ impl PyDistributedManager {
                     }
                 }
 
-                // Clean up all child processes
-                for child in &mut all_child_processes {
-                    if let Some(mut c) = child.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
-                }
+                // Tear down all aggregated worker subprocesses via the
+                // shared SIGTERM → grace → SIGKILL primitive. See
+                // `subprocess_factory::terminate_children` for the
+                // rationale (podman SIGTERM handoff vs SIGKILL).
+                crate::subprocess_factory::terminate_children(&mut all_child_processes);
             }));
         });
 
