@@ -268,6 +268,23 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--unfulfillable-reinject-max-per-task",
+        type=int,
+        default=None,
+        help=(
+            "Per-task budget for the PrimaryHandle.reinject_task control-plane "
+            "operation (operator-resolvable failures, e.g. unfulfillable "
+            "resource requests). Default None: unbounded — a control plane "
+            "can re-inject the same task as often as it likes. An integer N "
+            "permits at most N successful reinjects per task; subsequent "
+            "reinject calls receive a typed error from PrimaryHandle and the "
+            "structured log event 'unfulfillable_reinject_budget_exhausted' "
+            "fires. Separate from --retry-max-passes — that knob is the "
+            "framework's auto-retry for Recoverable failures; this one is "
+            "external-control-only."
+        ),
+    )
+    parser.add_argument(
         "--slurm-image-subfolder",
         type=str,
         default="image_bin",

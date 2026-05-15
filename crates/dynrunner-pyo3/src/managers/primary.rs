@@ -72,6 +72,30 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `uses_file_based_items=False`, and remote-only primaries
     /// that never read the source from this filesystem.
     source_dir: Option<std::path::PathBuf>,
+    /// Shared cell carrying the per-task reinject cap. Seeded by
+    /// the `unfulfillable_reinject_max_per_task` `__init__` kwarg;
+    /// mutated by `PrimaryHandle::set_unfulfillable_reinject_max_per_task`
+    /// until `run()` flips the cell's `run_started` flag. Read at
+    /// `run()` start when building the inner `PrimaryConfig` so the
+    /// setter and the run-start reader stay in sync without
+    /// duplicating the field.
+    reinject_cap: crate::managers::primary_handle::ReinjectCapCell,
+    /// Command-channel pair created at `__init__` time so the
+    /// `PrimaryHandle` Python sees is the same channel the
+    /// (later-constructed) `PrimaryCoordinator` reads from. The
+    /// sender side is cloned into the `PrimaryHandle` exposed via
+    /// the `handle` getter; the receiver is taken at `run()` start
+    /// and passed into `PrimaryCoordinator::replace_command_channel`.
+    ///
+    /// `Option` only because `run()` moves the receiver into the
+    /// detached tokio runtime — after that the field is `None` and
+    /// repeat-calling `run()` raises (single-shot lifecycle).
+    command_tx: tokio::sync::mpsc::Sender<
+        dynrunner_manager_distributed::primary::PrimaryCommand,
+    >,
+    command_rx: Option<tokio::sync::mpsc::Receiver<
+        dynrunner_manager_distributed::primary::PrimaryCommand,
+    >>,
     /// Whether dispatched task items back to real files. Read at
     /// construction from `TaskDefinition.uses_file_based_items`
     /// (defaults to True). Propagated to secondaries via
@@ -100,6 +124,7 @@ impl PyPrimaryCoordinator {
         listen_port = None,
         source_pre_staged_root = None,
         source_dir = None,
+        unfulfillable_reinject_max_per_task = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -110,6 +135,7 @@ impl PyPrimaryCoordinator {
         listen_port: Option<u16>,
         source_pre_staged_root: Option<std::path::PathBuf>,
         source_dir: Option<std::path::PathBuf>,
+        unfulfillable_reinject_max_per_task: Option<u32>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -117,7 +143,25 @@ impl PyPrimaryCoordinator {
             .ok()
             .and_then(|v| v.extract().ok())
             .unwrap_or(true);
+        // Channel pair built at __init__ so Python can fetch a
+        // `handle` BEFORE `run()` enters the detached tokio runtime.
+        // The receiver gets handed to `PrimaryCoordinator` via
+        // `replace_command_channel` once it's constructed inside
+        // the runtime; the sender lives here and is cloned into
+        // each `PrimaryHandle`.
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(
+            dynrunner_manager_distributed::primary::COMMAND_CHANNEL_CAPACITY,
+        );
 
+        // Seed the shared cell from the constructor kwarg. The
+        // setter on `PrimaryHandle` can override this any number of
+        // times until `run()` enters and flips `run_started`.
+        let reinject_cap = crate::managers::primary_handle::ReinjectCapCell::default();
+        reinject_cap
+            .inner
+            .lock()
+            .expect("ReinjectCapCell poisoned")
+            .max_per_task = unfulfillable_reinject_max_per_task;
         Ok(Self {
             num_secondaries,
             estimator: topology.estimator,
@@ -134,7 +178,24 @@ impl PyPrimaryCoordinator {
             uses_file_based_items,
             max_concurrent_per_type: topology.max_concurrent_per_type,
             task_definition: task_definition.clone().unbind(),
+            reinject_cap,
+            command_tx,
+            command_rx: Some(command_rx),
         })
+    }
+
+    /// PrimaryHandle factory. Each call returns a freshly-built
+    /// handle (with its own in-handle tokio runtime); the underlying
+    /// `command_tx` and reinject-cap cell are cloned so multiple
+    /// Python control planes / threads can share one coordinator.
+    /// Callable BEFORE `run()` so the Python caller can hand the
+    /// handle off to its async executor / thread BEFORE the
+    /// blocking `run()` starts.
+    fn handle(&self) -> PyResult<crate::managers::primary_handle::PyPrimaryHandle> {
+        crate::managers::primary_handle::PyPrimaryHandle::from_sender(
+            self.command_tx.clone(),
+            self.reinject_cap.clone(),
+        )
     }
 
     /// Whether items are file-backed (read at construction from
@@ -208,6 +269,21 @@ impl PyPrimaryCoordinator {
         let source_dir = self.source_dir.clone();
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
+        // Read the cap value the handle (or constructor kwarg) most
+        // recently set, then flip `run_started` so subsequent handle-
+        // side setter calls raise.
+        let unfulfillable_reinject_max_per_task = self.reinject_cap.snapshot();
+        self.reinject_cap.mark_run_started();
+        // Take the receiver out for the detached runtime. The sender
+        // stays on `self` so future `handle()` calls keep cloning the
+        // same channel.
+        let command_tx = self.command_tx.clone();
+        let command_rx = self.command_rx.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "RustPrimaryCoordinator.run(): already entered — \
+                 a coordinator is single-shot",
+            )
+        })?;
         // Load-bearing flip for the setup-deferred run path. When
         // `--source-already-staged` is set on the submitter (so
         // `source_pre_staged_root.is_some()`) AND the Python pipeline
@@ -394,6 +470,7 @@ impl PyPrimaryCoordinator {
                     // `uses_file_based_items=false`, or future
                     // remote-only primaries).
                     source_dir,
+                    unfulfillable_reinject_max_per_task,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, _, RunnerIdentifier> =
@@ -404,6 +481,11 @@ impl PyPrimaryCoordinator {
                         ResourceStealingScheduler::memory(),
                         estimator,
                     );
+
+                // Swap in the Python-facing command channel so the
+                // `PrimaryHandle` Python is holding talks to the same
+                // receiver the operational loop reads from.
+                primary.replace_command_channel(command_tx, command_rx);
 
                 for (sec_id, file_hash, content_hash, src, dest) in pending_stage_files {
                     primary.queue_stage_file(sec_id, file_hash, content_hash, src, dest);

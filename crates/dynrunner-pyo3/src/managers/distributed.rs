@@ -465,6 +465,7 @@ impl PyDistributedManager {
                     // pre-queues) wired without each caller re-
                     // implementing the orchestration.
                     source_dir: Some(source_dir.clone()),
+                    unfulfillable_reinject_max_per_task: None,
                 };
 
                 let mut primary = PrimaryCoordinator::new(

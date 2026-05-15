@@ -518,6 +518,7 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
     # `source_pre_staged_root.is_some() && binaries.is_empty()` (the
     # `_collect_binaries` helper guarantees the empty list in pre-
     # staged mode, so both halves of the gate agree).
+    unfulfillable_cap = getattr(args, "unfulfillable_reinject_max_per_task", None)
     result = _rs.run_primary(
         primary_cfg,
         task,
@@ -525,6 +526,7 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         binaries,
         source_dir=str(config.source_dir),
         source_pre_staged_root=args.source_already_staged,
+        unfulfillable_reinject_max_per_task=unfulfillable_cap,
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")

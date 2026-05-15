@@ -668,6 +668,37 @@ impl<I: Identifier> ClusterState<I> {
                 self.run_complete = true;
                 ApplyOutcome::Applied
             }
+            ClusterMutation::TaskReinjected { hash } => {
+                // External-control reinjection moves a
+                // `Failed { NonRecoverable, .. }` entry back to
+                // `Pending`. Any other state is a NoOp so out-of-
+                // order delivery and post-completion re-applies
+                // can't regress the ledger.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                let task = match state {
+                    TaskState::Failed { kind, task, .. }
+                        if matches!(kind, ErrorType::NonRecoverable) =>
+                    {
+                        task.clone()
+                    }
+                    _ => return ApplyOutcome::NoOp,
+                };
+                *state = TaskState::Pending { task };
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries: _ } => {
+                // Storage-side consumer of this mutation lands with
+                // the preferred-secondaries field on `TaskInfo`; for
+                // now the variant exists so the command channel can
+                // broadcast it end-to-end and apply is a NoOp gated
+                // on hash presence.
+                if !self.tasks.contains_key(&hash) {
+                    return ApplyOutcome::NoOp;
+                }
+                ApplyOutcome::Applied
+            }
             ClusterMutation::PeerJoined {
                 peer_id,
                 is_observer,
@@ -679,15 +710,10 @@ impl<I: Identifier> ClusterState<I> {
                 // present id is a silent NoOp (no double-fire of
                 // role-change hooks). `is_observer = false` is a
                 // no-op at this stage: only the matching
-                // `PeerRemoved` variant (Batch D) removes peers from
-                // the set, so a stale broadcast that flips the flag
-                // back to false MUST NOT mutate the observer set.
-                //
-                // TODO(Batch D): extend this arm to manage the full
-                // peer-lifecycle roster (member set, liveness
-                // window, etc.). The current narrow shape is the
-                // single-writer cutover that retires the legacy
-                // `ClusterState::set_observers` write path.
+                // `PeerRemoved` variant (peer-lifecycle work) removes
+                // peers from the set, so a stale broadcast that flips
+                // the flag back to false MUST NOT mutate the observer
+                // set.
                 if !is_observer {
                     return ApplyOutcome::NoOp;
                 }
