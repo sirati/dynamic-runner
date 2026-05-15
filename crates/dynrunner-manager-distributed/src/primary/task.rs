@@ -784,6 +784,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             | ClusterMutation::TaskPreferredSecondariesUpdated { .. }
             | ClusterMutation::PeerJoined { .. }
             | ClusterMutation::PeerRemoved { .. }
+            | ClusterMutation::PeerResourceHoldingsUpdated { .. }
             | ClusterMutation::TaskBlocked { .. } => {
                 // Routing / role / membership hints with no impact on
                 // terminal-state accounting. `TaskBlocked` is a
@@ -792,7 +793,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // does not record it; the originating Unfulfillable
                 // task's `TaskFailed` arm above is the only entry to
                 // the local-fail-counter pipeline for the cascade
-                // root.
+                // root. `PeerResourceHoldingsUpdated` is a generic
+                // CRDT replication of opaque-string per-peer
+                // holdings — orthogonal to task accounting.
             }
         }
     }

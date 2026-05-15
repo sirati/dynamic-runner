@@ -31,7 +31,7 @@
 //! success). Commutativity is preserved — see `apply`'s TaskCompleted
 //! arm doc.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
@@ -300,24 +300,19 @@ pub struct ClusterState<I> {
     /// Sender end of the fulfillability-matcher trigger mpsc. Installed
     /// via [`Self::install_matcher_trigger_sender`] when the
     /// coordinator wires its matcher pipeline; `None` while no
-    /// coordinator has attached (tests / consumers that don't wire a
-    /// matcher observe the same `None` state and the emit becomes a
-    /// silent drop). The receiver end is consumed by
+    /// coordinator has attached. Receiver is consumed by
     /// [`crate::fulfillability_matcher::drain_matcher_batch`] from
-    /// inside the operational `select!` loop.
-    ///
-    /// Mirrors `lifecycle_tx`'s skip-from-Clone/snapshot/restore
-    /// rationale: a cloned replica is a fresh node-local view and
-    /// inheriting the source's sender would route this replica's
-    /// trigger events into the source's pipeline, violating the
-    /// CCD-9 "apply path never crosses node boundaries" invariant.
-    ///
-    /// TODO (E1): the apply rule for
-    /// `ClusterMutation::PeerResourceHoldingsUpdated` is the only
-    /// legitimate caller of `emit_matcher_trigger`. Until the variant
-    /// lands, `emit_matcher_trigger` is only invoked by tests + by
-    /// `trigger_fulfillability_matcher_for_test`.
+    /// inside the operational `select!` loop. Skipped from Clone /
+    /// snapshot / restore for the same reason as `lifecycle_tx`.
     matcher_trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>>,
+    /// Per-peer set of opaque resource strings each peer announces
+    /// it currently holds locally. Maintained by the
+    /// `PeerResourceHoldingsUpdated` apply rule and round-tripped via
+    /// `ClusterStateSnapshot::peer_holdings` so a late-joiner sees
+    /// current holdings before the next per-peer announce arrives.
+    /// Opaque to the CRDT: the framework does not interpret the
+    /// strings; the fulfillability-matcher hook attaches meaning.
+    peer_holdings: HashMap<String, HashSet<String>>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -340,6 +335,8 @@ where
             lifecycle_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             matcher_trigger_tx: None,
+            // Replicated CRDT data — clone preserves it.
+            peer_holdings: self.peer_holdings.clone(),
         }
     }
 }
@@ -360,6 +357,7 @@ where
             .field("peer_state", &self.peer_state)
             .field("lifecycle_tx", &self.lifecycle_tx.is_some())
             .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
+            .field("peer_holdings", &self.peer_holdings)
             .finish()
     }
 }
@@ -377,6 +375,7 @@ impl<I> Default for ClusterState<I> {
             peer_state: HashMap::new(),
             lifecycle_tx: None,
             matcher_trigger_tx: None,
+            peer_holdings: HashMap::new(),
         }
     }
 }
@@ -407,6 +406,11 @@ impl<I> Default for ClusterState<I> {
 ///   compat with pre-Step-8 senders (snapshots from a peer running
 ///   an older crate omit the field; deserialize defaults to an
 ///   empty set, identical to the pre-Step-8 shape).
+/// - `peer_holdings`: replaced if local is empty, otherwise kept —
+///   same first-bootstrap-only contract as `observers`. The live
+///   `PeerResourceHoldingsUpdated` apply path is the steady-state
+///   writer; the snapshot field exists so a late-joiner sees
+///   current per-peer holdings before any live announce arrives.
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -429,7 +433,19 @@ pub struct ClusterStateSnapshot<I> {
     /// the next PeerInfo broadcast, the joiner would otherwise
     /// promote an observer candidate.
     #[serde(default)]
-    pub observers: std::collections::HashSet<String>,
+    pub observers: HashSet<String>,
+    /// Replicated per-peer holdings map. Carried so a late-joiner
+    /// sees the current set of opaque resource strings each peer
+    /// announces before any live `PeerResourceHoldingsUpdated`
+    /// broadcast arrives. Replaced on `restore` when local is
+    /// empty; otherwise kept (the live apply path is the steady-
+    /// state writer; the snapshot is authoritative for first-
+    /// bootstrap only — same shape as `observers` and `phase_deps`).
+    /// `#[serde(default)]` keeps wire compat with senders running an
+    /// older crate (missing field deserializes as an empty map,
+    /// identical to the pre-variant shape).
+    #[serde(default)]
+    pub peer_holdings: HashMap<String, HashSet<String>>,
 }
 
 fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
@@ -613,6 +629,15 @@ impl<I: Identifier> ClusterState<I> {
         &self.phase_deps
     }
 
+    /// Borrow the replicated per-peer holdings map. Each entry is
+    /// the set of opaque resource strings the named peer most
+    /// recently announced (via `ClusterMutation::PeerResourceHoldingsUpdated`).
+    /// The framework does not interpret the strings; downstream
+    /// consumers attach meaning.
+    pub fn peer_holdings(&self) -> &HashMap<String, HashSet<String>> {
+        &self.peer_holdings
+    }
+
     /// Snapshot of the replicated [`RoleTable`]. Borrowed for the
     /// lifetime of `&self`; callers wanting an owned copy should
     /// `.clone()` the returned reference. The transport-side
@@ -779,6 +804,10 @@ impl<I: Identifier> ClusterState<I> {
             // apply rule writes; the snapshot is authoritative for
             // first-bootstrap and inert thereafter.
             observers: self.role_table.observers.clone(),
+            // Per-peer holdings — same first-bootstrap-only
+            // contract as `observers` (replaced on restore when
+            // local is empty, otherwise kept).
+            peer_holdings: self.peer_holdings.clone(),
         }
     }
 
@@ -836,6 +865,17 @@ impl<I: Identifier> ClusterState<I> {
         if self.role_table.observers.is_empty() && !snap.observers.is_empty() {
             self.role_table.observers = snap.observers;
             self.fire_role_change_hooks();
+        }
+        // Peer-holdings map: same first-bootstrap-only contract
+        // as `observers` and `phase_deps`. The live
+        // `PeerResourceHoldingsUpdated` apply path is the steady-
+        // state writer; the snapshot field is authoritative only
+        // before any live announce reaches this replica. No hook
+        // fire here: holdings-change hooks (wired by the sibling
+        // E3 subtask via the lifecycle dispatcher mpsc) are
+        // per-peer-announce signals, not snapshot-bootstrap signals.
+        if self.peer_holdings.is_empty() && !snap.peer_holdings.is_empty() {
+            self.peer_holdings = snap.peer_holdings;
         }
     }
 
@@ -1088,6 +1128,11 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::PeerRemoved { id, cause } => {
                 self.apply_peer_removed(id, cause)
             }
+            ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id,
+                holdings,
+                epoch,
+            } => self.apply_peer_resource_holdings_updated(peer_id, holdings, epoch),
         }
     }
 
@@ -1198,6 +1243,51 @@ impl<I: Identifier> ClusterState<I> {
         }
         self.emit_lifecycle_event(PeerLifecycleEvent::Removed { id, cause });
         ApplyOutcome::Applied
+    }
+
+    /// Apply a `ClusterMutation::PeerResourceHoldingsUpdated`.
+    ///
+    /// Supersede-old-pending semantics on `epoch`: an announce whose
+    /// `epoch` is strictly older than the current `primary_epoch` is
+    /// dropped as stale (the announcing peer hadn't yet learned of
+    /// the current primary when it sent). Same-or-newer epoch is
+    /// accepted — the announce is about per-peer holdings, not
+    /// about primary identity, and a peer that already learned of a
+    /// newer primary before its announce reached us is still
+    /// authoritative about its own holdings.
+    ///
+    /// Replace-if-changed: the incoming `Vec<String>` is collected
+    /// into a `HashSet<String>` (so duplicate strings inside a
+    /// single announce collapse) and compared against the stored
+    /// set for the same `peer_id`. Unchanged → NoOp; changed (or
+    /// first-time insertion) → replace and return `Applied`.
+    ///
+    /// No `peer_state` liveness gate today: a `PeerResourceHoldingsUpdated`
+    /// for a peer the CRDT has never seen `PeerJoined` for is
+    /// accepted (the announce IS evidence the peer is alive enough
+    /// to send); for a peer marked `Dead` in `peer_state` the
+    /// announce is still recorded but downstream consumers reading
+    /// `peer_state` alongside `peer_holdings` can apply their own
+    /// liveness filter. The CRDT layer's only contract is "store
+    /// what was announced under the supersede-by-epoch rule"; a
+    /// liveness filter belongs to the consumer policy.
+    fn apply_peer_resource_holdings_updated(
+        &mut self,
+        peer_id: String,
+        holdings: Vec<String>,
+        epoch: u64,
+    ) -> ApplyOutcome {
+        if epoch < self.primary_epoch {
+            return ApplyOutcome::NoOp;
+        }
+        let incoming: HashSet<String> = holdings.into_iter().collect();
+        match self.peer_holdings.get(&peer_id) {
+            Some(existing) if existing == &incoming => ApplyOutcome::NoOp,
+            _ => {
+                self.peer_holdings.insert(peer_id, incoming);
+                ApplyOutcome::Applied
+            }
+        }
     }
 
     /// Whether the run has been declared finished by the primary.
@@ -2647,5 +2737,219 @@ mod tests {
             }
             other => panic!("expected Removed event, got {other:?}"),
         }
+    }
+
+    // ── PeerResourceHoldingsUpdated apply-rule + snapshot tests ──
+
+    /// First-time announce for an unseen peer inserts the holdings
+    /// set into `peer_holdings`. The wire `Vec<String>` collects to
+    /// a `HashSet<String>` so equality checks and dedup are
+    /// set-based.
+    #[test]
+    fn peer_resource_holdings_updated_apply_inserts_holdings() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert!(s.peer_holdings().is_empty());
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["res-1".into(), "res-2".into()],
+                epoch: 0,
+            }),
+            ApplyOutcome::Applied
+        );
+        let stored = s.peer_holdings().get("peer-a").expect("entry present");
+        assert_eq!(
+            *stored,
+            HashSet::from(["res-1".to_string(), "res-2".to_string()])
+        );
+    }
+
+    /// An announce whose `epoch` is strictly older than the local
+    /// `primary_epoch` is a NoOp — supersede-old-pending defends
+    /// against a stale pre-failover announce overwriting holdings
+    /// observed under the current primary. Equal-or-newer epoch
+    /// applies; only `epoch < primary_epoch` is rejected.
+    #[test]
+    fn peer_resource_holdings_updated_stale_epoch_is_noop() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        // Advance primary_epoch to 5.
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "lead".into(),
+            epoch: 5,
+        });
+        assert_eq!(s.primary_epoch(), 5);
+
+        // epoch < primary_epoch → NoOp, ledger untouched.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["stale".into()],
+                epoch: 4,
+            }),
+            ApplyOutcome::NoOp
+        );
+        assert!(s.peer_holdings().get("peer-a").is_none());
+
+        // epoch == primary_epoch → Applied (same-epoch announces are
+        // legitimate within the current primary's reign).
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["fresh".into()],
+                epoch: 5,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            s.peer_holdings()
+                .get("peer-a")
+                .unwrap()
+                .contains("fresh")
+        );
+
+        // epoch > primary_epoch → Applied (an announce from a peer
+        // that already learned of a newer primary is still
+        // authoritative about its own holdings).
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-b".into(),
+                holdings: vec!["future".into()],
+                epoch: 6,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            s.peer_holdings()
+                .get("peer-b")
+                .unwrap()
+                .contains("future")
+        );
+    }
+
+    /// Re-application of a `PeerResourceHoldingsUpdated` whose
+    /// `holdings` set (as collected to a HashSet) equals the
+    /// already-stored set is a NoOp. Different ordering of the same
+    /// strings on the wire is still equal under HashSet semantics —
+    /// the apply rule does not depend on wire order.
+    #[test]
+    fn peer_resource_holdings_updated_same_set_is_noop() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["r1".into(), "r2".into()],
+                epoch: 0,
+            }),
+            ApplyOutcome::Applied
+        );
+        // Same set, ordering swapped on the wire.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["r2".into(), "r1".into()],
+                epoch: 0,
+            }),
+            ApplyOutcome::NoOp
+        );
+        // Duplicate string in incoming Vec collapses on collect; still
+        // equal to the stored set → NoOp.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["r1".into(), "r2".into(), "r1".into()],
+                epoch: 0,
+            }),
+            ApplyOutcome::NoOp
+        );
+        // A different set (superset) Applies.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["r1".into(), "r2".into(), "r3".into()],
+                epoch: 0,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            *s.peer_holdings().get("peer-a").unwrap(),
+            HashSet::from(["r1".to_string(), "r2".to_string(), "r3".to_string()])
+        );
+        // A strictly smaller set also Applies (the announce is
+        // authoritative for the announcing peer's current holdings;
+        // shrinking is a real event when the peer evicts).
+        assert_eq!(
+            s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+                peer_id: "peer-a".into(),
+                holdings: vec!["r1".into()],
+                epoch: 0,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            *s.peer_holdings().get("peer-a").unwrap(),
+            HashSet::from(["r1".to_string()])
+        );
+    }
+
+    /// `ClusterStateSnapshot` round-trips the per-peer holdings map
+    /// so a late-joiner sees current holdings before the next live
+    /// `PeerResourceHoldingsUpdated` broadcast arrives. Pins the
+    /// "snapshot carries replicated CRDT data" contract for the new
+    /// field.
+    #[test]
+    fn peer_resource_holdings_snapshot_round_trip() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+            peer_id: "peer-a".into(),
+            holdings: vec!["r1".into(), "r2".into()],
+            epoch: 0,
+        });
+        s.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+            peer_id: "peer-b".into(),
+            holdings: vec!["r3".into()],
+            epoch: 0,
+        });
+
+        let snap = s.snapshot();
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        joiner.restore(snap);
+
+        assert_eq!(
+            *joiner.peer_holdings().get("peer-a").unwrap(),
+            HashSet::from(["r1".to_string(), "r2".to_string()])
+        );
+        assert_eq!(
+            *joiner.peer_holdings().get("peer-b").unwrap(),
+            HashSet::from(["r3".to_string()])
+        );
+    }
+
+    /// Pins the first-bootstrap-only contract on `restore`: a joiner
+    /// that has already observed a live `PeerResourceHoldingsUpdated`
+    /// broadcast (so `peer_holdings` is non-empty) keeps its local
+    /// map rather than overwriting from a (possibly stale) snapshot.
+    /// Mirrors the `observers` and `phase_deps` "replaced if local
+    /// empty, else kept" shape.
+    #[test]
+    fn peer_resource_holdings_restore_keeps_local_when_non_empty() {
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        joiner.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+            peer_id: "live-peer".into(),
+            holdings: vec!["live-res".into()],
+            epoch: 0,
+        });
+
+        let mut peer = ClusterState::<RunnerIdentifier>::new();
+        peer.apply(ClusterMutation::PeerResourceHoldingsUpdated {
+            peer_id: "stale-peer".into(),
+            holdings: vec!["stale-res".into()],
+            epoch: 0,
+        });
+
+        joiner.restore(peer.snapshot());
+        // Local map wins (live apply path is authoritative once it
+        // has fired); snapshot's peer_holdings field is inert.
+        assert!(joiner.peer_holdings().contains_key("live-peer"));
+        assert!(!joiner.peer_holdings().contains_key("stale-peer"));
     }
 }
