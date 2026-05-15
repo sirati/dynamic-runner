@@ -75,6 +75,41 @@ pub enum TaskState<I> {
         last_error: String,
         attempts: u32,
     },
+    /// The task hit `ErrorType::Unfulfillable` — a required cluster
+    /// resource (e.g. a toolchain outpath) is not held by any peer.
+    /// Discrete variant (rather than `Failed { kind: Unfulfillable, .. }`)
+    /// so downstream matcher / state-filter logic (the reinject command,
+    /// consumer-side state introspection) can dispatch on the
+    /// discriminant rather than parsing an inner `ErrorType`. `reason`
+    /// mirrors the `BoundedString<2048>` body from the wire mutation
+    /// (stored here as `String`; the cap is the wire-codec's concern,
+    /// not the in-memory ledger's).
+    ///
+    /// Reinjectable: `PrimaryCommand::ReinjectTask` accepts this state
+    /// and transitions it back to `Pending` via the `TaskReinjected`
+    /// apply rule; until then it behaves as a stable terminal for
+    /// counter / partition purposes (folded into `fail_final` by
+    /// `outcome_counts` for operator-readable buckets).
+    Unfulfillable {
+        task: TaskInfo<I>,
+        reason: String,
+    },
+    /// The task is a transitive dependent of a task currently in
+    /// `Unfulfillable`. Dormant until the prerequisite (identified by
+    /// `on`, the prereq's task hash) leaves Unfulfillable via the
+    /// reinject + complete path; the `TaskCompleted` apply rule
+    /// auto-resumes every `Blocked { on, .. }` entry whose `on` matches
+    /// the completing hash back to `Pending`.
+    ///
+    /// Discrete variant (rather than `Failed { .. }`) for the same
+    /// reason as `Unfulfillable`: dependents of an unfulfillable task
+    /// are NOT terminal-failed — they're cascade-paused, and the
+    /// auto-resume mechanism needs to identify them by discriminant +
+    /// `on` field rather than by parsing an error message.
+    Blocked {
+        task: TaskInfo<I>,
+        on: String,
+    },
 }
 
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge
@@ -92,6 +127,13 @@ pub struct StateCounts {
     pub in_flight: usize,
     pub completed: usize,
     pub failed: usize,
+    /// Tasks in `TaskState::Unfulfillable { .. }` — reinjectable
+    /// resource-availability failures awaiting external reinjection.
+    pub unfulfillable: usize,
+    /// Tasks in `TaskState::Blocked { .. }` — cascade-paused dependents
+    /// of an unfulfillable prerequisite, dormant until the prereq
+    /// completes via the reinject + re-run path.
+    pub blocked: usize,
 }
 
 /// Per-class outcome breakdown the primary emits on every
@@ -349,9 +391,23 @@ pub struct ClusterStateSnapshot<I> {
 
 fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
     match s {
+        // Pending and Blocked are both non-dispatching states; Blocked
+        // ranks above Pending because it carries the cascade prereq
+        // identity (`on`) — a snapshot's Blocked should not be silently
+        // overwritten by a stale peer's Pending observation.
         TaskState::Pending { .. } => 0,
-        TaskState::InFlight { .. } => 1,
-        TaskState::Completed { .. } | TaskState::Failed { .. } => 2,
+        TaskState::Blocked { .. } => 1,
+        // An active dispatch (InFlight) supersedes cascade-paused
+        // observers — if any peer saw the worker pick the task up, that
+        // happens-after the cascade decision.
+        TaskState::InFlight { .. } => 2,
+        // All terminals share the strongest rank. Convergence among
+        // terminals follows the per-arm rules in `apply` (Completed
+        // never regresses; Failed/Unfulfillable lock out incoming
+        // TaskFailed for their own hash).
+        TaskState::Completed { .. }
+        | TaskState::Failed { .. }
+        | TaskState::Unfulfillable { .. } => 3,
     }
 }
 
@@ -401,6 +457,8 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::InFlight { .. } => c.in_flight += 1,
                 TaskState::Completed { .. } => c.completed += 1,
                 TaskState::Failed { .. } => c.failed += 1,
+                TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
+                TaskState::Blocked { .. } => c.blocked += 1,
             }
         }
         c
@@ -437,20 +495,32 @@ impl<I: Identifier> ClusterState<I> {
                     ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {
                         o.fail_oom += 1
                     }
-                    // `Unfulfillable` is a resource-availability failure
-                    // that *will* become reinjectable once future phases
-                    // wire up the matcher state-filter + reinject command
-                    // path. Until that lands it terminates the task in the
-                    // ledger, so the outcome summary tallies it under
-                    // `fail_final` — same bucket as `NonRecoverable`,
-                    // which is the closest existing semantics. Revisit
-                    // when the reinject path arrives: the count may need
-                    // to move to a dedicated reinject/blocked bucket.
+                    // Defensive: the apply rule for `TaskFailed` routes
+                    // `Unfulfillable` straight to `TaskState::Unfulfillable`
+                    // (the discrete state below), so this arm is unreachable
+                    // in practice. Kept for exhaustiveness — if a legacy
+                    // wire path ever lands a `Failed { Unfulfillable, .. }`
+                    // entry the count still partitions correctly.
                     ErrorType::ResourceExhausted(_)
                     | ErrorType::NonRecoverable
                     | ErrorType::Unfulfillable { .. } => o.fail_final += 1,
                 },
-                TaskState::Pending { .. } | TaskState::InFlight { .. } => {}
+                // Discrete `Unfulfillable` state: reinjectable resource-
+                // availability failure. Tallied as `fail_final` for the
+                // operator-readable buckets until the dedicated
+                // reinject/blocked bucket lands; same mapping as the
+                // legacy `Failed { Unfulfillable, .. }` arm above so the
+                // total partition stays stable across the variant cutover.
+                TaskState::Unfulfillable { .. } => o.fail_final += 1,
+                // Non-terminal: Pending, InFlight, and Blocked all
+                // contribute to neither bucket. Blocked tasks are
+                // cascade-paused dependents that will auto-resume to
+                // Pending when their prereq completes; they're not a
+                // terminal outcome and counting them as one would
+                // double-tally on the eventual resumed run.
+                TaskState::Pending { .. }
+                | TaskState::InFlight { .. }
+                | TaskState::Blocked { .. } => {}
             }
         }
         o
@@ -467,17 +537,23 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Pending { task }
                 | TaskState::InFlight { task, .. }
                 | TaskState::Completed { task }
-                | TaskState::Failed { task, .. } => task,
+                | TaskState::Failed { task, .. }
+                | TaskState::Unfulfillable { task, .. }
+                | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
         })
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for terminal entries
-    /// (`Completed` or `Failed`).
+    /// (`Completed`, `Failed`, `Unfulfillable`). `Blocked` is non-
+    /// terminal (auto-resumes to `Pending` when its prereq completes)
+    /// and is excluded.
     pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
-            TaskState::Completed { task } | TaskState::Failed { task, .. } => Some((h, task)),
+            TaskState::Completed { task }
+            | TaskState::Failed { task, .. }
+            | TaskState::Unfulfillable { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -514,6 +590,46 @@ impl<I: Identifier> ClusterState<I> {
     fn fire_role_change_hooks(&self) {
         for hook in &self.role_change_hooks {
             hook(&self.role_table);
+        }
+    }
+
+    /// Auto-resume helper: scan every entry in `tasks`, transition any
+    /// `TaskState::Blocked { on, task }` whose `on` matches `prereq_hash`
+    /// back to `Pending { task }`.
+    ///
+    /// Invoked from the `TaskCompleted` apply arm — completion of a
+    /// prerequisite is the event that unblocks every cascade-paused
+    /// dependent. Linear scan over `tasks` because the CRDT does not
+    /// maintain a hash-keyed reverse index (the PendingPool's
+    /// `dependents_of` is task-id-keyed and lives only on the primary;
+    /// every replica must run this auto-resume locally to converge,
+    /// and the scan keeps the dependency-tracking concern self-
+    /// contained inside cluster_state).
+    ///
+    /// Single-pass and self-contained: the resumed entries land in
+    /// `Pending` immediately, so a chain of blocked dependents waiting
+    /// on the same prereq all resume in one call. Further chained
+    /// resumes (a now-resumed task itself completing later) fire on
+    /// their own `TaskCompleted` apply arm; no recursion here.
+    ///
+    /// Implementation note: two-pass (collect hashes, then mutate) so
+    /// the inner `TaskInfo<I>` can be moved out by value without
+    /// requiring `I: Default` or unsafe placeholder construction. The
+    /// hashmap-key clone is the only allocation; the `TaskInfo` move
+    /// itself is in-place.
+    fn resume_blocked_on(&mut self, prereq_hash: &str) {
+        let to_resume: Vec<String> = self
+            .tasks
+            .iter()
+            .filter_map(|(h, s)| match s {
+                TaskState::Blocked { on, .. } if on == prereq_hash => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        for h in to_resume {
+            if let Some(TaskState::Blocked { task, .. }) = self.tasks.remove(&h) {
+                self.tasks.insert(h, TaskState::Pending { task });
+            }
         }
     }
 
@@ -672,10 +788,27 @@ impl<I: Identifier> ClusterState<I> {
                     // the prior `attempts` / `last_error` are dropped
                     // because the cluster's authoritative outcome for
                     // this hash is now success.
-                    TaskState::Failed { task, .. } => task.clone(),
+                    //
+                    // `Unfulfillable` and `Blocked` both yield the same
+                    // way: if the run somehow reaches Completed for the
+                    // hash (worker raced ahead of the cascade decision,
+                    // or external resolver dispatched the binary out-of-
+                    // band), success is still the strongest terminal.
+                    TaskState::Failed { task, .. }
+                    | TaskState::Unfulfillable { task, .. }
+                    | TaskState::Blocked { task, .. } => task.clone(),
                     TaskState::Pending { task } | TaskState::InFlight { task, .. } => task.clone(),
                 };
                 *state = TaskState::Completed { task };
+                // Auto-resume: any `Blocked { on: <this hash>, .. }`
+                // dependent transitions back to `Pending` so the next
+                // dispatch tick on the live primary picks it up. Event-
+                // driven (apply-rule-local) rather than retry-pass
+                // wall-clock; the same broadcast that converges this
+                // hash to Completed converges every blocked dependent
+                // to Pending on the same apply call across every
+                // replica.
+                self.resume_blocked_on(&hash);
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskFailed { hash, kind, error } => {
@@ -683,7 +816,12 @@ impl<I: Identifier> ClusterState<I> {
                     return ApplyOutcome::NoOp;
                 };
                 match state {
-                    TaskState::Completed { .. } => ApplyOutcome::NoOp,
+                    // Strongest terminals lock out incoming TaskFailed.
+                    // `Completed` never regresses; `Unfulfillable` is a
+                    // stable reinjectable terminal — a late generic
+                    // worker-originated TaskFailed must not regress it.
+                    TaskState::Completed { .. }
+                    | TaskState::Unfulfillable { .. } => ApplyOutcome::NoOp,
                     TaskState::Failed {
                         kind: k,
                         last_error,
@@ -695,13 +833,30 @@ impl<I: Identifier> ClusterState<I> {
                         *last_error = error;
                         ApplyOutcome::Applied
                     }
-                    TaskState::Pending { task } | TaskState::InFlight { task, .. } => {
+                    // Non-terminal states transition based on the
+                    // error class: `Unfulfillable` routes to the
+                    // discrete state so downstream matcher / reinject
+                    // logic can dispatch on the discriminant; every
+                    // other `ErrorType` lands in the generic `Failed`
+                    // bucket preserving the legacy attempts/last_error
+                    // shape.
+                    TaskState::Pending { task }
+                    | TaskState::InFlight { task, .. }
+                    | TaskState::Blocked { task, .. } => {
                         let task = task.clone();
-                        *state = TaskState::Failed {
-                            task,
-                            kind,
-                            last_error: error,
-                            attempts: 1,
+                        *state = match kind {
+                            ErrorType::Unfulfillable { reason } => {
+                                TaskState::Unfulfillable {
+                                    task,
+                                    reason: reason.to_string(),
+                                }
+                            }
+                            other => TaskState::Failed {
+                                task,
+                                kind: other,
+                                last_error: error,
+                                attempts: 1,
+                            },
                         };
                         ApplyOutcome::Applied
                     }
@@ -742,23 +897,62 @@ impl<I: Identifier> ClusterState<I> {
             }
             ClusterMutation::TaskReinjected { hash } => {
                 // External-control reinjection moves a
-                // `Failed { NonRecoverable, .. }` entry back to
-                // `Pending`. Any other state is a NoOp so out-of-
-                // order delivery and post-completion re-applies
-                // can't regress the ledger.
+                // `Unfulfillable { .. }` entry back to `Pending`. Any
+                // other state is a NoOp so out-of-order delivery and
+                // post-completion re-applies can't regress the ledger.
+                //
+                // Tightened from the pre-variant matcher
+                // (`Failed { NonRecoverable, .. }`) in lockstep with
+                // `apply_reinject_task` in the command channel: the
+                // operator-resolvable-failure class now has its own
+                // discrete state, so the apply rule rejects anything
+                // outside it.
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
                 let task = match state {
-                    TaskState::Failed { kind, task, .. }
-                        if matches!(kind, ErrorType::NonRecoverable) =>
-                    {
-                        task.clone()
-                    }
+                    TaskState::Unfulfillable { task, .. } => task.clone(),
                     _ => return ApplyOutcome::NoOp,
                 };
                 *state = TaskState::Pending { task };
                 ApplyOutcome::Applied
+            }
+            ClusterMutation::TaskBlocked { hash, on } => {
+                // Cascade-paused dependent: transition Pending →
+                // Blocked, preserving the TaskInfo so auto-resume can
+                // re-dispatch the same binary. Idempotent under
+                // re-application against a `Blocked` entry whose `on`
+                // matches; mismatched `on` (peer A says blocked-on-X,
+                // peer B has blocked-on-Y) keeps local — the first
+                // observed cascade root wins. Terminal states
+                // (Completed, Failed, Unfulfillable) and an active
+                // dispatch (InFlight) lock out the cascade decision:
+                // a late TaskBlocked must not regress a worker's
+                // observed outcome.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                match state {
+                    TaskState::Completed { .. }
+                    | TaskState::Failed { .. }
+                    | TaskState::Unfulfillable { .. }
+                    | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
+                    TaskState::Blocked { on: existing_on, .. } => {
+                        if existing_on == &on {
+                            ApplyOutcome::NoOp
+                        } else {
+                            // First observed cascade root wins; a
+                            // divergent re-cascade against the same
+                            // dependent is silent.
+                            ApplyOutcome::NoOp
+                        }
+                    }
+                    TaskState::Pending { task } => {
+                        let task = task.clone();
+                        *state = TaskState::Blocked { task, on };
+                        ApplyOutcome::Applied
+                    }
+                }
             }
             ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries: _ } => {
                 // Storage-side consumer of this mutation lands with
@@ -1809,6 +2003,125 @@ mod tests {
         assert_eq!(obs, vec![Some("lead".to_string())]);
     }
 
+    // ── Discrete Unfulfillable / Blocked state pins ──
+
+    /// `TaskFailed { kind: ErrorType::Unfulfillable, .. }` lands in the
+    /// discrete `TaskState::Unfulfillable { reason, task }` variant,
+    /// NOT in `TaskState::Failed { kind: Unfulfillable, .. }`. The
+    /// `reason` field carries the inner `BoundedString` body verbatim
+    /// (stored as `String` in the in-memory ledger).
+    #[test]
+    fn task_failed_with_unfulfillable_lands_in_unfulfillable_variant() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("h"),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskFailed {
+                hash: "h".into(),
+                kind: ErrorType::Unfulfillable {
+                    reason: "missing toolchain xyz".to_string().into(),
+                },
+                error: "unfulfillable".into(),
+            }),
+            ApplyOutcome::Applied
+        );
+        match s.task_state("h") {
+            Some(TaskState::Unfulfillable { reason, .. }) => {
+                assert_eq!(reason, "missing toolchain xyz");
+            }
+            other => panic!("expected Unfulfillable, got {other:?}"),
+        }
+    }
+
+    /// Regression pin for the dispatcher in the `TaskFailed` apply
+    /// arm: generic non-recoverable errors must still land in
+    /// `TaskState::Failed`, NOT in `Unfulfillable`. Pins that the
+    /// kind-based routing only fires for `Unfulfillable` and every
+    /// other `ErrorType` keeps the legacy shape.
+    #[test]
+    fn task_failed_with_generic_nonrecoverable_lands_in_failed_variant() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("h"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "panic".into(),
+        });
+        assert!(matches!(
+            s.task_state("h"),
+            Some(TaskState::Failed { kind: ErrorType::NonRecoverable, .. })
+        ));
+        // And Recoverable also stays in Failed (sanity check the
+        // dispatcher routes ONLY Unfulfillable to the new variant).
+        let mut s2 = ClusterState::<RunnerIdentifier>::new();
+        s2.apply(ClusterMutation::TaskAdded {
+            hash: "h2".into(),
+            task: mk_task("h2"),
+        });
+        s2.apply(ClusterMutation::TaskFailed {
+            hash: "h2".into(),
+            kind: ErrorType::Recoverable,
+            error: "transient".into(),
+        });
+        assert!(matches!(
+            s2.task_state("h2"),
+            Some(TaskState::Failed { kind: ErrorType::Recoverable, .. })
+        ));
+    }
+
+    /// `ClusterMutation::TaskBlocked { hash, on }` lands a `Pending`
+    /// entry in `TaskState::Blocked { on, task }`. Pins the cascade
+    /// broadcast shape: dependents of an Unfulfillable prereq mirror
+    /// across every replica as Blocked (not Failed), carrying the
+    /// prereq's hash so auto-resume can identify them.
+    #[test]
+    fn cascade_on_unfulfillable_marks_dependents_blocked() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        // Prereq enters Unfulfillable.
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "prereq".into(),
+            task: mk_task("prereq"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "prereq".into(),
+            kind: ErrorType::Unfulfillable {
+                reason: "missing".to_string().into(),
+            },
+            error: "missing".into(),
+        });
+        // Dependent enters Blocked-on-prereq via cascade broadcast.
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "dep".into(),
+            task: mk_task("dep"),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskBlocked {
+                hash: "dep".into(),
+                on: "prereq".into(),
+            }),
+            ApplyOutcome::Applied
+        );
+        match s.task_state("dep") {
+            Some(TaskState::Blocked { on, .. }) => assert_eq!(on, "prereq"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
+        // Re-apply against an already-Blocked entry with the same
+        // `on` is a silent NoOp (idempotent under at-least-once
+        // delivery).
+        assert_eq!(
+            s.apply(ClusterMutation::TaskBlocked {
+                hash: "dep".into(),
+                on: "prereq".into(),
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
     // ── PeerRemoved + widened PeerJoined apply-rule tests ──
     //
     // These pin the peer-lifecycle contract on `ClusterState`:
@@ -1911,6 +2224,157 @@ mod tests {
             }),
             ApplyOutcome::NoOp
         );
+    }
+
+    /// `TaskCompleted` apply arm auto-resumes every Blocked dependent
+    /// whose `on` matches the completing hash back to `Pending`.
+    /// Event-driven: the same broadcast that converges the prereq to
+    /// Completed converges every blocked dependent to Pending in one
+    /// apply call across every replica.
+    #[test]
+    fn task_completed_auto_resumes_blocked_dependents() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        // Prereq landed Unfulfillable then was reinjected (Unfulfillable→Pending).
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "prereq".into(),
+            task: mk_task("prereq"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "prereq".into(),
+            kind: ErrorType::Unfulfillable {
+                reason: "missing".to_string().into(),
+            },
+            error: "missing".into(),
+        });
+        s.apply(ClusterMutation::TaskReinjected { hash: "prereq".into() });
+        // Two dependents Blocked-on-prereq.
+        for h in ["d1", "d2"] {
+            s.apply(ClusterMutation::TaskAdded {
+                hash: h.into(),
+                task: mk_task(h),
+            });
+            s.apply(ClusterMutation::TaskBlocked {
+                hash: h.into(),
+                on: "prereq".into(),
+            });
+        }
+        // An unrelated Blocked-on-other-prereq dependent must NOT auto-resume.
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "unrelated".into(),
+            task: mk_task("unrelated"),
+        });
+        s.apply(ClusterMutation::TaskBlocked {
+            hash: "unrelated".into(),
+            on: "some-other-prereq".into(),
+        });
+        // Prereq completes — every Blocked-on-prereq entry resumes.
+        assert_eq!(
+            s.apply(ClusterMutation::TaskCompleted { hash: "prereq".into() }),
+            ApplyOutcome::Applied
+        );
+        assert!(matches!(
+            s.task_state("d1"),
+            Some(TaskState::Pending { .. })
+        ));
+        assert!(matches!(
+            s.task_state("d2"),
+            Some(TaskState::Pending { .. })
+        ));
+        // Unrelated stays Blocked — the auto-resume keys on the `on`
+        // field, not blanket-resumes every Blocked entry.
+        assert!(matches!(
+            s.task_state("unrelated"),
+            Some(TaskState::Blocked { .. })
+        ));
+    }
+
+    /// `TaskReinjected` apply rule tightening: post-variant, only
+    /// `TaskState::Unfulfillable { .. }` transitions to `Pending`.
+    /// Other states (including the legacy `Failed { NonRecoverable, .. }`
+    /// the pre-variant matcher accepted) are NoOp.
+    #[test]
+    fn reinject_task_command_filters_to_unfulfillable_only() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        // Unfulfillable → Pending: accepted.
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "u".into(),
+            task: mk_task("u"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "u".into(),
+            kind: ErrorType::Unfulfillable {
+                reason: "missing".to_string().into(),
+            },
+            error: "missing".into(),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskReinjected { hash: "u".into() }),
+            ApplyOutcome::Applied
+        );
+        assert!(matches!(
+            s.task_state("u"),
+            Some(TaskState::Pending { .. })
+        ));
+
+        // Failed{NonRecoverable} → reinject: NoOp (pre-variant
+        // matcher accepted this; the tightened rule rejects).
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "f".into(),
+            task: mk_task("f"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "f".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "panic".into(),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskReinjected { hash: "f".into() }),
+            ApplyOutcome::NoOp
+        );
+        assert!(matches!(
+            s.task_state("f"),
+            Some(TaskState::Failed { .. })
+        ));
+    }
+
+    /// `ClusterStateSnapshot` round-trips the new Unfulfillable and
+    /// Blocked variants without loss; the late-joiner / reconnect
+    /// path observes the same state the originating replica recorded.
+    #[test]
+    fn pending_pool_unfulfillable_state_round_trips_via_snapshot() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "u".into(),
+            task: mk_task("u"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "u".into(),
+            kind: ErrorType::Unfulfillable {
+                reason: "missing dep".to_string().into(),
+            },
+            error: "missing".into(),
+        });
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "b".into(),
+            task: mk_task("b"),
+        });
+        s.apply(ClusterMutation::TaskBlocked {
+            hash: "b".into(),
+            on: "u".into(),
+        });
+        let snap = s.snapshot();
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        joiner.restore(snap);
+        match joiner.task_state("u") {
+            Some(TaskState::Unfulfillable { reason, .. }) => {
+                assert_eq!(reason, "missing dep");
+            }
+            other => panic!("expected Unfulfillable, got {other:?}"),
+        }
+        match joiner.task_state("b") {
+            Some(TaskState::Blocked { on, .. }) => assert_eq!(on, "u"),
+            other => panic!("expected Blocked, got {other:?}"),
+        }
     }
 
     /// Sticky-per-id under the cross-direction race: once a peer is
