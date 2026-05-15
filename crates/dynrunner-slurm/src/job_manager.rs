@@ -219,11 +219,41 @@ impl<G: Gateway> SlurmJobManager<G> {
     /// Submit a SLURM job using the given wrapper script content.
     ///
     /// The script is written to `<root_folder>/job_<job_name>.sh` on
-    /// the gateway and then submitted via `sbatch --parsable`. The
-    /// path placement, `--mail-type=ALL` flag, and conditional `--mem`
-    /// emission all mirror the Python `SlurmJobManager.submit_job` in
-    /// `packaging/job_manager.py` so a Rust-driven submission produces
-    /// the same sbatch invocation a Python-driven one would.
+    /// the gateway and then submitted via `sbatch --parsable`. Script
+    /// placement, sbatch argument order, `--ntasks=1`, `--mail-type=ALL`,
+    /// and `--mail-user=…` all mirror the legacy Python
+    /// `SlurmJobManager.submit_job` in `packaging/job_manager.py` so a
+    /// Rust-driven submission produces the same sbatch invocation a
+    /// Python-driven one would.
+    ///
+    /// Two intentional divergences from the legacy Python:
+    ///
+    /// * **Script write/chmod is one shell command** (`printf … > path
+    ///   && chmod +x path`) rather than two (`cat << EOFSCRIPT …
+    ///   EOFSCRIPT` + `chmod +x`). Functionally equivalent but saves an
+    ///   ssh round-trip on `SshGateway` and avoids the heredoc-marker
+    ///   collision risk if a wrapper ever contains a literal
+    ///   `\nEOFSCRIPT\n`. Single-quote escaping (`'` → `'\''`) keeps
+    ///   `$VAR` and other shell metacharacters literal.
+    /// * **`--mem={memory_per_node}` is opt-in** rather than always-off.
+    ///   Python never emits `--mem` (the field isn't in its sbatch
+    ///   argument list); the Rust path keeps the same default
+    ///   (`memory_per_node = None` → no `--mem`) but lets an operator
+    ///   that sets it explicitly get the `sbatch --mem=` cap. No-op for
+    ///   any caller using the Python-default config.
+    ///
+    /// `run_log_dir` is used verbatim as the prefix of the
+    /// `--output=`/`--error=` paths. Tilde expansion (`~/…` →
+    /// `/home/u/…`) is the caller's responsibility: the bash shell
+    /// expands a leading `~` for the trailing script-path argument and
+    /// for redirected paths in the write command, but it does NOT
+    /// expand `~` after `=` in `--output=~/…` style arguments, so
+    /// callers that hand a `~`-prefixed `run_log_dir` to `submit_job`
+    /// will end up with sbatch literally writing to `~/…`. The PyO3
+    /// bridge (see `crates/dynrunner-pyo3/src/slurm/job_manager.rs`)
+    /// expands tilde against the Python gateway's `remote_home` before
+    /// forwarding here, matching the legacy Python `_expand_path` call
+    /// site.
     pub async fn submit_job(
         &mut self,
         wrapper_script: &str,
@@ -247,22 +277,34 @@ impl<G: Gateway> SlurmJobManager<G> {
             )));
         }
 
+        // Argument order mirrors the legacy Python `submit_job` so
+        // operators eyeballing the rendered command see the same flag
+        // sequence either binding produces. The order is sbatch-
+        // semantics-insensitive (sbatch accepts flags in any order), so
+        // this is purely a parity guarantee.
         let mut sbatch_args = vec![
             "sbatch".to_string(),
             "--parsable".to_string(),
             format!("--job-name={job_name}"),
             format!("--nodes={nodes}"),
+            // `--ntasks=1` matches Python: every wrapper script SLURM
+            // launches is a single secondary process, regardless of how
+            // many cpus-per-task the partition allocates. Without it,
+            // some sites default `ntasks` to the partition's default
+            // (often > 1) and srun-based launchers downstream pick the
+            // wrong proc count.
+            "--ntasks=1".to_string(),
+            format!("--cpus-per-task={}", self.config.cpus_per_task),
+            format!("--partition={}", self.config.partition),
+            format!("--time={}", self.config.time_limit),
             format!("--output={run_log_dir}/slurm_%j.out"),
             format!("--error={run_log_dir}/slurm_%j.err"),
         ];
 
-        sbatch_args.push(format!("--partition={}", self.config.partition));
-        sbatch_args.push(format!("--time={}", self.config.time_limit));
-        sbatch_args.push(format!("--cpus-per-task={}", self.config.cpus_per_task));
-        // `--mem` is only emitted when the operator explicitly set
-        // `memory_per_node`. The Python shim never emits `--mem` (the
-        // field isn't in its sbatch argument list), so an unset config
-        // produces a Python-equivalent invocation here.
+        // `--mem` is intentionally opt-in (Python never emits it). See
+        // the method doc-comment for the rationale; default-config
+        // callers get the same `sbatch` invocation either binding
+        // produces.
         if let Some(mem) = &self.config.memory_per_node {
             sbatch_args.push(format!("--mem={mem}"));
         }
@@ -573,6 +615,10 @@ mod tests {
     /// (d) Wrapper script lands at `<root_folder>/job_<name>.sh`
     ///     (Python placement; the negative assertion guards against
     ///     regression to the historical `<log_path>/wrapper_<name>.sh`).
+    /// (e) `--ntasks=1` IS emitted (legacy Python had it; Rust
+    ///     previously omitted it — a parity gap that this assertion
+    ///     locks down so `sbatch` defaults can't drift the launched
+    ///     proc count on partitions whose default ntasks is > 1).
     #[tokio::test]
     async fn submit_job_matches_python_invocation_shape() {
         // Case A+B+D: defaults — no mem, mail=ALL on notify, script in root.
@@ -619,6 +665,12 @@ mod tests {
         assert!(
             !sbatch.contains("--mem="),
             "--mem must be omitted when memory_per_node is None; got: {sbatch}",
+        );
+        // (e) --ntasks=1 must be present (Python parity, locks down the
+        // partition-default-ntasks-drift class of bug).
+        assert!(
+            sbatch.contains("--ntasks=1"),
+            "--ntasks=1 must be emitted for Python-parity; got: {sbatch}",
         );
         // sbatch line ends with the script path argument.
         assert!(

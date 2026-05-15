@@ -2,7 +2,11 @@
 //!
 //! Wraps a `SlurmJobManager<PyGatewayAdapter>` so the Python thin
 //! shim (`dynamic_runner.packaging.job_manager.SlurmJobManager`) can
-//! delegate the directory-prep / cancel / status primitives to Rust.
+//! delegate every SLURM lifecycle primitive — directory prep, job
+//! submit, per-job cancel, cancel-all, status query, tracked-job-id
+//! list — to Rust. After this binding only Python-bridge concerns
+//! remain in the shim (run_log_dir default-arg, tilde expansion via
+//! the Python gateway's `remote_home`).
 //!
 //! The Python `slurm_config` is a different shape from the Rust
 //! `SlurmConfig` (see `python/dynamic_runner/packaging/slurm_config.py`
@@ -161,10 +165,11 @@ fn slurm_err_to_py(e: dynrunner_slurm::SlurmError) -> PyErr {
 /// `Arc<tokio::sync::Mutex<...>>`. Two distinct properties matter:
 ///
 /// 1. **Interior mutability via `&self`**: cancel- and status-query
-///    methods take `&self` at the trait level, but submit-style
-///    methods (when they migrate from the Python shim in a follow-up
-///    unit) need `&mut self`. The mutex smooths that over without
-///    requiring PyO3-level `&mut self` on the wrapper.
+///    methods take `&self` at the trait level, while `submit_job` and
+///    `cancel_all_jobs` take `&mut self` to mutate the tracked
+///    `job_ids` vector. PyO3 exposes a single `&self` surface; the
+///    mutex smooths the two trait-level shapes into one wrapper API
+///    without requiring PyO3-level `&mut self`.
 /// 2. **Async-safe locking**: every `SlurmJobManager` method we call
 ///    is `async` and the guard is held for the duration of the call,
 ///    i.e. across `.await` points. `std::sync::Mutex` is wrong here:
@@ -180,7 +185,9 @@ fn slurm_err_to_py(e: dynrunner_slurm::SlurmError) -> PyErr {
 /// The constructor accepts `packaging_method` and `deployment` to
 /// preserve the Python-side `SlurmJobManager.__init__` signature,
 /// but doesn't retain them — the Python thin shim still owns those
-/// references directly for the methods that haven't migrated yet.
+/// references directly for the non-lifecycle methods (wrapper-script
+/// generation, image transfer, source-binary upload) that have yet
+/// to migrate.
 #[pyclass(name = "RustSlurmJobManager")]
 pub(crate) struct PyRustSlurmJobManager {
     inner: Arc<Mutex<SlurmJobManager<PyGatewayAdapter>>>,
@@ -253,5 +260,81 @@ impl PyRustSlurmJobManager {
             })
         })?;
         job_status_to_dict(py, &info)
+    }
+
+    /// Submit a SLURM job by writing `wrapper_script` to
+    /// `<root_folder>/job_<job_name>.sh` on the gateway and invoking
+    /// `sbatch --parsable …`.
+    ///
+    /// `run_log_dir` must already be tilde-expanded by the caller — the
+    /// Python shim's `_expand_path(run_log_dir or
+    /// slurm_config.get_log_dir())` lives at the bridge boundary because
+    /// `~/…` resolution depends on the Python gateway's `remote_home`
+    /// attribute (a `PosixPath` for `LocalGateway`, `str | None` for
+    /// `SSHGateway`). Tilde-bearing paths reach the Rust core only after
+    /// the shim resolves them; `submit_job` itself takes the string
+    /// verbatim. See the doc-comment on
+    /// `dynrunner_slurm::SlurmJobManager::submit_job` for the rationale
+    /// (sbatch flag-value tilde is NOT shell-expanded).
+    ///
+    /// Returns the submitted job ID (the `--parsable` stdout). The
+    /// returned ID is also appended to the Rust-side `job_ids` vector
+    /// so a later `cancel_all_jobs` call can drain it.
+    fn submit_job(
+        &self,
+        py: Python<'_>,
+        wrapper_script: String,
+        job_name: String,
+        nodes: u32,
+        run_log_dir: String,
+    ) -> PyResult<String> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .submit_job(&wrapper_script, &job_name, nodes, &run_log_dir)
+                    .await
+                    .map_err(slurm_err_to_py)
+            })
+        })
+    }
+
+    /// Cancel every job tracked by the Rust manager (via `scancel`) and
+    /// clear the tracked job-id list. Idempotent: a second call with no
+    /// intervening `submit_job` is a no-op.
+    ///
+    /// Mirrors the legacy Python `SlurmJobManager.cancel_all_jobs`
+    /// shape (iterate + clear). Individual `scancel` failures are
+    /// logged on the Rust side and do not abort the loop, so a partial
+    /// failure still drains the remaining IDs.
+    fn cancel_all_jobs(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .cancel_all_jobs()
+                    .await
+                    .map_err(slurm_err_to_py)
+            })
+        })
+    }
+
+    /// Read-only view of the Rust-tracked job-id list. Returns a fresh
+    /// Python `list[str]` snapshot — mutations on the returned list do
+    /// NOT propagate back to the Rust state.
+    ///
+    /// Exposed so the Python thin shim can preserve the historical
+    /// `SlurmJobManager.job_ids` attribute on its public surface
+    /// without holding a duplicate Python-side list.
+    #[getter]
+    fn job_ids(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        let inner = self.inner.clone();
+        Ok(py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner).await.job_ids().to_vec()
+            })
+        }))
     }
 }
