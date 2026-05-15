@@ -613,6 +613,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
             primary_quic_port,
             &binaries,
             &slurm_config,
+            &job_manager,
             log,
         )?;
 
@@ -1004,6 +1005,7 @@ fn drive_rust_primary<'py>(
     primary_quic_port: u16,
     binaries: &Bound<'py, PyList>,
     slurm_config: &Bound<'py, PyAny>,
+    job_manager: &Bound<'py, PyAny>,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<()> {
     let runner_module = py.import("dynamic_runner")?;
@@ -1056,6 +1058,26 @@ fn drive_rust_primary<'py>(
         no_spawn_callback.unbind(),
     ])?;
     let coord = coord_cls.call(args_tuple, Some(&coord_kwargs))?;
+
+    // Park the SLURM `JobManager` on the coordinator so the respawn
+    // path can submit a fresh 1-node sbatch from inside the operational
+    // loop. Single concern at this call site: bridge the in-process
+    // Rust manager from the SLURM pipeline into the coordinator —
+    // before `coord.run()` enters, after preparation already produced
+    // a live manager. Skipped silently if `job_manager` is not the
+    // expected duck-typed shape (out-of-tree callers that subclass
+    // the shim won't have a `_rust` attribute; logging it here would
+    // be noise for those paths).
+    if let Ok(rust_handle) = job_manager.getattr("_rust") {
+        if let Ok(rust_jm) = rust_handle.cast::<crate::slurm::PyRustSlurmJobManager>() {
+            let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> =
+                rust_jm.borrow().arc_handle();
+            coord
+                .cast::<crate::managers::primary::PyPrimaryCoordinator>()?
+                .borrow_mut()
+                .set_slurm_job_manager_from_rust(arc);
+        }
+    }
 
     let coord_uses_file_based: bool = coord.getattr("uses_file_based_items")?.extract()?;
 
