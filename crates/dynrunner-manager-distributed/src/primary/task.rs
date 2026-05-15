@@ -782,9 +782,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::TaskPreferredSecondariesUpdated { .. }
-            | ClusterMutation::PeerJoined { .. } => {
+            | ClusterMutation::PeerJoined { .. }
+            | ClusterMutation::TaskBlocked { .. } => {
                 // Routing / role / membership hints with no impact on
-                // terminal-state accounting.
+                // terminal-state accounting. `TaskBlocked` is a
+                // cascade-pause notice — the dependent is dormant,
+                // not failed, so the per-pass `failed_tasks` ledger
+                // does not record it; the originating Unfulfillable
+                // task's `TaskFailed` arm above is the only entry to
+                // the local-fail-counter pipeline for the cascade
+                // root.
             }
         }
     }

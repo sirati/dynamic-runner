@@ -63,10 +63,37 @@ where
 
         for (hash, state) in self.cluster_state.tasks_iter() {
             match state {
-                TaskState::Completed { task } | TaskState::Failed { task, .. } => {
+                // Terminal-ish for hydration: contribute task_id to the
+                // dep-resolution seed and mark hash as completed in the
+                // primary-side ledger. `Unfulfillable` is included
+                // because the dep graph treats unfulfillable prereqs
+                // the same way the legacy `Failed { Unfulfillable, .. }`
+                // shape did — surviving variants' `task_depends_on`
+                // references must still resolve so `extend()` accepts
+                // them. The Unfulfillable entry itself stays in the
+                // CRDT and is reinjectable via the command channel; no
+                // pool work is needed for it.
+                TaskState::Completed { task }
+                | TaskState::Failed { task, .. }
+                | TaskState::Unfulfillable { task, .. } => {
                     primary_completed.insert(hash.clone());
                     if let Some(id) = &task.task_id {
                         completed_task_ids.insert(id.clone());
+                    }
+                }
+                // Cascade-paused dependent. Re-seed as Pending into the
+                // new primary's pool: the prereq's TaskCompleted apply
+                // arm has already (or will shortly) auto-resume the
+                // CRDT entry to Pending across every replica, and the
+                // pool needs the binary present to dispatch on the
+                // next tick. If the prereq is still Unfulfillable when
+                // this node promotes, the pool's dep-validation will
+                // surface the unresolved dep as a normal blocked
+                // state — same dormancy, owned by the pool's existing
+                // dep machine rather than a parallel "Blocked" set.
+                TaskState::Blocked { task, .. } => {
+                    if !self.active_tasks.contains_key(hash) {
+                        items.push(task.clone());
                     }
                 }
                 TaskState::Pending { task } => {

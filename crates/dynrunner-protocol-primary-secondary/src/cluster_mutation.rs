@@ -57,19 +57,43 @@ pub enum ClusterMutation<I> {
     RunComplete,
     /// External-control reinjection: the primary's
     /// `PrimaryHandle::reinject_task` accepts a hash whose ledger
-    /// state is `Failed { NonRecoverable, ... }` (the
-    /// "operator-resolvable failure" class, e.g. unfulfillable
-    /// resource request) and transitions the task back to `Pending`
-    /// so the next dispatch tick re-attempts it. Broadcast so every
-    /// node's CRDT mirror moves the entry off `Failed` synchronously
-    /// with the originator; the live primary's pool then picks the
-    /// hash up via the standard reinject path.
+    /// state is the discrete `TaskState::Unfulfillable { .. }` variant
+    /// (the operator-resolvable-failure class — a required cluster
+    /// resource that wasn't held by any peer at dispatch time) and
+    /// transitions the task back to `Pending` so the next dispatch
+    /// tick re-attempts it. Broadcast so every node's CRDT mirror
+    /// moves the entry off `Unfulfillable` synchronously with the
+    /// originator; the live primary's pool then picks the hash up via
+    /// the standard reinject path.
     ///
     /// Re-application is a no-op when the local state isn't
-    /// `Failed`. Carries no error/attempts payload: the entry's
-    /// previous `last_error`/`attempts` belong to the pre-reinject
-    /// failure attempt and are reset.
+    /// `Unfulfillable`. Carries no reason payload: the entry's
+    /// previous `reason` belongs to the pre-reinject Unfulfillable
+    /// state and is reset on transition to Pending.
     TaskReinjected { hash: String },
+    /// A cascade-paused dependent: `hash`'s prerequisite (identified
+    /// by `on`, the prereq's task hash) just transitioned to
+    /// `TaskState::Unfulfillable` and the dependent cannot make
+    /// progress until the prereq is reinjected and completes.
+    ///
+    /// Originated by the primary's `apply_fail_permanent` when the
+    /// failing task carries `ErrorType::Unfulfillable`: every
+    /// transitive dependent surfaced by the pool's cascade is
+    /// broadcast under this variant so every replica's CRDT converges
+    /// to `TaskState::Blocked { on, task }` for it. The matching
+    /// `TaskCompleted` apply arm auto-resumes any
+    /// `Blocked { on: <completed hash>, .. }` entry back to `Pending`,
+    /// event-driven across every replica.
+    ///
+    /// Distinct from `TaskFailed { kind: Unfulfillable, .. }` (which
+    /// targets the originating task whose resource is missing): a
+    /// Blocked dependent is dormant, not failed, and its
+    /// `TaskInfo` is preserved verbatim so the eventual resume to
+    /// `Pending` re-dispatches the same binary.
+    TaskBlocked {
+        hash: String,
+        on: String,
+    },
     /// External-control update of the per-task preferred-secondaries
     /// list. The future dispatch policy consults this field when
     /// picking a worker; this mutation lets external control planes
