@@ -239,6 +239,22 @@ pub struct ClusterState<I> {
     tasks: HashMap<String, TaskState<I>>,
     current_primary: Option<String>,
     primary_epoch: u64,
+    /// Lock-free mirror of `primary_epoch` exposed to off-`apply`
+    /// readers (e.g. the observer's resource-holdings announcer task
+    /// — see [`crate::observer::announcer::run_observer_announcer`]).
+    /// Written synchronously by the `apply` path (and `restore`)
+    /// **before** `fire_role_change_hooks` runs, so any hook
+    /// observer that reads the mirror in response to a role-change
+    /// notification sees the post-mutation value.
+    ///
+    /// Cloned (cheap — `Arc::clone`) on `Clone` rather than reset:
+    /// unlike `role_change_hooks` / `peer_state`, the mirror has no
+    /// runtime-handle semantics (it's an atomic counter, not a
+    /// channel sender), and snapshot-restore paths overwrite the
+    /// value to match the restored `primary_epoch` anyway, so
+    /// preserving the Arc is consistent with the field's read-only
+    /// downstream consumer contract.
+    primary_epoch_mirror: Arc<std::sync::atomic::AtomicU64>,
     /// Per-run static phase dependency graph. Set once at run start
     /// via `ClusterMutation::PhaseDepsSet` (originated by the primary,
     /// applied on every node) and never overwritten — the deps are
@@ -324,6 +340,8 @@ where
             tasks: self.tasks.clone(),
             current_primary: self.current_primary.clone(),
             primary_epoch: self.primary_epoch,
+            // Arc-clone is the right semantics here — see field doc.
+            primary_epoch_mirror: Arc::clone(&self.primary_epoch_mirror),
             phase_deps: self.phase_deps.clone(),
             run_complete: self.run_complete,
             role_table: self.role_table.clone(),
@@ -368,6 +386,7 @@ impl<I> Default for ClusterState<I> {
             tasks: HashMap::new(),
             current_primary: None,
             primary_epoch: 0,
+            primary_epoch_mirror: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             phase_deps: HashMap::new(),
             run_complete: false,
             role_table: RoleTable::default(),
@@ -625,6 +644,22 @@ impl<I: Identifier> ClusterState<I> {
         self.primary_epoch
     }
 
+    /// Clone the shared [`Arc<AtomicU64>`] mirror of `primary_epoch`
+    /// for an off-`apply` reader to install into a long-lived task.
+    /// The mirror is updated synchronously by every `apply` /
+    /// `restore` arm that bumps `primary_epoch`, **before** role-
+    /// change hooks fire — see field doc on `primary_epoch_mirror`
+    /// for the memory-ordering contract.
+    ///
+    /// The one production reader today is the observer's resource-
+    /// holdings announcer (`crate::observer::announcer`), which reads
+    /// the mirror at send time so a broadcast that retries past a
+    /// further `PrimaryChanged` automatically picks up the newer
+    /// epoch instead of carrying the stale trigger-time value.
+    pub fn primary_epoch_mirror(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.primary_epoch_mirror)
+    }
+
     pub fn phase_deps(&self) -> &HashMap<PhaseId, Vec<PhaseId>> {
         &self.phase_deps
     }
@@ -839,6 +874,13 @@ impl<I: Identifier> ClusterState<I> {
         }
         if snap.primary_epoch > self.primary_epoch {
             self.primary_epoch = snap.primary_epoch;
+            // Mirror update on the snapshot-merge path mirrors the live
+            // `PrimaryChanged` apply rule — same `Release` ordering, same
+            // pre-`fire_role_change_hooks` write — so a late-joiner's
+            // announcer wakes from the restore-time trigger and reads the
+            // restored epoch, not the cold-start 0.
+            self.primary_epoch_mirror
+                .store(snap.primary_epoch, std::sync::atomic::Ordering::Release);
             self.current_primary = snap.current_primary.clone();
             // Keep the replicated `RoleTable` in lockstep with
             // `current_primary` even when the new value lands via
@@ -1027,6 +1069,16 @@ impl<I: Identifier> ClusterState<I> {
                 }
                 self.current_primary = Some(new.clone());
                 self.primary_epoch = epoch;
+                // Keep the lock-free epoch mirror in lockstep with the
+                // field so off-`apply` readers (the observer
+                // resource-holdings announcer) see the post-mutation
+                // value when their hook is fired below. `Release`
+                // pairs with the announcer's `Acquire` load. Writing
+                // BEFORE `fire_role_change_hooks` ensures any hook
+                // observer that synchronously reads the mirror
+                // observes the new value.
+                self.primary_epoch_mirror
+                    .store(epoch, std::sync::atomic::Ordering::Release);
                 // Replicated `RoleTable` mutation: kept in lockstep
                 // with `current_primary` so the transport-layer
                 // write-through cache (Step 2) observes a coherent
@@ -1624,6 +1676,63 @@ mod tests {
         });
         assert_eq!(s.current_primary(), Some("c"));
         assert_eq!(s.primary_epoch(), 5);
+    }
+
+    /// `primary_epoch_mirror` tracks `primary_epoch` on every applied
+    /// `PrimaryChanged` mutation. Pins the lock-free reader contract
+    /// the observer-side announcer task depends on: a `mirror.load()`
+    /// in response to a role-change hook fire observes the
+    /// post-mutation value, not the pre-mutation one. Reject paths
+    /// (lower epoch, same epoch + same id) leave the mirror
+    /// unchanged because the underlying field is also unchanged.
+    #[test]
+    fn primary_epoch_mirror_tracks_apply() {
+        use std::sync::atomic::Ordering;
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let mirror = s.primary_epoch_mirror();
+        assert_eq!(mirror.load(Ordering::Acquire), 0);
+
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "a".into(),
+            epoch: 3,
+        });
+        assert_eq!(mirror.load(Ordering::Acquire), 3);
+
+        // NoOp branch (lower epoch) leaves the mirror untouched.
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "b".into(),
+            epoch: 1,
+        });
+        assert_eq!(mirror.load(Ordering::Acquire), 3);
+
+        s.apply(ClusterMutation::PrimaryChanged {
+            new: "c".into(),
+            epoch: 7,
+        });
+        assert_eq!(mirror.load(Ordering::Acquire), 7);
+    }
+
+    /// Snapshot-restore path keeps the mirror in lockstep with the
+    /// restored epoch. The late-joiner observer's first trigger is the
+    /// role-change hook firing from inside `restore`'s
+    /// `primary_epoch > local` branch — that branch writes the mirror
+    /// BEFORE `fire_role_change_hooks` so the announcer's first
+    /// awoken read sees the restored epoch, not 0.
+    #[test]
+    fn primary_epoch_mirror_tracks_restore() {
+        use std::sync::atomic::Ordering;
+        let mut origin = ClusterState::<RunnerIdentifier>::new();
+        origin.apply(ClusterMutation::PrimaryChanged {
+            new: "primary-id".into(),
+            epoch: 11,
+        });
+        let snap = origin.snapshot();
+
+        let mut joiner = ClusterState::<RunnerIdentifier>::new();
+        let mirror = joiner.primary_epoch_mirror();
+        assert_eq!(mirror.load(Ordering::Acquire), 0);
+        joiner.restore(snap);
+        assert_eq!(mirror.load(Ordering::Acquire), 11);
     }
 
     #[test]
