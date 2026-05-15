@@ -469,7 +469,16 @@ class PodmanPackaging:
             shutil.rmtree(scratch, ignore_errors=True)
 
     def get_load_command(self, image_path: str, storage_root: str, run_root: str) -> str:
-        return f"podman --root {storage_root} --runroot {run_root} load < {image_path}"
+        # `--cgroup-manager=cgroupfs`: rootless podman defaults to the
+        # systemd cgroup-manager, which depends on the user's
+        # `user@<uid>.service` being healthy. Under SLURM with shared
+        # accounts (or without `loginctl enable-linger`), that systemd
+        # user instance start/stop-storms across consecutive job steps;
+        # `podman load`'s pause-process registration drops mid-write
+        # ("sendmsg: broken pipe") and the load reports success without
+        # finalising the manifest — subsequent `podman run` then fails
+        # with "image not known". cgroupfs sidesteps systemd entirely.
+        return f"podman --root {storage_root} --runroot {run_root} --cgroup-manager=cgroupfs load < {image_path}"
 
     def get_run_command(
         self,
@@ -487,6 +496,7 @@ class PodmanPackaging:
             storage_root,
             "--runroot",
             run_root,
+            "--cgroup-manager=cgroupfs",
             "run",
             "--rm",
         ]
@@ -502,7 +512,7 @@ class PodmanPackaging:
         return " ".join(cmd_parts)
 
     def get_images_command(self, storage_root: str, run_root: str) -> str:
-        return f"podman --root {storage_root} --runroot {run_root} images"
+        return f"podman --root {storage_root} --runroot {run_root} --cgroup-manager=cgroupfs images"
 
     def get_version_command(self) -> str:
         return "podman --version"
