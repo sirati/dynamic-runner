@@ -1,4 +1,5 @@
 pub mod cluster_state;
+pub mod observer;
 pub mod peer_lifecycle;
 pub mod state;
 pub mod message_router;
@@ -24,3 +25,10 @@ pub use cluster_state::{
 // Re-export the role-table types so downstream crates don't have to
 // reach into the protocol crate to type the cache shape.
 pub use dynrunner_protocol_primary_secondary::{RoleChangeHookRegistrar, RoleTable};
+// Re-export observer-only surface for PyO3 and consumer wire-up. The
+// announcer task body + the lifecycle attach helper live behind one
+// import path so consumers don't have to descend into the submodule.
+pub use observer::{
+    attach_observer_announcer, run_observer_announcer, AnnounceTrigger, AnnouncerHandle,
+    AnnouncerSender, PeerResourceHoldingsUpdatedPayload,
+};

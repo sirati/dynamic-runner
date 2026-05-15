@@ -33,6 +33,10 @@ dynrunner-transport-tunnel = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
+# `test-util` exposes `tokio::time::pause` + `#[tokio::test(start_paused=true)]`
+# so the observer-announcer retry test can advance virtual time past the
+# 100 ms initial backoff without burning real wall-clock seconds.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
