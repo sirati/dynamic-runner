@@ -236,16 +236,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             //       ONLY safe exit is `cluster_state.run_complete()`
             //       (the authoritative primary's terminal broadcast).
             //
-            //       Legacy bootstrap (`required_setup_on_promote =
-            //       false`) is unaffected: even when demoted, the
-            //       local's view was fully seeded by
-            //       `seed_cluster_state` before the operational loop
-            //       started, so `total_tasks = binaries.len()` is
-            //       set once at run start and never drifts under
+            //       Pre-seeded mode (`required_setup_on_promote =
+            //       false` — local does discovery + seeds
+            //       `cluster_state` BEFORE handing off to the
+            //       promoted secondary; a fully production-supported
+            //       path, not a deprecated one) is unaffected: even
+            //       when demoted, the local's view was fully seeded
+            //       by `seed_cluster_state` before the operational
+            //       loop started, so `total_tasks = binaries.len()`
+            //       is set once at run start and never drifts under
             //       partial CRDT updates. The counter exit is the
-            //       load-bearing happy-path exit for every legacy-
-            //       mode run; gating it on `!self.demoted` would
-            //       break every distributed run.
+            //       load-bearing happy-path exit for every
+            //       pre-seeded run; gating it on `!self.demoted`
+            //       would break every distributed run.
             //
             // Concrete bug this guard kills (asm-tokenizer LMU CIP
             // `--jobs 15`, 50ms+ tunnel RTT, `--source-already-staged`):
@@ -303,14 +306,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // fail_retry=X ..." log line at the demoted exit reflects
             // the true final state.
             //
-            // Legacy-bootstrap demoted primary: RunComplete is a
-            // redundant exit (the counter check above trips first,
-            // since the local was fully seeded by
-            // `seed_cluster_state` and TaskCompleteds from every
-            // peer's worker arrive on the legacy / peer transport
-            // before the promoted primary itself decides
-            // RunComplete). Keeping this arm unguarded is harmless
-            // and serves as a uniform fallback.
+            // Pre-seeded demoted primary (`required_setup_on_promote
+            // = false`): RunComplete is a redundant exit (the
+            // counter check above trips first, since the local was
+            // fully seeded by `seed_cluster_state` and TaskCompleteds
+            // from every peer's worker arrive on the per-peer
+            // SecondaryTransport / peer transport before the promoted
+            // primary itself decides RunComplete). Keeping this arm
+            // unguarded is harmless and serves as a uniform fallback.
             //
             // Sticky monotonic flag, so this fires at most once
             // per run.
@@ -990,15 +993,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 epoch: new_epoch,
                 // Bootstrap-promote discriminator: when this primary
                 // skipped `seed_cluster_state` + `perform_initial_assignment`
-                // (setup-defer mode driven by `--source-already-staged`),
-                // the chosen secondary needs to know it's the one
-                // doing discovery + ledger seed after promotion. The
-                // election/failover sites in `secondary/election.rs`
-                // unconditionally pass `false` because, by election
-                // time, the local ledger is already non-empty (seeded
-                // either by the original setup-defer secondary or by
-                // a legacy submitter), so re-running discovery would
-                // double-seed.
+                // (setup-defer mode driven by `--source-already-staged`,
+                // i.e. `required_setup_on_promote = true`), the chosen
+                // secondary needs to know it's the one doing discovery
+                // + ledger seed after promotion. The election/failover
+                // sites in `secondary/election.rs` unconditionally
+                // pass `false` because, by election time, the local
+                // ledger is already non-empty (seeded either by the
+                // original setup-defer secondary or by a pre-seeded
+                // submitter — `required_setup_on_promote = false`,
+                // a fully production-supported path), so re-running
+                // discovery would double-seed.
                 required_setup: self.config.required_setup_on_promote,
             };
             // Broadcast to every secondary, not unicast to the elected
