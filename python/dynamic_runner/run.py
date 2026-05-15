@@ -230,14 +230,41 @@ def _dispatch_secondary(task, args, logger) -> None:
         logger.error("--secondary-id is required when running in secondary mode")
         return
 
-    # `--disable-peer-overlay` lives on `DistributedConfig` (the
-    # struct that already owns peer-related tuning). Construct an
-    # explicit DistributedConfig only when the flag deviates from
-    # the default; otherwise let `SecondaryConfig.__new__` install
-    # the stock default.
-    distributed_config = (
-        _rs.DistributedConfig(disable_peer_overlay=True) if args.disable_peer_overlay else None
-    )
+    # `--disable-peer-overlay` and `--slurm-setup-deadline-secs` both
+    # live on `DistributedConfig` (the struct that already owns the
+    # peer-related + setup-phase tuning knobs). Construct an explicit
+    # DistributedConfig only when at least one flag deviates from the
+    # default; otherwise let `SecondaryConfig.__new__` install the
+    # stock default.
+    #
+    # `--slurm-setup-deadline-secs` reaches the secondary by one of
+    # two paths, both terminating at this argparse attribute:
+    #
+    # * Operator-supplied: the flag travels verbatim through
+    #   `filter_framework_argv` (it's not in
+    #   `FRAMEWORK_REGENERATED_FLAGS`) and the SLURM wrapper's
+    #   forwarded_argv block re-emits it on the secondary command line.
+    # * Pipeline-derived: when the operator left it unset, the Rust
+    #   SLURM pipeline computes `max(60, num_secondaries * 15)` and
+    #   appends `--slurm-setup-deadline-secs=N` to forwarded_argv so
+    #   every secondary's argparse re-derives the same effective
+    #   deadline as the dispatcher (single source of truth: the
+    #   `dynrunner_slurm::pipeline::compute_setup_deadline_secs`
+    #   function).
+    #
+    # In both cases the secondary's argparse stores the int on
+    # `args.slurm_setup_deadline_secs`; here we hand it to
+    # `DistributedConfig.setup_deadline_secs`. Outside SLURM mode
+    # (no pipeline injection, no operator override) the attribute is
+    # `None` and the stock 60s default takes over — preserving the
+    # historical small-scale behaviour.
+    setup_deadline_override = getattr(args, "slurm_setup_deadline_secs", None)
+    dc_kwargs: dict[str, object] = {}
+    if args.disable_peer_overlay:
+        dc_kwargs["disable_peer_overlay"] = True
+    if setup_deadline_override is not None:
+        dc_kwargs["setup_deadline_secs"] = float(setup_deadline_override)
+    distributed_config = _rs.DistributedConfig(**dc_kwargs) if dc_kwargs else None
     # Per-machine cores AND memory: resolve both specs against
     # THIS host's detected resources, not the primary's. The
     # spawn argv carries `--cores=<spec>` always; `--max-memory`
