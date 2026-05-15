@@ -705,6 +705,265 @@ async fn setup_promote_run_with_retry_success_completes_via_runcomplete() {
     }).await;
 }
 
+/// Regression for the asm-tokenizer Tier-2 hang (post-`a78c89c`):
+/// multi-secondary setup-promote + all-success natural quiesce
+/// must broadcast `RunComplete` and let the run terminate, even when
+/// the chosen secondary's task workload happens to all dispatch
+/// to its own workers (peer secondaries stay idle).
+///
+/// Shape mirrors the 1-secondary `setup_promote_run_with_retry_success_completes_via_runcomplete`
+/// test but with FOUR real secondaries on a real peer mesh:
+///
+///   - 4 SecondaryCoordinators wired via `peer_mesh` (all-to-all
+///     `ChannelPeerTransport`) so each one has 3 real peers.
+///   - The submitter's PrimaryCoordinator is in setup-promote mode
+///     (`required_setup_on_promote = true`). It demotes itself and
+///     hands authority to the first secondary in its `secondaries`
+///     map ordering.
+///   - Only the chosen / promoted secondary drives discovery via
+///     `run_until_setup_or_done` → `ingest_setup_discovery`.
+///     The other three run plain `run()` (which loops on
+///     `run_until_setup_or_done` internally and never observes
+///     `SetupPending` because PromotePrimary targets a peer, not
+///     them).
+///   - 5 binaries, all succeed on first attempt (no retries).
+///     Workers on the chosen secondary are fast enough that in
+///     production-shaped runs the entire workload dispatches to
+///     its own pool before peers send TaskRequests; the test pins
+///     this end-state regardless.
+///
+/// Pre-fix Tier-2 symptom: after the last TaskComplete the promoted
+/// secondary's natural-quiesce branch fails to fire RunComplete,
+/// `primary.run()` hangs past the bounded timeout, the assertion
+/// trips.
+///
+/// Post-fix invariants:
+///   (A) `primary.run()` returns `Ok(())` within 10s.
+///   (B) `primary.cluster_state.run_complete()` is true.
+///   (C) Every binary terminates as `Completed` (`outcome.succeeded
+///       == total`, no `fail_retry` / `fail_oom` / `fail_final`).
+#[tokio::test(flavor = "current_thread")]
+async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete() {
+    use crate::secondary::RunOutcome;
+    use dynrunner_transport_channel::{peer_mesh, ChannelPeerTransport};
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        const N_SECONDARIES: usize = 4;
+        let secondary_ids: Vec<String> =
+            (0..N_SECONDARIES).map(|i| format!("sec-{i}")).collect();
+
+        // Build the peer mesh up front so every secondary's
+        // `ChannelPeerTransport` already has the full adjacency
+        // populated. `peer_mesh` returns one transport per id in
+        // input order; we pop them off into the per-secondary spawn
+        // sites below.
+        let mut peer_transports: Vec<ChannelPeerTransport<TestId>> =
+            peer_mesh(&secondary_ids);
+
+        // 5 binaries — small enough that the chosen secondary's
+        // own two workers cover the entire workload, mirroring the
+        // production scenario where `--jobs 4` * 2 workers >> 20
+        // tasks and a fast secondary grabs everything before
+        // peer-TaskRequest backoff cycles.
+        let discovered: Vec<TaskInfo<TestId>> = (0..5)
+            .map(|i| make_binary(&format!("bin-{i}"), 50 + i * 10))
+            .collect();
+        let total = discovered.len();
+        let phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>
+            = HashMap::new();
+
+        // Per-secondary primary-side channel pairs.
+        let mut pri_to_sec_txs: HashMap<String, _> = HashMap::new();
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut sec_handles: Vec<tokio::task::JoinHandle<(String, usize)>> = Vec::new();
+
+        // The "chosen" secondary id is whichever `secondaries.keys().next()`
+        // picks first inside `lifecycle.rs::promote_primary` — HashMap
+        // iteration order. We don't try to predict it; every spawned
+        // secondary is prepared to drive the setup-pending yield.
+        for (idx, secondary_id) in secondary_ids.iter().enumerate() {
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            pri_to_sec_txs.insert(secondary_id.clone(), pri_to_sec_tx);
+
+            // Wire the per-secondary upstream into the primary's
+            // aggregated incoming channel.
+            let tx = incoming_tx.clone();
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let peer_transport = peer_transports.remove(0);
+            let discovered_local = discovered.clone();
+            let phase_deps_local = phase_deps.clone();
+            let secondary_id_local = secondary_id.clone();
+            let max_res = dynrunner_core::ResourceMap::from(
+                [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+            );
+
+            let handle = tokio::task::spawn_local(async move {
+                let transport = ChannelPrimaryTransportEnd {
+                    tx: sec_to_pri_tx,
+                    rx: pri_to_sec_rx,
+                };
+                let config = SecondaryConfig {
+                    secondary_id: secondary_id_local.clone(),
+                    num_workers: 2,
+                    max_resources: max_res,
+                    hostname: "test-host".into(),
+                    // Tight keepalive so the natural-quiesce branch
+                    // ticks promptly once everything drains.
+                    keepalive_interval: Duration::from_millis(50),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                    keepalive_miss_threshold: 3,
+                    retry_max_passes: 1,
+                    primary_link_failure_threshold: 5,
+                    primary_link_failure_window: Duration::from_secs(30),
+                    setup_deadline: Duration::from_secs(60),
+                    is_observer: false,
+                };
+                let mut secondary = SecondaryCoordinator::new(
+                    config,
+                    transport,
+                    peer_transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let mut factory = FakeWorkerFactory;
+                // Every secondary runs the same wrapper-style loop.
+                // Only the chosen one will observe SetupPending; the
+                // others fall through `run_until_setup_or_done` →
+                // `Done` after the run completes.
+                loop {
+                    match secondary.run_until_setup_or_done(&mut factory).await {
+                        Ok(RunOutcome::Done) => break,
+                        Ok(RunOutcome::SetupPending) => {
+                            secondary
+                                .ingest_setup_discovery(
+                                    discovered_local.clone(),
+                                    phase_deps_local.clone(),
+                                )
+                                .await
+                                .expect("ingest_setup_discovery succeeds");
+                        }
+                        Err(e) => panic!("sec-{idx}.run_until_setup_or_done: {e}"),
+                    }
+                }
+                (secondary_id_local, secondary.completed_count())
+            });
+            sec_handles.push(handle);
+        }
+        drop(incoming_tx);
+
+        let transport = ChannelSecondaryTransportEnd {
+            outgoing: pri_to_sec_txs,
+            incoming_rx,
+        };
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: N_SECONDARIES as u32,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            // FakeWorkerFactory doesn't read the task file; passthrough
+            // matches the existing setup-promote test fixture.
+            uses_file_based_items: false,
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let (deps, ops, ope) = noop_phase_args();
+        let run_outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            primary.run(vec![], deps, ops, ope),
+        )
+        .await;
+
+        match run_outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "primary.run() returned an error on a multi-secondary \
+                 setup-promote happy-path: {e}"
+            ),
+            Err(_elapsed) => panic!(
+                "primary.run() did not return within 10s — Tier-2 \
+                 regression: the promoted secondary's natural-quiesce \
+                 branch failed to broadcast RunComplete in the \
+                 multi-secondary case, leaving the demoted primary's \
+                 partial-view operational_loop waiting forever."
+            ),
+        }
+
+        // Invariant (B): RunComplete actually fired on the demoted
+        // local's cluster_state mirror.
+        assert!(
+            primary.cluster_state_for_test().run_complete(),
+            "cluster_state.run_complete() must be true after the \
+             promoted secondary's natural-quiesce branch fires the \
+             RunComplete broadcast in a multi-secondary mesh."
+        );
+
+        // Invariant (C): every binary terminates as Completed.
+        let outcome = primary.outcome_summary();
+        assert_eq!(
+            outcome.succeeded, total,
+            "outcome.succeeded must equal total ({total}) — every \
+             binary should reach the Completed terminal state on \
+             a clean multi-secondary natural-quiesce run. \
+             Got outcome={outcome:?}"
+        );
+        assert_eq!(outcome.fail_retry, 0);
+        assert_eq!(outcome.fail_oom, 0);
+        assert_eq!(outcome.fail_final, 0);
+        assert_eq!(primary.stranded_count(), 0);
+
+        drop(primary);
+
+        // Every secondary must exit Done (not panic, not hang).
+        for handle in sec_handles {
+            let (sid, completed) = handle.await.unwrap();
+            // The cluster-wide completed_tasks set on every secondary
+            // covers the full task list — that's the failover-
+            // survivability contract from `cluster_state_converges_*`.
+            // Multi-secondary peers receive the broadcast TaskCompleted
+            // via primary_transport (from the demoted local's
+            // re-broadcast) AND the originator's TaskComplete via the
+            // peer mesh, so every secondary's `completed_tasks` set
+            // grows to `total`.
+            assert!(
+                completed >= total,
+                "secondary {sid} should have observed all {total} \
+                 completions (cluster-wide failover-survivability view); \
+                 got {completed}"
+            );
+        }
+    }).await;
+}
+
 /// Companion to `recoverable_failure_succeeds_on_retry_pass`: a task
 /// that fails Recoverably on EVERY attempt (main pass + every retry
 /// pass) ends up permanently in `primary_failed`, and the
