@@ -6,3 +6,4 @@ pub(crate) mod observer_late_joiner;
 pub(crate) mod primary;
 pub(crate) mod run;
 pub(crate) mod secondary;
+pub(crate) mod subprocess_spec;
