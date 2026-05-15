@@ -21,7 +21,6 @@ import importlib.util
 import pathlib
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
 
 
 def _setup_package_stub():
@@ -42,11 +41,11 @@ def _setup_package_stub():
 
 def _load_module_direct(name: str, relpath: str):
     """Import a single `dynamic_runner` source file by absolute path,
-    bypassing the package `__init__`. The two modules this test
-    exercises (`deployment_spec`, `spawn_secondary`) are pure-Python
-    and import nothing from `_native`, so direct file import is
-    safe. Used so the test runs in the bare `nix develop` shell
-    without a wheel build."""
+    bypassing the package `__init__`. The modules this test
+    exercises (`deployment_spec`, `subprocess_spec`, `spawn_secondary`)
+    are pure-Python and import nothing from `_native`, so direct file
+    import is safe. Used so the test runs in the bare `nix develop`
+    shell without a wheel build."""
     package_root = _setup_package_stub()
     target = package_root / relpath
     fullname = f"dynamic_runner.{name}"
@@ -61,8 +60,13 @@ def _load_module_direct(name: str, relpath: str):
 
 
 _deployment_spec = _load_module_direct("deployment_spec", "deployment_spec.py")
+# Load `subprocess_spec` first; `spawn_secondary` imports it via
+# `from .subprocess_spec import SubprocessSpec` so its module entry
+# must already be in `sys.modules` under the package-qualified name.
+_subprocess_spec_mod = _load_module_direct("subprocess_spec", "subprocess_spec.py")
 _spawn_secondary = _load_module_direct("spawn_secondary", "spawn_secondary.py")
 TaskDeploymentSpec = _deployment_spec.TaskDeploymentSpec
+SubprocessSpec = _subprocess_spec_mod.SubprocessSpec
 build_subprocess_spawn = _spawn_secondary.build_subprocess_spawn
 
 
@@ -88,15 +92,21 @@ def _make_args(**overrides) -> argparse.Namespace:
 
 
 def _captured_argv(args: argparse.Namespace) -> list[str]:
-    """Drive `spawn_secondary` without launching a subprocess and
-    return the argv it WOULD have launched."""
+    """Drive `spawn_secondary` and return the argv it produced.
+
+    Post-refactor `spawn_secondary` returns a
+    :class:`SubprocessSpec` describing what to spawn — no
+    `subprocess.Popen` is constructed here (lifecycle is Rust-owned;
+    see ``spawn_secondary.py`` header banner). The test simply
+    inspects the returned spec's ``argv`` field.
+    """
     deployment = _make_deployment()
     spawn = build_subprocess_spawn(deployment, args)
-    with patch("dynamic_runner.spawn_secondary.subprocess.Popen") as popen:
-        popen.return_value = MagicMock()
-        spawn("ws://primary:8080", "sec-0", 4242)
-    args_list, _kwargs = popen.call_args
-    return args_list[0]
+    spec = spawn("ws://primary:8080", "sec-0", 4242)
+    assert isinstance(spec, SubprocessSpec), (
+        f"spawn_secondary must return SubprocessSpec; got {type(spec).__name__}"
+    )
+    return list(spec.argv)
 
 
 class TestSpawnSecondaryCoresThreadThrough(unittest.TestCase):

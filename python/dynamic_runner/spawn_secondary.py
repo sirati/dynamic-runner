@@ -1,4 +1,27 @@
-"""Local-subprocess spawn for the network primary coordinator.
+"""Local-subprocess spawn-spec builder for the network primary coordinator.
+
+==============================================================================
+NO LOGIC HERE — this file is a thin CLI bridge.
+==============================================================================
+
+Single concern: assemble the argv (and forwarded CLI flags) for one
+``--multi-computer local`` secondary subprocess, and return a data-only
+:class:`dynamic_runner.subprocess_spec.SubprocessSpec` describing what
+to spawn. Nothing here owns a live process: no ``subprocess.Popen`` is
+constructed, no ``wait`` / ``kill`` happens, and there is no callback
+state across calls.
+
+Process lifecycle (spawn / wait / kill) lives in Rust —
+``crates/dynrunner-pyo3/src/managers/primary.rs`` reads the
+:class:`SubprocessSpec` and owns the resulting ``std::process::Child``
+through ``std::process::Command::spawn``. This split exists because
+the framework's invariant (per
+``feedback_features_in_rust_python_is_bridge``) is "runtime lifecycle
+lives in Rust crates; Python is CLI/config/PyO3 only". Assembling the
+argv string is legitimate Python concern (the spawned process IS
+Python; ``deployment.secondary_module`` is the consumer's
+``TaskDeploymentSpec`` field). Owning the resulting OS process across
+calls is not.
 
 Used by ``--multi-computer local`` (and only there): the primary
 launches each secondary as a local ``python -m {secondary_module}``
@@ -9,20 +32,23 @@ consumer expresses it exactly once.
 The SLURM path does not call this — it builds an analogous argv inside
 a podman wrapper, also from the same ``TaskDeploymentSpec``. Both
 paths reading the same spec is the whole point: there is one source of
-truth for "what's the secondary's Python module name".
+truth for "what's the secondary's Python module name". The SLURM
+callback returns ``None`` from
+``packaging.pipeline._slurm_already_spawned`` because sbatch handled
+the spawning out of band.
 """
 
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from collections.abc import Callable
 
 from .deployment_spec import TaskDeploymentSpec
+from .subprocess_spec import SubprocessSpec
 
 
-SpawnSecondary = Callable[[str, str, int], subprocess.Popen]
+SpawnSecondary = Callable[[str, str, int], "SubprocessSpec | None"]
 
 
 def build_subprocess_spawn(
@@ -31,10 +57,11 @@ def build_subprocess_spawn(
 ) -> SpawnSecondary:
     """Build the ``spawn_secondary`` callback the Rust primary calls.
 
-    The returned callable wraps ``subprocess.Popen([python, -m,
-    secondary_module, --secondary URL, --secondary-id ID,
-    --secondary-quic-port PORT])``. It propagates ``--raw-logs`` from
-    the primary's argv when set.
+    The returned callable assembles
+    ``[python, -m, secondary_module, --secondary URL, --secondary-id
+    ID, --secondary-quic-port PORT]`` and returns it inside a
+    :class:`SubprocessSpec`. It propagates ``--raw-logs`` from the
+    primary's argv when set.
 
     ``--src-network`` is auto-threaded to the dispatcher's ``--source``
     so the spawned secondary can resolve the framework's auto-stage
@@ -65,7 +92,7 @@ def build_subprocess_spawn(
     policy decision.
     """
 
-    def spawn_secondary(primary_url: str, secondary_id: str, quic_port: int) -> subprocess.Popen:
+    def spawn_secondary(primary_url: str, secondary_id: str, quic_port: int) -> SubprocessSpec:
         cmd = [sys.executable, "-m", deployment.secondary_module]
         cmd += ["--secondary", primary_url]
         cmd += ["--secondary-id", secondary_id]
@@ -78,6 +105,6 @@ def build_subprocess_spawn(
             cmd += ["--cores", str(cores)]
         if getattr(args, "raw_logs", False):
             cmd.append("--raw-logs")
-        return subprocess.Popen(cmd)
+        return SubprocessSpec(argv=cmd)
 
     return spawn_secondary
