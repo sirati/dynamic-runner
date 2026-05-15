@@ -111,6 +111,16 @@ pub(crate) struct PyPrimaryCoordinator {
     /// Held for the per-phase lifecycle hooks that re-acquire the GIL
     /// from inside `PrimaryCoordinator::run` (Phase 5B).
     task_definition: Py<PyAny>,
+    /// Optional Python peer-lifecycle listener supplied at `__init__`.
+    /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;
+    /// the object is bridged through
+    /// `crate::peer_lifecycle_bridge::PyPeerLifecycleListener` and
+    /// registered on the inner `PrimaryCoordinator` at `run()` start.
+    /// Constructor-only — no setter — because the manager-distributed
+    /// `register_lifecycle_listener` API also requires
+    /// pre-`run()` registration (the listener vector is
+    /// `mem::take`-d into the spawned dispatcher).
+    peer_lifecycle_listener: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -125,6 +135,7 @@ impl PyPrimaryCoordinator {
         source_pre_staged_root = None,
         source_dir = None,
         unfulfillable_reinject_max_per_task = None,
+        peer_lifecycle_listener = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -136,6 +147,7 @@ impl PyPrimaryCoordinator {
         source_pre_staged_root: Option<std::path::PathBuf>,
         source_dir: Option<std::path::PathBuf>,
         unfulfillable_reinject_max_per_task: Option<u32>,
+        peer_lifecycle_listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -181,6 +193,7 @@ impl PyPrimaryCoordinator {
             reinject_cap,
             command_tx,
             command_rx: Some(command_rx),
+            peer_lifecycle_listener,
         })
     }
 
@@ -315,6 +328,17 @@ impl PyPrimaryCoordinator {
                 self.task_definition.clone_ref(py),
             ),
         );
+
+        // Take the Python peer-lifecycle listener (if any) out of
+        // `self` so it can move into the detached tokio runtime.
+        // Wrapped through `PyPeerLifecycleListener::new` into a
+        // `Box<dyn LifecycleListener>` at the boundary so the
+        // manager-distributed registration API stays
+        // PyO3-agnostic.
+        let peer_lifecycle_listener =
+            self.peer_lifecycle_listener
+                .take()
+                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         // Resolve the bind port. When the caller (e.g. the SLURM
         // packaging pipeline) pre-supplied `listen_port`, honour it
@@ -486,6 +510,15 @@ impl PyPrimaryCoordinator {
                 // `PrimaryHandle` Python is holding talks to the same
                 // receiver the operational loop reads from.
                 primary.replace_command_channel(command_tx, command_rx);
+
+                // Register the Python peer-lifecycle listener (if any)
+                // BEFORE `run()` enters — the coordinator's
+                // `register_lifecycle_listener` contract requires
+                // pre-run registration because `run()` `mem::take`-s
+                // the listener vector into the spawned dispatcher.
+                if let Some(listener) = peer_lifecycle_listener {
+                    primary.register_lifecycle_listener(listener);
+                }
 
                 for (sec_id, file_hash, content_hash, src, dest) in pending_stage_files {
                     primary.queue_stage_file(sec_id, file_hash, content_hash, src, dest);

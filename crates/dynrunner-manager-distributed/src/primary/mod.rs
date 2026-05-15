@@ -619,6 +619,26 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// control callers use the hash as the canonical identifier
     /// (mirroring the rest of the wire protocol).
     pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
+
+    /// Peer-lifecycle dispatcher channel receiver, paired with the
+    /// `lifecycle_tx` installed on `cluster_state` at construction.
+    /// Taken out at `run()` start and handed to
+    /// [`crate::peer_lifecycle::run_peer_lifecycle_dispatcher`] inside
+    /// the operational LocalSet so the dispatcher's lifetime tracks
+    /// the operational loop's tokio runtime.
+    pub(super) lifecycle_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::peer_lifecycle::PeerLifecycleEvent>,
+    >,
+    /// Consumers of peer-lifecycle events. Appended to via
+    /// [`Self::register_lifecycle_listener`] before `run()` enters;
+    /// `std::mem::take` moves the whole vector into the spawned
+    /// dispatcher at `run()` start, after which the field is empty
+    /// and any post-run `register_lifecycle_listener` calls are
+    /// silently appending to a dead-letter list (no dispatcher will
+    /// see them). The single-shot lifecycle is consistent with the
+    /// rest of the coordinator's `run()`-once contract.
+    pub(super) peer_lifecycle_listeners:
+        Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -631,6 +651,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     ) -> Self {
         let setup_pending = config.required_setup_on_promote;
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
+        // Peer-lifecycle dispatcher channel: built at construction so
+        // the apply path on `cluster_state` has a sender to enqueue
+        // through from the very first `PeerJoined`/`PeerRemoved`
+        // mutation. The receiver waits on `self` until `run()`
+        // spawns the dispatcher; events emitted in the interim
+        // queue on the unbounded channel and drain on the first
+        // dispatcher poll.
+        let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut this = Self {
             config,
             transport,
@@ -665,7 +693,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             command_rx: Some(command_rx),
             command_tx,
             unfulfillable_reinject_remaining: HashMap::new(),
+            lifecycle_rx: Some(lifecycle_rx),
+            peer_lifecycle_listeners: Vec::new(),
         };
+        // Install the peer-lifecycle sender on `cluster_state` so the
+        // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
+        // through the dispatcher channel from this point onward.
+        // Done before any other registration so a mutation that
+        // somehow lands during construction still has a sender to
+        // enqueue against (defensive: today no mutation is applied
+        // pre-`run()`, but the contract should not depend on that).
+        this.cluster_state.install_lifecycle_sender(lifecycle_tx);
         // Mirror `SecondaryCoordinator::new`'s registration: attach the
         // peer transport's write-through `RoleTable` cache to the
         // authoritative `cluster_state.role_table`. The hook fires on
@@ -681,6 +719,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         this.peer_transport
             .register_with_cluster_state(&mut this.cluster_state);
         this
+    }
+
+    /// Register a [`crate::peer_lifecycle::LifecycleListener`] to be
+    /// invoked off the apply path for every `PeerJoined`/`PeerRemoved`
+    /// state transition. Must be called BEFORE `run()` enters; calls
+    /// after `run()` has consumed the listener vector are dropped
+    /// silently (the field is `mem::take`-d into the dispatcher at
+    /// run start, and the dispatcher is the only reader).
+    ///
+    /// Single concern: own the registration surface; the dispatcher
+    /// task in `crate::peer_lifecycle::dispatcher` owns the
+    /// invocation semantics.
+    pub fn register_lifecycle_listener(
+        &mut self,
+        listener: Box<dyn crate::peer_lifecycle::LifecycleListener>,
+    ) {
+        self.peer_lifecycle_listeners.push(listener);
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers
@@ -908,6 +963,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `TaskAdded` (discovery succeeded) or `RunComplete` (no items
         // to discover) — see the `setup_pending` field doc.
         self.setup_pending = self.config.required_setup_on_promote;
+
+        // Spawn the peer-lifecycle dispatcher BEFORE any wire mutation
+        // can land. The (sender, receiver) pair was built in `new()`
+        // and the sender already installed on `cluster_state`; here
+        // we hand the receiver and the registered listeners to the
+        // dispatcher task. `spawn_local` matches the rest of the
+        // coordinator's LocalSet-bound spawn pattern. If the receiver
+        // has already been taken (defensive — `run()` is single-shot
+        // by contract; this branch covers a future caller that
+        // re-enters), the dispatcher is silently skipped.
+        if let Some(rx) = self.lifecycle_rx.take() {
+            let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
+            tokio::task::spawn_local(
+                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
+            );
+        }
 
         // Discover the phase set: union of (1) every phase referenced
         // by an item, (2) every phase mentioned as a key or parent in

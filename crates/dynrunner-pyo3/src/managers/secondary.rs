@@ -65,6 +65,14 @@ pub(crate) struct PySecondaryCoordinator {
     /// positional argument to `discover_items`. Originates from the
     /// `task_args` Python object passed into the constructor.
     task_args_py: Py<PyAny>,
+    /// Optional Python peer-lifecycle listener supplied at `__init__`.
+    /// `Some` iff the caller passed `peer_lifecycle_listener=<obj>`;
+    /// bridged through
+    /// `crate::peer_lifecycle_bridge::PyPeerLifecycleListener` and
+    /// registered on the inner `SecondaryCoordinator` at `run()`
+    /// start. Constructor-only — see the matching field on
+    /// `PyPrimaryCoordinator` for the rationale.
+    peer_lifecycle_listener: Option<Py<PyAny>>,
     completed: u32,
 }
 
@@ -87,6 +95,7 @@ impl PySecondaryCoordinator {
         src_network = None,
         src_tmp = None,
         max_resources = None,
+        peer_lifecycle_listener = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -105,6 +114,7 @@ impl PySecondaryCoordinator {
         src_network: Option<PathBuf>,
         src_tmp: Option<PathBuf>,
         max_resources: Option<PyResourceMap>,
+        peer_lifecycle_listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -167,6 +177,7 @@ impl PySecondaryCoordinator {
             // fresh `Python::attach` scope.
             task_definition_py: task_definition.clone().unbind(),
             task_args_py: task_args.clone().unbind(),
+            peer_lifecycle_listener,
             completed: 0,
         })
     }
@@ -230,6 +241,16 @@ impl PySecondaryCoordinator {
         let task_args_py = self.task_args_py.clone_ref(py);
         let phase_deps_for_ingest = self.phase_deps.clone();
         let setup_discover_root = self.src_network.clone();
+        // Take the Python peer-lifecycle listener (if any) out of
+        // `self` so it can move into the detached tokio runtime.
+        // Wrapped through `PyPeerLifecycleListener::new` into a
+        // `Box<dyn LifecycleListener>` at the boundary so the
+        // manager-distributed registration API stays
+        // PyO3-agnostic.
+        let peer_lifecycle_listener =
+            self.peer_lifecycle_listener
+                .take()
+                .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
         // Errors produced inside the async block — including
         // `task.discover_items` raising in setup-promote — must surface
@@ -428,6 +449,16 @@ impl PySecondaryCoordinator {
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );
+
+                // Register the Python peer-lifecycle listener (if any)
+                // BEFORE `run_until_setup_or_done` enters — the
+                // coordinator's `register_lifecycle_listener` contract
+                // requires pre-run registration because the listener
+                // vector is `mem::take`-d into the spawned dispatcher
+                // on first entry.
+                if let Some(listener) = peer_lifecycle_listener {
+                    secondary.register_lifecycle_listener(listener);
+                }
 
                 // Set peer cert info so the CertExchange message
                 // includes our QUIC details. Both families are
