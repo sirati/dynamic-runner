@@ -964,6 +964,254 @@ async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete
     }).await;
 }
 
+/// Regression for the asm-tokenizer `--jobs 4` 20/0/0/0 dispatch bias.
+///
+/// Scenario: multi-secondary setup-promote on a real peer mesh,
+/// keepalive interval set to the production default (5s) so peers'
+/// `repoll_idle_workers` doesn't auto-retry inside the test's wall-
+/// clock budget.
+///
+/// Pre-fix shape of the race:
+///   1. Every secondary's process-tasks entry for-loop sends an
+///      initial `TaskRequest` for each idle worker. At that point
+///      `primary_link.current_primary() == None`, so requests route via
+///      `primary_transport.send` to the still-live demoted local.
+///   2. The demoted local skips local-assign (`!self.demoted` gate in
+///      `primary/task.rs::handle_task_request`) and tries to relay via
+///      `peer_transport.send(Address::Role(Primary), msg)`. The
+///      role-table cache is empty pre-PromotePrimary; the relay drops.
+///   3. `note_request_sent` already bumped each worker's backoff
+///      window. The next attempt only fires on `repoll_idle_workers`,
+///      called on the keepalive tick (5s).
+///   4. Meanwhile the chosen secondary's PromotePrimary lands; it
+///      runs discovery, hydrates `primary_pending`, and its own two
+///      workers self-assign synchronously in the entry for-loop.
+///      With FakeWorker (instant) the entire workload burns through
+///      before any peer's 5s repoll fires → peers' `local_tasks_run
+///      == 0` post-run, the promoted node ran every task.
+///
+/// Post-fix invariant: `on_primary_changed` (in the `PromotePrimary`
+/// arm of `dispatch.rs`) now calls `repoll_idle_workers` immediately
+/// after resetting backoff + installing the new routing target — every
+/// idle worker re-issues against the freshly-identified primary inside
+/// the same dispatch tick, no 5s wait. With 4 secondaries × 2 workers
+/// = 8 worker slots and 20 binaries, every secondary should run a
+/// non-zero share.
+///
+/// Test rig: identical to
+/// `setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete`
+/// but bumps `keepalive_interval` to 5s (production default) and
+/// `total` to 20 (matching the production recipe's binary count).
+/// Asserts every secondary's `local_tasks_run_for_test() > 0` AND
+/// the cluster as a whole completes (no hang).
+#[tokio::test(flavor = "current_thread")]
+async fn setup_promote_multi_secondary_distributes_to_idle_peers_on_promote() {
+    use crate::secondary::RunOutcome;
+    use dynrunner_transport_channel::{peer_mesh, ChannelPeerTransport};
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        const N_SECONDARIES: usize = 4;
+        let secondary_ids: Vec<String> =
+            (0..N_SECONDARIES).map(|i| format!("sec-{i}")).collect();
+
+        let mut peer_transports: Vec<ChannelPeerTransport<TestId>> =
+            peer_mesh(&secondary_ids);
+
+        // 20 binaries — matches the asm-tokenizer Tier-2 recipe's
+        // `--name-regex minigzipsh --platform x64 --compiler gcc`
+        // post-filter count exactly. Enough work that even
+        // FakeWorker instant-complete leaves plenty of dispatch
+        // opportunities for peers if their workers can re-poll.
+        let discovered: Vec<TaskInfo<TestId>> = (0..20)
+            .map(|i| make_binary(&format!("bin-{i}"), 50 + i * 5))
+            .collect();
+        let total = discovered.len();
+        let phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>
+            = HashMap::new();
+
+        let mut pri_to_sec_txs: HashMap<String, _> = HashMap::new();
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        // Per-secondary result: (secondary_id, completed_count,
+        // local_tasks_run). `local_tasks_run` is the assertion
+        // surface for this test.
+        let mut sec_handles: Vec<
+            tokio::task::JoinHandle<(String, usize, usize)>,
+        > = Vec::new();
+
+        for (idx, secondary_id) in secondary_ids.iter().enumerate() {
+            let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+            let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+            pri_to_sec_txs.insert(secondary_id.clone(), pri_to_sec_tx);
+
+            let tx = incoming_tx.clone();
+            tokio::task::spawn_local(async move {
+                let mut rx = sec_to_pri_rx;
+                while let Some(msg) = rx.recv().await {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let peer_transport = peer_transports.remove(0);
+            let discovered_local = discovered.clone();
+            let phase_deps_local = phase_deps.clone();
+            let secondary_id_local = secondary_id.clone();
+            let max_res = dynrunner_core::ResourceMap::from(
+                [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+            );
+
+            let handle = tokio::task::spawn_local(async move {
+                let transport = ChannelPrimaryTransportEnd {
+                    tx: sec_to_pri_tx,
+                    rx: pri_to_sec_rx,
+                };
+                let config = SecondaryConfig {
+                    secondary_id: secondary_id_local.clone(),
+                    num_workers: 2,
+                    max_resources: max_res,
+                    hostname: "test-host".into(),
+                    // Production-default keepalive: the 5s window that
+                    // makes the pre-fix bias visible. Tighter values
+                    // (50ms) would mask the bug because the periodic
+                    // repoll would catch up within the test's wall-
+                    // clock budget.
+                    keepalive_interval: Duration::from_secs(5),
+                    src_network: None,
+                    src_tmp: None,
+                    peer_timeout: Duration::from_secs(120),
+                    keepalive_miss_threshold: 3,
+                    retry_max_passes: 1,
+                    primary_link_failure_threshold: 5,
+                    primary_link_failure_window: Duration::from_secs(30),
+                    setup_deadline: Duration::from_secs(60),
+                    is_observer: false,
+                };
+                let mut secondary = SecondaryCoordinator::new(
+                    config,
+                    transport,
+                    peer_transport,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+                let mut factory = FakeWorkerFactory;
+                loop {
+                    match secondary.run_until_setup_or_done(&mut factory).await {
+                        Ok(RunOutcome::Done) => break,
+                        Ok(RunOutcome::SetupPending) => {
+                            secondary
+                                .ingest_setup_discovery(
+                                    discovered_local.clone(),
+                                    phase_deps_local.clone(),
+                                )
+                                .await
+                                .expect("ingest_setup_discovery succeeds");
+                        }
+                        Err(e) => panic!("sec-{idx}.run_until_setup_or_done: {e}"),
+                    }
+                }
+                (
+                    secondary_id_local,
+                    secondary.completed_count(),
+                    secondary.local_tasks_run_for_test(),
+                )
+            });
+            sec_handles.push(handle);
+        }
+        drop(incoming_tx);
+
+        let transport = ChannelSecondaryTransportEnd {
+            outgoing: pri_to_sec_txs,
+            incoming_rx,
+        };
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: N_SECONDARIES as u32,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: false,
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let (deps, ops, ope) = noop_phase_args();
+        // Generous timeout — 5s keepalive interval means the
+        // pre-fix path would only re-poll on the *next* tick after
+        // the role-table-empty drop; the test should still complete
+        // well under 30s post-fix because there's no need to wait
+        // for keepalive ticks at all.
+        let run_outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            primary.run(vec![], deps, ops, ope),
+        )
+        .await;
+
+        match run_outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("primary.run() failed: {e}"),
+            Err(_elapsed) => panic!(
+                "primary.run() did not return within 30s — \
+                 something other than the dispatch bias is wrong"
+            ),
+        }
+
+        assert!(
+            primary.cluster_state_for_test().run_complete(),
+            "cluster_state.run_complete() must be true"
+        );
+        let outcome = primary.outcome_summary();
+        assert_eq!(
+            outcome.succeeded, total,
+            "all {total} tasks must complete; got outcome={outcome:?}"
+        );
+
+        drop(primary);
+
+        // The load-bearing assertion: every secondary's OWN worker
+        // pool ran at least one task. Pre-fix the promoted secondary's
+        // pool consumed everything before peers got a second TaskRequest
+        // chance on the 5s keepalive; the 3 idle peers had
+        // `local_tasks_run == 0`.
+        let mut per_sec: Vec<(String, usize)> = Vec::new();
+        for handle in sec_handles {
+            let (sid, _cluster_seen, local_run) = handle.await.unwrap();
+            per_sec.push((sid, local_run));
+        }
+        let sum_local: usize = per_sec.iter().map(|(_, n)| *n).sum();
+        assert_eq!(
+            sum_local, total,
+            "sum of per-secondary local_tasks_run must equal total \
+             ({total}); got per_sec={per_sec:?}"
+        );
+        for (sid, local_run) in &per_sec {
+            assert!(
+                *local_run > 0,
+                "secondary {sid} ran zero tasks — peer-repoll-on-\
+                 PromotePrimary fix regressed; per-secondary \
+                 distribution = {per_sec:?}"
+            );
+        }
+    }).await;
+}
+
 /// Companion to `recoverable_failure_succeeds_on_retry_pass`: a task
 /// that fails Recoverably on EVERY attempt (main pass + every retry
 /// pass) ends up permanently in `primary_failed`, and the
