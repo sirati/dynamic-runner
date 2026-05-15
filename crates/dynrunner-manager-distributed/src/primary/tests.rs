@@ -393,6 +393,318 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
     }).await;
 }
 
+/// Regression for the asm-tokenizer LMU CIP Tier-3 2-of-235 hang.
+///
+/// Scenario (setup-promote + retry-success):
+///   - Local submitter is the demoted primary
+///     (`required_setup_on_promote = true`) — its `operational_loop`
+///     is gated off the counter-based exit by the `partial_view` guard
+///     and can ONLY exit via the authoritative
+///     `cluster_state.run_complete()` signal.
+///   - The promoted secondary discovers a small task graph including
+///     one binary that fails Recoverably on its first attempt and
+///     succeeds on its retry-pass redispatch.
+///   - All other binaries succeed on the first attempt.
+///
+/// Pre-fix shape of the bug:
+///   1. The CRDT `apply(TaskCompleted)` arm short-circuited to NoOp when
+///      the target hash was already in `TaskState::Failed { .. }`,
+///      leaving the retry-succeeded task stuck in the ledger as
+///      `Failed { Recoverable }`. `outcome_counts()` then reported
+///      `succeeded = N-1, fail_retry = 1` even though every task had
+///      ultimately succeeded.
+///   2. The promoted secondary's RunComplete-broadcast trigger required
+///      `primary_disconnected`, but the demoted local primary was
+///      sitting in operational_loop waiting for RunComplete and never
+///      disconnected first — circular wait, deadlock. The demoted's
+///      `run()` would hang for the SLURM job's full wall-clock budget
+///      (asm-tokenizer LMU saw the 1200s harness kill).
+///
+/// Post-fix invariants pinned here:
+///   (A) `cluster_state.outcome_counts().succeeded == total` —
+///       retry-success transitions Failed → Completed in the CRDT.
+///   (B) `cluster_state.outcome_counts().fail_retry == 0` — no task
+///       is stuck reporting as recoverable-failed after its retry
+///       succeeded.
+///   (C) `cluster_state.run_complete()` is set on the demoted primary
+///       — the natural-quiesce broadcast on the promoted secondary
+///       (independent of `primary_disconnected`) drove the demoted's
+///       exit cue.
+///   (D) `primary.run()` returns `Ok(())` within a bounded wait — no
+///       hang.
+///
+/// Test rig:
+///   - `required_setup_on_promote = true` so the demoted local sits in
+///     partial-view mode (`total_tasks = 0` until a `TaskAdded` arrives;
+///     counter exit gated by `partial_view`).
+///   - A driver task spawns the real secondary on a local-set task,
+///     calls `run_until_setup_or_done`, observes `SetupPending`, calls
+///     `ingest_setup_discovery` with three binaries (one of which is
+///     `flaky` — quota=1 on `FlakyWorkerFactory`), then re-enters
+///     `run_until_setup_or_done` until it returns `Done`. This mirrors
+///     the PyO3 secondary wrapper's contract.
+///   - Bounded `tokio::time::timeout` around `primary.run()` distinguishes
+///     "natural cue fired" from "fell back to transport-closed exit on
+///     timeout"; the test fails loudly on the latter.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_promote_run_with_retry_success_completes_via_runcomplete() {
+    use crate::secondary::RunOutcome;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+        );
+        // Quota=1 for "flaky": fail attempt 1 (Recoverable), succeed
+        // from attempt 2 onwards. The other two binaries have no quota
+        // entry → succeed on attempt 1.
+        let mut quotas = HashMap::new();
+        quotas.insert("/tmp/flaky".to_string(), 1u32);
+        let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
+
+        let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+        let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+
+        // Three binaries: discovered by the secondary inside its
+        // setup-promote yield. `make_binary` builds `/tmp/<name>`
+        // paths so the FlakyWorkerFactory's relative-path quota key
+        // matches.
+        let discovered = vec![
+            make_binary("ok-1", 50),
+            make_binary("flaky", 40),
+            make_binary("ok-2", 30),
+        ];
+        let total = discovered.len();
+        let phase_deps: HashMap<dynrunner_core::PhaseId, Vec<dynrunner_core::PhaseId>>
+            = HashMap::new();
+
+        // Drive the secondary: run_until_setup_or_done → on
+        // SetupPending, call ingest_setup_discovery with the three
+        // discovered binaries, then re-enter until Done. This mirrors
+        // the PyO3 secondary wrapper's two-call contract (the only
+        // production caller that drives setup-promote).
+        let discovered_for_secondary = discovered.clone();
+        let phase_deps_for_secondary = phase_deps.clone();
+        let sec_handle = tokio::task::spawn_local(async move {
+            let transport = ChannelPrimaryTransportEnd {
+                tx: sec_to_pri_tx,
+                rx: pri_to_sec_rx,
+            };
+            let config = SecondaryConfig {
+                secondary_id: "sec-0".into(),
+                num_workers: 2,
+                max_resources: max_res,
+                hostname: "test-host".into(),
+                // Tight keepalive so the natural-quiesce branch ticks
+                // promptly once primary_pending + primary_in_flight +
+                // active_tasks all drain — the assertion budget is 10s
+                // and we don't want CI flake from a slow heartbeat.
+                keepalive_interval: Duration::from_millis(50),
+                src_network: None,
+                src_tmp: None,
+                peer_timeout: Duration::from_secs(120),
+                keepalive_miss_threshold: 3,
+                retry_max_passes: 1,
+                primary_link_failure_threshold: 5,
+                primary_link_failure_window: Duration::from_secs(30),
+                setup_deadline: Duration::from_secs(60),
+                is_observer: false,
+            };
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                transport,
+                NoPeers,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = flaky;
+            loop {
+                match secondary.run_until_setup_or_done(&mut factory).await {
+                    Ok(RunOutcome::Done) => break,
+                    Ok(RunOutcome::SetupPending) => {
+                        secondary
+                            .ingest_setup_discovery(
+                                discovered_for_secondary.clone(),
+                                phase_deps_for_secondary.clone(),
+                            )
+                            .await
+                            .expect("ingest_setup_discovery succeeds");
+                        // Re-enter; the next iteration's
+                        // process_tasks sees setup_pending cleared and
+                        // the hydrated pool.
+                    }
+                    Err(e) => panic!("secondary.run_until_setup_or_done: {e}"),
+                }
+            }
+            (
+                secondary.completed_count(),
+                secondary.primary_failed_count_for_test(),
+                secondary.primary_retry_passes_used_for_test(),
+            )
+        });
+
+        // Wire the channel pair into the primary's transport.
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            // Pass binary paths through without hash-verifying against
+            // a staged source tree — the test fixtures don't materialise
+            // real files at `/tmp/<name>` and the resolver's existence
+            // check would drop the dispatch. The FlakyWorkerFactory
+            // doesn't read the file either, so passthrough is fine.
+            uses_file_based_items: false,
+            // Setup-promote mode: the LMU CIP path. Demoted local
+            // primary skips `seed_cluster_state` + `perform_initial_assignment`;
+            // total_tasks = 0 at run start; counter-based exit gated
+            // by `partial_view` (demoted && required_setup_on_promote).
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Setup-promote contract: primary.run() is called with an
+        // EMPTY binaries vector (the submitter has no local view of
+        // the corpus — `--source-already-staged` mode). The promoted
+        // secondary owns discovery + ledger seed via
+        // `ingest_setup_discovery`, driven from the spawn_local task
+        // above.
+        let (deps, ops, ope) = noop_phase_args();
+        let run_outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            primary.run(vec![], deps, ops, ope),
+        )
+        .await;
+
+        match run_outcome {
+            Ok(Ok(())) => {
+                // Invariant (D): clean Ok return. Distinguishes from
+                // (a) the pre-Fix-A NoOp on Failed → Completed which
+                // would have left cluster_state stuck reporting one
+                // task as fail_retry indefinitely, and (b) the pre-
+                // Fix-B circular-wait deadlock where the demoted
+                // primary's `cluster_state.run_complete()` exit cue
+                // never fired because the promoted secondary's
+                // RunComplete broadcast required `primary_disconnected`.
+            }
+            Ok(Err(e)) => panic!(
+                "primary.run() returned an error on a clean setup-promote \
+                 retry-success scenario: {e}"
+            ),
+            Err(_elapsed) => panic!(
+                "primary.run() did not return within 10s — pre-fix \
+                 deadlock regression. The demoted local primary's \
+                 partial-view operational_loop is waiting for \
+                 RunComplete, but the promoted secondary never \
+                 broadcast it because its RunComplete trigger was \
+                 gated on `primary_disconnected` (which the demoted \
+                 local never satisfied since it's stuck waiting for \
+                 RunComplete)."
+            ),
+        }
+
+        let outcome = primary.outcome_summary();
+        let cluster_state_counts = primary.cluster_state_counts_for_test();
+
+        // Invariant (A): every binary, including the retry-succeeded
+        // `flaky`, lands in the `succeeded` partition. Pre-Fix-A the
+        // CRDT NoOp on Failed → Completed left `flaky` stuck as
+        // `Failed { Recoverable }` and `outcome.succeeded` plateaued
+        // at `total - 1`.
+        assert_eq!(
+            outcome.succeeded, total,
+            "outcome.succeeded must equal total ({total}) — retry-succeeded \
+             tasks must transition Failed → Completed in cluster_state \
+             (Fix A). Got outcome={outcome:?}, cluster_state_counts={cluster_state_counts:?}"
+        );
+
+        // Invariant (B): the retry-success has emptied the
+        // `fail_retry` partition. The same CRDT transition that
+        // populates `succeeded` correctly clears `fail_retry` — pre-
+        // fix this stayed pinned at 1 indefinitely.
+        assert_eq!(
+            outcome.fail_retry, 0,
+            "outcome.fail_retry must be 0 after every retry has either \
+             succeeded or exhausted budget — pre-fix CRDT left the \
+             retry-succeeded task stuck as Failed{{Recoverable}}. \
+             Got outcome={outcome:?}"
+        );
+        assert_eq!(outcome.fail_oom, 0, "no OOM failures in this scenario");
+        assert_eq!(outcome.fail_final, 0, "no permanent failures in this scenario");
+
+        // Invariant (C): RunComplete actually fired on the demoted
+        // local's mirror. Pre-Fix-B the demoted local sat in
+        // operational_loop waiting for `cluster_state.run_complete()`,
+        // which only flips on a received `ClusterMutation::RunComplete`;
+        // the promoted secondary's broadcast was gated on
+        // `primary_disconnected` and never fired in the alive-demoted
+        // scenario.
+        assert!(
+            primary.cluster_state_for_test().run_complete(),
+            "cluster_state.run_complete() must be true after primary.run() \
+             returns — the promoted secondary's natural-quiesce branch \
+             must have broadcast ClusterMutation::RunComplete (Fix B). \
+             Pre-fix this stayed false and primary.run() would only \
+             return via the 10s timeout fallback (caught above)."
+        );
+
+        // Stranded must be zero: every task reached a terminal state.
+        assert_eq!(
+            primary.stranded_count(), 0,
+            "no task should be stranded on a clean retry-success run"
+        );
+
+        drop(primary);
+
+        let (completed, failed_residual, passes_used) =
+            sec_handle.await.unwrap();
+        assert_eq!(
+            completed, total,
+            "secondary's `completed_tasks` (the per-hash terminal set) \
+             must cover every binary"
+        );
+        assert_eq!(
+            failed_residual, 0,
+            "primary_failed should be empty after retry-success"
+        );
+        assert_eq!(
+            passes_used, 1,
+            "exactly one retry pass should have been consumed"
+        );
+    }).await;
+}
+
 /// Companion to `recoverable_failure_succeeds_on_retry_pass`: a task
 /// that fails Recoverably on EVERY attempt (main pass + every retry
 /// pass) ends up permanently in `primary_failed`, and the

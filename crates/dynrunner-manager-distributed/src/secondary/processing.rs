@@ -394,6 +394,109 @@ where
                 // flag is set locally.
             }
 
+            // Promoted-secondary RunComplete broadcast on natural
+            // quiesce — alive-demoted-primary path (asm-tokenizer LMU
+            // 2-of-235 retry hang). Distinct from the
+            // `primary_disconnected`-gated branch above: that branch is
+            // the dead-demoted backup (the demoted exited before all
+            // outcomes were accounted, so the local cluster_state
+            // mirror can never converge via loopback). This branch is
+            // the alive-demoted path: the loopback round-trip is
+            // expected to complete, so we WAIT for the local
+            // `cluster_state` mirror to converge (every task terminal
+            // in the ledger) before declaring run-done.
+            //
+            // Why this branch is needed at all: with
+            // `required_setup_on_promote = true` the demoted local
+            // primary's operational loop is gated off the counter exit
+            // (`partial_view` guard in `lifecycle.rs`) and can only
+            // exit via the authoritative `cluster_state.run_complete()`
+            // signal. The pre-fix code only originated `RunComplete`
+            // when the demoted disconnected first; the demoted, in
+            // turn, only disconnected after its operational loop
+            // exited — circular wait, deadlock. Originating
+            // `RunComplete` on natural quiesce breaks the cycle
+            // without depending on the demoted exiting first.
+            //
+            // Two-level gate to suppress spurious fires:
+            //
+            //   (a) Local-pool drained — primary_pending empty,
+            //       primary_in_flight empty, own active_tasks empty,
+            //       and either no Recoverable failures pending OR
+            //       retry budget exhausted. Necessary because a
+            //       retry-in-progress task transiently appears in
+            //       cluster_state as `Failed { Recoverable }`
+            //       (terminal-looking) while a worker is actively
+            //       running it; without the local-pool guard, the
+            //       cluster_state's terminal partition would fire the
+            //       branch mid-retry.
+            //
+            //   (b) cluster_state converged — every ledger entry is in
+            //       a terminal state (Completed or Failed). Necessary
+            //       because the promoted secondary itself doesn't
+            //       originate `ClusterMutation::TaskCompleted` —
+            //       it forwards `DistributedMessage::TaskComplete` to
+            //       the demoted-local primary, which applies +
+            //       broadcasts, and the loopback round-trip updates
+            //       this node's mirror. The local-pool empties one
+            //       round-trip BEFORE the broadcast arrives back, so
+            //       without (b) the branch fires before the
+            //       cross-node convergence is observable and the
+            //       cluster_state mirrors on OTHER nodes (which
+            //       observe RunComplete strictly after the inbound
+            //       roundtrip on this node) skip the last
+            //       TaskCompleted, leaving them with inflated
+            //       Pending / InFlight counts. (Concrete regression:
+            //       `cluster_state_converges_on_primary_and_secondary`
+            //       failed without this gate at sec_counts.completed
+            //       = 2/5 because the natural-quiesce branch was
+            //       firing on the last worker's local completion
+            //       BEFORE the inbound loopback for the previous 3
+            //       tasks had arrived.)
+            //
+            // Both gates use the cluster_state's own counts; reading
+            // through that single source keeps the predicate stable
+            // under arbitrary task-graph shapes (no hard-coded total
+            // — `task_count` is the CRDT-authoritative size of the
+            // ledger).
+            let cluster_counts = self.cluster_state.counts();
+            let cluster_quiesced = self.cluster_state.task_count() > 0
+                && cluster_counts.pending == 0
+                && cluster_counts.in_flight == 0;
+            if self.is_primary
+                && !self.primary_disconnected
+                && self.primary_in_flight.is_empty()
+                && self.active_tasks.is_empty()
+                && self.primary_pending_is_empty()
+                && (self.primary_failed.is_empty()
+                    || !self.primary_retry_budget.should_retry())
+                && cluster_quiesced
+                && !self.cluster_state.run_complete()
+            {
+                tracing::info!(
+                    completed = cluster_counts.completed,
+                    failed = cluster_counts.failed,
+                    "promoted primary observed cluster quiesce with alive \
+                     demoted primary; broadcasting RunComplete so the \
+                     demoted operational loop can exit"
+                );
+                self.cluster_state.apply(ClusterMutation::RunComplete);
+                let msg = DistributedMessage::ClusterMutation {
+                    sender_id: self.config.secondary_id.clone(),
+                    timestamp: timestamp_now(),
+                    mutations: vec![ClusterMutation::RunComplete],
+                };
+                // Fan out symmetric to the dead-demoted branch above:
+                // the loopback delivers to the alive demoted submitter
+                // (which is gated off its counter exit by the
+                // `partial_view` guard and waiting on this very
+                // signal); the peer broadcast covers any observers /
+                // other secondaries on the mesh. Errors swallowed for
+                // the same idempotency rationale.
+                let _ = self.primary_transport.send(msg.clone()).await;
+                let _ = self.peer_transport.broadcast(msg).await;
+            }
+
             // Run-complete exit: the primary broadcast
             // `ClusterMutation::RunComplete` just before returning
             // from its `run()` (see primary/mod.rs). Once that flag
