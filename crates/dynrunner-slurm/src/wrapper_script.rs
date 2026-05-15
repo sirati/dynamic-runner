@@ -661,7 +661,7 @@ if [ -n "${{SLURM_JOB_ID:-}}" ] \
 
         # Container already gone — workload finished, nothing
         # to do.
-        if ! podman --root "$storage" --runroot "$runroot" container exists "$cname" 2>/dev/null; then
+        if ! podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs container exists "$cname" 2>/dev/null; then
             exit 0
         fi
 
@@ -672,7 +672,7 @@ if [ -n "${{SLURM_JOB_ID:-}}" ] \
         # the container; the watchdog never issues `podman rm`.
         grace_seconds=60
         echo "WATCHDOG: job $job_id state=$last_state; sending SIGTERM to container $cname (${{grace_seconds}}s grace before SIGKILL)" >&3 2>/dev/null || true
-        podman --root "$storage" --runroot "$runroot" kill --signal TERM "$cname" 2>/dev/null
+        podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs kill --signal TERM "$cname" 2>/dev/null
 
         # Phase 3: wait up to grace_seconds for graceful exit.
         # Poll once a second so we exit promptly when the
@@ -683,7 +683,7 @@ if [ -n "${{SLURM_JOB_ID:-}}" ] \
         while [ "$elapsed" -lt "$grace_seconds" ]; do
             sleep 1
             elapsed=$((elapsed + 1))
-            if ! podman --root "$storage" --runroot "$runroot" container exists "$cname" 2>/dev/null; then
+            if ! podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs container exists "$cname" 2>/dev/null; then
                 echo "WATCHDOG: container $cname exited gracefully after ${{elapsed}}s" >&3 2>/dev/null || true
                 exit 0
             fi
@@ -698,7 +698,7 @@ if [ -n "${{SLURM_JOB_ID:-}}" ] \
         # (Comments here must avoid ASCII apostrophes because this
         # whole block runs inside a bash -c single-quoted string.)
         echo "WATCHDOG: container $cname did not exit within ${{grace_seconds}}s of SIGTERM; force-killing (SIGKILL)" >&3 2>/dev/null || true
-        podman --root "$storage" --runroot "$runroot" kill --signal KILL "$cname" 2>/dev/null
+        podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs kill --signal KILL "$cname" 2>/dev/null
     ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
         </dev/null >/dev/null 2>&1
     echo "Spawned podman teardown watchdog (poll=5s debounce=2 grace=60s)"
@@ -806,7 +806,7 @@ echo ""
 # podman applies the LAST occurrence. NOTE: this cannot raise the
 # SLURM cgroup's pids.max — that's operator policy. Documented in
 # `docs/MIGRATION_2026_05_PYTHON_TO_RUST.md`.
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm \
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupfs run --rm \
     --name "$CONTAINER_NAME" \
     --pull=never \
     --network host \
@@ -947,11 +947,11 @@ echo "Loading image..."
 echo ""
 
 echo "Verifying image is loaded..."
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" images | grep {image_name} || echo "WARNING: Image not found in listing"
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupfs images | grep {image_name} || echo "WARNING: Image not found in listing"
 echo ""
 
 echo "Testing secondary entrypoint ({container_command} --help)..."
-podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" run --rm {image_ref} {container_command} --help | head -5
+podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupfs run --rm {image_ref} {container_command} --help | head -5
 echo ""
 
 echo "=================================================="
@@ -1042,7 +1042,7 @@ mod tests {
             image_name: "test-app",
             image_tag: "latest",
             image_tar_basename: "test-app.tar",
-            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
             container_command: "dynamic_batch_tokenizer",
             cores_spec: "0",
             max_memory_spec: "-2G",
@@ -1378,7 +1378,7 @@ mod tests {
             image_name: "test-app",
             image_tag: "latest",
             image_tar_basename: "test-app.tar",
-            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
             container_command: "my_runner",
             cores_spec: "0",
             max_memory_spec: "-2G",
@@ -1432,7 +1432,7 @@ mod tests {
             image_name: "test-app",
             image_tag: "latest",
             image_tar_basename: "test-app.tar",
-            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
             container_command: "my_runner",
             cores_spec: "0",
             max_memory_spec: "-2G",
@@ -1739,7 +1739,7 @@ mod tests {
             image_name: "test-app",
             image_tag: "latest",
             image_tar_basename: "test-app.tar",
-            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
             container_command: "my_runner",
         });
 
@@ -1857,7 +1857,7 @@ mod tests {
             image_name: "test-app",
             image_tag: "latest",
             image_tar_basename: "test-app.tar",
-            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" load < \"$LOCAL_IMAGE\"",
+            load_command: "podman --root \"$PODMAN_STORAGE\" --runroot \"$PODMAN_RUN\" --cgroup-manager=cgroupfs load < \"$LOCAL_IMAGE\"",
             container_command: "my_runner",
         }
     }
