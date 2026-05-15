@@ -374,6 +374,7 @@ dependencies = [
  "dynrunner-transport-quic",
  "dynrunner-transport-socket",
  "dynrunner-transport-tunnel",
+ "nix",
  "pyo3",
  "serde",
  "serde_json",
