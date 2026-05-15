@@ -2,7 +2,11 @@
 //!
 //! Wraps a `SlurmJobManager<PyGatewayAdapter>` so the Python thin
 //! shim (`dynamic_runner.packaging.job_manager.SlurmJobManager`) can
-//! delegate the directory-prep / cancel / status primitives to Rust.
+//! delegate every SLURM lifecycle primitive — directory prep, job
+//! submit, per-job cancel, cancel-all, status query, tracked-job-id
+//! list — to Rust. After this binding only Python-bridge concerns
+//! remain in the shim (run_log_dir default-arg, tilde expansion via
+//! the Python gateway's `remote_home`).
 //!
 //! The Python `slurm_config` is a different shape from the Rust
 //! `SlurmConfig` (see `python/dynamic_runner/packaging/slurm_config.py`
@@ -161,10 +165,11 @@ fn slurm_err_to_py(e: dynrunner_slurm::SlurmError) -> PyErr {
 /// `Arc<tokio::sync::Mutex<...>>`. Two distinct properties matter:
 ///
 /// 1. **Interior mutability via `&self`**: cancel- and status-query
-///    methods take `&self` at the trait level, but submit-style
-///    methods (when they migrate from the Python shim in a follow-up
-///    unit) need `&mut self`. The mutex smooths that over without
-///    requiring PyO3-level `&mut self` on the wrapper.
+///    methods take `&self` at the trait level, while `submit_job` and
+///    `cancel_all_jobs` take `&mut self` to mutate the tracked
+///    `job_ids` vector. PyO3 exposes a single `&self` surface; the
+///    mutex smooths the two trait-level shapes into one wrapper API
+///    without requiring PyO3-level `&mut self`.
 /// 2. **Async-safe locking**: every `SlurmJobManager` method we call
 ///    is `async` and the guard is held for the duration of the call,
 ///    i.e. across `.await` points. `std::sync::Mutex` is wrong here:
@@ -180,7 +185,9 @@ fn slurm_err_to_py(e: dynrunner_slurm::SlurmError) -> PyErr {
 /// The constructor accepts `packaging_method` and `deployment` to
 /// preserve the Python-side `SlurmJobManager.__init__` signature,
 /// but doesn't retain them — the Python thin shim still owns those
-/// references directly for the methods that haven't migrated yet.
+/// references directly for the non-lifecycle methods (wrapper-script
+/// generation, image transfer, source-binary upload) that have yet
+/// to migrate.
 #[pyclass(name = "RustSlurmJobManager")]
 pub(crate) struct PyRustSlurmJobManager {
     inner: Arc<Mutex<SlurmJobManager<PyGatewayAdapter>>>,
