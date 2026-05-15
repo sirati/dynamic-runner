@@ -1,8 +1,10 @@
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use tokio::task::JoinSet;
 
 use dynrunner_core::{resolve_against_root, ErrorType, TaskInfo, Identifier, PhaseId, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
@@ -14,6 +16,8 @@ use dynrunner_scheduler_api::{
 use tokio::sync::mpsc as tokio_mpsc;
 
 pub use command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
+
+use respawn::{RespawnEvent, RespawnOutcome};
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
@@ -673,29 +677,30 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// Monotonic identity allocator for newly spawned secondaries.
     /// Initialised to `config.num_secondaries` so the IDs the
     /// preparation phase already minted (`secondary-0..secondary-N-1`)
-    /// are reserved; the first respawn returns `secondary-N`.
-    ///
-    /// Single concern: hand out a never-before-used secondary id.
-    /// Dead secondaries stay dead in the CRDT — IDs are never reused,
-    /// so this counter only ever advances. Mutated exclusively from
-    /// the operational loop via [`Self::mint_secondary_id`]; callers
-    /// must NOT mint from spawned tasks (would race on the `&mut`
-    /// path; the operational loop is the single writer).
+    /// are reserved; the first respawn returns `secondary-N`. Mutated
+    /// exclusively from the operational loop via
+    /// [`Self::mint_secondary_id`].
     pub(super) next_secondary_id: u32,
 
     /// Optional opaque handle to the deployment-mode job manager
     /// (today: `Arc<Mutex<SlurmJobManager<…>>>` parked here by the
-    /// SLURM PyO3 pipeline). `None` for the in-process / local-channel
-    /// pipelines that don't have a backing batch system.
-    ///
-    /// Stored as `Arc<dyn Any + Send + Sync>` so the `manager-distributed`
-    /// crate stays decoupled from `dynrunner-slurm` (and any future
-    /// alternative deployment mode); the SLURM-aware respawn caller
-    /// downcasts back to the concrete type at the call site. Setter
-    /// is callable AFTER the preparation phase returns but BEFORE
-    /// `run()` enters — the respawn path reads the field from inside
-    /// the operational loop.
+    /// SLURM PyO3 pipeline). Stored as `Arc<dyn Any + Send + Sync>`
+    /// so `manager-distributed` stays decoupled from `dynrunner-slurm`;
+    /// the respawn caller downcasts at the call site. Setter is
+    /// callable after preparation but before `run()` enters.
     pub(super) slurm_job_manager: Option<Arc<dyn Any + Send + Sync>>,
+
+    /// In-flight respawn tasks. The operational `select!` loop drains
+    /// finished tasks here to apply each [`respawn::RespawnOutcome`].
+    /// Not cloned, snapshotted, or restored — fresh coordinators
+    /// start with an empty `JoinSet`.
+    pub(super) respawn_tasks: JoinSet<RespawnOutcome>,
+
+    /// FIFO ring of completed-or-attempted respawn events, capped at
+    /// [`respawn::RESPAWN_EVENTS_CAP`] entries (oldest dropped on
+    /// overflow). For operator forensics and per-secondary cap
+    /// consultation. Not cloned, snapshotted, or restored.
+    pub(super) respawn_events: VecDeque<RespawnEvent>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -769,6 +774,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             fulfillability_matcher: None,
             next_secondary_id,
             slurm_job_manager: None,
+            respawn_tasks: JoinSet::new(),
+            respawn_events: VecDeque::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -1464,6 +1471,7 @@ mod fulfillability_matcher;
 mod heartbeat;
 mod lifecycle;
 mod peer_setup;
+pub mod respawn;
 pub mod staging;
 mod task;
 pub mod wire;

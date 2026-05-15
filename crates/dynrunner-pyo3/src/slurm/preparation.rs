@@ -255,7 +255,7 @@ impl PySlurmPreparation {
     /// pipeline orchestration).
     fn secondary_port_map(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
-        for (k, v) in self.inner.secondary_port_map() {
+        for (k, v) in self.inner.secondary_port_map().iter() {
             dict.set_item(k, v)?;
         }
         Ok(dict.into())

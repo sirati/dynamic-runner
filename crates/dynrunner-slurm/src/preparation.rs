@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use dynrunner_gateway::shell::shell_join;
 use tokio::process::{Child, Command};
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
 
@@ -230,16 +231,42 @@ pub struct SlurmPreparation {
     ssh_tunnels: Arc<Mutex<Vec<Child>>>,
     /// secondary_id -> tunnel_port discovered from the info file.
     /// Populated as watchers complete; preserved across cleanup so
-    /// the caller can still inspect the map after teardown.
-    secondary_port_map: HashMap<String, u16>,
+    /// the caller can still inspect the map after teardown. Wrapped
+    /// in `Arc<StdMutex<_>>` so per-tunnel watcher tasks (spawned as
+    /// `'static` futures) can clone-and-share the same map, and so
+    /// `establish_one_tunnel` can run under `&self` and still record
+    /// its outcome — the alternative (`&mut self`) would forbid
+    /// concurrent respawn callers from sharing the same manager.
+    /// `std::sync::Mutex` (not the tokio variant) because the lock
+    /// is never held across an await point.
+    secondary_port_map: Arc<StdMutex<HashMap<String, u16>>>,
+    /// Shared establishment-phase permit pool. Bounds the number of
+    /// in-flight `ssh -N -R` handshakes across all paths that establish
+    /// tunnels on this instance — the initial `setup_ssh_tunnels`
+    /// loop AND any later `establish_one_tunnel` respawn calls. Built
+    /// once at `new()` from `opts.establishment.max_concurrent` so the
+    /// rate cap is a per-manager invariant, not a per-call accident.
+    /// See `EstablishmentPolicy` for why the cap exists (LMU gateway
+    /// load-balancer `MaxStartups` random-drop).
+    establish_pool: Arc<Semaphore>,
+    /// The primary's QUIC port — destination of every reverse tunnel.
+    /// Captured at `setup_ssh_tunnels` entry so per-secondary respawn
+    /// callers (`establish_one_tunnel`) can build the same `-R` mapping
+    /// without re-threading the value through their call site. `None`
+    /// until the first `setup_ssh_tunnels` call records it.
+    primary_quic_port: StdMutex<Option<u16>>,
 }
 
 impl SlurmPreparation {
     pub fn new(opts: PreparationOptions) -> Self {
+        let establish_pool =
+            Arc::new(Semaphore::new(opts.establishment.max_concurrent.max(1)));
         Self {
             opts,
             ssh_tunnels: Arc::new(Mutex::new(Vec::new())),
-            secondary_port_map: HashMap::new(),
+            secondary_port_map: Arc::new(StdMutex::new(HashMap::new())),
+            establish_pool,
+            primary_quic_port: StdMutex::new(None),
         }
     }
 
@@ -247,8 +274,15 @@ impl SlurmPreparation {
         &self.opts
     }
 
-    pub fn secondary_port_map(&self) -> &HashMap<String, u16> {
-        &self.secondary_port_map
+    /// Snapshot of the `secondary_id -> tunnel_port` map. Cloned under
+    /// the mutex; the returned `HashMap` is independent of any
+    /// subsequent mutations. Synchronous because the underlying
+    /// `StdMutex` is never held across an await point.
+    pub fn secondary_port_map(&self) -> HashMap<String, u16> {
+        self.secondary_port_map
+            .lock()
+            .expect("secondary_port_map mutex poisoned")
+            .clone()
     }
 
     /// Spawn one watcher per secondary, gather results under a single
@@ -269,47 +303,72 @@ impl SlurmPreparation {
             "setting up SSH reverse tunnels for {num_secondaries} secondaries"
         );
 
-        let connection_info_dir = format!("{}/connection_info", self.opts.run_log_dir);
-
-        // Shared establishment-phase permit pool. Bounds the number
-        // of in-flight `ssh -N -R` handshakes across all watchers in
-        // this `setup_ssh_tunnels` call. Acquired inside `establish_tunnel`
-        // immediately before `Command::spawn`, released as soon as the
-        // 3s verify gate resolves — info-file polling is NOT permit-gated
-        // (it's I/O-bound on the gateway `cat`, not on the target sshd's
-        // MaxStartups budget). Without this cap, all N watchers race to
-        // spawn ssh in the same ~10ms window once their info files land,
-        // and OpenSSH's default `MaxStartups 10:30:100` random-drops
-        // handshakes above 10 in flight — manifesting as `Connection
-        // closed by <host> port 22, rc=255` on the load-balanced LMU
-        // gateway.
-        let establish_pool = Arc::new(Semaphore::new(self.opts.establishment.max_concurrent.max(1)));
+        // Capture the primary's QUIC port for later per-secondary
+        // respawn calls (`establish_one_tunnel`) — they need the same
+        // `-R <tunnel>:localhost:<primary_quic>` mapping as the initial
+        // setup. Overwrites any prior value: in practice this is only
+        // called once per run, but a re-entry would be against the
+        // current QUIC port, not a stale one.
+        *self
+            .primary_quic_port
+            .lock()
+            .expect("primary_quic_port mutex poisoned") = Some(primary_quic_port);
 
         // Each watcher signals completion via its own oneshot. Using
         // `JoinSet` for spawn-local + abort-on-drop semantics: when
         // we return from this function (success OR timeout), JoinSet
         // is dropped and aborts any still-running watcher.
         let mut watchers: JoinSet<()> = JoinSet::new();
-        let mut receivers: Vec<oneshot::Receiver<Result<WatcherOutcome, PrepError>>> =
-            Vec::with_capacity(num_secondaries);
+        let mut receivers: Vec<
+            oneshot::Receiver<Result<(String, u16), PrepError>>,
+        > = Vec::with_capacity(num_secondaries);
 
         for i in 0..num_secondaries {
             let secondary_id = format!("secondary-{i}");
-            let info_path = format!("{connection_info_dir}/{secondary_id}.info");
             let (tx, rx) = oneshot::channel();
             receivers.push(rx);
 
-            let watcher = TunnelWatcher {
-                secondary_id: secondary_id.clone(),
-                info_path,
-                primary_quic_port,
-                opts: self.opts.clone(),
-                reader: reader.clone(),
-                tunnels: Arc::clone(&self.ssh_tunnels),
-                establish_pool: Arc::clone(&establish_pool),
-                done: tx,
-            };
-            watchers.spawn_local(watcher.run());
+            // `establish_one_tunnel` body, lifted into a `'static`
+            // future via Arc-cloned state. Same code path the public
+            // `establish_one_tunnel` method takes — see its doc for
+            // the per-tunnel contract.
+            let info_path = format!(
+                "{}/connection_info/{secondary_id}.info",
+                self.opts.run_log_dir
+            );
+            let opts = self.opts.clone();
+            let reader_clone = reader.clone();
+            let tunnels = Arc::clone(&self.ssh_tunnels);
+            let establish_pool = Arc::clone(&self.establish_pool);
+            // `Arc<StdMutex<...>>` field lets per-watcher tasks share
+            // the persistent port map without borrowing `self` (they
+            // live on the JoinSet past the borrow).
+            let port_map = Arc::clone(&self.secondary_port_map);
+            let id_for_task = secondary_id.clone();
+            watchers.spawn_local(async move {
+                let spawner = production_spawner(id_for_task.clone(), opts.clone(), primary_quic_port);
+                let res = establish_one_tunnel_inner(
+                    &id_for_task,
+                    &info_path,
+                    primary_quic_port,
+                    &opts,
+                    reader_clone,
+                    &tunnels,
+                    &port_map,
+                    &establish_pool,
+                    spawner,
+                )
+                .await;
+                let outcome = res.map(|port| (id_for_task.clone(), port));
+                // Send result. If receiver was dropped (coordinator timed
+                // out), the outcome is silently dropped. Children that
+                // passed verification are already in the shared `tunnels`
+                // Vec for cleanup(); children that didn't reach
+                // verification were owned locally inside
+                // establish_one_tunnel_inner and dropped there (SIGKILL
+                // via `kill_on_drop`).
+                let _ = tx.send(outcome);
+            });
         }
 
         // Outer deadline. `try_join_all`-style gather over the
@@ -318,7 +377,7 @@ impl SlurmPreparation {
             let mut out: HashMap<String, u16> = HashMap::new();
             for rx in receivers {
                 match rx.await {
-                    Ok(Ok(WatcherOutcome { secondary_id, tunnel_port })) => {
+                    Ok(Ok((secondary_id, tunnel_port))) => {
                         out.insert(secondary_id, tunnel_port);
                     }
                     Ok(Err(e)) => return Err(e),
@@ -349,12 +408,86 @@ impl SlurmPreparation {
 
         match &result {
             Ok(map) => {
-                self.secondary_port_map.extend(map.iter().map(|(k, v)| (k.clone(), *v)));
+                // Per-tunnel inner already wrote each (id, port) into
+                // the persistent port map under the StdMutex; nothing
+                // to extend here. The returned `map` is the per-call
+                // snapshot built from oneshot outcomes — by construction
+                // it equals what the inner wrote.
                 tracing::info!(num = map.len(), "all SSH tunnels established");
             }
             Err(e) => tracing::error!(error = %e, "ssh tunnel setup failed"),
         }
         result
+    }
+
+    /// Establish ONE reverse tunnel for a just-spawned secondary,
+    /// reusing the same `ssh_tunnels` Vec and rate-limiter pool that
+    /// the initial [`Self::setup_ssh_tunnels`] used. Intended for the
+    /// respawn path: a single compute node has just re-checked in via
+    /// its info file, and the framework needs its tunnel up without
+    /// re-running the whole N-secondary setup loop.
+    ///
+    /// Polls the info file with the configured `poll_interval`, spawns
+    /// `ssh -N -R`, verifies past the 3s alive-gate (with the
+    /// `EstablishmentPolicy` retry budget + rate-limiter applied), and
+    /// pushes the verified `Child` into the shared `ssh_tunnels` Vec.
+    /// On success, the discovered `tunnel_port` is recorded in
+    /// `secondary_port_map`.
+    ///
+    /// Precondition: [`Self::setup_ssh_tunnels`] must have been called
+    /// at least once on this instance — it captures the primary's QUIC
+    /// port, which this method reuses as the `-R` target. Calling
+    /// before initial setup returns [`PrepError::TunnelFailed`] with a
+    /// "primary QUIC port not yet known" message rather than panicking.
+    ///
+    /// Caller cleanup: same as `setup_ssh_tunnels` — children added
+    /// here are drained by [`Self::cleanup`] on teardown. There is no
+    /// dedicated outer timeout for this method; the per-tunnel
+    /// wall-clock cap in [`EstablishmentPolicy::per_tunnel_timeout`]
+    /// bounds the establishment phase, and the info-file poll loop
+    /// runs until success or caller-side abort (drop the future).
+    pub async fn establish_one_tunnel<R: InfoFileReader>(
+        &self,
+        secondary_id: &str,
+        reader: R,
+    ) -> Result<(), PrepError> {
+        let primary_quic_port = self
+            .primary_quic_port
+            .lock()
+            .expect("primary_quic_port mutex poisoned")
+            .ok_or_else(|| PrepError::TunnelFailed {
+                secondary_id: secondary_id.to_owned(),
+                rc: None,
+                stderr:
+                    "primary QUIC port not yet known — call setup_ssh_tunnels at least once first"
+                        .to_owned(),
+            })?;
+
+        let info_path = format!(
+            "{}/connection_info/{secondary_id}.info",
+            self.opts.run_log_dir
+        );
+
+        let opts = self.opts.clone();
+        let tunnels = Arc::clone(&self.ssh_tunnels);
+        let establish_pool = Arc::clone(&self.establish_pool);
+        let port_map = Arc::clone(&self.secondary_port_map);
+        let id_owned = secondary_id.to_owned();
+
+        let spawner = production_spawner(id_owned.clone(), opts.clone(), primary_quic_port);
+        let _port = establish_one_tunnel_inner(
+            &id_owned,
+            &info_path,
+            primary_quic_port,
+            &opts,
+            reader,
+            &tunnels,
+            &port_map,
+            &establish_pool,
+            spawner,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Terminate all tracked tunnel subprocesses. SIGTERM, 5s wait,
@@ -371,76 +504,56 @@ impl SlurmPreparation {
     }
 }
 
-/// Result a watcher reports on its oneshot channel. The spawned
-/// `Child` is owned locally by `drive_one_watcher` until it has
-/// passed the 3s "established" gate; only then is it pushed into
-/// the shared tunnels Vec for cleanup() to reap. If the watcher
-/// is aborted before verification completes, dropping the local
-/// `Child` SIGKILLs the ssh process via `kill_on_drop(true)`.
-struct WatcherOutcome {
-    secondary_id: String,
-    tunnel_port: u16,
-}
-
-struct TunnelWatcher<R: InfoFileReader> {
-    secondary_id: String,
-    info_path: String,
-    primary_quic_port: u16,
-    opts: PreparationOptions,
-    reader: R,
-    tunnels: Arc<Mutex<Vec<Child>>>,
-    /// Shared rate-limiter permit pool — see `setup_ssh_tunnels` for
-    /// why it exists. Cloned per-watcher; the establish helper
-    /// acquires/releases on each attempt.
-    establish_pool: Arc<Semaphore>,
-    done: oneshot::Sender<Result<WatcherOutcome, PrepError>>,
-}
-
-impl<R: InfoFileReader> TunnelWatcher<R> {
-    async fn run(self) {
-        let TunnelWatcher {
-            secondary_id,
-            info_path,
-            primary_quic_port,
-            opts,
-            reader,
-            tunnels,
-            establish_pool,
-            done,
-        } = self;
-
-        let result = drive_one_watcher(
-            &secondary_id,
-            &info_path,
-            primary_quic_port,
-            &opts,
-            reader,
-            &tunnels,
-            &establish_pool,
-        )
-        .await;
-        // Send result. If receiver was dropped (coordinator timed
-        // out), the outcome is silently dropped. Children that
-        // passed verification are already in the shared `tunnels`
-        // Vec for cleanup(); children that didn't reach
-        // verification were owned locally inside drive_one_watcher
-        // and dropped there (SIGKILL via `kill_on_drop`).
-        let _ = done.send(result);
-    }
-}
-
-async fn drive_one_watcher<R: InfoFileReader>(
+/// Per-tunnel work shared by `setup_ssh_tunnels` (run in parallel
+/// across N secondaries inside a JoinSet) and `establish_one_tunnel`
+/// (run once for a single respawn).
+///
+/// Single concern: take one secondary from "info file may or may not
+/// be there yet" to "verified ssh -R subprocess in the shared cleanup
+/// set, with `(id, port)` recorded in the shared port map". Returns
+/// the discovered `tunnel_port` on success.
+///
+/// Spawner DI: the `spawner` closure is parameterised over
+/// `(host: String, tunnel_port: u16) -> Future<Result<Child, PrepError>>`.
+/// Production callers pass a closure that builds the `ssh -N -R` argv
+/// and runs `Command::spawn`; tests pass a closure that returns a
+/// `/bin/sh` child with a configurable outcome, exercising the
+/// push-to-Vec / port-map / rate-limiter control flow without ever
+/// touching ssh. `String` (not `&str`) so the closure's returned
+/// future can own its inputs without borrow-lifetime contortions.
+///
+/// Cancel-safety: the `Command::spawn` inside the spawner sets
+/// `kill_on_drop(true)`, so an outer abort drops the in-progress Child
+/// and SIGKILL fires. The Semaphore permit acquired inside
+/// `establish_tunnel` is released on drop — no manual re-balance.
+//
+// `too_many_arguments` is intentional — this helper sits at the
+// crate-internal seam between the per-instance manager (which owns
+// the shared state) and the per-attempt policy engine. Bundling the
+// state into a struct would just shift the verbosity to the
+// call-site without changing the parameter count.
+#[allow(clippy::too_many_arguments)]
+async fn establish_one_tunnel_inner<R, F, Fut>(
     secondary_id: &str,
     info_path: &str,
     primary_quic_port: u16,
     opts: &PreparationOptions,
     reader: R,
     tunnels: &Arc<Mutex<Vec<Child>>>,
+    port_map: &Arc<StdMutex<HashMap<String, u16>>>,
     establish_pool: &Arc<Semaphore>,
-) -> Result<WatcherOutcome, PrepError> {
-    // Poll until the info file appears. The outer timeout guards
-    // total runtime; this loop has no inner deadline by design —
-    // the coordinator owns the deadline.
+    mut spawner: F,
+) -> Result<u16, PrepError>
+where
+    R: InfoFileReader,
+    F: FnMut(String, u16) -> Fut,
+    Fut: Future<Output = Result<Child, PrepError>>,
+{
+    // Poll until the info file appears. The outer timeout (when
+    // called from `setup_ssh_tunnels`) guards total runtime; this
+    // loop has no inner deadline by design — the coordinator owns
+    // the deadline. `establish_one_tunnel` callers control timeout
+    // by dropping the future.
     let (host, tunnel_port) = loop {
         let stdout = reader
             .read(info_path.to_owned())
@@ -481,24 +594,20 @@ async fn drive_one_watcher<R: InfoFileReader>(
         }
         tokio::time::sleep(opts.poll_interval).await;
     };
-
+    // `primary_quic_port` is captured by the production spawner
+    // closure (see `production_spawner`). For test stubs that don't
+    // touch ssh, it's passed in for parity but ignored.
+    let _ = primary_quic_port;
     // Delegate spawn + verify + rate-limit + retry to a single
     // helper that owns the establishment concern (see
     // `EstablishmentPolicy` doc-comment). Returns the verified Child
-    // already past the 3s alive-gate; the caller (this function) is
-    // responsible for moving it into the shared tunnels Vec for
-    // cleanup() to reap.
-    //
-    // Cancel-safety: the `Command::spawn` inside `spawn_reverse_tunnel`
-    // sets `kill_on_drop(true)`, so an outer-timeout abort drops the
-    // in-progress Child and SIGKILL fires. The acquired Semaphore
-    // permit is released on drop — no need to manually re-balance
-    // the pool on cancellation.
+    // already past the 3s alive-gate; this function then moves it
+    // into the shared tunnels Vec for cleanup() to reap.
     let child = establish_tunnel(
         secondary_id,
         &opts.establishment,
         establish_pool,
-        || spawn_reverse_tunnel(secondary_id, &host, tunnel_port, primary_quic_port, opts),
+        || spawner(host.clone(), tunnel_port),
     )
     .await?;
 
@@ -509,10 +618,14 @@ async fn drive_one_watcher<R: InfoFileReader>(
         guard.push(child);
     }
 
-    Ok(WatcherOutcome {
-        secondary_id: secondary_id.to_owned(),
-        tunnel_port,
-    })
+    // Record the discovered port in the persistent port map. Under
+    // a synchronous `StdMutex` — not held across any await.
+    port_map
+        .lock()
+        .expect("secondary_port_map mutex poisoned")
+        .insert(secondary_id.to_owned(), tunnel_port);
+
+    Ok(tunnel_port)
 }
 
 /// Establish a single SSH reverse tunnel: acquire a semaphore permit,
@@ -723,6 +836,34 @@ fn build_ssh_argv(
         "TCPKeepAlive=yes".into(),
     ]);
     argv
+}
+
+/// Build the production spawner closure passed into
+/// [`establish_one_tunnel_inner`]. Captures `(secondary_id, opts,
+/// primary_quic_port)` by move so the returned closure is `'static`
+/// and the futures it produces own their data — no borrow-lifetime
+/// gymnastics at the call site. Each invocation clones the captured
+/// state into the produced future (retry attempts get a fresh future
+/// each time).
+fn production_spawner(
+    secondary_id: String,
+    opts: PreparationOptions,
+    primary_quic_port: u16,
+) -> impl FnMut(String, u16) -> std::pin::Pin<Box<dyn Future<Output = Result<Child, PrepError>>>> {
+    move |host: String, tunnel_port: u16| {
+        let secondary_id = secondary_id.clone();
+        let opts = opts.clone();
+        Box::pin(async move {
+            spawn_reverse_tunnel(
+                &secondary_id,
+                &host,
+                tunnel_port,
+                primary_quic_port,
+                &opts,
+            )
+            .await
+        })
+    }
 }
 
 /// Spawn the ssh tunnel subprocess from `build_ssh_argv` output.
@@ -1515,5 +1656,208 @@ mod tests {
         assert_eq!(got.as_deref(), Some("tcp://h:1234\n"));
         let none = rt.block_on(reader.read(absent.display().to_string())).unwrap();
         assert!(none.is_none());
+    }
+
+    // ─── establish_one_tunnel coverage ────────────────────────────────
+    //
+    // These tests exercise `establish_one_tunnel_inner` directly with
+    // a stub spawner — same DI seam the `establish_tunnel_*` tests
+    // above use. The public `establish_one_tunnel` method is a thin
+    // glue layer that hard-codes `production_spawner` and reads
+    // `primary_quic_port` from `self`; everything load-bearing for the
+    // respawn contract (push-to-Vec, port-map write, rate-limiter
+    // sharing) lives in the inner.
+
+    /// Stubbed `InfoFileReader` returning a fixed URI immediately.
+    /// Lets the inner skip directly into the spawn+verify phase
+    /// without filesystem polling.
+    #[derive(Clone)]
+    struct CannedUriReader {
+        uri: String,
+    }
+
+    impl InfoFileReader for CannedUriReader {
+        fn read(
+            &self,
+            _path: String,
+        ) -> impl Future<Output = Result<Option<String>, PrepError>> + 'static {
+            let uri = self.uri.clone();
+            async move { Ok(Some(uri)) }
+        }
+    }
+
+    /// Push-to-Vec invariant: after `establish_one_tunnel_inner`
+    /// returns Ok, the verified `Child` must be in the shared
+    /// `ssh_tunnels` Vec and the port-map must carry the discovered
+    /// `(id, port)`. Pre-fix this was tangled through `drive_one_watcher`
+    /// + `setup_ssh_tunnels`'s post-gather extend; the refactor moves
+    /// it inside the inner so any single-tunnel caller observes the
+    /// same effect.
+    #[test]
+    fn establish_one_tunnel_pushes_child_handle() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        rt.block_on(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let opts = opts_for(&tmp);
+            let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+            let port_map: Arc<StdMutex<HashMap<String, u16>>> =
+                Arc::new(StdMutex::new(HashMap::new()));
+            let establish_pool = Arc::new(Semaphore::new(1));
+            let reader = CannedUriReader {
+                uri: "tcp://compute-77:54321".into(),
+            };
+            // Stub spawner: returns a long-lived `/bin/sh sleep` child
+            // that passes the 3s verify gate. The child is `kill_on_drop`
+            // so it's reaped when the test ends.
+            let port = establish_one_tunnel_inner(
+                "secondary-0",
+                "/unused/info_path",
+                /* primary_quic_port */ 51000,
+                &opts,
+                reader,
+                &tunnels,
+                &port_map,
+                &establish_pool,
+                |_host, _tunnel_port| async move { Ok(alive_child()) },
+            )
+            .await
+            .expect("establish_one_tunnel_inner must succeed");
+            // The discovered port came from the canned URI.
+            assert_eq!(port, 54321);
+            // Child landed in the shared cleanup Vec.
+            let guard = tunnels.lock().await;
+            assert_eq!(
+                guard.len(),
+                1,
+                "expected one Child in shared ssh_tunnels Vec, got {}",
+                guard.len()
+            );
+            drop(guard);
+            // Port map carries the (id, port) entry.
+            let m = port_map.lock().unwrap();
+            assert_eq!(m.get("secondary-0").copied(), Some(54321));
+        }));
+    }
+
+    /// Rate-limiter invariant: two concurrent `establish_one_tunnel_inner`
+    /// calls sharing the same `Semaphore` may have at most
+    /// `max_concurrent` spawner invocations in flight at any instant.
+    /// Mirrors `establish_tunnel_caps_in_flight_spawns_at_max_concurrent`
+    /// but goes through the inner helper so the rate cap is verified
+    /// at the per-secondary tunnel API surface, not just the policy
+    /// engine. Pinned at `MAX = 1` so the two callers must serialise.
+    #[test]
+    fn establish_one_tunnel_applies_rate_limiter() {
+        const N: usize = 2;
+        const MAX: usize = 1;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let peak: usize = rt.block_on(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let opts = opts_for(&tmp);
+            let tunnels: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
+            let port_map: Arc<StdMutex<HashMap<String, u16>>> =
+                Arc::new(StdMutex::new(HashMap::new()));
+            let establish_pool = Arc::new(Semaphore::new(MAX));
+            let in_flight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+
+            let mut set: JoinSet<Result<u16, PrepError>> = JoinSet::new();
+            for i in 0..N {
+                let opts = opts.clone();
+                let tunnels = Arc::clone(&tunnels);
+                let port_map = Arc::clone(&port_map);
+                let pool = Arc::clone(&establish_pool);
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak);
+                let id = format!("secondary-{i}");
+                let reader = CannedUriReader {
+                    uri: format!("tcp://compute-{i}:{}", 60000 + i),
+                };
+                set.spawn_local(async move {
+                    establish_one_tunnel_inner(
+                        &id,
+                        "/unused/info_path",
+                        51000,
+                        &opts,
+                        reader,
+                        &tunnels,
+                        &port_map,
+                        &pool,
+                        move |_host, _tunnel_port| {
+                            let in_flight = Arc::clone(&in_flight);
+                            let peak = Arc::clone(&peak);
+                            async move {
+                                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                                peak.fetch_max(now, Ordering::SeqCst);
+                                // Hold the permit window long enough
+                                // that a sibling spawn — if the cap
+                                // were broken — would overlap.
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                in_flight.fetch_sub(1, Ordering::SeqCst);
+                                Ok(alive_child())
+                            }
+                        },
+                    )
+                    .await
+                });
+            }
+            while let Some(joined) = set.join_next().await {
+                joined.expect("inner task join").expect("inner Ok");
+            }
+            peak.load(Ordering::SeqCst)
+        }));
+        assert!(
+            peak <= MAX,
+            "in-flight spawn count exceeded max_concurrent: peak={peak}, max={MAX}"
+        );
+        // Sanity: at least one spawner ran (proves the test actually
+        // exercised the spawn path, not a no-op).
+        assert!(peak >= 1, "expected at least one in-flight spawn, got 0");
+    }
+
+    /// Calling `establish_one_tunnel` on a fresh manager (before
+    /// `setup_ssh_tunnels` has stored the primary QUIC port) must
+    /// surface `TunnelFailed` rather than panicking on a missing
+    /// precondition. Documents the API contract pinned in the
+    /// doc-comment.
+    #[test]
+    fn establish_one_tunnel_errors_without_prior_setup() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let err: PrepError = rt.block_on(local.run_until(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let opts = opts_for(&tmp);
+            let prep = SlurmPreparation::new(opts);
+            prep.establish_one_tunnel(
+                "secondary-0",
+                CannedUriReader {
+                    uri: "tcp://h:1".into(),
+                },
+            )
+            .await
+            .expect_err("must fail without prior setup_ssh_tunnels")
+        }));
+        match err {
+            PrepError::TunnelFailed { secondary_id, stderr, .. } => {
+                assert_eq!(secondary_id, "secondary-0");
+                assert!(
+                    stderr.contains("primary QUIC port"),
+                    "expected precondition stderr, got {stderr:?}"
+                );
+            }
+            other => panic!("expected TunnelFailed, got {other}"),
+        }
     }
 }
