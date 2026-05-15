@@ -345,13 +345,13 @@ impl PyLocalManager {
                 outcome
             }));
 
-            // Clean up child processes
-            for child in &mut factory.child_processes {
-                if let Some(mut c) = child.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
+            // Tear down tracked worker subprocesses via the shared
+            // SIGTERM → grace → SIGKILL primitive. SIGKILL with no
+            // grace orphans podman-launched workers because podman
+            // traps SIGTERM to remove the container; SIGKILL skips
+            // that path. Per project rule "no special-casing", the
+            // teardown policy is uniform across worker kinds.
+            factory.cleanup_all();
             result
         });
 
