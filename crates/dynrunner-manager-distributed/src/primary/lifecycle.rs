@@ -204,18 +204,61 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // guarantees we only exit when every dispatched
             // assignment has been reconciled.
             let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            // `setup_pending` blocks this counter-based exit while a
-            // setup-promoted secondary hasn't yet broadcast its first
-            // `TaskAdded` (`total_tasks == 0` and no work has even
-            // been advertised yet, so `0 + 0 >= 0` would trip
-            // immediately). Cleared on the first `TaskAdded` (proves
-            // discovery seeded ≥1 task) or on `RunComplete` (proves
-            // the setup-secondary legitimately found zero items and
-            // finished cleanly) — see `mirror_mutation_to_accounting`
-            // and the `setup_pending` field doc on `PrimaryCoordinator`.
-            // Legacy bootstrap starts `setup_pending = false`, so this
-            // arm is a strict superset of the historical exit semantics.
-            if !self.setup_pending
+            // Counter-based exit. Gates:
+            //
+            //   (a) `!self.setup_pending` — the historical setup-defer
+            //       guard: in setup-promote mode (`required_setup_on_promote
+            //       = true`) the local enters the loop with `total_tasks
+            //       = 0` and the chosen secondary still owes its first
+            //       TaskAdded broadcast; without this gate `0+0 >= 0`
+            //       trips immediately. Cleared by the first TaskAdded
+            //       or RunComplete mirror — see
+            //       `mirror_mutation_to_accounting`.
+            //
+            //   (b) `!(self.demoted && self.config.required_setup_on_promote)`
+            //       — the LMU CIP partial-CRDT-view guard. The local
+            //       submitter is always `demoted = true` post-bootstrap
+            //       (`promote_primary` unconditionally hands off to the
+            //       first secondary, see `lifecycle.rs:981`), so the
+            //       demoted-flag alone cannot gate the counter exit
+            //       without breaking every normal run. The bug only
+            //       manifests when the demoted's view is also PARTIAL
+            //       — i.e. `required_setup_on_promote = true` so
+            //       `seed_cluster_state` never ran locally and the
+            //       local learns task counts only from out-of-order
+            //       TaskAdded broadcasts. In that regime
+            //       `total_tasks` and `completed_tasks.len()` can
+            //       transiently align (e.g. 50 TaskAddeds arrive,
+            //       then 50 TaskCompleteds arrive before the next
+            //       TaskAdded batch — `50 + 0 >= 50` trips while
+            //       185 items are still unaccounted-for upstream).
+            //       For these setup-promoted demoted primaries the
+            //       ONLY safe exit is `cluster_state.run_complete()`
+            //       (the authoritative primary's terminal broadcast).
+            //
+            //       Legacy bootstrap (`required_setup_on_promote =
+            //       false`) is unaffected: even when demoted, the
+            //       local's view was fully seeded by
+            //       `seed_cluster_state` before the operational loop
+            //       started, so `total_tasks = binaries.len()` is
+            //       set once at run start and never drifts under
+            //       partial CRDT updates. The counter exit is the
+            //       load-bearing happy-path exit for every legacy-
+            //       mode run; gating it on `!self.demoted` would
+            //       break every distributed run.
+            //
+            // Concrete bug this guard kills (asm-tokenizer LMU CIP
+            // `--jobs 15`, 50ms+ tunnel RTT, `--source-already-staged`):
+            // the setup-promoted secondary discovers 235 items,
+            // broadcasts batched TaskAdded + interleaved
+            // TaskCompleted; the demoted local's counter check
+            // momentarily aligns and the loop exits with `total=N,
+            // succeeded=N` before the upstream run is anywhere near
+            // done. The local dispatcher then chains to Phase 2 and
+            // tears down Phase 1's tunnels — killing Phase 1.
+            let partial_view = self.demoted && self.config.required_setup_on_promote;
+            if !partial_view
+                && !self.setup_pending
                 && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
                 && active_workers == 0
             {
@@ -230,16 +273,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // completion yet (mostly defensive — `on_item_finished`
             // runs synchronously off the wire message).
             //
-            // Gated on `!setup_pending` for the same reason as the
-            // counter-based exit above: in setup-promote mode the
-            // demoted submitter starts with an empty pool and (often)
-            // an empty phase_set — `is_run_complete()` would return
-            // true immediately, before the chosen secondary has had a
-            // chance to broadcast `TaskAdded` (which is mirrored only
-            // into `cluster_state`, not into this pool — the local
-            // pool stays empty on the demoted submitter). Cleared by
-            // the same mirror-path hooks as `setup_pending` itself.
-            if !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
+            // Same `partial_view` guard as the counter exit above:
+            // a setup-promoted demoted primary's pool is also a
+            // stale local view (the authoritative pool lives on the
+            // promoted secondary, and the local pool stays empty
+            // because TaskAdded mirrors into cluster_state, not into
+            // the local pool — only the live primary's pool ingests
+            // staged items). Legacy bootstrap's pool was seeded
+            // pre-loop and drains normally.
+            if !partial_view && !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
                 tracing::info!("pool drained and no active workers");
                 break;
             }
@@ -247,18 +289,30 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // Replicated-ledger run-complete signal. The promoted
             // primary broadcasts `ClusterMutation::RunComplete` as the
             // last act before its own `run()` returns; `handle_cluster_mutation`
-            // applies it to our `cluster_state` mirror. For the demoted
-            // local primary this is the load-bearing exit cue: the
-            // counter-based check above only trips when every per-task
-            // outcome reaches `completed_tasks` / `failed_tasks`, and
-            // post-promotion cross-secondary completions can miss that
-            // path entirely (the new primary's pool dispatched a
-            // task on a peer; the peer's TaskComplete reaches the new
-            // primary's pool, never the demoted primary's local
-            // accounting). Without this exit, the demoted primary's
-            // tokio runtime never decides "done" and the local-primary
-            // process sits forever — asm-dataset-nix R2 / T3 1200s
-            // hang. Sticky monotonic flag, so this fires at most once
+            // applies it to our `cluster_state` mirror.
+            //
+            // For a setup-promoted demoted primary (`partial_view`
+            // = true above) this is the SOLE exit cue — the local
+            // counter / pool views are partial and unreliable until
+            // RunComplete proves the authoritative primary has
+            // accounted for every task. RunComplete is causally
+            // ordered after every TaskCompleted / TaskFailed in the
+            // run, so by the time we apply it to our mirror those
+            // mutations have already updated `completed_tasks` /
+            // `failed_tasks` — the "primary finished succeeded=X
+            // fail_retry=X ..." log line at the demoted exit reflects
+            // the true final state.
+            //
+            // Legacy-bootstrap demoted primary: RunComplete is a
+            // redundant exit (the counter check above trips first,
+            // since the local was fully seeded by
+            // `seed_cluster_state` and TaskCompleteds from every
+            // peer's worker arrive on the legacy / peer transport
+            // before the promoted primary itself decides
+            // RunComplete). Keeping this arm unguarded is harmless
+            // and serves as a uniform fallback.
+            //
+            // Sticky monotonic flag, so this fires at most once
             // per run.
             if self.cluster_state.run_complete() && active_workers == 0 {
                 tracing::info!("RunComplete signal received from cluster; exiting");

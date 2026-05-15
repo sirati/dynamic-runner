@@ -4346,9 +4346,18 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         );
 
         // Mirror what `run()` would set up: empty pool, default phase
-        // tracked, no binaries, `total_tasks = 0`. demoted=true puts
-        // the loop in observer mode so the heartbeat tick doesn't
-        // race on dead-secondary detection in this synthetic state.
+        // tracked, no binaries, `total_tasks = 0`. demoted=false: this
+        // test pins the `setup_pending` gate on the !partial_view
+        // counter exit path. With `required_setup_on_promote = true
+        // && demoted = true` the `partial_view` gate
+        // (lifecycle.rs `let partial_view = self.demoted &&
+        // self.config.required_setup_on_promote`) would suppress
+        // the counter exit entirely, making the test hang — and
+        // the partial-view race is covered separately by
+        // `demoted_primary_ignores_partial_crdt_view_waits_for_run_complete`.
+        // `self.secondaries` is empty in this synthetic setup, so
+        // `process_heartbeat_tick` walks empty hashmaps and is a
+        // no-op even on the !demoted path; no race.
         let phase = dynrunner_core::PhaseId::from("default");
         let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
             [phase.clone()],
@@ -4359,7 +4368,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         primary.phase_completed.insert(phase.clone(), 0);
         primary.phase_failed.insert(phase, 0);
         primary.total_tasks = 0;
-        primary.demoted = true;
+        primary.demoted = false;
 
         // Pre-load the transport: a TaskAdded mutation followed by a
         // TaskCompleted for the same hash. The loop's first iteration
@@ -4553,6 +4562,256 @@ async fn legacy_bootstrap_counter_exit_unchanged() {
                  despite the counter check `2+0 >= 2 && active_workers == 0` \
                  being satisfied on the first iteration — regression on the \
                  historical exit semantics"
+            ),
+        }
+    }).await;
+}
+
+/// T3 — demoted-primary partial-CRDT-view race. The asm-tokenizer LMU
+/// CIP `--jobs 15` bug: the setup-promoted secondary discovers 235
+/// items and broadcasts a stream of TaskAdded + interleaved
+/// TaskCompleted mutations over the SSH-tunneled QUIC mesh. The demoted
+/// local primary's view evolves through partial states where
+/// `total_tasks` (refreshed from `cluster_state.task_count()` after
+/// each TaskAdded batch) and `completed_tasks.len()` BOTH advance — but
+/// briefly align (e.g. 50 Added arrive, then 50 Completed arrive
+/// before the next Added batch). At that instant `completed + failed
+/// >= total_tasks && active_workers == 0` is true, even though the
+/// authoritative primary is still mid-run with 185 unaccounted-for
+/// items.
+///
+/// Pre-fix: the counter-based exit at the top of `operational_loop`
+/// trips on that partial view, the demoted primary exits with `total=N
+/// succeeded=N`, and the local dispatcher reads that as run-done,
+/// chains to Phase 2, and tears down Phase 1's tunnels — killing the
+/// actively-running Phase 1 on the secondaries.
+///
+/// Post-fix: the counter-based exit (and the parallel pool-drained
+/// exit) is gated behind `!(self.demoted && self.config.required_setup_on_promote)`
+/// — the local view is treated as partial (and unreliable) whenever
+/// the demoted submitter never ran `seed_cluster_state`. In that
+/// regime the demoted-primary loop has exactly one exit cue:
+/// `cluster_state.run_complete() && active_workers == 0` — the
+/// authoritative "every task accounted for" assertion the new primary
+/// broadcasts as its last act. Legacy demoted primaries (the local
+/// always demotes post-PromotePrimary in every distributed run, see
+/// `lifecycle.rs::self.demoted = true`) keep the counter exit
+/// because their `total_tasks` was pre-seeded and is stable.
+///
+/// This test stages the partial-view race directly: TaskAdded for 2
+/// items, TaskCompleted for both. Pre-fix the loop exits immediately
+/// after the second TaskCompleted dispatches (`2+0 >= 2`). Post-fix
+/// the loop stays alive for the bounded poll window because no
+/// RunComplete has arrived. The second half then injects RunComplete
+/// to prove the loop CAN still exit when the authoritative signal
+/// lands — distinguishing "exit gate fixed" from "loop wedged".
+#[tokio::test(flavor = "current_thread")]
+async fn demoted_primary_ignores_partial_crdt_view_waits_for_run_complete() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+        let (_sec_id, _to_sec_rx, incoming_tx) =
+            secondary_ends.into_iter().next().unwrap();
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            // Setup-promote: this primary deferred discovery + ledger
+            // seed to the promoted secondary. `setup_pending` starts
+            // true; the first TaskAdded will clear it. Pre-fix that
+            // unblocked the counter exit — exactly the bug under test.
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let phase = dynrunner_core::PhaseId::from("default");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("default-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase.clone(), 0);
+        primary.phase_failed.insert(phase, 0);
+        primary.total_tasks = 0;
+        // Local submitter is already demoted (PromotePrimary broadcast
+        // happened during `complete_handshake_and_assignment` per
+        // `lifecycle.rs::self.demoted = true` post-PromotePrimary).
+        primary.demoted = true;
+
+        // Stage the partial-CRDT-view race: two TaskAdded then two
+        // TaskCompleted for the same hashes. Pre-fix progression:
+        //   iter 1: setup_pending=true → counter exit blocked. Recv
+        //           TaskAdded batch → mirror clears setup_pending,
+        //           cluster_state.task_count = 2, total_tasks = 2.
+        //   iter 2: counter check `0+0 >= 2` → false. Recv first
+        //           TaskCompleted → completed_tasks.len() = 1.
+        //   iter 3: counter check `1+0 >= 2` → false. Recv second
+        //           TaskCompleted → completed_tasks.len() = 2.
+        //   iter 4: counter check `2+0 >= 2 && active_workers == 0`
+        //           → **PRE-FIX EXITS HERE**. This is the asm-
+        //           tokenizer LMU bug.
+        //
+        // Post-fix iter 4: counter check is `partial_view`-gated
+        // (demoted=true && required_setup_on_promote=true → true)
+        // → never tested. cluster_state.run_complete() is still
+        // false (no RunComplete arrived yet). Loop stays alive.
+        let bin_a = make_binary("lmu-task-a", 100);
+        let hash_a = super::wire::compute_task_hash(&bin_a);
+        let bin_b = make_binary("lmu-task-b", 100);
+        let hash_b = super::wire::compute_task_hash(&bin_b);
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![
+                    ClusterMutation::<TestId>::TaskAdded {
+                        hash: hash_a.clone(),
+                        task: bin_a,
+                    },
+                    ClusterMutation::<TestId>::TaskAdded {
+                        hash: hash_b.clone(),
+                        task: bin_b,
+                    },
+                ],
+            })
+            .unwrap();
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
+                    hash: hash_a.clone(),
+                }],
+            })
+            .unwrap();
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
+                    hash: hash_b.clone(),
+                }],
+            })
+            .unwrap();
+
+        // Phase A: poll the loop for 1s and assert it does NOT exit.
+        // Pre-fix the loop would have exited within milliseconds of
+        // the second TaskCompleted being dispatched. Post-fix it must
+        // stay alive — no RunComplete has been broadcast yet, and the
+        // authoritative primary at the other end is still mid-run.
+        let phase_a = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            primary.operational_loop(),
+        )
+        .await;
+        match phase_a {
+            Ok(Ok(())) => panic!(
+                "demoted-primary operational_loop exited within 1s on \
+                 the partial-CRDT-view race (TaskAdded x2 + \
+                 TaskCompleted x2 with total_tasks refreshed to 2 \
+                 and completed_tasks.len() == 2). This is the \
+                 asm-tokenizer LMU CIP `--jobs 15` regression — the \
+                 counter-based exit must be `partial_view`-gated \
+                 (demoted && required_setup_on_promote)."
+            ),
+            Ok(Err(e)) => panic!(
+                "demoted-primary operational_loop returned Err in \
+                 partial-view scenario: {e}"
+            ),
+            Err(_) => {
+                // Timeout = loop still alive = correct.
+                // Pin the intermediate state: setup_pending cleared,
+                // total_tasks refreshed to 2, both tasks completed.
+                // If any of these don't hold, the test isn't actually
+                // exercising the racy state and the "didn't exit"
+                // result is meaningless.
+                assert!(
+                    !primary.setup_pending,
+                    "TaskAdded mirror must have cleared setup_pending; \
+                     if not, the loop stayed alive only because the \
+                     setup_pending gate was still active — not what \
+                     this test is pinning"
+                );
+                assert_eq!(
+                    primary.total_tasks, 2,
+                    "total_tasks must have refreshed from \
+                     cluster_state.task_count() = 2"
+                );
+                assert_eq!(
+                    primary.completed_tasks.len(),
+                    2,
+                    "both TaskCompleted mirrors must have landed; \
+                     completed.len() < 2 means the loop didn't \
+                     actually reach the racy state"
+                );
+                assert!(
+                    !primary.cluster_state_for_test().run_complete(),
+                    "cluster_state.run_complete() must still be false; \
+                     a stray RunComplete here would invalidate the \
+                     test premise"
+                );
+            }
+        }
+
+        // Phase B: inject RunComplete and assert the loop NOW exits
+        // promptly. Distinguishes "demoted exit gate fixed" (correct)
+        // from "loop wedged forever" (would also pass Phase A but for
+        // the wrong reason).
+        incoming_tx
+            .send(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::<TestId>::RunComplete],
+            })
+            .unwrap();
+        let _hold = incoming_tx;
+
+        let phase_b = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            primary.operational_loop(),
+        )
+        .await;
+        match phase_b {
+            Ok(Ok(())) => {
+                assert!(
+                    primary.cluster_state_for_test().run_complete(),
+                    "cluster_state.run_complete() must be set on \
+                     exit; otherwise the loop exited via the \
+                     transport-closed fallback (sender held open \
+                     above to prevent that path) or some other arm"
+                );
+            }
+            Ok(Err(e)) => panic!(
+                "demoted-primary operational_loop returned Err on \
+                 RunComplete: {e}"
+            ),
+            Err(_) => panic!(
+                "demoted-primary operational_loop did not exit within \
+                 5s after RunComplete was injected — the run_complete \
+                 exit arm is broken, or the new `partial_view` gate \
+                 also accidentally suppressed the run_complete exit"
             ),
         }
     }).await;
