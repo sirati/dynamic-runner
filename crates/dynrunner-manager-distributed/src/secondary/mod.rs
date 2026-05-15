@@ -247,6 +247,21 @@ where
     active_tasks: HashMap<String, WorkerId>,
     completed_tasks: HashSet<String>,
 
+    /// Test-only counter: number of `WorkerEvent::TaskCompleted` events
+    /// this secondary's OWN workers fired (i.e. tasks actually
+    /// dispatched to and executed by this node's worker pool). Distinct
+    /// from `completed_tasks` (which is the cluster-wide set of all
+    /// task hashes any secondary observed terminal). Pinned by the
+    /// peer-repoll-on-primary-changed regression test to assert
+    /// post-fix distribution across secondaries: pre-fix the promoted
+    /// secondary's pool burns through small workloads before any peer
+    /// re-polls (production keepalive default = 5s), so peer
+    /// `local_tasks_run` stays 0; post-fix every secondary's idle
+    /// workers retry against the freshly-identified primary inside
+    /// the PromotePrimary dispatch tick and pick up work.
+    #[cfg(test)]
+    local_tasks_run: usize,
+
     // State
     transfer_complete: bool,
     is_primary: bool,
@@ -576,6 +591,8 @@ where
             pool: WorkerPool::new(),
             active_tasks: HashMap::new(),
             completed_tasks: HashSet::new(),
+            #[cfg(test)]
+            local_tasks_run: 0,
             transfer_complete: false,
             is_primary: false,
             extraction_cache,
@@ -786,6 +803,18 @@ where
     #[cfg(test)]
     pub fn cluster_state_counts_for_test(&self) -> crate::cluster_state::StateCounts {
         self.cluster_state.counts()
+    }
+
+    /// Test-only inspector for the count of tasks this secondary's
+    /// OWN worker pool ran (i.e. local `WorkerEvent::TaskCompleted`
+    /// fires). Distinct from `completed_count()` which reports the
+    /// cluster-wide observed-terminal set. Used by the
+    /// `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
+    /// regression test to assert post-fix distribution across all 4
+    /// secondaries.
+    #[cfg(test)]
+    pub fn local_tasks_run_for_test(&self) -> usize {
+        self.local_tasks_run
     }
 
     /// Run the secondary coordination loop:
