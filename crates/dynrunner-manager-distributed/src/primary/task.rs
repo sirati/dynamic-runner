@@ -782,7 +782,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             | ClusterMutation::PrimaryChanged { .. }
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::TaskPreferredSecondariesUpdated { .. }
-            | ClusterMutation::PeerJoined { .. } => {
+            | ClusterMutation::PeerJoined { .. }
+            | ClusterMutation::PeerRemoved { .. } => {
                 // Routing / role / membership hints with no impact on
                 // terminal-state accounting.
             }

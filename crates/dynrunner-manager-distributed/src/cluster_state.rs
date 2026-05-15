@@ -36,9 +36,11 @@ use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, RoleChangeHookRegistrar, RoleTable,
+    ClusterMutation, RemovalCause, RoleChangeHookRegistrar, RoleTable,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::peer_lifecycle::PeerLifecycleEvent;
 
 /// Per-task state in the replicated ledger.
 ///
@@ -152,6 +154,43 @@ impl OutcomeSummary {
 /// table; never the pre-mutation snapshot.
 pub type RoleChangeHook = Arc<dyn Fn(&RoleTable) + Send + Sync + 'static>;
 
+/// Liveness bit on a `PeerEntry`. `Dead` is sticky-per-id: once a peer
+/// is `Dead`, no subsequent `PeerJoined`/`PeerRemoved` mutation for the
+/// same id may mutate the entry (re-application is silent). Respawn
+/// requires a fresh id.
+///
+/// Internal — the `peer_state` map is module-private and the apply
+/// rules are the only writers, so the variant set need not be `pub`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PeerState {
+    Alive,
+    Dead,
+}
+
+/// One entry in `ClusterState::peer_state`. Holds the liveness bit plus
+/// scaffolding metadata that future mutations (`PeerInfo`/`PeerCert`
+/// broadcasts) will populate — today `pubkey`/`endpoint` start `None`
+/// and stay `None` because no mutation writes them yet. `is_observer`
+/// mirrors the `RoleTable.observers` projection so reads that need the
+/// flag without going through the observer set have a single source.
+///
+/// Internal — exposed nowhere; the apply rules are the only writers
+/// and `peer_state` is module-private.
+#[derive(Debug, Clone)]
+struct PeerEntry {
+    state: PeerState,
+    /// Populated by a future `PeerInfo`-shaped mutation; today no
+    /// mutation writes this and reads never fire. Kept as a stable
+    /// field so the future wiring lands as an in-place update rather
+    /// than a struct shape change.
+    #[allow(dead_code)]
+    pubkey: Option<String>,
+    /// See `pubkey` — same forward-looking scaffolding.
+    #[allow(dead_code)]
+    endpoint: Option<String>,
+    is_observer: bool,
+}
+
 /// The replicated cluster-state CRDT.
 pub struct ClusterState<I> {
     tasks: HashMap<String, TaskState<I>>,
@@ -186,6 +225,22 @@ pub struct ClusterState<I> {
     /// does not own. Tests that need hooks on a cloned state must
     /// re-register on the clone.
     role_change_hooks: Vec<RoleChangeHook>,
+    /// Per-id liveness ledger maintained by the `PeerJoined` and
+    /// `PeerRemoved` apply rules. The `RoleTable.observers` set is a
+    /// projection of this map (the subset whose entries are
+    /// `Alive { is_observer: true }`); the map itself is the
+    /// authoritative "have we ever seen this id, and is it currently
+    /// alive or dead-forever" answer.
+    ///
+    /// Skipped from `Clone`, snapshot, and restore — same rationale
+    /// as `role_change_hooks`: the map is paired with a node-local
+    /// dispatcher channel (the sibling subtask wires the real mpsc;
+    /// today the channel is the stub `emit_lifecycle_event`) and a
+    /// cloned replica has neither the channel nor any reason to
+    /// inherit the source's runtime peer view. Receivers rebuild the
+    /// map by re-applying broadcast `PeerJoined`/`PeerRemoved`
+    /// mutations after restore.
+    peer_state: HashMap<String, PeerEntry>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -202,6 +257,8 @@ where
             role_table: self.role_table.clone(),
             // Deliberately not cloned — see field doc.
             role_change_hooks: Vec::new(),
+            // Deliberately not cloned — see field doc.
+            peer_state: HashMap::new(),
         }
     }
 }
@@ -219,6 +276,7 @@ where
             .field("run_complete", &self.run_complete)
             .field("role_table", &self.role_table)
             .field("role_change_hooks", &self.role_change_hooks.len())
+            .field("peer_state", &self.peer_state)
             .finish()
     }
 }
@@ -233,6 +291,7 @@ impl<I> Default for ClusterState<I> {
             run_complete: false,
             role_table: RoleTable::default(),
             role_change_hooks: Vec::new(),
+            peer_state: HashMap::new(),
         }
     }
 }
@@ -456,6 +515,19 @@ impl<I: Identifier> ClusterState<I> {
         for hook in &self.role_change_hooks {
             hook(&self.role_table);
         }
+    }
+
+    /// Enqueue a [`PeerLifecycleEvent`] onto the dispatcher channel.
+    ///
+    /// TODO(peer-lifecycle dispatcher): a sibling subtask replaces
+    /// this stub with the real `mpsc::Sender<PeerLifecycleEvent>`
+    /// enqueue. The wire-side mutation apply rules already call this
+    /// method at the correct point in the state transition so the
+    /// downstream consumer plumbing is the only piece that needs to
+    /// land — the call sites are stable. Until then the event is
+    /// discarded; no consumer is listening.
+    pub(crate) fn emit_lifecycle_event(&self, _event: PeerLifecycleEvent) {
+        // Stub: future subtask wires the mpsc sender here.
     }
 
     /// Take a snapshot of the whole state. The snapshot is a deep
@@ -702,28 +774,120 @@ impl<I: Identifier> ClusterState<I> {
             ClusterMutation::PeerJoined {
                 peer_id,
                 is_observer,
-            } => {
-                // Minimal apply rule for the unification refactor:
-                // observer membership only. `is_observer = true`
-                // inserts `peer_id` into `RoleTable.observers` with
-                // set semantics — re-application against an already-
-                // present id is a silent NoOp (no double-fire of
-                // role-change hooks). `is_observer = false` is a
-                // no-op at this stage: only the matching
-                // `PeerRemoved` variant (peer-lifecycle work) removes
-                // peers from the set, so a stale broadcast that flips
-                // the flag back to false MUST NOT mutate the observer
-                // set.
-                if !is_observer {
-                    return ApplyOutcome::NoOp;
-                }
-                if !self.role_table.observers.insert(peer_id) {
-                    return ApplyOutcome::NoOp;
-                }
-                self.fire_role_change_hooks();
-                ApplyOutcome::Applied
+            } => self.apply_peer_joined(peer_id, is_observer),
+            ClusterMutation::PeerRemoved { id, cause } => {
+                self.apply_peer_removed(id, cause)
             }
         }
+    }
+
+    /// Apply a `ClusterMutation::PeerJoined`.
+    ///
+    /// Sticky-per-id removal wins: if the id is currently `Dead` in
+    /// `peer_state`, the broadcast is logged at `warn` and dropped
+    /// (NoOp). Otherwise the entry is brought to `Alive` (insert or
+    /// in-place ratchet of `is_observer` upward; the observer flag
+    /// never regresses true→false via `PeerJoined`, only the matching
+    /// `PeerRemoved` can clear it). The `RoleTable.observers`
+    /// projection is updated in lockstep and role-change hooks fire
+    /// when the set actually changes. A `PeerLifecycleEvent::Added`
+    /// is emitted on every state-changing apply; pure-idempotent
+    /// re-deliveries return NoOp and emit nothing.
+    fn apply_peer_joined(&mut self, peer_id: String, is_observer: bool) -> ApplyOutcome {
+        match self.peer_state.get(&peer_id) {
+            Some(entry) if entry.state == PeerState::Dead => {
+                tracing::warn!(
+                    target: "dynrunner_cluster_state",
+                    peer_id = %peer_id,
+                    "PeerJoined for dead id ignored",
+                );
+                return ApplyOutcome::NoOp;
+            }
+            _ => {}
+        }
+        let (entry_was_new, observer_set_changed) = match self.peer_state.get_mut(&peer_id) {
+            None => {
+                self.peer_state.insert(
+                    peer_id.clone(),
+                    PeerEntry {
+                        state: PeerState::Alive,
+                        pubkey: None,
+                        endpoint: None,
+                        is_observer,
+                    },
+                );
+                let observer_set_changed =
+                    is_observer && self.role_table.observers.insert(peer_id.clone());
+                (true, observer_set_changed)
+            }
+            Some(entry) => {
+                // Ratchet the observer flag upward only. Stale flip-
+                // back broadcasts (`is_observer = false` for an
+                // already-observed peer) must not regress the
+                // projection — only `PeerRemoved` clears observer
+                // status.
+                if is_observer && !entry.is_observer {
+                    entry.is_observer = true;
+                    let inserted = self.role_table.observers.insert(peer_id.clone());
+                    (false, inserted)
+                } else {
+                    (false, false)
+                }
+            }
+        };
+        if observer_set_changed {
+            self.fire_role_change_hooks();
+        }
+        if !entry_was_new && !observer_set_changed {
+            return ApplyOutcome::NoOp;
+        }
+        self.emit_lifecycle_event(PeerLifecycleEvent::Added {
+            id: peer_id,
+            is_observer,
+        });
+        ApplyOutcome::Applied
+    }
+
+    /// Apply a `ClusterMutation::PeerRemoved`.
+    ///
+    /// Sticky-per-id: once `peer_state[id]` is `Dead`, any further
+    /// `PeerRemoved` for the same id is a silent NoOp. An `Absent`
+    /// id is inserted as `Dead` so the entry blocks any late
+    /// out-of-order `PeerJoined` for the same id. Observers lose
+    /// their projection on removal; role-change hooks fire when the
+    /// set actually shrinks. A `PeerLifecycleEvent::Removed` is
+    /// emitted on every state-changing apply.
+    fn apply_peer_removed(&mut self, id: String, cause: RemovalCause) -> ApplyOutcome {
+        if let Some(entry) = self.peer_state.get(&id) {
+            if entry.state == PeerState::Dead {
+                return ApplyOutcome::NoOp;
+            }
+        }
+        let observer_set_changed = match self.peer_state.get_mut(&id) {
+            None => {
+                self.peer_state.insert(
+                    id.clone(),
+                    PeerEntry {
+                        state: PeerState::Dead,
+                        pubkey: None,
+                        endpoint: None,
+                        is_observer: false,
+                    },
+                );
+                false
+            }
+            Some(entry) => {
+                entry.state = PeerState::Dead;
+                let was_observer = entry.is_observer;
+                entry.is_observer = false;
+                was_observer && self.role_table.observers.remove(&id)
+            }
+        };
+        if observer_set_changed {
+            self.fire_role_change_hooks();
+        }
+        self.emit_lifecycle_event(PeerLifecycleEvent::Removed { id, cause });
+        ApplyOutcome::Applied
     }
 
     /// Whether the run has been declared finished by the primary.
@@ -1569,15 +1733,13 @@ mod tests {
         );
     }
 
-    /// `ClusterMutation::PeerJoined { is_observer: false }` for a
-    /// peer NOT currently in `RoleTable.observers` is a no-op under
-    /// the minimal apply rule — only the matching `PeerRemoved`
-    /// variant (Batch D) removes peers from the set. This pins the
-    /// "stale flip-back does not regress the observer set" guarantee
-    /// the receiver-side relies on (a delayed broadcast that
-    /// re-asserts a peer's non-observer status MUST NOT delete a
-    /// genuine observer that arrived through a separate writer
-    /// ordering).
+    /// `ClusterMutation::PeerJoined { is_observer: false }` for a peer
+    /// already in `RoleTable.observers` MUST NOT regress the projection
+    /// (only `PeerRemoved` may remove peers from the set). A first-seen
+    /// non-observer peer is recorded in `peer_state` — that is the
+    /// widened apply rule's tracking contract — but the observer set
+    /// stays untouched. This pins the "stale flip-back does not regress
+    /// the observer set" guarantee the receiver-side relies on.
     #[test]
     fn peer_joined_non_observer_does_not_remove_existing_observer() {
         let mut s = ClusterState::<RunnerIdentifier>::new();
@@ -1590,8 +1752,9 @@ mod tests {
         );
         assert!(s.role_table().observers.contains("obs-1"));
 
-        // `is_observer: false` arrives later: minimal apply rule
-        // treats this as a no-op (only `PeerRemoved` may remove).
+        // `is_observer: false` for an already-Alive observer is a
+        // NoOp under the non-regression rule — neither peer_state nor
+        // the observer projection mutate.
         assert_eq!(
             s.apply(ClusterMutation::PeerJoined {
                 peer_id: "obs-1".into(),
@@ -1602,16 +1765,17 @@ mod tests {
         assert!(
             s.role_table().observers.contains("obs-1"),
             "obs-1 must remain in role_table.observers (only PeerRemoved \
-             removes peers under the minimal apply rule)"
+             removes peers from the projection)"
         );
 
-        // `is_observer: false` for a peer never seen is also a no-op.
+        // A first-seen non-observer peer is now tracked in peer_state
+        // (Applied), but does not enter the observer projection.
         assert_eq!(
             s.apply(ClusterMutation::PeerJoined {
                 peer_id: "never-joined".into(),
                 is_observer: false,
             }),
-            ApplyOutcome::NoOp
+            ApplyOutcome::Applied
         );
         assert!(!s.role_table().observers.contains("never-joined"));
     }
@@ -1643,5 +1807,218 @@ mod tests {
         assert_eq!(joiner.role_table().primary, Some("lead".to_string()));
         let obs = observed.lock().unwrap().clone();
         assert_eq!(obs, vec![Some("lead".to_string())]);
+    }
+
+    // ── PeerRemoved + widened PeerJoined apply-rule tests ──
+    //
+    // These pin the peer-lifecycle contract on `ClusterState`:
+    //
+    //  1. `PeerRemoved` is sticky-per-id: once Dead, always Dead. A
+    //     duplicate broadcast is a NoOp; a late `PeerJoined` for the
+    //     same id is dropped with a warn log (no resurrection).
+    //  2. The observer-set projection is maintained in lockstep with
+    //     the `peer_state` map — removal of an observer drops them
+    //     from `RoleTable.observers`.
+
+    /// Local capture layer for warn-level tracing events. Scoped to
+    /// the cluster_state test module — we only need it for the
+    /// `peer_joined_dead_is_noop` warn-log assertion, so keep it
+    /// module-private rather than lifting into a shared test util.
+    struct WarnCapture {
+        records: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            if event.metadata().target() != "dynrunner_cluster_state" {
+                return;
+            }
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            if let Ok(mut buf) = self.records.lock() {
+                buf.push(visitor.0);
+            }
+        }
+    }
+
+    /// Run `body` against a scoped subscriber that captures every
+    /// warn-level `dynrunner_cluster_state` event.
+    fn with_warn_capture<F, R>(body: F) -> (R, Vec<String>)
+    where
+        F: FnOnce() -> R,
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        let records: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = WarnCapture {
+            records: Arc::clone(&records),
+        };
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+        let out = tracing::subscriber::with_default(subscriber, body);
+        let captured = records.lock().unwrap().clone();
+        (out, captured)
+    }
+
+    /// Idempotent removal: a second `PeerRemoved` for the same id is
+    /// a silent NoOp under sticky-per-id semantics.
+    #[test]
+    fn peer_removed_is_sticky() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "p1".into(),
+                is_observer: false,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            s.apply(ClusterMutation::PeerRemoved {
+                id: "p1".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            }),
+            ApplyOutcome::Applied
+        );
+        // Re-applying PeerRemoved for the same id is a silent NoOp —
+        // the entry is already Dead.
+        assert_eq!(
+            s.apply(ClusterMutation::PeerRemoved {
+                id: "p1".into(),
+                cause: RemovalCause::MassDeathEscalation,
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    /// Sticky-per-id under the cross-direction race: once a peer is
+    /// Dead, a late `PeerJoined` for the same id is a NoOp and emits
+    /// a warn log. Respawn requires a fresh id.
+    #[test]
+    fn peer_joined_dead_is_noop() {
+        let ((), records) = with_warn_capture(|| {
+            let mut s = ClusterState::<RunnerIdentifier>::new();
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "p1".into(),
+                is_observer: false,
+            });
+            s.apply(ClusterMutation::PeerRemoved {
+                id: "p1".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            });
+            assert_eq!(
+                s.apply(ClusterMutation::PeerJoined {
+                    peer_id: "p1".into(),
+                    is_observer: true,
+                }),
+                ApplyOutcome::NoOp,
+                "PeerJoined for a Dead id must be NoOp"
+            );
+            assert!(
+                !s.role_table().observers.contains("p1"),
+                "Dead peer must not appear in the observer projection",
+            );
+        });
+        assert!(
+            records.iter().any(|m| m.contains("PeerJoined for dead id ignored")),
+            "expected warn log on PeerJoined for dead id, captured: {records:?}",
+        );
+    }
+
+    /// The widened `PeerJoined` apply rule preserves the observer-set
+    /// extension semantics: a new observer peer enters the projection,
+    /// re-application is silent, and a subsequent distinct observer
+    /// extends the set.
+    #[test]
+    fn peer_joined_alive_extends_observer_set() {
+        use std::collections::HashSet;
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-a".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-a".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::NoOp,
+            "re-applying the same PeerJoined is idempotent NoOp"
+        );
+        assert_eq!(
+            s.apply(ClusterMutation::PeerJoined {
+                peer_id: "obs-b".into(),
+                is_observer: true,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            s.role_table().observers,
+            HashSet::from(["obs-a".to_string(), "obs-b".to_string()]),
+        );
+    }
+
+    /// Removing an observer drops it from `RoleTable.observers` and
+    /// fires role-change hooks against the post-mutation projection.
+    #[test]
+    fn peer_removed_observer_drops_from_role_table() {
+        use std::sync::Mutex;
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "obs-1".into(),
+            is_observer: true,
+        });
+        assert!(s.role_table().observers.contains("obs-1"));
+
+        let observed: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let observed = Arc::clone(&observed);
+            s.register_role_change_hook(Box::new(move |table: &RoleTable| {
+                observed.lock().unwrap().push(table.observers.len());
+            }));
+        }
+
+        assert_eq!(
+            s.apply(ClusterMutation::PeerRemoved {
+                id: "obs-1".into(),
+                cause: RemovalCause::KeepaliveMiss,
+            }),
+            ApplyOutcome::Applied
+        );
+        assert!(
+            !s.role_table().observers.contains("obs-1"),
+            "PeerRemoved on an observer must drop it from RoleTable.observers"
+        );
+        let hook_fires = observed.lock().unwrap().clone();
+        assert_eq!(
+            hook_fires,
+            vec![0],
+            "role-change hook must fire once with the shrunk set"
+        );
     }
 }
