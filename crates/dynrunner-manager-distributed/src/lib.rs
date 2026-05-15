@@ -1,4 +1,5 @@
 pub mod cluster_state;
+pub mod fulfillability_matcher;
 pub mod peer_lifecycle;
 pub mod state;
 pub mod message_router;

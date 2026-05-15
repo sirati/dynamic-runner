@@ -4,6 +4,7 @@ mod config;
 mod discovery;
 mod driver;
 mod estimator;
+mod fulfillability_matcher_bridge;
 mod gateway;
 mod identifier;
 mod managers;
@@ -38,7 +39,9 @@ use managers::run::{compute_task_hash, run_distributed, run_local, run_primary, 
 use system_resources::{parse_cores, parse_memory, pick_free_port};
 use managers::secondary::PySecondaryCoordinator;
 use pyo3::wrap_pyfunction;
-use pytypes::{PyBinaryIdentifier, PyTaskInfo, PyFailedTask, PyProcessingStats};
+use pytypes::{
+    PyBinaryIdentifier, PyFailedTask, PyProcessingStats, PyTaskInfo, PyTaskInfoView,
+};
 use slurm::PyRustSlurmJobManager;
 
 /// Python module definition.
@@ -57,6 +60,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;
+    m.add_class::<PyTaskInfoView>()?;
     m.add_class::<PyProcessingStats>()?;
     m.add_class::<PyFailedTask>()?;
     m.add_class::<LogPathConfig>()?;
