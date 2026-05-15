@@ -1,6 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::{Duration, Instant};
+
+use tokio::task::JoinSet;
 
 use dynrunner_core::{resolve_against_root, ErrorType, TaskInfo, Identifier, PhaseId, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
@@ -12,6 +14,8 @@ use dynrunner_scheduler_api::{
 use tokio::sync::mpsc as tokio_mpsc;
 
 pub use command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
+
+use respawn::{RespawnEvent, RespawnOutcome};
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
@@ -667,6 +671,27 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     pub(super) fulfillability_matcher: Option<
         Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>,
     >,
+
+    /// In-flight respawn tasks. Each spawned task represents one
+    /// outstanding "ask the configured `SecondarySpawner` to bring up
+    /// a replacement secondary" request, plus whatever
+    /// post-spawn bookkeeping the dispatcher chooses to chain on. The
+    /// operational `select!` loop drains finished tasks here to apply
+    /// the [`respawn::RespawnOutcome`] (success/failure record-keeping,
+    /// downstream telemetry, optional retry-scheduling). Not cloned,
+    /// snapshotted, or restored: a coordinator does not hand over its
+    /// in-flight async tasks to a peer on promotion / late-joiner
+    /// snapshot — fresh coordinators start with an empty `JoinSet`.
+    pub(super) respawn_tasks: JoinSet<RespawnOutcome>,
+
+    /// FIFO ring of completed-or-attempted respawn events, capped at
+    /// [`respawn::RESPAWN_EVENTS_CAP`] entries (oldest dropped on
+    /// overflow). For operator forensics and per-secondary cap
+    /// consultation by the budget enforcer the F5/F6 subtasks will
+    /// land. Not cloned, snapshotted, or restored — see
+    /// `respawn_tasks` for the rationale (history is local to the
+    /// coordinator's process lifetime).
+    pub(super) respawn_events: VecDeque<RespawnEvent>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -734,6 +759,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             peer_lifecycle_listeners: Vec::new(),
             matcher_trigger_rx: Some(matcher_trigger_rx),
             fulfillability_matcher: None,
+            respawn_tasks: JoinSet::new(),
+            respawn_events: VecDeque::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -1389,6 +1416,7 @@ mod fulfillability_matcher;
 mod heartbeat;
 mod lifecycle;
 mod peer_setup;
+pub mod respawn;
 pub mod staging;
 mod task;
 pub mod wire;
