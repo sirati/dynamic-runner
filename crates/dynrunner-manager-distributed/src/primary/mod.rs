@@ -639,6 +639,34 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// rest of the coordinator's `run()`-once contract.
     pub(super) peer_lifecycle_listeners:
         Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
+
+    /// Matcher-trigger receiver, paired with the
+    /// `matcher_trigger_tx` installed on `cluster_state` at
+    /// construction. Taken out at `run()` start so the operational
+    /// `select!` arm can `drain_matcher_batch` against it. `None`
+    /// once the loop has taken ownership; subsequent runs against the
+    /// same coordinator are not supported (single-shot lifecycle).
+    pub(super) matcher_trigger_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<
+            crate::fulfillability_matcher::MatcherTriggerEvent,
+        >,
+    >,
+
+    /// Optional consumer-supplied fulfillability matcher. `None`
+    /// (the default) disables the matcher pipeline entirely — the
+    /// `select!` arm collapses to `pending::<Never>` shape and never
+    /// fires. `Some(m)` installs the matcher; the operational loop
+    /// calls `m.should_reinject(...)` once per `Unfulfillable` task
+    /// per batch of holdings-update events.
+    ///
+    /// Registered via [`Self::set_fulfillability_matcher`] BEFORE
+    /// `run()` enters (same pre-run-only contract as
+    /// `register_lifecycle_listener`; the field is `mem::take`-d into
+    /// the operational loop at run start so post-run registration is
+    /// silently dropped).
+    pub(super) fulfillability_matcher: Option<
+        Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>,
+    >,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -659,6 +687,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // queue on the unbounded channel and drain on the first
         // dispatcher poll.
         let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Matcher-trigger dispatcher channel. Built at construction
+        // for the same reason as `lifecycle_tx`: the apply path on
+        // `cluster_state` needs a sender ready from the very first
+        // `PeerResourceHoldingsUpdated` apply (E1). The receiver
+        // waits on `self` until `run()` enters the operational
+        // `select!` and drains it via
+        // `crate::fulfillability_matcher::drain_matcher_batch`.
+        let (matcher_trigger_tx, matcher_trigger_rx) =
+            tokio::sync::mpsc::unbounded_channel();
         let mut this = Self {
             config,
             transport,
@@ -695,6 +732,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             unfulfillable_reinject_remaining: HashMap::new(),
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
+            matcher_trigger_rx: Some(matcher_trigger_rx),
+            fulfillability_matcher: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -704,6 +743,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // enqueue against (defensive: today no mutation is applied
         // pre-`run()`, but the contract should not depend on that).
         this.cluster_state.install_lifecycle_sender(lifecycle_tx);
+        // Same shape as the lifecycle sender install: the apply path
+        // on `cluster_state` now has a sender to enqueue trigger
+        // events through; the operational `select!` will own the
+        // receiver from `run()` onward.
+        this.cluster_state
+            .install_matcher_trigger_sender(matcher_trigger_tx);
         // Mirror `SecondaryCoordinator::new`'s registration: attach the
         // peer transport's write-through `RoleTable` cache to the
         // authoritative `cluster_state.role_table`. The hook fires on
@@ -736,6 +781,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         listener: Box<dyn crate::peer_lifecycle::LifecycleListener>,
     ) {
         self.peer_lifecycle_listeners.push(listener);
+    }
+
+    /// Install the consumer-supplied fulfillability matcher. Must be
+    /// called BEFORE `run()` enters; the operational loop reads the
+    /// field directly from `self` and a post-run setter call has no
+    /// effect (the loop has already captured the trait object).
+    ///
+    /// At most one matcher per coordinator — re-installation replaces
+    /// the prior matcher silently. Consumer policy lives entirely
+    /// behind the trait method; the coordinator's only job is "fire
+    /// `ReinjectTask` when `should_reinject` returns true".
+    pub fn set_fulfillability_matcher(
+        &mut self,
+        matcher: Box<dyn crate::fulfillability_matcher::FulfillabilityMatcher<I>>,
+    ) {
+        self.fulfillability_matcher = Some(matcher);
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers
@@ -1324,6 +1385,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 mod assignment;
 mod command_channel;
 mod connect;
+mod fulfillability_matcher;
 mod heartbeat;
 mod lifecycle;
 mod peer_setup;

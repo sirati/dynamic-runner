@@ -40,6 +40,7 @@ use dynrunner_protocol_primary_secondary::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 
 /// Per-task state in the replicated ledger.
@@ -296,6 +297,27 @@ pub struct ClusterState<I> {
     /// dispatcher, violating the CCD-9 "apply path never crosses
     /// node boundaries" invariant.
     lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<PeerLifecycleEvent>>,
+    /// Sender end of the fulfillability-matcher trigger mpsc. Installed
+    /// via [`Self::install_matcher_trigger_sender`] when the
+    /// coordinator wires its matcher pipeline; `None` while no
+    /// coordinator has attached (tests / consumers that don't wire a
+    /// matcher observe the same `None` state and the emit becomes a
+    /// silent drop). The receiver end is consumed by
+    /// [`crate::fulfillability_matcher::drain_matcher_batch`] from
+    /// inside the operational `select!` loop.
+    ///
+    /// Mirrors `lifecycle_tx`'s skip-from-Clone/snapshot/restore
+    /// rationale: a cloned replica is a fresh node-local view and
+    /// inheriting the source's sender would route this replica's
+    /// trigger events into the source's pipeline, violating the
+    /// CCD-9 "apply path never crosses node boundaries" invariant.
+    ///
+    /// TODO (E1): the apply rule for
+    /// `ClusterMutation::PeerResourceHoldingsUpdated` is the only
+    /// legitimate caller of `emit_matcher_trigger`. Until the variant
+    /// lands, `emit_matcher_trigger` is only invoked by tests + by
+    /// `trigger_fulfillability_matcher_for_test`.
+    matcher_trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -316,6 +338,8 @@ where
             peer_state: HashMap::new(),
             // Deliberately not cloned — see field doc.
             lifecycle_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            matcher_trigger_tx: None,
         }
     }
 }
@@ -335,6 +359,7 @@ where
             .field("role_change_hooks", &self.role_change_hooks.len())
             .field("peer_state", &self.peer_state)
             .field("lifecycle_tx", &self.lifecycle_tx.is_some())
+            .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
             .finish()
     }
 }
@@ -351,6 +376,7 @@ impl<I> Default for ClusterState<I> {
             role_change_hooks: Vec::new(),
             peer_state: HashMap::new(),
             lifecycle_tx: None,
+            matcher_trigger_tx: None,
         }
     }
 }
@@ -694,6 +720,47 @@ impl<I: Identifier> ClusterState<I> {
     ) {
         self.lifecycle_tx = Some(tx);
     }
+
+    /// Enqueue a [`MatcherTriggerEvent`] onto the matcher-pipeline channel.
+    ///
+    /// Same best-effort / non-blocking / non-panicking contract as
+    /// [`Self::emit_lifecycle_event`] — no installed sender or a
+    /// closed receiver is a silent drop; the matcher pipeline is a
+    /// strictly-observational layer on top of the CRDT.
+    ///
+    /// CCD-9 invariant: this method must never invoke the matcher
+    /// directly. Matcher invocation happens off the apply task in the
+    /// operational `select!` loop; the channel is the only
+    /// synchronization crossing.
+    ///
+    /// TODO (E1): the apply rule for
+    /// `ClusterMutation::PeerResourceHoldingsUpdated` is the only
+    /// legitimate production caller. Until that variant + its apply
+    /// rule land, the only paths that invoke this are tests (via the
+    /// `trigger_fulfillability_matcher_for_test` shim below).
+    #[allow(dead_code)]
+    pub(crate) fn emit_matcher_trigger(&self, event: MatcherTriggerEvent) {
+        if let Some(tx) = &self.matcher_trigger_tx {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Attach the matcher-pipeline sender end so subsequent
+    /// `emit_matcher_trigger` calls route events through the
+    /// coordinator's operational-loop drain.
+    ///
+    /// Called by the coordinator at `new()` time after building the
+    /// (sender, receiver) pair; the receiver is then consumed by
+    /// [`crate::fulfillability_matcher::drain_matcher_batch`] from
+    /// inside the `select!` loop. Same re-installation semantics as
+    /// [`Self::install_lifecycle_sender`].
+    pub fn install_matcher_trigger_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>,
+    ) {
+        self.matcher_trigger_tx = Some(tx);
+    }
+
 
     /// Take a snapshot of the whole state. The snapshot is a deep
     /// clone — applying further mutations to `self` after this call
