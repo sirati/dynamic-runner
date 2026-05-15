@@ -41,12 +41,11 @@
 //!   * `FailPermanent` — drives `pending_pool::on_item_failed_permanent`
 //!     (with the cascade-to-dependents semantics that primitive owns)
 //!     and broadcasts `TaskFailed { kind: NonRecoverable, .. }`.
-//!   * `ReinjectTask` — accepts only entries whose CRDT state is
-//!     `Failed { NonRecoverable, ErrorType::Unfulfillable }`
-//!     (placeholder: `ErrorType::NonRecoverable` until the C2-side
-//!     `Unfulfillable` variant lands — see TODO at the matcher); flips
-//!     the local pool's Failed → re-injected, broadcasts
-//!     `TaskReinjected{hash}`, and decrements the per-task budget
+//!   * `ReinjectTask` — accepts only entries whose CRDT state is the
+//!     discrete `TaskState::Unfulfillable { .. }` variant (the
+//!     operator-resolvable-failure class); flips the local pool's
+//!     Unfulfillable → re-injected, broadcasts `TaskReinjected{hash}`,
+//!     and decrements the per-task budget
 //!     `unfulfillable_reinject_remaining[hash]` (initialised from
 //!     `PrimaryConfig::unfulfillable_reinject_max_per_task`; `None`
 //!     means unbounded). Budget exhaustion is a structured-log event,
@@ -96,14 +95,14 @@ pub enum PrimaryCommand {
     },
 
     /// External-control reinjection: accept iff the named hash is in
-    /// `Failed{ NonRecoverable, ErrorType::Unfulfillable }` (placeholder
-    /// matcher pending C2) and there's at least one reinjection ticket
-    /// left in `unfulfillable_reinject_remaining[hash]`. On accept,
-    /// transition Failed→Pending and broadcast
+    /// `TaskState::Unfulfillable { .. }` (the discrete state for the
+    /// operator-resolvable-failure class) and there's at least one
+    /// reinjection ticket left in `unfulfillable_reinject_remaining[hash]`.
+    /// On accept, transition Unfulfillable→Pending and broadcast
     /// `ClusterMutation::TaskReinjected{ hash }`. On budget exhaustion,
     /// emit the `unfulfillable_reinject_budget_exhausted` structured
     /// log event and return `Err` to the caller — the local state
-    /// stays `Failed{Unfulfillable}` (no regression).
+    /// stays `Unfulfillable` (no regression).
     ReinjectTask {
         hash: String,
         reply: oneshot::Sender<Result<(), String>>,
@@ -185,7 +184,9 @@ where
             TaskState::Pending { task }
             | TaskState::InFlight { task, .. }
             | TaskState::Completed { task }
-            | TaskState::Failed { task, .. } => task,
+            | TaskState::Failed { task, .. }
+            | TaskState::Unfulfillable { task, .. }
+            | TaskState::Blocked { task, .. } => task,
         };
         Some((task.phase_id.clone(), task.task_id.clone()))
     }
@@ -195,6 +196,27 @@ where
     /// cascade-to-dependents semantics that primitive owns also apply
     /// to externally-requested failures, then broadcasts the
     /// `TaskFailed` mutation so every node mirrors the terminal state.
+    ///
+    /// Cascade routing splits on `error`:
+    /// * `ErrorType::Unfulfillable { .. }` — dependents are broadcast
+    ///   as `ClusterMutation::TaskBlocked { hash, on: <root> }`, so
+    ///   the CRDT mirrors land in `TaskState::Blocked { on, task }`
+    ///   on every replica. The matching `TaskCompleted` apply arm
+    ///   auto-resumes them to `Pending` when the prereq later
+    ///   completes via the reinject + re-run path. Dependents are
+    ///   NOT recorded in the local per-pass `failed_tasks` ledger —
+    ///   they're cascade-paused, not failed.
+    /// * Any other `ErrorType` — dependents are recorded in the local
+    ///   `failed_tasks` ledger with the same error (the legacy shape
+    ///   a worker-driven cascade-fail produces).
+    ///
+    /// TODO: when a prereq's TaskCompleted auto-resumes its Blocked
+    /// dependents in the CRDT, the live primary's pool must re-add
+    /// those binaries (the pool's `on_item_failed_permanent` cascade
+    /// already removed them from the blocked-set). Wire this through
+    /// the auto-resume apply path so the pool stays coherent with
+    /// the CRDT. Today the CRDT side is correct; pool-side dispatch
+    /// of auto-resumed binaries needs the integration.
     pub(super) async fn apply_fail_permanent(
         &mut self,
         hash: String,
@@ -214,70 +236,77 @@ where
         self.failed_tasks.insert(hash.clone(), error.clone());
 
         // Cascade-to-dependents via the pool primitive. The returned
-        // list is the dependents that the pool just gave up on; we
-        // record each in `failed_tasks` with the same error so the
-        // per-pass accounting stays consistent with a worker-driven
-        // cascade.
-        if let Some(id) = task_id.as_deref() {
+        // list is the dependents that the pool just gave up on; how
+        // the caller observes them depends on the error class
+        // (cascade-pause for Unfulfillable, cascade-fail otherwise).
+        let cascaded_blocks: Vec<(String, String)> = if let Some(id) = task_id.as_deref() {
             let cascaded = self
                 .pool_mut()
                 .on_item_failed_permanent(&phase_id, id);
+            let is_unfulfillable = matches!(error, ErrorType::Unfulfillable { .. });
+            let mut blocks = Vec::new();
             for cascaded_binary in &cascaded {
                 let cascaded_hash =
                     super::wire::compute_task_hash(cascaded_binary);
-                self.failed_tasks
-                    .insert(cascaded_hash, error.clone());
+                if is_unfulfillable {
+                    blocks.push((cascaded_hash, hash.clone()));
+                } else {
+                    self.failed_tasks
+                        .insert(cascaded_hash, error.clone());
+                }
             }
-        }
+            blocks
+        } else {
+            Vec::new()
+        };
 
         // Phase + lifecycle bookkeeping. Must run AFTER the pool
         // mutation so `process_phase_lifecycle` observes the post-
         // cascade pool state.
         self.note_item_failed(&phase_id, task_id.as_deref());
 
-        // Broadcast the terminal state through the same primitive every
-        // other terminal path uses; the CRDT-applied broadcast is the
-        // single source of truth for every observer.
-        self.apply_and_broadcast_cluster_mutations(vec![
-            ClusterMutation::TaskFailed {
-                hash,
-                kind: error,
-                error: reason,
-            },
-        ])
-        .await;
+        // Broadcast the terminal state for the originating task plus
+        // any cascade-paused dependents (Unfulfillable case only).
+        // The CRDT-applied broadcast is the single source of truth
+        // for every observer; ordering the originating TaskFailed
+        // first means receivers see the prereq's Unfulfillable state
+        // before the dependents' Blocked state — the cascade root is
+        // visible whenever a dependent's `on` field is consulted.
+        let mut mutations: Vec<ClusterMutation<I>> = Vec::with_capacity(
+            1 + cascaded_blocks.len(),
+        );
+        mutations.push(ClusterMutation::TaskFailed {
+            hash,
+            kind: error,
+            error: reason,
+        });
+        for (dep_hash, on_hash) in cascaded_blocks {
+            mutations.push(ClusterMutation::TaskBlocked {
+                hash: dep_hash,
+                on: on_hash,
+            });
+        }
+        self.apply_and_broadcast_cluster_mutations(mutations).await;
         Ok(())
     }
 
     /// Handler for `PrimaryCommand::ReinjectTask`. Accepts only entries
-    /// whose CRDT state is `Failed{ NonRecoverable, .. }` (placeholder
-    /// pending the C2-side `ErrorType::Unfulfillable` variant — see
-    /// TODO in the matcher). Decrements the per-task budget; on
-    /// exhaustion the local state stays `Failed{Unfulfillable}` and
+    /// whose CRDT state is the discrete `TaskState::Unfulfillable { .. }`
+    /// — the operator-resolvable-failure class. Decrements the per-task
+    /// budget; on exhaustion the local state stays `Unfulfillable` and
     /// the caller receives `Err`.
     pub(super) async fn apply_reinject_task(
         &mut self,
         hash: String,
     ) -> Result<(), String> {
         // Inspect CRDT state first — the local pool isn't indexed by
-        // hash, and the per-error-kind gate has to read the
+        // hash, and the discrete-variant gate has to read the
         // authoritative ledger.
         let binary = match self.cluster_state.task_state(&hash) {
-            // TODO(C2): tighten the matcher to
-            // `ErrorType::Unfulfillable` once the variant lands.
-            // Today we accept any `Failed{NonRecoverable, ..}` because
-            // that's the closest available shape; this stays correct
-            // by inspection — `handle_task_failed` only writes
-            // `NonRecoverable` for non-Recoverable / non-OOM worker
-            // failures, which is the population the
-            // operator-resolvable-failure class is meant to address.
-            Some(TaskState::Failed { kind: ErrorType::NonRecoverable, task, .. }) => {
-                task.clone()
-            }
+            Some(TaskState::Unfulfillable { task, .. }) => task.clone(),
             Some(_) => {
                 return Err(format!(
-                    "reinject_task: hash {hash} not in \
-                     Failed{{NonRecoverable, ..}} state"
+                    "reinject_task: hash {hash} not in Unfulfillable state"
                 ));
             }
             None => {
@@ -498,9 +527,9 @@ mod tests {
         }).await;
     }
 
-    /// `ReinjectTask` accepts on `Failed{NonRecoverable}` and budget
-    /// exhaustion locks further reinjects out without regressing the
-    /// ledger.
+    /// `ReinjectTask` accepts on `TaskState::Unfulfillable { .. }` and
+    /// budget exhaustion locks further reinjects out without
+    /// regressing the ledger.
     #[tokio::test(flavor = "current_thread")]
     async fn reinject_task_budget_exhaustion() {
         let local = tokio::task::LocalSet::new();
@@ -516,7 +545,9 @@ mod tests {
             });
             coordinator.cluster_state.apply(ClusterMutation::TaskFailed {
                 hash: hash.clone(),
-                kind: ErrorType::NonRecoverable,
+                kind: ErrorType::Unfulfillable {
+                    reason: "missing toolchain".to_string().into(),
+                },
                 error: "unfulfillable".into(),
             });
             // Pool init: reinject requires the phase to exist.
@@ -538,16 +569,18 @@ mod tests {
             )
             .await;
             assert!(reply_rx.await.unwrap().is_ok(), "first reinject accepts");
-            // CRDT mirror moved off Failed.
+            // CRDT mirror moved off Unfulfillable.
             assert!(matches!(
                 coordinator.cluster_state.task_state(&hash),
                 Some(TaskState::Pending { .. })
             ));
 
-            // Re-set to Failed and try again — budget should be exhausted.
+            // Re-set to Unfulfillable and try again — budget should be exhausted.
             coordinator.cluster_state.apply(ClusterMutation::TaskFailed {
                 hash: hash.clone(),
-                kind: ErrorType::NonRecoverable,
+                kind: ErrorType::Unfulfillable {
+                    reason: "still missing".to_string().into(),
+                },
                 error: "unfulfillable again".into(),
             });
             let (reply_tx2, reply_rx2) = oneshot::channel();
@@ -561,10 +594,10 @@ mod tests {
             .await;
             let r2 = reply_rx2.await.unwrap();
             assert!(r2.is_err(), "second reinject should hit budget cap");
-            // Ledger stays Failed.
+            // Ledger stays Unfulfillable.
             assert!(matches!(
                 coordinator.cluster_state.task_state(&hash),
-                Some(TaskState::Failed { .. })
+                Some(TaskState::Unfulfillable { .. })
             ));
         }).await;
     }
@@ -647,6 +680,98 @@ mod tests {
             let reply = reply_rx.await.expect("reply oneshot closed");
             assert!(reply.is_ok(), "{reply:?}");
             assert!(coordinator.failed_tasks.contains_key(&hash));
+        }).await;
+    }
+
+    /// `FailPermanent` with `ErrorType::Unfulfillable` routes the
+    /// cascade to a `TaskBlocked` broadcast for each dependent — the
+    /// dependent's CRDT entry lands in `TaskState::Blocked { on, .. }`
+    /// rather than `TaskState::Failed`, so the auto-resume path can
+    /// recover when the prereq is reinjected. Pins the cascade
+    /// dispatch in `apply_fail_permanent`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fail_permanent_unfulfillable_blocks_dependents() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+
+            // Prereq carries an explicit task_id so the pool can wire
+            // the dep-cascade reverse-index.
+            let mut prereq = make_binary("prereq", 100);
+            prereq.task_id = Some("prereq_id".into());
+            let prereq_hash = compute_task_hash(&prereq);
+
+            // Dependent declares task_depends_on for the cascade walk.
+            let mut dep = make_binary("dep", 100);
+            dep.task_id = Some("dep_id".into());
+            dep.task_depends_on = vec!["prereq_id".into()];
+            let dep_hash = compute_task_hash(&dep);
+
+            // Seed CRDT for both.
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: prereq_hash.clone(),
+                task: prereq.clone(),
+            });
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: dep_hash.clone(),
+                task: dep.clone(),
+            });
+
+            // Pool seeded with both phases + the items so the cascade
+            // primitive has dependents to walk.
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(prereq.phase_id.clone());
+            let mut pool = dynrunner_scheduler_api::PendingPool::new(
+                phase_set,
+                HashMap::new(),
+            )
+            .expect("pool init");
+            pool.extend(vec![prereq.clone(), dep.clone()])
+                .expect("pool extend");
+            coordinator.pending = Some(pool);
+            for p in coordinator.pool().active_phases() {
+                coordinator.phase_completed.insert(p.clone(), 0);
+                coordinator.phase_failed.insert(p.clone(), 0);
+            }
+            // Mark the prereq in flight so on_item_failed_permanent's
+            // in_flight bookkeeping doesn't saturate.
+            coordinator.pool_mut().mark_in_flight(&prereq.phase_id);
+
+            let (reply_tx, reply_rx) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::FailPermanent {
+                    hash: prereq_hash.clone(),
+                    error: ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                    reason: "no peer holds the resource".into(),
+                    reply: reply_tx,
+                },
+            )
+            .await;
+            let reply = reply_rx.await.expect("reply oneshot closed");
+            assert!(reply.is_ok(), "fail_permanent should accept: {reply:?}");
+
+            // Prereq lands in the discrete Unfulfillable variant.
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&prereq_hash),
+                Some(TaskState::Unfulfillable { .. })
+            ));
+            // Dependent lands in Blocked-on-prereq via the cascade
+            // broadcast (NOT in Failed).
+            match coordinator.cluster_state.task_state(&dep_hash) {
+                Some(TaskState::Blocked { on, .. }) => {
+                    assert_eq!(on, &prereq_hash);
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+            // Dependent is NOT in the local failed_tasks ledger — it's
+            // cascade-paused, not failed.
+            assert!(
+                !coordinator.failed_tasks.contains_key(&dep_hash),
+                "blocked dependent must not be in failed_tasks"
+            );
         }).await;
     }
 }
