@@ -783,6 +783,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             | ClusterMutation::PhaseDepsSet { .. }
             | ClusterMutation::TaskPreferredSecondariesUpdated { .. }
             | ClusterMutation::PeerJoined { .. }
+            | ClusterMutation::PeerRemoved { .. }
             | ClusterMutation::TaskBlocked { .. } => {
                 // Routing / role / membership hints with no impact on
                 // terminal-state accounting. `TaskBlocked` is a
