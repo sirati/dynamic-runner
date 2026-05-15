@@ -115,6 +115,21 @@ pub(crate) struct PyObserverLateJoiner {
     /// at `run()` start. Constructor-only; see the matching field
     /// on `PyPrimaryCoordinator` for the rationale.
     peer_lifecycle_listener: Option<Py<PyAny>>,
+    /// Static set of `holdings` this observer advertises to the
+    /// cluster (e.g. asm-dataset-nix passes the local Nix-store
+    /// outpaths it can serve). Drained into the observer-side
+    /// announcer at `run()` time so a `PrimaryChanged` mutation
+    /// triggers a `PeerResourceHoldingsUpdated` broadcast carrying
+    /// the cluster's current `primary_epoch`. Defaults to empty
+    /// when the kwarg is omitted — a consumer that doesn't host
+    /// any resources simply never announces anything, which is the
+    /// correct shape for a pure observer.
+    ///
+    /// Stored as `HashSet` to deduplicate at the boundary; the
+    /// announcer's `build_payload` sorts before send so the wire
+    /// order is stable regardless of insertion sequence on the
+    /// Python side.
+    holdings: std::collections::HashSet<String>,
     completed: u32,
 }
 
@@ -127,6 +142,7 @@ impl PyObserverLateJoiner {
         observer_id = None,
         distributed_config = None,
         peer_lifecycle_listener = None,
+        holdings = None,
     ))]
     fn new(
         peer_info_dir: PathBuf,
@@ -134,6 +150,7 @@ impl PyObserverLateJoiner {
         observer_id: Option<String>,
         distributed_config: Option<DistributedConfig>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
+        holdings: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         // Default observer-id includes a small random suffix so two
@@ -151,12 +168,21 @@ impl PyObserverLateJoiner {
                 .unwrap_or(0);
             format!("observer-{ts:08x}")
         });
+        // Dedup at the boundary — Python typically passes a list, but
+        // the announcer's storage is set-semantics (`HashSet`). The
+        // alternative (push the dedup onto the consumer) would mean
+        // every Python caller has to know about the wire-side
+        // contract; doing it here once keeps the kwarg's shape
+        // operator-friendly (`list[str]`).
+        let holdings: std::collections::HashSet<String> =
+            holdings.unwrap_or_default().into_iter().collect();
         Ok(Self {
             observer_id,
             peer_info_dir,
             topology,
             distributed_config: distributed_config.unwrap_or_default(),
             peer_lifecycle_listener,
+            holdings,
             completed: 0,
         })
     }
@@ -214,6 +240,12 @@ impl PyObserverLateJoiner {
             self.peer_lifecycle_listener
                 .take()
                 .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+        // Move the holdings set out of `self` so it can be drained into
+        // `attach_observer_announcer` on the tokio side. After this
+        // point `self.holdings` is empty; the observer is single-shot
+        // per `__init__` so a second `run()` would never make sense
+        // anyway (the snapshot RPC + restore latch are also one-shot).
+        let holdings = std::mem::take(&mut self.holdings);
 
         let result: Result<u32, PyErr> = py.detach(|| -> Result<u32, PyErr> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -371,12 +403,51 @@ impl PyObserverLateJoiner {
                     quic_port: peer_port,
                 });
 
+                // Attach the resource-holdings announcer's hook +
+                // channel BEFORE the snapshot restore: the restore's
+                // `cluster_state.restore` path fires
+                // `fire_role_change_hooks` from inside its
+                // `primary_epoch > local` branch, which we want to
+                // count as the post-restore initial trigger. With
+                // attach-then-restore the snapshot's apply naturally
+                // emits the first `AnnounceTrigger` into the queue;
+                // a separate explicit "fire one trigger" step would
+                // duplicate that stimulus.
+                //
+                // The handle is held until the spawn site below.
+                let announcer_handle = secondary.attach_observer_announcer(holdings);
+
                 // 5. Install the snapshot AND latch
                 //    setup_phase_completed=true. The single-method
                 //    `restore_from_snapshot_and_skip_setup` is the
                 //    only place outside the secondary crate allowed
                 //    to touch the latch (see its doc-comment).
                 secondary.restore_from_snapshot_and_skip_setup(snap);
+
+                // TODO(E1-merge): spawn `run_observer_announcer` here
+                // once the production `AnnouncerSender` impl is wired
+                // up. Today the missing pieces are:
+                //   1. `ClusterMutation::PeerResourceHoldingsUpdated`
+                //      (lands with the sibling E1 subtask).
+                //   2. A cross-task outbox from the announcer to the
+                //      secondary's run loop so the announcer doesn't
+                //      need shared access to `peer_transport` (which
+                //      stays `&mut self`-owned by the run loop).
+                // The announcer module + the attach call above are
+                // already in place; the spawn site is a single
+                // `tokio::task::spawn_local(run_observer_announcer(
+                // announcer_handle.rx, announcer_handle.holdings,
+                // announcer_handle.peer_id, sender,
+                // announcer_handle.primary_epoch_mirror))` once
+                // those two land. For now we drop the handle —
+                // the trigger queue absorbs role-change fires
+                // (`ANNOUNCE_CHANNEL_CAPACITY = 8` per
+                // `crate::observer::lifecycle`) and the hook's
+                // `try_send` then silently drops, which is
+                // structurally identical to "announcer task not yet
+                // started" so the safety property holds even with
+                // E1 unmerged.
+                let _ = announcer_handle;
 
                 // 6. Drive the run loop. The first iteration's
                 //    setup-skip guard fires immediately; subsequent
@@ -621,6 +692,7 @@ mod tests {
     task_definition,
     observer_id = None,
     distributed_config = None,
+    holdings = None,
 ))]
 pub(crate) fn run_observer_late_joiner<'py>(
     py: Python<'py>,
@@ -628,6 +700,7 @@ pub(crate) fn run_observer_late_joiner<'py>(
     task_definition: &Bound<'py, PyAny>,
     observer_id: Option<String>,
     distributed_config: Option<DistributedConfig>,
+    holdings: Option<Vec<String>>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     if let Some(id) = observer_id.as_ref() {
@@ -635,6 +708,9 @@ pub(crate) fn run_observer_late_joiner<'py>(
     }
     if let Some(dc) = distributed_config.as_ref() {
         kwargs.set_item("distributed_config", dc.clone())?;
+    }
+    if let Some(h) = holdings.as_ref() {
+        kwargs.set_item("holdings", h.clone())?;
     }
     // Resolve the legacy class via the package, mirroring `run_secondary`
     // / `run_distributed`'s "build-via-Python-module-attribute" pattern

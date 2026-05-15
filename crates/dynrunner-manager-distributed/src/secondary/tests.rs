@@ -2169,6 +2169,7 @@ mod late_joiner_observer {
             primary_epoch: 7,
             phase_deps: HashMap::new(),
             observers,
+            peer_holdings: HashMap::new(),
         }
     }
 

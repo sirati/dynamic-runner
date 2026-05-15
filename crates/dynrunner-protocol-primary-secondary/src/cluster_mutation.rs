@@ -155,4 +155,37 @@ pub enum ClusterMutation<I> {
         id: String,
         cause: RemovalCause,
     },
+    /// A peer announces the current set of opaque resource strings it
+    /// holds locally. The framework does NOT interpret the strings —
+    /// downstream consumers (e.g. the asm-dataset-nix scheduler treats
+    /// them as nix outpaths) attach meaning. The CRDT layer's only
+    /// concern is replicating the per-peer announcement so every node
+    /// converges to the same `peer_id → holdings` map.
+    ///
+    /// Wire shape uses `Vec<String>` rather than `HashSet<String>` to
+    /// keep deterministic serde ordering and codec simplicity on the
+    /// wire; the apply rule collects into a `HashSet<String>` for
+    /// storage so duplicate strings inside a single announce collapse
+    /// and equality checks are set-based.
+    ///
+    /// `epoch` carries the primary epoch under which the announcing
+    /// peer believed the cluster was operating. The apply rule
+    /// no-ops any announce whose `epoch < self.primary_epoch` — a
+    /// stale announce from a pre-failover view of the cluster must
+    /// not overwrite holdings observed under the current primary.
+    /// `epoch == self.primary_epoch` and `epoch > self.primary_epoch`
+    /// (a peer that already learned of a newer primary before its
+    /// announce reaches us) both apply — the announce is about
+    /// per-peer holdings, not about primary identity, and "newer
+    /// announce wins" is the same supersede-old-pending shape the
+    /// other CRDT entries use.
+    ///
+    /// Re-application against an unchanged set (same `peer_id`, same
+    /// `holdings` as already stored) is a NoOp under the standard
+    /// idempotency contract.
+    PeerResourceHoldingsUpdated {
+        peer_id: String,
+        holdings: Vec<String>,
+        epoch: u64,
+    },
 }

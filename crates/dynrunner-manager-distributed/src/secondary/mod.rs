@@ -685,6 +685,22 @@ where
         self.peer_lifecycle_listeners.push(listener);
     }
 
+    /// Forward an observer-mode announcer attach onto the underlying
+    /// [`ClusterState`]. Returns the [`crate::observer::AnnouncerHandle`]
+    /// the caller subsequently spawns the announcer task with.
+    ///
+    /// `secondary_id` from the coordinator's config is the announcer's
+    /// stamped `peer_id`; the caller passes the holdings set. See
+    /// [`crate::observer::attach_observer_announcer`] for the full
+    /// hook-registration + mirror-handoff contract.
+    pub fn attach_observer_announcer(
+        &mut self,
+        holdings: std::collections::HashSet<String>,
+    ) -> crate::observer::AnnouncerHandle {
+        let peer_id = self.config.secondary_id.clone();
+        crate::observer::attach_observer_announcer(&mut self.cluster_state, holdings, peer_id)
+    }
+
     /// Whether the run is in pre-staged-source mode (set from the
     /// primary's `InitialAssignment`). Exposed within the secondary
     /// module so dispatch / setup can pick the right resolution path.

@@ -199,6 +199,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // serviced across retry pass boundaries.
         let mut command_rx = self.command_rx.take();
 
+        // Matcher-trigger receiver. Same shape + lifetime as
+        // `command_rx`: taken out for the loop's duration so the
+        // `drain_matcher_batch` await can borrow it without
+        // conflicting with the per-arm `&mut self` borrows, then put
+        // back at loop exit so subsequent operational-loop entries
+        // (retry passes) keep draining the same channel. `None` when
+        // a previous run already consumed it (single-shot lifecycle
+        // — same handling as `command_rx`).
+        let mut matcher_trigger_rx = self.matcher_trigger_rx.take();
+        // One-shot gate on the matcher arm. Flips true on
+        // `rx.recv() == None` (every sender dropped); subsequent
+        // poll attempts would resolve immediately and hot-loop the
+        // select. Mirrors the `transport_closed` / `peer_transport_closed`
+        // gates above.
+        let mut matcher_arm_closed = false;
+
         loop {
             // Check termination: all tasks accounted for AND no
             // worker is mid-dispatch. Both halves of the check are
@@ -502,6 +518,45 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         }
                     }
                 }
+                batch = async {
+                    match matcher_trigger_rx.as_mut() {
+                        Some(rx) => {
+                            crate::fulfillability_matcher::drain_matcher_batch(
+                                rx,
+                                crate::fulfillability_matcher::MATCHER_BATCH_IDLE_WINDOW,
+                            ).await
+                        }
+                        // No receiver attached — park forever so the
+                        // arm never fires. Mirrors the command_rx
+                        // arm's `pending().await` for the same
+                        // closed-channel hot-loop reason.
+                        None => std::future::pending().await,
+                    }
+                }, if !matcher_arm_closed => {
+                    match batch {
+                        Some(batch) => {
+                            // Single-line delegation: the walk +
+                            // matcher invocation + auto-fire of
+                            // ReinjectTask lives in
+                            // `primary/fulfillability_matcher.rs`.
+                            // This arm's only concern is "a batch
+                            // arrived; hand it off".
+                            self.invoke_fulfillability_matcher_batch(batch).await;
+                        }
+                        None => {
+                            // Every sender dropped. Same as the
+                            // command channel's None arm: disable
+                            // this arm and let the timer / counter
+                            // exit cues take over.
+                            matcher_arm_closed = true;
+                            tracing::debug!(
+                                "matcher-trigger channel closed; disabling \
+                                 the fulfillability-matcher arm for the \
+                                 remainder of the loop"
+                            );
+                        }
+                    }
+                }
                 peer_msg = self.peer_transport.recv_peer(), if !peer_transport_closed => {
                     match peer_msg {
                         Some(m) => {
@@ -609,6 +664,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // PyO3 `PrimaryHandle` calls would be silently dropped from the
         // moment the first pass exits.
         self.command_rx = command_rx;
+        // Same rationale for the matcher-trigger receiver: retry
+        // passes re-enter the operational loop and must keep draining
+        // the same channel so holdings-update bursts during retry
+        // passes still drive the matcher.
+        self.matcher_trigger_rx = matcher_trigger_rx;
 
         Ok(())
     }

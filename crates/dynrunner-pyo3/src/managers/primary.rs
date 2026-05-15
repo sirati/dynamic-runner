@@ -121,6 +121,17 @@ pub(crate) struct PyPrimaryCoordinator {
     /// pre-`run()` registration (the listener vector is
     /// `mem::take`-d into the spawned dispatcher).
     peer_lifecycle_listener: Option<Py<PyAny>>,
+
+    /// Optional Python fulfillability matcher supplied at `__init__`.
+    /// `Some` iff the caller passed `fulfillability_matcher=<callable>`;
+    /// the object is bridged through
+    /// `crate::fulfillability_matcher_bridge::PyFulfillabilityMatcher`
+    /// and installed on the inner `PrimaryCoordinator` at `run()`
+    /// start. Constructor-only — no setter — because the
+    /// manager-distributed `set_fulfillability_matcher` API also
+    /// requires pre-`run()` registration (the matcher trait object
+    /// is owned by `self` and read in the operational `select!`).
+    fulfillability_matcher: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -136,6 +147,7 @@ impl PyPrimaryCoordinator {
         source_dir = None,
         unfulfillable_reinject_max_per_task = None,
         peer_lifecycle_listener = None,
+        fulfillability_matcher = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -148,6 +160,7 @@ impl PyPrimaryCoordinator {
         source_dir: Option<std::path::PathBuf>,
         unfulfillable_reinject_max_per_task: Option<u32>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
+        fulfillability_matcher: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -194,6 +207,7 @@ impl PyPrimaryCoordinator {
             command_tx,
             command_rx: Some(command_rx),
             peer_lifecycle_listener,
+            fulfillability_matcher,
         })
     }
 
@@ -339,6 +353,16 @@ impl PyPrimaryCoordinator {
             self.peer_lifecycle_listener
                 .take()
                 .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+
+        // Same shape for the fulfillability matcher kwarg: take the
+        // Python callable out of `self`, wrap it as a
+        // `Box<dyn FulfillabilityMatcher<RunnerIdentifier>>` at the
+        // bridge boundary, and install it on the inner coordinator
+        // BEFORE `run()` enters.
+        let fulfillability_matcher =
+            self.fulfillability_matcher
+                .take()
+                .map(crate::fulfillability_matcher_bridge::PyFulfillabilityMatcher::new);
 
         // Resolve the bind port. When the caller (e.g. the SLURM
         // packaging pipeline) pre-supplied `listen_port`, honour it
@@ -518,6 +542,16 @@ impl PyPrimaryCoordinator {
                 // the listener vector into the spawned dispatcher.
                 if let Some(listener) = peer_lifecycle_listener {
                     primary.register_lifecycle_listener(listener);
+                }
+
+                // Same boundary as the lifecycle listener: install
+                // the Python fulfillability matcher (if any) BEFORE
+                // `run()` enters. The setter is one line; the
+                // matcher invocation cadence + state-filter +
+                // ReinjectTask fire all live behind the
+                // manager-distributed API.
+                if let Some(matcher) = fulfillability_matcher {
+                    primary.set_fulfillability_matcher(matcher);
                 }
 
                 for (sec_id, file_hash, content_hash, src, dest) in pending_stage_files {
