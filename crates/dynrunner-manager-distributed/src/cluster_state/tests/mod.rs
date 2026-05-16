@@ -17,6 +17,7 @@ use std::sync::Arc;
 mod apply_basics;
 mod cascade_and_reinject;
 mod dispatchers;
+mod panik;
 mod peer_lifecycle;
 mod peer_resources;
 mod role_table;

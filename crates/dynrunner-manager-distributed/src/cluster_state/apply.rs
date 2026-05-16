@@ -128,7 +128,8 @@ impl<I: Identifier> ClusterState<I> {
                     // band), success is still the strongest terminal.
                     TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
-                    | TaskState::Blocked { task, .. } => task.clone(),
+                    | TaskState::Blocked { task, .. }
+                    | TaskState::Cancelled { task, .. } => task.clone(),
                     TaskState::Pending { task } | TaskState::InFlight { task, .. } => task.clone(),
                 };
                 // Snapshot the `task_id` for the dispatcher event
@@ -181,7 +182,17 @@ impl<I: Identifier> ClusterState<I> {
                     // stable reinjectable terminal — a late generic
                     // worker-originated TaskFailed must not regress it.
                     TaskState::Completed { .. }
-                    | TaskState::Unfulfillable { .. } => ApplyOutcome::NoOp,
+                    | TaskState::Unfulfillable { .. }
+                    // `Cancelled` is an operator-initiated emergency
+                    // terminal; a late worker-surfaced `TaskFailed`
+                    // must not regress it (operator's "stop the run"
+                    // intent supersedes a residual worker failure
+                    // message that raced the panik signal). Late
+                    // `TaskCompleted` against `Cancelled` is allowed
+                    // (handled in the `TaskCompleted` arm) — success
+                    // is the strongest terminal, so genuine work
+                    // completion still lands.
+                    | TaskState::Cancelled { .. } => ApplyOutcome::NoOp,
                     TaskState::Failed {
                         task,
                         kind: k,
@@ -323,6 +334,12 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Completed { .. }
                     | TaskState::Failed { .. }
                     | TaskState::Unfulfillable { .. }
+                    // `Cancelled` is an operator-initiated emergency
+                    // terminal — cascade-block decisions land before
+                    // it (the panik wipes Pending/Blocked alike) and
+                    // a stale `TaskBlocked` arriving after panik must
+                    // not regress the cancellation.
+                    | TaskState::Cancelled { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
                     TaskState::Blocked { on: existing_on, .. } => {
                         if existing_on == &on {
@@ -351,7 +368,8 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Completed { task }
                     | TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
-                    | TaskState::Blocked { task, .. } => task,
+                    | TaskState::Blocked { task, .. }
+                    | TaskState::Cancelled { task, .. } => task,
                 };
                 task.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
                 ApplyOutcome::Applied
@@ -369,6 +387,46 @@ impl<I: Identifier> ClusterState<I> {
                 epoch,
             } => self.apply_peer_resource_holdings_updated(peer_id, holdings, epoch),
             ClusterMutation::TasksSpawned { tasks } => self.apply_tasks_spawned(tasks),
+            ClusterMutation::PanikRequested {
+                source_peer,
+                reason,
+            } => {
+                // Sticky-first-wins: once `panik_active` is set, the
+                // first-applying broadcast's `source_peer`/`reason`
+                // are canonical and re-application is silent. This
+                // means two distinct nodes detecting the panik file
+                // independently and broadcasting in parallel converge
+                // to identical state across the cluster — the second
+                // applying broadcast finds `panik_active = true` and
+                // exits before touching the task map.
+                if self.panik_active {
+                    return ApplyOutcome::NoOp;
+                }
+                self.panik_active = true;
+                self.panik_source = Some(source_peer);
+                self.panik_reason = Some(reason.clone());
+                // Sweep non-terminal entries to `Cancelled`. Terminal
+                // states (`Completed`, `Failed`, `Unfulfillable`, and
+                // re-applied `Cancelled` itself) are preserved —
+                // work that already finished isn't retroactively
+                // un-finished.
+                for state in self.tasks.values_mut() {
+                    let task = match state {
+                        TaskState::Pending { task }
+                        | TaskState::InFlight { task, .. }
+                        | TaskState::Blocked { task, .. } => task.clone(),
+                        TaskState::Completed { .. }
+                        | TaskState::Failed { .. }
+                        | TaskState::Unfulfillable { .. }
+                        | TaskState::Cancelled { .. } => continue,
+                    };
+                    *state = TaskState::Cancelled {
+                        task,
+                        reason: reason.clone(),
+                    };
+                }
+                ApplyOutcome::Applied
+            }
         }
     }
 }

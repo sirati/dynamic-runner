@@ -228,4 +228,35 @@ pub enum ClusterMutation<I> {
     /// the same auto-resume mechanism as cascade-paused dependents
     /// from `apply_fail_permanent`.
     TasksSpawned { tasks: Vec<TaskInfo<I>> },
+    /// Operator-initiated emergency stop. Broadcast when ANY node
+    /// observes the panik filesystem signal (e.g. a per-host or
+    /// shared-network sentinel path); the apply rule latches a sticky
+    /// `panik_active` flag on local `ClusterState` and transitions
+    /// every non-terminal task entry (`Pending` / `InFlight` /
+    /// `Blocked`) to the discrete `TaskState::Cancelled { task,
+    /// reason }` variant so the run terminates with a defined outcome
+    /// instead of stranding.
+    ///
+    /// Sticky-first-wins: once `panik_active` is set, subsequent
+    /// `PanikRequested` broadcasts (e.g. a slow secondary detecting
+    /// the same file 10s later) are silent NoOps — the first
+    /// applying broadcast wins on `source_peer` / `reason`.
+    ///
+    /// Terminal preservation: `Completed` / `Failed` / `Unfulfillable`
+    /// entries are left intact — work that already finished isn't
+    /// retroactively cancelled. A `TaskCompleted` that races a
+    /// `PanikRequested` and lands after the apply still legitimately
+    /// transitions `Cancelled → Completed` (the `TaskCompleted` arm
+    /// preserves success as the strongest terminal across all non-
+    /// `Completed` predecessors).
+    ///
+    /// `reason` is the caller-supplied panik justification (e.g.
+    /// `"file: /tmp/asm-tokenizer.panik"` or `"file: /shared/dataset.panik"`).
+    /// Stored on each transitioned `Cancelled { reason }` entry so
+    /// the OutcomeSummary's `cancelled` bucket has operator-visible
+    /// per-task provenance.
+    PanikRequested {
+        source_peer: String,
+        reason: String,
+    },
 }
