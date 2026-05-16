@@ -547,6 +547,8 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         binaries,
         skip_existing=args.skip_existing,
         source_pre_staged_root=args.source_already_staged,
+        fulfillability_matcher=getattr(task, "fulfillability_matcher", None),
+        peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
@@ -612,6 +614,8 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
         respawn_policy=respawn_policy,
         respawn_spawner=respawn_spawner,
+        fulfillability_matcher=getattr(task, "fulfillability_matcher", None),
+        peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")

@@ -1311,6 +1311,25 @@ fn drive_rust_primary<'py>(
         }
     }
 
+    // ---- Task-protocol attribute pass-through. ----
+    //
+    // The task object owns optional `fulfillability_matcher` and
+    // `peer_lifecycle_listener` attributes (same duck-typed shape as
+    // `discover_items` / `add_task_arguments`). Forward them into the
+    // coordinator kwargs so the SLURM pipeline matches the in-process
+    // local / distributed paths — consumers don't have to construct
+    // `RustPrimaryCoordinator` themselves to reach these hooks.
+    if let Ok(matcher) = task.getattr("fulfillability_matcher") {
+        if !matcher.is_none() {
+            coord_kwargs.set_item("fulfillability_matcher", matcher)?;
+        }
+    }
+    if let Ok(listener) = task.getattr("peer_lifecycle_listener") {
+        if !listener.is_none() {
+            coord_kwargs.set_item("peer_lifecycle_listener", listener)?;
+        }
+    }
+
     let num_secondaries = outcome.num_secondaries;
     let args_tuple = PyTuple::new(py, [
         num_secondaries.into_pyobject(py)?.into_any().unbind(),
