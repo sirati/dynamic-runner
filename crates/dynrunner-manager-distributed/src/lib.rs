@@ -1,6 +1,7 @@
 pub mod cluster_state;
 pub mod fulfillability_matcher;
 pub mod observer;
+pub mod panik_watcher;
 pub mod peer_lifecycle;
 pub mod task_completed;
 pub mod state;
