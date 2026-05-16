@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use super::options::PreparationOptions;
 
 mod establish;
+mod gather;
 mod pipeline;
 mod respawn;
 mod ssh;

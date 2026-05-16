@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex, Semaphore};
 use tokio::task::JoinSet;
@@ -182,37 +183,12 @@ impl SlurmPreparation {
             });
         }
 
-        // Outer deadline. `try_join_all`-style gather over the
-        // receivers under a single timeout.
-        let gather = async {
-            let mut out: HashMap<String, u16> = HashMap::new();
-            for rx in receivers {
-                match rx.await {
-                    Ok(Ok((secondary_id, tunnel_port))) => {
-                        out.insert(secondary_id, tunnel_port);
-                    }
-                    Ok(Err(e)) => return Err(e),
-                    // Sender dropped without sending → watcher
-                    // panicked or was aborted. JoinSet will surface
-                    // the panic on drop; report a generic error.
-                    Err(e) => {
-                        return Err(PrepError::WatcherLost(e.to_string()));
-                    }
-                }
-            }
-            Ok(out)
-        };
-
-        let result = match tokio::time::timeout(self.opts.setup_timeout, gather).await {
-            Ok(inner) => inner,
-            Err(_) => {
-                let ready = self.ssh_tunnels.lock().await.len();
-                Err(PrepError::Timeout {
-                    ready,
-                    total: num_secondaries,
-                })
-            }
-        };
+        // Single-concern handoff: gather oneshot outcomes under the
+        // shared setup deadline, allowing partial success. See
+        // `gather_under_deadline` for the per-receiver timeout
+        // semantics and the zero-vs-partial fleet failure split.
+        let result =
+            gather_under_deadline(receivers, num_secondaries, self.opts.setup_timeout).await;
 
         // Drop the JoinSet — aborts any in-flight watchers.
         drop(watchers);
@@ -223,8 +199,14 @@ impl SlurmPreparation {
                 // the persistent port map under the StdMutex; nothing
                 // to extend here. The returned `map` is the per-call
                 // snapshot built from oneshot outcomes — by construction
-                // it equals what the inner wrote.
-                tracing::info!(num = map.len(), "all SSH tunnels established");
+                // it equals what the inner wrote. May be partial when
+                // setup-deadline fired before all watchers reported;
+                // the warn! above carries the partial-fleet headline.
+                tracing::info!(
+                    ready = map.len(),
+                    total = num_secondaries,
+                    "ssh tunnel setup done"
+                );
             }
             Err(e) => tracing::error!(error = %e, "ssh tunnel setup failed"),
         }
@@ -318,3 +300,97 @@ impl SlurmPreparation {
         tracing::info!("SLURM preparation cleanup complete");
     }
 }
+
+/// Gather per-watcher `oneshot` outcomes under a shared setup
+/// deadline, allowing partial success.
+///
+/// Single concern: turning N oneshot receivers + one deadline into
+/// either:
+///   * `Ok(partial_or_full_map)` when at least one secondary
+///     connected (the late-joiner system handles slots that didn't
+///     arrive — see `PeerJoined` cluster mutation),
+///   * `Err(PrepError::Timeout { ready: 0, total })` when zero
+///     secondaries connected (genuine fleet-failure), or
+///   * `Err(other)` when a watcher surfaced an explicit error or
+///     dropped its sender without sending (`WatcherLost`).
+///
+/// Each receiver is awaited via [`tokio::time::timeout_at`] anchored
+/// at the same `Instant` so already-completed senders STILL resolve
+/// Ok after the deadline (the inner future is polled before the
+/// timer is checked), while stalled senders cleanly elapse and leave
+/// their map slot absent. Replaces the pre-fix
+/// `tokio::time::timeout(setup_timeout, gather)` shape, whose
+/// cancellation dropped the partial `HashMap` and crashed callers
+/// that could have proceeded on K-of-N.
+///
+/// Extracted from `setup_ssh_tunnels` so the deadline + partial-
+/// fleet semantics can be exercised by `cargo test` without spawning
+/// real `ssh` subprocesses — tests drive the senders directly.
+pub(super) async fn gather_under_deadline(
+    receivers: Vec<oneshot::Receiver<Result<(String, u16), PrepError>>>,
+    num_secondaries: usize,
+    setup_timeout: Duration,
+) -> Result<HashMap<String, u16>, PrepError> {
+    let deadline = tokio::time::Instant::now() + setup_timeout;
+    let mut out: HashMap<String, u16> = HashMap::new();
+    let mut early_err: Option<PrepError> = None;
+    for rx in receivers {
+        match tokio::time::timeout_at(deadline, rx).await {
+            // Watcher delivered an established tunnel.
+            Ok(Ok(Ok((secondary_id, tunnel_port)))) => {
+                out.insert(secondary_id, tunnel_port);
+            }
+            // Watcher delivered an explicit error (InfoRead /
+            // InfoParse / TunnelFailed / Io). Fail fast — same as
+            // the pre-refactor `gather` closure did. A live
+            // explicit error from one secondary is a fleet-
+            // configuration problem, not a partial-fleet case.
+            Ok(Ok(Err(e))) => {
+                early_err = Some(e);
+                break;
+            }
+            // Sender dropped without sending → watcher panicked or
+            // was aborted before reaching its `tx.send`. Same
+            // `WatcherLost` surfacing as before; the JoinSet drop
+            // at the call site will surface any panic on top.
+            Ok(Err(join_err)) => {
+                early_err = Some(PrepError::WatcherLost(join_err.to_string()));
+                break;
+            }
+            // Per-receiver deadline fired — this secondary did not
+            // connect in time. Leave the slot absent; the late-
+            // joiner path can still attach it via the PeerJoined
+            // cluster mutation. Continue to drain siblings whose
+            // senders may have raced ahead.
+            Err(_elapsed) => {}
+        }
+    }
+
+    if let Some(e) = early_err {
+        Err(e)
+    } else if out.is_empty() && num_secondaries > 0 {
+        // Genuine fleet-failure: zero secondaries connected
+        // inside the deadline. `ssh_tunnels.lock().await.len()`
+        // at the call site matches `out.len()` by construction
+        // (every successful tunnel pushes into `ssh_tunnels`
+        // BEFORE the watcher sends on its oneshot — see
+        // `establish_one_tunnel_inner`), so reading from the
+        // gathered map here is equivalent to the prior lock read.
+        Err(PrepError::Timeout {
+            ready: 0,
+            total: num_secondaries,
+        })
+    } else {
+        if out.len() < num_secondaries {
+            tracing::warn!(
+                ready = out.len(),
+                total = num_secondaries,
+                "setup-deadline timeout: only {} of {} secondaries connected; proceeding with partial fleet; late-joiners can attach via PeerJoined",
+                out.len(),
+                num_secondaries,
+            );
+        }
+        Ok(out)
+    }
+}
+

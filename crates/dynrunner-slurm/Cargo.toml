@@ -25,6 +25,7 @@ async-trait = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 
 [lints]
 workspace = true
