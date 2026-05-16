@@ -83,7 +83,31 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // (`secondary::primary::apply_and_broadcast_mutations`) share
         // one canonical filter; the broadcast step stays at each call
         // site because the two transports have different error shapes.
-        let applied = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
+        //
+        // `apply_locally_for_broadcast` also surfaces any `TaskInfo`s
+        // the apply pass auto-resumed from `Blocked → Pending` (a
+        // `TaskCompleted` arm side-effect — every dependent whose
+        // `Blocked { on: <this hash> }` matches transitions back to
+        // `Pending` in the CRDT). On the live primary, those binaries
+        // were dropped from the pool by `pool.on_item_failed_permanent`
+        // when the cascade originally fired, so the pool needs them
+        // re-introduced; the broadcast itself carries no `TaskInfo`
+        // for these dependents, only the CRDT side knows. Re-inject
+        // each resumed binary into the live pool so the next dispatch
+        // tick picks them up.
+        let batch = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
+        let crate::cluster_state::AppliedBatch {
+            applied,
+            resumed_for_dispatch,
+        } = batch;
+        for binary in resumed_for_dispatch {
+            tracing::debug!(
+                phase = %binary.phase_id,
+                task_id = ?binary.task_id,
+                "pool: re-inject auto-resumed Blocked dependent"
+            );
+            self.pool_mut().reinject(binary);
+        }
         if applied.is_empty() {
             return;
         }

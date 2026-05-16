@@ -1378,6 +1378,48 @@ impl<I: Identifier> PendingPool<I> {
         }
     }
 
+    /// Apply `update` in-place to the FIRST queued or blocked
+    /// `TaskInfo<I>` for which `pred` returns `true`. Returns `true`
+    /// iff a match was found and updated.
+    ///
+    /// Scan order: queued buckets in `BucketKey` order, FIFO within
+    /// each bucket; then the `blocked` map in its `HashMap` iteration
+    /// order (deterministic enough for "first match wins" semantics
+    /// when at most one task can match — the intended use case).
+    /// In-flight items are NOT visited: they've already been
+    /// dispatched, and the per-task metadata snapshot they carry on
+    /// the wire was taken at dispatch time. The pool's
+    /// post-dispatch mutation cannot retroactively reshape an
+    /// in-flight task.
+    ///
+    /// Used by callers that own out-of-band per-task metadata
+    /// updates (e.g. preferred-secondaries change applied via the
+    /// CRDT command channel) and need the live pool's clone to
+    /// reflect the change before the next scheduler tick reads it.
+    /// The pool stays generic over what "match" means: the predicate
+    /// closes over whatever identity key the caller cares about
+    /// (task hash, task_id, identifier) so the pool doesn't have to
+    /// learn about wire-canonical hashing.
+    pub fn update_first_match_in_place<F, U>(&mut self, pred: F, mut update: U) -> bool
+    where
+        F: Fn(&TaskInfo<I>) -> bool,
+        U: FnMut(&mut TaskInfo<I>),
+    {
+        for bucket in self.buckets.values_mut() {
+            if let Some(item) = bucket.items.iter_mut().find(|t| pred(t)) {
+                update(item);
+                return true;
+            }
+        }
+        for item in self.blocked.values_mut() {
+            if pred(item) {
+                update(item);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Find the first queued item (in bucket-key order, FIFO within a
     /// bucket) for which `pred` returns `true`, remove it from its
     /// bucket and return it. Returns `None` if no item matches.

@@ -827,3 +827,91 @@ fn task_deps_cascade_fail_on_permanent_prereq_failure() {
     // No queued items remain — B and C never made it into a bucket.
     assert!(p.pop_for_worker(1).is_none());
 }
+
+#[test]
+fn update_first_match_in_place_mutates_queued_match() {
+    // Three items in two buckets; predicate matches the middle one.
+    // The closure flips `preferred_secondaries` on the matched
+    // entry and leaves the rest alone.
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &[]),
+        t_with_id("P", "T", "", 1, "c", &[]),
+    ])
+    .expect("valid extend");
+    let updated = p.update_first_match_in_place(
+        |t| t.task_id.as_deref() == Some("b"),
+        |t| {
+            t.preferred_secondaries =
+                SoftPreferredSecondaries::new(vec!["sec-x".into()]);
+        },
+    );
+    assert!(updated, "predicate must match `b`");
+    let prefs: Vec<_> = p
+        .iter()
+        .map(|t| {
+            (
+                t.task_id.clone().unwrap(),
+                t.preferred_secondaries.as_slice().to_vec(),
+            )
+        })
+        .collect();
+    // Only `b` mutated; `a` and `c` stay default-empty.
+    let by_id: std::collections::HashMap<_, _> = prefs.into_iter().collect();
+    assert!(by_id["a"].is_empty());
+    assert_eq!(by_id["b"], vec!["sec-x".to_string()]);
+    assert!(by_id["c"].is_empty());
+}
+
+#[test]
+fn update_first_match_in_place_visits_blocked_items() {
+    // `b` depends on the still-pending `a`, so `b` lives in
+    // `blocked` (not in any bucket). The update primitive must
+    // still find and mutate it — operator-side preference updates
+    // should land on blocked entries the moment they're queued
+    // back into a bucket, not on a stale clone.
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([
+        t_with_id("P", "T", "", 1, "a", &[]),
+        t_with_id("P", "T", "", 1, "b", &["a"]),
+    ])
+    .expect("valid extend");
+    // Sanity: `b` is not in the bucket-side iter (it's in `blocked`).
+    let ids_in_buckets: Vec<_> = p.iter().map(|t| t.task_id.clone().unwrap()).collect();
+    assert_eq!(ids_in_buckets, vec!["a".to_string()]);
+    let updated = p.update_first_match_in_place(
+        |t| t.task_id.as_deref() == Some("b"),
+        |t| {
+            t.preferred_secondaries =
+                SoftPreferredSecondaries::new(vec!["sec-y".into()]);
+        },
+    );
+    assert!(updated, "predicate must match blocked `b`");
+    // Pop `a` to unblock `b`, then verify `b`'s preference survived.
+    p.pop_for_worker(1).expect("a");
+    p.on_item_finished(&phase("P"), Some("a"));
+    let b = p.pop_for_worker(1).expect("b unblocked");
+    assert_eq!(b.task_id.as_deref(), Some("b"));
+    assert_eq!(
+        b.preferred_secondaries.as_slice(),
+        &["sec-y".to_string()][..]
+    );
+}
+
+#[test]
+fn update_first_match_in_place_returns_false_on_no_match() {
+    let mut p = pool_with(&["P"], &[]);
+    p.extend([t_with_id("P", "T", "", 1, "a", &[])]).expect("valid");
+    let updated = p.update_first_match_in_place(
+        |t| t.task_id.as_deref() == Some("nonexistent"),
+        |t| {
+            t.preferred_secondaries =
+                SoftPreferredSecondaries::new(vec!["never".into()]);
+        },
+    );
+    assert!(!updated, "no match → false");
+    // `a` untouched.
+    let a = p.pop_for_worker(1).expect("a");
+    assert!(a.preferred_secondaries.as_slice().is_empty());
+}
