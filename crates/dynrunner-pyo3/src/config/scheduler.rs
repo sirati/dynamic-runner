@@ -11,6 +11,14 @@ use dynrunner_scheduler::ResourceStealingScheduler;
 ///   `SchedulerConfig` per kind).
 /// - `base_overhead`: 150 MiB
 /// - `pressure_threshold`: 500 MiB
+/// - `cgroup_safety_margin`: 1 GiB — headroom below the cgroup cap
+///   at which the framework's userland preempt fires. Without this
+///   margin the active-kill threshold sat at exactly the cgroup cap
+///   and consistently lost the race against the kernel's
+///   `memory.max` enforcement; with the margin, both kill branches
+///   shift down so the smallest-active kill lands BEFORE the kernel
+///   SIGKILLs the cgroup. Surfaced to operators via
+///   `--oom-cgroup-safety-margin`.
 /// - `temp_factors`: `[1.5, 2.0, 3.0, 4.0]` (slowest opportunistic worker
 ///   gets `available / 1.5`, the next one `/ 2.0`, etc.; later workers reuse
 ///   the final value).
@@ -20,6 +28,7 @@ pub(crate) struct SchedulerConfig {
     resource_kind: String,
     base_overhead: u64,
     pressure_threshold: u64,
+    cgroup_safety_margin: u64,
     temp_factors: Vec<f64>,
 }
 
@@ -29,6 +38,7 @@ impl Default for SchedulerConfig {
             resource_kind: "memory".into(),
             base_overhead: 150 * 1024 * 1024,
             pressure_threshold: 500 * 1024 * 1024,
+            cgroup_safety_margin: 1024 * 1024 * 1024,
             temp_factors: vec![1.5, 2.0, 3.0, 4.0],
         }
     }
@@ -41,12 +51,14 @@ impl SchedulerConfig {
         resource_kind = None,
         base_overhead = None,
         pressure_threshold = None,
+        cgroup_safety_margin = None,
         temp_factors = None,
     ))]
     fn new(
         resource_kind: Option<String>,
         base_overhead: Option<u64>,
         pressure_threshold: Option<u64>,
+        cgroup_safety_margin: Option<u64>,
         temp_factors: Option<Vec<f64>>,
     ) -> Self {
         let d = SchedulerConfig::default();
@@ -54,6 +66,7 @@ impl SchedulerConfig {
             resource_kind: resource_kind.unwrap_or(d.resource_kind),
             base_overhead: base_overhead.unwrap_or(d.base_overhead),
             pressure_threshold: pressure_threshold.unwrap_or(d.pressure_threshold),
+            cgroup_safety_margin: cgroup_safety_margin.unwrap_or(d.cgroup_safety_margin),
             temp_factors: temp_factors.unwrap_or(d.temp_factors),
         }
     }
@@ -71,6 +84,7 @@ impl SchedulerConfig {
             resource_kind: ResourceKind::new(self.resource_kind.as_str()),
             base_overhead: self.base_overhead,
             pressure_threshold: self.pressure_threshold,
+            cgroup_safety_margin: self.cgroup_safety_margin,
             temp_factors: self.temp_factors.clone(),
         }
     }

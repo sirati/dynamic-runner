@@ -12,6 +12,18 @@ pub struct ResourceStealingScheduler {
     pub resource_kind: ResourceKind,
     pub base_overhead: u64,
     pub pressure_threshold: u64,
+    /// Headroom below the cgroup cap (`max_resources`) at which userland
+    /// preempt activates. Both pressure-check branches operate against an
+    /// `effective_max = max.saturating_sub(cgroup_safety_margin)` so the
+    /// framework's smallest-active-worker kill fires BEFORE the kernel's
+    /// cgroup-OOM. Without this margin, the active-kill threshold races
+    /// the kernel's `memory.max` enforcement and loses — kernel SIGKILL
+    /// strikes first, the worker never gets a userland teardown chance,
+    /// and the OOM event surfaces as a process-tree death rather than a
+    /// scheduler-mediated kill. Default in `::memory()` / `::for_kind()`
+    /// is 1 GiB. Set to `0` to restore the pre-fix behaviour (preempt
+    /// only AT the cgroup cap, racing kernel-OOM).
+    pub cgroup_safety_margin: u64,
     /// Temporary-budget divisors used when an opportunistic worker requests
     /// a task in `assign_normal`. The slowest idle worker (rank 0) gets
     /// `available / temp_factors[0]`; rank 1 gets `available / temp_factors[1]`;
@@ -52,6 +64,7 @@ impl ResourceStealingScheduler {
             resource_kind,
             base_overhead,
             pressure_threshold,
+            cgroup_safety_margin: 1024 * 1024 * 1024,
             temp_factors: vec![1.5, 2.0, 3.0, 4.0],
         }
     }
@@ -197,9 +210,19 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         if num_workers == 0 {
             return ResourcePressureDecision::NoAction;
         }
-        let threshold = self.pressure_threshold.min(max / num_workers);
+        // Reserve a headroom band below the cgroup cap so the
+        // framework's preempt fires before the kernel's cgroup-OOM.
+        // Both kill branches operate against `effective_max`; the
+        // user-supplied `pressure_threshold` is then layered on top
+        // for the opportunistic branch as before. With the defaults
+        // (`cgroup_safety_margin = 1 GiB`, `pressure_threshold = 500 MiB`):
+        //   - opportunistic-kill fires when usage > max − 1.5 GiB
+        //   - active-kill fires when usage > max − 1 GiB
+        // giving userland a ~1 GiB window before the kernel SIGKILLs.
+        let effective_max = max.saturating_sub(self.cgroup_safety_margin);
+        let threshold = self.pressure_threshold.min(effective_max / num_workers);
 
-        if actual_usage > max.saturating_sub(threshold) {
+        if actual_usage > effective_max.saturating_sub(threshold) {
             let mut opp: Vec<&WorkerBudgetInfo<I>> = workers
                 .iter()
                 .filter(|w| w.is_opportunistic && w.current_task.is_some())
@@ -218,7 +241,7 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
             }
         }
 
-        if actual_usage > max {
+        if actual_usage > effective_max {
             let active: Vec<&WorkerBudgetInfo<I>> = workers
                 .iter()
                 .filter(|w| w.current_task.is_some())

@@ -232,12 +232,22 @@ def _dispatch_local(task, args, config, logger) -> None:
         logger.info("No binaries to process")
         return
 
+    # SchedulerConfig surfaces the OOM headroom knobs operators need
+    # to keep the framework's userland preempt ahead of the kernel's
+    # cgroup-OOM. Both `--oom-cgroup-safety-margin` and
+    # `--oom-pressure-threshold` are absolute byte counts parsed via
+    # the same `parse_memory` helper as `--max-memory` (M/G suffixes).
+    scheduler_config = _rs.SchedulerConfig(
+        cgroup_safety_margin=_rs.parse_memory(args.oom_cgroup_safety_margin),
+        pressure_threshold=_rs.parse_memory(args.oom_pressure_threshold),
+    )
     cfg = _rs.LocalManagerConfig(
         num_workers=num_cores,
         max_resources=_rs.ResourceMap({"memory": max_memory}),
         always_restart_worker=args.always_restart_worker,
         print_pid=args.pid,
         log_oom_watcher=getattr(args, "log_oom_watcher", False),
+        scheduler_config=scheduler_config,
     )
     result = _rs.run_local(
         cfg,
