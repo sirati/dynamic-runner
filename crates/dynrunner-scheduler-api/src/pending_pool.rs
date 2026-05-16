@@ -139,7 +139,7 @@ impl<I: Identifier> WorkerView<I> {
         } = self;
         let mut kept_items = Vec::with_capacity(items.len());
         let mut kept_locators = Vec::with_capacity(locators.len());
-        for (item, locator) in items.into_iter().zip(locators.into_iter()) {
+        for (item, locator) in items.into_iter().zip(locators) {
             if pred(&item) {
                 kept_items.push(item);
                 kept_locators.push(locator);
@@ -275,6 +275,7 @@ pub struct PendingPool<I: Identifier> {
     ///     hydration path (`populate_primary_from_cluster_state`)
     ///     to seed task_ids that are in flight on OTHER nodes,
     ///     learnt from the replicated cluster ledger.
+    ///
     /// Cleared by `on_item_finished` / `on_item_failed_permanent` on
     /// terminal observation.
     ///

@@ -7,7 +7,6 @@ use tracing;
 
 use crate::config::SshConfig;
 use crate::path::expand_tilde;
-use crate::shell::shell_quote;
 use crate::traits::{CommandResult, Gateway, GatewayError};
 
 /// Gateway for SSH connections using a persistent ControlMaster connection.
@@ -76,6 +75,7 @@ pub struct SshGateway {
     ///   - adopted: `ssh -O cancel -R` each registered forward
     ///     (undo our additions, leave the master alive for the
     ///     upstream driver that spawned it)
+    ///
     /// Pre-fix disconnect() unconditionally ran `ssh -O exit`,
     /// killing the user's pre-spawned master mid-dispatch and
     /// stranding the reverse-forwards along with it. asm-tokenizer
@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn master_argv_threads_control_path_and_target() {
         let argv = build_master_argv(
-            &vec!["-p".to_string(), "2222".to_string()],
+            &["-p".to_string(), "2222".to_string()],
             "/tmp/dynrunner-m-42-7.sock",
             &[(1234, 5678)],
             "alice@host",

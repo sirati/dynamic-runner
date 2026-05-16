@@ -348,7 +348,7 @@ mod tests {
         assert_eq!(read_file(&dst), b"hello");
         assert!(!src.exists(), "src not removed");
 
-        let leftover = fs::read_dir(&dst_root.join("out"))
+        let leftover = fs::read_dir(dst_root.join("out"))
             .unwrap()
             .filter_map(|e| e.ok())
             .any(|e| {
