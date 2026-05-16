@@ -177,7 +177,21 @@ impl SubprocessWorkerFactory {
     /// Build a `std::process::Command` from a rendered template. Stdio is
     /// silenced; callers add transport-specific extras (e.g. socketpair
     /// `pre_exec` hooks) afterwards.
+    ///
+    /// Worker as its own process-group leader: `process_group(0)` asks the
+    /// kernel to create a fresh process group with `pgid == child_pid` at
+    /// exec time. Every descendant the worker forks inherits that pgid
+    /// (unless it explicitly creates its own). This is the contract the
+    /// manager-local layer's `sigterm_process_tree` /
+    /// `sigkill_process_tree` rely on: a single `kill(-pgid, ...)`
+    /// reaches the worker AND every child it spawned, which is the
+    /// load-bearing primitive for the panik (emergency-stop) shutdown
+    /// path. Without this, a worker that forked helper subprocesses
+    /// would leave them alive after a tree-kill, blocking container
+    /// teardown and orphaning compute that the operator already
+    /// declared unwanted.
     fn command_from_rendered(rendered: &RenderedCommand) -> std::process::Command {
+        use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(&rendered.argv[0]);
         cmd.args(&rendered.argv[1..]);
         for (k, v) in &rendered.env {
@@ -188,7 +202,8 @@ impl SubprocessWorkerFactory {
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
         cmd
     }
 

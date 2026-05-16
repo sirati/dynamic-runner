@@ -219,4 +219,71 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             }
         }
     }
+
+    /// Emergency-stop every worker AND its child process tree with
+    /// a SIGTERM → grace → SIGKILL ladder.
+    ///
+    /// Single concern: "take down every worker pgid the pool owns,
+    /// with a bounded escalation so a stuck child can't block the
+    /// shutdown". Used by the coordinator panik-react path; the
+    /// regular shutdown path goes through `stop_all` (which sends
+    /// a clean protocol Stop and lets the worker exit on its own).
+    ///
+    /// Sequence:
+    ///   1. SIGTERM to every worker's process group in one fan-out
+    ///      pass. This signals the worker AND every descendant
+    ///      sharing its pgid; workers that installed a SIGTERM
+    ///      handler (`runtime.py::_install_term_handler`) translate
+    ///      it into a clean shutdown.
+    ///   2. Sleep `grace` (bounded by the caller — typically a few
+    ///      seconds). The sleep is a single `tokio::time::sleep`
+    ///      across the pool rather than per-worker, so the total
+    ///      wait time is `grace`, not `grace * num_workers`.
+    ///   3. SIGKILL to every process group still alive. The
+    ///      `process_tree_alive` probe (`kill(-pgid, 0)`) tells us
+    ///      whether SIGTERM already drained the group; live ones
+    ///      escalate, dead ones are skipped.
+    ///
+    /// Idempotent: workers without a tracked pid, workers whose
+    /// process tree has already exited, and workers where pgid
+    /// signalling fails for any other reason are all no-ops on
+    /// each step. The pool's `workers` vec is left intact — the
+    /// caller is responsible for any subsequent state mutation
+    /// (e.g. setting the protocol state to Stopped).
+    pub async fn kill_all_workers_with_grace(
+        &self,
+        grace: std::time::Duration,
+    ) {
+        let count = self.workers.len();
+        if count == 0 {
+            return;
+        }
+        tracing::info!(
+            workers = count,
+            grace_ms = grace.as_millis() as u64,
+            "kill_all_workers_with_grace: sending SIGTERM to every worker pgid"
+        );
+        for worker in &self.workers {
+            worker.sigterm_process_tree();
+        }
+        // Single sleep across the pool — wall-clock teardown is
+        // bounded by `grace`, not `grace * num_workers`.
+        tokio::time::sleep(grace).await;
+        let mut escalated = 0usize;
+        for worker in &self.workers {
+            if worker.process_tree_alive() {
+                worker.sigkill_process_tree();
+                escalated += 1;
+            }
+        }
+        if escalated > 0 {
+            tracing::warn!(
+                escalated,
+                workers = count,
+                "kill_all_workers_with_grace: SIGKILL escalation fired \
+                 for {escalated}/{count} worker pgid(s) that ignored \
+                 SIGTERM within the grace window"
+            );
+        }
+    }
 }
