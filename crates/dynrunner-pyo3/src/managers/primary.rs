@@ -124,6 +124,16 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `mem::take`-d into the spawned dispatcher).
     peer_lifecycle_listener: Option<Py<PyAny>>,
 
+    /// Optional Python task-completion listener supplied at
+    /// `__init__`. `Some` iff the caller passed
+    /// `task_completed_listener=<callable>`; the callable is bridged
+    /// through `crate::task_completed_bridge::PyTaskCompletedListener`
+    /// and registered on the inner `PrimaryCoordinator` at `run()`
+    /// start via `register_task_completed_listener`. Constructor-only
+    /// — same pre-`run()` registration contract as the peer-lifecycle
+    /// listener.
+    task_completed_listener: Option<Py<PyAny>>,
+
     /// Optional Python fulfillability matcher supplied at `__init__`.
     /// `Some` iff the caller passed `fulfillability_matcher=<callable>`;
     /// the object is bridged through
@@ -184,6 +194,7 @@ impl PyPrimaryCoordinator {
         fulfillability_matcher = None,
         respawn_policy = None,
         respawn_spawner = None,
+        task_completed_listener = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -199,6 +210,7 @@ impl PyPrimaryCoordinator {
         fulfillability_matcher: Option<Py<PyAny>>,
         respawn_policy: Option<crate::config::respawn::PyRespawnPolicy>,
         respawn_spawner: Option<Py<PyAny>>,
+        task_completed_listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -250,6 +262,7 @@ impl PyPrimaryCoordinator {
             respawn_policy: respawn_policy
                 .unwrap_or_else(crate::config::respawn::PyRespawnPolicy::rust_disabled),
             respawn_spawner,
+            task_completed_listener,
         })
     }
 
@@ -453,6 +466,19 @@ impl PyPrimaryCoordinator {
             self.peer_lifecycle_listener
                 .take()
                 .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+
+        // Same shape as the peer-lifecycle listener: take the Python
+        // callable out of `self`, wrap it as a `Box<dyn
+        // TaskCompletedListener>` at the bridge boundary, and register
+        // it on the inner coordinator BEFORE `run()` enters. The
+        // dispatcher takes ownership at run-start (see
+        // `PrimaryCoordinator::run_pipeline` -> `mem::take` on
+        // `task_completed_listeners`), so registration must happen
+        // pre-run.
+        let task_completed_listener =
+            self.task_completed_listener
+                .take()
+                .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
         // Same shape for the fulfillability matcher kwarg: take the
         // Python callable out of `self`, wrap it as a
@@ -691,6 +717,13 @@ impl PyPrimaryCoordinator {
                 // the listener vector into the spawned dispatcher.
                 if let Some(listener) = peer_lifecycle_listener {
                     primary.register_lifecycle_listener(listener);
+                }
+
+                // Same shape for the task-completion listener: an
+                // independent dispatcher pair with the same pre-run
+                // registration requirement.
+                if let Some(listener) = task_completed_listener {
+                    primary.register_task_completed_listener(listener);
                 }
 
                 // Same boundary as the lifecycle listener: install

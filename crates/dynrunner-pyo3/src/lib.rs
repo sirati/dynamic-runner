@@ -10,6 +10,7 @@ mod identifier;
 mod managers;
 mod network;
 mod peer_lifecycle_bridge;
+mod task_completed_bridge;
 mod protocol_manager_worker;
 mod publish;
 mod pytypes;

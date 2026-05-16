@@ -669,6 +669,35 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// synchronous with `run()` returning.
     pub(super) lifecycle_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Task-completion dispatcher channel receiver, paired with the
+    /// `task_completed_tx` installed on `cluster_state` at construction.
+    /// Taken out at `run()` start and handed to
+    /// [`crate::task_completed::run_task_completed_dispatcher`] inside
+    /// the operational LocalSet so the dispatcher's lifetime tracks
+    /// the operational loop's tokio runtime. Mirrors `lifecycle_rx`
+    /// exactly; the two dispatchers are independent modules with
+    /// independent channels and independent listener vectors.
+    pub(super) task_completed_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>,
+    >,
+
+    /// Consumers of task-completion events. Appended to via
+    /// [`Self::register_task_completed_listener`] before `run()`
+    /// enters; `std::mem::take` moves the whole vector into the
+    /// spawned dispatcher at `run()` start, after which the field is
+    /// empty and any post-run `register_task_completed_listener` calls
+    /// are silently appending to a dead-letter list. Mirrors
+    /// `peer_lifecycle_listeners`.
+    pub(super) task_completed_listeners:
+        Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
+
+    /// Handle to the task-completion dispatcher task spawned at
+    /// `run()` start. Same shape + cleanup discipline as
+    /// `lifecycle_dispatcher_handle`; the
+    /// `cleanup_task_completed_dispatcher` helper takes it and joins
+    /// on every exit path of `run()`.
+    pub(super) task_completed_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// Matcher-trigger receiver, paired with the
     /// `matcher_trigger_tx` installed on `cluster_state` at
     /// construction. Taken out at `run()` start so the operational
@@ -811,6 +840,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `crate::fulfillability_matcher::drain_matcher_batch`.
         let (matcher_trigger_tx, matcher_trigger_rx) =
             tokio::sync::mpsc::unbounded_channel();
+        // Task-completion dispatcher channel. Same construction-time
+        // motivation as `lifecycle_tx`: the apply path on
+        // `cluster_state` needs a sender ready from the very first
+        // `TaskCompleted`/`TaskFailed` apply. The receiver waits on
+        // `self` until `run()` spawns the dispatcher; events emitted
+        // in the interim queue on the unbounded channel and drain on
+        // the first dispatcher poll.
+        let (task_completed_tx, task_completed_rx) =
+            tokio::sync::mpsc::unbounded_channel();
         // Seed the monotonic id allocator past the IDs the prep phase
         // already minted (`secondary-0..secondary-{num_secondaries - 1}`)
         // so the first respawn lands on `secondary-{num_secondaries}`.
@@ -852,6 +890,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
             lifecycle_dispatcher_handle: None,
+            task_completed_rx: Some(task_completed_rx),
+            task_completed_listeners: Vec::new(),
+            task_completed_dispatcher_handle: None,
             matcher_trigger_rx: Some(matcher_trigger_rx),
             fulfillability_matcher: None,
             next_secondary_id,
@@ -881,6 +922,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // receiver from `run()` onward.
         this.cluster_state
             .install_matcher_trigger_sender(matcher_trigger_tx);
+        // Same shape: install the task-completion sender so the
+        // `TaskCompleted` / `TaskFailed` apply rules' emit calls route
+        // through the dispatcher channel from this point onward.
+        this.cluster_state
+            .install_task_completed_sender(task_completed_tx);
         // Mirror `SecondaryCoordinator::new`'s registration: attach the
         // peer transport's write-through `RoleTable` cache to the
         // authoritative `cluster_state.role_table`. The hook fires on
@@ -939,6 +985,31 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // value (it's `Future<Output = ()>`), so the only thing
             // an Ok branch could carry is the unit value — nothing
             // to consume.
+            let _ = handle.await;
+        }
+    }
+
+    /// Register a [`crate::task_completed::TaskCompletedListener`] to
+    /// be invoked off the apply path for every `TaskCompleted` /
+    /// `TaskFailed` (state-changing) apply rule. Must be called BEFORE
+    /// `run()` enters; calls after `run()` has consumed the listener
+    /// vector are dropped silently (the field is `mem::take`-d into
+    /// the dispatcher at run start, and the dispatcher is the only
+    /// reader). Mirrors [`Self::register_lifecycle_listener`].
+    pub fn register_task_completed_listener(
+        &mut self,
+        listener: Box<dyn crate::task_completed::TaskCompletedListener>,
+    ) {
+        self.task_completed_listeners.push(listener);
+    }
+
+    /// Tear down the task-completion dispatcher task spawned at
+    /// `run()` start. Mirrors [`Self::cleanup_lifecycle_dispatcher`]
+    /// exactly — the same abort+await dance with the same Drop-vs-
+    /// LocalSet rationale.
+    pub(super) async fn cleanup_task_completed_dispatcher(&mut self) {
+        if let Some(handle) = self.task_completed_dispatcher_handle.take() {
+            handle.abort();
             let _ = handle.await;
         }
     }
@@ -1280,6 +1351,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
             .await;
         self.cleanup_lifecycle_dispatcher().await;
+        // Independent of `cleanup_lifecycle_dispatcher` — the two
+        // dispatchers own independent channels + listener vectors;
+        // both run from spawn-at-`run()`-start to abort-at-`run()`-
+        // exit and both must be joined before `run()` returns so the
+        // PyO3 wrapper / SLURM pipeline don't leak them.
+        self.cleanup_task_completed_dispatcher().await;
         result
     }
 
@@ -1331,6 +1408,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
             );
             self.lifecycle_dispatcher_handle = Some(handle);
+        }
+
+        // Same shape as the peer-lifecycle dispatcher spawn: hand the
+        // (rx, listeners) pair to the task-completion dispatcher
+        // BEFORE any wire mutation can land. The (sender, receiver)
+        // pair was built in `new()` and the sender already installed
+        // on `cluster_state`. The returned `JoinHandle` is stored on
+        // `self` so `cleanup_task_completed_dispatcher` aborts + joins
+        // on every `run()` exit path (same dispatcher-leak defence
+        // documented for the peer-lifecycle handle).
+        if let Some(rx) = self.task_completed_rx.take() {
+            let listeners = std::mem::take(&mut self.task_completed_listeners);
+            let handle = tokio::task::spawn_local(
+                crate::task_completed::run_task_completed_dispatcher(rx, listeners),
+            );
+            self.task_completed_dispatcher_handle = Some(handle);
         }
 
         // Discover the phase set: union of (1) every phase referenced

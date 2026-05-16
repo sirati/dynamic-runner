@@ -63,12 +63,33 @@ correctness reason.
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 from ._shared import TaskInfo
+
+if TYPE_CHECKING:
+    # `PrimaryHandle` is the in-flight runtime control surface minted
+    # off `RustPrimaryCoordinator.handle()`; imported here only for
+    # type-checking so the module doesn't carry a runtime dependency on
+    # the Rust extension at import time.
+    from . import PrimaryHandle
+
+
+# Type alias for the optional `task_completed_listener` task attribute.
+# Called once per terminal task transition with
+# `(task_id, success, error_kind)`:
+#   - `task_id`: the consumer-supplied identifier from `TaskInfo.task_id`,
+#     or `None` if the task carried no id.
+#   - `success`: `True` if the apply path transitioned the task to
+#     `Completed`; `False` for any failure terminal (`Failed`,
+#     `Unfulfillable`).
+#   - `error_kind`: `None` on success; on failure the wire-stable
+#     `ErrorType.wire_value()` tag (e.g. `"oom"`, `"non_recoverable"`,
+#     `"recoverable"`, `"unfulfillable:<reason>"`).
+TaskCompletedListener = Callable[[Optional[str], bool, Optional[str]], None]
 
 
 PhaseId = str
@@ -166,8 +187,26 @@ class TaskDefinition(Protocol):
     # ── Lifecycle hooks ────────────────────────────────────────────────
 
     def on_run_start(
-        self, source_dir: Path, output_dir: Path, args: Namespace
-    ) -> None: ...
+        self,
+        source_dir: Path,
+        output_dir: Path,
+        args: Namespace,
+        primary_handle: Optional["PrimaryHandle"] = None,
+    ) -> None:
+        """Fire at run start, after the coordinator is constructed.
+
+        ``primary_handle`` is the in-flight runtime control surface for
+        the primary coordinator. It is ``None`` on secondaries (which
+        own no coordinator), and the live ``PrimaryHandle`` on the
+        primary so the task can drive
+        ``primary_handle.spawn_tasks(...)`` from inside ``on_run_start``.
+
+        The framework calls ``on_run_start`` with the kwarg on every
+        primary-side dispatcher; legacy task signatures that omit it
+        keep working via a positional-only fallback in the PyO3
+        bridge.
+        """
+        ...
 
     def on_run_end(self, success: bool) -> None: ...
 
@@ -176,3 +215,14 @@ class TaskDefinition(Protocol):
     def on_phase_end(
         self, phase_id: PhaseId, completed: int, failed: int
     ) -> None: ...
+
+    # Optional task-completion listener attribute.
+    #
+    # When the task exposes ``task_completed_listener`` as a callable
+    # matching :data:`TaskCompletedListener`, the framework registers
+    # it on the primary's cluster-state dispatcher. The listener fires
+    # once per terminal task transition (success or failure), off the
+    # CRDT apply path, with panic + ``PyErr`` isolation so a buggy
+    # listener can never stall the apply path or tear the dispatcher
+    # task down. Absent or ``None`` opts out.
+    task_completed_listener: Optional[TaskCompletedListener]
