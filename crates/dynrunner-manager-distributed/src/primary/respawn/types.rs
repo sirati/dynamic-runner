@@ -1,0 +1,145 @@
+//! Wire/value types and traits for the respawn pipeline.
+//!
+//! Pure data + the [`SecondarySpawner`] trait. No methods on
+//! `PrimaryCoordinator` here; budget evaluation lives in [`super::budget`]
+//! and the operational-loop wiring lives in [`super::handler`].
+
+use dynrunner_protocol_primary_secondary::RemovalCause;
+
+/// Specification handed to the spawner when the primary requests a
+/// replacement secondary. Carries the primary's pubkey so the spawned
+/// secondary can authenticate inbound connections.
+#[derive(Clone, Debug)]
+pub struct SecondarySpawnSpec {
+    pub new_secondary_id: String,
+    pub primary_endpoint: String,
+    pub primary_pubkey_pem: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error("spawn provider unavailable: {0}")]
+    ProviderUnavailable(String),
+    #[error("spawn timed out")]
+    Timeout,
+    #[error("spawn failed: {0}")]
+    Other(String),
+}
+
+/// Async trait for the per-provider spawner. Multi-process and SLURM
+/// implementations live in sibling files.
+///
+/// `#[async_trait(?Send)]` because the SLURM impl drives
+/// `ssh -N -R` subprocess spawn through a closure whose future is not
+/// `Send` (the closure returns `Pin<Box<dyn Future + 'static>>` — see
+/// `dynrunner_slurm::preparation::production_spawner`). The operational
+/// loop on `PrimaryCoordinator` already runs inside a
+/// `tokio::task::LocalSet` for the same reason (the SLURM preparation
+/// pipeline uses `spawn_local` for per-tunnel watchers), so dropping
+/// the `Send` bound on the returned future does not constrain the
+/// integration site — it just lifts a constraint the provider physics
+/// can't satisfy. The trait object itself stays `Send + Sync` so
+/// `Arc<dyn SecondarySpawner>` is moveable across `select!` arms.
+#[async_trait::async_trait(?Send)]
+pub trait SecondarySpawner: Send + Sync {
+    async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct RespawnBudget {
+    pub max_per_secondary: u32,
+    pub max_total: u32,
+    pub cooldown: std::time::Duration,
+}
+
+impl Default for RespawnBudget {
+    fn default() -> Self {
+        Self {
+            max_per_secondary: 3,
+            max_total: 10,
+            cooldown: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RespawnOutcome {
+    pub original_id: String,
+    pub new_id: String,
+    pub cause: RemovalCause,
+    pub result: Result<(), String>,
+}
+
+/// Track family of respawned secondaries — `original_id` lets the
+/// budget look at the chain to apply per-secondary caps.
+#[derive(Clone, Debug)]
+pub struct RespawnEvent {
+    pub original_id: String,
+    pub new_id: String,
+    pub cause: RemovalCause,
+    pub at: std::time::SystemTime,
+}
+
+/// Maximum number of [`RespawnEvent`]s retained on the coordinator's
+/// `respawn_events` ring. Sized for operator forensics across the
+/// lifetime of a single run; the ring drops oldest on overflow.
+pub const RESPAWN_EVENTS_CAP: usize = 1024;
+
+/// Push `ev` onto a `respawn_events` ring, evicting the oldest entry
+/// when the ring is already at [`RESPAWN_EVENTS_CAP`]. The single
+/// concern of this helper is bounded FIFO semantics; the operational
+/// loop (the only legitimate caller) does not need to know the cap.
+pub(crate) fn push_event(ring: &mut std::collections::VecDeque<RespawnEvent>, ev: RespawnEvent) {
+    if ring.len() == RESPAWN_EVENTS_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(ev);
+}
+
+/// Cross-boundary request issued by the peer-lifecycle listener side
+/// and consumed by the operational `select!` arm.
+///
+/// Single concern: carry a `Removed`-shaped lifecycle observation
+/// across the dispatcher → operational-loop boundary without leaking
+/// any coordinator-side state into the listener. The listener cannot
+/// hold `&mut PrimaryCoordinator` (it runs on the peer-lifecycle
+/// dispatcher task, which has no access to the coordinator's
+/// `respawn_tasks` JoinSet or the `next_secondary_id` allocator);
+/// instead it emits one of these requests and the operational loop
+/// owns the budget check, the id mint, the spawner invocation, and
+/// the JoinSet push.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RespawnRequest {
+    pub original_id: String,
+    pub cause: RemovalCause,
+}
+
+// Note: the dispatcher → operational-loop request channel is now
+// UNBOUNDED. The historical bounded capacity (`RESPAWN_REQUEST_CHANNEL_CAPACITY
+// = 256`) drop-on-full path lost deaths during mass-death-grace
+// finalize bursts and broke the budget accounting (a dropped request
+// is invisible to `respawn_events`, so the family-budget counter
+// never increments and the operator-visible `respawn_budget_exhausted`
+// line never fires for the lost peer). The apply-path lifecycle
+// channel uses `tokio::sync::mpsc::unbounded_channel` for the same
+// reason: the producer is the synchronous lifecycle dispatcher
+// `on_event` arm, which must NEVER block; the consumer is the
+// operational-loop `select!` arm, which drains at the rate of one
+// `dispatch_respawn_request` per iteration. Memory is bounded by the
+// total-budget cap (`RespawnBudget::max_total`, default 10) — once
+// the operational loop has reconciled `max_total` requests every
+// subsequent enqueue gets a `RejectTotalBudget` decision and the
+// queue empties.
+
+/// Decision returned by [`RespawnBudget::should_respawn`].
+///
+/// `Accept` is the success arm; the three `Reject*` variants carry
+/// the reason so the operational-loop arm can emit a distinct
+/// structured-log event per case (the operator forensics surface).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RespawnDecision {
+    Accept,
+    RejectFamilyBudget,
+    RejectTotalBudget,
+    RejectCooldown,
+}
