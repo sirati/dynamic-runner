@@ -178,7 +178,10 @@ pub(crate) fn run_local<'py>(
     unfulfillable_reinject_max_per_task = None,
     respawn_policy = None,
     respawn_spawner = None,
+    fulfillability_matcher = None,
+    peer_lifecycle_listener = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_primary<'py>(
     py: Python<'py>,
     config: PyRef<'py, PyPrimaryConfig>,
@@ -190,6 +193,8 @@ pub(crate) fn run_primary<'py>(
     unfulfillable_reinject_max_per_task: Option<u32>,
     respawn_policy: Option<Py<PyAny>>,
     respawn_spawner: Option<Py<PyAny>>,
+    fulfillability_matcher: Option<Py<PyAny>>,
+    peer_lifecycle_listener: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
@@ -207,6 +212,12 @@ pub(crate) fn run_primary<'py>(
     }
     if let Some(s) = respawn_spawner.as_ref() {
         kwargs.set_item("respawn_spawner", s)?;
+    }
+    if let Some(m) = fulfillability_matcher.as_ref() {
+        kwargs.set_item("fulfillability_matcher", m)?;
+    }
+    if let Some(l) = peer_lifecycle_listener.as_ref() {
+        kwargs.set_item("peer_lifecycle_listener", l)?;
     }
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;
@@ -348,6 +359,8 @@ pub(crate) fn run_secondary<'py>(
     log_paths = None,
     worker_spec = None,
     source_pre_staged_root = None,
+    fulfillability_matcher = None,
+    peer_lifecycle_listener = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_distributed<'py>(
@@ -363,6 +376,8 @@ pub(crate) fn run_distributed<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
     source_pre_staged_root: Option<std::path::PathBuf>,
+    fulfillability_matcher: Option<Py<PyAny>>,
+    peer_lifecycle_listener: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_per_secondary` retained for back-compat; the
     // typed path passes the full multi-resource map via the
@@ -392,6 +407,12 @@ pub(crate) fn run_distributed<'py>(
     )?;
     if let Some(root) = source_pre_staged_root.as_ref() {
         kwargs.set_item("source_pre_staged_root", root)?;
+    }
+    if let Some(m) = fulfillability_matcher.as_ref() {
+        kwargs.set_item("fulfillability_matcher", m)?;
+    }
+    if let Some(l) = peer_lifecycle_listener.as_ref() {
+        kwargs.set_item("peer_lifecycle_listener", l)?;
     }
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
