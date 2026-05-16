@@ -1,0 +1,272 @@
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+
+use super::types::{SlurmError, SlurmJobManager};
+use crate::config::SlurmConfig;
+use crate::packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
+use dynrunner_gateway::local::LocalGateway;
+use dynrunner_gateway::traits::{CommandResult, Gateway, GatewayError};
+
+/// Records the inputs the manager hands to the packager so we
+/// can assert the boundary contract (output_dir == image_path)
+/// without standing up a real builder.
+struct RecordingPackaging {
+    calls: AtomicUsize,
+    last_output_dir: Mutex<Option<PathBuf>>,
+    last_project_root: Mutex<Option<PathBuf>>,
+    result: PodmanImageMetadata,
+}
+
+impl<G: Gateway> PodmanPackaging<G> for RecordingPackaging {
+    async fn build_images(
+        &self,
+        _gateway: &G,
+        local_project_root: &Path,
+        output_dir: &Path,
+    ) -> Result<PodmanImageMetadata, PackagingError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_output_dir.lock().unwrap() = Some(output_dir.to_path_buf());
+        *self.last_project_root.lock().unwrap() = Some(local_project_root.to_path_buf());
+        Ok(self.result.clone())
+    }
+}
+
+#[tokio::test]
+async fn build_and_transfer_images_forwards_to_packager() {
+    let gw = LocalGateway::new();
+    let config = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        ..SlurmConfig::default()
+    };
+    let manager = SlurmJobManager::new(config, gw);
+
+    let packager = RecordingPackaging {
+        calls: AtomicUsize::new(0),
+        last_output_dir: Mutex::new(None),
+        last_project_root: Mutex::new(None),
+        result: PodmanImageMetadata {
+            remote_path: PathBuf::from("/srv/slurm/image_bin/app.tar.gz"),
+            image_hash: "abc123".into(),
+            uploaded: true,
+        },
+    };
+
+    let project_root = PathBuf::from("/work/proj");
+    let metadata = manager
+        .build_and_transfer_images(&packager, &project_root)
+        .await
+        .expect("delegation succeeds");
+
+    // Boundary contract: SlurmJobManager translates its config's
+    // image_path() into the packager's output_dir argument; the
+    // local project root is forwarded unchanged.
+    assert_eq!(packager.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        packager.last_output_dir.lock().unwrap().as_deref(),
+        Some(Path::new("/srv/slurm/image_bin")),
+    );
+    assert_eq!(
+        packager.last_project_root.lock().unwrap().as_deref(),
+        Some(project_root.as_path()),
+    );
+
+    // Returned metadata is forwarded verbatim — the manager owns
+    // no normalisation policy.
+    assert_eq!(metadata.remote_path, PathBuf::from("/srv/slurm/image_bin/app.tar.gz"));
+    assert_eq!(metadata.image_hash, "abc123");
+    assert!(metadata.uploaded);
+}
+
+#[tokio::test]
+async fn build_and_transfer_images_propagates_packager_failure() {
+    struct FailingPackaging;
+    impl<G: Gateway> PodmanPackaging<G> for FailingPackaging {
+        async fn build_images(
+            &self,
+            _gateway: &G,
+            _local_project_root: &Path,
+            _output_dir: &Path,
+        ) -> Result<PodmanImageMetadata, PackagingError> {
+            Err(PackagingError::BuildFailed("nix build crashed".into()))
+        }
+    }
+
+    let gw = LocalGateway::new();
+    let manager = SlurmJobManager::new(SlurmConfig::default(), gw);
+    let err = manager
+        .build_and_transfer_images(&FailingPackaging, Path::new("/proj"))
+        .await
+        .expect_err("packager error must surface");
+    match err {
+        SlurmError::Packaging(PackagingError::BuildFailed(msg)) => {
+            assert_eq!(msg, "nix build crashed");
+        }
+        other => panic!("expected Packaging(BuildFailed), got {other:?}"),
+    }
+}
+
+/// Recording gateway for `submit_job` tests: captures every
+/// `execute_command` and answers any `sbatch ...` line with a
+/// canned job ID, every other command with empty stdout. Routing
+/// by command-prefix (rather than call-index) means the test stays
+/// correct if `submit_job` ever inserts an additional setup
+/// command before the sbatch invocation.
+#[derive(Default)]
+struct SubmitRecordingGateway {
+    commands: Mutex<Vec<String>>,
+}
+
+impl SubmitRecordingGateway {
+    fn commands(&self) -> Vec<String> {
+        self.commands.lock().unwrap().clone()
+    }
+
+    fn sbatch_command(&self) -> String {
+        self.commands
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|c| c.starts_with("sbatch "))
+            .expect("sbatch command must have been issued")
+            .clone()
+    }
+}
+
+impl Gateway for SubmitRecordingGateway {
+    async fn connect(&mut self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn disconnect(&mut self) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn execute_command(
+        &self,
+        cmd: &str,
+        _cwd: Option<&str>,
+    ) -> Result<CommandResult, GatewayError> {
+        self.commands.lock().unwrap().push(cmd.to_string());
+        // Only `sbatch --parsable` is expected to produce stdout;
+        // anything else (e.g. the `printf … > path` script-write)
+        // is silent in the real shell.
+        let stdout = if cmd.starts_with("sbatch ") {
+            "12345".to_string()
+        } else {
+            String::new()
+        };
+        Ok(CommandResult {
+            return_code: 0,
+            stdout,
+            stderr: String::new(),
+        })
+    }
+    async fn transfer_file(&self, _local: &Path, _remote: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn download_file(&self, _remote: &str, _local: &Path) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn create_directory(&self, _remote: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+    async fn file_exists(&self, _remote: &str) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+    fn setup_port_forwarding(&mut self, _l: u16, _r: u16) -> Result<(), GatewayError> {
+        Ok(())
+    }
+}
+
+/// Parity vs. Python `SlurmJobManager.submit_job` in
+/// `packaging/job_manager.py`:
+///
+/// (a) `--mail-type=ALL` is the only mail-type emitted when notify
+///     is set (Python uses ALL; the negative assertion guards
+///     against accidental regression to FAIL).
+/// (b) `--mem` is OMITTED when `memory_per_node` is `None` —
+///     matches Python, which never emits `--mem` at all.
+/// (c) `memory_per_node = Some("...")` → `--mem={val}` IS emitted
+///     so opt-in operators still get a cap.
+/// (d) Wrapper script lands at `<root_folder>/job_<name>.sh`
+///     (Python placement; the negative assertion guards against
+///     regression to the historical `<log_path>/wrapper_<name>.sh`).
+/// (e) `--ntasks=1` IS emitted (legacy Python had it; Rust
+///     previously omitted it — a parity gap that this assertion
+///     locks down so `sbatch` defaults can't drift the launched
+///     proc count on partitions whose default ntasks is > 1).
+#[tokio::test]
+async fn submit_job_matches_python_invocation_shape() {
+    // Case A+B+D: defaults — no mem, mail=ALL on notify, script in root.
+    let gw = SubmitRecordingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        notify_email: Some("ops@example.com".into()),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    let jid = mgr
+        .submit_job("#!/bin/sh\necho hi", "myjob", 1, "/srv/slurm/log/run-1")
+        .await
+        .expect("submit succeeds");
+    assert_eq!(jid, "12345");
+
+    let cmds = mgr.gateway().commands();
+
+    // (d) Script path: `<root_folder>/job_<job_name>.sh`.
+    let write_cmd = cmds
+        .iter()
+        .find(|c| !c.starts_with("sbatch "))
+        .expect("script-write command must precede sbatch");
+    assert!(
+        write_cmd.contains("/srv/slurm/job_myjob.sh"),
+        "wrapper script must land under root_folder, got: {write_cmd}",
+    );
+    assert!(
+        !write_cmd.contains("/log/wrapper_"),
+        "wrapper must not land at <log_path>/wrapper_<name>.sh: {write_cmd}",
+    );
+
+    let sbatch = mgr.gateway().sbatch_command();
+    // (a) mail=ALL only.
+    assert!(
+        sbatch.contains("--mail-type=ALL"),
+        "expected --mail-type=ALL in sbatch; got: {sbatch}",
+    );
+    assert!(
+        !sbatch.contains("--mail-type=FAIL"),
+        "--mail-type=FAIL must not appear: {sbatch}",
+    );
+    // (b) no --mem when memory_per_node is unset.
+    assert!(
+        !sbatch.contains("--mem="),
+        "--mem must be omitted when memory_per_node is None; got: {sbatch}",
+    );
+    // (e) --ntasks=1 must be present (Python parity, locks down the
+    // partition-default-ntasks-drift class of bug).
+    assert!(
+        sbatch.contains("--ntasks=1"),
+        "--ntasks=1 must be emitted for Python-parity; got: {sbatch}",
+    );
+    // sbatch line ends with the script path argument.
+    assert!(
+        sbatch.ends_with("/srv/slurm/job_myjob.sh"),
+        "sbatch must terminate with the script path; got: {sbatch}",
+    );
+
+    // Case C: memory_per_node explicitly set → --mem={val} emitted.
+    let gw = SubmitRecordingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        memory_per_node: Some("32G".into()),
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    mgr.submit_job("#!/bin/sh", "j2", 1, "/srv/slurm/log/run-2")
+        .await
+        .expect("submit succeeds");
+    let sbatch = mgr.gateway().sbatch_command();
+    assert!(
+        sbatch.contains("--mem=32G"),
+        "expected --mem=32G when memory_per_node is set; got: {sbatch}",
+    );
+}
