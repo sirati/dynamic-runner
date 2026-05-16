@@ -745,6 +745,16 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// adapter-side cache.
     pub(super) respawn_primary_endpoint: String,
     pub(super) respawn_primary_pubkey_pem: String,
+
+    /// Dedup state for "task names a preferred secondary id we have
+    /// never heard of" warnings. The validator does not own the
+    /// known-secondaries set nor the task list; the call sites in
+    /// `lifecycle.rs::seed_cluster_state` (initial validation) and
+    /// `task.rs::handle_cluster_mutation` (post-PeerJoined revalidation)
+    /// supply both per invocation. Single concern lives in
+    /// [`preferred_secondaries::PreferredSecondariesValidator`].
+    pub(super) preferred_secondaries_validator:
+        preferred_secondaries::PreferredSecondariesValidator,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -826,6 +836,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             respawn_request_rx: None,
             respawn_primary_endpoint: String::new(),
             respawn_primary_pubkey_pem: String::new(),
+            preferred_secondaries_validator:
+                preferred_secondaries::PreferredSecondariesValidator::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -1562,6 +1574,7 @@ mod fulfillability_matcher;
 mod heartbeat;
 mod lifecycle;
 mod peer_setup;
+pub mod preferred_secondaries;
 pub mod respawn;
 pub mod staging;
 mod task;
