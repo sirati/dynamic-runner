@@ -24,6 +24,15 @@ use pyo3::types::PyDict;
 
 use dynrunner_core::PhaseId;
 
+/// Boxed `on_phase_start` callback shape callers wire into the
+/// manager run loop.
+pub(crate) type OnPhaseStart = Box<dyn FnMut(&PhaseId) + Send>;
+
+/// Boxed `on_phase_end` callback shape callers wire into the
+/// manager run loop. Receives `(phase_id, completed_count,
+/// failed_count)` at every Active → Drained transition.
+pub(crate) type OnPhaseEnd = Box<dyn FnMut(&PhaseId, u32, u32) + Send>;
+
 /// Build an `on_phase_start` closure that re-acquires the GIL and calls
 /// `task_definition.on_phase_start(phase_id)`.
 ///

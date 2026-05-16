@@ -103,15 +103,15 @@ impl SlurmConfig {
         if self.root_folder.is_empty() {
             return Err("SLURM root folder is required".into());
         }
-        if let Some(exists) = root_exists {
-            if !exists(&self.root_folder) {
-                let home = remote_home.unwrap_or("~");
-                let suggestions = format!("{home}/slurm, {home}/BIG/slurm");
-                return Err(format!(
-                    "SLURM root folder does not exist on gateway: {}\nSuggested locations: {}",
-                    self.root_folder, suggestions,
-                ));
-            }
+        if let Some(exists) = root_exists
+            && !exists(&self.root_folder)
+        {
+            let home = remote_home.unwrap_or("~");
+            let suggestions = format!("{home}/slurm, {home}/BIG/slurm");
+            return Err(format!(
+                "SLURM root folder does not exist on gateway: {}\nSuggested locations: {}",
+                self.root_folder, suggestions,
+            ));
         }
         Ok(())
     }
@@ -160,8 +160,10 @@ mod tests {
 
     #[test]
     fn srcbins_mount_source_uses_prestaged_absolute_path_verbatim() {
-        let mut cfg = SlurmConfig::default();
-        cfg.prestaged_src_bins_path = Some("/srv/cluster/staged-src".into());
+        let cfg = SlurmConfig {
+            prestaged_src_bins_path: Some("/srv/cluster/staged-src".into()),
+            ..SlurmConfig::default()
+        };
         assert_eq!(
             cfg.srcbins_mount_source(),
             "/srv/cluster/staged-src",
@@ -171,8 +173,10 @@ mod tests {
 
     #[test]
     fn srcbins_mount_source_resolves_relative_prestaged_against_root() {
-        let mut cfg = SlurmConfig::default();
-        cfg.prestaged_src_bins_path = Some("staged-src".into());
+        let cfg = SlurmConfig {
+            prestaged_src_bins_path: Some("staged-src".into()),
+            ..SlurmConfig::default()
+        };
         assert_eq!(
             cfg.srcbins_mount_source(),
             "~/dynamic_batch/staged-src",
@@ -182,8 +186,10 @@ mod tests {
 
     #[test]
     fn srcbins_mount_source_does_not_mutate_src_bins_path() {
-        let mut cfg = SlurmConfig::default();
-        cfg.prestaged_src_bins_path = Some("/elsewhere".into());
+        let cfg = SlurmConfig {
+            prestaged_src_bins_path: Some("/elsewhere".into()),
+            ..SlurmConfig::default()
+        };
         assert_eq!(cfg.src_bins_path(), "~/dynamic_batch/image_bin/srcbins");
         assert_eq!(cfg.srcbins_mount_source(), "/elsewhere");
     }

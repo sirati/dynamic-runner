@@ -220,6 +220,9 @@ pub(super) struct PrimaryInFlightItem<I: Identifier> {
 #[derive(Debug, Clone)]
 pub(super) struct FailedTaskEntry<I: Identifier> {
     pub(super) binary: TaskInfo<I>,
+    // Kept for diagnostic / future routing; not currently read by the
+    // retry path which surfaces it via the FailedTask wire message.
+    #[allow(dead_code)]
     pub(super) error_type: ErrorType,
 }
 
@@ -910,6 +913,7 @@ where
     /// When false, the worker receives `local_path` as an opaque
     /// identifier and the framework performs no filesystem
     /// resolution.
+    #[allow(dead_code)]
     pub(super) fn uses_file_based_items(&self) -> bool {
         self.uses_file_based_items
     }

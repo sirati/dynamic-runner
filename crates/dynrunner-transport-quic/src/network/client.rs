@@ -52,7 +52,10 @@ use crate::wss::{WssConnection, connect_wss};
 /// is captured elsewhere via the next `send` returning
 /// "transport writer task exited").
 enum Outgoing<I: Identifier> {
-    Msg(DistributedMessage<I>),
+    // `Msg` is boxed so the enum stack size matches `Flush`'s 8 bytes
+    // rather than carrying a ~332-byte `DistributedMessage` inline
+    // through every mpsc slot (clippy::large_enum_variant).
+    Msg(Box<DistributedMessage<I>>),
     Flush(oneshot::Sender<()>),
 }
 
@@ -142,7 +145,7 @@ impl<I: Identifier> MessageSender<DistributedMessage<I>> for NetworkClient<I> {
         // has exited (transport closed).
         self.bridge_mut()
             .outgoing_tx
-            .send(Outgoing::Msg(msg))
+            .send(Outgoing::Msg(Box::new(msg)))
             .map_err(|_| "transport writer task exited".to_string())
     }
 

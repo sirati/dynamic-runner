@@ -11,9 +11,14 @@ use crate::worker::{WorkerEvent, WorkerHandle};
 pub enum ResourcePressureResult<I: Identifier> {
     /// A worker was killed. The caller should handle the displaced binary
     /// (e.g. requeue locally or report failure to primary).
+    ///
+    /// `binary` is boxed because `TaskInfo<I>` is large enough that the
+    /// inlined variant blew this enum out to ~236 bytes against
+    /// `NoAction`'s zero (clippy::large_enum_variant). Consumers unbox
+    /// once when passing the displaced task to its next destination.
     Killed {
         worker_id: WorkerId,
-        binary: Option<dynrunner_core::TaskInfo<I>>,
+        binary: Option<Box<dynrunner_core::TaskInfo<I>>>,
         reason: String,
     },
     /// No action needed — resources are within limits.
@@ -29,6 +34,12 @@ pub struct WorkerPool<M: ManagerEndpoint, I: Identifier> {
     pub workers: Vec<WorkerHandle<M, I>>,
     event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     event_rx: mpsc::UnboundedReceiver<WorkerEvent<I>>,
+}
+
+impl<M: ManagerEndpoint + 'static, I: Identifier> Default for WorkerPool<M, I> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
@@ -65,10 +76,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             let (transport, pid) = factory
                 .spawn_worker(i)
                 .map_err(|e| format!("failed to spawn worker {i}: {e}"))?;
-            if print_pid {
-                if let Some(pid) = pid {
-                    tracing::info!(worker_id = i, pid, "worker PID");
-                }
+            if print_pid
+                && let Some(pid) = pid
+            {
+                tracing::info!(worker_id = i, pid, "worker PID");
             }
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
@@ -122,10 +133,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         let (transport, pid) = factory
             .spawn_worker(worker_id)
             .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?;
-        if print_pid {
-            if let Some(pid) = pid {
-                tracing::info!(worker_id, pid, "worker PID (restart)");
-            }
+        if print_pid
+            && let Some(pid) = pid
+        {
+            tracing::info!(worker_id, pid, "worker PID (restart)");
         }
 
         let reserved_budgets = self.workers[worker_id as usize].reserved_budgets.clone();
@@ -182,7 +193,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
                     "killing worker under resource pressure"
                 );
                 let worker = &mut self.workers[worker_id as usize];
-                let binary = worker.current_binary.take();
+                let binary = worker.current_binary.take().map(Box::new);
                 worker.mark_oom_killed();
                 ResourcePressureResult::Killed {
                     worker_id,

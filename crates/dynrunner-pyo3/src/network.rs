@@ -1,22 +1,22 @@
-/// Local-host network helpers (hostname, IPv4/IPv6 detection).
-///
-/// Both `detect_ipv4` and `detect_ipv6` share the same primitive: parsing
-/// the space-separated address list from `hostname -I`. On Linux that
-/// command emits every non-loopback address configured on every
-/// non-loopback interface, both families intermixed — so the only
-/// difference between IPv4 and IPv6 detection is which `parse::<…Addr>`
-/// the per-token filter applies. Factored into [`first_hostname_addr`]
-/// to keep the two callers free of duplicated parsing logic.
-///
-/// Resolution honours an env-var hint (`PRIMARY_NODE_IPV4`,
-/// `PRIMARY_NODE_IPV6`) before falling back to `hostname -I`. The hint
-/// is for deployments where `hostname -I` doesn't yield a peer-routable
-/// address — e.g. a SLURM compute node whose first non-loopback IPv4
-/// is a podman/CNI bridge or an unrouted secondary NIC, while the
-/// cluster's actual LAN address is reachable via DNS on the host's
-/// FQDN. The SLURM wrapper computes the routable IP on the host and
-/// exports it; everywhere else the env var is unset and detection
-/// behaves exactly as before.
+//! Local-host network helpers (hostname, IPv4/IPv6 detection).
+//!
+//! Both `detect_ipv4` and `detect_ipv6` share the same primitive: parsing
+//! the space-separated address list from `hostname -I`. On Linux that
+//! command emits every non-loopback address configured on every
+//! non-loopback interface, both families intermixed — so the only
+//! difference between IPv4 and IPv6 detection is which `parse::<…Addr>`
+//! the per-token filter applies. Factored into [`first_hostname_addr`]
+//! to keep the two callers free of duplicated parsing logic.
+//!
+//! Resolution honours an env-var hint (`PRIMARY_NODE_IPV4`,
+//! `PRIMARY_NODE_IPV6`) before falling back to `hostname -I`. The hint
+//! is for deployments where `hostname -I` doesn't yield a peer-routable
+//! address — e.g. a SLURM compute node whose first non-loopback IPv4
+//! is a podman/CNI bridge or an unrouted secondary NIC, while the
+//! cluster's actual LAN address is reachable via DNS on the host's
+//! FQDN. The SLURM wrapper computes the routable IP on the host and
+//! exports it; everywhere else the env var is unset and detection
+//! behaves exactly as before.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;

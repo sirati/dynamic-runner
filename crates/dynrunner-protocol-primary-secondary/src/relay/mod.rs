@@ -246,6 +246,11 @@ pub fn route_send<I: Identifier, V>(
 ///
 /// `blacklist` skips peers the transport knows have recently bounced
 /// a relay for this target. Same semantics as in [`route_send`].
+///
+/// The argument list reflects the `DistributedMessage::Relay`
+/// envelope fields plus routing context; bundling into a struct
+/// would just shift the destructure-rebundle one step out.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_step<I: Identifier, V>(
     connections: &HashMap<String, V>,
     my_peer_id: &str,

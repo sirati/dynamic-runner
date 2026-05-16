@@ -59,7 +59,7 @@ fn empty_string_round_trips() {
 fn display_and_deref_match() {
     let s: BoundedString<16> = "hello".to_string().into();
     assert_eq!(format!("{}", s), "hello");
-    let r: &str = &*s;
+    let r: &str = &s;
     assert_eq!(r, "hello");
     let a: &str = s.as_ref();
     assert_eq!(a, "hello");

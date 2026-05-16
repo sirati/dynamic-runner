@@ -5,9 +5,15 @@ use crate::transport::QuicConnection;
 use crate::wss::WssConnection;
 
 /// Internal enum for either QUIC or WSS peer connection.
+///
+/// `Wss` is boxed because `WssConnection` is ~3× the size of the
+/// QUIC variant; leaving it inline blew the enum to ~304 bytes
+/// (clippy::large_enum_variant). The Box is consumed at handshake
+/// time when we destructure into the per-connection reader/writer
+/// halves.
 pub(super) enum PeerConnection {
     Quic(QuicConnection),
-    Wss(WssConnection),
+    Wss(Box<WssConnection>),
 }
 
 /// Parse a PEM certificate string to get the DER-encoded certificate.

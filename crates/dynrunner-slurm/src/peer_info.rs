@@ -266,8 +266,8 @@ pub fn parse(contents: &str) -> Result<PeerInfoRecord, PeerInfoError> {
 }
 
 /// Builder for a v2 record. Owns the `(host, tunnel_port)` legacy URI
-/// + the envelope fields. Producing the final on-disk string goes
-/// through [`Builder::format`] so the file shape (line 1 then
+/// alongside the envelope fields. Producing the final on-disk string
+/// goes through [`Builder::format`] so the file shape (line 1 then
 /// envelope) is centralised here, not duplicated across writers.
 #[derive(Debug, Clone)]
 pub struct Builder {
@@ -373,7 +373,7 @@ impl Builder {
 fn encode_b64(s: &str) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let bytes = s.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= bytes.len() {
         let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);

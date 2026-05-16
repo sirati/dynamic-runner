@@ -874,6 +874,7 @@ pub fn generate_test_wrapper_script(cfg: &TestWrapperScriptConfig<'_>) -> String
     let rndtmp = format!("/tmp/asm-test-{rnd_suffix}");
     let podman_storage = format!("{rndtmp}/storage");
     let podman_run = format!("{rndtmp}/run");
+    let image_ref = format!("{}:{}", cfg.image_name, cfg.image_tag);
 
     format!(
         r##"#!/usr/bin/env bash
@@ -964,7 +965,6 @@ echo "=================================================="
         load_command = cfg.load_command,
         image_name = cfg.image_name,
         container_command = cfg.container_command,
-        image_ref = format!("{}:{}", cfg.image_name, cfg.image_tag),
     )
 }
 
@@ -1003,13 +1003,13 @@ fn bash_quote(s: &str) -> String {
 fn rand_hex8() -> String {
     use std::io::Read;
     let mut buf = [0u8; 4];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        if f.read_exact(&mut buf).is_ok() {
-            return format!(
-                "{:02x}{:02x}{:02x}{:02x}",
-                buf[0], buf[1], buf[2], buf[3]
-            );
-        }
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom")
+        && f.read_exact(&mut buf).is_ok()
+    {
+        return format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            buf[0], buf[1], buf[2], buf[3]
+        );
     }
     // Fallback: hash of nanoseconds-since-epoch — not cryptographic
     // but identical entropy semantics for the suffix's purpose

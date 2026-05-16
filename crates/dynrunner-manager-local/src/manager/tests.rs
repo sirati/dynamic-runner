@@ -2,7 +2,7 @@
 //! `super::test_helpers`; this file holds the test scenarios.
 
 use super::test_helpers::{
-    fake_worker_loop, make_binary, test_config, FakeWorkerFactory, FakeWorkerMode,
+    make_binary, test_config, FakeWorkerFactory, FakeWorkerMode,
     FixedEstimator, TestId,
 };
 use super::*;

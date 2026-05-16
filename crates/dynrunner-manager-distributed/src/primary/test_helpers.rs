@@ -321,24 +321,24 @@ pub(super) async fn fake_secondary_with_addrs(
     while let Some(msg) = incoming_from_primary.recv().await {
         match msg {
             DistributedMessage::PeerInfo { .. } => {}
-            DistributedMessage::PromotePrimary { new_primary_id, .. } => {
-                if new_primary_id == secondary_id {
-                    // Drain the residual Pending set: every hash still
-                    // tracked here is the new primary's responsibility
-                    // post-handoff. Emit TaskComplete for each so the
-                    // primary's counter-check exit can fire.
-                    for task_hash in pending_hashes.drain() {
-                        outgoing_to_primary
-                            .send(DistributedMessage::TaskComplete {
-                                sender_id: secondary_id.clone(),
-                                timestamp: 0.0,
-                                secondary_id: secondary_id.clone(),
-                                worker_id: 0,
-                                task_hash,
-                                result_data: None,
-                            })
-                            .unwrap();
-                    }
+            DistributedMessage::PromotePrimary { new_primary_id, .. }
+                if new_primary_id == secondary_id =>
+            {
+                // Drain the residual Pending set: every hash still
+                // tracked here is the new primary's responsibility
+                // post-handoff. Emit TaskComplete for each so the
+                // primary's counter-check exit can fire.
+                for task_hash in pending_hashes.drain() {
+                    outgoing_to_primary
+                        .send(DistributedMessage::TaskComplete {
+                            sender_id: secondary_id.clone(),
+                            timestamp: 0.0,
+                            secondary_id: secondary_id.clone(),
+                            worker_id: 0,
+                            task_hash,
+                            result_data: None,
+                        })
+                        .unwrap();
                 }
             }
             DistributedMessage::ClusterMutation { mutations, .. } => {
@@ -446,6 +446,9 @@ pub(super) async fn fake_secondary_with_addrs(
 /// that the test plumbs into `fake_secondary` (or a real
 /// SecondaryCoordinator via `spawn_real_secondary` in the
 /// `e2e_helpers` companion).
+// One-off test-helper return; the tuple shape is documented by the
+// per-element doc above and isn't reused elsewhere.
+#[allow(clippy::type_complexity)]
 pub(super) fn setup_test(
     num_secondaries: u32,
 ) -> (

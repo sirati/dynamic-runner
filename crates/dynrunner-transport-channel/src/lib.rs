@@ -237,7 +237,9 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
                 .router
                 .process_inbound(msg, &mut self.outgoing, clocks)
             {
-                InboundOutcome::Deliver { msg, .. } => msg,
+                // `msg` is `Box<DistributedMessage<I>>`; unbox to feed
+                // the by-value role-layer entry point.
+                InboundOutcome::Deliver { msg, .. } => *msg,
                 InboundOutcome::Handled { .. } => continue,
             };
             match self.handle_role_layer(delivered, clocks) {
@@ -253,7 +255,7 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
             let delivered = match self.router.process_inbound_sync(msg, clocks) {
-                InboundOutcome::Deliver { msg, .. } => msg,
+                InboundOutcome::Deliver { msg, .. } => *msg,
                 InboundOutcome::Handled { .. } => continue,
             };
             match self.handle_role_layer(delivered, clocks) {
@@ -360,7 +362,10 @@ impl<I: Identifier> ChannelPeerTransport<I> {
                         }
                         if let Err(e) = self.router.send_to_peer(
                             &hint_to,
-                            hint,
+                            // Unbox once at the dispatch boundary so the
+                            // by-value send_to_peer signature stays
+                            // unchanged.
+                            *hint,
                             &mut self.outgoing,
                             clocks,
                         ) {
@@ -825,9 +830,13 @@ mod tests {
     /// driving it against an arbitrary `RoleTable`. Strictly enough
     /// to test the transport's cache plumbing without taking a
     /// dev-dep on the cluster-state crate.
+    type RoleTableHook = Box<
+        dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static,
+    >;
+
     #[derive(Default)]
     struct TestRegistrar {
-        hooks: Vec<Box<dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync>>,
+        hooks: Vec<RoleTableHook>,
     }
 
     impl TestRegistrar {
@@ -839,12 +848,7 @@ mod tests {
     }
 
     impl RoleChangeHookRegistrar for TestRegistrar {
-        fn register_role_change_hook(
-            &mut self,
-            hook: Box<
-                dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static,
-            >,
-        ) {
+        fn register_role_change_hook(&mut self, hook: RoleTableHook) {
             self.hooks.push(hook);
         }
     }

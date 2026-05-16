@@ -30,7 +30,10 @@ use super::{NoPeerTransport, PeerNetwork};
 /// blocks forever, `peer_count == 0`). Picked once at secondary
 /// startup; never switches mid-run.
 pub enum EitherPeerTransport<I: Identifier> {
-    Real(PeerNetwork<I>),
+    // `PeerNetwork<I>` is ~500 bytes; boxing keeps the enum
+    // size close to `Disabled`'s zero so the runtime-select doesn't
+    // pessimise the disabled arm (clippy::large_enum_variant).
+    Real(Box<PeerNetwork<I>>),
     Disabled(NoPeerTransport),
 }
 
@@ -69,14 +72,17 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
 
     fn peer_count(&self) -> usize {
         match self {
-            Self::Real(p) => PeerTransport::<I>::peer_count(p),
+            // `&**p` derefs Box<PeerNetwork<I>> back to &PeerNetwork<I>
+            // so the qualified trait-call resolves the same way as
+            // before boxing.
+            Self::Real(p) => PeerTransport::<I>::peer_count(&**p),
             Self::Disabled(p) => PeerTransport::<I>::peer_count(p),
         }
     }
 
     async fn connect_to_peers(&mut self, peers: &[PeerConnectionInfo]) {
         match self {
-            Self::Real(p) => <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(p, peers).await,
+            Self::Real(p) => <PeerNetwork<I> as PeerTransport<I>>::connect_to_peers(&mut **p, peers).await,
             Self::Disabled(p) => PeerTransport::<I>::connect_to_peers(p, peers).await,
         }
     }
@@ -88,14 +94,14 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
         // returning `None` on that side — the safe answer for
         // single-secondary deployments.
         match self {
-            Self::Real(p) => PeerTransport::<I>::register_with_cluster_state(p, registrar),
+            Self::Real(p) => PeerTransport::<I>::register_with_cluster_state(&**p, registrar),
             Self::Disabled(p) => PeerTransport::<I>::register_with_cluster_state(p, registrar),
         }
     }
 
     fn peer_for_role(&self, role: &Role) -> Option<String> {
         match self {
-            Self::Real(p) => PeerTransport::<I>::peer_for_role(p, role),
+            Self::Real(p) => PeerTransport::<I>::peer_for_role(&**p, role),
             Self::Disabled(p) => PeerTransport::<I>::peer_for_role(p, role),
         }
     }
@@ -106,7 +112,7 @@ impl<I: Identifier> PeerTransport<I> for EitherPeerTransport<I> {
         // role envelopes to construct and no misaddress hints can
         // reach it, so the empty default is safe here.
         match self {
-            Self::Real(p) => PeerTransport::<I>::local_id(p),
+            Self::Real(p) => PeerTransport::<I>::local_id(&**p),
             Self::Disabled(p) => PeerTransport::<I>::local_id(p),
         }
     }

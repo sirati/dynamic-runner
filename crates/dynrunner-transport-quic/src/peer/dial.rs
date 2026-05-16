@@ -45,15 +45,15 @@ const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (used by single-host integration tests).
 pub(super) fn candidate_addrs(peer_info: &PeerConnectionInfo) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
-    if let Some(s) = peer_info.ipv4.as_deref() {
-        if let Ok(ip) = s.parse::<std::net::Ipv4Addr>() {
-            addrs.push(SocketAddr::new(ip.into(), peer_info.port));
-        }
+    if let Some(s) = peer_info.ipv4.as_deref()
+        && let Ok(ip) = s.parse::<std::net::Ipv4Addr>()
+    {
+        addrs.push(SocketAddr::new(ip.into(), peer_info.port));
     }
-    if let Some(s) = peer_info.ipv6.as_deref() {
-        if let Ok(ip) = s.parse::<std::net::Ipv6Addr>() {
-            addrs.push(SocketAddr::new(ip.into(), peer_info.port));
-        }
+    if let Some(s) = peer_info.ipv6.as_deref()
+        && let Ok(ip) = s.parse::<std::net::Ipv6Addr>()
+    {
+        addrs.push(SocketAddr::new(ip.into(), peer_info.port));
     }
     if addrs.is_empty() {
         // Localhost fallback — preserves the pre-happy-eyeballs
@@ -144,7 +144,7 @@ pub(super) async fn dial_peer(
 
     if let Some((addr, conn)) = race_wss(&addrs, ATTEMPT_TIMEOUT).await {
         tracing::info!(peer = peer_id, %addr, "connected to peer via WSS");
-        return Some(PeerConnection::Wss(conn));
+        return Some(PeerConnection::Wss(Box::new(conn)));
     }
 
     tracing::error!(peer = peer_id, "WSS race to peer failed across all addresses");
@@ -167,7 +167,7 @@ async fn race_wss(
     addrs: &[SocketAddr],
     timeout: Duration,
 ) -> Option<(SocketAddr, crate::wss::WssConnection)> {
-    race_first_success(addrs, timeout, |addr| connect_wss(addr)).await
+    race_first_success(addrs, timeout, connect_wss).await
 }
 
 #[cfg(test)]

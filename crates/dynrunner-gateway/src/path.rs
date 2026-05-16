@@ -5,6 +5,7 @@
 //! because each gateway resolves it differently:
 //!   * `LocalGateway` reads `$HOME` from the local process environment.
 //!   * `SshGateway` queries `echo $HOME` over the master connection.
+//!
 //! Keeping the substitution in one place prevents the two gateways from
 //! drifting on whitespace, multi-`~` semantics, or non-leading `~` handling.
 

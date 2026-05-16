@@ -211,7 +211,7 @@ impl<I: Identifier> TunneledPeerTransport<I> {
                                 "RoleAddressed relay forward failed (tunneled)",
                             );
                         }
-                        if let Err(e) = self.send_direct(&hint_to, hint) {
+                        if let Err(e) = self.send_direct(&hint_to, *hint) {
                             tracing::warn!(
                                 hint_to = %hint_to,
                                 error = %e,

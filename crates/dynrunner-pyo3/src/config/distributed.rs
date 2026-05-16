@@ -125,6 +125,9 @@ impl DistributedConfig {
         resource_check_interval_secs = None,
         log_oom_watcher = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         connect_timeout_secs: Option<f64>,
         connect_retry_delay_secs: Option<f64>,

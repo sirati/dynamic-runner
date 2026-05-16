@@ -35,11 +35,11 @@ impl ProcStatmMonitor {
                 Ok(contents) => {
                     // statm format: size resident shared text lib data dt
                     // We want the second field (resident) in pages
-                    if let Some(rss_pages_str) = contents.split_whitespace().nth(1) {
-                        if let Ok(rss_pages) = rss_pages_str.parse::<u64>() {
-                            let page_size = 4096u64; // standard Linux page size
-                            return rss_pages * page_size;
-                        }
+                    if let Some(rss_pages_str) = contents.split_whitespace().nth(1)
+                        && let Ok(rss_pages) = rss_pages_str.parse::<u64>()
+                    {
+                        let page_size = 4096u64; // standard Linux page size
+                        return rss_pages * page_size;
                     }
                     0
                 }

@@ -60,7 +60,11 @@ impl PyFulfillabilityMatcher {
     /// `Box<dyn FulfillabilityMatcher<RunnerIdentifier>>`) so the
     /// manager-distributed registration API consumes a uniform
     /// trait-object shape and the caller doesn't need to spell out
-    /// the concrete type.
+    /// the concrete type. Returning `Box<dyn ...>` instead of `Self`
+    /// is the load-bearing API contract; clippy's "new should return
+    /// Self" doesn't fit a constructor whose whole purpose is to
+    /// hand callers an erased trait object.
+    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new(
         matcher: Py<PyAny>,
     ) -> Box<dyn FulfillabilityMatcher<RunnerIdentifier>> {

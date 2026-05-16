@@ -214,6 +214,9 @@ impl PyTaskInfo {
         task_depends_on = Vec::new(),
         preferred_secondaries = Vec::new(),
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: String,
         size: u64,
@@ -313,7 +316,7 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
 /// Read-only at the Python surface: every field is a `#[pyo3(get)]`
 /// without a setter; the Python side cannot mutate the underlying
 /// CRDT through this view.
-#[pyclass(name = "TaskInfoView")]
+#[pyclass(name = "TaskInfoView", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PyTaskInfoView {
     /// Content-hash of the failed task. Same key the rest of the

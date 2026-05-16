@@ -475,6 +475,14 @@ impl PyObserverLateJoiner {
                 // announcer task into the next observer dispatcher
                 // run.
                 let loop_result: Result<u32, PyErr> = async {
+                    // `RunOutcome` is currently two-variant
+                    // (Done | SetupPending) and both arms terminate,
+                    // so clippy sees the loop as never iterating. The
+                    // loop is retained as defensive scaffolding for a
+                    // future "retry on SetupPending" branch — same
+                    // shape the in-process distributed manager will
+                    // need if observers ever become promotable.
+                    #[allow(clippy::never_loop)]
                     loop {
                         let outcome = secondary
                             .run_until_setup_or_done(&mut factory)

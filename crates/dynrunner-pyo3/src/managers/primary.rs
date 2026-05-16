@@ -7,7 +7,8 @@ use pyo3::types::PyList;
 
 use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{
-    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, RunError, StagingError,
+    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, RunError, StagingEntry,
+    StagingError,
 };
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
@@ -54,7 +55,7 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `file_hash` is the task identifier for cache lookup;
     /// `content_hash` is the SHA256 of the file contents that the
     /// staging integrity check will verify against.
-    pending_stage_files: Vec<(String, String, String, String, String)>,
+    pending_stage_files: Vec<StagingEntry>,
     /// Pre-staged-source mode (`--source-already-staged` on the
     /// pipeline). When `Some`, this is the gateway-side host path
     /// the wrapper bind-mounts into each secondary container at
@@ -180,6 +181,9 @@ impl PyPrimaryCoordinator {
         respawn_spawner = None,
         task_completed_listener = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         num_secondaries: u32,
@@ -407,12 +411,12 @@ impl PyPrimaryCoordinator {
         // and dispatch to the Python TaskDefinition's `on_phase_*`
         // methods. Each closure owns its own ref-bumped `Py<PyAny>` so
         // the manager owns the lifetime independent of `self`.
-        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+        let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(
                 self.task_definition.clone_ref(py),
             ),
         );
-        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+        let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
             crate::managers::lifecycle::make_on_phase_end(
                 self.task_definition.clone_ref(py),
             ),

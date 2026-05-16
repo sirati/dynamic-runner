@@ -99,7 +99,8 @@ impl<I: Identifier> PeerNetwork<I> {
                         }
                         if let Err(e) = self.router.send_to_peer(
                             &hint_to,
-                            hint,
+                            // Unbox once at the dispatch boundary.
+                            *hint,
                             &mut self.connections,
                             clocks,
                         ) {
@@ -221,7 +222,10 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             if let Some(id) = redial_target {
                                 self.spawn_redial(&id);
                             }
-                            Some(msg)
+                            // Unbox once at the router/role-layer boundary
+                            // so the by-value role-layer signature stays
+                            // unchanged.
+                            Some(*msg)
                         }
                         InboundOutcome::Handled { redial_target } => {
                             if let Some(id) = redial_target {
@@ -232,22 +236,22 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                 }
                 accepted = self.new_conn_rx.recv() => {
-                    if let Some(accepted) = accepted {
-                        if !self.connections.contains_key(&accepted.peer_id) {
-                            // Same observe_reconnect-before-register
-                            // ordering as drain_new_connections so
-                            // operator log shows resolution
-                            // (with attempts+elapsed) immediately
-                            // before "incoming peer registered".
-                            self.reconnect_tracker
-                                .observe_reconnect(&accepted.peer_id);
-                            tracing::info!(
-                                peer = %accepted.peer_id,
-                                "incoming peer registered (during recv)"
-                            );
-                            self.connections
-                                .insert(accepted.peer_id, accepted.outgoing_tx);
-                        }
+                    if let Some(accepted) = accepted
+                        && !self.connections.contains_key(&accepted.peer_id)
+                    {
+                        // Same observe_reconnect-before-register
+                        // ordering as drain_new_connections so
+                        // operator log shows resolution
+                        // (with attempts+elapsed) immediately
+                        // before "incoming peer registered".
+                        self.reconnect_tracker
+                            .observe_reconnect(&accepted.peer_id);
+                        tracing::info!(
+                            peer = %accepted.peer_id,
+                            "incoming peer registered (during recv)"
+                        );
+                        self.connections
+                            .insert(accepted.peer_id, accepted.outgoing_tx);
                     }
                     None
                 }
@@ -267,10 +271,10 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
             // Role-layer intercept: RoleAddressed (Case A/B/C/D)
             // and RoleMisaddressHint (silent cache-warm). See
             // `handle_role_layer` for the four-case decision.
-            if let Some(msg) = delivered_from_router {
-                if let Some(payload) = self.handle_role_layer(msg, clocks) {
-                    return Some(payload);
-                }
+            if let Some(msg) = delivered_from_router
+                && let Some(payload) = self.handle_role_layer(msg, clocks)
+            {
+                return Some(payload);
             }
         }
     }
@@ -286,7 +290,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     if let Some(id) = redial_target {
                         self.spawn_redial(&id);
                     }
-                    msg
+                    *msg
                 }
                 InboundOutcome::Handled { redial_target } => {
                     if let Some(id) = redial_target {
