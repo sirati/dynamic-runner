@@ -187,6 +187,23 @@ impl<I: Identifier> ClusterState<I> {
                             blocked_on_pending = Some(dep_hash);
                         }
                     }
+                    Some(TaskState::Cancelled { .. }) => {
+                        // Dependent of a panik-cancelled prereq.
+                        // The prereq won't reach Completed, so the
+                        // dependent can't ever succeed; treat as
+                        // cascade-fail (parallel to a NonRecoverable
+                        // prereq above). The new spawn lands in
+                        // `Failed { NonRecoverable, "upstream-failed" }`
+                        // — distinct from a fresh `Cancelled`
+                        // discriminant because the panik latch is the
+                        // single source of "this run was operator-
+                        // stopped"; per-task `Cancelled` is reserved
+                        // for the sweep originated by the panik
+                        // broadcast, not for new derived tasks
+                        // spawned afterwards.
+                        cascade_fail = true;
+                        break;
+                    }
                     None => {
                         tracing::warn!(
                             target: "dynrunner_cluster_state",

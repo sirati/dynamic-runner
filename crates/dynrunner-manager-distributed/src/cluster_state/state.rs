@@ -130,6 +130,30 @@ pub struct ClusterState<I> {
     /// Opaque to the CRDT: the framework does not interpret the
     /// strings; the fulfillability-matcher hook attaches meaning.
     pub(super) peer_holdings: HashMap<String, HashSet<String>>,
+    /// Sticky panik latch. Set to `true` by the first applying
+    /// `ClusterMutation::PanikRequested` broadcast; never clears for
+    /// the lifetime of this state. Read by the coordinator's
+    /// operational loop to short-circuit further dispatch (no new
+    /// `Cancelled` entries get re-promoted to `Pending`, the
+    /// retry-pass machinery refuses to seed against a panik'd ledger)
+    /// and by the watcher integration to recognise "panik already
+    /// applied — don't re-broadcast".
+    ///
+    /// Replicated via `ClusterStateSnapshot::panik_active` so a
+    /// late-joining observer sees the latched state immediately on
+    /// snapshot-restore, in addition to the live `PanikRequested`
+    /// apply path.
+    pub(super) panik_active: bool,
+    /// First-applying reason payload from the originating
+    /// `PanikRequested`. `Some(_)` iff `panik_active`. Operator-
+    /// readable: surfaces in the terminal log line so the run report
+    /// shows which signal triggered the cancellation.
+    pub(super) panik_reason: Option<String>,
+    /// Peer that originated the first-applying `PanikRequested`.
+    /// `Some(_)` iff `panik_active`. Useful for forensic logs
+    /// ("primary saw the file first" vs "secondary-3 propagated to
+    /// us") but does NOT affect any apply rule's behaviour.
+    pub(super) panik_source: Option<String>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -158,6 +182,10 @@ where
             task_completed_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: self.peer_holdings.clone(),
+            // Replicated sticky panik state — clone preserves it.
+            panik_active: self.panik_active,
+            panik_reason: self.panik_reason.clone(),
+            panik_source: self.panik_source.clone(),
         }
     }
 }
@@ -180,6 +208,9 @@ where
             .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
             .field("task_completed_tx", &self.task_completed_tx.is_some())
             .field("peer_holdings", &self.peer_holdings)
+            .field("panik_active", &self.panik_active)
+            .field("panik_reason", &self.panik_reason)
+            .field("panik_source", &self.panik_source)
             .finish()
     }
 }
@@ -200,6 +231,9 @@ impl<I> Default for ClusterState<I> {
             matcher_trigger_tx: None,
             task_completed_tx: None,
             peer_holdings: HashMap::new(),
+            panik_active: false,
+            panik_reason: None,
+            panik_source: None,
         }
     }
 }

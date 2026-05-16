@@ -73,7 +73,17 @@ where
                 // pool work is needed for it.
                 TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
-                | TaskState::Unfulfillable { task, .. } => {
+                | TaskState::Unfulfillable { task, .. }
+                // Panik-cancelled tasks land here too: terminal for
+                // dep-resolution (their task_id seeds
+                // `completed_task_ids` so dependents' `extend()` is
+                // accepted) and the hash is marked completed in the
+                // primary-side ledger so the new primary doesn't
+                // attempt to re-dispatch. Cancelled is a panik-
+                // sticky terminal — a hydrating new-primary inherits
+                // the latched `panik_active` via the CRDT replica
+                // and shouldn't be re-running this hash regardless.
+                | TaskState::Cancelled { task, .. } => {
                     primary_completed.insert(hash.clone());
                     if let Some(id) = &task.task_id {
                         completed_task_ids.insert(id.clone());

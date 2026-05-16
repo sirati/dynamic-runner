@@ -228,6 +228,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // the per-task landing state isn't known.
                 self.setup_pending = false;
             }
+            ClusterMutation::PanikRequested { .. } => {
+                // Operator-initiated emergency stop. The apply rule
+                // transitions every non-terminal entry to
+                // `TaskState::Cancelled` in one sweep; the per-pass
+                // accounting mirror is updated in the post-apply walk
+                // (`mirror_panik_post_apply` in
+                // `handle_cluster_mutation`) where every affected
+                // hash is known. At this point the apply hasn't yet
+                // run, so we record nothing here — same shape as
+                // `TasksSpawned` above. The post-apply walk inserts
+                // every cancelled hash into the `failed_tasks`
+                // accounting bucket (alongside its terminal counter)
+                // so the operational-loop exit check sees the
+                // run as fully accounted-for.
+            }
         }
     }
 
