@@ -210,13 +210,14 @@ where
     ///   `failed_tasks` ledger with the same error (the legacy shape
     ///   a worker-driven cascade-fail produces).
     ///
-    /// TODO: when a prereq's TaskCompleted auto-resumes its Blocked
-    /// dependents in the CRDT, the live primary's pool must re-add
-    /// those binaries (the pool's `on_item_failed_permanent` cascade
-    /// already removed them from the blocked-set). Wire this through
-    /// the auto-resume apply path so the pool stays coherent with
-    /// the CRDT. Today the CRDT side is correct; pool-side dispatch
-    /// of auto-resumed binaries needs the integration.
+    /// Pool-side auto-resume of cascade-paused dependents is wired
+    /// through `apply_and_broadcast_cluster_mutations`: when the
+    /// prereq's `TaskCompleted` later flows through the apply path,
+    /// `cluster_state::apply_locally_for_broadcast` surfaces every
+    /// just-resumed `TaskInfo<I>` and the caller re-injects each
+    /// into the live `PendingPool` so the next dispatch tick picks
+    /// them up. The CRDT and pool stay coherent without a per-task
+    /// re-cascade walk here.
     pub(super) async fn apply_fail_permanent(
         &mut self,
         hash: String,
@@ -359,9 +360,17 @@ where
 
     /// Handler for `PrimaryCommand::UpdatePreferredSecondaries`.
     /// Broadcasts the per-task preferred-secondaries update so every
-    /// node's CRDT mirror sees the new preference list; the Phase-4
-    /// `TaskInfo.preferred_secondaries` storage owns the in-memory
-    /// side once it lands.
+    /// node's CRDT mirror sees the new preference list AND mirrors
+    /// the new list onto the live primary's `PendingPool` entry so
+    /// the next scheduler tick reads the updated preference. The
+    /// pool stores `TaskInfo<I>` clones (taken at injection time);
+    /// without this mirror the CRDT write would only become visible
+    /// to the scheduler on a snapshot-restore cycle — every
+    /// dispatch between the two would see the stale preference list.
+    ///
+    /// The pool match is keyed on the wire-canonical task hash via
+    /// the generic `pool::update_first_match_in_place` primitive,
+    /// so the pool itself stays oblivious to hashing.
     pub(super) async fn apply_update_preferred_secondaries(
         &mut self,
         hash: String,
@@ -372,9 +381,33 @@ where
                 "update_preferred_secondaries: unknown task hash {hash}"
             ));
         }
-        // TODO(phase-4): also update the in-memory
-        // `TaskInfo.preferred_secondaries` on the live primary's pool
-        // entry once the field exists; today only the CRDT side moves.
+        // Mirror onto the live pool's TaskInfo clone. Done BEFORE the
+        // broadcast so a hypothetical synchronous reader of the pool
+        // (post-apply, pre-broadcast) sees the new preferences and
+        // the CRDT-side mirror simultaneously. The hash-keyed
+        // predicate closes over `compute_task_hash`; the pool API
+        // takes any predicate so it doesn't have to learn about
+        // wire-canonical hashing.
+        let target_hash = hash.clone();
+        let new_preferences = dynrunner_core::SoftPreferredSecondaries::new(
+            secondaries.clone(),
+        );
+        let matched = self.pool_mut().update_first_match_in_place(
+            |t| super::wire::compute_task_hash(t) == target_hash,
+            |t| t.preferred_secondaries = new_preferences.clone(),
+        );
+        if !matched {
+            // The pool may legitimately not hold the binary (in-flight
+            // / completed / not yet seeded), and that's fine — only
+            // queued/blocked items need the live mirror. CRDT side
+            // still broadcasts so every replica's `TaskInfo` clone
+            // converges on the new preference list.
+            tracing::debug!(
+                task_hash = %hash,
+                "update_preferred_secondaries: hash not present in pool; \
+                 CRDT mirror only"
+            );
+        }
         self.apply_and_broadcast_cluster_mutations(vec![
             ClusterMutation::TaskPreferredSecondariesUpdated {
                 hash,
@@ -602,10 +635,14 @@ mod tests {
         }).await;
     }
 
-    /// `UpdatePreferredSecondaries` is the simplest path — it only
-    /// broadcasts the CRDT mutation; with no consumer wired today,
-    /// the success case is "the call returns Ok and the CRDT
-    /// applies".
+    /// `UpdatePreferredSecondaries` happy-path smoke: CRDT applies
+    /// and the live pool mirror moves in lockstep. The deeper
+    /// pool-mirror assertion lives in
+    /// `update_preferred_secondaries_propagates_to_live_pool`; this
+    /// test just pins that the handler accepts under a fully-seeded
+    /// operational fixture (pool initialised, task present in both
+    /// CRDT and pool) the way the production operational loop calls
+    /// in.
     #[tokio::test(flavor = "current_thread")]
     async fn update_preferred_secondaries_smoke() {
         let local = tokio::task::LocalSet::new();
@@ -617,6 +654,12 @@ mod tests {
                 hash: hash.clone(),
                 task: binary.clone(),
             });
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(binary.phase_id.clone());
+            coordinator.pending = Some(
+                dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                    .expect("pool init"),
+            );
             let (reply_tx, reply_rx) = oneshot::channel();
             super::handle_primary_command(
                 &mut coordinator,
@@ -771,6 +814,342 @@ mod tests {
             assert!(
                 !coordinator.failed_tasks.contains_key(&dep_hash),
                 "blocked dependent must not be in failed_tasks"
+            );
+        }).await;
+    }
+
+    /// Full Unfulfillable-cascade chain: root Unfulfillable →
+    /// dependents Blocked → reinject root → root completes →
+    /// auto-resume on the CRDT side mirrors into the live pool via
+    /// `apply_and_broadcast_cluster_mutations`'s
+    /// `resumed_for_dispatch` plumb. After completion the dependent
+    /// must be back in the live pool and dispatchable through the
+    /// normal pool primitives.
+    ///
+    /// Pins Phase-6 Finding 6: pool-side cascade-resume of Blocked
+    /// dependents when the prereq's `TaskCompleted` lands. The CRDT
+    /// side was already correct; this test enforces the pool stays
+    /// coherent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+
+            let mut prereq = make_binary("prereq", 100);
+            prereq.task_id = Some("prereq_id".into());
+            let prereq_hash = compute_task_hash(&prereq);
+
+            let mut dep = make_binary("dep", 100);
+            dep.task_id = Some("dep_id".into());
+            dep.task_depends_on = vec!["prereq_id".into()];
+            let dep_hash = compute_task_hash(&dep);
+
+            // Seed CRDT and pool with both items.
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: prereq_hash.clone(),
+                task: prereq.clone(),
+            });
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: dep_hash.clone(),
+                task: dep.clone(),
+            });
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(prereq.phase_id.clone());
+            let mut pool = dynrunner_scheduler_api::PendingPool::new(
+                phase_set,
+                HashMap::new(),
+            )
+            .expect("pool init");
+            pool.extend(vec![prereq.clone(), dep.clone()])
+                .expect("pool extend");
+            coordinator.pending = Some(pool);
+            for p in coordinator.pool().active_phases() {
+                coordinator.phase_completed.insert(p.clone(), 0);
+                coordinator.phase_failed.insert(p.clone(), 0);
+            }
+            coordinator.pool_mut().mark_in_flight(&prereq.phase_id);
+
+            // Step 1: prereq fails Unfulfillable → dep moves to
+            // Blocked in CRDT, pool drops the dep entry.
+            let (rx1, rxr1) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::FailPermanent {
+                    hash: prereq_hash.clone(),
+                    error: ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                    reason: "no peer".into(),
+                    reply: rx1,
+                },
+            )
+            .await;
+            assert!(rxr1.await.unwrap().is_ok());
+            // Sanity: pool no longer contains the dep binary.
+            assert!(
+                !coordinator
+                    .pool()
+                    .iter()
+                    .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                "dep should be dropped from pool after Unfulfillable cascade"
+            );
+
+            // Step 2: reinject the root.
+            let (rx2, rxr2) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::ReinjectTask {
+                    hash: prereq_hash.clone(),
+                    reply: rx2,
+                },
+            )
+            .await;
+            assert!(rxr2.await.unwrap().is_ok());
+            // Dep still Blocked in CRDT (only root flipped to
+            // Pending; auto-resume fires on TaskCompleted, not on
+            // TaskReinjected).
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&dep_hash),
+                Some(TaskState::Blocked { .. })
+            ));
+            // Dep still absent from the pool.
+            assert!(
+                !coordinator
+                    .pool()
+                    .iter()
+                    .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                "dep must still be absent from pool until root completes"
+            );
+
+            // Step 3: simulate the root completing. The mark_in_flight
+            // above already incremented in_flight by 1; we route
+            // `TaskCompleted` through `apply_and_broadcast_cluster_mutations`
+            // so the resumed-dispatch plumbing fires.
+            coordinator
+                .apply_and_broadcast_cluster_mutations(vec![
+                    ClusterMutation::TaskCompleted {
+                        hash: prereq_hash.clone(),
+                    },
+                ])
+                .await;
+
+            // CRDT side: dep auto-resumed to Pending.
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&dep_hash),
+                Some(TaskState::Pending { .. })
+            ));
+            // Pool side: dep is back in a bucket and dispatchable.
+            assert!(
+                coordinator
+                    .pool()
+                    .iter()
+                    .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                "dep must be back in the pool after auto-resume"
+            );
+            // The dep's phase must be dispatchable (not Blocked).
+            // `reinject` flips Draining/Drained/Done back to Active;
+            // for an originally-Active phase it stays Active.
+            let phase_state = coordinator.pool().phase_state(&dep.phase_id);
+            assert!(
+                matches!(
+                    phase_state,
+                    Some(dynrunner_scheduler_api::PhaseState::Active)
+                ),
+                "dep's phase must be Active for dispatch; got {phase_state:?}"
+            );
+        }).await;
+    }
+
+    /// Re-inject path is independent of dependent unblock: after the
+    /// root flips Unfulfillable→Pending via `ReinjectTask`, the
+    /// dependents must STAY Blocked in CRDT (auto-resume only fires
+    /// on `TaskCompleted`) and remain absent from the pool. Guards
+    /// against an accidental "reinject also unblocks dependents"
+    /// regression that would let dependents dispatch ahead of a
+    /// still-pending root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reinject_resets_blocked_dependents_pool_state() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+
+            let mut prereq = make_binary("prereq", 100);
+            prereq.task_id = Some("prereq_id".into());
+            let prereq_hash = compute_task_hash(&prereq);
+
+            let mut dep = make_binary("dep", 100);
+            dep.task_id = Some("dep_id".into());
+            dep.task_depends_on = vec!["prereq_id".into()];
+            let dep_hash = compute_task_hash(&dep);
+
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: prereq_hash.clone(),
+                task: prereq.clone(),
+            });
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: dep_hash.clone(),
+                task: dep.clone(),
+            });
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(prereq.phase_id.clone());
+            let mut pool = dynrunner_scheduler_api::PendingPool::new(
+                phase_set,
+                HashMap::new(),
+            )
+            .expect("pool init");
+            pool.extend(vec![prereq.clone(), dep.clone()])
+                .expect("pool extend");
+            coordinator.pending = Some(pool);
+            for p in coordinator.pool().active_phases() {
+                coordinator.phase_completed.insert(p.clone(), 0);
+                coordinator.phase_failed.insert(p.clone(), 0);
+            }
+            coordinator.pool_mut().mark_in_flight(&prereq.phase_id);
+
+            // Cascade: prereq Unfulfillable → dep Blocked.
+            let (tx1, rx1) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::FailPermanent {
+                    hash: prereq_hash.clone(),
+                    error: ErrorType::Unfulfillable {
+                        reason: "missing toolchain".to_string().into(),
+                    },
+                    reason: "no peer".into(),
+                    reply: tx1,
+                },
+            )
+            .await;
+            assert!(rx1.await.unwrap().is_ok());
+
+            // Reinject root only.
+            let (tx2, rx2) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::ReinjectTask {
+                    hash: prereq_hash.clone(),
+                    reply: tx2,
+                },
+            )
+            .await;
+            assert!(rx2.await.unwrap().is_ok());
+
+            // CRDT: root flipped to Pending; dep stays Blocked.
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&prereq_hash),
+                Some(TaskState::Pending { .. })
+            ));
+            match coordinator.cluster_state.task_state(&dep_hash) {
+                Some(TaskState::Blocked { on, .. }) => {
+                    assert_eq!(on, &prereq_hash);
+                }
+                other => panic!("dep should still be Blocked, got {other:?}"),
+            }
+            // Pool: dep must NOT be present (the cascade dropped it
+            // and reinject of root does not re-introduce it).
+            assert!(
+                !coordinator
+                    .pool()
+                    .iter()
+                    .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                "dep must stay out of pool until root completes"
+            );
+            // Root IS back in the pool.
+            assert!(
+                coordinator
+                    .pool()
+                    .iter()
+                    .any(|t| t.task_id.as_deref() == Some("prereq_id")),
+                "root must be back in pool after reinject"
+            );
+        }).await;
+    }
+
+    /// `UpdatePreferredSecondaries` runtime mutation must propagate to
+    /// the live pool's `TaskInfo` clone, not only to the CRDT mirror.
+    /// The scheduler's hot path reads `preferred_secondaries` from the
+    /// pool entry it dispatches; a CRDT-only update would only become
+    /// visible on snapshot-restore.
+    ///
+    /// Pins Phase-6 Finding 7: pool-side mirror of preferred-secondaries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn update_preferred_secondaries_propagates_to_live_pool() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut binary = make_binary("a", 100);
+            binary.task_id = Some("a_id".into());
+            let hash = compute_task_hash(&binary);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: hash.clone(),
+                task: binary.clone(),
+            });
+            let mut phase_set = std::collections::HashSet::new();
+            phase_set.insert(binary.phase_id.clone());
+            let mut pool = dynrunner_scheduler_api::PendingPool::new(
+                phase_set,
+                HashMap::new(),
+            )
+            .expect("pool init");
+            pool.extend(vec![binary.clone()]).expect("pool extend");
+            coordinator.pending = Some(pool);
+            for p in coordinator.pool().active_phases() {
+                coordinator.phase_completed.insert(p.clone(), 0);
+                coordinator.phase_failed.insert(p.clone(), 0);
+            }
+
+            // Pre-condition: pool's clone has empty preferred_secondaries.
+            let pre = coordinator
+                .pool()
+                .iter()
+                .find(|t| t.task_id.as_deref() == Some("a_id"))
+                .expect("task in pool")
+                .preferred_secondaries
+                .clone();
+            assert!(pre.as_slice().is_empty(), "fixture starts empty");
+
+            let (tx, rx) = oneshot::channel();
+            super::handle_primary_command(
+                &mut coordinator,
+                PrimaryCommand::UpdatePreferredSecondaries {
+                    hash: hash.clone(),
+                    secondaries: vec!["sec-a".into(), "sec-b".into()],
+                    reply: tx,
+                },
+            )
+            .await;
+            assert!(rx.await.unwrap().is_ok());
+
+            // CRDT mirror updated.
+            let crdt_task = match coordinator.cluster_state.task_state(&hash) {
+                Some(TaskState::Pending { task }) => task.clone(),
+                other => panic!("expected Pending, got {other:?}"),
+            };
+            let expected: Vec<&str> = vec!["sec-a", "sec-b"];
+            assert_eq!(
+                crdt_task
+                    .preferred_secondaries
+                    .as_slice()
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "CRDT mirror"
+            );
+
+            // Live pool's clone reflects the update on the next read.
+            let post = coordinator
+                .pool()
+                .iter()
+                .find(|t| t.task_id.as_deref() == Some("a_id"))
+                .expect("task still in pool")
+                .preferred_secondaries
+                .clone();
+            assert_eq!(
+                post.as_slice().iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                expected,
+                "live pool's TaskInfo.preferred_secondaries must mirror the CRDT update"
             );
         }).await;
     }
