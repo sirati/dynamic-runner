@@ -261,7 +261,17 @@ fn assign_normal_non_idle_worker_returns_no_fit() {
 
 #[test]
 fn check_pressure_no_action_below_threshold() {
-    let s = sched();
+    // Test uses proxy-byte numbers (max=10000) so the production
+    // 1 GiB safety margin would saturate `effective_max` to zero and
+    // kill the worker on every tick. Override the margin to zero
+    // here so the test exercises ONLY the threshold-driven NoAction
+    // branch — the safety-margin behaviour has dedicated tests
+    // (`active_kill_fires_at_margin_not_at_cgroup_cap`,
+    // `safety_margin_zero_restores_pre_fix_behavior`).
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
     let workers = vec![WorkerBudgetInfo {
         worker_id: 0,
         reserved_budgets: mem(1000),
@@ -279,7 +289,12 @@ fn check_pressure_no_action_below_threshold() {
 
 #[test]
 fn check_pressure_kills_opportunistic_first() {
-    let s = sched();
+    // Pre-fix threshold semantics under proxy-byte numbers; the
+    // safety-margin shift has dedicated tests below.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
     let max = 1000u64;
     let workers = vec![
         WorkerBudgetInfo {
@@ -313,7 +328,12 @@ fn check_pressure_kills_opportunistic_first() {
 
 #[test]
 fn check_pressure_kills_smallest_active_when_no_opportunistic() {
-    let s = sched();
+    // Pre-fix threshold semantics under proxy-byte numbers; the
+    // safety-margin shift has dedicated tests below.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
     let max = 1000u64;
     let workers = vec![
         WorkerBudgetInfo {
@@ -347,7 +367,13 @@ fn check_pressure_kills_smallest_active_when_no_opportunistic() {
 
 #[test]
 fn check_pressure_still_runs_during_pressure_phase() {
-    let s = sched();
+    // Proxy-byte numbers: explicit zero margin so the test exercises
+    // the documented behaviour (pressure_phase=true does not gate
+    // pressure checks) rather than the margin-saturation path.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
     let workers = vec![WorkerBudgetInfo {
         worker_id: 0,
         reserved_budgets: mem(500),
@@ -369,6 +395,129 @@ fn check_pressure_no_action_empty_workers() {
     let decision =
         Scheduler::<TestId>::check_resource_pressure(&s, &[], &mem(10000), false);
     assert!(matches!(decision, ResourcePressureDecision::NoAction));
+}
+
+// ── cgroup_safety_margin tests ──
+// These pin the contract that `cgroup_safety_margin` shifts BOTH kill
+// branches down by the margin so userland preempt fires before the
+// kernel's cgroup-OOM. Pre-fix the active-kill threshold was exactly
+// the cgroup cap and the framework consistently lost the race against
+// the kernel SIGKILL — see the bug-report context for the production
+// repro that drove this change.
+
+#[test]
+fn pressure_kill_fires_before_cgroup_oom() {
+    // Layout: cgroup cap 100, margin 10, pressure_threshold 5.
+    //   effective_max = 100 − 10 = 90
+    //   opp-kill threshold = effective_max − threshold = 85
+    // With usage 92 (between 85 and the legacy `max − threshold = 95`)
+    // the pre-fix scheduler would have stayed quiet; the post-fix
+    // scheduler must fire the opportunistic-kill branch.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 10,
+        pressure_threshold: 5,
+        ..sched()
+    };
+    let workers = vec![
+        WorkerBudgetInfo {
+            worker_id: 0,
+            reserved_budgets: mem(50),
+            actual_usage: mem(46),
+            is_idle: false,
+            is_opportunistic: false,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("a", 10)),
+            estimated_usage: mem(46),
+        },
+        WorkerBudgetInfo {
+            worker_id: 1,
+            reserved_budgets: mem(50),
+            actual_usage: mem(46),
+            is_idle: false,
+            is_opportunistic: true,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("b", 10)),
+            estimated_usage: mem(46),
+        },
+    ];
+    // Sum of actual_usage = 92.
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
+        _ => panic!("expected Kill of opportunistic worker, got {decision:?}"),
+    }
+}
+
+#[test]
+fn active_kill_fires_at_margin_not_at_cgroup_cap() {
+    // Layout: cgroup cap 100, margin 10, no opportunistic workers.
+    //   effective_max = 90
+    // With usage 95 (above effective_max but below the cgroup cap):
+    //   pre-fix: `usage > max` is `95 > 100` → false → NoAction
+    //            (and the kernel cgroup-OOM eventually wins)
+    //   post-fix: `usage > effective_max` is `95 > 90` → fires
+    //             smallest-active kill so userland gets there first.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 10,
+        pressure_threshold: 5,
+        ..sched()
+    };
+    let workers = vec![WorkerBudgetInfo {
+        worker_id: 7,
+        reserved_budgets: mem(100),
+        actual_usage: mem(95),
+        is_idle: false,
+        is_opportunistic: false,
+        has_initial_assignment: true,
+        current_task: Some(make_binary("a", 10)),
+        estimated_usage: mem(95),
+    }];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 7),
+        _ => panic!("expected Kill of smallest active worker, got {decision:?}"),
+    }
+}
+
+#[test]
+fn safety_margin_zero_restores_pre_fix_behavior() {
+    // Regression pin: setting `cgroup_safety_margin = 0` is the
+    // documented escape hatch ("preempt only AT cgroup cap, races
+    // kernel-OOM"). Same workers/usage as
+    // `active_kill_fires_at_margin_not_at_cgroup_cap` but with the
+    // margin disabled must return NoAction. If a future default-zero
+    // mistake re-emerges this test catches it.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        pressure_threshold: 5,
+        ..sched()
+    };
+    let workers = vec![WorkerBudgetInfo {
+        worker_id: 7,
+        reserved_budgets: mem(100),
+        actual_usage: mem(95),
+        is_idle: false,
+        is_opportunistic: false,
+        has_initial_assignment: true,
+        current_task: Some(make_binary("a", 10)),
+        estimated_usage: mem(95),
+    }];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+    assert!(
+        matches!(decision, ResourcePressureDecision::NoAction),
+        "expected NoAction with margin=0 and usage<cap, got {decision:?}"
+    );
+}
+
+#[test]
+fn memory_constructor_default_margin_is_1gib() {
+    // Pins the production default so a refactor cannot silently
+    // change the headroom band that ships to operators.
+    let s = ResourceStealingScheduler::memory();
+    assert_eq!(s.cgroup_safety_margin, 1024 * 1024 * 1024);
 }
 
 // ── Multi-idle worker temp_factor tests ──

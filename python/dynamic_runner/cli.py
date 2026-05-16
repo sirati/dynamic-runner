@@ -91,6 +91,34 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--oom-cgroup-safety-margin",
+        type=str,
+        default="1G",
+        metavar="SIZE",
+        help=(
+            "Headroom below the container's cgroup cap at which the "
+            "framework preempts (kills the smallest active worker) — "
+            "gives userland a chance to act before the kernel's "
+            "cgroup-OOM fires. Accepts the same M/G suffixes as "
+            "--max-memory. Default 1G. Set to 0M to restore the "
+            "pre-fix behaviour (preempt only AT the cgroup cap, races "
+            "kernel-OOM)."
+        ),
+    )
+    parser.add_argument(
+        "--oom-pressure-threshold",
+        type=str,
+        default="500M",
+        metavar="SIZE",
+        help=(
+            "Extra headroom above the safety margin at which the "
+            "framework kills a median opportunistic worker. Total "
+            "opportunistic-kill threshold is (cgroup_cap − "
+            "safety_margin − pressure_threshold). Accepts the same "
+            "M/G suffixes as --max-memory. Default 500M."
+        ),
+    )
+    parser.add_argument(
         "--manual-start-worker",
         action="store_true",
         help="Manually start worker processes (print command and wait)",
