@@ -70,6 +70,19 @@ pub(crate) struct DistributedConfig {
     /// connection retries hang for ~6min before container teardown
     /// reaps the secondary; this deadline reaps it in 60s instead.
     setup_deadline_secs: f64,
+    /// Per-secondary OOM resource-check decision cadence in seconds.
+    /// Mirrors `LocalManagerConfig.resource_check_interval_secs`.
+    /// Default 0.1 (100ms). Pre-extraction this was a hardcoded
+    /// 100ms literal in `secondary/processing.rs`; surfacing it
+    /// via the config makes it tunable from the operator side and
+    /// keeps the local-vs-secondary surfaces symmetric.
+    resource_check_interval_secs: f64,
+    /// Master switch for the structured OOM-watcher JSON log on
+    /// secondaries (and the primary's in-process secondary, when
+    /// it has workers). When `true`, the watcher emits heartbeat +
+    /// delta + kill log lines at `target = "oom_watcher"`. Operators
+    /// flip this via `--log-oom-watcher`. Default `false`.
+    log_oom_watcher: bool,
 }
 
 impl Default for DistributedConfig {
@@ -87,6 +100,8 @@ impl Default for DistributedConfig {
             primary_link_failure_threshold: 5,
             primary_link_failure_window_secs: 30.0,
             setup_deadline_secs: 60.0,
+            resource_check_interval_secs: 0.1,
+            log_oom_watcher: false,
         }
     }
 }
@@ -107,6 +122,8 @@ impl DistributedConfig {
         primary_link_failure_threshold = None,
         primary_link_failure_window_secs = None,
         setup_deadline_secs = None,
+        resource_check_interval_secs = None,
+        log_oom_watcher = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -124,6 +141,8 @@ impl DistributedConfig {
         primary_link_failure_threshold: Option<u32>,
         primary_link_failure_window_secs: Option<f64>,
         setup_deadline_secs: Option<f64>,
+        resource_check_interval_secs: Option<f64>,
+        log_oom_watcher: Option<bool>,
     ) -> Self {
         let d = DistributedConfig::default();
         Self {
@@ -142,6 +161,9 @@ impl DistributedConfig {
             primary_link_failure_window_secs: primary_link_failure_window_secs
                 .unwrap_or(d.primary_link_failure_window_secs),
             setup_deadline_secs: setup_deadline_secs.unwrap_or(d.setup_deadline_secs),
+            resource_check_interval_secs: resource_check_interval_secs
+                .unwrap_or(d.resource_check_interval_secs),
+            log_oom_watcher: log_oom_watcher.unwrap_or(d.log_oom_watcher),
         }
     }
 }
@@ -182,6 +204,12 @@ impl DistributedConfig {
     }
     pub(crate) fn setup_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.setup_deadline_secs)
+    }
+    pub(crate) fn resource_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.resource_check_interval_secs)
+    }
+    pub(crate) fn log_oom_watcher(&self) -> bool {
+        self.log_oom_watcher
     }
 }
 

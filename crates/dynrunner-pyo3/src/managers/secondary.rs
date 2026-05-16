@@ -211,6 +211,8 @@ impl PySecondaryCoordinator {
             self.distributed_config.primary_link_failure_window();
         let dist_setup_deadline = self.distributed_config.setup_deadline();
         let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
+        let dist_resource_check_interval = self.distributed_config.resource_check_interval();
+        let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         // TODO(phase-5a-followup): worker subprocesses currently use the
         // first type's worker_module + cmd_args; restart-on-type-shift
         // is not yet implemented. The factory will need a per-type
@@ -428,6 +430,8 @@ impl PySecondaryCoordinator {
                     primary_link_failure_window: dist_primary_link_failure_window,
                     setup_deadline: dist_setup_deadline,
                     is_observer: false,
+                    resource_check_interval: dist_resource_check_interval,
+                    log_oom_watcher: dist_log_oom_watcher,
                 };
 
                 let mut factory = SubprocessWorkerFactory {
