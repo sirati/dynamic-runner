@@ -212,6 +212,11 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         is_observer: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,
+        // Short grace so promotion-gated tests can drive the
+        // natural-quiesce branch without waiting the production
+        // 2-second default. Production code-path semantics are
+        // identical; only the wall-clock threshold differs.
+        promoted_primary_quiesce_grace: Duration::from_millis(100),
     }
 }
 

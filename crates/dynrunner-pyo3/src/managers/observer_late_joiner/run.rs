@@ -178,6 +178,7 @@ impl PyObserverLateJoiner {
                     // cadences mirror the live secondary path.
                     resource_check_interval: std::time::Duration::from_millis(100),
                     log_oom_watcher: false,
+                    promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
                 };
 
                 // No-op factory: the run loop's only `factory`

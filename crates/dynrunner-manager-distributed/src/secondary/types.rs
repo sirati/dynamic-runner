@@ -156,6 +156,35 @@ pub struct SecondaryConfig {
     /// partial) transport state, so the cancellation hazard the
     /// setup-loop comment warns about does not arise.
     pub setup_deadline: Duration,
+
+    /// Minimum wall-clock time the promoted-primary natural-quiesce
+    /// `RunComplete`-broadcast branch waits after a `is_primary: false →
+    /// true` transition before considering itself eligible to fire.
+    ///
+    /// The alive-demoted natural-quiesce branch (in `process_tasks`)
+    /// declares the cluster done based on a CRDT-derived predicate
+    /// (`task_count() > 0 && pending == 0 && in_flight == 0`), which
+    /// is **incomplete-mirror-prone** in the immediate post-promotion
+    /// window: a freshly promoted secondary may hold only the
+    /// fraction of `TaskAdded` broadcasts the demoted primary had
+    /// already flushed. Firing on the partial view (e.g. "5 of 10
+    /// tasks added + all 5 already terminal") strands the in-flight
+    /// remainder once the loopback `RunComplete` reaches the demoted
+    /// primary and tears down its operational loop
+    /// (asm-dataset-nix T11: 5/10 phase_build tasks unassigned).
+    ///
+    /// Default 2 s. Sized to bracket worst-case loopback latency
+    /// (single-digit ms typical, hundreds of ms under network stress)
+    /// with three orders of magnitude headroom, while still finite
+    /// enough that an actually-quiesced cluster fires inside any
+    /// reasonable SLURM time budget. Operators can shorten this for
+    /// fast-feedback test environments or lengthen it for tunnelled
+    /// production clusters with higher latency.
+    ///
+    /// This is a documented bandage: the structurally clean fix is
+    /// a wire signal from the demoted primary saying "I'm done
+    /// publishing", which the protocol does not have today.
+    pub promoted_primary_quiesce_grace: Duration,
 }
 
 impl Default for SecondaryConfig {
@@ -177,6 +206,7 @@ impl Default for SecondaryConfig {
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
             setup_deadline: Duration::from_secs(60),
+            promoted_primary_quiesce_grace: Duration::from_secs(2),
         }
     }
 }
