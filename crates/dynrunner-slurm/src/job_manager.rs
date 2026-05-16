@@ -182,12 +182,12 @@ impl<G: Gateway> SlurmJobManager<G> {
                 }
             };
             let remote = srcbins_dir.join(&rel);
-            if let Some(parent) = remote.parent() {
-                if created_dirs.insert(parent.to_path_buf()) {
-                    self.gateway
-                        .create_directory(&parent.to_string_lossy())
-                        .await?;
-                }
+            if let Some(parent) = remote.parent()
+                && created_dirs.insert(parent.to_path_buf())
+            {
+                self.gateway
+                    .create_directory(&parent.to_string_lossy())
+                    .await?;
             }
             self.gateway
                 .transfer_file(&local, &remote.to_string_lossy())
