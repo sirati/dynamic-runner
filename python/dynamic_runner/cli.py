@@ -11,6 +11,29 @@ import argparse
 from ._shared import add_selection_arguments
 
 
+def parse_duration_secs(value: str) -> float:
+    """Parse a duration string like '30s', '2m', '1h' into seconds.
+
+    Accepted suffixes: ``s`` (seconds, default if no suffix),
+    ``m`` (minutes), ``h`` (hours). Sub-second precision is preserved
+    when the numeric part is a float. The single concern is wire-shape
+    parsing — every CLI knob that surfaces a duration consumes this
+    helper rather than re-implementing the suffix table.
+    """
+    s = value.strip()
+    if not s:
+        raise ValueError("empty duration")
+    suffix_table = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    suffix = s[-1].lower()
+    if suffix in suffix_table:
+        body = s[:-1]
+        multiplier = suffix_table[suffix]
+    else:
+        body = s
+        multiplier = 1.0
+    return float(body) * multiplier
+
+
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
     """Construct the runner argparse with all generic dynamic_runner flags.
 
@@ -282,6 +305,57 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
             "fires. Separate from --retry-max-passes — that knob is the "
             "framework's auto-retry for Recoverable failures; this one is "
             "external-control-only."
+        ),
+    )
+    parser.add_argument(
+        "--respawn-policy",
+        type=str,
+        choices=["disabled", "on-secondary-death"],
+        default="disabled",
+        help=(
+            "Secondary-respawn policy. 'disabled' (default) leaves a dead "
+            "secondary dead — pending tasks land on the remaining secondaries "
+            "via the normal requeue path. 'on-secondary-death' enables the "
+            "respawn pipeline: the primary observes PeerRemoved lifecycle "
+            "events and asks the configured spawner (multi-process or SLURM) "
+            "to bring up a replacement, subject to the per-secondary/total "
+            "budgets and the per-family cooldown below."
+        ),
+    )
+    parser.add_argument(
+        "--respawn-max-per-secondary",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Per-family respawn cap (default 3). A 'family' is the chain "
+            "rooted at the operator-provisioned secondary id: when N deaths "
+            "in the same chain have already been respawned, the next death "
+            "in that family is rejected with the structured log event "
+            "'respawn_budget_exhausted'."
+        ),
+    )
+    parser.add_argument(
+        "--respawn-max-total",
+        type=int,
+        default=10,
+        metavar="N",
+        help=(
+            "Global respawn cap (default 10). When N respawns have happened "
+            "across the lifetime of the coordinator (any family), subsequent "
+            "respawn requests are rejected regardless of per-family budget."
+        ),
+    )
+    parser.add_argument(
+        "--respawn-cooldown",
+        type=str,
+        default="30s",
+        metavar="DUR",
+        help=(
+            "Minimum gap between consecutive respawns in the same family "
+            "(default 30s). Accepts 'Ns' / 'Nm' / 'Nh' suffixes. The "
+            "cooldown is per-family so a well-behaved cluster losing one "
+            "peer per minute never trips it; a flapping family does."
         ),
     )
     parser.add_argument(

@@ -147,6 +147,25 @@ pub(crate) struct PyPrimaryCoordinator {
     /// in-process / network-primary callers that don't drive a SLURM
     /// submit-loop.
     slurm_job_manager: Option<Arc<dyn Any + Send + Sync>>,
+
+    /// Respawn policy supplied by the Python caller. `Disabled`
+    /// (the default) leaves the inner coordinator's respawn pipeline
+    /// unwired — no listener registered, no JoinSet arm reachable.
+    /// `OnSecondaryDeath { budget }` translates to an
+    /// `enable_respawn` call at `run()` entry, paired with the
+    /// spawner stored below.
+    respawn_policy: crate::config::respawn::PyRespawnPolicy,
+
+    /// Secondary spawner adapter (currently only
+    /// [`PyMultiProcessSpawner`]; the SLURM equivalent will land
+    /// behind the same `as_arc` boundary). `None` when no spawner
+    /// was supplied at construction; combined with `respawn_policy
+    /// = Disabled` this means the respawn pipeline is fully off.
+    /// Held as `Py<PyAny>` so the underlying pyclass refcount stays
+    /// tied to the coordinator's lifetime; the actual
+    /// `Arc<dyn SecondarySpawner>` is extracted via `as_arc` at
+    /// `run()` entry.
+    respawn_spawner: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -163,6 +182,8 @@ impl PyPrimaryCoordinator {
         unfulfillable_reinject_max_per_task = None,
         peer_lifecycle_listener = None,
         fulfillability_matcher = None,
+        respawn_policy = None,
+        respawn_spawner = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -176,6 +197,8 @@ impl PyPrimaryCoordinator {
         unfulfillable_reinject_max_per_task: Option<u32>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
         fulfillability_matcher: Option<Py<PyAny>>,
+        respawn_policy: Option<crate::config::respawn::PyRespawnPolicy>,
+        respawn_spawner: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -224,6 +247,9 @@ impl PyPrimaryCoordinator {
             peer_lifecycle_listener,
             fulfillability_matcher,
             slurm_job_manager: None,
+            respawn_policy: respawn_policy
+                .unwrap_or_else(crate::config::respawn::PyRespawnPolicy::rust_disabled),
+            respawn_spawner,
         })
     }
 
@@ -315,6 +341,58 @@ impl PyPrimaryCoordinator {
         // park it on itself before `run()` enters. `None` for the
         // in-process / network-primary paths that never wire it.
         let slurm_job_manager = self.slurm_job_manager.take();
+
+        // Materialise the respawn pipeline wiring. Only the
+        // (budget, spawner) pair is meaningful — when either is
+        // absent the inner coordinator's respawn pipeline stays
+        // unwired (CCD-5). Extract the `Arc<dyn SecondarySpawner>`
+        // here while we still hold the GIL: the inner adapters
+        // (today only `PyMultiProcessSpawner`; SLURM lands on the
+        // same `as_arc` boundary later) expose a Rust-only
+        // `as_arc()` method that clones their internal `Arc`.
+        let respawn_budget = self.respawn_policy.to_budget();
+        let respawn_spawner_arc: Option<
+            std::sync::Arc<
+                dyn dynrunner_manager_distributed::primary::respawn::SecondarySpawner,
+            >,
+        > = match (&self.respawn_spawner, &respawn_budget) {
+            (Some(spawner_py), Some(_)) => {
+                let bound = spawner_py.bind(py);
+                if let Ok(mp) = bound
+                    .cast::<crate::managers::multi_process_respawner::PyMultiProcessSpawner>()
+                {
+                    Some(mp.borrow().as_arc())
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "respawn_spawner must be a recognised secondary-spawner \
+                         pyclass (PyMultiProcessSpawner, or a future SLURM \
+                         binding); got an unrecognised type",
+                    ));
+                }
+            }
+            // Budget present without spawner (or vice-versa) — the
+            // CLI ensures both are supplied together when policy ≠
+            // disabled, so this branch is the misconfiguration arm.
+            (None, Some(_)) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "respawn_policy is on-secondary-death but no \
+                     respawn_spawner was supplied",
+                ));
+            }
+            (_, None) => None,
+        };
+        // The primary's listen endpoint + pubkey are bound inside the
+        // detached tokio runtime (see the `py.detach(|| { … })` block
+        // below) — we cannot snapshot them here on the GIL thread.
+        // Today's adapters (`PyMultiProcessSpawner`, the SLURM
+        // spawner) cache their own construction-time copies and
+        // ignore the spec's equivalent fields, so both placeholders
+        // are empty strings. When a future provider depends on the
+        // spec values directly, snapshot the real endpoint/pubkey
+        // immediately after `NetworkServer::bind` inside the
+        // detached runtime and thread them through `enable_respawn`.
+        let respawn_primary_endpoint = String::new();
+        let respawn_primary_pubkey_pem = String::new();
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         // Read the cap value the handle (or constructor kwarg) most
@@ -564,6 +642,25 @@ impl PyPrimaryCoordinator {
                 // late installs would be invisible.
                 if let Some(jm) = slurm_job_manager {
                     primary.set_slurm_job_manager(jm);
+                }
+
+                // Wire the respawn pipeline iff both a budget and a
+                // spawner are present. The early-return branch above
+                // guarantees they're either both `Some` or both
+                // `None`, so a single match-on-Some covers the
+                // enabled arm without re-validation. CCD-5: this is
+                // the ONLY call site that touches the respawn
+                // wiring; no downstream `if policy_enabled` checks
+                // live on the hot path.
+                if let (Some(spawner), Some(budget)) =
+                    (respawn_spawner_arc, respawn_budget)
+                {
+                    primary.enable_respawn(
+                        spawner,
+                        budget,
+                        respawn_primary_endpoint,
+                        respawn_primary_pubkey_pem,
+                    );
                 }
 
                 // Register the Python peer-lifecycle listener (if any)

@@ -162,6 +162,55 @@ def _collect_binaries(task: TaskDefinition, args: argparse.Namespace, config) ->
     return binaries
 
 
+def _build_respawn_args(args: argparse.Namespace, spawn_secondary) -> tuple:
+    """Translate the four CLI respawn knobs into the
+    ``(respawn_policy, respawn_spawner)`` pair the Rust
+    ``run_primary`` / ``RustPrimaryCoordinator`` constructor expects.
+
+    Single concern: own the policy + spawner construction so every
+    dispatch path (in-process local, SLURM, future remote) consumes
+    one helper. When ``--respawn-policy=disabled`` (the default), the
+    helper returns ``(None, None)`` and the coordinator's respawn
+    pipeline stays unwired (CCD-5).
+    """
+    import dynamic_runner as _rs
+
+    policy_name = getattr(args, "respawn_policy", "disabled")
+    if policy_name == "disabled":
+        return None, None
+    if policy_name == "on-secondary-death":
+        max_per = int(getattr(args, "respawn_max_per_secondary", 3))
+        max_total = int(getattr(args, "respawn_max_total", 10))
+        # `parse_duration_secs` is the cli-side suffix parser; we
+        # re-import here so this helper stays portable across
+        # callsites (the run.py module-level import in 3.x lazy-binds
+        # cli.parse_duration_secs only at first call).
+        from .cli import parse_duration_secs
+
+        cooldown_secs = parse_duration_secs(
+            getattr(args, "respawn_cooldown", "30s")
+        )
+        policy = _rs.RespawnPolicy.on_secondary_death(
+            max_per, max_total, cooldown_secs
+        )
+        # Today's spawner adapter is the multi-process one. The SLURM
+        # equivalent will live behind the same wrapper class and
+        # extend this branch. The Python `spawn_secondary` callable
+        # is the same one the initial-cohort loop uses; reusing it
+        # keeps the wire-flow shape identical for the operator
+        # ("respawn = re-run the same callback with a fresh id").
+        spawner = _rs.PyMultiProcessSpawner(
+            spawn_secondary,
+            "",  # primary_endpoint — adapter caches its own copy at construction time
+            "",  # primary_pubkey_pem — same; the adapter ignores this
+        )
+        return policy, spawner
+    raise ValueError(
+        f"unknown --respawn-policy={policy_name!r}; expected one of "
+        "'disabled' / 'on-secondary-death'"
+    )
+
+
 def _dispatch_local(task, args, config, logger) -> None:
     """Standard in-process local manager."""
     import dynamic_runner as _rs
@@ -519,6 +568,13 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
     # `_collect_binaries` helper guarantees the empty list in pre-
     # staged mode, so both halves of the gate agree).
     unfulfillable_cap = getattr(args, "unfulfillable_reinject_max_per_task", None)
+    # Build the respawn-pipeline wiring from the CLI knobs. The
+    # `_build_respawn_args` helper centralises the policy +
+    # PyMultiProcessSpawner construction so every dispatch path
+    # (in-process local, future SLURM) consumes the same code.
+    # When --respawn-policy=disabled (the default), the helper
+    # returns `(None, None)` and `run_primary` ignores both kwargs.
+    respawn_policy, respawn_spawner = _build_respawn_args(args, spawn_secondary)
     result = _rs.run_primary(
         primary_cfg,
         task,
@@ -527,6 +583,8 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         source_dir=str(config.source_dir),
         source_pre_staged_root=args.source_already_staged,
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
+        respawn_policy=respawn_policy,
+        respawn_spawner=respawn_spawner,
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")

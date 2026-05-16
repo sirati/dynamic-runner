@@ -176,6 +176,8 @@ pub(crate) fn run_local<'py>(
     source_dir = None,
     source_pre_staged_root = None,
     unfulfillable_reinject_max_per_task = None,
+    respawn_policy = None,
+    respawn_spawner = None,
 ))]
 pub(crate) fn run_primary<'py>(
     py: Python<'py>,
@@ -186,6 +188,8 @@ pub(crate) fn run_primary<'py>(
     source_dir: Option<std::path::PathBuf>,
     source_pre_staged_root: Option<std::path::PathBuf>,
     unfulfillable_reinject_max_per_task: Option<u32>,
+    respawn_policy: Option<Py<PyAny>>,
+    respawn_spawner: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
@@ -197,6 +201,12 @@ pub(crate) fn run_primary<'py>(
     }
     if let Some(n) = unfulfillable_reinject_max_per_task {
         kwargs.set_item("unfulfillable_reinject_max_per_task", n)?;
+    }
+    if let Some(p) = respawn_policy.as_ref() {
+        kwargs.set_item("respawn_policy", p)?;
+    }
+    if let Some(s) = respawn_spawner.as_ref() {
+        kwargs.set_item("respawn_spawner", s)?;
     }
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;
