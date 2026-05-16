@@ -32,6 +32,12 @@ use dynrunner_core::Identifier;
 /// Capability to dispatch one message to the peer this channel
 /// addresses. See module docs for error semantics.
 pub trait OutboundChannel<I: Identifier> {
+    // `Result<(), ()>` is the trait contract: callers branch on Ok/Err
+    // and never inspect the error payload (see module docs — Err means
+    // "drop this connection from the map"). Switching the trait to
+    // `Option<()>` would cascade through every impl + caller for a
+    // purely stylistic gain.
+    #[allow(clippy::result_unit_err)]
     fn dispatch(&self, msg: DistributedMessage<I>) -> Result<(), ()>;
 }
 
