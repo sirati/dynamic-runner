@@ -51,6 +51,16 @@ pub enum PublishError {
         source: std::io::Error,
     },
 
+    #[error(
+        "destination parent path is a file, not a directory: {path:?} \
+         (a file with this name already exists where a directory is needed; \
+         common cause: source corpus and output tree share inodes via \
+         `cp -al` and the source name collides with a directory the worker \
+         needs to create — point --slurm-root-folder at a fresh path or \
+         remove the colliding file)"
+    )]
+    DestinationParentIsFile { path: PathBuf },
+
     #[error("cross-FS copy failed: src={src:?} tmp={tmp:?}: {source}")]
     Copy {
         src: PathBuf,
@@ -116,9 +126,24 @@ pub fn publish_one(
     }
 
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| PublishError::DestinationParentCreate {
-            path: parent.to_path_buf(),
-            source: e,
+        fs::create_dir_all(parent).map_err(|e| {
+            // `create_dir_all` returns EEXIST when any ancestor along
+            // the path is already a regular file (the kernel won't
+            // overwrite a file with a directory of the same name).
+            // Surface that case with a targeted error so operators
+            // immediately see the file-vs-directory collision rather
+            // than chasing a "could not be created" generic.
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                if let Some(culprit) = first_existing_file_ancestor(parent) {
+                    return PublishError::DestinationParentIsFile {
+                        path: culprit,
+                    };
+                }
+            }
+            PublishError::DestinationParentCreate {
+                path: parent.to_path_buf(),
+                source: e,
+            }
         })?;
     }
 
@@ -160,6 +185,24 @@ pub fn publish_one(
         source: e,
     })?;
     Ok(())
+}
+
+/// Walk `path` from the root down looking for the first ancestor that
+/// exists as a regular file (not a directory). Returned path is the
+/// culprit `create_dir_all` tripped on. None when every existing
+/// ancestor is a directory (the EEXIST originated elsewhere — caller
+/// falls back to the generic `DestinationParentCreate` error).
+fn first_existing_file_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut acc = PathBuf::new();
+    for component in path.components() {
+        acc.push(component.as_os_str());
+        match fs::symlink_metadata(&acc) {
+            Ok(md) if md.file_type().is_file() => return Some(acc),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn is_cross_device(e: &io::Error) -> bool {
@@ -246,6 +289,34 @@ mod tests {
 
     fn same_device(a: &Path, b: &Path) -> bool {
         fs::metadata(a).unwrap().dev() == fs::metadata(b).unwrap().dev()
+    }
+
+    #[test]
+    fn destination_parent_is_file_surfaces_targeted_error() {
+        let root = tempfile::tempdir().unwrap();
+        let src_root = root.path().join("staging");
+        let dst_root = root.path().join("network");
+        fs::create_dir_all(&src_root).unwrap();
+        fs::create_dir_all(&dst_root).unwrap();
+        // A file lives at the path the worker expects to be a directory.
+        let collision = dst_root.join("dataset").join("hello.tar.zst");
+        fs::create_dir_all(collision.parent().unwrap()).unwrap();
+        write_file(&collision, b"this is a file, not a directory");
+        // Source is set up in the staging tree.
+        let src = src_root.join("payload");
+        write_file(&src, b"payload bytes");
+        // Worker tries to publish to a path under the collision file
+        // (e.g. an archive's per-member output).
+        let dst = collision.join("member-output.csv");
+        let err = publish_one(&src, &dst, &src_root).unwrap_err();
+        match err {
+            PublishError::DestinationParentIsFile { path } => {
+                assert_eq!(path, collision);
+            }
+            other => panic!(
+                "expected DestinationParentIsFile, got {other:?}"
+            ),
+        }
     }
 
     #[test]
