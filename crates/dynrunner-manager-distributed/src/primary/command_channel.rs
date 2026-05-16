@@ -56,7 +56,7 @@
 //!     storage of the field lands in Phase 4; the command-variant +
 //!     reply path are in place today so the PyO3 surface can ship.
 
-use dynrunner_core::{ErrorType, Identifier};
+use dynrunner_core::{ErrorType, Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, PeerTransport, SecondaryTransport,
 };
@@ -72,14 +72,46 @@ use super::PrimaryCoordinator;
 /// commands in a tight loop) some slack before backpressure kicks in.
 pub const COMMAND_CHANNEL_CAPACITY: usize = 256;
 
+/// Per-task error returned by `PrimaryCommand::SpawnTasks` from the
+/// pre-apply validation pass.
+///
+/// Vec-wide failure modes (channel closed, oneshot dropped) surface
+/// as the outer `Result<_, String>` on the reply oneshot; per-task
+/// failure modes (one entry in the input vec) ride inside the
+/// returned `Vec<(usize, SpawnError)>`. The rest of the input vec
+/// proceeds regardless — `DuplicateTaskHash` and `UnknownDependency`
+/// are per-task failures, not vec-aborts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnError {
+    /// The task's wire-canonical content hash collides with an entry
+    /// already present in the cluster ledger. The originator-side
+    /// pre-validation catches this; the apply rule itself is also
+    /// idempotent (a duplicate is silently NoOp'd) so the wire layer
+    /// never regresses prior state.
+    DuplicateTaskHash(String),
+    /// The task's `task_depends_on` references a task_id that does
+    /// not resolve to any entry in the current cluster ledger.
+    /// `task_hash` is the wire-canonical hash of the task that
+    /// carried the bad reference; `dep_task_id` is the missing
+    /// dependency's task_id.
+    UnknownDependency {
+        task_hash: String,
+        dep_task_id: String,
+    },
+}
+
 /// One in-flight command on the `PrimaryHandle` → coordinator channel.
 ///
-/// No `I: Identifier` parameter: every variant addresses a task by
-/// its content hash (`String`) — the same wire-canonical key the rest
-/// of the CRDT path uses — so the channel doesn't have to be typed by
-/// the task identifier. Cheap to construct; the `reply` oneshot is the
-/// per-call flow-control signal.
-pub enum PrimaryCommand {
+/// Generic over `I: Identifier` because [`PrimaryCommand::SpawnTasks`]
+/// carries `Vec<TaskInfo<I>>` for runtime task injection. The other
+/// variants still address tasks by their content hash (`String`) and
+/// would be `I`-free in isolation; carrying the generic on the enum
+/// keeps every variant on the same channel and lets the receiver be
+/// `tokio_mpsc::Receiver<PrimaryCommand<I>>` matching the
+/// coordinator's own `I` parameter. The PyO3 layer specialises
+/// `I = RunnerIdentifier` (the only concrete identifier type Python
+/// can construct).
+pub enum PrimaryCommand<I: Identifier> {
     /// Apply `pending_pool::on_item_failed_permanent` + cascade for the
     /// named hash and broadcast `ClusterMutation::TaskFailed{
     /// NonRecoverable, error }`.
@@ -118,6 +150,25 @@ pub enum PrimaryCommand {
         secondaries: Vec<String>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+
+    /// Runtime task injection: a batch of brand-new `TaskInfo<I>`
+    /// entries to add to the cluster ledger so the live primary
+    /// dispatches them and every replica's CRDT mirror converges.
+    ///
+    /// The handler [`PrimaryCoordinator::apply_spawn_tasks`]
+    /// performs per-task pre-validation (duplicate-hash, unknown
+    /// dependency) and emits a single
+    /// `ClusterMutation::TasksSpawned { tasks: <valid subset> }`
+    /// mutation; the reply oneshot returns a per-index `SpawnError`
+    /// for every input task that failed validation (empty `Vec` =
+    /// full success). The outer `Result<_, String>` carries
+    /// channel-wide failure modes (unknown internal state, broadcast
+    /// retry exhaustion). One wire-broadcast event per call,
+    /// regardless of batch size.
+    SpawnTasks {
+        tasks: Vec<TaskInfo<I>>,
+        reply: oneshot::Sender<Result<Vec<(usize, SpawnError)>, String>>,
+    },
 }
 
 /// Dispatch one received command to its handler. Single line at the
@@ -125,7 +176,7 @@ pub enum PrimaryCommand {
 /// transport-shape-pure.
 pub(super) async fn handle_primary_command<T, P, S, E, I>(
     coordinator: &mut PrimaryCoordinator<T, P, S, E, I>,
-    command: PrimaryCommand,
+    command: PrimaryCommand<I>,
 ) where
     T: SecondaryTransport<I>,
     P: PeerTransport<I>,
@@ -157,6 +208,10 @@ pub(super) async fn handle_primary_command<T, P, S, E, I>(
             let result = coordinator
                 .apply_update_preferred_secondaries(hash, secondaries)
                 .await;
+            let _ = reply.send(result);
+        }
+        PrimaryCommand::SpawnTasks { tasks, reply } => {
+            let result = coordinator.apply_spawn_tasks(tasks).await;
             let _ = reply.send(result);
         }
     }
@@ -416,6 +471,148 @@ where
         ])
         .await;
         Ok(())
+    }
+
+    /// Handler for `PrimaryCommand::SpawnTasks`. Pre-validates every
+    /// input task (duplicate-hash + unknown-dependency check) against
+    /// the current cluster ledger, builds a single
+    /// `ClusterMutation::TasksSpawned` carrying the valid subset, and
+    /// applies+broadcasts it. Returns per-index errors for the
+    /// rejected entries; the rest of the batch proceeds regardless.
+    ///
+    /// Post-apply, every freshly-Pending task is re-injected into the
+    /// live primary's `PendingPool` so the next dispatch tick picks
+    /// it up. Tasks that landed in `Blocked` are not pool-resident
+    /// (they wait for the auto-resume mechanism in
+    /// `resume_blocked_on` to fire on a later `TaskCompleted`). Tasks
+    /// that landed in `Failed { NonRecoverable, .. }` (cascade-fail
+    /// against an upstream `Failed { NonRecoverable, .. }` dep) are
+    /// recorded in the per-pass `failed_tasks` ledger so the
+    /// operational loop's accounting matches the wire-side state —
+    /// same shape `apply_fail_permanent` produces for worker-
+    /// originated permanent failures.
+    pub(super) async fn apply_spawn_tasks(
+        &mut self,
+        tasks: Vec<TaskInfo<I>>,
+    ) -> Result<Vec<(usize, super::command_channel::SpawnError)>, String> {
+        use super::command_channel::SpawnError;
+        let mut errors: Vec<(usize, SpawnError)> = Vec::new();
+        let mut valid_tasks: Vec<TaskInfo<I>> = Vec::with_capacity(tasks.len());
+        // Build a set of task_ids the pre-validation pass treats as
+        // known: every task_id in the existing ledger PLUS every
+        // task_id contributed by the input batch (so within-batch
+        // dependencies validate). The wire-side apply rule does its
+        // own dep resolution per-task; this pre-pass surfaces failures
+        // for the caller before the broadcast happens.
+        let mut known_task_ids: std::collections::HashSet<String> = self
+            .cluster_state
+            .tasks_iter()
+            .filter_map(|(_, s)| {
+                let task = match s {
+                    crate::cluster_state::TaskState::Pending { task }
+                    | crate::cluster_state::TaskState::InFlight { task, .. }
+                    | crate::cluster_state::TaskState::Completed { task }
+                    | crate::cluster_state::TaskState::Failed { task, .. }
+                    | crate::cluster_state::TaskState::Unfulfillable { task, .. }
+                    | crate::cluster_state::TaskState::Blocked { task, .. } => task,
+                };
+                task.task_id.clone()
+            })
+            .collect();
+        for task in &tasks {
+            if let Some(id) = task.task_id.as_deref() {
+                known_task_ids.insert(id.to_string());
+            }
+        }
+        // Per-task validation pass. A task can fail multiple checks
+        // (duplicate hash AND unknown dep); we surface the FIRST
+        // failure per index so the caller sees one error per rejected
+        // task. Duplicate-hash is checked first because it short-
+        // circuits the rest of the task's checks: a hash collision
+        // means the task is already in the ledger and re-validating
+        // its deps against the existing entry would be redundant.
+        for (idx, task) in tasks.into_iter().enumerate() {
+            let hash = super::wire::compute_task_hash(&task);
+            if self.cluster_state.task_state(&hash).is_some() {
+                errors.push((idx, SpawnError::DuplicateTaskHash(hash)));
+                continue;
+            }
+            let mut bad_dep: Option<String> = None;
+            for dep_id in &task.task_depends_on {
+                if !known_task_ids.contains(dep_id) {
+                    bad_dep = Some(dep_id.clone());
+                    break;
+                }
+            }
+            if let Some(dep_task_id) = bad_dep {
+                errors.push((
+                    idx,
+                    SpawnError::UnknownDependency {
+                        task_hash: hash,
+                        dep_task_id,
+                    },
+                ));
+                continue;
+            }
+            valid_tasks.push(task);
+        }
+
+        if valid_tasks.is_empty() {
+            // No mutation to broadcast; the per-index errors are the
+            // entire result. Skip the apply+broadcast pass so we
+            // don't emit an empty-batch wire event.
+            return Ok(errors);
+        }
+
+        // Compute hashes of the valid subset so we can post-apply
+        // inspect each entry's CRDT state to decide pool-side
+        // bookkeeping. The hash function is deterministic; the
+        // apply rule recomputes the same value internally, so the
+        // hashes here line up with cluster_state's HashMap keys.
+        let valid_hashes: Vec<String> = valid_tasks
+            .iter()
+            .map(super::wire::compute_task_hash)
+            .collect();
+
+        self.apply_and_broadcast_cluster_mutations(vec![
+            ClusterMutation::TasksSpawned {
+                tasks: valid_tasks,
+            },
+        ])
+        .await;
+
+        // Pool-side bookkeeping for the live primary. Read every
+        // valid entry's post-apply state and route by classification:
+        //   * Pending → reinject into the pool so the next dispatch
+        //     tick picks it up. `reinject` is the right primitive
+        //     here (vs `extend`): the pool's dep-tracking is the
+        //     CRDT's concern post-Phase-B, the pool just dispatches
+        //     what's in it.
+        //   * Blocked → CRDT auto-resume on a later `TaskCompleted`
+        //     fires `resume_blocked_on`; the existing
+        //     `apply_and_broadcast_cluster_mutations` plumb
+        //     re-injects via `resumed_for_dispatch`. No pool action
+        //     here.
+        //   * Failed → record in the in-pass `failed_tasks` ledger so
+        //     accounting matches the wire-side state. Same shape
+        //     `apply_fail_permanent` produces for the legacy
+        //     cascade-fail path.
+        for hash in valid_hashes {
+            match self.cluster_state.task_state(&hash) {
+                Some(TaskState::Pending { task }) => {
+                    let task = task.clone();
+                    self.pool_mut().reinject(task);
+                }
+                Some(TaskState::Failed { kind, .. }) => {
+                    self.failed_tasks.insert(hash, kind.clone());
+                }
+                _ => {
+                    // Blocked / other states: no pool-side action.
+                }
+            }
+        }
+
+        Ok(errors)
     }
 }
 
@@ -1152,5 +1349,375 @@ mod tests {
                 "live pool's TaskInfo.preferred_secondaries must mirror the CRDT update"
             );
         }).await;
+    }
+
+    // ── PrimaryCommand::SpawnTasks ──
+
+    /// Seed `coordinator.pending` with a `PendingPool` whose active
+    /// phases include `phase_id` (plus any extras supplied) and
+    /// initialise the per-phase completed/failed counters. Centralised
+    /// so every spawn-tasks test starts from the same shape the
+    /// production operational loop uses.
+    fn seed_pool(
+        coordinator: &mut PrimaryCoordinator<
+            ChannelSecondaryTransportEnd<TestId>,
+            NoPeers,
+            ResourceStealingScheduler,
+            FixedEstimator,
+            TestId,
+        >,
+        phases: &[&dynrunner_core::PhaseId],
+    ) {
+        let mut phase_set = std::collections::HashSet::new();
+        for p in phases {
+            phase_set.insert((*p).clone());
+        }
+        coordinator.pending = Some(
+            dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                .expect("pool init"),
+        );
+        for p in coordinator.pool().active_phases() {
+            coordinator.phase_completed.insert(p.clone(), 0);
+            coordinator.phase_failed.insert(p.clone(), 0);
+        }
+    }
+
+    /// Drive a `SpawnTasks` command through the dispatch path and
+    /// return the per-index error list. Centralised so every test
+    /// uses the same call sequence.
+    async fn spawn_via_handler(
+        coordinator: &mut PrimaryCoordinator<
+            ChannelSecondaryTransportEnd<TestId>,
+            NoPeers,
+            ResourceStealingScheduler,
+            FixedEstimator,
+            TestId,
+        >,
+        tasks: Vec<dynrunner_core::TaskInfo<TestId>>,
+    ) -> Result<Vec<(usize, super::SpawnError)>, String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        super::handle_primary_command(
+            coordinator,
+            PrimaryCommand::SpawnTasks {
+                tasks,
+                reply: reply_tx,
+            },
+        )
+        .await;
+        reply_rx.await.expect("reply oneshot closed")
+    }
+
+    /// 3 fresh tasks with no deps: all 3 land in Pending in the CRDT
+    /// and are reinjected into the live pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_tasks_all_pending_dispatched() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut a = make_binary("a", 100);
+            a.task_id = Some("a_id".into());
+            let mut b = make_binary("b", 100);
+            b.task_id = Some("b_id".into());
+            let mut c = make_binary("c", 100);
+            c.task_id = Some("c_id".into());
+            seed_pool(&mut coordinator, &[&a.phase_id]);
+
+            let errors = spawn_via_handler(
+                &mut coordinator,
+                vec![a.clone(), b.clone(), c.clone()],
+            )
+            .await
+            .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "no per-index errors expected: {errors:?}");
+
+            for binary in &[&a, &b, &c] {
+                let hash = compute_task_hash(binary);
+                assert!(
+                    matches!(
+                        coordinator.cluster_state.task_state(&hash),
+                        Some(TaskState::Pending { .. })
+                    ),
+                    "task {:?} must land in Pending",
+                    binary.task_id
+                );
+                assert!(
+                    coordinator
+                        .pool()
+                        .iter()
+                        .any(|t| t.task_id == binary.task_id),
+                    "task {:?} must be re-injected into the live pool",
+                    binary.task_id
+                );
+            }
+        })
+        .await;
+    }
+
+    /// Task A depends on Pending task B: A lands in `Blocked{on=B}`,
+    /// NOT in the pool. B was seeded as Pending in the ledger.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_tasks_with_pending_dep_lands_blocked() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut b = make_binary("b", 100);
+            b.task_id = Some("b_id".into());
+            let b_hash = compute_task_hash(&b);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: b_hash.clone(),
+                task: b.clone(),
+            });
+            seed_pool(&mut coordinator, &[&b.phase_id]);
+
+            let mut a = make_binary("a", 100);
+            a.task_id = Some("a_id".into());
+            a.task_depends_on = vec!["b_id".into()];
+
+            let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
+                .await
+                .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "no per-index errors expected: {errors:?}");
+
+            let a_hash = compute_task_hash(&a);
+            match coordinator.cluster_state.task_state(&a_hash) {
+                Some(TaskState::Blocked { on, .. }) => {
+                    assert_eq!(on, &b_hash, "Blocked.on must point to dep's hash");
+                }
+                other => panic!("expected Blocked, got {other:?}"),
+            }
+            assert!(
+                !coordinator.pool().iter().any(|t| t.task_id == a.task_id),
+                "Blocked task must not be in the pool"
+            );
+        })
+        .await;
+    }
+
+    /// Task A depends on Completed task B: A lands in Pending (deps
+    /// resolved) and is reinjected into the pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_tasks_with_completed_dep_lands_pending() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut b = make_binary("b", 100);
+            b.task_id = Some("b_id".into());
+            let b_hash = compute_task_hash(&b);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: b_hash.clone(),
+                task: b.clone(),
+            });
+            coordinator.cluster_state.apply(ClusterMutation::TaskCompleted {
+                hash: b_hash.clone(),
+            });
+            seed_pool(&mut coordinator, &[&b.phase_id]);
+
+            let mut a = make_binary("a", 100);
+            a.task_id = Some("a_id".into());
+            a.task_depends_on = vec!["b_id".into()];
+
+            let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
+                .await
+                .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "no per-index errors expected: {errors:?}");
+
+            let a_hash = compute_task_hash(&a);
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&a_hash),
+                    Some(TaskState::Pending { .. })
+                ),
+                "task with all-Completed deps must land in Pending"
+            );
+            assert!(
+                coordinator.pool().iter().any(|t| t.task_id == a.task_id),
+                "Pending task must be in the pool"
+            );
+        })
+        .await;
+    }
+
+    /// Task A depends on Unfulfillable task B: A lands in
+    /// `Blocked{on=B}`. The CRDT's auto-resume on a later
+    /// `TaskCompleted` will move A back to Pending — same shape as
+    /// the legacy cascade-pause path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut b = make_binary("b", 100);
+            b.task_id = Some("b_id".into());
+            let b_hash = compute_task_hash(&b);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: b_hash.clone(),
+                task: b.clone(),
+            });
+            coordinator.cluster_state.apply(ClusterMutation::TaskFailed {
+                hash: b_hash.clone(),
+                kind: ErrorType::Unfulfillable {
+                    reason: "missing toolchain".to_string().into(),
+                },
+                error: "unfulfillable".into(),
+            });
+            seed_pool(&mut coordinator, &[&b.phase_id]);
+
+            let mut a = make_binary("a", 100);
+            a.task_id = Some("a_id".into());
+            a.task_depends_on = vec!["b_id".into()];
+
+            let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
+                .await
+                .expect("spawn_tasks succeeds");
+            assert!(errors.is_empty(), "no per-index errors expected: {errors:?}");
+
+            let a_hash = compute_task_hash(&a);
+            match coordinator.cluster_state.task_state(&a_hash) {
+                Some(TaskState::Blocked { on, .. }) => {
+                    assert_eq!(on, &b_hash);
+                }
+                other => panic!("expected Blocked-on-unfulfillable, got {other:?}"),
+            }
+            assert!(
+                !coordinator.pool().iter().any(|t| t.task_id == a.task_id),
+                "Blocked-on-Unfulfillable task must not be in the pool"
+            );
+        })
+        .await;
+    }
+
+    /// Vec with 3 tasks, 1 with a hash that already exists in the
+    /// ledger: the duplicate surfaces as a per-index error
+    /// `SpawnError::DuplicateTaskHash`; the other 2 land normally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            // Pre-seed `dup` so the second input clashes.
+            let mut dup = make_binary("dup", 100);
+            dup.task_id = Some("dup_id".into());
+            let dup_hash = compute_task_hash(&dup);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: dup_hash.clone(),
+                task: dup.clone(),
+            });
+            seed_pool(&mut coordinator, &[&dup.phase_id]);
+
+            let mut a = make_binary("a", 100);
+            a.task_id = Some("a_id".into());
+            let mut c = make_binary("c", 100);
+            c.task_id = Some("c_id".into());
+
+            let errors = spawn_via_handler(
+                &mut coordinator,
+                vec![a.clone(), dup.clone(), c.clone()],
+            )
+            .await
+            .expect("spawn_tasks succeeds (per-task failures are NOT vec-level)");
+            assert_eq!(errors.len(), 1, "exactly one per-index error: {errors:?}");
+            let (idx, err) = &errors[0];
+            assert_eq!(*idx, 1, "duplicate at vec position 1");
+            match err {
+                super::SpawnError::DuplicateTaskHash(h) => assert_eq!(h, &dup_hash),
+                other => panic!("expected DuplicateTaskHash, got {other:?}"),
+            }
+            // The other two land normally.
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&compute_task_hash(&a)),
+                    Some(TaskState::Pending { .. })
+                ),
+                "task a must land in Pending"
+            );
+            assert!(
+                matches!(
+                    coordinator.cluster_state.task_state(&compute_task_hash(&c)),
+                    Some(TaskState::Pending { .. })
+                ),
+                "task c must land in Pending"
+            );
+        })
+        .await;
+    }
+
+    /// Vec with 3 tasks, 1 carrying `task_depends_on=["nope"]`: the
+    /// bad-dep entry surfaces as `SpawnError::UnknownDependency`;
+    /// the other 2 land normally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let mut coordinator = make_coordinator();
+            let mut a = make_binary("a", 100);
+            a.task_id = Some("a_id".into());
+            seed_pool(&mut coordinator, &[&a.phase_id]);
+            let mut bad = make_binary("bad", 100);
+            bad.task_id = Some("bad_id".into());
+            bad.task_depends_on = vec!["nope".into()];
+            let mut c = make_binary("c", 100);
+            c.task_id = Some("c_id".into());
+
+            let errors = spawn_via_handler(
+                &mut coordinator,
+                vec![a.clone(), bad.clone(), c.clone()],
+            )
+            .await
+            .expect("spawn_tasks succeeds");
+            assert_eq!(errors.len(), 1, "exactly one per-index error: {errors:?}");
+            let (idx, err) = &errors[0];
+            assert_eq!(*idx, 1);
+            match err {
+                super::SpawnError::UnknownDependency {
+                    task_hash,
+                    dep_task_id,
+                } => {
+                    assert_eq!(task_hash, &compute_task_hash(&bad));
+                    assert_eq!(dep_task_id, "nope");
+                }
+                other => panic!("expected UnknownDependency, got {other:?}"),
+            }
+            // Other two land normally.
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&compute_task_hash(&a)),
+                Some(TaskState::Pending { .. })
+            ));
+            assert!(matches!(
+                coordinator.cluster_state.task_state(&compute_task_hash(&c)),
+                Some(TaskState::Pending { .. })
+            ));
+            // And the bad entry is NOT in the ledger.
+            assert!(
+                coordinator.cluster_state.task_state(&compute_task_hash(&bad)).is_none(),
+                "bad-dep task must not be inserted in the ledger"
+            );
+        })
+        .await;
+    }
+
+    /// `ClusterMutation::TasksSpawned` round-trips through serde.
+    /// Pins wire-codec compatibility for the new variant.
+    #[test]
+    fn tasks_spawned_mutation_round_trips_through_serde() {
+        let mut a = make_binary("a", 100);
+        a.task_id = Some("a_id".into());
+        let mut b = make_binary("b", 100);
+        b.task_id = Some("b_id".into());
+        b.task_depends_on = vec!["a_id".into()];
+        let m: ClusterMutation<TestId> = ClusterMutation::TasksSpawned {
+            tasks: vec![a.clone(), b.clone()],
+        };
+        let json = serde_json::to_string(&m).expect("serialize");
+        let round: ClusterMutation<TestId> =
+            serde_json::from_str(&json).expect("deserialize");
+        match round {
+            ClusterMutation::TasksSpawned { tasks } => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].task_id.as_deref(), Some("a_id"));
+                assert_eq!(tasks[1].task_id.as_deref(), Some("b_id"));
+                assert_eq!(tasks[1].task_depends_on, vec!["a_id".to_string()]);
+            }
+            other => panic!("variant lost in round-trip: {other:?}"),
+        }
     }
 }

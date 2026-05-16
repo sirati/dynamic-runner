@@ -93,10 +93,10 @@ pub(crate) struct PyPrimaryCoordinator {
     /// detached tokio runtime — after that the field is `None` and
     /// repeat-calling `run()` raises (single-shot lifecycle).
     command_tx: tokio::sync::mpsc::Sender<
-        dynrunner_manager_distributed::primary::PrimaryCommand,
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
     >,
     command_rx: Option<tokio::sync::mpsc::Receiver<
-        dynrunner_manager_distributed::primary::PrimaryCommand,
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
     >>,
     /// Whether dispatched task items back to real files. Read at
     /// construction from `TaskDefinition.uses_file_based_items`

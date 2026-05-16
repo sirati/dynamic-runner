@@ -15,7 +15,7 @@ use dynrunner_scheduler_api::{
 };
 use tokio::sync::mpsc as tokio_mpsc;
 
-pub use command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
+pub use command_channel::{PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY};
 
 use respawn::{
     respawn_dispatcher_listener, RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest,
@@ -611,14 +611,14 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// inside the same `&mut self` that the per-arm handlers need)
     /// and put it back when the loop exits. Outside the loop, the
     /// option is `Some` so cloned senders keep working between runs.
-    pub(super) command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand>>,
+    pub(super) command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
 
     /// Sender side of the command channel, cloned to consumers via
     /// `command_sender()`. Stored on `Self` so the lifetime is tied
     /// to the coordinator — when the coordinator is dropped, all
     /// cloned senders return `SendError` on subsequent `send()`
     /// calls and the PyO3 side surfaces that as a Python exception.
-    pub(super) command_tx: tokio_mpsc::Sender<PrimaryCommand>,
+    pub(super) command_tx: tokio_mpsc::Sender<PrimaryCommand<I>>,
 
     /// Per-task reinject counter, paired with
     /// `PrimaryConfig::unfulfillable_reinject_max_per_task`. Lazily
@@ -1047,7 +1047,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// mutation". The sender itself is `Clone` and `Send` so the
     /// returned handle is freely passable across threads / async
     /// runtimes.
-    pub fn command_sender(&self) -> tokio_mpsc::Sender<PrimaryCommand> {
+    pub fn command_sender(&self) -> tokio_mpsc::Sender<PrimaryCommand<I>> {
         self.command_tx.clone()
     }
 
@@ -1070,8 +1070,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// same contract.
     pub fn replace_command_channel(
         &mut self,
-        tx: tokio_mpsc::Sender<PrimaryCommand>,
-        rx: tokio_mpsc::Receiver<PrimaryCommand>,
+        tx: tokio_mpsc::Sender<PrimaryCommand<I>>,
+        rx: tokio_mpsc::Receiver<PrimaryCommand<I>>,
     ) {
         self.command_tx = tx;
         self.command_rx = Some(rx);

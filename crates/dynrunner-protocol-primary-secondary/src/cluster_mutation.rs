@@ -188,4 +188,44 @@ pub enum ClusterMutation<I> {
         holdings: Vec<String>,
         epoch: u64,
     },
+    /// Runtime task injection: introduce a batch of brand-new
+    /// `TaskInfo<I>` entries into the replicated ledger so the live
+    /// primary can dispatch them and every replica's CRDT mirror
+    /// converges to the new task set.
+    ///
+    /// Single mutation per batch (plural `tasks`): a 100-task Phase-1
+    /// graph computed at runtime is ONE wire-broadcast event, not
+    /// 100. The receiver iterates the inner `Vec` and applies each
+    /// task against the local ledger independently — duplicates (by
+    /// content hash) are silently NoOp'd, surviving entries land in
+    /// the appropriate initial state based on their `task_depends_on`
+    /// resolution against the existing ledger:
+    ///
+    ///   * No deps OR all deps `Completed` → `Pending { task }`.
+    ///   * Any dep `Unfulfillable` → `Blocked { task, on: dep_hash }`.
+    ///   * Any dep `Failed { NonRecoverable, .. }` → cascade-fail as
+    ///     `Failed { kind: NonRecoverable, task, last_error:
+    ///     "upstream-failed", attempts: 1 }`.
+    ///   * Else (any dep in `Pending` / `InFlight` / `Blocked`) →
+    ///     `Blocked { task, on: first-unresolved-dep-hash }`.
+    ///
+    /// `task_depends_on` references are by task_id (matching the
+    /// existing pool-side semantics); the apply rule resolves each
+    /// id to a hash via a linear scan over `self.tasks` and uses
+    /// the resolved hash for `Blocked.on`. Pre-apply validation in
+    /// the originator's command handler (`apply_spawn_tasks`) rejects
+    /// per-task entries whose `task_depends_on` references an id not
+    /// known to the ledger (those failures surface as per-index
+    /// `SpawnError::UnknownDependency` on the command's reply
+    /// oneshot, not as wire-side state); the apply rule therefore
+    /// trusts that every dep id it encounters resolves to a present
+    /// hash.
+    ///
+    /// Auto-resume on a later `TaskCompleted` works for free:
+    /// `cluster_state::resume_blocked_on` walks every
+    /// `Blocked { on, .. }` entry and resumes when the prereq's
+    /// hash matches — newly-injected Blocked entries participate in
+    /// the same auto-resume mechanism as cascade-paused dependents
+    /// from `apply_fail_permanent`.
+    TasksSpawned { tasks: Vec<TaskInfo<I>> },
 }
