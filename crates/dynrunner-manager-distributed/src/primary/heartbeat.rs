@@ -627,6 +627,9 @@ mod tests {
     /// because the singleton `empty_transport` only knows about
     /// `dead-sec`, and `requeue_dead_secondary` walks the outgoing
     /// table to fan `TimeoutDetected` to survivors.
+    // One-off test-helper return; the tuple shape is documented
+    // structurally by the field types and isn't reused elsewhere.
+    #[allow(clippy::type_complexity)]
     fn two_secondary_transport() -> (
         ChannelSecondaryTransportEnd<TestId>,
         Vec<tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>>,

@@ -64,6 +64,16 @@ impl std::fmt::Display for StagingError {
 
 impl std::error::Error for StagingError {}
 
+/// One per-secondary staging entry emitted by
+/// [`compute_initial_staging_entries`]: the 5-tuple
+/// `(secondary_id, file_hash, content_hash, src_path, dest_path)`.
+/// `file_hash` is the task identifier (cache lookup key);
+/// `content_hash` is the SHA256 of the file contents the staging
+/// integrity check verifies against; `src_path` / `dest_path` are
+/// the primary-side read location and the secondary-side stage
+/// destination respectively.
+pub type StagingEntry = (String, String, String, String, String);
+
 /// Compute the per-secondary StageFile entries for `binaries`, fanned
 /// out across each id in `secondary_ids`.
 ///
@@ -107,7 +117,7 @@ pub fn compute_initial_staging_entries<I: Identifier>(
     binaries: &[TaskInfo<I>],
     secondary_ids: &[String],
     source_root: &Path,
-) -> Result<Vec<(String, String, String, String, String)>, StagingError> {
+) -> Result<Vec<StagingEntry>, StagingError> {
     let mut entries = Vec::with_capacity(binaries.len() * secondary_ids.len());
     for binary in binaries {
         // Resolve the on-disk read location: relative paths join

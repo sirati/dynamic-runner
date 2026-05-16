@@ -593,6 +593,11 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
 // past the deadline so the next `check_peer_mesh_watchdog()` call
 // fires the degraded path. Returns the secondary plus the primary's
 // receive end so callers can drain MeshReady / TaskFailed / etc.
+//
+// `SecondaryCoordinator` carries six type parameters by design; the
+// concrete monomorphisation here is one-off and a `type` alias would
+// just push the same shape one layer away.
+#[allow(clippy::type_complexity)]
 fn arm_watchdog_no_peers(
     secondary_id: &str,
     dial_count: u32,
@@ -1670,6 +1675,11 @@ mod setup_promote_discriminator {
     /// setup-promote tests don't drive election timing but reusing
     /// the helper keeps the construction site identical to the R1
     /// tests for grep-affinity.
+    // SecondaryCoordinator's six type parameters mean any return
+    // shape that mentions it qualifies as "complex"; a type alias
+    // would mirror the same shape and is not warranted for a
+    // one-off test helper.
+    #[allow(clippy::type_complexity)]
     fn make_secondary_with_recording_peer(
         secondary_id: &str,
         peer_count: usize,
@@ -2366,6 +2376,9 @@ mod late_joiner_accept_emits_peer_joined {
     /// inspect what got broadcast over the peer mesh, plus a hand-held
     /// primary-side receiver so the test can confirm the unicast
     /// snapshot reply does NOT mis-fire on `primary_transport`.
+    // SecondaryCoordinator's six type parameters make this triple
+    // "complex" by clippy's measure; a one-off test helper.
+    #[allow(clippy::type_complexity)]
     fn make_secondary_with_recording_peer(
         secondary_id: &str,
     ) -> (

@@ -7,7 +7,8 @@ use pyo3::types::PyList;
 
 use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::{
-    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, RunError, StagingError,
+    compute_initial_staging_entries, PrimaryConfig, PrimaryCoordinator, RunError, StagingEntry,
+    StagingError,
 };
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
@@ -54,7 +55,7 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `file_hash` is the task identifier for cache lookup;
     /// `content_hash` is the SHA256 of the file contents that the
     /// staging integrity check will verify against.
-    pending_stage_files: Vec<(String, String, String, String, String)>,
+    pending_stage_files: Vec<StagingEntry>,
     /// Pre-staged-source mode (`--source-already-staged` on the
     /// pipeline). When `Some`, this is the gateway-side host path
     /// the wrapper bind-mounts into each secondary container at

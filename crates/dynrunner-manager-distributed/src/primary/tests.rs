@@ -2016,6 +2016,9 @@ fn spawn_real_secondary_with_src_network(
 ///
 /// `flaky` is cloned (its `Rc<RefCell<HashMap>>` is shared) so the test
 /// caller can also inspect the per-task attempt counts after the run.
+// One-off test-helper return; the tuple shape is documented by the
+// doc comment above and isn't reused elsewhere.
+#[allow(clippy::type_complexity)]
 fn spawn_real_secondary_flaky(
     secondary_id: String,
     num_workers: u32,

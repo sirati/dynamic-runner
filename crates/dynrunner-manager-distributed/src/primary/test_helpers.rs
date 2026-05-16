@@ -446,6 +446,9 @@ pub(super) async fn fake_secondary_with_addrs(
 /// that the test plumbs into `fake_secondary` (or a real
 /// SecondaryCoordinator via `spawn_real_secondary` in the
 /// `e2e_helpers` companion).
+// One-off test-helper return; the tuple shape is documented by the
+// per-element doc above and isn't reused elsewhere.
+#[allow(clippy::type_complexity)]
 pub(super) fn setup_test(
     num_secondaries: u32,
 ) -> (
