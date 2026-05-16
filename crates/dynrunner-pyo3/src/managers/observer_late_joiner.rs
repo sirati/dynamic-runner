@@ -334,6 +334,13 @@ impl PyObserverLateJoiner {
                     primary_link_failure_window: dist_primary_link_failure_window,
                     setup_deadline: dist_setup_deadline,
                     is_observer: true,
+                    // Observer has zero workers — the watcher's
+                    // decision arm short-circuits on an empty pool
+                    // and the sample arm reports the host reading
+                    // with `tracked_workers_count = 0`. Default
+                    // cadences mirror the live secondary path.
+                    resource_check_interval: std::time::Duration::from_millis(100),
+                    log_oom_watcher: false,
                 };
 
                 // No-op factory: the run loop's only `factory`

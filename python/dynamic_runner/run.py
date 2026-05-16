@@ -237,6 +237,7 @@ def _dispatch_local(task, args, config, logger) -> None:
         max_resources=_rs.ResourceMap({"memory": max_memory}),
         always_restart_worker=args.always_restart_worker,
         print_pid=args.pid,
+        log_oom_watcher=getattr(args, "log_oom_watcher", False),
     )
     result = _rs.run_local(
         cfg,
@@ -336,6 +337,13 @@ def _dispatch_secondary(task, args, logger) -> None:
     # historical small-scale behaviour.
     setup_deadline_override = getattr(args, "slurm_setup_deadline_secs", None)
     dc_kwargs: dict[str, object] = {}
+    # `--log-oom-watcher` rides through to the secondary via the
+    # SLURM wrapper's `forwarded_argv` block (it's NOT a
+    # framework-regenerated flag, so it passes through verbatim);
+    # here we just wire it onto the secondary's DistributedConfig
+    # so the Rust-side `OomWatcher` picks it up.
+    if getattr(args, "log_oom_watcher", False):
+        dc_kwargs["log_oom_watcher"] = True
     if args.disable_peer_overlay:
         dc_kwargs["disable_peer_overlay"] = True
     if setup_deadline_override is not None:

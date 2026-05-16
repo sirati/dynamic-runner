@@ -19,6 +19,12 @@ dynrunner-transport-channel = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# Used by the OOM watcher (`crate::oom`) to construct the
+# structured log line as a single JSON document, then hand it
+# to `tracing::info!(target: "oom_watcher", ...)`. Constructing
+# the document via `serde_json::json!` keeps field-name shape
+# the consumer locked in lined up with one source of truth.
+serde_json = { workspace = true }
 
 # `nix::sys::wait::waitpid` for non-blocking reap of dead worker
 # subprocesses. The `process` feature gates `sys::wait`. Cfg-gated

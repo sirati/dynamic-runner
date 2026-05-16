@@ -8,6 +8,8 @@ use dynrunner_scheduler_api::{
     AssignmentDecision, ProcessingPhase, ResourceEstimator, Scheduler,
 };
 
+use crate::oom::{OomWatcher, OomWatcherConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL};
+
 use super::{LocalManager, WorkerFactory};
 
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
@@ -19,8 +21,18 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         phase: ProcessingPhase,
         factory: &mut impl WorkerFactory<M>,
     ) {
-        let mut pressure_check_interval =
-            tokio::time::interval(self.config.resource_check_interval);
+        // Decouple sample cadence (50ms, fast forensic sampling) from
+        // decision cadence (config-driven, default 100ms). Both ticks
+        // are driven by `OomWatcher` so the secondary's processing
+        // loop can use the same surface. See `crate::oom`.
+        let mut oom_watcher = OomWatcher::new(OomWatcherConfig {
+            sample_interval: DEFAULT_SAMPLE_INTERVAL,
+            decision_interval: self.config.resource_check_interval,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            log_enabled: self.config.log_oom_watcher,
+        });
+        let mut sample_interval = oom_watcher.sample_interval_ticker();
+        let mut decision_interval = oom_watcher.decision_interval_ticker();
 
         while !active_workers.is_empty() {
             // Try to assign tasks to any idle workers
@@ -35,12 +47,13 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 break;
             }
 
-            // Wait for either a worker event or the OOM check timer.
+            // Wait for either a worker event, the sample tick, or
+            // the decision tick.
             //
             // Cancellation safety: `pool.recv_event` is
-            // `mpsc::Receiver::recv` (cancel-safe). The interval tick
-            // is cancel-safe per tokio docs. Either arm dropping the
-            // other's future is harmless.
+            // `mpsc::Receiver::recv` (cancel-safe). The interval ticks
+            // are cancel-safe per tokio docs. Each arm dropping the
+            // others' futures is harmless.
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
@@ -64,11 +77,20 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         self.process_drain_transitions();
                     }
                 }
-                _ = pressure_check_interval.tick() => {
-                    // Periodic maintenance: resource pressure checks, usage updates, timeouts
-                    self.pool.update_all_resource_usage();
+                _ = sample_interval.tick() => {
+                    // Fast (default 50ms) sample tick: refreshes per-
+                    // worker RSS, reads host + cgroup state, evaluates
+                    // structured-log triggers. No scheduler call here.
+                    oom_watcher.on_sample(&mut self.pool);
+                }
+                _ = decision_interval.tick() => {
+                    // Decision tick (config-driven, default 100ms):
+                    // periodic maintenance plus the scheduler-driven
+                    // OOM kill check. The watcher drives the pressure
+                    // check itself and records any kill so the next
+                    // log line carries `trigger=kill`.
                     if !self.pool_ref().is_empty() {
-                        self.check_resource_pressure();
+                        self.check_resource_pressure_via_watcher(&mut oom_watcher);
                     }
                     self.check_timeouts(active_workers, on_failure_increment_failed, factory).await;
                     self.report_stuck_workers();

@@ -173,6 +173,8 @@ async fn secondary_with_real_workers_processes_tasks() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             let binaries = vec![
@@ -236,6 +238,8 @@ async fn secondary_multi_worker_processes_tasks() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..6)
@@ -305,6 +309,8 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..15)
@@ -400,6 +406,8 @@ async fn stage_file_then_assign_task_succeeds() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             let secondary_id_clone = config.secondary_id.clone();
@@ -638,6 +646,8 @@ fn arm_watchdog_no_peers(
         primary_link_failure_window: Duration::from_secs(30),
         setup_deadline: Duration::from_secs(60),
         is_observer: false,
+        resource_check_interval: Duration::from_millis(100),
+        log_oom_watcher: false,
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -878,6 +888,8 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
             let binaries = vec![
                 make_binary("a", 50),
@@ -1006,6 +1018,8 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         primary_link_failure_window: Duration::from_secs(30),
         setup_deadline: Duration::from_secs(60),
         is_observer: false,
+        resource_check_interval: Duration::from_millis(100),
+        log_oom_watcher: false,
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -1420,6 +1434,8 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 // Tight deadline so the test reaps in ~200ms.
                 setup_deadline: Duration::from_millis(200),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             let mut secondary = SecondaryCoordinator::new(
@@ -1502,6 +1518,8 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_millis(200),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             // FixedPeerCount(2) reports peer_count() == 2 without
@@ -1574,6 +1592,8 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
 
             let mut secondary = SecondaryCoordinator::new(

@@ -210,6 +210,8 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // wall-clock budget, so it never fires accidentally.
         setup_deadline: Duration::from_secs(60),
         is_observer: false,
+        resource_check_interval: Duration::from_millis(100),
+        log_oom_watcher: false,
     }
 }
 
