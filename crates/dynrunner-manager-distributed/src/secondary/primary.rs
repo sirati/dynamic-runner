@@ -932,6 +932,20 @@ where
             tasks = task_count,
             "ingested setup-discovery; primary pool hydrated"
         );
+        // Empty-discovery happy path: when discovery surfaces zero
+        // items (e.g. every binary's output already exists under a
+        // `--skip-existing` filter), the pool is drained from
+        // inception and there will never be a `TaskCompleted` to
+        // trigger the normal counter-driven RunComplete broadcast.
+        // Originate RunComplete directly so every peer's exit arm
+        // observes the same authoritative terminal signal.
+        if task_count == 0 {
+            self.apply_and_broadcast_mutations(vec![ClusterMutation::RunComplete])
+                .await?;
+            tracing::info!(
+                "empty-discovery: RunComplete broadcast — no tasks to run"
+            );
+        }
         Ok(())
     }
 }
