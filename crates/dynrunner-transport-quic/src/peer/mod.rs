@@ -83,10 +83,28 @@ pub struct PeerNetwork<I: Identifier> {
     /// Periodic reconnect-tick receiver. The 5s ticker spawned in
     /// `start()` fires `()` here; `recv_peer`'s tokio::select! arm
     /// pulls the tick and drives the reconnect state machine.
-    /// `Option` so single-secondary test fixtures that bypass
-    /// `start()` (e.g. unit tests that construct `PeerNetwork`
-    /// directly) compile without modifying every test.
-    pub(super) reconnect_tick_rx: Option<mpsc::UnboundedReceiver<()>>,
+    ///
+    /// Held as a plain receiver (not `Option<…>`) so `recv_peer` can
+    /// poll it via the disjoint-field borrow `self.reconnect_tick_rx
+    /// .recv()` inside `tokio::select!`. The prior `Option` + per-
+    /// arm `.take()`/restore dance was not cancel-safe: if the outer
+    /// caller's `select!` dropped the `recv_peer` future while the
+    /// inner select was pending, the local taken-out receiver was
+    /// destroyed together with the dropped future and
+    /// `reconnect_tick_rx` stayed `None` forever, silently disabling
+    /// the periodic reconnect tick for the lifetime of the
+    /// coordinator. `UnboundedReceiver::recv()` is itself cancel-
+    /// safe, so polling the field in place preserves the contract.
+    pub(super) reconnect_tick_rx: mpsc::UnboundedReceiver<()>,
+    /// Test-only handle to the reconnect-tick sender. Production
+    /// builds drop the sender into the ticker task spawned in
+    /// `start()`; the test backdoor keeps a clone so regression
+    /// tests can inject synthetic ticks without waiting for the
+    /// real 5s cadence (see `peer/tests.rs::
+    /// recv_peer_tick_survives_outer_drop`). Gated to `cfg(test)`
+    /// so the production struct layout is unchanged.
+    #[cfg(test)]
+    pub(super) reconnect_tick_tx_for_test: mpsc::UnboundedSender<()>,
     /// Per-peer reconnect-attempt state. See `reconnect.rs` for
     /// the milestone schedule and the disconnect/reconnect event
     /// semantics. Visibility limited to the `peer` submodule so
@@ -153,6 +171,8 @@ impl<I: Identifier> PeerNetwork<I> {
         // `connections` so a freshly-restored peer doesn't get a
         // second dial.
         let (reconnect_tick_tx, reconnect_tick_rx) = mpsc::unbounded_channel();
+        #[cfg(test)]
+        let reconnect_tick_tx_for_test = reconnect_tick_tx.clone();
         {
             let tick_tx = reconnect_tick_tx;
             tokio::task::spawn_local(async move {
@@ -194,7 +214,9 @@ impl<I: Identifier> PeerNetwork<I> {
             new_conn_tx,
             router: Router::new(peer_id.to_string()),
             peer_dial_info: HashMap::new(),
-            reconnect_tick_rx: Some(reconnect_tick_rx),
+            reconnect_tick_rx,
+            #[cfg(test)]
+            reconnect_tick_tx_for_test,
             reconnect_tracker: reconnect::ReconnectTracker::new(),
             role_cache,
         })
