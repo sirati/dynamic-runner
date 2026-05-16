@@ -135,7 +135,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let worker_info = self.workers[worker_idx].budget_info();
             let max_res = self.workers[worker_idx].resource_budgets.clone();
             let global_wid = self.workers[worker_idx].worker_id;
-            let view = self.cap_filter_view(self.pool().view_for_worker(global_wid, None));
+            // Soft preference tie-break: tasks whose
+            // `preferred_secondaries` lists this worker's secondary
+            // sort first within their priority class. The predicate
+            // is applied AFTER `cap_filter_view` — caps are hard,
+            // preferences are advisory. See
+            // `primary::preferred_secondaries` for the helper's
+            // contract.
+            let secondary_id = self.workers[worker_idx].secondary_id.clone();
+            let preference_predicate =
+                super::preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
+                    &secondary_id,
+                );
+            let view = self.cap_filter_view(
+                self.pool()
+                    .view_for_worker(global_wid, Some(&preference_predicate)),
+            );
             if view.is_empty() {
                 continue;
             }

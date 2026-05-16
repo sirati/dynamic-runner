@@ -137,6 +137,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         );
         let task_count = self.all_binaries.len();
         self.apply_and_broadcast_cluster_mutations(mutations).await;
+        // Validate `preferred_secondaries` lists against the known
+        // secondary set NOW that both inputs are settled: the seed
+        // batch finished applying (so every task's
+        // `preferred_secondaries` is in `all_binaries`) and the
+        // pre-loop handshake has populated `self.secondaries` with
+        // every secondary the primary has connected to. The
+        // validator emits one structured warn per unknown id; a
+        // later `PeerLifecycleEvent::Added` may make a previously-
+        // unknown id known and the re-validation in
+        // `handle_cluster_mutation` will silence it.
+        let known: std::collections::HashSet<&str> =
+            self.secondaries.keys().map(|s| s.as_str()).collect();
+        self.preferred_secondaries_validator
+            .validate(self.all_binaries.iter(), &known);
         tracing::info!(tasks = task_count, "seeded cluster ledger");
     }
 
@@ -974,7 +988,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 continue;
             }
             let global_wid = self.workers[worker_idx].worker_id;
-            let view = self.cap_filter_view(self.pool().view_for_worker(global_wid, None));
+            // Soft preference tie-break: tasks whose
+            // `preferred_secondaries` lists this worker's secondary
+            // sort first within their priority class. Applied AFTER
+            // `cap_filter_view` so caps remain hard. See
+            // `primary::preferred_secondaries`.
+            let dispatch_secondary_id =
+                self.workers[worker_idx].secondary_id.clone();
+            let preference_predicate =
+                super::preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
+                    &dispatch_secondary_id,
+                );
+            let view = self.cap_filter_view(
+                self.pool()
+                    .view_for_worker(global_wid, Some(&preference_predicate)),
+            );
             if view.is_empty() {
                 continue;
             }

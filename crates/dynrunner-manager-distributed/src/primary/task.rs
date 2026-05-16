@@ -100,7 +100,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // for this worker; the scheduler picks the index, the
                 // pool commits the take.
                 let global_wid = self.workers[idx].worker_id;
-                let view = self.cap_filter_view(self.pool().view_for_worker(global_wid, None));
+                // Soft preference tie-break: tasks whose
+                // `preferred_secondaries` lists this worker's secondary
+                // sort first within their priority class. Applied
+                // AFTER `cap_filter_view` so caps remain hard.
+                let req_secondary_id = self.workers[idx].secondary_id.clone();
+                let preference_predicate =
+                    super::preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
+                        &req_secondary_id,
+                    );
+                let view = self.cap_filter_view(
+                    self.pool()
+                        .view_for_worker(global_wid, Some(&preference_predicate)),
+                );
                 if !view.is_empty() {
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
@@ -690,9 +702,47 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let has_task_added = mutations
                 .iter()
                 .any(|m| matches!(m, ClusterMutation::TaskAdded { .. }));
+            // Collect any PeerJoined ids riding in the batch BEFORE
+            // moving the mutations into apply. After the batch
+            // applies, each joined id may have resolved a previously-
+            // unknown entry in some task's `preferred_secondaries`,
+            // so we forget its dedup state and re-run validation.
+            // Same shape as `has_task_added`: snapshot pre-apply,
+            // act post-apply.
+            let joined_peer_ids: Vec<String> = mutations
+                .iter()
+                .filter_map(|m| match m {
+                    ClusterMutation::PeerJoined { peer_id, .. } => {
+                        Some(peer_id.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
             for m in mutations {
                 self.mirror_mutation_to_accounting(&m);
                 self.cluster_state.apply(m);
+            }
+            if !joined_peer_ids.is_empty() {
+                // A peer that just joined may have resolved a
+                // previously-unknown `preferred_secondaries` id; drop
+                // each joined id from the warn dedup set so the next
+                // validation cycle re-evaluates from scratch, then
+                // walk every replicated task in `cluster_state` (the
+                // authoritative post-apply view — on a demoted /
+                // setup-promoted primary `all_binaries` is empty and
+                // `cluster_state.iter_all()` is the only source).
+                for id in &joined_peer_ids {
+                    self.preferred_secondaries_validator.forget(id);
+                }
+                let known: std::collections::HashSet<&str> =
+                    self.secondaries.keys().map(|s| s.as_str()).collect();
+                let tasks: Vec<TaskInfo<I>> = self
+                    .cluster_state
+                    .iter_all()
+                    .map(|(_, t)| t.clone())
+                    .collect();
+                self.preferred_secondaries_validator
+                    .validate(tasks.iter(), &known);
             }
             if has_task_added {
                 // Refresh from the post-apply CRDT view. In setup-defer
