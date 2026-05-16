@@ -506,6 +506,7 @@ where
     }
 
     /// Whether the secondary has been elected primary in this run.
+    #[allow(dead_code)]
     pub(super) fn is_promoted(&self) -> bool {
         matches!(self.election, ElectionState::Promoted)
     }
