@@ -19,7 +19,7 @@ pub use command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
 
 use respawn::{
     respawn_dispatcher_listener, RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest,
-    SecondarySpawner, RESPAWN_REQUEST_CHANNEL_CAPACITY,
+    SecondarySpawner,
 };
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
@@ -724,9 +724,16 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// `run()` start so synchronous `on_event` calls have a place
     /// to enqueue. Held as `Option` so the channel is only
     /// constructed when the respawn policy is enabled (avoids an
-    /// idle bounded channel sitting on every coordinator).
+    /// idle channel sitting on every coordinator).
+    ///
+    /// Unbounded shape so the synchronous lifecycle-dispatcher
+    /// `on_event` arm never blocks and never drops: mass-death-grace
+    /// finalize bursts that previously blew past a bounded cap now
+    /// enqueue every death; the total-budget cap on
+    /// `RespawnBudget::max_total` is what bounds the memory cost in
+    /// practice (the operational loop reject-accepts beyond it).
     pub(super) respawn_request_tx:
-        Option<tokio::sync::mpsc::Sender<RespawnRequest>>,
+        Option<tokio::sync::mpsc::UnboundedSender<RespawnRequest>>,
 
     /// Receiver side of the dispatcher → operational-loop respawn
     /// request channel. Taken out for the duration of the
@@ -734,7 +741,7 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// `matcher_trigger_rx`. `None` outside an active loop (or
     /// when the respawn policy is disabled).
     pub(super) respawn_request_rx:
-        Option<tokio::sync::mpsc::Receiver<RespawnRequest>>,
+        Option<tokio::sync::mpsc::UnboundedReceiver<RespawnRequest>>,
 
     /// Construction-time primary endpoint and pubkey snapshot used
     /// to build [`SecondarySpawnSpec`]. The per-provider spawner
@@ -968,7 +975,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         primary_endpoint: String,
         primary_pubkey_pem: String,
     ) {
-        let (tx, rx) = tokio::sync::mpsc::channel(RESPAWN_REQUEST_CHANNEL_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.respawn_spawner = Some(spawner);
         self.respawn_budget = Some(budget);
         self.respawn_request_tx = Some(tx.clone());

@@ -128,13 +128,22 @@ pub struct RespawnRequest {
     pub cause: RemovalCause,
 }
 
-/// Bounded capacity for the dispatcher → operational-loop request
-/// channel. Sized identical-in-shape to the `PrimaryCommand` channel
-/// (`COMMAND_CHANNEL_CAPACITY`): the producer is a synchronous
-/// listener firing at the rate of real-world cluster-membership
-/// events, so 256 entries is comfortably above the worst-case
-/// mass-death burst on any realistic cluster.
-pub const RESPAWN_REQUEST_CHANNEL_CAPACITY: usize = 256;
+// Note: the dispatcher → operational-loop request channel is now
+// UNBOUNDED. The historical bounded capacity (`RESPAWN_REQUEST_CHANNEL_CAPACITY
+// = 256`) drop-on-full path lost deaths during mass-death-grace
+// finalize bursts and broke the budget accounting (a dropped request
+// is invisible to `respawn_events`, so the family-budget counter
+// never increments and the operator-visible `respawn_budget_exhausted`
+// line never fires for the lost peer). The apply-path lifecycle
+// channel uses `tokio::sync::mpsc::unbounded_channel` for the same
+// reason: the producer is the synchronous lifecycle dispatcher
+// `on_event` arm, which must NEVER block; the consumer is the
+// operational-loop `select!` arm, which drains at the rate of one
+// `dispatch_respawn_request` per iteration. Memory is bounded by the
+// total-budget cap (`RespawnBudget::max_total`, default 10) — once
+// the operational loop has reconciled `max_total` requests every
+// subsequent enqueue gets a `RejectTotalBudget` decision and the
+// queue empties.
 
 /// Decision returned by [`RespawnBudget::should_respawn`].
 ///
@@ -274,22 +283,24 @@ impl RespawnBudget {
 /// off-apply) can observe `Added` independently without changing this
 /// listener.
 ///
-/// Channel-full handling: the channel is bounded
-/// ([`RESPAWN_REQUEST_CHANNEL_CAPACITY`]). `try_send` is used so the
-/// dispatcher task (which calls `on_event` synchronously) never
-/// blocks. On overflow the request is dropped with a `warn`-level
-/// log; this is the same shape as the apply-path's unbounded
-/// lifecycle channel reasoning inverted — here we cap the queue so a
-/// stuck spawner cannot OOM the primary, and the operator-visible
-/// log line is the recovery surface.
+/// Channel shape: the request channel is unbounded
+/// (`tokio::sync::mpsc::UnboundedSender::send` is sync and infallible
+/// on the value side), so the dispatcher task (which calls `on_event`
+/// synchronously) NEVER blocks and NEVER drops. Mass-death-grace
+/// finalize bursts that previously blew past the legacy bounded cap
+/// of 256 now enqueue every death; the operational-loop arm drains
+/// at the rate of one `dispatch_respawn_request` per iteration, and
+/// the total-budget cap on `RespawnBudget::max_total` ensures only the
+/// first N drain past acceptance — the rest land as
+/// `RejectTotalBudget` decisions, keeping memory bounded.
 pub fn respawn_dispatcher_listener(
-    request_tx: tokio::sync::mpsc::Sender<RespawnRequest>,
+    request_tx: tokio::sync::mpsc::UnboundedSender<RespawnRequest>,
 ) -> Box<dyn LifecycleListener> {
     Box::new(RespawnDispatcherListener { request_tx })
 }
 
 struct RespawnDispatcherListener {
-    request_tx: tokio::sync::mpsc::Sender<RespawnRequest>,
+    request_tx: tokio::sync::mpsc::UnboundedSender<RespawnRequest>,
 }
 
 impl LifecycleListener for RespawnDispatcherListener {
@@ -300,14 +311,19 @@ impl LifecycleListener for RespawnDispatcherListener {
                     original_id: id.clone(),
                     cause: cause.clone(),
                 };
-                if let Err(e) = self.request_tx.try_send(req) {
-                    tracing::warn!(
+                // `UnboundedSender::send` only fails when every
+                // receiver has been dropped — i.e. the operational
+                // loop is gone. Log at debug level: this happens
+                // during normal teardown when the lifecycle
+                // dispatcher outlives the operational loop by a
+                // tick. There is no actionable failure here.
+                if let Err(e) = self.request_tx.send(req) {
+                    tracing::debug!(
                         target: "dynrunner_respawn",
                         peer_id = %id,
                         cause = ?cause,
                         error = %e,
-                        event = "respawn_request_dropped",
-                        "respawn request channel full or closed; dropping request",
+                        "respawn request channel closed; receiver gone",
                     );
                 }
             }
@@ -820,7 +836,7 @@ mod respawn_dispatcher_tests {
         // land if the channel side hasn't been wired. We construct a
         // throwaway channel just to verify the closure shape; the
         // coordinator's wiring itself is the contract under test.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<RespawnRequest>(8);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RespawnRequest>();
         let listener = respawn_dispatcher_listener(tx);
         listener.on_event(&PeerLifecycleEvent::Removed {
             id: "secondary-0".into(),
@@ -995,6 +1011,103 @@ mod respawn_dispatcher_tests {
                 assert_eq!(ids[0], "secondary-1");
                 assert_eq!(ids[1], "secondary-2");
                 assert_eq!(ids[2], "secondary-3");
+            })
+            .await;
+    }
+
+    /// Mass-death-grace finalize bursts in a real cluster can emit a
+    /// `PeerRemoved` per peer within a tight window. With the
+    /// historical bounded (256-cap) channel and `try_send` drop-on-full
+    /// path, anything past 256 vanished without trace — the budget
+    /// accounting (`respawn_events` ring) never saw the request,
+    /// `respawn_budget_exhausted` never fired, and the operator had no
+    /// way to know a death had happened. The unbounded shape pins the
+    /// inverse: 1000 sequential `Removed` events all enqueue without
+    /// drop, exactly N of them clear the budget (here `max_total = 1000`),
+    /// and the spawner sees all N.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unbounded_respawn_request_channel_accepts_burst() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let mut coordinator = make_coordinator();
+                let spawner = Arc::new(MockSpawner::new());
+                let calls = Arc::clone(&spawner.calls);
+                coordinator.enable_respawn(
+                    spawner.clone(),
+                    RespawnBudget {
+                        // Budget high enough that none of the burst
+                        // entries are rejected: the test pins the
+                        // ENQUEUE side (channel doesn't drop), so the
+                        // budget arithmetic stays out of the way.
+                        max_per_secondary: 1,
+                        max_total: 1000,
+                        cooldown: Duration::ZERO,
+                    },
+                    "tcp://127.0.0.1:5555".into(),
+                    "-----BEGIN PUBLIC KEY-----\nFAKE\n".into(),
+                );
+
+                let tx = coordinator
+                    .respawn_request_tx
+                    .as_ref()
+                    .expect("enable_respawn must install the sender")
+                    .clone();
+
+                // 1000 sequential `PeerRemoved` translations. Each
+                // peer id is unique so the family-budget cap of 1
+                // accepts every entry.
+                const BURST: u32 = 1000;
+                for i in 0..BURST {
+                    tx.send(RespawnRequest {
+                        original_id: format!("burst-{i}"),
+                        cause: RemovalCause::KeepaliveMiss,
+                    })
+                    .expect(
+                        "unbounded send must succeed while the \
+                         receiver is alive — this is the contract \
+                         the burst test pins",
+                    );
+                }
+
+                // Drain on the operational-loop side. We can't enter
+                // `lifecycle::operational_loop` from this test
+                // fixture (no real transport), so we replicate the
+                // arm's behaviour: pull one request at a time and
+                // call `dispatch_respawn_request`, draining the
+                // JoinSet between dispatches so the spawner's atomic
+                // counter has settled. The rx is taken out for the
+                // duration of the drain so the per-iteration
+                // `dispatch_respawn_request` (which mutates the same
+                // coordinator) does not conflict with an outstanding
+                // borrow on `respawn_request_rx`.
+                let mut rx = coordinator
+                    .respawn_request_rx
+                    .take()
+                    .expect("enable_respawn must install the receiver");
+                let mut drained = 0u32;
+                while let Ok(req) = rx.try_recv() {
+                    drained += 1;
+                    coordinator.dispatch_respawn_request(req);
+                    if let Some(outcome) = coordinator.respawn_tasks.join_next().await {
+                        let _ = outcome.expect("no panic in mock spawner");
+                    }
+                }
+                coordinator.respawn_request_rx = Some(rx);
+                assert_eq!(
+                    drained, BURST,
+                    "all {BURST} enqueued requests must be drainable",
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    BURST,
+                    "spawner must have received every accepted request",
+                );
+                assert_eq!(
+                    coordinator.respawn_events.len() as u32,
+                    BURST,
+                    "every accepted request must land on the events ring",
+                );
             })
             .await;
     }

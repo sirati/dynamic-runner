@@ -12,11 +12,15 @@
 //!
 //! Module boundary (the only surface other code crosses):
 //!
-//! - From Python: [`PyMultiProcessSpawner::new`] takes the callable,
-//!   the primary's endpoint URL, and the primary's PEM-encoded public
-//!   key. Python instantiates the pyclass once at primary startup and
-//!   hands it to the coordinator (the actual ``JoinSet`` wiring lands
-//!   in the sibling subtask that owns the operational loop).
+//! - From Python: [`PyMultiProcessSpawner::new`] takes the spawn
+//!   callable. The primary's endpoint and PEM-encoded public key are
+//!   NOT construction-time inputs — they reach the adapter through
+//!   each [`SecondarySpawnSpec`] the coordinator hands to ``spawn``.
+//!   Reading per-spawn means a respawned secondary from a later
+//!   generation can in principle see a refreshed pubkey without
+//!   re-instantiating the adapter (today's primary keeps the same
+//!   cert for the whole run; the per-spec read keeps the contract
+//!   honest for future rotation paths).
 //! - From Rust: the coordinator holds it as
 //!   ``Arc<dyn SecondarySpawner>`` and calls ``spawn(spec)`` whenever
 //!   ``peer_lifecycle::PeerRemoved`` triggers a replacement. Internals
@@ -56,30 +60,27 @@ use dynrunner_manager_distributed::primary::respawn::{
 /// [`PyMultiProcessSpawner::as_arc`] (Rust-only) hand back a clone of
 /// that Arc upcast to the trait object the coordinator consumes.
 ///
-/// Single concern: hold the Python callback + the construction-time
-/// snapshot. The `SecondarySpawner` impl below lives on this type
-/// (not on the pyclass wrapper) so the trait-object impl can move
-/// freely across thread / runtime boundaries — pyclass instances are
-/// pinned to the GIL-managed `PyCell` and cannot be sent as
-/// `Arc<dyn SecondarySpawner>` directly.
+/// Single concern: hold the Python callback. The primary's listen
+/// endpoint and pubkey arrive per-spawn through the
+/// [`SecondarySpawnSpec`] handed to the trait method — they are NOT
+/// stored on this struct. The `SecondarySpawner` impl below lives on
+/// this type (not on the pyclass wrapper) so the trait-object impl
+/// can move freely across thread / runtime boundaries — pyclass
+/// instances are pinned to the GIL-managed `PyCell` and cannot be
+/// sent as `Arc<dyn SecondarySpawner>` directly.
 pub(crate) struct MultiProcessSpawnerInner {
     spawn_callable: Py<PyAny>,
-    primary_endpoint: String,
-    primary_pubkey_pem: String,
 }
 
 /// Adapter from the Rust [`SecondarySpawner`] trait to a Python
 /// ``spawn_secondary`` callable.
 ///
-/// Construction-time fields (``primary_endpoint`` / ``primary_pubkey_pem``)
-/// are the source of truth for the respawn callbacks: the Rust primary
-/// already knows its own listen endpoint and certificate at startup,
-/// and threading those through ``SecondarySpawnSpec`` would force every
-/// trait-level caller to repeat that knowledge. The per-call spec
-/// supplies ``new_secondary_id`` — the only piece the adapter cannot
-/// know ahead of time. This split mirrors how the existing
-/// ``primary.rs`` initial-spawn path treats ``primary_url`` (built once
-/// from the bound port) and ``secondary_id`` (formatted per call).
+/// The Python callback receives `(primary_url, secondary_id, quic_port)`
+/// positionally and `primary_pubkey_pem` as a kwarg. Each value comes
+/// from the per-spawn [`SecondarySpawnSpec`]: the coordinator
+/// populates the spec from its own bound NetworkServer's cert and
+/// endpoint inside `enable_respawn`, so the adapter only relays — no
+/// construction-time cache, no GIL-side snapshotting.
 #[pyclass(name = "PyMultiProcessSpawner")]
 pub(crate) struct PyMultiProcessSpawner {
     inner: Arc<MultiProcessSpawnerInner>,
@@ -88,17 +89,9 @@ pub(crate) struct PyMultiProcessSpawner {
 #[pymethods]
 impl PyMultiProcessSpawner {
     #[new]
-    fn new(
-        spawn_callable: Py<PyAny>,
-        primary_endpoint: String,
-        primary_pubkey_pem: String,
-    ) -> Self {
+    fn new(spawn_callable: Py<PyAny>) -> Self {
         Self {
-            inner: Arc::new(MultiProcessSpawnerInner {
-                spawn_callable,
-                primary_endpoint,
-                primary_pubkey_pem,
-            }),
+            inner: Arc::new(MultiProcessSpawnerInner { spawn_callable }),
         }
     }
 }
@@ -159,9 +152,14 @@ impl SecondarySpawner for MultiProcessSpawnerInner {
         // `'static` closure, so it cannot borrow `&self`. `Py<PyAny>`
         // refcounts live in the interpreter — `clone_ref` is the
         // GIL-acquire path for "another owner".
+        //
+        // Endpoint + pubkey come from the per-spawn `spec`, NOT a
+        // construction-time field — see the module-level rationale
+        // (the coordinator owns the trust anchor; this adapter is
+        // pure relay).
         let callable = Python::attach(|py| self.spawn_callable.clone_ref(py));
-        let endpoint = self.primary_endpoint.clone();
-        let pubkey = self.primary_pubkey_pem.clone();
+        let endpoint = spec.primary_endpoint;
+        let pubkey = spec.primary_pubkey_pem;
         let new_id = spec.new_secondary_id;
 
         tokio::task::spawn_blocking(move || {
@@ -216,11 +214,11 @@ mod tests {
     fn spec(new_id: &str) -> SecondarySpawnSpec {
         SecondarySpawnSpec {
             new_secondary_id: new_id.to_owned(),
-            // The adapter intentionally ignores these — the
-            // construction-time fields on the pyclass are the source
-            // of truth. Filled here only so the spec is well-formed.
-            primary_endpoint: "tcp://ignored-by-adapter:0".to_owned(),
-            primary_pubkey_pem: "-----IGNORED BY ADAPTER-----".to_owned(),
+            // The adapter consumes these from the spec — the
+            // coordinator populates them from its NetworkServer's
+            // cert PEM + bind endpoint inside `enable_respawn`.
+            primary_endpoint: "tcp://127.0.0.1:5555".to_owned(),
+            primary_pubkey_pem: "-----BEGIN PUBLIC KEY-----\nFAKEPEM\n".to_owned(),
         }
     }
 
@@ -245,11 +243,7 @@ mod tests {
                 .unbind()
         });
 
-        let spawner = PyMultiProcessSpawner::new(
-            callable,
-            "tcp://127.0.0.1:5555".to_owned(),
-            "-----BEGIN PUBLIC KEY-----\nFAKEPEM\n".to_owned(),
-        );
+        let spawner = PyMultiProcessSpawner::new(callable);
 
         rt().block_on(async {
             spawner
@@ -305,11 +299,7 @@ mod tests {
                  raise RuntimeError('mock spawn failure')\n",
             "cb",
         );
-        let spawner = PyMultiProcessSpawner::new(
-            callable,
-            "tcp://127.0.0.1:5555".to_owned(),
-            "-----BEGIN PUBLIC KEY-----\n".to_owned(),
-        );
+        let spawner = PyMultiProcessSpawner::new(callable);
 
         let outcome =
             rt().block_on(async { spawner.as_arc().spawn(spec("sec-replacement-1")).await });
@@ -348,11 +338,7 @@ mod tests {
                 .unbind()
         });
 
-        let spawner = PyMultiProcessSpawner::new(
-            callable,
-            "tcp://127.0.0.1:5555".to_owned(),
-            "-----BEGIN PUBLIC KEY-----\n".to_owned(),
-        );
+        let spawner = PyMultiProcessSpawner::new(callable);
 
         let rt = rt();
         rt.block_on(async {
@@ -370,6 +356,85 @@ mod tests {
             let second: String = seen_list.get_item(1).unwrap().extract().unwrap();
             assert_eq!(first, "sec-a-replacement");
             assert_eq!(second, "sec-b-replacement");
+        });
+    }
+
+    /// `primary_pubkey_pem` reaches the Python callback verbatim from
+    /// the per-spawn `SecondarySpawnSpec`, NOT from a construction-
+    /// time field. Two successive `spawn()` calls each carry a
+    /// distinct pem; the callback must observe both in order — a
+    /// regression here means the adapter accidentally cached a
+    /// construction-time pem (the pre-fix shape) and the SLURM /
+    /// cert-rotation paths would silently authenticate against the
+    /// wrong anchor.
+    #[test]
+    fn primary_pubkey_pem_reaches_spawner_spec() {
+        let callable = make_python_callable(
+            "seen_pems = []\n\
+             seen_endpoints = []\n\
+             def cb(primary_url, secondary_id, quic_port, **kwargs):\n    \
+                 seen_pems.append(kwargs['primary_pubkey_pem'])\n    \
+                 seen_endpoints.append(primary_url)\n    \
+                 return None\n",
+            "cb",
+        );
+        let module_handle = Python::attach(|py| {
+            callable.bind(py).getattr("__globals__").unwrap().unbind()
+        });
+
+        let spawner = PyMultiProcessSpawner::new(callable);
+
+        let pem_a = "-----BEGIN PUBLIC KEY-----\nAAA\n-----END PUBLIC KEY-----\n";
+        let pem_b = "-----BEGIN PUBLIC KEY-----\nBBB\n-----END PUBLIC KEY-----\n";
+        let endpoint_a = "127.0.0.1:5555".to_owned();
+        let endpoint_b = "127.0.0.1:6666".to_owned();
+
+        rt().block_on(async {
+            let arc = spawner.as_arc();
+            arc.spawn(SecondarySpawnSpec {
+                new_secondary_id: "sec-a".into(),
+                primary_endpoint: endpoint_a.clone(),
+                primary_pubkey_pem: pem_a.to_owned(),
+            })
+            .await
+            .unwrap();
+            arc.spawn(SecondarySpawnSpec {
+                new_secondary_id: "sec-b".into(),
+                primary_endpoint: endpoint_b.clone(),
+                primary_pubkey_pem: pem_b.to_owned(),
+            })
+            .await
+            .unwrap();
+        });
+
+        Python::attach(|py| {
+            let globals = module_handle.bind(py);
+            let seen_pems_any = globals.get_item("seen_pems").unwrap();
+            let seen_pems = seen_pems_any.cast::<PyList>().unwrap();
+            let seen_endpoints_any = globals.get_item("seen_endpoints").unwrap();
+            let seen_endpoints = seen_endpoints_any.cast::<PyList>().unwrap();
+            assert_eq!(seen_pems.len(), 2);
+            assert_eq!(seen_endpoints.len(), 2);
+            let pem0: String = seen_pems.get_item(0).unwrap().extract().unwrap();
+            let pem1: String = seen_pems.get_item(1).unwrap().extract().unwrap();
+            let ep0: String = seen_endpoints.get_item(0).unwrap().extract().unwrap();
+            let ep1: String = seen_endpoints.get_item(1).unwrap().extract().unwrap();
+            assert_eq!(
+                pem0, pem_a,
+                "first spawn's spec.primary_pubkey_pem must reach the callback",
+            );
+            assert_eq!(
+                pem1, pem_b,
+                "second spawn's spec.primary_pubkey_pem must reach the callback (per-spawn read, NOT cached)",
+            );
+            assert_eq!(
+                ep0, endpoint_a,
+                "first spawn's spec.primary_endpoint must reach the callback as primary_url",
+            );
+            assert_eq!(
+                ep1, endpoint_b,
+                "second spawn's spec.primary_endpoint must reach the callback as primary_url",
+            );
         });
     }
 }

@@ -181,52 +181,120 @@ where
     G: Gateway + Send + Sync + 'static,
     T: TunnelEstablisher + 'static,
 {
+    /// Orphan-safety shape: the actual sbatch + job_ids.push + tunnel
+    /// setup runs inside `tokio::task::spawn_local`, NOT inline on the
+    /// caller's future. The `spawn_local` task is parented to the
+    /// surrounding `LocalSet` (the operational loop's `run_until`),
+    /// not to the coordinator's `respawn_tasks: JoinSet<RespawnOutcome>`
+    /// which gets `.shutdown().await`-d on teardown. The outer
+    /// `spawn()` future awaits a `oneshot::Receiver`; dropping the
+    /// receiver does NOT abort the inner task — the sbatch finishes,
+    /// `submit_job` pushes the job_id onto `job_ids`, and the
+    /// coordinator's later `cleanup()` `scancel`s the orphan.
+    ///
+    /// This closes two hazard windows the brief identified:
+    /// (a) sbatch submitted but `job_ids.push` aborted → orphan with
+    ///     no scancel record.
+    /// (b) sbatch recorded but tunnel-setup aborted → SLURM job runs
+    ///     orphaned in the queue.
+    /// Both are fixed by making the (sbatch + push + tunnel) sequence
+    /// inseparable from a JoinSet-shutdown perspective.
     async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError> {
         // (1) Synthesise the wrapper script body for this respawn id.
         // The generator owns the deployment-context capture; any
         // failure (template-render, missing config, …) lands here as
         // an opaque string so the trait's `SpawnError` variants stay
-        // provider-agnostic.
+        // provider-agnostic. Wrapper-gen failure is a synchronous
+        // local-state error; no sbatch has touched the gateway yet,
+        // so we surface it directly without taking the inner-task
+        // detour.
         let wrapper_script = (self.wrapper_script_generator)(&spec)
             .map_err(|e| SpawnError::Other(format!("wrapper-gen: {e}")))?;
 
-        // (2) Submit a 1-node sbatch. `submit_job` owns the script-
-        // write + sbatch invocation; we just hand it the script body
-        // and the new secondary id (used as both the SLURM job-name
-        // and the wrapper-script filename suffix). The lock is held
-        // across the entire submission so concurrent respawn callers
-        // serialise their sbatch invocations through the same manager
-        // — matches the existing pipeline contract (the manager owns
-        // `job_ids` mutation under `&mut self`).
-        let job_id = {
-            let mut mgr = self.job_manager.lock().await;
-            mgr.submit_job(&wrapper_script, &spec.new_secondary_id, 1, &self.run_log_dir)
-                .await
-                .map_err(|e| SpawnError::Other(format!("sbatch: {e}")))?
-        };
+        // Snapshot the collaborator handles the inner task needs.
+        // Cloning is cheap (Arc clones); the inner task moves them in
+        // so it has no lifetime dependency on `self`.
+        let job_manager = Arc::clone(&self.job_manager);
+        let tunnel_establisher = Arc::clone(&self.tunnel_establisher);
+        let run_log_dir = self.run_log_dir.clone();
+        let secondary_id = spec.new_secondary_id.clone();
 
-        tracing::info!(
-            new_secondary_id = %spec.new_secondary_id,
-            job_id = %job_id,
-            "respawn sbatch submitted; awaiting tunnel",
-        );
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), SpawnError>>();
 
-        // (3) Bring up the reverse tunnel for the new secondary via
-        // the `TunnelEstablisher` port. Production binds this to
-        // `SlurmPreparation::establish_one_tunnel`, which polls the
-        // connection-info file the compute node writes and spawns the
-        // verified `ssh -N -R` into the shared `ssh_tunnels` Vec.
-        self.tunnel_establisher
-            .establish_one_tunnel(&spec.new_secondary_id)
-            .await
-            .map_err(|e| SpawnError::Other(format!("tunnel: {e}")))?;
+        // Spawn the inseparable (sbatch + job_ids.push + tunnel) work
+        // onto the surrounding `LocalSet`. The task is detached from
+        // the outer JoinSet so a `.shutdown().await` on
+        // `respawn_tasks` only aborts the await below; the inner
+        // task keeps running until sbatch returns AND the job_id has
+        // been pushed onto `job_manager.job_ids` (so the coordinator's
+        // later `cleanup()` can `scancel` the orphan).
+        tokio::task::spawn_local(async move {
+            // (2) Submit a 1-node sbatch. `submit_job` writes the
+            // wrapper, invokes sbatch, and pushes the returned job_id
+            // onto its `job_ids` Vec in a single `&mut self` borrow.
+            // Holding the Mutex across the whole call serialises
+            // concurrent respawns through the same manager — matches
+            // the existing pipeline contract.
+            let job_id = {
+                let mut mgr = job_manager.lock().await;
+                match mgr
+                    .submit_job(&wrapper_script, &secondary_id, 1, &run_log_dir)
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        // sbatch failed → no job_id was minted, no
+                        // push happened, no orphan exists. Surface
+                        // the error and stop.
+                        let _ = tx.send(Err(SpawnError::Other(format!("sbatch: {e}"))));
+                        return;
+                    }
+                }
+            };
 
-        tracing::info!(
-            new_secondary_id = %spec.new_secondary_id,
-            job_id = %job_id,
-            "respawn tunnel established",
-        );
-        Ok(())
+            tracing::info!(
+                new_secondary_id = %secondary_id,
+                job_id = %job_id,
+                "respawn sbatch submitted; awaiting tunnel",
+            );
+
+            // (3) Bring up the reverse tunnel for the new secondary
+            // via the `TunnelEstablisher` port. Failure here is NOT
+            // an orphan condition for sbatch: the job_id has already
+            // landed on `job_ids` (above), so `cleanup()` will
+            // `scancel` it on coordinator drop. The error is still
+            // surfaced to the budget so a flapping tunnel doesn't
+            // silently re-submit.
+            let tunnel_outcome = tunnel_establisher
+                .establish_one_tunnel(&secondary_id)
+                .await;
+            match tunnel_outcome {
+                Ok(()) => {
+                    tracing::info!(
+                        new_secondary_id = %secondary_id,
+                        job_id = %job_id,
+                        "respawn tunnel established",
+                    );
+                    let _ = tx.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(SpawnError::Other(format!("tunnel: {e}"))));
+                }
+            }
+        });
+
+        // Outer future awaits the oneshot. If the JoinSet drops this
+        // future, the `rx` is dropped — the inner task's `tx.send`
+        // becomes a no-op (oneshot::Sender::send returns Err if rx is
+        // gone, which we ignore via `let _ =`). The inner task
+        // continues to completion regardless, so the orphan-safety
+        // invariant holds.
+        match rx.await {
+            Ok(result) => result,
+            Err(_recv_err) => Err(SpawnError::Other(
+                "spawn inner task dropped its sender before completion".to_string(),
+            )),
+        }
     }
 }
 
@@ -318,10 +386,17 @@ mod tests {
     /// `TunnelEstablisher` stub: records every call and returns either
     /// `Ok(())` or a canned `PrepError` so we can exercise the
     /// spawner's success and failure branches without touching ssh.
+    ///
+    /// A `gate` oneshot is held by tests that want to suspend the
+    /// `establish_one_tunnel` future deterministically (so they can
+    /// abort the outer spawn() future and then complete the tunnel
+    /// step to observe the post-abort side-effects on `job_manager`).
+    /// When `gate` is `None`, the call returns immediately.
     struct RecordingTunnelEstablisher {
         calls: AtomicUsize,
         last_id: StdMutex<Option<String>>,
         fail_with: StdMutex<Option<PrepError>>,
+        gate: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     }
 
     impl RecordingTunnelEstablisher {
@@ -330,6 +405,20 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 last_id: StdMutex::new(None),
                 fail_with: StdMutex::new(None),
+                gate: StdMutex::new(None),
+            }
+        }
+
+        /// Variant that suspends `establish_one_tunnel` on the
+        /// supplied gate. The test holds the matching `Sender` and
+        /// completes the tunnel step deterministically (or drops the
+        /// sender to observe a wedged-tunnel scenario).
+        fn gated(gate: tokio::sync::oneshot::Receiver<()>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                last_id: StdMutex::new(None),
+                fail_with: StdMutex::new(None),
+                gate: StdMutex::new(Some(gate)),
             }
         }
 
@@ -350,7 +439,13 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_id.lock().unwrap() = Some(secondary_id.to_owned());
             let maybe_err = self.fail_with.lock().unwrap().take();
+            let maybe_gate = self.gate.lock().unwrap().take();
             Box::pin(async move {
+                if let Some(gate) = maybe_gate {
+                    // Awaiting a dropped sender returns Err; treat
+                    // both Ok and Err as "the test released us".
+                    let _ = gate.await;
+                }
                 match maybe_err {
                     Some(e) => Err(e),
                     None => Ok(()),
@@ -374,8 +469,16 @@ mod tests {
     /// respawn-event ring). This locks down both propagation paths in
     /// a single test rather than splitting them — the same id must
     /// reach both places or the respawn is broken.
+    /// All `spawn()` tests run under a `LocalSet`: the production
+    /// implementation uses `tokio::task::spawn_local` to detach the
+    /// (sbatch + job_ids.push + tunnel) inner task from the
+    /// coordinator's `respawn_tasks` JoinSet so a JoinSet-level abort
+    /// can't orphan a submitted job. `spawn_local` requires a
+    /// `LocalSet` context — providing it in the test scaffold matches
+    /// the production caller (the operational loop's `run_until`).
     #[tokio::test]
     async fn slurm_spawner_submit_job_called_with_new_id() {
+        tokio::task::LocalSet::new().run_until(async {
         let gw = RecordingGateway::default();
         let cfg = SlurmConfig {
             root_folder: "/srv/slurm-test".into(),
@@ -427,6 +530,7 @@ mod tests {
             sbatch.contains("--nodes=1"),
             "respawn must request exactly 1 node; got: {sbatch}",
         );
+        }).await;
     }
 
     /// When sbatch fails (non-zero rc), `spawn()` must surface the
@@ -443,6 +547,7 @@ mod tests {
     ///       respawn flow's failure-budget arithmetic correct upstream.
     #[tokio::test]
     async fn slurm_spawner_returns_spawn_error_on_sbatch_failure() {
+        tokio::task::LocalSet::new().run_until(async {
         let gw = RecordingGateway {
             sbatch_fails: true,
             ..RecordingGateway::default()
@@ -490,6 +595,7 @@ mod tests {
             0,
             "tunnel establishment must not run when sbatch failed",
         );
+        }).await;
     }
 
     /// On the happy path, the tunnel port must be invoked AFTER
@@ -510,6 +616,7 @@ mod tests {
     /// branch.
     #[tokio::test]
     async fn slurm_spawner_invokes_establish_one_tunnel_after_submit() {
+        tokio::task::LocalSet::new().run_until(async {
         let gw = RecordingGateway::default();
         let cfg = SlurmConfig {
             root_folder: "/srv/slurm-test".into(),
@@ -554,5 +661,142 @@ mod tests {
             cmds.iter().any(|c| c.starts_with("sbatch ")),
             "submit_job must have issued an sbatch command",
         );
+        }).await;
+    }
+
+    /// Orphan-safety contract: after `spawn()` has submitted sbatch
+    /// (the inner task pushed the job_id onto `job_manager.job_ids`),
+    /// dropping the outer future mid-tunnel-setup must NOT lose the
+    /// job_id from the manager — the coordinator's later `cleanup()`
+    /// scancels the orphan exactly because the id is recorded there.
+    ///
+    /// Repro pattern:
+    /// 1. Tunnel-establisher is gated on a oneshot the test holds.
+    /// 2. We `spawn()` into the surrounding LocalSet via
+    ///    `tokio::task::spawn_local` and yield until sbatch has run
+    ///    (visible on the gateway's command log).
+    /// 3. At that point, we drop the outer JoinHandle (mirroring the
+    ///    JoinSet::shutdown abort path) WITHOUT releasing the gate.
+    /// 4. We then release the gate (so the inner task can finish its
+    ///    tunnel step) and yield until the inner task drains.
+    /// 5. Assert `mgr.job_ids` contains exactly one entry —
+    ///    `"67890"` (the canned sbatch stdout) — proving the post-
+    ///    abort sequence preserved the orphan-cleanup invariant.
+    #[tokio::test]
+    async fn slurm_spawner_orphan_sbatch_recorded_in_job_ids_after_shutdown_abort() {
+        tokio::task::LocalSet::new().run_until(async {
+            let gw = RecordingGateway::default();
+            let cfg = SlurmConfig {
+                root_folder: "/srv/slurm-test".into(),
+                ..SlurmConfig::default()
+            };
+            let mgr = Arc::new(Mutex::new(SlurmJobManager::new(cfg, gw)));
+
+            // Gate the tunnel step so we can observe the post-sbatch /
+            // pre-tunnel window. The sender is dropped by the test at
+            // the right moment to release the inner task.
+            let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+            let tunnel = Arc::new(RecordingTunnelEstablisher::gated(gate_rx));
+
+            let wrap_gen: WrapperScriptGenerator = Arc::new(
+                |_spec: &SecondarySpawnSpec| Ok("#!/bin/sh\necho hi\n".to_string()),
+            );
+
+            let spawner = Arc::new(SlurmSecondarySpawner::new(
+                Arc::clone(&mgr),
+                Arc::clone(&tunnel),
+                wrap_gen,
+                "/srv/slurm-test/log/run-1".into(),
+            ));
+
+            // Mirror the operational-loop shape: the outer `spawn()`
+            // future lives on a separate spawn_local (the JoinSet's
+            // task). When we abort that JoinHandle, only the outer
+            // future is cancelled — the inner spawn_local the
+            // production code spawned during `spawn()` survives.
+            let spawner_for_task = Arc::clone(&spawner);
+            let outer_handle = tokio::task::spawn_local(async move {
+                spawner_for_task.spawn(make_spec("sec-orphan-test")).await
+            });
+
+            // Yield until sbatch has run. The recording gateway logs
+            // every `execute_command`; sbatch is the second one (the
+            // first writes the wrapper script via `printf`). We poll
+            // for the sbatch line rather than sleeping a fixed
+            // duration so the test stays deterministic on slow CI.
+            let sbatch_seen = async {
+                loop {
+                    {
+                        let mgr_locked = mgr.lock().await;
+                        if mgr_locked
+                            .gateway()
+                            .commands()
+                            .iter()
+                            .any(|c| c.starts_with("sbatch "))
+                        {
+                            break;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            };
+            sbatch_seen.await;
+
+            // Confirm the orphan-safety pre-condition: the job_id is
+            // already on `job_ids` immediately after `submit_job`
+            // returns. This pins the invariant the production code
+            // relies on for the post-abort scancel path.
+            {
+                let mgr_locked = mgr.lock().await;
+                assert_eq!(
+                    mgr_locked.job_ids(),
+                    &["67890".to_string()],
+                    "submit_job must push the id onto job_ids before \
+                     yielding control back to the spawner",
+                );
+            }
+
+            // Abort the outer future (mirrors `JoinSet::shutdown`).
+            // The inner spawn_local task is parented to the
+            // surrounding LocalSet, NOT to this handle, so it keeps
+            // running.
+            outer_handle.abort();
+            // Yield so the abort actually takes effect; the inner
+            // task is still pending on the gate.
+            tokio::task::yield_now().await;
+
+            // Release the gate so the inner task can finish its
+            // tunnel step. With the production implementation, the
+            // tunnel succeeds, the inner task tries to send on the
+            // oneshot (the rx is gone — the outer future was
+            // aborted), and the `let _ =` swallows the error.
+            let _ = gate_tx.send(());
+
+            // Yield a few times so the inner task drains. We can't
+            // join on it directly (it's a detached spawn_local), but
+            // a handful of yields are enough for the recorder's
+            // `calls` counter to settle.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+
+            // The orphan-safety contract: the id is still on
+            // `job_ids` so the coordinator's `cleanup()` can scancel
+            // it on drop. Plus: the tunnel establishment ran (the
+            // inner task wasn't aborted along with the outer).
+            let mgr_locked = mgr.lock().await;
+            assert_eq!(
+                mgr_locked.job_ids(),
+                &["67890".to_string()],
+                "post-abort, job_id must remain on job_ids so \
+                 cleanup() can scancel the orphan",
+            );
+            assert_eq!(
+                tunnel.calls(),
+                1,
+                "the inner task must keep running after outer abort \
+                 (proves the spawn_local detach)",
+            );
+        }).await;
     }
 }

@@ -566,6 +566,17 @@ pub(crate) fn run_slurm_pipeline<'py>(
             skip_image_build,
             log,
         )?;
+        // Snapshot the tunnel manager Py-ref for the respawn wiring
+        // BEFORE moving the original into the cleanup guard. The
+        // tunnel manager is the only Python-side holder of the
+        // `Arc<SlurmPreparation>` the respawn `TunnelEstablisher`
+        // needs; passing both halves (the Py-ref AND the guard's
+        // owned move below) keeps the cleanup contract intact (the
+        // guard's Drop tears down the same preparation instance the
+        // respawn spawner shares).
+        let respawn_tunnel_manager: Option<Py<PyAny>> =
+            tunnel_manager.as_ref().map(|m| m.clone_ref(py));
+
         // Install the tunnel manager (if reverse mode produced one) on
         // the guard AFTER `run_preparation` returns so any later
         // failure in this pipeline still tears the established tunnels
@@ -614,6 +625,11 @@ pub(crate) fn run_slurm_pipeline<'py>(
             &binaries,
             &slurm_config,
             &job_manager,
+            respawn_tunnel_manager,
+            &cores_spec,
+            &max_memory_spec,
+            &forwarded_argv,
+            use_reverse_connection,
             log,
         )?;
 
@@ -622,6 +638,186 @@ pub(crate) fn run_slurm_pipeline<'py>(
 
     drop(guard);
     pipeline_result
+}
+
+/// Build the (`respawn_policy`, `respawn_spawner`) pair the SLURM
+/// pipeline hands to `RustPrimaryCoordinator(...)` at coordinator
+/// construction.
+///
+/// Single concern: assemble the SLURM respawn collaborators
+/// (`Arc<Mutex<SlurmJobManager>>`, `Arc<SlurmPreparation>`,
+/// wrapper-script generator closure capturing the deployment
+/// context) into a `PySlurmSpawner` pyclass + a `PyRespawnPolicy`,
+/// returning `None` if any required input is missing (out-of-tree
+/// callers subclassing `SlurmJobManager` without the `_rust` attr,
+/// or non-reverse-connection topologies with no tunnel manager).
+/// The caller short-circuits the respawn wiring in that case —
+/// preserving the legacy "respawn pipeline disabled, no crash"
+/// behaviour while logging the reason.
+#[allow(clippy::too_many_arguments)]
+fn build_slurm_respawn_kwargs<'py>(
+    py: Python<'py>,
+    args: &Bound<'py, PyAny>,
+    job_manager: &Bound<'py, PyAny>,
+    tunnel_manager: Option<&Py<PyAny>>,
+    outcome: &PreparationOutcome,
+    primary_quic_port: u16,
+    cores_spec: &str,
+    max_memory_spec: &str,
+    forwarded_argv: &[String],
+    use_reverse_connection: bool,
+    log: &Bound<'py, PyAny>,
+) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
+    // --- Budget from CLI flags. ---
+    let max_per_secondary: u32 = args
+        .getattr("respawn_max_per_secondary")
+        .ok()
+        .and_then(|v| v.extract().ok())
+        .unwrap_or(3);
+    let max_total: u32 = args
+        .getattr("respawn_max_total")
+        .ok()
+        .and_then(|v| v.extract().ok())
+        .unwrap_or(10);
+    // `--respawn-cooldown` is a duration string ("30s", "1m", …);
+    // delegate parsing to the existing `parse_duration_secs` helper
+    // on the CLI module so the SLURM path and the in-process path
+    // share one source of truth.
+    let cooldown_secs: f64 = match args.getattr("respawn_cooldown") {
+        Ok(v) if !v.is_none() => {
+            let cli_module = py.import("dynamic_runner.cli")?;
+            cli_module
+                .getattr("parse_duration_secs")?
+                .call1((v,))?
+                .extract()?
+        }
+        _ => 30.0,
+    };
+    let respawn_module = py.import("dynamic_runner")?;
+    let policy_cls = respawn_module.getattr("RespawnPolicy")?;
+    let policy = policy_cls.call_method1(
+        "on_secondary_death",
+        (max_per_secondary, max_total, cooldown_secs),
+    )?;
+
+    // --- Job manager Arc (must be the pyclass `_rust` handle). ---
+    let job_manager_arc = match job_manager.getattr("_rust") {
+        Ok(rust_handle) => match rust_handle
+            .cast::<crate::slurm::PyRustSlurmJobManager>()
+        {
+            Ok(rust_jm) => rust_jm.borrow().arc_handle(),
+            Err(_) => {
+                log.call_method1(
+                    "warning",
+                    (
+                        "SLURM respawn pipeline NOT wired: job_manager._rust is not a \
+                         RustSlurmJobManager pyclass (out-of-tree subclass?). \
+                         Respawn requests will be silently dropped — the operator \
+                         flag is honoured at the policy level but no spawner exists \
+                         to fulfil them.",
+                    ),
+                )?;
+                return Ok(None);
+            }
+        },
+        Err(_) => {
+            log.call_method1(
+                "warning",
+                (
+                    "SLURM respawn pipeline NOT wired: job_manager has no _rust \
+                     attribute. The respawn policy will be policy-only (no spawner).",
+                ),
+            )?;
+            return Ok(None);
+        }
+    };
+
+    // --- Preparation Arc + gateway reader (from the tunnel manager). ---
+    let (preparation_arc, info_reader) = match tunnel_manager {
+        Some(mgr) => {
+            let bound = mgr.bind(py);
+            match bound.cast::<crate::slurm::preparation::PySlurmPreparation>() {
+                Ok(prep) => {
+                    let prep_borrow = prep.borrow();
+                    (
+                        prep_borrow.arc_handle(),
+                        crate::slurm::preparation::PyGatewayReader::new(
+                            prep_borrow.gateway_handle(py),
+                        ),
+                    )
+                }
+                Err(_) => {
+                    log.call_method1(
+                        "warning",
+                        (
+                            "SLURM respawn pipeline NOT wired: tunnel_manager is \
+                             not a RustSlurmPreparation pyclass. Cannot share the \
+                             tunnel-establisher pool with the initial cohort.",
+                        ),
+                    )?;
+                    return Ok(None);
+                }
+            }
+        }
+        None => {
+            log.call_method1(
+                "warning",
+                (
+                    "SLURM respawn pipeline NOT wired: no tunnel manager in the \
+                     current topology. Respawn requires reverse-connection mode.",
+                ),
+            )?;
+            return Ok(None);
+        }
+    };
+
+    // --- Wrapper-script generator closure. ---
+    let image_metadata = match outcome.image_metadata.as_ref() {
+        Some(m) => m.clone_ref(py),
+        None => {
+            log.call_method1(
+                "warning",
+                (
+                    "SLURM respawn pipeline NOT wired: no image metadata recorded \
+                     by preparation. This usually means preparation did not run \
+                     to completion.",
+                ),
+            )?;
+            return Ok(None);
+        }
+    };
+    let wrapper_gen =
+        crate::slurm::respawn_bridge::wrapper_script_generator_from_pyobj(
+            job_manager.clone().unbind(),
+            image_metadata,
+            outcome.gateway_host.clone(),
+            primary_quic_port,
+            cores_spec.to_owned(),
+            max_memory_spec.to_owned(),
+            forwarded_argv.to_vec(),
+            use_reverse_connection,
+            outcome.run_log_dir.clone(),
+        );
+
+    // --- Build the PySlurmSpawner pyclass. ---
+    let spawner = crate::slurm::respawn_bridge::PySlurmSpawner::new(
+        job_manager_arc,
+        preparation_arc,
+        info_reader,
+        wrapper_gen,
+        outcome.run_log_dir.clone(),
+    );
+    let spawner_py = Py::new(py, spawner)?;
+
+    log.call_method1(
+        "info",
+        (format!(
+            "SLURM respawn pipeline wired: policy=on-secondary-death \
+             (max_per={max_per_secondary}, max_total={max_total}, cooldown={cooldown_secs:.1}s)",
+        ),),
+    )?;
+
+    Ok(Some((policy.unbind(), spawner_py.into_any())))
 }
 
 /// Mirrors the shape of the legacy Python
@@ -648,6 +844,20 @@ struct PreparationOutcome {
     cert_dir: Py<PyAny>,
     primary_entropy: Py<PyAny>,
     mode_specific_data: Py<PyDict>,
+    /// Image metadata kept after preparation so the SLURM respawn
+    /// wiring (`drive_rust_primary`) can re-render a per-respawn
+    /// wrapper script with the same image path the initial cohort
+    /// uses. None outside reverse-connection mode (no respawn path is
+    /// reachable there today either, but the field is shape-compatible).
+    image_metadata: Option<Py<PyAny>>,
+    /// Gateway hostname secondaries dial back through. Captured here
+    /// so the per-respawn wrapper-script generator closure in
+    /// `drive_rust_primary` doesn't need to re-import the gateway
+    /// reference.
+    gateway_host: String,
+    /// Run-scoped log dir. The per-respawn `submit_job` call uses it
+    /// for the regenerated `--output=`/`--error=` paths.
+    run_log_dir: String,
 }
 
 /// Drive the SLURM preparation steps in order, directly from the
@@ -891,6 +1101,9 @@ fn run_preparation<'py>(
             cert_dir: cert_dir.clone().unbind(),
             primary_entropy: primary_entropy.unbind(),
             mode_specific_data: mode_specific_data.unbind(),
+            image_metadata: Some(image_metadata.clone().unbind()),
+            gateway_host: gateway_host.clone(),
+            run_log_dir: run_log_dir.clone(),
         },
         tunnel_manager_handle,
     ))
@@ -1006,6 +1219,11 @@ fn drive_rust_primary<'py>(
     binaries: &Bound<'py, PyList>,
     slurm_config: &Bound<'py, PyAny>,
     job_manager: &Bound<'py, PyAny>,
+    tunnel_manager: Option<Py<PyAny>>,
+    cores_spec: &str,
+    max_memory_spec: &str,
+    forwarded_argv: &[String],
+    use_reverse_connection: bool,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<()> {
     let runner_module = py.import("dynamic_runner")?;
@@ -1051,6 +1269,48 @@ fn drive_rust_primary<'py>(
     // the manager boundary.
     let source_dir_str = sel_result.getattr("source_dir")?.str()?;
     coord_kwargs.set_item("source_dir", source_dir_str)?;
+
+    // ---- SLURM respawn wiring. ----
+    //
+    // Single concern at this call site: build the per-deployment
+    // SLURM respawn policy + spawner pair from (a) the CLI flags
+    // (`--respawn-policy`, `--respawn-max-per-secondary`, …) and
+    // (b) the live SLURM pipeline state (`job_manager._rust`'s
+    // `Arc<Mutex<SlurmJobManager<...>>>`, the tunnel manager's
+    // `Arc<SlurmPreparation>`, the deployment context the wrapper-
+    // script generator needs). The coordinator's `enable_respawn`
+    // call at run() entry consumes both kwargs through the same
+    // boundary the in-process multi-process path uses — no
+    // hot-site `if multi_computer == slurm` branches.
+    //
+    // Disabled (the default) leaves both kwargs unset; the
+    // coordinator's CCD-5 gate keeps the respawn pipeline structurally
+    // unreachable.
+    let respawn_policy_name: String = args
+        .getattr("respawn_policy")
+        .ok()
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_else(|| "disabled".into());
+    if respawn_policy_name != "disabled" {
+        let respawn_pyobjs = build_slurm_respawn_kwargs(
+            py,
+            args,
+            job_manager,
+            tunnel_manager.as_ref(),
+            outcome,
+            primary_quic_port,
+            cores_spec,
+            max_memory_spec,
+            forwarded_argv,
+            use_reverse_connection,
+            log,
+        )?;
+        if let Some((policy, spawner)) = respawn_pyobjs {
+            coord_kwargs.set_item("respawn_policy", policy)?;
+            coord_kwargs.set_item("respawn_spawner", spawner)?;
+        }
+    }
+
     let num_secondaries = outcome.num_secondaries;
     let args_tuple = PyTuple::new(py, [
         num_secondaries.into_pyobject(py)?.into_any().unbind(),

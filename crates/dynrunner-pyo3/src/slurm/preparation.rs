@@ -33,12 +33,12 @@ use dynrunner_slurm::preparation::{
 /// `Clone` for `Py<T>` without the `py-clone` feature, so this is
 /// the explicit-GIL path. Each watcher gets its own clone at
 /// spawn time.
-struct PyGatewayReader {
+pub(crate) struct PyGatewayReader {
     gateway: Py<PyAny>,
 }
 
 impl PyGatewayReader {
-    fn new(gateway: Py<PyAny>) -> Self {
+    pub(crate) fn new(gateway: Py<PyAny>) -> Self {
         Self { gateway }
     }
 }
@@ -110,7 +110,19 @@ impl InfoFileReader for PyGatewayReader {
 /// surrounding event loop keeps cooperating during the 600s deadline.
 #[pyclass(name = "RustSlurmPreparation")]
 pub(crate) struct PySlurmPreparation {
-    inner: SlurmPreparation,
+    /// Held as `Arc<SlurmPreparation>` so respawn callers (the SLURM
+    /// `SecondarySpawner` adapter built in `slurm/pipeline.rs`) can
+    /// share the SAME preparation instance the initial-cohort
+    /// `setup_ssh_tunnels` loop is using. This keeps the per-tunnel
+    /// `ssh_tunnels` cleanup set and the `establish_pool` rate-limiter
+    /// pool unified across both code paths — without an Arc the
+    /// respawn spawner would need a fresh `SlurmPreparation` and its
+    /// tunnels would never join the operator's `scancel`-on-shutdown
+    /// path. `setup_ssh_tunnels` / `cleanup` use `&self` (interior-
+    /// mutable fields under `Arc<Mutex<...>>` / `StdMutex<...>`) so
+    /// the Arc shape requires no other change at the lifecycle call
+    /// sites.
+    inner: std::sync::Arc<SlurmPreparation>,
     gateway: Py<PyAny>,
 }
 
@@ -188,7 +200,7 @@ impl PySlurmPreparation {
         }
         opts.establishment = est;
         Ok(Self {
-            inner: SlurmPreparation::new(opts),
+            inner: std::sync::Arc::new(SlurmPreparation::new(opts)),
             gateway,
         })
     }
@@ -199,17 +211,18 @@ impl PySlurmPreparation {
     /// - `TimeoutError` on outer deadline
     /// - `RuntimeError` for ssh-tunnel-failure / IO / parse errors
     fn setup_ssh_tunnels(
-        &mut self,
+        &self,
         py: Python<'_>,
         num_secondaries: usize,
         primary_quic_port: u16,
     ) -> PyResult<Py<PyDict>> {
         let reader = PyGatewayReader::new(self.gateway.clone_ref(py));
-        // Take a Send `&mut` to the inner state machine for the
-        // detached tokio runtime. `Py<PyAny>` is Send (refcounted
-        // across threads) but we never touch it without re-acquiring
-        // the GIL via `Python::attach` — see PyGatewayReader::read.
-        let inner: &mut SlurmPreparation = &mut self.inner;
+        // `SlurmPreparation::setup_ssh_tunnels` is `&self` (every
+        // mutating field is interior-mutable under
+        // `Arc<Mutex<...>>` / `StdMutex<...>`), so the Arc clone
+        // gives us a `'static`-friendly handle without taking out
+        // the GIL-pinned `&mut self` borrow.
+        let inner = std::sync::Arc::clone(&self.inner);
 
         let result: Result<std::collections::HashMap<String, u16>, PrepError> = py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -234,8 +247,8 @@ impl PySlurmPreparation {
 
     /// Drain all tracked tunnel subprocesses (SIGTERM → 5s wait →
     /// SIGKILL escalation). Idempotent.
-    fn cleanup(&mut self, py: Python<'_>) -> PyResult<()> {
-        let inner: &mut SlurmPreparation = &mut self.inner;
+    fn cleanup(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = std::sync::Arc::clone(&self.inner);
         py.detach(|| -> PyResult<()> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -259,6 +272,30 @@ impl PySlurmPreparation {
             dict.set_item(k, v)?;
         }
         Ok(dict.into())
+    }
+
+}
+
+impl PySlurmPreparation {
+    /// Rust-only hand-off: clone the inner `Arc<SlurmPreparation>` so
+    /// the respawn wiring (in `slurm/pipeline.rs`) can construct a
+    /// `SlurmPreparationTunnelEstablisher` over the SAME preparation
+    /// instance the initial-cohort tunnel setup is using. Without
+    /// this hand-off, a respawn's `establish_one_tunnel` would not
+    /// share the `ssh_tunnels` cleanup set or the `establish_pool`
+    /// rate-limiter with the initial cohort.
+    pub(crate) fn arc_handle(&self) -> std::sync::Arc<SlurmPreparation> {
+        std::sync::Arc::clone(&self.inner)
+    }
+
+    /// Rust-only access to the gateway `Py<PyAny>` the preparation
+    /// was constructed with. The respawn wiring needs it to build a
+    /// fresh `PyGatewayReader` for the tunnel-establisher's info-file
+    /// polling — same gateway the initial cohort uses, so per-respawn
+    /// info files land at the same path the operator's logs already
+    /// show.
+    pub(crate) fn gateway_handle(&self, py: Python<'_>) -> Py<PyAny> {
+        self.gateway.clone_ref(py)
     }
 }
 
