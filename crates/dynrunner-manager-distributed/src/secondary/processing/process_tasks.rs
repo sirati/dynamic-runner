@@ -539,7 +539,7 @@ where
             // `RunComplete` on natural quiesce breaks the cycle
             // without depending on the demoted exiting first.
             //
-            // Two-level gate to suppress spurious fires:
+            // Three-level gate to suppress spurious fires:
             //
             //   (a) Local-pool drained — primary_pending empty,
             //       primary_in_flight empty, own active_tasks empty,
@@ -580,20 +580,16 @@ where
             // under arbitrary task-graph shapes (no hard-coded total
             // — `task_count` is the CRDT-authoritative size of the
             // ledger).
-            let cluster_counts = self.cluster_state.counts();
-            let cluster_quiesced = self.cluster_state.task_count() > 0
-                && cluster_counts.pending == 0
-                && cluster_counts.in_flight == 0;
-            if self.is_primary
-                && !self.primary_disconnected
-                && self.primary_in_flight.is_empty()
-                && self.active_tasks.is_empty()
-                && self.primary_pending_is_empty()
-                && (self.primary_failed.is_empty()
-                    || !self.primary_retry_budget.should_retry())
-                && cluster_quiesced
-                && !self.cluster_state.run_complete()
-            {
+            // The (a) + (b) + (c) gate set described above is owned
+            // by `promoted_primary_natural_quiesce_eligible` (in
+            // `primary/ledger_ops.rs`). Lifted out of the call site
+            // so the test suite can pin gate semantics without
+            // driving the full operational loop; the branch keeps
+            // its side effects (cluster_state.apply, fan-out, flush)
+            // local because they sequence with the loop's exit
+            // condition immediately below.
+            if self.promoted_primary_natural_quiesce_eligible() {
+                let cluster_counts = self.cluster_state.counts();
                 tracing::info!(
                     completed = cluster_counts.completed,
                     failed = cluster_counts.failed,

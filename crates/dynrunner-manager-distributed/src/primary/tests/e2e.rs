@@ -304,6 +304,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     is_observer: false,
                     resource_check_interval: Duration::from_millis(100),
                     log_oom_watcher: false,
+                    promoted_primary_quiesce_grace: Duration::from_millis(100),
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,

@@ -85,6 +85,7 @@ where
             local_tasks_run: 0,
             transfer_complete: false,
             is_primary: false,
+            promoted_at: None,
             extraction_cache,
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,

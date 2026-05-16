@@ -297,6 +297,19 @@ where
                 let became_primary =
                     new_primary_id == self.config.secondary_id && !self.is_primary;
                 self.is_primary = new_primary_id == self.config.secondary_id;
+                if became_primary {
+                    // Stamp the promotion instant so the alive-demoted
+                    // natural-quiesce branch in `process_tasks` can
+                    // enforce its minimum-elapsed-time gate. See the
+                    // `promoted_at` field doc on `SecondaryCoordinator`
+                    // for the full rationale. Stamped here BEFORE
+                    // `populate_primary_from_cluster_state` so the
+                    // grace counts from the role flip, not from the
+                    // hydration write (which is sub-millisecond after
+                    // but conceptually distinct — a future hydration
+                    // refactor should not change the grace start).
+                    self.promoted_at = Some(std::time::Instant::now());
+                }
                 // `on_primary_changed` updates the routing target AND
                 // resets per-worker backoff so idle workers fire a
                 // fresh `TaskRequest` at the new primary on their next

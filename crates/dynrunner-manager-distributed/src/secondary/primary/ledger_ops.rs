@@ -246,4 +246,58 @@ where
             .map(|p| p.is_empty())
             .unwrap_or(true)
     }
+
+    /// Eligibility predicate for the **promoted-primary natural-quiesce
+    /// `RunComplete` broadcast** branch in `process_tasks`.
+    ///
+    /// Returns true exactly when every gate the branch requires
+    /// holds: this secondary acts as primary, the demoted primary is
+    /// still alive (the dead-demoted path has its own sibling branch),
+    /// the local primary-side ledger is drained, the cluster-wide
+    /// ledger has converged on a terminal partition
+    /// (`task_count() > 0 && pending == 0 && in_flight == 0`), the
+    /// post-promotion settle period has elapsed, and the
+    /// `RunComplete` flag is not already set on the local
+    /// cluster-state mirror.
+    ///
+    /// Single concern: the eligibility decision. The branch's side
+    /// effects (apply `RunComplete`, fan out the broadcast, flush
+    /// the primary transport) stay in `process_tasks`. Lifted to a
+    /// method so the test suite can pin the gate semantics without
+    /// driving the full operational `select!` loop.
+    ///
+    /// See `SecondaryCoordinator::promoted_at` and
+    /// `SecondaryConfig::promoted_primary_quiesce_grace` for the
+    /// settle-period gate's rationale (asm-dataset-nix T11
+    /// regression: a promoted secondary fires `RunComplete` on a
+    /// partial CRDT mirror and strands the in-flight remainder).
+    pub(in crate::secondary) fn promoted_primary_natural_quiesce_eligible(
+        &self,
+    ) -> bool {
+        if !self.is_primary
+            || self.primary_disconnected
+            || self.cluster_state.run_complete()
+        {
+            return false;
+        }
+        // Local-pool drained: gate (a) in the call-site comment.
+        let local_drained = self.primary_in_flight.is_empty()
+            && self.active_tasks.is_empty()
+            && self.primary_pending_is_empty()
+            && (self.primary_failed.is_empty()
+                || !self.primary_retry_budget.should_retry());
+        // Cluster-wide CRDT terminal partition: gate (b).
+        let cluster_counts = self.cluster_state.counts();
+        let cluster_quiesced = self.cluster_state.task_count() > 0
+            && cluster_counts.pending == 0
+            && cluster_counts.in_flight == 0;
+        // Post-promotion settle period elapsed: gate (c). `None` is
+        // treated as "not yet settled" so a code path that flips
+        // `is_primary` without stamping `promoted_at` fails closed.
+        let grace = self.config.promoted_primary_quiesce_grace;
+        let promotion_settled = self
+            .promoted_at
+            .is_some_and(|t| std::time::Instant::now().duration_since(t) >= grace);
+        local_drained && cluster_quiesced && promotion_settled
+    }
 }

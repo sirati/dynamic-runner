@@ -377,6 +377,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
             };
 
             let mut secondary = SecondaryCoordinator::new(
@@ -461,6 +462,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
             };
 
             // FixedPeerCount(2) reports peer_count() == 2 without
@@ -535,6 +537,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
             };
 
             let mut secondary = SecondaryCoordinator::new(

@@ -121,6 +121,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             is_observer: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -179,6 +180,7 @@ pub(super) fn spawn_real_secondary_flaky(
             is_observer: false,
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
         };
         let mut secondary = SecondaryCoordinator::new(
             config,

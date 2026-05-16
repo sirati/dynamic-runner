@@ -65,6 +65,7 @@ fn arm_watchdog_no_peers(
         is_observer: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,
+        promoted_primary_quiesce_grace: Duration::from_millis(100),
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -307,6 +308,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
+                promoted_primary_quiesce_grace: Duration::from_millis(100),
             };
             let binaries = vec![
                 make_binary("a", 50),
@@ -437,6 +439,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         is_observer: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,
+        promoted_primary_quiesce_grace: Duration::from_millis(100),
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,

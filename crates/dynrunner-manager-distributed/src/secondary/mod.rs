@@ -140,6 +140,41 @@ where
     transfer_complete: bool,
     is_primary: bool,
 
+    /// Wall-clock instant of the most recent `is_primary: false → true`
+    /// transition. `None` while this secondary has never been promoted;
+    /// set whenever a `PromotePrimary` (dispatch path) or a failover
+    /// election (election path) flips `is_primary` to true.
+    ///
+    /// Read by the **alive-demoted natural-quiesce** branch in
+    /// `process_tasks` to enforce a minimum-elapsed-time gate
+    /// (`PROMOTED_PRIMARY_QUIESCE_GRACE`) before declaring the cluster
+    /// done. Rationale: that branch fires on a CRDT-derived predicate
+    /// (`task_count() > 0 && pending == 0 && in_flight == 0`) that is
+    /// **incomplete-mirror-prone** in the immediate post-promotion
+    /// window — a freshly promoted secondary may hold only the
+    /// fraction of `TaskAdded` broadcasts the demoted primary had
+    /// flushed at promotion time. Without a settle period the local
+    /// view "5 of 10 tasks added, all 5 already terminal" satisfies
+    /// the predicate and the branch broadcasts `RunComplete` while
+    /// the demoted primary is still publishing the other 5
+    /// (asm-dataset-nix T11: 5/10 phase_build tasks stranded).
+    ///
+    /// This is a **time-based bandage**, documented as such: the
+    /// structurally clean fix (a wire signal from the demoted primary
+    /// that it has finished publishing) does not exist in the
+    /// protocol today. The grace is small enough not to defeat the
+    /// branch's original asm-tokenizer LMU 2-of-235 deadlock-break
+    /// purpose (loopback round-trips on a healthy cluster complete
+    /// in single-digit ms; 2 s gives orders-of-magnitude headroom)
+    /// while still finite so the branch eventually fires in the
+    /// LMU scenario it was added to fix.
+    ///
+    /// Not reset on a subsequent re-hydration (the post-bootstrap
+    /// `ClusterSnapshot` arm in `dispatch_message`): later snapshot
+    /// arrivals are exactly the events the grace exists to wait for,
+    /// resetting would defeat the purpose.
+    pub(in crate::secondary) promoted_at: Option<Instant>,
+
     // ZIP extraction cache
     extraction_cache: ExtractionCache,
 

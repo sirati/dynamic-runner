@@ -305,6 +305,15 @@ impl PySecondaryConfig {
             is_observer: false,
             resource_check_interval: self.distributed_config.resource_check_interval(),
             log_oom_watcher: self.distributed_config.log_oom_watcher(),
+            // Hardcoded to the SecondaryConfig::default() value (2 s).
+            // The grace gate is an internal heuristic on the
+            // promoted-primary natural-quiesce branch (see
+            // `SecondaryConfig::promoted_primary_quiesce_grace` for
+            // the rationale). Not exposed through PyDistributedConfig
+            // yet — operators who need to tune it would do so via the
+            // Rust crate directly; surfacing through the Python CLI
+            // is queued behind operator demand.
+            promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
         }
     }
 }

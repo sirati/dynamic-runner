@@ -299,6 +299,7 @@ impl PyDistributedManager {
                             is_observer: false,
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
+                            promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
                         };
 
                         let estimator = sec_estimator;
