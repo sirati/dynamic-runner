@@ -141,6 +141,20 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         help="Port for QUIC server to listen on (0 = let OS pick, default: 0)",
     )
     parser.add_argument(
+        "--secondary-primary-pubkey-pem",
+        type=str,
+        default=None,
+        help=(
+            "PEM-encoded primary QUIC server certificate, supplied by the "
+            "respawn pipeline so the respawned secondary can pin the primary's "
+            "trust anchor at QUIC handshake time. Carried verbatim from the "
+            "primary's `NetworkServer::cert_pem()`. Today's secondary stores "
+            "the value but does not yet act on it (the handshake-time "
+            "verification is a follow-up to the respawn-fix bundle); when the "
+            "verification path lands, this flag is its source of truth."
+        ),
+    )
+    parser.add_argument(
         "--disable-peer-overlay",
         action="store_true",
         help=(

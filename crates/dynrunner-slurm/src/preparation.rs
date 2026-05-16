@@ -291,8 +291,16 @@ impl SlurmPreparation {
     ///
     /// On timeout: outstanding watchers are aborted, [`Self::cleanup`]
     /// must still be called by the caller (drains `ssh_tunnels`).
+    ///
+    /// `&self` (not `&mut self`): every mutating site below is on an
+    /// interior-mutable field (`StdMutex<Option<u16>>`,
+    /// `Arc<Mutex<Vec<Child>>>`). The `&self` shape lets respawn
+    /// callers share an `Arc<SlurmPreparation>` between the
+    /// `setup_ssh_tunnels` initial-cohort loop and a downstream
+    /// `establish_one_tunnel` per respawn — see
+    /// `crate::respawn::SlurmPreparationTunnelEstablisher`.
     pub async fn setup_ssh_tunnels<R: InfoFileReader>(
-        &mut self,
+        &self,
         reader: R,
         num_secondaries: usize,
         primary_quic_port: u16,
@@ -494,7 +502,11 @@ impl SlurmPreparation {
     /// then SIGKILL escalation — mirrors Python's
     /// `proc.terminate(); proc.wait(timeout=5); proc.kill()`.
     /// Idempotent (drains `ssh_tunnels`).
-    pub async fn cleanup(&mut self) {
+    ///
+    /// `&self` mirrors [`Self::setup_ssh_tunnels`]: the only mutation
+    /// is draining the `Arc<Mutex<Vec<Child>>>`, which is already
+    /// interior-mutable.
+    pub async fn cleanup(&self) {
         tracing::info!("cleaning up SLURM preparation resources");
         let mut tunnels = self.ssh_tunnels.lock().await;
         for mut child in tunnels.drain(..) {

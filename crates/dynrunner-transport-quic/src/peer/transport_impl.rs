@@ -196,17 +196,18 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
         let mut clocks = now_clocks();
         self.router.prune(clocks.now);
         loop {
-            // The reconnect tick is conditionally polled: take()
-            // the receiver out for the duration of the select so
-            // tokio's borrow checker is happy, restore it on each
-            // arm. Single-secondary test fixtures that construct
-            // PeerNetwork without `start()` leave
-            // `reconnect_tick_rx = None`; that branch resolves to
-            // `pending::<Option<()>>().await` and never fires.
-            let mut tick_rx = self.reconnect_tick_rx.take();
+            // All three select arms poll cancel-safe channel
+            // receivers via disjoint-field borrows of `self`. The
+            // futures are dropped before the winning arm's body
+            // runs, so each body has unrestricted `&mut self`. No
+            // take/restore of `reconnect_tick_rx` is needed (and
+            // doing it was the pre-fix bug: an outer caller that
+            // dropped the `recv_peer` future mid-poll destroyed
+            // the taken-out receiver and silently disabled the
+            // periodic reconnect tick — see the comment on
+            // `PeerNetwork::reconnect_tick_rx`).
             let delivered_from_router = tokio::select! {
                 msg = self.incoming_rx.recv() => {
-                    self.reconnect_tick_rx = tick_rx;
                     self.drain_new_connections();
                     clocks = now_clocks();
                     self.router.prune(clocks.now);
@@ -231,7 +232,6 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                 }
                 accepted = self.new_conn_rx.recv() => {
-                    self.reconnect_tick_rx = tick_rx;
                     if let Some(accepted) = accepted {
                         if !self.connections.contains_key(&accepted.peer_id) {
                             // Same observe_reconnect-before-register
@@ -251,13 +251,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     }
                     None
                 }
-                _ = async {
-                    match tick_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending::<Option<()>>().await,
-                    }
-                } => {
-                    self.reconnect_tick_rx = tick_rx;
+                _ = self.reconnect_tick_rx.recv() => {
                     // Periodic reconnect-tick. The tracker
                     // reconciles against the authoritative cluster
                     // list (peer_dial_info) so a peer that dropped

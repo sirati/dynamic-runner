@@ -825,7 +825,27 @@ where
         if mutations.is_empty() {
             return Ok(());
         }
-        let applied = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
+        // `apply_locally_for_broadcast` also surfaces auto-resumed
+        // Blocked dependents (see the live primary's mirror site).
+        // The promoted secondary's `primary_pending` pool was seeded
+        // from CRDT at promotion time (`populate_primary_from_cluster_state`)
+        // so any Blocked entries already exist in the pool as
+        // `task_depends_on`-tracked items — the pool's own dep
+        // machinery will dispatch them when the prereq's
+        // `on_item_finished` fires through the normal task-event
+        // path. Re-injecting the resumed clones here would
+        // duplicate them in the pool's buckets, so we deliberately
+        // discard the list on this path. (Unfulfillable-cascade
+        // sequences originated post-promotion would also leave the
+        // dependents in the pool's `blocked` map for the same
+        // dep-machinery to unblock; the live primary's mirror site
+        // is the only one whose pool actually loses the items via
+        // `on_item_failed_permanent`.)
+        let batch = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
+        let crate::cluster_state::AppliedBatch {
+            applied,
+            resumed_for_dispatch: _,
+        } = batch;
         if applied.is_empty() {
             return Ok(());
         }
@@ -912,6 +932,20 @@ where
             tasks = task_count,
             "ingested setup-discovery; primary pool hydrated"
         );
+        // Empty-discovery happy path: when discovery surfaces zero
+        // items (e.g. every binary's output already exists under a
+        // `--skip-existing` filter), the pool is drained from
+        // inception and there will never be a `TaskCompleted` to
+        // trigger the normal counter-driven RunComplete broadcast.
+        // Originate RunComplete directly so every peer's exit arm
+        // observes the same authoritative terminal signal.
+        if task_count == 0 {
+            self.apply_and_broadcast_mutations(vec![ClusterMutation::RunComplete])
+                .await?;
+            tracing::info!(
+                "empty-discovery: RunComplete broadcast — no tasks to run"
+            );
+        }
         Ok(())
     }
 }

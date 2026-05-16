@@ -83,6 +83,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPrimaryHandle>()?;
     m.add_class::<PyMultiProcessSpawner>()?;
     m.add_class::<PyRustSlurmJobManager>()?;
+    m.add_class::<slurm::respawn_bridge::PySlurmSpawner>()?;
     m.add_class::<PySecondaryCoordinator>()?;
     m.add_class::<PyObserverLateJoiner>()?;
     m.add_class::<gateway::ssh::PySshGateway>()?;

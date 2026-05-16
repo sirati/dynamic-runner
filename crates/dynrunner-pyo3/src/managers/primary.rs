@@ -362,11 +362,15 @@ impl PyPrimaryCoordinator {
                     .cast::<crate::managers::multi_process_respawner::PyMultiProcessSpawner>()
                 {
                     Some(mp.borrow().as_arc())
+                } else if let Ok(slurm) = bound
+                    .cast::<crate::slurm::respawn_bridge::PySlurmSpawner>()
+                {
+                    Some(slurm.borrow().as_arc())
                 } else {
                     return Err(pyo3::exceptions::PyTypeError::new_err(
                         "respawn_spawner must be a recognised secondary-spawner \
-                         pyclass (PyMultiProcessSpawner, or a future SLURM \
-                         binding); got an unrecognised type",
+                         pyclass (PyMultiProcessSpawner or PySlurmSpawner); \
+                         got an unrecognised type",
                     ));
                 }
             }
@@ -383,16 +387,13 @@ impl PyPrimaryCoordinator {
         };
         // The primary's listen endpoint + pubkey are bound inside the
         // detached tokio runtime (see the `py.detach(|| { … })` block
-        // below) — we cannot snapshot them here on the GIL thread.
-        // Today's adapters (`PyMultiProcessSpawner`, the SLURM
-        // spawner) cache their own construction-time copies and
-        // ignore the spec's equivalent fields, so both placeholders
-        // are empty strings. When a future provider depends on the
-        // spec values directly, snapshot the real endpoint/pubkey
-        // immediately after `NetworkServer::bind` inside the
-        // detached runtime and thread them through `enable_respawn`.
-        let respawn_primary_endpoint = String::new();
-        let respawn_primary_pubkey_pem = String::new();
+        // below). Snapshotting them here on the GIL thread is not
+        // possible (NetworkServer::bind is async and consumes the
+        // port); the detached-runtime block reads them off the bound
+        // server and supplies them to `primary.enable_respawn(...)`
+        // directly. These placeholders are no longer used past this
+        // point — kept as `None` so any future GIL-side caller has a
+        // single source-of-truth they cannot accidentally re-derive.
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
         // Read the cap value the handle (or constructor kwarg) most
@@ -567,6 +568,26 @@ impl PyPrimaryCoordinator {
                         }
                     };
                 tracing::info!(port, "primary network server listening");
+
+                // Capture the primary's listen endpoint + cert PEM
+                // BEFORE moving `server` into the coordinator below.
+                // These are the trust anchors threaded through
+                // `enable_respawn` and surfaced to each respawned
+                // secondary via `SecondarySpawnSpec` (per-spawn, so
+                // a future cert rotation reaches downstream
+                // respawns).
+                //
+                // Endpoint format mirrors the QUIC-listen surface in
+                // `NetworkServer::bind`: `127.0.0.1:<port>`. In SLURM
+                // mode the secondary dials `localhost:<gateway_port>`
+                // via the per-secondary reverse tunnel — the gateway-
+                // facing port differs but the same PEM authenticates
+                // either path. In multi-process local mode the
+                // submitter and the spawned subprocess share the same
+                // loopback, so this endpoint is already the dial-able
+                // address.
+                let respawn_primary_endpoint = format!("127.0.0.1:{}", server.port());
+                let respawn_primary_pubkey_pem = server.cert_pem().to_string();
 
                 // Step 5b: pair the legacy `NetworkServer` (the
                 // submitter primary's per-secondary tunnel writers
