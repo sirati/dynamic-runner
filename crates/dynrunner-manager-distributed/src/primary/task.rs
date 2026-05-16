@@ -100,7 +100,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // for this worker; the scheduler picks the index, the
                 // pool commits the take.
                 let global_wid = self.workers[idx].worker_id;
-                let view = self.cap_filter_view(self.pool().view_for_worker(global_wid));
+                let view = self.cap_filter_view(self.pool().view_for_worker(global_wid, None));
                 if !view.is_empty() {
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =
