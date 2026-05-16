@@ -26,6 +26,7 @@ use super::module;
     manual_start_worker = false,
     log_paths = None,
     worker_spec = None,
+    log_dir = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_local<'py>(
@@ -42,6 +43,7 @@ pub(crate) fn run_local<'py>(
     manual_start_worker: bool,
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
+    log_dir: Option<String>,
 ) -> PyResult<Py<PyAny>> {
     // The legacy positional `max_memory` is kept for back-compat with
     // direct `RustLocalManager(...)` callers; the typed-config path
@@ -68,6 +70,9 @@ pub(crate) fn run_local<'py>(
     }
     if let Some(ws) = worker_spec {
         kwargs.set_item("worker_spec", ws)?;
+    }
+    if let Some(ld) = log_dir {
+        kwargs.set_item("log_dir", ld)?;
     }
     kwargs.set_item("max_resources", config.max_resources.clone())?;
     kwargs.set_item(

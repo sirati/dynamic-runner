@@ -22,6 +22,7 @@ use super::module;
     skip_existing = false,
     log_paths = None,
     worker_spec = None,
+    log_dir = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_secondary<'py>(
@@ -35,6 +36,7 @@ pub(crate) fn run_secondary<'py>(
     skip_existing: bool,
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
+    log_dir: Option<String>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_bytes` retained for back-compat; the typed
     // path passes the full multi-resource map via the `max_resources`
@@ -47,6 +49,9 @@ pub(crate) fn run_secondary<'py>(
     }
     if let Some(ws) = worker_spec {
         kwargs.set_item("worker_spec", ws)?;
+    }
+    if let Some(ld) = log_dir {
+        kwargs.set_item("log_dir", ld)?;
     }
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
     kwargs.set_item("max_resources", config.max_resources.clone())?;

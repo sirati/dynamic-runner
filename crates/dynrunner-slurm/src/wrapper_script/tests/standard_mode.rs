@@ -169,6 +169,51 @@ fn script_forwards_src_network_container_path() {
 }
 
 #[test]
+fn script_forwards_log_dir_container_path() {
+    // Log-mount split: the wrapper bind-mounts the gateway's per-run
+    // log directory at `/app/log-network` and MUST tell the secondary
+    // subprocess to use that as the log-mount root via
+    // `--log-dir=/app/log-network`. Without this flag the framework's
+    // `resolve_log_dir` falls back to the output-mount root
+    // (`/app/out-network`) — pre-split, worker logs landed at
+    // `/app/out-network/<timestamp>/<sid>/worker_<N>.log` instead of
+    // under `/app/log-network` (asm-tokenizer field report). The fix
+    // adds a typed `log_path` on the PyO3 task config plus this
+    // explicit framework flag so the wrapper-secondary contract is
+    // symbolic (matching `--src-network`), not path-existence-
+    // dependent.
+    //
+    // Asserted invariants:
+    //   1. The flag is present in `=` form (task #32 argparse-
+    //      collision rule).
+    //   2. It carries the container path `/app/log-network`,
+    //      matching the bind-mount destination on the
+    //      `-v "{log_network}:/app/log-network"` line.
+    //   3. The flag lands AFTER `--src-network=` in the
+    //      container_command suffix (argv-build order).
+    let config = SlurmConfig::default();
+    let cfg = standard_cfg(&config, &[]);
+    let script = generate_wrapper_script(&cfg);
+    assert!(
+        script.contains("--log-dir=/app/log-network"),
+        "wrapper script must forward `--log-dir=/app/log-network` to \
+         secondary so its argparse stores the container-internal log-\
+         mount path on `args.log_dir`; render did not contain it"
+    );
+    let srcnet_idx = script
+        .find("--src-network=")
+        .expect("--src-network= must be present");
+    let logdir_idx = script
+        .find("--log-dir=")
+        .expect("--log-dir= must be present");
+    assert!(
+        logdir_idx > srcnet_idx,
+        "--log-dir must appear after --src-network in the secondary's \
+         argv (currently at byte {logdir_idx}, src-network at {srcnet_idx})"
+    );
+}
+
+#[test]
 fn standard_mode_script_contains_gateway() {
     let config = SlurmConfig::default();
     let script = generate_wrapper_script(&standard_cfg(&config, &[]));

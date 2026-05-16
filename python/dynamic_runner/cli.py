@@ -185,6 +185,19 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         "/app/src-network in container deployments.",
     )
     parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help=(
+            "Per-run log-mount root. The framework anchors per-secondary "
+            "log directories (`{timestamp}/{secondary_id}/worker_*.log` by "
+            "default) under this path; falls back to the output dir when "
+            "unset. The SLURM wrapper passes `--log-dir=/app/log-network` "
+            "so worker logs land under the dedicated log-mount tree "
+            "instead of the output-mount tree."
+        ),
+    )
+    parser.add_argument(
         "--src-tmp",
         type=str,
         default=None,

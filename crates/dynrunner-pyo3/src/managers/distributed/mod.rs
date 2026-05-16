@@ -39,6 +39,16 @@ pub(crate) struct PyDistributedManager {
     pub(super) max_resources_per_secondary: ResourceMap,
     pub(super) source_dir: PathBuf,
     pub(super) output_dir: PathBuf,
+    /// Per-run log-mount root passed to
+    /// `LogPathConfig::resolve_log_dir`. Resolved by
+    /// `LoadedTaskDefinition::from_python` from the caller-supplied
+    /// `log_dir` kwarg, falling back to `output_dir` for single-host
+    /// deployments where the two roots coincide. Threaded into the
+    /// `run()` loop's per-secondary log-dir resolution so logs land
+    /// under the dedicated log-mount tree on SLURM deployments
+    /// (`/app/log-network`) rather than the output-mount tree
+    /// (`/app/out-network`).
+    pub(super) log_path: PathBuf,
     pub(super) log_paths: LogPathConfig,
     pub(super) worker_spec: Option<WorkerSpec>,
     pub(super) distributed_config: DistributedConfig,

@@ -191,14 +191,24 @@ impl LoadedTopology {
 /// `LoadedTaskDefinition`, each with its own `secondary_id`, and a
 /// single eager `log_dir` would force them to share a directory and
 /// collide their `worker_*.log` filenames. Each manager calls
-/// `log_paths.resolve_log_dir(py, &output_path, &secondary_id)` itself
+/// `log_paths.resolve_log_dir(py, &log_path, &secondary_id)` itself
 /// once it knows which secondary the directory belongs to.
+///
+/// `log_path` is the per-run log-mount root: the framework feeds it
+/// (not `output_path`) to `LogPathConfig::resolve_log_dir` so logs
+/// land under the dedicated log-mount tree on SLURM deployments
+/// (`/app/log-network`) rather than spilling into the output-mount
+/// tree (`/app/out-network`). It defaults to `output_path` when the
+/// caller did not supply an explicit log-mount root — preserving the
+/// pre-split behaviour for single-host deployments where output and
+/// log roots are intentionally the same directory.
 pub(crate) struct LoadedTaskDefinition {
     pub(crate) estimator: PyMemoryEstimatorBridge,
     pub(crate) types: TypeRegistry,
     pub(crate) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(crate) source_path: PathBuf,
     pub(crate) output_path: PathBuf,
+    pub(crate) log_path: PathBuf,
     pub(crate) log_paths: LogPathConfig,
     pub(crate) python_executable: PathBuf,
     /// `TaskDefinition.uses_file_based_items` (FR-2). False means
@@ -214,12 +224,20 @@ pub(crate) struct LoadedTaskDefinition {
 }
 
 impl LoadedTaskDefinition {
+    // Internal extractor — adding `log_dir` pushed this past clippy's
+    // 7-arg comfort threshold. The shape is dictated by what every
+    // manager constructor needs from the Python `task_definition` +
+    // per-run paths; a struct of these would just push the same set
+    // of params one level up. Collapsing into a builder is a separate
+    // API refactor (same allow as the manager constructors).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_python(
         py: Python<'_>,
         task_definition: &Bound<'_, PyAny>,
         task_args: &Bound<'_, PyAny>,
         source_dir: &str,
         output_dir: &str,
+        log_dir: Option<&str>,
         skip_existing: bool,
         log_paths: Option<LogPathConfig>,
     ) -> PyResult<Self> {
@@ -235,6 +253,14 @@ impl LoadedTaskDefinition {
 
         let source_path = PathBuf::from(source_dir);
         let output_path = PathBuf::from(output_dir);
+        // Single-source-of-truth fallback: when the caller did not
+        // supply a dedicated log-mount root (single-host deployments,
+        // legacy callers), the log root degenerates to the output
+        // root — preserving the pre-split behaviour. The three
+        // managers below read `task.log_path` unconditionally; the
+        // None-handling lives here so each call site stays a single
+        // boolean-free expression.
+        let log_path = log_dir.map(PathBuf::from).unwrap_or_else(|| output_path.clone());
         let source_str = source_path.to_str().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "source_dir is not valid UTF-8: {:?}",
@@ -290,6 +316,7 @@ impl LoadedTaskDefinition {
             phase_deps: topology.phase_deps,
             source_path,
             output_path,
+            log_path,
             log_paths,
             python_executable: PathBuf::from(python_executable),
             uses_file_based_items,

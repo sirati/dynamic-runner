@@ -250,6 +250,7 @@ def _dispatch_local(task, args, config, logger) -> None:
         connection_mode=args.connection_mode,
         socket_dir=args.socket_dir,
         manual_start_worker=args.manual_start_worker,
+        log_dir=getattr(args, "log_dir", None),
     )
     _log_local_result(result, logger)
 
@@ -432,6 +433,7 @@ def _dispatch_secondary(task, args, logger) -> None:
         str(worker_source_dir),
         str(cfg.output_dir),
         skip_existing=args.skip_existing,
+        log_dir=getattr(args, "log_dir", None),
     )
 
 
@@ -567,6 +569,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
         task_completed_listener=getattr(task, "task_completed_listener", None),
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
+        log_dir=getattr(args, "log_dir", None),
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
