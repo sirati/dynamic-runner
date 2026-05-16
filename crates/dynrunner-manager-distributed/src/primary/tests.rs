@@ -3310,10 +3310,10 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         tokio::task::spawn_local(async move {
             let mut rx = sec1_inbound;
             while let Some(msg) = rx.recv().await {
-                if let DistributedMessage::PeerInfo { peers, .. } = &msg {
-                    if let Some(tx) = peer_info_tx.take() {
-                        let _ = tx.send(peers.clone());
-                    }
+                if let DistributedMessage::PeerInfo { peers, .. } = &msg
+                    && let Some(tx) = peer_info_tx.take()
+                {
+                    let _ = tx.send(peers.clone());
                 }
                 if sec1_inner_tx.send(msg).is_err() {
                     break;

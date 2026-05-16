@@ -75,12 +75,11 @@ pub(super) fn stage_file(
     // If the destination already matches the expected content hash,
     // skip the copy (idempotent — repeated StageFile notifications
     // are cheap).
-    if dest.exists() {
-        if let Some(existing_hash) = compute_file_hash(&dest) {
-            if existing_hash == expected_content_hash {
-                return Ok(StageOutcome { dest });
-            }
-        }
+    if dest.exists()
+        && let Some(existing_hash) = compute_file_hash(&dest)
+        && existing_hash == expected_content_hash
+    {
+        return Ok(StageOutcome { dest });
     }
 
     std::fs::copy(&effective_src, &dest).map_err(|e| {

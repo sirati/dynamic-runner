@@ -131,10 +131,10 @@ impl ExtractionCache {
         file_hash: &str,
     ) -> Option<PathBuf> {
         // Check cache
-        if let Some(path) = self.extracted.get(file_hash) {
-            if path.exists() {
-                return Some(path.clone());
-            }
+        if let Some(path) = self.extracted.get(file_hash)
+            && path.exists()
+        {
+            return Some(path.clone());
         }
 
         let src_network = self.src_network.as_ref()?;
