@@ -3453,7 +3453,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
         // Post-fix it must early-return without touching pool
         // state — since the primary now owns dispatch.
         let pool_len_before = primary.pool().len();
-        let view_before = primary.pool().view_for_worker(0).len();
+        let view_before = primary.pool().view_for_worker(0, None).len();
         assert_eq!(pool_len_before, 1);
         assert_eq!(view_before, 1);
         assert!(primary.workers[0].is_idle);

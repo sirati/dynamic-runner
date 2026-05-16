@@ -974,7 +974,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 continue;
             }
             let global_wid = self.workers[worker_idx].worker_id;
-            let view = self.cap_filter_view(self.pool().view_for_worker(global_wid));
+            let view = self.cap_filter_view(self.pool().view_for_worker(global_wid, None));
             if view.is_empty() {
                 continue;
             }

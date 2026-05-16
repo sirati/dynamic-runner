@@ -55,7 +55,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     pub(super) async fn try_assign_initial(&mut self, worker_id: WorkerId, factory: &mut impl WorkerFactory<M>) {
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let max = self.max_resources();
-        let view = self.pool_ref().view_for_worker(worker_id);
+        let view = self.pool_ref().view_for_worker(worker_id, None);
         let decision = self.scheduler.assign_initial(
             &worker_info,
             view.as_slice(),
