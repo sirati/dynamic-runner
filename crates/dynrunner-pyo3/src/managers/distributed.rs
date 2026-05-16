@@ -286,12 +286,12 @@ impl PyDistributedManager {
         // and dispatch to the Python TaskDefinition's `on_phase_*`
         // methods. Built before `py.detach` so the closures can capture
         // ref-bumped `Py<PyAny>` clones.
-        let on_phase_start: Box<dyn FnMut(&dynrunner_core::PhaseId) + Send> = Box::new(
+        let on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(
                 self.task_definition.clone_ref(py),
             ),
         );
-        let on_phase_end: Box<dyn FnMut(&dynrunner_core::PhaseId, u32, u32) + Send> = Box::new(
+        let on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
             crate::managers::lifecycle::make_on_phase_end(
                 self.task_definition.clone_ref(py),
             ),
