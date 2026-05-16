@@ -194,16 +194,23 @@ def _build_respawn_args(args: argparse.Namespace, spawn_secondary) -> tuple:
             max_per, max_total, cooldown_secs
         )
         # Today's spawner adapter is the multi-process one. The SLURM
-        # equivalent will live behind the same wrapper class and
-        # extend this branch. The Python `spawn_secondary` callable
-        # is the same one the initial-cohort loop uses; reusing it
-        # keeps the wire-flow shape identical for the operator
-        # ("respawn = re-run the same callback with a fresh id").
-        spawner = _rs.PyMultiProcessSpawner(
-            spawn_secondary,
-            "",  # primary_endpoint — adapter caches its own copy at construction time
-            "",  # primary_pubkey_pem — same; the adapter ignores this
-        )
+        # equivalent lives in `dynrunner-slurm` and is wired by the
+        # SLURM pipeline (see `_dispatch_slurm` / the Rust
+        # `_run_slurm_pipeline`), not here. The Python
+        # `spawn_secondary` callable is the same one the initial-
+        # cohort loop uses; reusing it keeps the wire-flow shape
+        # identical for the operator ("respawn = re-run the same
+        # callback with a fresh id").
+        #
+        # The primary's listen endpoint + pubkey PEM no longer travel
+        # through this constructor — they are bound inside the Rust
+        # primary's detached tokio runtime (after `NetworkServer::bind`
+        # returns its cert) and threaded into `enable_respawn`
+        # directly. Each per-spawn `SecondarySpawnSpec` carries them
+        # to the adapter, which relays them into the Python callback
+        # as the existing `primary_url` positional + `primary_pubkey_pem`
+        # kwarg.
+        spawner = _rs.PyMultiProcessSpawner(spawn_secondary)
         return policy, spawner
     raise ValueError(
         f"unknown --respawn-policy={policy_name!r}; expected one of "
