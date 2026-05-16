@@ -1,21 +1,31 @@
+//! The secondary's operational `select!` loop body.
+//!
+//! Single concern: drive one secondary's tick-driven event loop.
+//! Inbound primary messages, peer messages, worker events, and timers
+//! all funnel through this select! and route to the appropriate
+//! handler in sibling modules. The body is intentionally large
+//! because the select! arm-set IS the loop's API surface; per-arm
+//! extraction would force every arm to plumb the loop-state (timers,
+//! interval handles, OOM watcher) back through method parameters.
+//!
+//! Length exception: this file is over the 500-line threshold (the
+//! select! loop runs ~700 lines including doc/comments). Documented
+//! in `secondary/processing/mod.rs`.
+
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, WorkerId};
-use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender, WorkerId};
 use dynrunner_manager_local::oom::{
     OomWatcher, OomWatcherConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL,
 };
-use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_manager_local::WorkerFactory;
-use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-};
+use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-
-use super::{RunOutcome, SecondaryCoordinator};
-use super::wire::timestamp_now;
+use super::super::wire::timestamp_now;
+use super::super::{RunOutcome, SecondaryCoordinator};
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
@@ -26,7 +36,7 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub(super) async fn process_tasks(
+    pub(in crate::secondary) async fn process_tasks(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<RunOutcome, String> {
@@ -729,379 +739,5 @@ where
         // SetupPending yield uses `return Ok(RunOutcome::SetupPending)`
         // directly, so reaching here means we're done.
         Ok(RunOutcome::Done)
-    }
-
-    /// Tick-driven re-check of the primary-link failover threshold.
-    /// Called once per keepalive tick from `process_tasks`. The
-    /// recv-None branch only triggers on a NEW recv-None event;
-    /// since the bridge architecture turns the recv future permanently
-    /// pending after a single None, a single dropped-bridge event would
-    /// otherwise never re-evaluate the time axis. This method bridges
-    /// the gap by polling `primary_link.should_arm_failover()` on
-    /// every tick and arming once the time window elapses.
-    ///
-    /// Idempotent: harmless when the link is healthy (the predicate
-    /// short-circuits on `first_failure_at.is_none()`), and harmless
-    /// when failover is already armed (`primary_disconnected` short-
-    /// circuits the body so we don't re-backdate `primary_last_seen`).
-    /// `is_primary` short-circuits as well — a promoted secondary has
-    /// no use for failover.
-    pub(super) fn check_primary_link_threshold(&mut self) {
-        if self.is_primary {
-            return;
-        }
-        if !self.primary_link.is_link_failing() {
-            return;
-        }
-        if !self.primary_link.should_arm_failover() {
-            return;
-        }
-        // Already-armed: nothing to do — election is in flight.
-        // We still want to gate the recv arm if it hasn't been
-        // gated yet (first iteration of the time-elapsed branch
-        // before any recv-None observation).
-        if self.primary_disconnected {
-            return;
-        }
-        let peers = self.peer_transport.peer_count();
-        if peers == 0 {
-            // The recv-arm None branch handles the no-mesh case via
-            // `break`; we shouldn't be reachable here without at
-            // least one peer (since the time-axis arming requires
-            // a prior recv-None which would have taken the no-peer
-            // exit). Defensive: exit cleanly if we somehow are.
-            tracing::info!(
-                "primary-link threshold breached and no peer mesh; \
-                 deferring exit to natural termination path"
-            );
-            self.primary_disconnected = true;
-            return;
-        }
-        tracing::warn!(
-            connected_peers = peers,
-            "primary-link failure-window elapsed; arming failover \
-             (election will run via peer mesh)"
-        );
-        self.primary_disconnected = true;
-        let backdate = self
-            .config
-            .keepalive_interval
-            .saturating_mul(self.config.keepalive_miss_threshold + 1);
-        self.primary_last_seen = Some(
-            Instant::now()
-                .checked_sub(backdate)
-                .unwrap_or_else(Instant::now),
-        );
-    }
-
-    /// Send keepalive to the current primary and broadcast to peers.
-    /// In degraded-mesh mode (`peer_mesh_degraded`) the peer
-    /// broadcast is skipped — there's nothing to broadcast to. The
-    /// primary→secondary keepalive over WSS still fires so the
-    /// primary keeps seeing us as alive.
-    pub(super) async fn send_keepalive(&mut self) {
-        let active_count = self
-            .pool.workers
-            .iter()
-            .filter(|w| w.current_binary.is_some())
-            .count() as u32;
-        let msg = DistributedMessage::Keepalive {
-            sender_id: self.config.secondary_id.clone(),
-            timestamp: timestamp_now(),
-            secondary_id: self.config.secondary_id.clone(),
-            active_workers: active_count,
-        };
-        // Send to whoever is currently primary (local at run start;
-        // the promoted peer after PromotePrimary).
-        let _ = self.send_to_current_primary(msg.clone()).await;
-        if self.peer_mesh_degraded {
-            return;
-        }
-        // Broadcast to peers (including the primary if it's a peer —
-        // duplicate but idempotent).
-        let _ = self.peer_transport.broadcast(msg).await;
-    }
-
-    pub(super) async fn handle_worker_event(
-        &mut self,
-        event: WorkerEvent<I>,
-    ) -> Result<Option<WorkerId>, String> {
-        match event {
-            WorkerEvent::TaskCompleted {
-                worker_id,
-                result,
-                binary,
-                ..
-            } => {
-                // Test-only: track tasks run on this secondary's own
-                // workers. See `local_tasks_run` doc on
-                // `SecondaryCoordinator`.
-                #[cfg(test)]
-                {
-                    self.local_tasks_run += 1;
-                }
-                // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
-                self.pool.workers[worker_id as usize].clear_task();
-
-                // Find the file hash for this worker's task
-                let file_hash = self
-                    .active_tasks
-                    .iter()
-                    .find(|&(_, &wid)| wid == worker_id)
-                    .map(|(hash, _)| hash.clone());
-                let log_task_hash = file_hash.clone();
-
-                if let Some(hash) = file_hash {
-                    self.active_tasks.remove(&hash);
-                    // `completed_tasks` is the "saw it terminate" set;
-                    // the primary's dispatch path uses it to
-                    // avoid redispatching tasks the cluster has
-                    // already finished. For Recoverable failures we
-                    // intend to retry, so the hash must NOT land here
-                    // — otherwise `handle_primary_task_request` would
-                    // filter the re-injected binary out via its
-                    // `completed_tasks` retain, and retry silently
-                    // becomes a no-op. Mirrors the pre-existing
-                    // dispatch.rs::TaskFailed forward and peer.rs::
-                    // TaskFailed wire paths, both of which already
-                    // skip `completed_tasks` insertion for
-                    // Recoverable. The terminal-failure / success
-                    // branches still insert below.
-                    let recoverable_failure = !result.success
-                        && result
-                            .error_type
-                            .as_ref()
-                            .is_some_and(|e| matches!(
-                                e,
-                                dynrunner_core::ErrorType::Recoverable
-                            ));
-                    if !recoverable_failure {
-                        self.completed_tasks.insert(hash.clone());
-                    }
-
-                    if result.success {
-                        // Drive the primary's phase machine if
-                        // this node is acting as one and dispatched
-                        // the task — a no-op otherwise. Mid-run
-                        // firing is what unblocks chained phases in
-                        // the primary pool.
-                        self.note_primary_item_completed(&hash);
-                        // Report completion to the current primary
-                        // (whichever node currently holds authority).
-                        let msg = DistributedMessage::TaskComplete {
-                            sender_id: self.config.secondary_id.clone(),
-                            timestamp: timestamp_now(),
-                            secondary_id: self.config.secondary_id.clone(),
-                            worker_id,
-                            task_hash: hash.clone(),
-                            result_data: None,
-                        };
-                        self.send_to_current_primary(msg.clone()).await?;
-                        let _ = self.peer_transport.broadcast(msg).await;
-                    } else {
-                        // Reuse the upstream classification from the
-                        // worker protocol; default to NonRecoverable
-                        // only when the worker layer didn't tag the
-                        // result (genuine "unknown" — distinct from
-                        // the disconnect path which now reports
-                        // Recoverable explicitly via worker.rs /
-                        // protocol-manager-worker).
-                        let error_type = result
-                            .error_type
-                            .clone()
-                            .unwrap_or(ErrorType::NonRecoverable);
-                        // Failure-aware variant: Recoverable failures
-                        // land in `primary_failed` for the
-                        // retry pass. Phase-machine in-flight
-                        // bookkeeping is identical to the success
-                        // case (decrement + cascade).
-                        self.note_primary_item_failed(&hash, &error_type);
-                        // Synchronous drain-check (see peer.rs for
-                        // rationale): immediately re-inject if this
-                        // was the last in-flight task and there's
-                        // retry budget left.
-                        self.primary_drain_check_and_retry().await;
-                        // Report error to the current primary.
-                        let msg = DistributedMessage::TaskFailed {
-                            sender_id: self.config.secondary_id.clone(),
-                            timestamp: timestamp_now(),
-                            secondary_id: self.config.secondary_id.clone(),
-                            worker_id,
-                            task_hash: hash.clone(),
-                            error_type,
-                            error_message: result
-                                .error_message
-                                .unwrap_or_else(|| "Unknown error".into()),
-                        };
-                        self.send_to_current_primary(msg.clone()).await?;
-                        let _ = self.peer_transport.broadcast(msg).await;
-                    }
-
-                    // Request next task for this worker
-                    self.request_task_for_worker(worker_id).await?;
-                }
-
-                // Operator-facing INFO: did the worker finish a
-                // task, and did it succeed? The `secondary_id` is
-                // redundant in per-secondary slurm_*.out files
-                // (the file IS the secondary). Per-task identity
-                // (task_id / phase / task_type) moves to the
-                // sibling DEBUG so the operator log stays terse
-                // while diagnostic context is preserved.
-                tracing::info!(
-                    worker_id,
-                    task_hash = ?log_task_hash,
-                    success = result.success,
-                    "task done"
-                );
-                tracing::debug!(
-                    secondary = %self.config.secondary_id,
-                    worker_id,
-                    task_id = ?binary.as_ref().and_then(|b| b.task_id.as_deref()),
-                    phase = ?binary.as_ref().map(|b| b.phase_id.to_string()),
-                    task_type = ?binary.as_ref().map(|b| b.type_id.to_string()),
-                    task_hash = ?log_task_hash,
-                    success = result.success,
-                    "task done: identity"
-                );
-
-                Ok(None)
-            }
-            WorkerEvent::Disconnected {
-                worker_id,
-                result,
-                binary,
-            } => {
-                // Reap the subprocess BEFORE reclaim_protocol so the
-                // exit status rides the same log line as the
-                // disconnect. `try_reap_exit` is non-blocking; `None`
-                // means PID was untracked, kernel hasn't reaped yet
-                // (SIGCHLD race), or the child was already reaped by
-                // another path. See WorkerHandle::try_reap_exit for
-                // the full set of None conditions.
-                let exit_status = self.pool.workers[worker_id as usize].try_reap_exit();
-
-                // Reclaim protocol state from the spawned poll task
-                self.pool.workers[worker_id as usize].reclaim_protocol().await;
-                self.pool.workers[worker_id as usize].clear_task();
-
-                tracing::warn!(
-                    worker_id,
-                    error = ?result.error_message,
-                    exit_status = exit_status.as_ref().map(|s| s.to_string()),
-                    "worker disconnected"
-                );
-
-                // Find and report the task as failed
-                let file_hash = self
-                    .active_tasks
-                    .iter()
-                    .find(|&(_, &wid)| wid == worker_id)
-                    .map(|(hash, _)| hash.clone());
-
-                if let Some(hash) = file_hash {
-                    self.active_tasks.remove(&hash);
-
-                    // Discriminate two Disconnected-event shapes:
-                    //
-                    //   A. Worker explicitly reported a real
-                    //      task failure on the wire — Response::
-                    //      Error(NonRecoverable, msg). The
-                    //      communication SUCCEEDED; the message
-                    //      WAS delivered. The task ran (or at
-                    //      least the worker attempted it) and
-                    //      reported a non-recoverable failure.
-                    //      → forward as TaskFailed(NonRecoverable)
-                    //        so the primary records the real
-                    //        failure (consumes retry budget if
-                    //        applicable; surfaces in fail_final
-                    //        per the outcome-class breakdown).
-                    //
-                    //   B. Pure transport-level disconnect — no
-                    //      wire-level error response, just an
-                    //      EOF on the manager's read end (the
-                    //      protocol layer at `state.rs:152`
-                    //      synthesises `Recoverable +
-                    //      "transport disconnected"` for this
-                    //      case; `worker.rs:154` synthesises
-                    //      `Recoverable + "Disconnected before
-                    //      Ready"` for the pre-Ready variant).
-                    //      The communication FAILED; the task
-                    //      may not have run at all.
-                    //      → forward as backpressure-shaped
-                    //        TaskFailed (Recoverable + the
-                    //        marker the primary's
-                    //        `is_backpressure` predicate
-                    //        recognises) so the primary REQUEUES
-                    //        the task at the pool without
-                    //        consuming retry budget. The next
-                    //        TaskRequest from the respawned
-                    //        worker (or another peer) picks it
-                    //        back up.
-                    //
-                    // Discriminator is `result.error_type`:
-                    // NonRecoverable → real failure (A); anything
-                    // else (Recoverable + transport-disconnected
-                    // synthesis) → comm failure (B).
-                    let error_type = result
-                        .error_type
-                        .clone()
-                        .unwrap_or(ErrorType::Recoverable);
-                    let is_comm_failure =
-                        !matches!(error_type, ErrorType::NonRecoverable);
-
-                    let (wire_error_type, wire_error_message) = if is_comm_failure {
-                        (
-                            ErrorType::Recoverable,
-                            "worker pipe broken; respawning".to_string(),
-                        )
-                    } else {
-                        (
-                            error_type,
-                            result
-                                .error_message
-                                .unwrap_or_else(|| "Worker disconnected".into()),
-                        )
-                    };
-
-                    let msg = DistributedMessage::TaskFailed {
-                        sender_id: self.config.secondary_id.clone(),
-                        timestamp: timestamp_now(),
-                        secondary_id: self.config.secondary_id.clone(),
-                        worker_id,
-                        task_hash: hash,
-                        error_type: wire_error_type,
-                        error_message: wire_error_message,
-                    };
-                    let _ = self.send_to_current_primary(msg.clone()).await;
-                    let _ = self.peer_transport.broadcast(msg).await;
-                }
-
-                let _ = binary; // binary info already reported
-
-                // Signal that this worker needs restart
-                Ok(Some(worker_id))
-            }
-            WorkerEvent::PhaseUpdate {
-                worker_id,
-                phase_name,
-            } => {
-                tracing::debug!(worker_id, phase = %phase_name, "phase update");
-                Ok(None)
-            }
-            WorkerEvent::Keepalive { worker_id } => {
-                tracing::trace!(worker_id, "worker keepalive");
-                Ok(None)
-            }
-            WorkerEvent::Ready { worker_id } => {
-                tracing::debug!(worker_id, "worker ready");
-                Ok(None)
-            }
-        }
-    }
-
-    pub(super) async fn stop_all_workers(&mut self) {
-        self.pool.stop_all().await;
     }
 }
