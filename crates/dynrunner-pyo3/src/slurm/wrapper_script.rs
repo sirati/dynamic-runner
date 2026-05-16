@@ -30,9 +30,10 @@ use dynrunner_slurm::wrapper_script::{
 /// object here — keeping the boundary minimal means changes to the
 /// Python config shape don't ripple into the generator API.
 fn build_slurm_config(root_folder: &str) -> SlurmConfig {
-    let mut cfg = SlurmConfig::default();
-    cfg.root_folder = root_folder.to_string();
-    cfg
+    SlurmConfig {
+        root_folder: root_folder.to_string(),
+        ..SlurmConfig::default()
+    }
 }
 
 /// Render the SLURM secondary-job wrapper script. Mirrors the

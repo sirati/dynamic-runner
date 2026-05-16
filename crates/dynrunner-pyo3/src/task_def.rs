@@ -148,11 +148,11 @@ impl LoadedTopology {
                 // Optional per-type concurrency cap. `None` (or
                 // missing attr for old task definitions) → no cap on
                 // this type.
-                if let Ok(mc) = tts.getattr("max_concurrent") {
-                    if !mc.is_none() {
-                        let cap: u32 = mc.extract()?;
-                        max_concurrent_per_type.insert(type_id.clone(), cap);
-                    }
+                if let Ok(mc) = tts.getattr("max_concurrent")
+                    && !mc.is_none()
+                {
+                    let cap: u32 = mc.extract()?;
+                    max_concurrent_per_type.insert(type_id.clone(), cap);
                 }
 
                 if !seen_type_ids.insert(type_id.clone()) {

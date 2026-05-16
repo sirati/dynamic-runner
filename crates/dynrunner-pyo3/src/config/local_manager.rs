@@ -96,6 +96,13 @@ impl PyLocalManagerConfig {
     /// Build the Rust-side config. Consumes `self.restart_predicate` by
     /// cloning the Py reference (callers may keep `self` for inspection;
     /// the predicate closure clones the Py once and holds it for the run).
+    ///
+    /// Currently unused — the in-process Python-facing manager
+    /// constructs `LocalManagerConfig` directly from kwargs rather
+    /// than via this wrapper. Kept as documented API surface for
+    /// callers that prefer to build a `PyLocalManagerConfig` and
+    /// convert in one step.
+    #[allow(dead_code)]
     pub(crate) fn to_rust(&self, py: Python<'_>) -> RustLocalManagerConfig {
         let restart_predicate = self.restart_predicate.as_ref().map(|cb| {
             let cb = cb.clone_ref(py);

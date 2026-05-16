@@ -42,6 +42,11 @@ impl PyPrimaryConfig {
 }
 
 impl PyPrimaryConfig {
+    /// Build the Rust-side config. Currently unused — the
+    /// `PyPrimaryCoordinator` constructor pulls each field
+    /// individually rather than through this wrapper. Kept as a
+    /// documented API for callers that prefer a one-step conversion.
+    #[allow(dead_code)]
     pub(crate) fn to_rust(&self) -> RustPrimaryConfig {
         RustPrimaryConfig {
             node_id: self.node_id.clone(),
@@ -265,6 +270,11 @@ fn default_secondary_dir(
 use crate::system_resources::{detect_logical_cpu_count as detect_num_workers, detect_total_memory_bytes};
 
 impl PySecondaryConfig {
+    /// Build the Rust-side config. Currently unused — the
+    /// `PySecondaryCoordinator` constructor pulls each field
+    /// individually rather than through this wrapper. Kept as a
+    /// documented API for callers that prefer a one-step conversion.
+    #[allow(dead_code)]
     pub(crate) fn to_rust(&self) -> RustSecondaryConfig {
         RustSecondaryConfig {
             secondary_id: self.secondary_id.clone(),

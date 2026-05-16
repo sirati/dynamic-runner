@@ -212,10 +212,10 @@ impl PySshGateway {
         let home = py.detach(|| {
             block_on_local(async { self.inner.execute_command("echo $HOME", None).await })
         });
-        if let Ok(result) = home {
-            if result.success() {
-                self._remote_home = Some(result.stdout.trim().to_owned());
-            }
+        if let Ok(result) = home
+            && result.success()
+        {
+            self._remote_home = Some(result.stdout.trim().to_owned());
         }
         Ok(())
     }
