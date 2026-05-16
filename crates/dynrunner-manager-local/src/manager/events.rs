@@ -35,10 +35,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
 
-                if result.success {
-                    if let Some(b) = binary.as_ref() {
-                        self.task_payloads.push((b.clone(), result_data));
-                    }
+                if result.success
+                    && let Some(b) = binary.as_ref()
+                {
+                    self.task_payloads.push((b.clone(), result_data));
                 }
 
                 self.handle_task_completed(

@@ -65,10 +65,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             let (transport, pid) = factory
                 .spawn_worker(i)
                 .map_err(|e| format!("failed to spawn worker {i}: {e}"))?;
-            if print_pid {
-                if let Some(pid) = pid {
-                    tracing::info!(worker_id = i, pid, "worker PID");
-                }
+            if print_pid
+                && let Some(pid) = pid
+            {
+                tracing::info!(worker_id = i, pid, "worker PID");
             }
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
@@ -122,10 +122,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         let (transport, pid) = factory
             .spawn_worker(worker_id)
             .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?;
-        if print_pid {
-            if let Some(pid) = pid {
-                tracing::info!(worker_id, pid, "worker PID (restart)");
-            }
+        if print_pid
+            && let Some(pid) = pid
+        {
+            tracing::info!(worker_id, pid, "worker PID (restart)");
         }
 
         let reserved_budgets = self.workers[worker_id as usize].reserved_budgets.clone();
