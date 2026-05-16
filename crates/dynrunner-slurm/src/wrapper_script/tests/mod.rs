@@ -8,6 +8,7 @@ use crate::wrapper_script::{ConnectionMode, WrapperScriptConfig};
 
 mod argv_quoting;
 mod cleanup;
+mod preflight_podman;
 mod reverse_mode;
 mod standard_mode;
 mod syntax_and_quote;

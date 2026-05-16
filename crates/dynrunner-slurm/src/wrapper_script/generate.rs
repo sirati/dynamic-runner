@@ -150,6 +150,82 @@ echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 echo ""
 
+# ============================================================================
+# Pre-flight: graceful-stop any podman containers left running under the
+# current user from prior dispatches on this compute node.
+# ============================================================================
+#
+# Why this exists: ungraceful SLURM job termination (preemption, time-limit
+# SIGKILL after the script's TERM trap missed, node reboot) leaves the
+# wrapper's per-job ``$PODMAN_STORAGE`` (under /tmp/asm-XXXX/storage) on
+# disk with its container still running, supervised by an orphan conmon
+# process that no parent will ever reap. Field-observed pattern
+# (asm-tokenizer 2026-05-16): 16 orphan containers on a 40-node cluster,
+# one alive 7+ hours, actively writing into the network output volume
+# alongside live dispatches and corrupting data. Default-storage
+# ``podman ps`` does NOT see these — they're in orphan per-job
+# ``$PODMAN_STORAGE`` roots ``podman`` was never told about. Recovery
+# required a 1.167 TiB manual sweep across all 40 nodes (host-side
+# ``find /tmp -name 'asm-*'`` + per-orphan ``podman --root X --runroot Y
+# stop+rm`` + ``unshare`` mode rewrites for the rootless-subuid layers).
+#
+# What this does: enumerate every ``/tmp/*/storage`` directory owned by
+# this user (the wrapper's per-job storage shape), graceful-stop running
+# containers there, then ``podman rm -af`` so the orphan exited
+# containers no longer hold storage layers. Also scans the user-default
+# rootless storage for symmetry — same operation, no harm if empty.
+# Skipped via ``DYNRUNNER_DISABLE_PREFLIGHT_PODMAN=1`` for the rare
+# operator who needs to keep prior containers running (mid-job
+# diagnostics).
+#
+# Why graceful (-t 10) rather than ``podman kill``: per user spec
+# (``--oom-pressure-threshold`` PR thread on 2026-05-17). 10s grace
+# lets the orphan's process tree flush bind-mount writes and final
+# logs before the SIGKILL fallback.
+#
+# Why the current job's own ``$PODMAN_STORAGE`` is harmless to scan:
+# it was just ``mkdir -p``'d empty above. ``podman ps`` returns nothing
+# there; ``podman rm -af`` is a no-op.
+if [ "${{DYNRUNNER_DISABLE_PREFLIGHT_PODMAN:-0}}" = "1" ]; then
+    echo "Pre-flight podman cleanup: skipped (DYNRUNNER_DISABLE_PREFLIGHT_PODMAN=1)"
+else
+    echo "Pre-flight: scanning for leftover podman containers..."
+    preflight_found=0
+    # Phase 1: orphan per-job storage roots under /tmp/.
+    for orphan_storage in /tmp/*/storage; do
+        [ -d "$orphan_storage" ] || continue
+        [ -O "$orphan_storage" ] || continue
+        orphan_runroot="${{orphan_storage%/storage}}/run"
+        # Running containers: graceful stop with 10s grace.
+        orphan_running=$(podman --root "$orphan_storage" --runroot "$orphan_runroot" --cgroup-manager=cgroupfs ps -q 2>/dev/null || true)
+        if [ -n "$orphan_running" ]; then
+            preflight_found=1
+            echo "Pre-flight: stopping containers in $orphan_storage: $orphan_running"
+            podman --root "$orphan_storage" --runroot "$orphan_runroot" --cgroup-manager=cgroupfs stop -t 10 $orphan_running 2>/dev/null || true
+        fi
+        # All containers (including stopped/exited): remove to release
+        # storage layers. The peer-documented leak: exited containers
+        # held the network-output bind mount open even after the
+        # process died; only ``rm`` releases those references.
+        podman --root "$orphan_storage" --runroot "$orphan_runroot" --cgroup-manager=cgroupfs rm -af 2>/dev/null || true
+    done
+    # Phase 2: user-default rootless storage. Same operations; covers
+    # operators who run ad-hoc ``podman`` without ``--root``.
+    default_running=$(podman ps -q 2>/dev/null || true)
+    if [ -n "$default_running" ]; then
+        preflight_found=1
+        echo "Pre-flight: stopping containers in default storage: $default_running"
+        podman stop -t 10 $default_running 2>/dev/null || true
+    fi
+    podman rm -af 2>/dev/null || true
+    if [ "$preflight_found" = "1" ]; then
+        echo "Pre-flight: cleaned up leftover containers"
+    else
+        echo "Pre-flight: no leftover containers"
+    fi
+fi
+echo ""
+
 # Cap container memory at MIN(host MemTotal - 2GiB, wrapper-cgroup-memory-max)
 # so a runaway worker hits a graceful container-OOM (just kills the
 # worker process) instead of a host kernel-OOM that wedges the cgroup
