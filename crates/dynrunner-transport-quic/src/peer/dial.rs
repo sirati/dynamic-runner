@@ -167,7 +167,7 @@ async fn race_wss(
     addrs: &[SocketAddr],
     timeout: Duration,
 ) -> Option<(SocketAddr, crate::wss::WssConnection)> {
-    race_first_success(addrs, timeout, |addr| connect_wss(addr)).await
+    race_first_success(addrs, timeout, connect_wss).await
 }
 
 #[cfg(test)]

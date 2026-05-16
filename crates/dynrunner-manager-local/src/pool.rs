@@ -36,6 +36,12 @@ pub struct WorkerPool<M: ManagerEndpoint, I: Identifier> {
     event_rx: mpsc::UnboundedReceiver<WorkerEvent<I>>,
 }
 
+impl<M: ManagerEndpoint + 'static, I: Identifier> Default for WorkerPool<M, I> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     pub fn new() -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();

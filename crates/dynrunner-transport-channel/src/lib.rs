@@ -830,9 +830,13 @@ mod tests {
     /// driving it against an arbitrary `RoleTable`. Strictly enough
     /// to test the transport's cache plumbing without taking a
     /// dev-dep on the cluster-state crate.
+    type RoleTableHook = Box<
+        dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static,
+    >;
+
     #[derive(Default)]
     struct TestRegistrar {
-        hooks: Vec<Box<dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync>>,
+        hooks: Vec<RoleTableHook>,
     }
 
     impl TestRegistrar {
@@ -844,12 +848,7 @@ mod tests {
     }
 
     impl RoleChangeHookRegistrar for TestRegistrar {
-        fn register_role_change_hook(
-            &mut self,
-            hook: Box<
-                dyn Fn(&dynrunner_protocol_primary_secondary::RoleTable) + Send + Sync + 'static,
-            >,
-        ) {
+        fn register_role_change_hook(&mut self, hook: RoleTableHook) {
             self.hooks.push(hook);
         }
     }

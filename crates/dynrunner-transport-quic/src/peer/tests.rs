@@ -832,13 +832,8 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // endpoint; any keepalive it itself receives is
             // discarded silently.
             let forwarder_handle = tokio::task::spawn_local(async move {
-                loop {
-                    match peer_c.recv_peer().await {
-                        Some(m) => {
-                            tracing::warn!(target: "test_debug", "peer-c forwarder received: {m:?}");
-                        }
-                        None => break,
-                    }
+                while let Some(m) = peer_c.recv_peer().await {
+                    tracing::warn!(target: "test_debug", "peer-c forwarder received: {m:?}");
                 }
             });
 

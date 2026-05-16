@@ -143,16 +143,11 @@ mod tests {
             .unwrap();
 
         let mut all = Vec::new();
-        loop {
-            match manager.recv().await {
-                Some(r) => {
-                    let is_done = matches!(r, Response::Done { .. });
-                    all.push(r);
-                    if is_done {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(r) = manager.recv().await {
+            let is_done = matches!(r, Response::Done { .. });
+            all.push(r);
+            if is_done {
+                break;
             }
         }
 
@@ -187,16 +182,11 @@ mod tests {
             .unwrap();
 
         let mut all = Vec::new();
-        loop {
-            match manager.recv().await {
-                Some(r) => {
-                    let is_error = matches!(r, Response::Error { .. });
-                    all.push(r);
-                    if is_error {
-                        break;
-                    }
-                }
-                None => break,
+        while let Some(r) = manager.recv().await {
+            let is_error = matches!(r, Response::Error { .. });
+            all.push(r);
+            if is_error {
+                break;
             }
         }
 
