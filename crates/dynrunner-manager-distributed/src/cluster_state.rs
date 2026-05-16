@@ -34,7 +34,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, SoftPreferredSecondaries, TaskInfo, WorkerId};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, RemovalCause, RoleChangeHookRegistrar, RoleTable,
 };
@@ -1162,15 +1162,19 @@ impl<I: Identifier> ClusterState<I> {
                     }
                 }
             }
-            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries: _ } => {
-                // Storage-side consumer of this mutation lands with
-                // the preferred-secondaries field on `TaskInfo`; for
-                // now the variant exists so the command channel can
-                // broadcast it end-to-end and apply is a NoOp gated
-                // on hash presence.
-                if !self.tasks.contains_key(&hash) {
+            ClusterMutation::TaskPreferredSecondariesUpdated { hash, secondaries } => {
+                let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
-                }
+                };
+                let task = match state {
+                    TaskState::Pending { task }
+                    | TaskState::InFlight { task, .. }
+                    | TaskState::Completed { task }
+                    | TaskState::Failed { task, .. }
+                    | TaskState::Unfulfillable { task, .. }
+                    | TaskState::Blocked { task, .. } => task,
+                };
+                task.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
                 ApplyOutcome::Applied
             }
             ClusterMutation::PeerJoined {
@@ -2317,6 +2321,66 @@ mod tests {
         assert_eq!(joiner.role_table().primary, Some("lead".to_string()));
         let obs = observed.lock().unwrap().clone();
         assert_eq!(obs, vec![Some("lead".to_string())]);
+    }
+
+    #[test]
+    fn task_preferred_secondaries_updated_apply_writes_to_task() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("h"),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
+                hash: "h".into(),
+                secondaries: vec!["secondary-2".into(), "secondary-5".into()],
+            }),
+            ApplyOutcome::Applied
+        );
+        let Some(TaskState::Pending { task }) = s.task_state("h") else {
+            panic!("expected Pending");
+        };
+        assert_eq!(task.preferred_secondaries.as_slice(), &["secondary-2", "secondary-5"]);
+    }
+
+    #[test]
+    fn task_preferred_secondaries_updated_apply_unknown_hash_is_noop() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        assert_eq!(
+            s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
+                hash: "nope".into(),
+                secondaries: vec!["secondary-1".into()],
+            }),
+            ApplyOutcome::NoOp
+        );
+    }
+
+    #[test]
+    fn task_preferred_secondaries_updated_apply_preserves_state() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h".into(),
+            task: mk_task("h"),
+        });
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::Unfulfillable {
+                reason: "missing".to_string().into(),
+            },
+            error: "missing".into(),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskPreferredSecondariesUpdated {
+                hash: "h".into(),
+                secondaries: vec!["secondary-7".into()],
+            }),
+            ApplyOutcome::Applied
+        );
+        let Some(TaskState::Unfulfillable { task, reason }) = s.task_state("h") else {
+            panic!("state must stay Unfulfillable across preferred-secondaries update");
+        };
+        assert_eq!(reason, "missing");
+        assert_eq!(task.preferred_secondaries.as_slice(), &["secondary-7"]);
     }
 
     // ── Discrete Unfulfillable / Blocked state pins ──
