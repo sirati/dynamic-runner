@@ -331,3 +331,69 @@ def test_run_secondary_fires_on_run_start_before_connect(tmp_path: Path) -> None
     assert names.count("on_run_start") == 1, names
     assert names.count("on_run_end") == 1, names
     assert names.index("on_run_start") < names.index("on_run_end"), names
+
+
+def test_run_distributed_passes_primary_handle_to_on_run_start(tmp_path: Path) -> None:
+    """`run_distributed` must pre-mint a `PrimaryHandle` and pass it to
+    the task's `on_run_start` as the `primary_handle=` kwarg — matching
+    the contract `run_primary` already honours.
+
+    The in-process `RustDistributedManager` builds its command-channel
+    pair at `__init__` (mirroring `RustPrimaryCoordinator`), exposes a
+    pre-run `handle()` factory, and the `run_distributed` pyfunction
+    calls that factory BEFORE blocking on `mgr.run(...)` so the handle
+    is live by the time the consumer's hook runs.
+
+    This test pins the wiring: a modern `on_run_start(..., primary_handle=None)`
+    receives a non-`None` `PrimaryHandle` instance, and the call signature
+    is the only thing required to make the pipeline use it.
+    """
+    import dynamic_runner as _rs
+
+    class _HandleCapturingTask(_RecordingTask):
+        def __init__(self) -> None:
+            super().__init__()
+            self.captured_handle = None
+
+        def on_run_start(
+            self,
+            source_dir,
+            output_dir,
+            args,
+            primary_handle=None,
+        ) -> None:  # type: ignore[override]
+            self.calls.append(
+                ("on_run_start", str(source_dir), str(output_dir))
+            )
+            self.captured_handle = primary_handle
+
+    task = _HandleCapturingTask()
+    primary_cfg = _rs.PrimaryConfig(num_secondaries=1)
+    secondary_template = _rs.SecondaryConfig(
+        secondary_id="<template>",
+        num_workers=1,
+        max_resources=_rs.ResourceMap({"memory": 64 * 1024 * 1024}),
+    )
+    args = SimpleNamespace()
+
+    _rs.run_distributed(
+        primary_cfg,
+        secondary_template,
+        task,
+        args,
+        str(tmp_path / "src"),
+        str(tmp_path / "out"),
+        [],
+    )
+
+    # `on_run_start` fired, and it received a live `PrimaryHandle`.
+    names = _ordered_calls(task)
+    assert names.count("on_run_start") == 1, names
+    assert task.captured_handle is not None, (
+        "run_distributed must pass a non-None primary_handle kwarg"
+    )
+    # Type-name check is enough — the `PrimaryHandle` class is private
+    # to the Rust extension, so importing it isn't worth the coupling.
+    assert type(task.captured_handle).__name__ == "PrimaryHandle", (
+        f"expected PrimaryHandle, got {type(task.captured_handle).__name__}"
+    )

@@ -89,7 +89,13 @@ pub(crate) struct PyPrimaryHandle {
     /// the underlying `PrimaryCoordinator` is alive; once the
     /// coordinator drops the receiver, every subsequent `send().await`
     /// returns SendError and the method raises `PyRuntimeError`.
-    sender: tokio_mpsc::Sender<PrimaryCommand<RunnerIdentifier>>,
+    ///
+    /// `pub(crate)` for crate-internal contract tests
+    /// (`distributed::tests::handle_clones_share_same_command_channel`)
+    /// that need `mpsc::Sender::same_channel` to prove two handles
+    /// minted by `PyDistributedManager::handle` point at the same
+    /// receiver. No Python-facing surface reads it.
+    pub(crate) sender: tokio_mpsc::Sender<PrimaryCommand<RunnerIdentifier>>,
 
     /// In-handle runtime for `block_on(...)` calls from Python. Shared
     /// across clones of `PrimaryHandle` so multiple calls don't each

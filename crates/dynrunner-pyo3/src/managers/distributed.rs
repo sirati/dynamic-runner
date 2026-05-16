@@ -86,6 +86,42 @@ pub(crate) struct PyDistributedManager {
     /// their own apply paths but routing all to the same listener
     /// would deliver N+1 copies of each terminal task transition.
     task_completed_listener: Option<Py<PyAny>>,
+
+    /// Command-channel sender, cloned into each `PrimaryHandle`
+    /// returned from `handle()`. Built at `__init__` so Python can
+    /// fetch a handle BEFORE the blocking `run()` enters the
+    /// detached tokio runtime. The receiver is held in the
+    /// `command_rx` Option below and taken out at `run()` start; the
+    /// sender stays on `self` so subsequent `handle()` calls keep
+    /// cloning the same channel. Mirrors `PyPrimaryCoordinator`'s
+    /// matching field — same rationale: `PrimaryCoordinator` is
+    /// constructed INSIDE `py.detach`, so the Python-visible
+    /// `PrimaryHandle` must be backed by a channel that exists
+    /// outside the detached runtime.
+    command_tx: tokio::sync::mpsc::Sender<
+        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+    >,
+
+    /// Command-channel receiver. Taken at `run()` start and handed to
+    /// the inner `PrimaryCoordinator` via `replace_command_channel`;
+    /// `None` afterwards. Re-entering `run()` would surface a typed
+    /// `PyRuntimeError`, but the manager is single-shot by contract
+    /// (no per-method re-entry is supported), so the path is
+    /// defensive rather than load-bearing.
+    command_rx: Option<
+        tokio::sync::mpsc::Receiver<
+            dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
+        >,
+    >,
+
+    /// Shared cell carrying the per-task reinject cap. Seeded by the
+    /// `unfulfillable_reinject_max_per_task` `__init__` kwarg;
+    /// mutable through `PrimaryHandle::set_unfulfillable_reinject_max_per_task`
+    /// until `run()` flips the cell's `run_started` flag. Read at
+    /// `run()` start when building `PrimaryConfig` so the setter and
+    /// the run-start reader stay in sync without duplicating the
+    /// field. Mirrors `PyPrimaryCoordinator`'s same-named field.
+    reinject_cap: crate::managers::primary_handle::ReinjectCapCell,
 }
 
 #[pymethods]
@@ -107,6 +143,7 @@ impl PyDistributedManager {
         source_pre_staged_root = None,
         peer_lifecycle_listener = None,
         task_completed_listener = None,
+        unfulfillable_reinject_max_per_task = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -125,6 +162,7 @@ impl PyDistributedManager {
         source_pre_staged_root: Option<PathBuf>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
         task_completed_listener: Option<Py<PyAny>>,
+        unfulfillable_reinject_max_per_task: Option<u32>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -144,6 +182,28 @@ impl PyDistributedManager {
             .unwrap_or_else(|| {
                 ResourceMap::from([(ResourceKind::memory(), ram_per_secondary)])
             });
+
+        // Channel pair built at __init__ so Python can fetch a
+        // `handle` BEFORE `run()` enters the detached tokio runtime.
+        // Mirrors `PyPrimaryCoordinator`'s same-shaped wiring — the
+        // receiver is handed to the inner `PrimaryCoordinator` via
+        // `replace_command_channel` once it's constructed inside the
+        // runtime; the sender lives here and is cloned into each
+        // `PrimaryHandle`.
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(
+            dynrunner_manager_distributed::primary::COMMAND_CHANNEL_CAPACITY,
+        );
+
+        // Seed the shared cell from the constructor kwarg. The
+        // setter on `PrimaryHandle` can override this any number of
+        // times until `run()` enters and flips `run_started`. Same
+        // contract as `PyPrimaryCoordinator`.
+        let reinject_cap = crate::managers::primary_handle::ReinjectCapCell::default();
+        reinject_cap
+            .inner
+            .lock()
+            .expect("ReinjectCapCell poisoned")
+            .max_per_task = unfulfillable_reinject_max_per_task;
 
         Ok(Self {
             python_executable: task.python_executable,
@@ -168,7 +228,25 @@ impl PyDistributedManager {
             task_definition: task_definition.clone().unbind(),
             peer_lifecycle_listener,
             task_completed_listener,
+            command_tx,
+            command_rx: Some(command_rx),
+            reinject_cap,
         })
+    }
+
+    /// PrimaryHandle factory for the in-process distributed primary.
+    /// Symmetric with `PyPrimaryCoordinator::handle` — each call
+    /// returns a freshly-built handle (with its own in-handle tokio
+    /// runtime); the underlying `command_tx` and reinject-cap cell
+    /// are cloned so multiple Python control planes / threads can
+    /// share one manager. Callable BEFORE `run()` so the Python
+    /// caller can hand the handle off to its `on_run_start` hook
+    /// before the blocking `run()` enters the detached runtime.
+    fn handle(&self) -> PyResult<crate::managers::primary_handle::PyPrimaryHandle> {
+        crate::managers::primary_handle::PyPrimaryHandle::from_sender(
+            self.command_tx.clone(),
+            self.reinject_cap.clone(),
+        )
     }
 
     /// Run the distributed processing pipeline.
@@ -283,6 +361,23 @@ impl PyDistributedManager {
             self.task_completed_listener
                 .take()
                 .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
+
+        // Read the cap value the handle (or constructor kwarg) most
+        // recently set, then flip `run_started` so subsequent
+        // handle-side setter calls raise. Mirrors the
+        // `PyPrimaryCoordinator::run` ordering exactly.
+        let unfulfillable_reinject_max_per_task = self.reinject_cap.snapshot();
+        self.reinject_cap.mark_run_started();
+        // Take the receiver out for the detached runtime. The sender
+        // stays on `self` so future `handle()` calls keep cloning the
+        // same channel.
+        let command_tx = self.command_tx.clone();
+        let command_rx = self.command_rx.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "RustDistributedManager.run(): already entered — \
+                 the manager is single-shot",
+            )
+        })?;
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -514,7 +609,16 @@ impl PyDistributedManager {
                     // pre-queues) wired without each caller re-
                     // implementing the orchestration.
                     source_dir: Some(source_dir.clone()),
-                    unfulfillable_reinject_max_per_task: None,
+                    // Snapshot taken on the GIL thread (see above) so
+                    // the in-process distributed primary honours the
+                    // same `unfulfillable_reinject_max_per_task` knob
+                    // every other primary path does. The
+                    // `PrimaryHandle::set_unfulfillable_reinject_max_per_task`
+                    // setter writes through the shared cell pre-run;
+                    // post-`mark_run_started` writes raise on the
+                    // handle side, so the value frozen here is the
+                    // single source of truth for the inner loop.
+                    unfulfillable_reinject_max_per_task,
                 };
 
                 let mut primary = PrimaryCoordinator::new(
@@ -524,6 +628,12 @@ impl PyDistributedManager {
                     ResourceStealingScheduler::memory(),
                     estimator,
                 );
+
+                // Swap in the Python-facing command channel so the
+                // `PrimaryHandle` Python is holding talks to the same
+                // receiver the operational loop reads from. Same
+                // pre-`run()` contract as `PyPrimaryCoordinator`.
+                primary.replace_command_channel(command_tx, command_rx);
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE the primary's `run()` enters — the
@@ -622,6 +732,199 @@ impl PyDistributedManager {
     #[getter]
     fn stranded(&self) -> u32 {
         self.stranded
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod tests {
+    //! Pre-run `handle()` factory contract tests for the in-process
+    //! distributed manager. Mirrors `PyPrimaryCoordinator::handle`'s
+    //! shape — same single concern: can the Python caller fetch a
+    //! `PrimaryHandle` BEFORE the blocking `run()` enters the
+    //! detached tokio runtime?
+    //!
+    //! Tests require an embedded CPython interpreter (gated behind
+    //! the `test-with-python` feature). Invoke as:
+    //!   `cargo test -p dynrunner-pyo3 --lib --no-default-features \
+    //!        --features test-with-python pydistributed_manager`
+    //!
+    //! Scope: limited to (1) the factory call surface and (2) the
+    //! cap-cell seeding. End-to-end command dispatch is already
+    //! exercised by the `primary_handle.rs` tests against a stub
+    //! receiver; the channel-and-cell wiring on this manager carries
+    //! the same `PyPrimaryHandle::from_sender` constructor, so the
+    //! same dispatch contract holds transitively.
+    use super::*;
+    use pyo3::types::{PyAnyMethods, PyModule};
+
+    /// Compile a tiny Python module that exports a `TaskDefinition`-
+    /// shaped stub + a default `task_args` Namespace. The shape is
+    /// the minimum `LoadedTaskDefinition::from_python` needs:
+    ///   * `get_phases()` → one PhaseSpec with one TaskTypeSpec.
+    ///   * `build_worker_command_args(...)` → `[]`.
+    ///   * `estimate_memory_returns` attribute referenced by the
+    ///     `estimator_attr` lookup → trivial callable.
+    /// Centralised so each test phrases the stub once.
+    fn build_task_definition_module(py: Python<'_>) -> Bound<'_, PyModule> {
+        // Stubs are pure-Python `SimpleNamespace` instances to avoid
+        // importing `dynamic_runner.task_protocol` (the test
+        // interpreter doesn't have the wheel installed; the cdylib
+        // under test isn't even on sys.path here). The `from_python`
+        // extractors duck-type via `getattr`, so any object with the
+        // right attribute names + types works.
+        let source = r#"
+from types import SimpleNamespace
+
+def estimate_memory(item):
+    return 1024 * 1024
+
+_TYPE = SimpleNamespace(
+    type_id="t",
+    worker_module="stub_worker_module",
+    estimator_attr="estimate_memory",
+    timeout_seconds=None,
+    reserved_memory_per_worker=0,
+    max_concurrent=None,
+)
+
+_PHASE = SimpleNamespace(
+    phase_id="p",
+    depends_on=[],
+    types=(_TYPE,),
+)
+
+class _StubTask:
+    uses_file_based_items = False
+    # `LoadedTopology::from_python` reads `task_definition.<estimator_attr>`
+    # on the matching type; expose the callable as an attribute on
+    # the stub directly.
+    estimate_memory = staticmethod(estimate_memory)
+    def get_phases(self):
+        return (_PHASE,)
+    def build_worker_command_args(self, type_id, args, source_dir, output_dir, skip_existing):
+        return []
+
+task = _StubTask()
+task_args = SimpleNamespace()
+"#;
+        PyModule::from_code(
+            py,
+            std::ffi::CString::new(source).unwrap().as_c_str(),
+            std::ffi::CString::new("stub_task_def.py").unwrap().as_c_str(),
+            std::ffi::CString::new("stub_task_def").unwrap().as_c_str(),
+        )
+        .expect("compile stub TaskDefinition module")
+    }
+
+    /// Construct a `PyDistributedManager` with the supplied
+    /// `unfulfillable_reinject_max_per_task`. Returns the manager
+    /// already wrapped in a `PyClass` cell so subsequent `.handle()`
+    /// calls can flow through the PyO3 method-dispatch surface (the
+    /// production call path).
+    fn build_manager(py: Python<'_>, cap: Option<u32>) -> PyResult<Py<PyDistributedManager>> {
+        let module = build_task_definition_module(py);
+        let task = module.getattr("task")?;
+        let task_args = module.getattr("task_args")?;
+        // `&Bound<'_, PyAny>` for the `new` signature.
+        let mgr = PyDistributedManager::new(
+            py,
+            /* num_secondaries */ 1,
+            /* num_workers_per_secondary */ 1,
+            /* ram_per_secondary */ 64 * 1024 * 1024,
+            /* source_dir */ "/tmp/src".into(),
+            /* output_dir */ "/tmp/out".into(),
+            &task,
+            &task_args,
+            /* skip_existing */ false,
+            /* log_paths */ None,
+            /* worker_spec */ None,
+            /* distributed_config */ None,
+            /* max_resources_per_secondary */ None,
+            /* source_pre_staged_root */ None,
+            /* peer_lifecycle_listener */ None,
+            /* task_completed_listener */ None,
+            /* unfulfillable_reinject_max_per_task */ cap,
+        )?;
+        Py::new(py, mgr)
+    }
+
+    /// Test (1) from the brief: the factory produces a `PrimaryHandle`
+    /// BEFORE `run()` is called.
+    #[test]
+    fn handle_returns_pyprimaryhandle_before_run() {
+        Python::attach(|py| {
+            let mgr = build_manager(py, None).expect("manager constructs");
+            let handle_obj = mgr
+                .bind(py)
+                .call_method0("handle")
+                .expect("handle() must succeed before run()");
+            // Downcast to the concrete pyclass — proves the type
+            // contract independent of any Python-side getattr name
+            // collision.
+            let _handle: pyo3::PyRef<'_, crate::managers::primary_handle::PyPrimaryHandle> =
+                handle_obj
+                    .downcast::<crate::managers::primary_handle::PyPrimaryHandle>()
+                    .expect("handle() must return a PrimaryHandle pyclass")
+                    .borrow();
+        });
+    }
+
+    /// Test (3) variant from the brief: the reinject cap kwarg is
+    /// seeded into the shared cell at `__init__`, so the handle
+    /// produced by `handle()` carries the same value.
+    #[test]
+    fn handle_reinject_cap_seed_from_init_kwarg() {
+        Python::attach(|py| {
+            let mgr = build_manager(py, Some(7)).expect("manager constructs");
+            // Read the cap directly off the manager's cell — this is
+            // the same cell the produced handle clones, so a match
+            // here proves the round-trip.
+            let snapshot = mgr.borrow(py).reinject_cap.snapshot();
+            assert_eq!(snapshot, Some(7), "cap kwarg must seed the cell");
+            // Sanity: the factory still succeeds with the cap set.
+            let _ = mgr
+                .bind(py)
+                .call_method0("handle")
+                .expect("handle() must succeed with seeded cap");
+        });
+    }
+
+    /// Test (2) from the brief: two `handle()` calls return distinct
+    /// `PrimaryHandle` instances backed by the same underlying
+    /// channel. We can't directly compare `mpsc::Sender`s, but
+    /// `tokio::sync::mpsc::Sender::same_channel` exposes the
+    /// equivalence we want; calling it on the cloned senders proves
+    /// the factory does not mint a fresh channel per call.
+    #[test]
+    fn handle_clones_share_same_command_channel() {
+        Python::attach(|py| {
+            let mgr = build_manager(py, None).expect("manager constructs");
+            let h1 = mgr.bind(py).call_method0("handle").expect("first handle");
+            let h2 = mgr
+                .bind(py)
+                .call_method0("handle")
+                .expect("second handle");
+            // Both downcasts must succeed (factory returns the same
+            // pyclass); after that, `same_channel` confirms the
+            // senders point at one receiver.
+            let r1 = h1
+                .downcast::<crate::managers::primary_handle::PyPrimaryHandle>()
+                .unwrap();
+            let r2 = h2
+                .downcast::<crate::managers::primary_handle::PyPrimaryHandle>()
+                .unwrap();
+            // Pull out the inner senders via the shared cell — both
+            // were minted from `self.command_tx.clone()`, so they
+            // are clones of the same `Sender` and `same_channel`
+            // must return true.
+            let s1 = &r1.borrow().sender;
+            let s2 = &r2.borrow().sender;
+            assert!(
+                s1.same_channel(s2),
+                "two handles must share one command channel"
+            );
+        });
     }
 }
 

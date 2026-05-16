@@ -537,6 +537,14 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     # in-process manager's `PrimaryConfig.required_setup_on_promote`
     # flips to `True` and the chosen secondary owns discovery +
     # ledger-seed.
+    # `unfulfillable_reinject_max_per_task` is the CLI knob plumbed
+    # uniformly through every primary path; the in-process distributed
+    # manager mints its `PrimaryHandle` from a shared
+    # `ReinjectCapCell` seeded with this value, so the
+    # `PrimaryHandle::set_unfulfillable_reinject_max_per_task` setter
+    # and the `run()`-time PrimaryConfig snapshot stay in lockstep
+    # with the network-primary and SLURM paths.
+    unfulfillable_cap = getattr(args, "unfulfillable_reinject_max_per_task", None)
     result = _rs.run_distributed(
         primary_cfg,
         secondary_template,
@@ -550,6 +558,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         fulfillability_matcher=getattr(task, "fulfillability_matcher", None),
         peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
         task_completed_listener=getattr(task, "task_completed_listener", None),
+        unfulfillable_reinject_max_per_task=unfulfillable_cap,
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
