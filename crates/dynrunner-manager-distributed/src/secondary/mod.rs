@@ -573,6 +573,27 @@ where
     /// the task, so it can't be re-spawned).
     pub(super) lifecycle_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
 
+    /// Task-completion dispatcher channel receiver, paired with the
+    /// `task_completed_tx` installed on `cluster_state` at
+    /// construction. Same single-shot / `mem::take`-at-first-entry
+    /// semantics as `lifecycle_rx`.
+    pub(super) task_completed_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::task_completed::TaskCompletedEvent>,
+    >,
+
+    /// Consumers of task-completion events; same single-shot
+    /// `mem::take`-at-run semantics as on `PrimaryCoordinator`. See
+    /// `PrimaryCoordinator::task_completed_listeners` for the
+    /// rationale.
+    pub(super) task_completed_listeners:
+        Vec<Box<dyn crate::task_completed::TaskCompletedListener>>,
+
+    /// Handle to the task-completion dispatcher task. Mirrors
+    /// `lifecycle_dispatcher_handle` — same Drop-vs-explicit cleanup
+    /// rationale, same re-entrant SetupPending non-cleanup
+    /// discipline.
+    pub(super) task_completed_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// Announcer-outbox sender. Cloned out via
     /// [`Self::attach_observer_announcer`] into the
     /// [`crate::observer::announcer::PeerMeshAnnouncerSender`] held
@@ -652,6 +673,10 @@ where
         // dispatcher is spawned queue on the unbounded channel and
         // drain on first poll.
         let (lifecycle_tx, lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Task-completion dispatcher channel; same construction-time
+        // installation rationale as `lifecycle_tx`.
+        let (task_completed_tx, task_completed_rx) =
+            tokio::sync::mpsc::unbounded_channel();
         let mut this = Self {
             config,
             primary_transport,
@@ -694,6 +719,9 @@ where
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
             lifecycle_dispatcher_handle: None,
+            task_completed_rx: Some(task_completed_rx),
+            task_completed_listeners: Vec::new(),
+            task_completed_dispatcher_handle: None,
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
         };
@@ -706,6 +734,12 @@ where
         // pre-`run_until_setup_or_done()`, but the contract should
         // not depend on that).
         this.cluster_state.install_lifecycle_sender(lifecycle_tx);
+        // Install the task-completion sender alongside the
+        // peer-lifecycle one — the two are independent dispatcher
+        // modules with independent channels; same construction-time
+        // installation contract.
+        this.cluster_state
+            .install_task_completed_sender(task_completed_tx);
         // Attach the transport's write-through role cache to our
         // authoritative `cluster_state.role_table`. The hook fires
         // on every applied `PrimaryChanged` mutation; the cache
@@ -745,6 +779,27 @@ where
     /// design rationale.
     pub(super) async fn cleanup_lifecycle_dispatcher(&mut self) {
         if let Some(handle) = self.lifecycle_dispatcher_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    /// Register a [`crate::task_completed::TaskCompletedListener`].
+    /// Same single-shot, pre-`run_until_setup_or_done`-only contract
+    /// as [`Self::register_lifecycle_listener`].
+    pub fn register_task_completed_listener(
+        &mut self,
+        listener: Box<dyn crate::task_completed::TaskCompletedListener>,
+    ) {
+        self.task_completed_listeners.push(listener);
+    }
+
+    /// Tear down the task-completion dispatcher task. Mirrors
+    /// [`Self::cleanup_lifecycle_dispatcher`] — same Drop-vs-explicit
+    /// design rationale, same re-entrant SetupPending non-cleanup
+    /// discipline.
+    pub(super) async fn cleanup_task_completed_dispatcher(&mut self) {
+        if let Some(handle) = self.task_completed_dispatcher_handle.take() {
             handle.abort();
             let _ = handle.await;
         }
@@ -1080,6 +1135,9 @@ where
         let cleanup = !matches!(&result, Ok(RunOutcome::SetupPending));
         if cleanup {
             self.cleanup_lifecycle_dispatcher().await;
+            // Independent of `cleanup_lifecycle_dispatcher`; same
+            // Done/Err vs. SetupPending discipline as documented above.
+            self.cleanup_task_completed_dispatcher().await;
         }
         result
     }
@@ -1115,6 +1173,17 @@ where
                 crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
             );
             self.lifecycle_dispatcher_handle = Some(handle);
+        }
+        // Same shape for the task-completion dispatcher: spawn on
+        // first entry only (the receiver was moved on first entry,
+        // so the take() returns None on SetupPending re-entry and the
+        // branch is a no-op).
+        if let Some(rx) = self.task_completed_rx.take() {
+            let listeners = std::mem::take(&mut self.task_completed_listeners);
+            let handle = tokio::task::spawn_local(
+                crate::task_completed::run_task_completed_dispatcher(rx, listeners),
+            );
+            self.task_completed_dispatcher_handle = Some(handle);
         }
         if !self.setup_phase_completed {
             tracing::info!(

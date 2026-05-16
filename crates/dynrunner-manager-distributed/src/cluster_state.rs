@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
+use crate::task_completed::TaskCompletedEvent;
 
 /// Per-task state in the replicated ledger.
 ///
@@ -321,6 +322,21 @@ pub struct ClusterState<I> {
     /// inside the operational `select!` loop. Skipped from Clone /
     /// snapshot / restore for the same reason as `lifecycle_tx`.
     matcher_trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>>,
+    /// Sender end of the task-completion dispatcher mpsc. Installed
+    /// via [`Self::install_task_completed_sender`] when the
+    /// coordinator wires its dispatcher task; `None` while no
+    /// coordinator has attached (the apply path in isolation observes
+    /// the same `None` state and the emit becomes a silent drop).
+    /// Receiver is owned by
+    /// [`crate::task_completed::run_task_completed_dispatcher`].
+    ///
+    /// Skipped from `Clone`, snapshot, and restore — same rationale as
+    /// `lifecycle_tx` / `matcher_trigger_tx`: a cloned replica is a
+    /// fresh node-local view and inheriting the source's sender would
+    /// route this replica's events into the source's dispatcher,
+    /// violating the CCD-9 "apply path never crosses node boundaries"
+    /// invariant.
+    task_completed_tx: Option<tokio::sync::mpsc::UnboundedSender<TaskCompletedEvent>>,
     /// Per-peer set of opaque resource strings each peer announces
     /// it currently holds locally. Maintained by the
     /// `PeerResourceHoldingsUpdated` apply rule and round-tripped via
@@ -353,6 +369,8 @@ where
             lifecycle_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             matcher_trigger_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            task_completed_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: self.peer_holdings.clone(),
         }
@@ -375,6 +393,7 @@ where
             .field("peer_state", &self.peer_state)
             .field("lifecycle_tx", &self.lifecycle_tx.is_some())
             .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
+            .field("task_completed_tx", &self.task_completed_tx.is_some())
             .field("peer_holdings", &self.peer_holdings)
             .finish()
     }
@@ -394,6 +413,7 @@ impl<I> Default for ClusterState<I> {
             peer_state: HashMap::new(),
             lifecycle_tx: None,
             matcher_trigger_tx: None,
+            task_completed_tx: None,
             peer_holdings: HashMap::new(),
         }
     }
@@ -831,6 +851,40 @@ impl<I: Identifier> ClusterState<I> {
         self.matcher_trigger_tx = Some(tx);
     }
 
+    /// Enqueue a [`TaskCompletedEvent`] onto the dispatcher channel.
+    ///
+    /// Same best-effort / non-blocking / non-panicking contract as
+    /// [`Self::emit_lifecycle_event`]: a missing or closed receiver is
+    /// a silent drop. The dispatcher channel is strictly observational
+    /// on top of the CRDT — the broadcast happens-before observation
+    /// is the only contract the CRDT promises.
+    ///
+    /// CCD-9 invariant: this method must never invoke a listener
+    /// directly. Listener invocation happens off the apply task on
+    /// the dispatcher; the channel is the only synchronization
+    /// crossing.
+    pub(crate) fn emit_task_completed_event(&self, event: TaskCompletedEvent) {
+        if let Some(tx) = &self.task_completed_tx {
+            // `send` on `UnboundedSender` only fails when the
+            // receiver is dropped; silent drop matches the
+            // "best-effort observation" contract documented above.
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Attach the dispatcher's sender end so subsequent
+    /// `emit_task_completed_event` calls route events through the
+    /// coordinator's dispatcher task.
+    ///
+    /// Same re-installation semantics as
+    /// [`Self::install_lifecycle_sender`].
+    pub fn install_task_completed_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<TaskCompletedEvent>,
+    ) {
+        self.task_completed_tx = Some(tx);
+    }
+
 
     /// Take a snapshot of the whole state. The snapshot is a deep
     /// clone — applying further mutations to `self` after this call
@@ -1039,6 +1093,15 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Blocked { task, .. } => task.clone(),
                     TaskState::Pending { task } | TaskState::InFlight { task, .. } => task.clone(),
                 };
+                // Snapshot the `task_id` for the dispatcher event
+                // BEFORE the move into `TaskState::Completed`; both
+                // halves consume distinct fields of the same `task`
+                // value, but the dispatcher event lives strictly off
+                // the apply path (mpsc enqueue) so capturing the id
+                // before the state transition keeps the apply rule
+                // observably equivalent to the pre-event-emit
+                // baseline.
+                let event_task_id = task.task_id.clone();
                 *state = TaskState::Completed { task };
                 // Auto-resume: any `Blocked { on: <this hash>, .. }`
                 // dependent transitions back to `Pending` so the next
@@ -1050,13 +1113,31 @@ impl<I: Identifier> ClusterState<I> {
                 // replica.
                 let just_resumed = self.resume_blocked_on(&hash);
                 resumed.extend(just_resumed);
+                // Best-effort, non-blocking dispatcher fan-out. See
+                // [`Self::emit_task_completed_event`] for the CCD-9
+                // contract (apply path never invokes a listener
+                // directly).
+                self.emit_task_completed_event(TaskCompletedEvent {
+                    task_id: event_task_id,
+                    task_hash: hash,
+                    success: true,
+                    error_kind: None,
+                });
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskFailed { hash, kind, error } => {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                match state {
+                // Capture task_id + wire-stable error_kind for the
+                // dispatcher event. The id snapshot lives outside the
+                // arms below so the emit at the bottom of the match
+                // sees a uniform binding regardless of which arm
+                // applied. The arms that NoOp return early and never
+                // reach the emit; the two "Applied" arms set this to
+                // `Some(...)` before exiting via the bottom emit.
+                let mut emit_payload: Option<(Option<String>, String)> = None;
+                let outcome = match state {
                     // Strongest terminals lock out incoming TaskFailed.
                     // `Completed` never regresses; `Unfulfillable` is a
                     // stable reinjectable terminal — a late generic
@@ -1064,11 +1145,12 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Completed { .. }
                     | TaskState::Unfulfillable { .. } => ApplyOutcome::NoOp,
                     TaskState::Failed {
+                        task,
                         kind: k,
                         last_error,
                         attempts,
-                        ..
                     } => {
+                        emit_payload = Some((task.task_id.clone(), kind.wire_value()));
                         *attempts += 1;
                         *k = kind;
                         *last_error = error;
@@ -1085,6 +1167,7 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::InFlight { task, .. }
                     | TaskState::Blocked { task, .. } => {
                         let task = task.clone();
+                        emit_payload = Some((task.task_id.clone(), kind.wire_value()));
                         *state = match kind {
                             ErrorType::Unfulfillable { reason } => {
                                 TaskState::Unfulfillable {
@@ -1101,7 +1184,22 @@ impl<I: Identifier> ClusterState<I> {
                         };
                         ApplyOutcome::Applied
                     }
+                };
+                // Best-effort, non-blocking dispatcher fan-out — only
+                // when the apply actually advanced state (the
+                // strongest-terminal NoOp arms above leave
+                // `emit_payload = None`). See
+                // [`Self::emit_task_completed_event`] for the CCD-9
+                // contract.
+                if let Some((task_id, error_kind)) = emit_payload {
+                    self.emit_task_completed_event(TaskCompletedEvent {
+                        task_id,
+                        task_hash: hash,
+                        success: false,
+                        error_kind: Some(error_kind),
+                    });
                 }
+                outcome
             }
             ClusterMutation::PrimaryChanged { new, epoch } => {
                 if epoch < self.primary_epoch {
@@ -3168,6 +3266,159 @@ mod tests {
             }
             other => panic!("expected Removed event, got {other:?}"),
         }
+    }
+
+    // ── TaskCompleted / TaskFailed dispatcher fan-out tests ──
+    //
+    // Pin the "apply emits, dispatcher rx receives" contract for the
+    // task-completion module — the boundary the PyO3
+    // `task_completed_listener` kwarg ultimately observes.
+
+    /// A successful `TaskCompleted` apply MUST emit
+    /// `TaskCompletedEvent { success: true, error_kind: None,
+    /// task_hash, task_id }` on the installed dispatcher channel.
+    #[tokio::test]
+    async fn task_completed_listener_fires_on_task_completed_apply() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.install_task_completed_sender(tx);
+        let task = mk_task("alpha");
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h-alpha".into(),
+            task: task.clone(),
+        });
+        // Move it through to InFlight so the success transition isn't
+        // a Pending → Completed shortcut (the apply rule covers both
+        // but the in-flight path is the production shape).
+        s.apply(ClusterMutation::TaskAssigned {
+            hash: "h-alpha".into(),
+            secondary: "sec-1".into(),
+            worker: 0,
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskCompleted {
+                hash: "h-alpha".into()
+            }),
+            ApplyOutcome::Applied
+        );
+        match rx.try_recv() {
+            Ok(event) => {
+                assert_eq!(event.task_hash, "h-alpha");
+                assert_eq!(event.task_id.as_deref(), Some("alpha"));
+                assert!(event.success);
+                assert!(event.error_kind.is_none());
+            }
+            other => panic!("expected TaskCompleted event, got {other:?}"),
+        }
+    }
+
+    /// A `TaskFailed` apply MUST emit
+    /// `TaskCompletedEvent { success: false, error_kind:
+    /// Some(<wire_value>), ... }` so consumers can dispatch on the
+    /// wire-stable error tag without re-deriving it from `Debug`.
+    #[tokio::test]
+    async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.install_task_completed_sender(tx);
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h-beta".into(),
+            task: mk_task("beta"),
+        });
+        // Pending → Failed (NonRecoverable). The wire tag for
+        // NonRecoverable is `"non_recoverable"`.
+        assert_eq!(
+            s.apply(ClusterMutation::TaskFailed {
+                hash: "h-beta".into(),
+                kind: ErrorType::NonRecoverable,
+                error: "disk full".into(),
+            }),
+            ApplyOutcome::Applied
+        );
+        match rx.try_recv() {
+            Ok(event) => {
+                assert_eq!(event.task_hash, "h-beta");
+                assert_eq!(event.task_id.as_deref(), Some("beta"));
+                assert!(!event.success);
+                assert_eq!(event.error_kind.as_deref(), Some("non_recoverable"));
+            }
+            other => panic!("expected TaskFailed event, got {other:?}"),
+        }
+    }
+
+    /// `TaskFailed { kind: Unfulfillable, .. }` against a Pending
+    /// task drives the `TaskState::Unfulfillable` transition; the
+    /// dispatcher event still fires with `success=false` and the
+    /// wire-stable `unfulfillable:<reason>` tag. Validates that the
+    /// Unfulfillable arm hooks into the same emit point as the
+    /// Failed arm — consumers don't have to know which terminal
+    /// the CRDT chose.
+    #[tokio::test]
+    async fn task_completed_listener_fires_on_unfulfillable_terminal() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.install_task_completed_sender(tx);
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h-gamma".into(),
+            task: mk_task("gamma"),
+        });
+        assert_eq!(
+            s.apply(ClusterMutation::TaskFailed {
+                hash: "h-gamma".into(),
+                kind: ErrorType::Unfulfillable {
+                    reason: "missing toolchain".to_owned().into(),
+                },
+                error: "missing toolchain".into(),
+            }),
+            ApplyOutcome::Applied
+        );
+        match rx.try_recv() {
+            Ok(event) => {
+                assert_eq!(event.task_hash, "h-gamma");
+                assert!(!event.success);
+                assert_eq!(
+                    event.error_kind.as_deref(),
+                    Some("unfulfillable:missing toolchain"),
+                );
+            }
+            other => panic!("expected Unfulfillable event, got {other:?}"),
+        }
+    }
+
+    /// A `TaskCompleted` apply that re-deduplicates (the task was
+    /// already `Completed`) MUST NOT emit a dispatcher event. The
+    /// apply rule is a NoOp; the dispatcher channel should stay
+    /// silent so consumers don't see ghost "task X completed again"
+    /// notifications.
+    #[tokio::test]
+    async fn task_completed_dedup_does_not_re_emit() {
+        let mut s = ClusterState::<RunnerIdentifier>::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.install_task_completed_sender(tx);
+        s.apply(ClusterMutation::TaskAdded {
+            hash: "h-delta".into(),
+            task: mk_task("delta"),
+        });
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "h-delta".into(),
+        });
+        // Drain the first (valid) event so we can prove the
+        // dedup-apply doesn't enqueue a second.
+        rx.try_recv().expect("first TaskCompleted must emit");
+        assert_eq!(
+            s.apply(ClusterMutation::TaskCompleted {
+                hash: "h-delta".into()
+            }),
+            ApplyOutcome::NoOp
+        );
+        // No event should follow the NoOp dedup apply.
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "dedup TaskCompleted must not re-emit a dispatcher event",
+        );
     }
 
     // ── PeerResourceHoldingsUpdated apply-rule + snapshot tests ──

@@ -78,6 +78,14 @@ pub(crate) struct PyDistributedManager {
     /// Constructor-only — see the matching field on
     /// `PyPrimaryCoordinator` for the rationale.
     peer_lifecycle_listener: Option<Py<PyAny>>,
+
+    /// Optional Python task-completion listener supplied at
+    /// `__init__`. Same shape + single-source-of-truth rationale as
+    /// `peer_lifecycle_listener`: registered on the in-process
+    /// primary only; per-secondary mirrors fire the same events from
+    /// their own apply paths but routing all to the same listener
+    /// would deliver N+1 copies of each terminal task transition.
+    task_completed_listener: Option<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -98,6 +106,7 @@ impl PyDistributedManager {
         max_resources_per_secondary = None,
         source_pre_staged_root = None,
         peer_lifecycle_listener = None,
+        task_completed_listener = None,
     ))]
     fn new(
         py: Python<'_>,
@@ -115,6 +124,7 @@ impl PyDistributedManager {
         max_resources_per_secondary: Option<PyResourceMap>,
         source_pre_staged_root: Option<PathBuf>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
+        task_completed_listener: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -157,6 +167,7 @@ impl PyDistributedManager {
             source_pre_staged_root,
             task_definition: task_definition.clone().unbind(),
             peer_lifecycle_listener,
+            task_completed_listener,
         })
     }
 
@@ -264,6 +275,14 @@ impl PyDistributedManager {
             self.peer_lifecycle_listener
                 .take()
                 .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
+
+        // Same shape for the task-completion listener: independent
+        // dispatcher pair on the in-process primary; same
+        // pre-`run()` registration contract.
+        let task_completed_listener =
+            self.task_completed_listener
+                .take()
+                .map(crate::task_completed_bridge::PyTaskCompletedListener::new);
 
         let mut completed = 0u32;
         let mut failed = 0u32;
@@ -513,6 +532,13 @@ impl PyDistributedManager {
                 // vector is `mem::take`-d into the spawned dispatcher.
                 if let Some(listener) = peer_lifecycle_listener {
                     primary.register_lifecycle_listener(listener);
+                }
+
+                // Same shape for the task-completion listener:
+                // independent dispatcher pair with the same pre-run
+                // registration contract.
+                if let Some(listener) = task_completed_listener {
+                    primary.register_task_completed_listener(listener);
                 }
 
                 // Initial staging is now driven by
