@@ -10,6 +10,7 @@ use dynrunner_core::{ResourceKind, ResourceMap};
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
 use crate::config::resources::PyResourceMap;
+use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::task_def::LoadedTaskDefinition;
 
@@ -36,6 +37,7 @@ impl PyDistributedManager {
         task_completed_listener = None,
         unfulfillable_reinject_max_per_task = None,
         log_dir = None,
+        scheduler_config = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -59,6 +61,7 @@ impl PyDistributedManager {
         task_completed_listener: Option<Py<PyAny>>,
         unfulfillable_reinject_max_per_task: Option<u32>,
         log_dir: Option<String>,
+        scheduler_config: Option<SchedulerConfig>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -112,6 +115,7 @@ impl PyDistributedManager {
             peer_lifecycle_listener,
             task_completed_listener,
             control_plane,
+            scheduler_config: scheduler_config.unwrap_or_default(),
         })
     }
 

@@ -27,6 +27,7 @@ use dynrunner_core::PhaseId;
 use dynrunner_manager_distributed::StagingEntry;
 
 use crate::config::distributed::DistributedConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::estimator::PyMemoryEstimatorBridge;
 
 mod new;
@@ -155,6 +156,15 @@ pub(crate) struct PyPrimaryCoordinator {
     /// in-process / network-primary callers that don't drive a SLURM
     /// submit-loop.
     pub(super) slurm_job_manager: Option<Arc<dyn Any + Send + Sync>>,
+
+    /// Scheduler tuning forwarded into every `ResourceStealingScheduler`
+    /// the coordinator constructs at `run()` start. Sourced from the
+    /// caller's `scheduler_config` kwarg (defaulting via
+    /// `SchedulerConfig::default()`). The OOM-preempt safety margin
+    /// (`cgroup_safety_margin`) and pressure threshold ride through
+    /// here, mirroring the `PyLocalManager` path so every Rust
+    /// manager-hosting pyclass exposes the same tuning surface.
+    pub(super) scheduler_config: SchedulerConfig,
 
     /// Respawn policy supplied by the Python caller. `Disabled`
     /// (the default) leaves the inner coordinator's respawn pipeline

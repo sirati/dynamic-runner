@@ -12,7 +12,6 @@ use dynrunner_manager_distributed::{
     PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::{PeerTransport, DEFAULT_JOIN_TIMEOUT};
-use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_slurm::read_peer_info_dir_v2;
 use dynrunner_transport_quic::{NoPrimaryTransport, PeerNetwork};
 
@@ -85,6 +84,7 @@ impl PyObserverLateJoiner {
         // per `__init__` so a second `run()` would never make sense
         // anyway (the snapshot RPC + restore latch are also one-shot).
         let holdings = std::mem::take(&mut self.holdings);
+        let scheduler_config = self.scheduler_config.clone();
 
         let result: Result<u32, PyErr> = py.detach(|| -> Result<u32, PyErr> {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -220,7 +220,7 @@ impl PyObserverLateJoiner {
                     config,
                     NoPrimaryTransport,
                     peer_network,
-                    ResourceStealingScheduler::memory(),
+                    scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
 

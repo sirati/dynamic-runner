@@ -144,6 +144,37 @@ pub(super) fn drive_rust_primary<'py>(
         coord_kwargs.set_item("task_completed_listener", listener)?;
     }
 
+    // Forward the OOM preempt-margin knobs through to the
+    // `RustPrimaryCoordinator`'s `scheduler_config` kwarg so the SLURM
+    // path tunes the inner scheduler with the same operator-supplied
+    // values as the in-process / local-multi-computer paths. The
+    // argparse Namespace carries the unparsed M/G-suffixed strings; we
+    // parse them with the same `parse_memory` helper Python uses.
+    // Missing kwargs / `None` values keep `SchedulerConfig::default()`
+    // (1 GiB safety margin, 500 MiB pressure threshold) so an older
+    // operator who never passes the flags still gets the safer default.
+    let sc_kwargs = PyDict::new(py);
+    let mut sc_kwargs_populated = false;
+    if let Ok(v) = args.getattr("oom_cgroup_safety_margin")
+        && !v.is_none()
+    {
+        let bytes = crate::system_resources::parse_memory(v.extract::<&str>()?)?;
+        sc_kwargs.set_item("cgroup_safety_margin", bytes)?;
+        sc_kwargs_populated = true;
+    }
+    if let Ok(v) = args.getattr("oom_pressure_threshold")
+        && !v.is_none()
+    {
+        let bytes = crate::system_resources::parse_memory(v.extract::<&str>()?)?;
+        sc_kwargs.set_item("pressure_threshold", bytes)?;
+        sc_kwargs_populated = true;
+    }
+    if sc_kwargs_populated {
+        let sc_cls = runner_module.getattr("SchedulerConfig")?;
+        let sc = sc_cls.call((), Some(&sc_kwargs))?;
+        coord_kwargs.set_item("scheduler_config", sc)?;
+    }
+
     let num_secondaries = outcome.num_secondaries;
     let args_tuple = PyTuple::new(py, [
         num_secondaries.into_pyobject(py)?.into_any().unbind(),

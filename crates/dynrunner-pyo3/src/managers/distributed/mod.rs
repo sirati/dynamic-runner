@@ -22,6 +22,7 @@ use dynrunner_core::{PhaseId, ResourceMap, TypeId};
 
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::task_def::TypeRegistry;
@@ -114,4 +115,13 @@ pub(crate) struct PyDistributedManager {
     /// each primary-hosting manager. See that module's doc for the
     /// lifecycle contract.
     pub(super) control_plane: crate::managers::control_plane::PrimaryControlPlane,
+
+    /// Scheduler tuning shared by both the in-process primary AND every
+    /// in-process secondary the manager spawns. The same
+    /// `cgroup_safety_margin` / `pressure_threshold` knobs (carried
+    /// here via `SchedulerConfig`) drive both kill branches on every
+    /// node; sharing a single value across the cluster mirrors how
+    /// SLURM operators tune the framework: one CLI flag pair, applied
+    /// uniformly to whichever Rust coordinator is the local one.
+    pub(super) scheduler_config: SchedulerConfig,
 }

@@ -7,6 +7,7 @@ use pyo3::prelude::*;
 use dynrunner_manager_distributed::{compute_initial_staging_entries, StagingError};
 
 use crate::config::distributed::DistributedConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::task_def::LoadedTopology;
 
 use super::PyPrimaryCoordinator;
@@ -28,6 +29,7 @@ impl PyPrimaryCoordinator {
         respawn_policy = None,
         respawn_spawner = None,
         task_completed_listener = None,
+        scheduler_config = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -47,6 +49,7 @@ impl PyPrimaryCoordinator {
         respawn_policy: Option<crate::config::respawn::PyRespawnPolicy>,
         respawn_spawner: Option<Py<PyAny>>,
         task_completed_listener: Option<Py<PyAny>>,
+        scheduler_config: Option<SchedulerConfig>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -86,6 +89,7 @@ impl PyPrimaryCoordinator {
                 .unwrap_or_else(crate::config::respawn::PyRespawnPolicy::rust_disabled),
             respawn_spawner,
             task_completed_listener,
+            scheduler_config: scheduler_config.unwrap_or_default(),
         })
     }
 

@@ -12,7 +12,6 @@ use pyo3::types::PyList;
 use dynrunner_manager_distributed::{
     PrimaryConfig, PrimaryCoordinator, RunError, SecondaryConfig, SecondaryCoordinator,
 };
-use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd};
 
 use crate::config::connection::ConnectionMode;
@@ -37,6 +36,11 @@ impl PyDistributedManager {
         let output_dir = self.output_dir.clone();
         let log_path = self.log_path.clone();
         let log_paths = self.log_paths.clone();
+        // Single scheduler-tuning snapshot is shared between the
+        // in-process primary AND every spawned secondary; cloning into
+        // the per-secondary task closure below preserves the same
+        // budget shape across the cluster.
+        let scheduler_config = self.scheduler_config.clone();
 
         // Pre-compute per-secondary log directories under the GIL —
         // `resolve_log_dir` calls into Python's `datetime` module —
@@ -260,6 +264,7 @@ impl PyDistributedManager {
                     let sec_worker_args = worker_cmd_args.clone();
                     let sec_estimator = estimator.clone();
                     let sec_max_resources = max_resources_per_secondary.clone();
+                    let sec_scheduler_config = scheduler_config.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -329,7 +334,7 @@ impl PyDistributedManager {
                             config,
                             transport,
                             dynrunner_transport_quic::NoPeerTransport,
-                            ResourceStealingScheduler::memory(),
+                            sec_scheduler_config.build_memory_scheduler(),
                             estimator,
                         );
                         let result = secondary.run(&mut factory).await;
@@ -404,7 +409,7 @@ impl PyDistributedManager {
                     config,
                     transport,
                     peer_transport,
-                    ResourceStealingScheduler::memory(),
+                    scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
 

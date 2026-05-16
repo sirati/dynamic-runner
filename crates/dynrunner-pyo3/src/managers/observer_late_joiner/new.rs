@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 
 use crate::config::distributed::DistributedConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::task_def::LoadedTopology;
 
 use super::PyObserverLateJoiner;
@@ -22,6 +23,7 @@ impl PyObserverLateJoiner {
         distributed_config = None,
         peer_lifecycle_listener = None,
         holdings = None,
+        scheduler_config = None,
     ))]
     fn new(
         peer_info_dir: PathBuf,
@@ -30,6 +32,7 @@ impl PyObserverLateJoiner {
         distributed_config: Option<DistributedConfig>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
         holdings: Option<Vec<String>>,
+        scheduler_config: Option<SchedulerConfig>,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         // Default observer-id includes a small random suffix so two
@@ -63,6 +66,7 @@ impl PyObserverLateJoiner {
             distributed_config: distributed_config.unwrap_or_default(),
             peer_lifecycle_listener,
             holdings,
+            scheduler_config: scheduler_config.unwrap_or_default(),
             completed: 0,
         })
     }

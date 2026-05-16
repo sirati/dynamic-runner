@@ -6,6 +6,7 @@ use pyo3::types::{PyDict, PyList};
 
 use crate::config::log_paths::LogPathConfig;
 use crate::config::primary_secondary::{PyPrimaryConfig, PySecondaryConfig};
+use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::managers::lifecycle::{fire_on_run_end, fire_on_run_start};
 
@@ -44,6 +45,7 @@ use super::module;
     task_completed_listener = None,
     unfulfillable_reinject_max_per_task = None,
     log_dir = None,
+    scheduler_config = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_distributed<'py>(
@@ -64,6 +66,7 @@ pub(crate) fn run_distributed<'py>(
     task_completed_listener: Option<Py<PyAny>>,
     unfulfillable_reinject_max_per_task: Option<u32>,
     log_dir: Option<String>,
+    scheduler_config: Option<SchedulerConfig>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_per_secondary` retained for back-compat; the
     // typed path passes the full multi-resource map via the
@@ -108,6 +111,9 @@ pub(crate) fn run_distributed<'py>(
     }
     if let Some(ld) = log_dir {
         kwargs.set_item("log_dir", ld)?;
+    }
+    if let Some(sc) = scheduler_config.as_ref() {
+        kwargs.set_item("scheduler_config", sc.clone())?;
     }
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
