@@ -556,6 +556,32 @@ impl PySecondaryCoordinator {
                                 let task_def = task_definition_py.bind(py);
                                 let args = task_args_py.bind(py);
                                 let root_py = root.clone().into_pyobject(py)?;
+                                // Mirror the submitter-side
+                                // `run.py:139` assignment so the task's
+                                // `discover_items` sees the same
+                                // `args.resolved_output_root` attribute
+                                // contract on both deployment paths. The
+                                // secondary's argv carries the
+                                // container-correct `--output` already
+                                // (rendered by the wrapper script);
+                                // `pathlib.Path(args.output).resolve()`
+                                // matches `_collect_binaries`'s shape
+                                // exactly. Without this the
+                                // setup-promote `discover_items` reads
+                                // `args.resolved_output_root` as None
+                                // and any `--skip-existing`-style filter
+                                // built around it silently no-ops.
+                                if let Ok(output_attr) = args.getattr("output") {
+                                    let pathlib = py.import("pathlib")?;
+                                    let path = pathlib
+                                        .getattr("Path")?
+                                        .call1((output_attr,))?
+                                        .call_method0("resolve")?;
+                                    args.setattr(
+                                        "resolved_output_root",
+                                        path.str()?,
+                                    )?;
+                                }
                                 // Buffer the discover_items iterable
                                 // into a `PyList` so the workspace's
                                 // existing `extract_binaries` helper
