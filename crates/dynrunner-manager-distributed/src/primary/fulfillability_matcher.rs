@@ -314,7 +314,7 @@ mod tests {
                                 )
                                 .into(),
                             },
-                            error: format!("unfulfillable {name}").into(),
+                            error: format!("unfulfillable {name}"),
                         },
                     );
                 }

@@ -259,7 +259,7 @@ impl ExtractionCache {
         expected_content_hash: Option<&str>,
     ) -> Option<PathBuf> {
         // File-ready mode: zip_name is empty or None
-        if zip_name.map_or(true, |z| z.is_empty()) {
+        if zip_name.is_none_or(|z| z.is_empty()) {
             return self.get_file_by_hash(
                 file_hash,
                 Some(local_path),

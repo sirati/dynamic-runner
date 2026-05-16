@@ -1056,7 +1056,7 @@ mod tests {
                      got {} bytes",
                     s.as_ref().len()
                 );
-                let expected: String = std::iter::repeat('x').take(1024).collect();
+                let expected: String = "x".repeat(1024);
                 assert_eq!(s.as_ref(), expected);
             }
             other => panic!("expected FatalError cause; got {other:?}"),

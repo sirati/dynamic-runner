@@ -1020,11 +1020,13 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
-                if self.tasks.contains_key(&hash) {
-                    ApplyOutcome::NoOp
-                } else {
-                    self.tasks.insert(hash, TaskState::Pending { task });
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.tasks.entry(hash)
+                {
+                    e.insert(TaskState::Pending { task });
                     ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
                 }
             }
             ClusterMutation::TaskAssigned {

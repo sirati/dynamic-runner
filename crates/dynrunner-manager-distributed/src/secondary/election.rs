@@ -264,7 +264,7 @@ where
                     })
                     .count()
                     + 1; // include us
-                let quorum = (peer_count + 1) / 2 + 1;
+                let quorum = peer_count.div_ceil(2) + 1;
                 if agreeing < quorum {
                     tracing::info!(
                         agreeing,
@@ -477,7 +477,7 @@ where
             return false;
         }
         let peer_count = self.peer_keepalives.len();
-        let quorum = (peer_count + 1) / 2 + 1;
+        let quorum = peer_count.div_ceil(2) + 1;
         let promoted = match &mut self.election {
             ElectionState::Candidate {
                 round: r,

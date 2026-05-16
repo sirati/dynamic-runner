@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn validate_dedups_unknown_id_until_forget() {
         let mut v = PreferredSecondariesValidator::new();
-        let tasks = vec![
+        let tasks = [
             task_with_prefs("a", &["secondary-unknown"]),
             task_with_prefs("b", &["secondary-unknown"]),
         ];
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn validate_silent_when_id_in_known_set() {
         let mut v = PreferredSecondariesValidator::new();
-        let tasks = vec![task_with_prefs("a", &["secondary-known"])];
+        let tasks = [task_with_prefs("a", &["secondary-known"])];
         let known: HashSet<String> = [String::from("secondary-known")]
             .into_iter()
             .collect();
