@@ -65,8 +65,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// fires only post-`wait_for_setup`). Applying the threshold
     /// during setup falsely declares a slow-to-handshake secondary
     /// dead at the operational-loop transition: e.g. a SLURM
-    /// secondary that took 38s for container startup + SSH-tunnel
-    /// + handshake gets dropped immediately on the first heartbeat
+    /// secondary that took 38s for container startup, SSH-tunnel, and
+    /// handshake gets dropped immediately on the first heartbeat
     /// tick, despite being healthy and processing tasks.
     pub(super) fn collect_heartbeat_report(&self) -> SecondaryHeartbeatReport {
         let now = Instant::now();

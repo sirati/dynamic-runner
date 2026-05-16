@@ -243,22 +243,6 @@ where
         );
     }
 
-    /// Run the phase-lifecycle drain cascade on a pool until quiescent.
-    /// Shared between `populate_primary_from_cluster_state` (catches
-    /// phases whose only items pre-completed elsewhere) and
-    /// `note_primary_item_completed` (catches phases whose only items
-    /// just finished). Each iteration:
-    ///   1. `drain_empty_active_phases` — moves any Active phase
-    ///      whose `(queued, in_flight) == (0, 0)` to Drained, queues
-    ///      it for `poll_drain_transitions`.
-    ///   2. `poll_drain_transitions` — returns and clears the
-    ///      drained-pending list.
-    ///   3. `mark_phase_done` — flips Drained → Done, may unblock
-    ///      dependent phases (Blocked → Active).
-    /// The loop terminates when no new drains surface (the second
-    /// `drain_empty_active_phases` finds nothing to transition AND
-    /// `poll_drain_transitions` returns empty).
-
     /// Test/inspection helper: number of queued items in the pool.
     /// Returns 0 if the pool isn't initialised yet.
     pub(super) fn primary_pending_len(&self) -> usize {
@@ -975,6 +959,7 @@ fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
 ///      drained-pending list.
 ///   3. `mark_phase_done` — flips Drained → Done, may unblock
 ///      dependent phases (Blocked → Active).
+///
 /// The loop terminates when no new drains surface (the next
 /// `drain_empty_active_phases` finds nothing to transition AND
 /// `poll_drain_transitions` returns empty).

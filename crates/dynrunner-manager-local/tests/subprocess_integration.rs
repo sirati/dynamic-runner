@@ -8,8 +8,6 @@ mod common;
 
 use common::{make_binary, worker_module_dir, FixedEstimator, PythonWorkerFactory, TestId};
 
-use std::os::fd::FromRawFd;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
@@ -18,7 +16,7 @@ use dynrunner_manager_local::{LocalManager, LocalManagerConfig, WorkerFactory};
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
-use dynrunner_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
+use dynrunner_transport_socket::socketpair::SocketpairManagerEnd;
 
 
 #[tokio::test(flavor = "current_thread")]

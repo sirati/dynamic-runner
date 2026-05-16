@@ -1149,8 +1149,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     /// Set the per-task budget cap for
-    /// `PrimaryCommand::ReinjectTask` after construction. The CLI
-    /// + PyO3 surfaces wire this through to the underlying
+    /// `PrimaryCommand::ReinjectTask` after construction. The CLI and
+    /// PyO3 surfaces wire this through to the underlying
     /// `PrimaryConfig` field so the live coordinator and the
     /// CLI-supplied `--unfulfillable-reinject-max-per-task=N` flag
     /// stay in lockstep. Idempotent if the existing value matches;
