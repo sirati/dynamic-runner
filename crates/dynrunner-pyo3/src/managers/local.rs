@@ -91,6 +91,9 @@ impl PyLocalManager {
         max_resources = None,
         low_resource_thresholds = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         num_workers: u32,

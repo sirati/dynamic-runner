@@ -97,6 +97,9 @@ impl PySecondaryCoordinator {
         max_resources = None,
         peer_lifecycle_listener = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         primary_url: String,

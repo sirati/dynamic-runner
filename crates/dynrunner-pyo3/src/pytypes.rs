@@ -214,6 +214,9 @@ impl PyTaskInfo {
         task_depends_on = Vec::new(),
         preferred_secondaries = Vec::new(),
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: String,
         size: u64,

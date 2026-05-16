@@ -59,6 +59,9 @@ impl PyLocalManagerConfig {
         phase_status_log_intervals_secs = None,
         scheduler_config = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         num_workers: u32,
         max_resources: PyResourceMap,

@@ -118,6 +118,9 @@ impl PyDistributedManager {
         task_completed_listener = None,
         unfulfillable_reinject_max_per_task = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         num_secondaries: u32,

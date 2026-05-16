@@ -108,6 +108,9 @@ impl DistributedConfig {
         primary_link_failure_window_secs = None,
         setup_deadline_secs = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         connect_timeout_secs: Option<f64>,
         connect_retry_delay_secs: Option<f64>,
