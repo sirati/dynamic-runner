@@ -560,6 +560,53 @@ where
     /// rationale.
     pub(super) peer_lifecycle_listeners:
         Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
+
+    /// Handle to the peer-lifecycle dispatcher task spawned at
+    /// `run_until_setup_or_done`'s first entry. `Some` between spawn
+    /// and the `cleanup_lifecycle_dispatcher` abort+await at run
+    /// exit; `None` outside an active run. Mirrors the same field on
+    /// `PrimaryCoordinator` — see that doc for the leaked-dispatcher
+    /// failure mode this guards against. The re-entrant
+    /// `RunOutcome::SetupPending` yield path deliberately does NOT
+    /// clean up: the caller will re-enter and the dispatcher is
+    /// still useful (and the receiver has already been moved into
+    /// the task, so it can't be re-spawned).
+    pub(super) lifecycle_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Announcer-outbox sender. Cloned out via
+    /// [`Self::attach_observer_announcer`] into the
+    /// [`crate::observer::announcer::PeerMeshAnnouncerSender`] held
+    /// by the spawned announcer task. The matching receiver is
+    /// drained by the operational `select!` arm in `process_tasks`,
+    /// which dequeues each [`crate::observer::announcer::AnnouncerOutboxItem`]
+    /// and forwards it onto `peer_transport.send(Address::Role(Role::Primary),
+    /// msg)`, returning the outcome through the item's `reply`
+    /// oneshot.
+    ///
+    /// `None` outside an active observer wiring — non-observer
+    /// secondaries (and observer coordinators whose caller hasn't
+    /// attached the announcer) never construct the outbox, so the
+    /// select arm parks on `pending()` instead of polling a dead
+    /// channel.
+    pub(super) announcer_outbox_tx: Option<
+        tokio::sync::mpsc::Sender<
+            crate::observer::announcer::AnnouncerOutboxItem<I>,
+        >,
+    >,
+
+    /// Announcer-outbox receiver, paired with `announcer_outbox_tx`.
+    /// Built in [`Self::attach_observer_announcer`] (so non-observer
+    /// secondaries don't allocate a channel they'll never use). Taken
+    /// out at `process_tasks`' first entry into the drain arm and
+    /// held locally for the duration of the loop — same shape as
+    /// `command_rx`/`matcher_trigger_rx` on the primary. `None`
+    /// outside the attached-observer window or once the loop has
+    /// taken ownership.
+    pub(super) announcer_outbox_rx: Option<
+        tokio::sync::mpsc::Receiver<
+            crate::observer::announcer::AnnouncerOutboxItem<I>,
+        >,
+    >,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -646,6 +693,9 @@ where
             setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
+            lifecycle_dispatcher_handle: None,
+            announcer_outbox_tx: None,
+            announcer_outbox_rx: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -685,20 +735,87 @@ where
         self.peer_lifecycle_listeners.push(listener);
     }
 
+    /// Tear down the peer-lifecycle dispatcher task spawned at
+    /// `run_until_setup_or_done`'s first entry. No-op when the
+    /// dispatcher was never spawned (e.g. the coordinator's
+    /// `run_until_setup_or_done` was never called, or only the
+    /// SetupPending-yielding first entry ran and no second entry
+    /// reached the terminal cleanup). Mirrors the same helper on
+    /// `PrimaryCoordinator` — see that doc for the Drop-vs-explicit
+    /// design rationale.
+    pub(super) async fn cleanup_lifecycle_dispatcher(&mut self) {
+        if let Some(handle) = self.lifecycle_dispatcher_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
     /// Forward an observer-mode announcer attach onto the underlying
-    /// [`ClusterState`]. Returns the [`crate::observer::AnnouncerHandle`]
-    /// the caller subsequently spawns the announcer task with.
+    /// [`ClusterState`] AND allocate the coordinator-side outbox the
+    /// production [`crate::observer::announcer::PeerMeshAnnouncerSender`]
+    /// posts into. Returns the bundle the caller subsequently spawns
+    /// the announcer task with.
     ///
-    /// `secondary_id` from the coordinator's config is the announcer's
-    /// stamped `peer_id`; the caller passes the holdings set. See
-    /// [`crate::observer::attach_observer_announcer`] for the full
-    /// hook-registration + mirror-handoff contract.
+    /// # Outputs
+    ///
+    /// - `handle`: the [`crate::observer::AnnouncerHandle`] threaded
+    ///   into `run_observer_announcer` for `rx` / `holdings` /
+    ///   `peer_id` / `primary_epoch_mirror`. Same shape as the
+    ///   pre-outbox API.
+    /// - `sender`: the production [`PeerMeshAnnouncerSender`] passed
+    ///   into `run_observer_announcer` as the
+    ///   [`crate::observer::announcer::AnnouncerSender`] impl. Holds
+    ///   a clone of the freshly-built outbox sender.
+    ///
+    /// # Side effects on `self`
+    ///
+    /// - Builds the outbox (`mpsc::channel::<AnnouncerOutboxItem<I>>`),
+    ///   stashes the receiver on `self.announcer_outbox_rx`, and the
+    ///   sender clone on `self.announcer_outbox_tx`. The receiver is
+    ///   later taken by `process_tasks` for its drain arm; the sender
+    ///   clone on `self` is held purely to keep the channel alive
+    ///   when the announcer task's clone gets dropped (so the drain
+    ///   arm doesn't observe a spurious close).
+    ///
+    /// # Single concern
+    ///
+    /// Bundle the three independent setup steps (CRDT hook registration,
+    /// outbox channel allocation, production sender construction) into
+    /// one call so the late-joiner dispatcher does not have to know
+    /// the wiring details. Each constituent piece is testable in
+    /// isolation through the underlying APIs
+    /// ([`crate::observer::attach_observer_announcer`] for the hook,
+    /// the announcer's tests for the sender contract).
     pub fn attach_observer_announcer(
         &mut self,
         holdings: std::collections::HashSet<String>,
-    ) -> crate::observer::AnnouncerHandle {
+    ) -> (
+        crate::observer::AnnouncerHandle,
+        crate::observer::announcer::PeerMeshAnnouncerSender<I>,
+    ) {
         let peer_id = self.config.secondary_id.clone();
-        crate::observer::attach_observer_announcer(&mut self.cluster_state, holdings, peer_id)
+        let handle = crate::observer::attach_observer_announcer(
+            &mut self.cluster_state,
+            holdings,
+            peer_id.clone(),
+        );
+        // Capacity 32: an announcer trigger fires once per role-change
+        // event; the announcer's retry-on-failure loop is rate-limited
+        // by `MAX_BACKOFF=5s` so the steady-state in-flight count is
+        // ≤1. 32 absorbs a flap-burst without applying back-pressure
+        // to the announcer task (which would deadlock against the
+        // drain arm if both ran on the same LocalSet).
+        const ANNOUNCER_OUTBOX_CAPACITY: usize = 32;
+        let (outbox_tx, outbox_rx) =
+            tokio::sync::mpsc::channel::<crate::observer::announcer::AnnouncerOutboxItem<I>>(
+                ANNOUNCER_OUTBOX_CAPACITY,
+            );
+        self.announcer_outbox_rx = Some(outbox_rx);
+        self.announcer_outbox_tx = Some(outbox_tx.clone());
+        let sender = crate::observer::announcer::PeerMeshAnnouncerSender::new(
+            peer_id, outbox_tx,
+        );
+        (handle, sender)
     }
 
     /// Whether the run is in pre-staged-source mode (set from the
@@ -938,7 +1055,40 @@ where
     /// and the next entry rebuilds a fresh `select!`. No state is
     /// dropped except those in-flight recv futures, which are
     /// cancel-safe by construction.
+    ///
+    /// # Cleanup discipline
+    ///
+    /// Thin wrapper around [`Self::run_until_setup_or_done_inner`]
+    /// whose secondary concern is to drive the peer-lifecycle
+    /// dispatcher's abort-on-exit contract. `Done` and any `Err`
+    /// path flow through `cleanup_lifecycle_dispatcher` before
+    /// returning, so the spawned dispatcher task is always aborted
+    /// and joined before the caller observes the result. The
+    /// `SetupPending` yield path deliberately bypasses cleanup —
+    /// the caller will re-enter, the dispatcher is still useful
+    /// across that boundary, and the receiver has been moved into
+    /// the task so a fresh spawn would be impossible anyway.
     pub async fn run_until_setup_or_done(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<RunOutcome, String> {
+        let result = self.run_until_setup_or_done_inner(factory).await;
+        // SetupPending is a re-entrant yield, not a terminal exit;
+        // the dispatcher must stay alive across the boundary so the
+        // next `run_until_setup_or_done` re-entry inherits it.
+        // Match on the borrow to keep the result move-back intact.
+        let cleanup = !matches!(&result, Ok(RunOutcome::SetupPending));
+        if cleanup {
+            self.cleanup_lifecycle_dispatcher().await;
+        }
+        result
+    }
+
+    /// Original `run_until_setup_or_done` body, factored out so the
+    /// public wrapper can drive cleanup-on-exit regardless of how
+    /// this function returns. See [`Self::run_until_setup_or_done`]
+    /// for the rationale.
+    async fn run_until_setup_or_done_inner(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<RunOutcome, String> {
@@ -950,11 +1100,21 @@ where
         // the unbounded channel and drains here. `spawn_local`
         // matches the rest of the secondary's LocalSet-bound spawn
         // pattern.
+        //
+        // The returned `JoinHandle` is stored on `self` so
+        // `cleanup_lifecycle_dispatcher` (called from the outer
+        // wrapper on Done / Err exits — NOT on the re-entrant
+        // SetupPending yield) can abort the task and await its
+        // termination. Without this, an error-return from inside the
+        // run loop would leave the dispatcher blocked on its input
+        // channel forever (the sender on `cluster_state` is still
+        // alive as long as the coordinator object is).
         if let Some(rx) = self.lifecycle_rx.take() {
             let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
-            tokio::task::spawn_local(
+            let handle = tokio::task::spawn_local(
                 crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
             );
+            self.lifecycle_dispatcher_handle = Some(handle);
         }
         if !self.setup_phase_completed {
             tracing::info!(

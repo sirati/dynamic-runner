@@ -6537,3 +6537,76 @@ async fn peer_joined_revalidates_preferred_secondaries() {
         );
     }).await;
 }
+
+/// Pins the peer-lifecycle dispatcher cleanup contract: every `run()`
+/// exit (Ok happy-path here; the Err path goes through the same
+/// `cleanup_lifecycle_dispatcher` call in the outer wrapper) must
+/// take + abort + join the dispatcher's `JoinHandle`. The observable
+/// post-condition is `lifecycle_dispatcher_handle == None`.
+///
+/// Without the cleanup, the spawned dispatcher task would stay
+/// blocked on its input channel forever (the channel's sender lives
+/// on `cluster_state`, which the coordinator still owns post-run),
+/// leaking a tokio task per `run()` invocation. This test mirrors the
+/// single-secondary happy-path fixture so the assertion exercises the
+/// same end-of-run boundary every other test relies on.
+#[tokio::test(flavor = "current_thread")]
+async fn lifecycle_dispatcher_joinhandle_aborted_on_run_exit() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Pre-run: no dispatcher spawned yet.
+        assert!(
+            !primary.lifecycle_dispatcher_handle_present_for_test(),
+            "dispatcher handle must be None before run() spawns it"
+        );
+
+        let binaries = vec![make_binary("a", 50)];
+        for (id, rx, tx) in secondary_ends {
+            tokio::task::spawn_local(fake_secondary(id, 1, 1024 * 1024 * 1024, rx, tx));
+        }
+
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // Post-run: cleanup_lifecycle_dispatcher must have taken the
+        // handle out of `self`. A surviving `Some` would mean the
+        // dispatcher was not aborted+joined and is leaking against
+        // the still-alive `cluster_state` sender.
+        assert!(
+            !primary.lifecycle_dispatcher_handle_present_for_test(),
+            "lifecycle_dispatcher_handle must be None after run() exits — \
+             cleanup_lifecycle_dispatcher should have taken + aborted + \
+             joined the handle"
+        );
+    }).await;
+}

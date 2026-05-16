@@ -60,8 +60,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use dynrunner_manager_distributed::{
-    cluster_state::ClusterStateSnapshot, PeerCertInfo, RunOutcome, SecondaryConfig,
-    SecondaryCoordinator,
+    cluster_state::ClusterStateSnapshot,
+    observer::run_observer_announcer,
+    PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator,
 };
 use dynrunner_protocol_primary_secondary::{
     PeerConnectionInfo, PeerTransport, DEFAULT_JOIN_TIMEOUT,
@@ -405,7 +406,7 @@ impl PyObserverLateJoiner {
                 });
 
                 // Attach the resource-holdings announcer's hook +
-                // channel BEFORE the snapshot restore: the restore's
+                // outbox BEFORE the snapshot restore: the restore's
                 // `cluster_state.restore` path fires
                 // `fire_role_change_hooks` from inside its
                 // `primary_epoch > local` branch, which we want to
@@ -415,8 +416,14 @@ impl PyObserverLateJoiner {
                 // a separate explicit "fire one trigger" step would
                 // duplicate that stimulus.
                 //
-                // The handle is held until the spawn site below.
-                let announcer_handle = secondary.attach_observer_announcer(holdings);
+                // The bundle carries the `AnnouncerHandle` (rx /
+                // holdings / peer_id / primary_epoch_mirror — the
+                // four `run_observer_announcer` inputs) plus the
+                // production `PeerMeshAnnouncerSender` that forwards
+                // each announce onto the coordinator-side outbox the
+                // operational loop drains.
+                let (announcer_handle, announcer_sender) =
+                    secondary.attach_observer_announcer(holdings);
 
                 // 5. Install the snapshot AND latch
                 //    setup_phase_completed=true. The single-method
@@ -425,30 +432,21 @@ impl PyObserverLateJoiner {
                 //    to touch the latch (see its doc-comment).
                 secondary.restore_from_snapshot_and_skip_setup(snap);
 
-                // TODO(E1-merge): spawn `run_observer_announcer` here
-                // once the production `AnnouncerSender` impl is wired
-                // up. Today the missing pieces are:
-                //   1. `ClusterMutation::PeerResourceHoldingsUpdated`
-                //      (lands with the sibling E1 subtask).
-                //   2. A cross-task outbox from the announcer to the
-                //      secondary's run loop so the announcer doesn't
-                //      need shared access to `peer_transport` (which
-                //      stays `&mut self`-owned by the run loop).
-                // The announcer module + the attach call above are
-                // already in place; the spawn site is a single
-                // `tokio::task::spawn_local(run_observer_announcer(
-                // announcer_handle.rx, announcer_handle.holdings,
-                // announcer_handle.peer_id, sender,
-                // announcer_handle.primary_epoch_mirror))` once
-                // those two land. For now we drop the handle —
-                // the trigger queue absorbs role-change fires
-                // (`ANNOUNCE_CHANNEL_CAPACITY = 8` per
-                // `crate::observer::lifecycle`) and the hook's
-                // `try_send` then silently drops, which is
-                // structurally identical to "announcer task not yet
-                // started" so the safety property holds even with
-                // E1 unmerged.
-                let _ = announcer_handle;
+                // 5.5. Spawn the announcer task. The coordinator's
+                //      `select!` arm drains the production sender's
+                //      outbox onto `peer_transport.send`; here we just
+                //      hand the task its four inputs (rx / holdings /
+                //      peer_id / primary_epoch_mirror) plus the
+                //      production sender, and store the JoinHandle for
+                //      shutdown abort+join — same discipline as the
+                //      peer-lifecycle dispatcher's cleanup.
+                let announcer_task = tokio::task::spawn_local(run_observer_announcer(
+                    announcer_handle.rx,
+                    announcer_handle.holdings,
+                    announcer_handle.peer_id,
+                    announcer_sender,
+                    announcer_handle.primary_epoch_mirror,
+                ));
 
                 // 6. Drive the run loop. The first iteration's
                 //    setup-skip guard fires immediately; subsequent
@@ -458,42 +456,75 @@ impl PyObserverLateJoiner {
                 //    pre-staged-mode primaries emit the
                 //    PromotePrimary that triggers it, and an observer
                 //    is never the elected secondary).
-                loop {
-                    let outcome = secondary
-                        .run_until_setup_or_done(&mut factory)
-                        .await
-                        .map_err(|e| {
-                            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                                "observer late-joiner: secondary run loop failed: {e}"
-                            ))
-                        })?;
-                    match outcome {
-                        RunOutcome::Done => break,
-                        RunOutcome::SetupPending => {
-                            // Defensive: a late-joiner observer
-                            // should never see SetupPending — that
-                            // outcome comes from a
-                            // PromotePrimary{required_setup=true}
-                            // arrival, which an observer cannot
-                            // accept (the election filter + the
-                            // dispatch.rs defensive reject keep
-                            // observers off the promote path).
-                            // Surface it as a typed error rather
-                            // than retrying — silent re-entry on
-                            // an unreachable branch would mask a
-                            // protocol bug.
-                            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                "observer late-joiner: secondary returned \
-                                 RunOutcome::SetupPending — unreachable for an \
-                                 observer (PromotePrimary should be rejected); \
-                                 this indicates a protocol or election-filter \
-                                 regression",
-                            ));
+                //
+                // # Why a sub-block
+                //
+                // Wrapped in an inner async block whose result is
+                // captured BEFORE the announcer-task cleanup so any
+                // `?`-propagated error or early `Err`-return still
+                // routes through the abort+await on
+                // `announcer_task`. Without the wrapper an
+                // error-return would skip the cleanup and leak the
+                // announcer task into the next observer dispatcher
+                // run.
+                let loop_result: Result<u32, PyErr> = async {
+                    loop {
+                        let outcome = secondary
+                            .run_until_setup_or_done(&mut factory)
+                            .await
+                            .map_err(|e| {
+                                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                    "observer late-joiner: secondary run loop failed: {e}"
+                                ))
+                            })?;
+                        match outcome {
+                            RunOutcome::Done => break,
+                            RunOutcome::SetupPending => {
+                                // Defensive: a late-joiner observer
+                                // should never see SetupPending — that
+                                // outcome comes from a
+                                // PromotePrimary{required_setup=true}
+                                // arrival, which an observer cannot
+                                // accept (the election filter + the
+                                // dispatch.rs defensive reject keep
+                                // observers off the promote path).
+                                // Surface it as a typed error rather
+                                // than retrying — silent re-entry on
+                                // an unreachable branch would mask a
+                                // protocol bug.
+                                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                                    "observer late-joiner: secondary returned \
+                                     RunOutcome::SetupPending — unreachable for an \
+                                     observer (PromotePrimary should be rejected); \
+                                     this indicates a protocol or election-filter \
+                                     regression",
+                                ));
+                            }
                         }
                     }
-                }
 
-                Ok(secondary.completed_count() as u32)
+                    Ok(secondary.completed_count() as u32)
+                }
+                .await;
+
+                // Announcer-task cleanup. The task is `spawn_local`-ed
+                // on this LocalSet and holds a clone of the
+                // coordinator-side outbox `mpsc::Sender`; the
+                // coordinator itself holds another clone on
+                // `announcer_outbox_tx`, so neither side observes a
+                // closed-channel `None` on natural shutdown. The
+                // explicit abort+await mirrors the peer-lifecycle
+                // dispatcher's cleanup discipline (see
+                // `SecondaryCoordinator::cleanup_lifecycle_dispatcher`):
+                // `abort()` is the kill signal, `await` synchronises
+                // with the task's actual termination so a follow-on
+                // observer dispatcher run (test-driven; the
+                // production single-shot Python wrapper exits after
+                // this) starts with a quiesced runtime.
+                announcer_task.abort();
+                let _ = announcer_task.await;
+
+                loop_result
             }))
         });
 

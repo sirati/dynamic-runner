@@ -50,6 +50,19 @@ where
             }
         }
 
+        // Take the announcer outbox receiver out of `self` for the
+        // duration of the loop so the drain arm's `recv().await` can
+        // borrow it without conflicting with the per-arm `&mut self`
+        // borrows that the other arms (peer_transport, primary_transport)
+        // require. `None` when no observer-mode caller has invoked
+        // `attach_observer_announcer` on this coordinator — the arm
+        // then parks on `pending().await` and is structurally a no-op,
+        // matching the `command_rx` / `matcher_trigger_rx` shape on
+        // the primary. Put back on `self` at loop exit so a future
+        // re-entry (test-driven; the production single-shot path
+        // exits via Done) re-attaches the same channel.
+        let mut announcer_outbox_rx = self.announcer_outbox_rx.take();
+
         loop {
             // Workers that need restart after disconnect
             let mut workers_to_restart: Vec<WorkerId> = Vec::new();
@@ -207,6 +220,72 @@ where
                         self.handle_peer_message(m).await;
                     }
                 }
+                // Announcer-outbox drain. The observer-mode
+                // [`crate::observer::announcer::PeerMeshAnnouncerSender`]
+                // posts each holdings-announce DistributedMessage onto
+                // the bounded outbox; this arm drains one item per
+                // iteration, issues the actual `peer_transport.send`,
+                // and replies via the item's oneshot so the
+                // announcer task's `send_holdings` resolves with the
+                // delivery outcome.
+                //
+                // # Why an arm rather than a non-select drain
+                //
+                // The drain has to await `peer_transport.send`, which
+                // takes `&mut self`. Hoisting it out of `select!`
+                // would mean serialising every iteration on a send
+                // call that's only relevant when the outbox is non-
+                // empty; placing it inside the select preserves the
+                // structure-of-control the other &mut-self arms
+                // already use (one wire-touch per iteration, paired
+                // with `recv` to gate).
+                //
+                // # Cancel-safety
+                //
+                // `mpsc::Receiver::recv` is documented cancel-safe.
+                // When a sibling arm wins the race, the in-flight
+                // `recv` future is dropped and re-built on the next
+                // iteration; no item is consumed without being
+                // handled.
+                //
+                // # Parked when no announcer attached
+                //
+                // Non-observer secondaries (and pre-attach observer
+                // coordinators) leave `announcer_outbox_rx = None`;
+                // the arm parks on `pending().await` and never fires.
+                outbox_item = async {
+                    match announcer_outbox_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(item) = outbox_item {
+                        let send_result = self
+                            .peer_transport
+                            .send(
+                                dynrunner_protocol_primary_secondary::Address::Role(
+                                    dynrunner_protocol_primary_secondary::Role::Primary,
+                                ),
+                                item.msg,
+                            )
+                            .await;
+                        // A dropped `item.reply` receiver means the
+                        // announcer task was aborted between
+                        // `send_holdings`'s outbox push and the
+                        // drain — drop the result, the next trigger
+                        // (or task shutdown) will reconcile.
+                        let _ = item.reply.send(send_result);
+                    }
+                    // None from `rx.recv()` means every announcer-
+                    // side sender (the announcer task's clone and
+                    // any other sites holding `announcer_outbox_tx`)
+                    // has been dropped. The `self.announcer_outbox_tx`
+                    // clone on the coordinator keeps the channel
+                    // alive across that drop, so a `None` here would
+                    // only fire after the coordinator's own clone is
+                    // also released — which never happens inside
+                    // `process_tasks`. Drop the value (no-op).
+                }
                 _ = keepalive_interval.tick() => {
                     self.send_keepalive().await;
                     self.check_peer_timeouts();
@@ -311,6 +390,17 @@ where
                      so caller can run discovery and call \
                      ingest_setup_discovery"
                 );
+                // SetupPending is a re-entrant yield — the caller will
+                // call `run_until_setup_or_done` again, which will
+                // re-enter `process_tasks`. The announcer outbox
+                // receiver must be put back on `self` so the next
+                // iteration's `take()` finds it; otherwise the
+                // announcer's outbox would fill up against a
+                // perpetually-parked drain arm. Other exit paths (Err,
+                // break + Ok(Done)) don't restore — the dispatcher
+                // teardown in the outer wrapper aborts the announcer
+                // task before its next outbox push.
+                self.announcer_outbox_rx = announcer_outbox_rx;
                 return Ok(RunOutcome::SetupPending);
             }
 
