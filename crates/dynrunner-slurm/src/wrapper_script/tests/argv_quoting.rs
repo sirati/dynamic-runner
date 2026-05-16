@@ -96,21 +96,23 @@ fn forwarded_argv_lands_after_framework_flags_in_secondary_argv() {
 
 /// Empty forwarded_argv must collapse to no rendered diff: the
 /// secondary's container_command line ends with the framework's
-/// `--src-network={path}` exactly as it did pre-forwarding. Guards
-/// against accidentally introducing a trailing space, empty quote,
-/// or stray separator when the consumer passes no extra args.
+/// final emitted flag (`--log-dir=/app/log-network` since the
+/// log-mount split landed) and nothing else. Guards against
+/// accidentally introducing a trailing space, empty quote, or
+/// stray separator when the consumer passes no extra args.
 #[test]
 fn empty_forwarded_argv_emits_no_trailing_tokens() {
     let config = SlurmConfig::default();
     let script = generate_wrapper_script(&standard_cfg(&config, &[]));
-    // The container_command line ends with `--src-network={path}`
-    // followed immediately by the next line break (no trailing
-    // space, no stray quote). Asserting on the joined byte sequence
-    // is the strictest way to defend the no-diff invariant.
+    // The container_command line ends with `--log-dir={path}`
+    // (the last framework-emitted flag) followed immediately by
+    // the next line break (no trailing space, no stray quote).
+    // Asserting on the joined byte sequence is the strictest way
+    // to defend the no-diff invariant.
     assert!(
-        script.contains("--src-network=/app/src-network\n"),
+        script.contains("--log-dir=/app/log-network\n"),
         "with empty forwarded_argv the container_command line must \
-         end at `--src-network={{path}}` with no trailing token"
+         end at `--log-dir={{path}}` with no trailing token"
     );
 }
 

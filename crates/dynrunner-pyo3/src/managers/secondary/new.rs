@@ -38,6 +38,7 @@ impl PySecondaryCoordinator {
         src_tmp = None,
         max_resources = None,
         peer_lifecycle_listener = None,
+        log_dir = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -60,6 +61,7 @@ impl PySecondaryCoordinator {
         src_tmp: Option<PathBuf>,
         max_resources: Option<PyResourceMap>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
+        log_dir: Option<String>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -67,6 +69,7 @@ impl PySecondaryCoordinator {
             task_args,
             &source_dir,
             &output_dir,
+            log_dir.as_deref(),
             skip_existing,
             log_paths,
         )?;
@@ -80,7 +83,7 @@ impl PySecondaryCoordinator {
         // the mount happened to be read-only or missing.
         let log_dir =
             task.log_paths
-                .resolve_log_dir(py, &task.output_path, &secondary_id)?;
+                .resolve_log_dir(py, &task.log_path, &secondary_id)?;
         std::fs::create_dir_all(&log_dir).map_err(|e| {
             pyo3::exceptions::PyOSError::new_err(format!(
                 "failed to create log directory {log_dir:?}: {e}"

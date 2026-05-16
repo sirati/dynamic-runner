@@ -95,6 +95,7 @@ impl PyLocalManager {
         max_resources = None,
         low_resource_thresholds = None,
         log_oom_watcher = false,
+        log_dir = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -124,6 +125,7 @@ impl PyLocalManager {
         max_resources: Option<PyResourceMap>,
         low_resource_thresholds: Option<PyResourceMap>,
         log_oom_watcher: bool,
+        log_dir: Option<String>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -131,6 +133,7 @@ impl PyLocalManager {
             task_args,
             &source_dir,
             &output_dir,
+            log_dir.as_deref(),
             skip_existing,
             log_paths,
         )?;
@@ -152,7 +155,7 @@ impl PyLocalManager {
         };
         let log_dir =
             task.log_paths
-                .resolve_log_dir(py, &task.output_path, &secondary_id)?;
+                .resolve_log_dir(py, &task.log_path, &secondary_id)?;
         std::fs::create_dir_all(&log_dir).map_err(|e| {
             pyo3::exceptions::PyOSError::new_err(format!(
                 "failed to create log directory {log_dir:?}: {e}"

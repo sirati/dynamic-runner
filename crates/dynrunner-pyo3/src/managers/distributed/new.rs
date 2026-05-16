@@ -35,6 +35,7 @@ impl PyDistributedManager {
         peer_lifecycle_listener = None,
         task_completed_listener = None,
         unfulfillable_reinject_max_per_task = None,
+        log_dir = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -57,6 +58,7 @@ impl PyDistributedManager {
         peer_lifecycle_listener: Option<Py<PyAny>>,
         task_completed_listener: Option<Py<PyAny>>,
         unfulfillable_reinject_max_per_task: Option<u32>,
+        log_dir: Option<String>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -64,6 +66,7 @@ impl PyDistributedManager {
             task_args,
             &source_dir,
             &output_dir,
+            log_dir.as_deref(),
             skip_existing,
             log_paths,
         )?;
@@ -91,6 +94,7 @@ impl PyDistributedManager {
             max_resources_per_secondary,
             source_dir: task.source_path,
             output_dir: task.output_path,
+            log_path: task.log_path,
             log_paths: task.log_paths,
             worker_spec,
             distributed_config: distributed_config.unwrap_or_default(),
