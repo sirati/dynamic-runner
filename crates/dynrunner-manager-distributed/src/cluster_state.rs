@@ -698,7 +698,11 @@ impl<I: Identifier> ClusterState<I> {
 
     /// Auto-resume helper: scan every entry in `tasks`, transition any
     /// `TaskState::Blocked { on, task }` whose `on` matches `prereq_hash`
-    /// back to `Pending { task }`.
+    /// back to `Pending { task }`, and return a clone of every just-
+    /// resumed `TaskInfo<I>` so originator-side callers can mirror the
+    /// transition into their live `PendingPool` (whose cascade-paused
+    /// items were dropped by the earlier `on_item_failed_permanent`
+    /// call and have to be re-introduced for dispatch to see them).
     ///
     /// Invoked from the `TaskCompleted` apply arm — completion of a
     /// prerequisite is the event that unblocks every cascade-paused
@@ -719,8 +723,11 @@ impl<I: Identifier> ClusterState<I> {
     /// the inner `TaskInfo<I>` can be moved out by value without
     /// requiring `I: Default` or unsafe placeholder construction. The
     /// hashmap-key clone is the only allocation; the `TaskInfo` move
-    /// itself is in-place.
-    fn resume_blocked_on(&mut self, prereq_hash: &str) {
+    /// itself is in-place. We clone the task once before re-insertion
+    /// so the returned `Vec<TaskInfo<I>>` is independent of further
+    /// CRDT mutations — callers may hold the clones across additional
+    /// apply calls.
+    fn resume_blocked_on(&mut self, prereq_hash: &str) -> Vec<TaskInfo<I>> {
         let to_resume: Vec<String> = self
             .tasks
             .iter()
@@ -729,11 +736,14 @@ impl<I: Identifier> ClusterState<I> {
                 _ => None,
             })
             .collect();
+        let mut resumed: Vec<TaskInfo<I>> = Vec::with_capacity(to_resume.len());
         for h in to_resume {
             if let Some(TaskState::Blocked { task, .. }) = self.tasks.remove(&h) {
+                resumed.push(task.clone());
                 self.tasks.insert(h, TaskState::Pending { task });
             }
         }
+        resumed
     }
 
     /// Enqueue a [`PeerLifecycleEvent`] onto the dispatcher channel.
@@ -921,7 +931,39 @@ impl<I: Identifier> ClusterState<I> {
         }
     }
 
+    /// Convenience wrapper around [`Self::apply_with_resumed_blocked`]
+    /// for callers that don't care which `Blocked` dependents the
+    /// apply unblocked (the receiver side: any peer secondary or
+    /// observer applying a mutation observed on the wire).
+    ///
+    /// Originator-side callers — i.e. the live primary's
+    /// `apply_and_broadcast_cluster_mutations` and the promoted
+    /// secondary's `apply_and_broadcast_mutations` — must use
+    /// `apply_with_resumed_blocked` so the resumed `TaskInfo`s can
+    /// be re-injected into the live `PendingPool` (their original
+    /// pool entries were dropped by the cascade-fail in
+    /// `pool.on_item_failed_permanent` and only the CRDT side has
+    /// kept them addressable since).
     pub fn apply(&mut self, m: ClusterMutation<I>) -> ApplyOutcome {
+        let mut _scratch: Vec<TaskInfo<I>> = Vec::new();
+        self.apply_with_resumed_blocked(m, &mut _scratch)
+    }
+
+    /// Apply a single `ClusterMutation<I>` and, in addition to the
+    /// usual [`ApplyOutcome`], append any `TaskInfo<I>`s that were
+    /// just auto-resumed from `Blocked → Pending` (see
+    /// [`Self::resume_blocked_on`]) to `resumed`.
+    ///
+    /// `resumed` is intentionally an out-parameter rather than part
+    /// of the return type: most apply variants append zero items, and
+    /// originator-side callers (which are the only ones that read
+    /// the list) prefer to accumulate across a whole mutation batch
+    /// into a single buffer before deciding what to do with it.
+    pub fn apply_with_resumed_blocked(
+        &mut self,
+        m: ClusterMutation<I>,
+        resumed: &mut Vec<TaskInfo<I>>,
+    ) -> ApplyOutcome {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
                 if self.tasks.contains_key(&hash) {
@@ -1006,7 +1048,8 @@ impl<I: Identifier> ClusterState<I> {
                 // hash to Completed converges every blocked dependent
                 // to Pending on the same apply call across every
                 // replica.
-                self.resume_blocked_on(&hash);
+                let just_resumed = self.resume_blocked_on(&hash);
+                resumed.extend(just_resumed);
                 ApplyOutcome::Applied
             }
             ClusterMutation::TaskFailed { hash, kind, error } => {
@@ -1372,20 +1415,45 @@ impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
     }
 }
 
+/// Output of [`apply_locally_for_broadcast`]: the wire subset to
+/// broadcast plus every `TaskInfo<I>` that was just auto-resumed
+/// from `Blocked → Pending` by a `TaskCompleted` mutation in this
+/// batch (see [`ClusterState::apply_with_resumed_blocked`]).
+///
+/// Originator-side callers must re-inject `resumed_for_dispatch`
+/// into their live `PendingPool` (the cascade-paused entries were
+/// dropped from the pool by the earlier `on_item_failed_permanent`
+/// call; only the CRDT auto-resume kept them addressable). The
+/// promoted-secondary originator path's pool seeds Blocked items
+/// from the CRDT at promotion time and tracks them via the pool's
+/// own `task_depends_on` graph, so its caller may silently discard
+/// the list.
+#[derive(Debug)]
+pub(crate) struct AppliedBatch<I: Identifier> {
+    pub applied: Vec<ClusterMutation<I>>,
+    pub resumed_for_dispatch: Vec<TaskInfo<I>>,
+}
+
 /// Apply each mutation to `state` locally and return the subset that
-/// actually changed state (`ApplyOutcome::Applied`). `NoOp` mutations
-/// are dropped — under the CRDT's idempotency contract a re-application
-/// against the post-state is silent, and re-broadcasting a NoOp would
-/// amplify under peer-forward redundancy (every peer forwarding observed
+/// actually changed state (`ApplyOutcome::Applied`) plus every
+/// `TaskInfo<I>` the apply pass auto-resumed from `Blocked` to
+/// `Pending`. `NoOp` mutations are dropped from the wire batch —
+/// under the CRDT's idempotency contract a re-application against the
+/// post-state is silent, and re-broadcasting a NoOp would amplify
+/// under peer-forward redundancy (every peer forwarding observed
 /// terminal events to the primary would turn one TaskComplete into N
 /// re-broadcasts = N² messages).
 ///
-/// Single concern: apply-locally + filter to applied. The broadcast
-/// step is transport-specific (primary uses `SecondaryTransport`,
-/// promoted-secondary uses `PeerTransport`; the two have different
-/// error shapes) so it stays at the call site. This free function is
-/// the canonical place to perform the apply+filter so the two
-/// originator paths can't drift on the filter semantics.
+/// Single concern: apply-locally + filter to applied (+ surface the
+/// resumed-for-dispatch list). The broadcast step and the pool
+/// re-injection step are both transport-/state-specific (primary
+/// uses `SecondaryTransport`, promoted-secondary uses `PeerTransport`;
+/// the live primary always wants to re-inject, the promoted secondary
+/// already has Blocked items in its pool via the
+/// `populate_primary_from_cluster_state` seed) so they stay at the
+/// call sites. This free function is the canonical place to perform
+/// the apply+filter so the two originator paths can't drift on the
+/// filter semantics.
 ///
 /// Callers:
 ///   - `primary::lifecycle::apply_and_broadcast_cluster_mutations`
@@ -1397,15 +1465,19 @@ impl<I: Identifier> RoleChangeHookRegistrar for ClusterState<I> {
 pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
     state: &mut ClusterState<I>,
     mutations: Vec<ClusterMutation<I>>,
-) -> Vec<ClusterMutation<I>> {
+) -> AppliedBatch<I> {
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
+    let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
     for m in mutations {
-        let outcome = state.apply(m.clone());
+        let outcome = state.apply_with_resumed_blocked(m.clone(), &mut resumed_for_dispatch);
         if outcome == ApplyOutcome::Applied {
             applied.push(m);
         }
     }
-    applied
+    AppliedBatch {
+        applied,
+        resumed_for_dispatch,
+    }
 }
 
 #[cfg(test)]
