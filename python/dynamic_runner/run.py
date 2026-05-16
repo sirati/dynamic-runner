@@ -286,6 +286,26 @@ def _dispatch_secondary(task, args, logger) -> None:
         logger.error("--secondary-id is required when running in secondary mode")
         return
 
+    # `--secondary-primary-pubkey-pem` is supplied by the respawn
+    # pipeline so a respawned secondary can pin the primary's trust
+    # anchor at QUIC handshake time. The structural plumbing
+    # (Rust primary `NetworkServer::cert_pem()` → coordinator
+    # `enable_respawn` → `SecondarySpawnSpec` → SLURM wrapper-script
+    # `forwarded_argv` → secondary argparse) is in place; the
+    # handshake-time verification is a follow-up. Log the receipt
+    # explicitly so an operator inspecting a respawned secondary's
+    # log can verify the value reached this side end-to-end.
+    pubkey_pem = getattr(args, "secondary_primary_pubkey_pem", None)
+    if pubkey_pem:
+        # Truncate for the log line (PEMs are several lines long).
+        fingerprint_snippet = pubkey_pem.replace("\n", "")[:48]
+        logger.info(
+            "Received primary pubkey PEM via respawn pipeline "
+            f"(prefix: {fingerprint_snippet}...); QUIC handshake-time "
+            "verification against this anchor is a follow-up — value "
+            "stored but not yet enforced."
+        )
+
     # `--disable-peer-overlay` and `--slurm-setup-deadline-secs` both
     # live on `DistributedConfig` (the struct that already owns the
     # peer-related + setup-phase tuning knobs). Construct an explicit

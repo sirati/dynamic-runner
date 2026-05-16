@@ -362,11 +362,15 @@ impl PyPrimaryCoordinator {
                     .cast::<crate::managers::multi_process_respawner::PyMultiProcessSpawner>()
                 {
                     Some(mp.borrow().as_arc())
+                } else if let Ok(slurm) = bound
+                    .cast::<crate::slurm::respawn_bridge::PySlurmSpawner>()
+                {
+                    Some(slurm.borrow().as_arc())
                 } else {
                     return Err(pyo3::exceptions::PyTypeError::new_err(
                         "respawn_spawner must be a recognised secondary-spawner \
-                         pyclass (PyMultiProcessSpawner, or a future SLURM \
-                         binding); got an unrecognised type",
+                         pyclass (PyMultiProcessSpawner or PySlurmSpawner); \
+                         got an unrecognised type",
                     ));
                 }
             }
