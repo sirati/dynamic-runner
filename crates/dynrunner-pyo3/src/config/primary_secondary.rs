@@ -9,7 +9,7 @@ use super::resources::PyResourceMap;
 
 /// Per-primary tuning. Combine with `DistributedConfig` for the shared
 /// connect/peer/keepalive knobs.
-#[pyclass(name = "PrimaryConfig")]
+#[pyclass(name = "PrimaryConfig", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PyPrimaryConfig {
     #[pyo3(get, set)]
@@ -89,7 +89,7 @@ impl PyPrimaryConfig {
 }
 
 /// Per-secondary tuning.
-#[pyclass(name = "SecondaryConfig")]
+#[pyclass(name = "SecondaryConfig", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PySecondaryConfig {
     #[pyo3(get, set)]

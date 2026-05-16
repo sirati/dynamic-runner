@@ -8,7 +8,7 @@ use dynrunner_core::{ResourceKind, ResourceMap as RustResourceMap};
 ///
 /// Construct from a Python dict: `ResourceMap({'memory': 1024**3})`. The
 /// kinds are opaque strings; the runner treats every kind interchangeably.
-#[pyclass(name = "ResourceMap")]
+#[pyclass(name = "ResourceMap", from_py_object)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PyResourceMap {
     pub(crate) inner: HashMap<String, u64>,
