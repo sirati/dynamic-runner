@@ -159,14 +159,15 @@ impl PyObserverLateJoiner {
         // mirrors the secondary-id shape (`<role>-<unique>`) so peer
         // logs read uniformly.
         let observer_id = observer_id.unwrap_or_else(|| {
-            // `nanos()` collapses to `u32` (mod 2^32) without
-            // importing rand; the collision space is enormous for
-            // the typical 1-2 concurrent observer use case.
+            // Nanosecond timestamp plus 16 bits of process-entropy so
+            // two observers launched in the same nanosecond bucket on
+            // the same gateway can't collide on the peer id.
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0);
-            format!("observer-{ts:08x}")
+            let pid = std::process::id() & 0xffff;
+            format!("observer-{ts:08x}-{pid:04x}")
         });
         // Dedup at the boundary — Python typically passes a list, but
         // the announcer's storage is set-semantics (`HashSet`). The
