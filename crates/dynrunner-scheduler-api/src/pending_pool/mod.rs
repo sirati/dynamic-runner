@@ -65,5 +65,5 @@ pub use types::{BucketKey, PendingPoolError, PhaseState, PreferencePredicate};
 pub use view::WorkerView;
 
 #[cfg(test)]
-#[path = "../pending_pool_tests.rs"]
+#[path = "../pending_pool_tests/mod.rs"]
 mod tests;
