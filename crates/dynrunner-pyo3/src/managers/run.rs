@@ -405,6 +405,7 @@ pub(crate) fn run_secondary<'py>(
     fulfillability_matcher = None,
     peer_lifecycle_listener = None,
     task_completed_listener = None,
+    unfulfillable_reinject_max_per_task = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_distributed<'py>(
@@ -423,6 +424,7 @@ pub(crate) fn run_distributed<'py>(
     fulfillability_matcher: Option<Py<PyAny>>,
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
+    unfulfillable_reinject_max_per_task: Option<u32>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_per_secondary` retained for back-compat; the
     // typed path passes the full multi-resource map via the
@@ -462,6 +464,9 @@ pub(crate) fn run_distributed<'py>(
     if let Some(l) = task_completed_listener.as_ref() {
         kwargs.set_item("task_completed_listener", l)?;
     }
+    if let Some(cap) = unfulfillable_reinject_max_per_task {
+        kwargs.set_item("unfulfillable_reinject_max_per_task", cap)?;
+    }
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
     let args = (
@@ -478,16 +483,22 @@ pub(crate) fn run_distributed<'py>(
     // Phase 5B: fire `on_run_start` under the GIL. Failure aborts the
     // run (consumer's setup hasn't completed; no point dispatching).
     //
-    // TODO: thread a `PrimaryHandle` here so the in-process distributed
-    // path matches `run_primary`. Requires `PyDistributedManager` to
-    // expose a pre-run `handle()` factory (the inner
-    // `PrimaryCoordinator` is built inside `py.detach`; the wrapper
-    // would need to mint the command-channel pair at `__init__` like
-    // `PyPrimaryCoordinator` does and swap it in at `run()` start).
-    // Until that lands, modern tasks running under the in-process
-    // distributed pipeline see `primary_handle=None` and degrade to
-    // the legacy positional shape.
-    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args, None)?;
+    // Pre-run handle factory: the in-process distributed manager mints
+    // the command-channel pair at `__init__` (mirroring
+    // `PyPrimaryCoordinator`), so we fetch a `PrimaryHandle` BEFORE
+    // blocking on `run()`. Modern tasks can drive
+    // `primary_handle.spawn_tasks(...)` from inside their
+    // `on_run_start` hook; legacy positional-only `on_run_start`
+    // signatures fall back via the TypeError-retry path inside
+    // `fire_on_run_start`.
+    let primary_handle = mgr.call_method0("handle")?.unbind();
+    fire_on_run_start(
+        task_definition,
+        &source_dir,
+        &output_dir,
+        task_args,
+        Some(primary_handle),
+    )?;
 
     let run_outcome = mgr.call_method1("run", (binaries.clone(),));
 
