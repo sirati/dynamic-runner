@@ -1024,7 +1024,11 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
     // share one FIFO, so a flush only fires AFTER every preceding
     // message has been forwarded.
     enum BufOut {
-        Msg(DistributedMessage<TestId>),
+        // Box keeps `BufOut` small: `DistributedMessage<TestId>` is
+        // ~360B while `Flush` is one oneshot::Sender — boxing the
+        // heavy variant stops the entire enum from carrying the
+        // worst-case payload through the writer's mpsc.
+        Msg(Box<DistributedMessage<TestId>>),
         Flush(oneshot::Sender<()>),
     }
 
@@ -1057,7 +1061,7 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
             msg: DistributedMessage<TestId>,
         ) -> Result<(), String> {
             self.outgoing_tx
-                .send(BufOut::Msg(msg))
+                .send(BufOut::Msg(Box::new(msg)))
                 .map_err(|_| "buffered transport writer task exited".to_string())
         }
 
@@ -1114,7 +1118,7 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
                             std::time::Duration::from_millis(50),
                         )
                         .await;
-                        if inner_tx.send(msg).is_err() {
+                        if inner_tx.send(*msg).is_err() {
                             break;
                         }
                     }
