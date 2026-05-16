@@ -11,6 +11,10 @@
 //!   tests + post-promotion peer-message dispatch test.
 //! - [`setup_promote_discriminator`] — Step 10's `required_setup`
 //!   discriminator across the three promotion-reason cases.
+//! - [`promoted_primary_quiesce_gate`] — T11 regression: gate
+//!   the promoted-primary natural-quiesce branch on a settle
+//!   window so a partial CRDT mirror doesn't broadcast a
+//!   spurious `RunComplete`.
 //! - [`late_joiner_observer`] — late-joiner observer-mode scenario.
 //! - [`late_joiner_accept_emits_peer_joined`] — receive-side
 //!   PeerJoined emission contract for the late-joiner accept path.
@@ -25,5 +29,6 @@ mod late_joiner_observer;
 mod observer_announcer_wireup;
 mod peer_mesh_watchdog;
 mod processing;
+mod promoted_primary_quiesce_gate;
 mod r1;
 mod setup_promote_discriminator;
