@@ -592,6 +592,52 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // is in flight; an empty JoinSet is a fast no-op.
         self.drain_respawn_tasks().await;
 
+        // Mirror-divergence detector. On the demoted observer the
+        // `completed_tasks` / `failed_tasks` HashSets and the CRDT-
+        // replicated `cluster_state` outcome partition are supposed
+        // to converge: every TaskCompleted / TaskFailed broadcast
+        // routes through either `handle_task_complete` (line 58 of
+        // `task/complete.rs`, direct insert) or
+        // `mirror_mutation_to_accounting` (line 168 of
+        // `task/mutation.rs`, mirror-then-apply). Both populate the
+        // HashSets BEFORE applying to `cluster_state`, so the
+        // CRDT cannot have a terminal entry the HashSet is missing.
+        //
+        // The production bug class #88 documents the opposite: the
+        // demoted primary's terminal log undercounted whenever a
+        // cross-secondary completion's mirror hop was bypassed. The
+        // accessors `completed_count()` / `failed_count()` now route
+        // through `cluster_state.outcome_counts()` to mask that
+        // divergence at the operator-facing read site (the dispatcher's
+        // `succeeded=N` stdout); this trace fires when the divergence
+        // is actually observable so a production trace can pin the
+        // wire path that produced it. Demoted-observer-only (a live
+        // primary's HashSet IS authoritative for its own dispatched
+        // tasks); behind `tracing::debug` so a clean run is silent.
+        if self.demoted {
+            let crdt = self.cluster_state.outcome_counts();
+            let crdt_failed = crdt.fail_retry + crdt.fail_oom + crdt.fail_final;
+            if self.completed_tasks.len() != crdt.succeeded
+                || self.failed_tasks.len() != crdt_failed
+            {
+                tracing::debug!(
+                    hashset_completed = self.completed_tasks.len(),
+                    hashset_failed = self.failed_tasks.len(),
+                    crdt_succeeded = crdt.succeeded,
+                    crdt_failed,
+                    "demoted-observer mirror divergence: completed_tasks / \
+                     failed_tasks HashSets disagree with cluster_state. \
+                     `mirror_mutation_to_accounting` should keep them in \
+                     lock-step on every TaskCompleted / TaskFailed CRDT \
+                     apply (see primary/task/mutation.rs). The \
+                     `completed_count()` / `failed_count()` accessors mask \
+                     the divergence by reading from `cluster_state`; this \
+                     log surfaces the underlying mirror bypass for \
+                     post-hoc diagnosis."
+                );
+            }
+        }
+
         Ok(())
     }
 

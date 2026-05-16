@@ -910,12 +910,60 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             .push((secondary_id, file_hash, content_hash, src_path, dest_path));
     }
 
+    /// Number of tasks the cluster recorded as successfully completed.
+    ///
+    /// Reads through `cluster_state.outcome_counts().succeeded` so the
+    /// count is the CRDT-authoritative tally rather than the per-node
+    /// `completed_tasks` HashSet — analogous to the existing
+    /// [`Self::outcome_summary`] which routes through the same CRDT
+    /// reader for cosmetic #88. The `completed_tasks` HashSet stays
+    /// authoritative for per-task identity decisions (dedup on a
+    /// re-applied `TaskComplete`, the operational-loop exit gate, the
+    /// kickstart-suppression check); cross-class *counts* live one
+    /// layer up, on the replicated ledger every replica converges to.
+    ///
+    /// Without this routing the demoted primary's PyO3-facing
+    /// `succeeded=N` stdout undercounted whenever a cross-secondary
+    /// completion's mirror hop (`mirror_mutation_to_accounting`) was
+    /// bypassed — the same divergence class #88 fixed at the
+    /// terminal-log site but missed at the dispatcher's PyO3
+    /// `completed_count()` read site. Concrete symptom: setup-promote
+    /// single-task phases (e.g. asm-tokenizer's unify-vocab) reporting
+    /// `succeeded=0` while the promoted secondary's count is the
+    /// real value (which is also what `cluster_state` records on every
+    /// replica, including this one).
+    ///
+    /// Residual concern: the mirror divergence itself is documented at
+    /// `mirror_mutation_to_accounting`'s call sites but not yet
+    /// root-caused. In-process tests cover the mirror path end-to-end
+    /// (see `demoted_primary_applies_cluster_mutation_taskcompleted`
+    /// and the `setup_promote_*` integration suite — both observe
+    /// `completed_count()` == CRDT succeeded in test fixtures). The
+    /// production bypass is likely a real-QUIC writer-task race on the
+    /// loopback path that the in-process channel fixture doesn't
+    /// exercise. Until the bypass is root-caused, the CRDT read is
+    /// the authoritative source for cross-class count reporting on
+    /// the demoted observer. See the demoted-observer divergence
+    /// trace in `lifecycle/operational_loop.rs`.
     pub fn completed_count(&self) -> usize {
-        self.completed_tasks.len()
+        self.cluster_state.outcome_counts().succeeded
     }
 
+    /// Number of tasks the cluster recorded as terminally failed
+    /// (any failure class — `Recoverable` whose retry budget is
+    /// exhausted, `ResourceExhausted`, `NonRecoverable`, or
+    /// `Unfulfillable`).
+    ///
+    /// Same CRDT-routing rationale as [`Self::completed_count`]:
+    /// reads through `cluster_state.outcome_counts()` for the
+    /// CRDT-authoritative tally rather than the per-node
+    /// `failed_tasks` HashSet. Sums the three failure buckets
+    /// (`fail_retry + fail_oom + fail_final`) to preserve the
+    /// pre-migration semantics of "any task currently in a terminal
+    /// failure state".
     pub fn failed_count(&self) -> usize {
-        self.failed_tasks.len()
+        let o = self.cluster_state.outcome_counts();
+        o.fail_retry + o.fail_oom + o.fail_final
     }
 
     /// Per-class outcome breakdown for the coordinator-facing log

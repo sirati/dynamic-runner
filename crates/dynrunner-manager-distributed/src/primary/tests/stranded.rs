@@ -503,10 +503,22 @@ async fn drain_pending_messages_updates_completed_set() {
             .await
             .expect("drain must succeed on healthy transport");
 
+        // Post-drain the per-hash completed-set has every drained
+        // TaskComplete's hash. We pin the HashSet contents directly
+        // (rather than `completed_count()`) because the test injects
+        // synthesized TaskComplete messages without prior TaskAdded
+        // mutations — `cluster_state.apply(TaskCompleted)` NoOps on
+        // a non-existent ledger entry (CRDT precondition). The drain's
+        // load-bearing job here is to consume the messages through
+        // `handle_task_complete` (line 58: `completed_tasks.insert`),
+        // not to converge the CRDT mirror; the post-fix
+        // `completed_count()` reads through the CRDT and would NOT
+        // observe these synthetic completes.
         assert_eq!(
-            primary.completed_count(),
+            primary.completed_tasks.len(),
             3,
-            "drain must have processed all three queued TaskComplete messages"
+            "drain must have processed all three queued TaskComplete messages \
+             (per-hash set populated by handle_task_complete's direct insert)"
         );
         for hash in ["hash-a", "hash-b", "hash-c"] {
             assert!(
