@@ -43,6 +43,7 @@ use super::module;
     peer_lifecycle_listener = None,
     task_completed_listener = None,
     unfulfillable_reinject_max_per_task = None,
+    log_dir = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_distributed<'py>(
@@ -62,6 +63,7 @@ pub(crate) fn run_distributed<'py>(
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
     unfulfillable_reinject_max_per_task: Option<u32>,
+    log_dir: Option<String>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_per_secondary` retained for back-compat; the
     // typed path passes the full multi-resource map via the
@@ -103,6 +105,9 @@ pub(crate) fn run_distributed<'py>(
     }
     if let Some(cap) = unfulfillable_reinject_max_per_task {
         kwargs.set_item("unfulfillable_reinject_max_per_task", cap)?;
+    }
+    if let Some(ld) = log_dir {
+        kwargs.set_item("log_dir", ld)?;
     }
 
     let cls = module(py)?.getattr("RustDistributedManager")?;

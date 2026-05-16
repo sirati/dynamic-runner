@@ -108,6 +108,7 @@ task_args = SimpleNamespace()
             /* peer_lifecycle_listener */ None,
             /* task_completed_listener */ None,
             /* unfulfillable_reinject_max_per_task */ cap,
+            /* log_dir */ None,
         )?;
         Py::new(py, mgr)
     }

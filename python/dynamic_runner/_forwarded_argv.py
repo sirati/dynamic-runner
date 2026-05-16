@@ -6,9 +6,9 @@ the same parser (``build_arg_parser + task.add_task_arguments``) so
 anything that parsed on the dispatcher will re-parse identically on
 the secondary — *except* the framework-regenerated flags
 (``--secondary``, ``--secondary-id``, ``--secondary-quic-port``,
-``--src-network``, ``--cores``, ``--max-memory``) which the SLURM
-wrapper emits afresh per-job. Forwarding those would duplicate
-arguments and confuse argparse; this filter drops them.
+``--src-network``, ``--cores``, ``--max-memory``, ``--log-dir``)
+which the SLURM wrapper emits afresh per-job. Forwarding those would
+duplicate arguments and confuse argparse; this filter drops them.
 
 The result is opaque to all downstream layers (SlurmPreparation,
 SlurmJobManager, the Rust wrapper-script generator). Only this
@@ -20,8 +20,9 @@ from __future__ import annotations
 
 # Framework flags the SLURM wrapper regenerates from per-job state
 # (gateway-derived URL, secondary index, host-detected cores/memory,
-# container-internal bind-mount path). Forwarding these as well would
-# duplicate the flag and confuse the secondary's argparse.
+# container-internal bind-mount path, container-internal log-mount
+# path). Forwarding these as well would duplicate the flag and confuse
+# the secondary's argparse.
 FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
     {
         "--secondary",
@@ -30,6 +31,7 @@ FRAMEWORK_REGENERATED_FLAGS: frozenset[str] = frozenset(
         "--src-network",
         "--cores",
         "--max-memory",
+        "--log-dir",
     }
 )
 

@@ -35,6 +35,7 @@ impl PyDistributedManager {
         let python_executable = self.python_executable.clone();
         let source_dir = self.source_dir.clone();
         let output_dir = self.output_dir.clone();
+        let log_path = self.log_path.clone();
         let log_paths = self.log_paths.clone();
 
         // Pre-compute per-secondary log directories under the GIL —
@@ -44,11 +45,16 @@ impl PyDistributedManager {
         // default `worker_<id>.log` filename never collides across
         // secondaries on a shared mount, and `create_dir_all` errors
         // surface here at run start rather than as silent log loss.
+        // `log_path` (not `output_dir`) is the log-mount root — on
+        // SLURM deployments it points at `/app/log-network` while
+        // `output_dir` is `/app/out-network`. Single-host callers
+        // that did not supply a separate log dir get `log_path ==
+        // output_dir` from the fallback in `LoadedTaskDefinition`.
         let mut sec_log_dirs: Vec<(String, PathBuf)> =
             Vec::with_capacity(num_secondaries as usize);
         for i in 0..num_secondaries {
             let sid = format!("sec-{i}");
-            let dir = log_paths.resolve_log_dir(py, &output_dir, &sid)?;
+            let dir = log_paths.resolve_log_dir(py, &log_path, &sid)?;
             std::fs::create_dir_all(&dir).map_err(|e| {
                 pyo3::exceptions::PyOSError::new_err(format!(
                     "failed to create log directory {dir:?} for {sid}: {e}"
