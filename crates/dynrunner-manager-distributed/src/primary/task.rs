@@ -699,9 +699,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // the cluster ledger; refreshing `total_tasks` for any
             // other variant would be a wasted read on the hot terminal-
             // mutation path (TaskCompleted / TaskFailed).
-            let has_task_added = mutations
-                .iter()
-                .any(|m| matches!(m, ClusterMutation::TaskAdded { .. }));
+            let has_task_added = mutations.iter().any(|m| {
+                matches!(
+                    m,
+                    ClusterMutation::TaskAdded { .. }
+                        | ClusterMutation::TasksSpawned { .. }
+                )
+            });
             // Collect any PeerJoined ids riding in the batch BEFORE
             // moving the mutations into apply. After the batch
             // applies, each joined id may have resolved a previously-
@@ -718,9 +722,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     _ => None,
                 })
                 .collect();
+            // Snapshot the per-task list inside every TasksSpawned
+            // mutation so we can mirror accounting AFTER apply (the
+            // apply rule decides which task lands in Pending /
+            // Blocked / Failed based on dependency resolution; the
+            // pre-apply mirror can't see that classification).
+            let spawned_task_batches: Vec<Vec<TaskInfo<I>>> = mutations
+                .iter()
+                .filter_map(|m| match m {
+                    ClusterMutation::TasksSpawned { tasks } => Some(tasks.clone()),
+                    _ => None,
+                })
+                .collect();
             for m in mutations {
                 self.mirror_mutation_to_accounting(&m);
                 self.cluster_state.apply(m);
+            }
+            for batch in &spawned_task_batches {
+                self.mirror_tasks_spawned_post_apply(batch);
             }
             if !joined_peer_ids.is_empty() {
                 // A peer that just joined may have resolved a
@@ -846,6 +865,47 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // root. `PeerResourceHoldingsUpdated` is a generic
                 // CRDT replication of opaque-string per-peer
                 // holdings — orthogonal to task accounting.
+            }
+            ClusterMutation::TasksSpawned { .. } => {
+                // Mirrors `TaskAdded`: a TasksSpawned batch grows the
+                // ledger with brand-new entries. Setup-pending flips
+                // off for the same reason TaskAdded does — the
+                // batch is evidence the promoted secondary is
+                // actively building out the task graph. Failed
+                // (cascade-fail) and accounting-relevant entries are
+                // mirrored in the post-apply walk in
+                // `handle_cluster_mutation` (the
+                // `mirror_tasks_spawned_post_apply` step there),
+                // because at this point the apply hasn't yet run and
+                // the per-task landing state isn't known.
+                self.setup_pending = false;
+            }
+        }
+    }
+
+    /// Post-apply accounting mirror for a `ClusterMutation::TasksSpawned`
+    /// batch arriving from a remote originator. Each task in the
+    /// batch lands in one of three relevant states (Pending,
+    /// Blocked, Failed); we walk every input task and record the
+    /// Failed entries in `failed_tasks` so the operational-loop's
+    /// exit-counter check converges.
+    ///
+    /// Pending / Blocked entries contribute nothing here: they're
+    /// non-terminal. The hash recomputation is the same wire-
+    /// canonical primitive the apply rule uses, so the keys line up
+    /// with `cluster_state.tasks`.
+    pub(super) fn mirror_tasks_spawned_post_apply(
+        &mut self,
+        tasks: &[TaskInfo<I>],
+    ) {
+        for task in tasks {
+            let hash = super::wire::compute_task_hash(task);
+            if let Some(crate::cluster_state::TaskState::Failed { kind, .. }) =
+                self.cluster_state.task_state(&hash)
+            {
+                if !self.completed_tasks.contains(&hash) {
+                    self.failed_tasks.insert(hash, kind.clone());
+                }
             }
         }
     }

@@ -1232,6 +1232,7 @@ impl<I: Identifier> ClusterState<I> {
                 holdings,
                 epoch,
             } => self.apply_peer_resource_holdings_updated(peer_id, holdings, epoch),
+            ClusterMutation::TasksSpawned { tasks } => self.apply_tasks_spawned(tasks),
         }
     }
 
@@ -1386,6 +1387,190 @@ impl<I: Identifier> ClusterState<I> {
                 self.peer_holdings.insert(peer_id, incoming);
                 ApplyOutcome::Applied
             }
+        }
+    }
+
+    /// Resolve a task_id to its wire-canonical hash via a linear scan
+    /// over `self.tasks`. Returns `None` if no entry in the ledger
+    /// carries that `task_id`.
+    ///
+    /// O(n) over the ledger; the CRDT does not maintain a task_id →
+    /// hash reverse index (the live `PendingPool` does, but it's
+    /// task_id-keyed by design and lives only on the primary;
+    /// every replica must resolve locally to converge on dependency
+    /// states). The scan keeps the dependency-tracking concern
+    /// self-contained inside cluster_state.
+    pub fn task_hash_for_task_id(&self, task_id: &str) -> Option<&str> {
+        self.tasks.iter().find_map(|(h, s)| {
+            let task = match s {
+                TaskState::Pending { task }
+                | TaskState::InFlight { task, .. }
+                | TaskState::Completed { task }
+                | TaskState::Failed { task, .. }
+                | TaskState::Unfulfillable { task, .. }
+                | TaskState::Blocked { task, .. } => task,
+            };
+            (task.task_id.as_deref() == Some(task_id)).then_some(h.as_str())
+        })
+    }
+
+    /// Apply a `ClusterMutation::TasksSpawned` batch.
+    ///
+    /// For each `TaskInfo<I>` in `tasks` (iteration order = caller's
+    /// insertion order; the wire format preserves it):
+    ///
+    /// 1. Compute the wire-canonical content hash.
+    /// 2. If `self.tasks` already contains an entry under that hash,
+    ///    NoOp this entry (idempotent re-injection of an already-
+    ///    spawned task is silent; the originator's pre-validation
+    ///    surfaces the duplicate as a per-index `SpawnError` so
+    ///    callers see it even when the wire apply is silent).
+    /// 3. Otherwise resolve each `task_depends_on` task_id to a hash
+    ///    via [`Self::task_hash_for_task_id`] and decide the initial
+    ///    state per the cascade rules:
+    ///      * Any dep in `Failed { kind: NonRecoverable, .. }` →
+    ///        insert as `Failed { kind: NonRecoverable, task,
+    ///        last_error: "upstream-failed", attempts: 1 }`
+    ///        (cascade-fail; matches the legacy worker-originated
+    ///        cascade shape).
+    ///      * Else any dep in `Unfulfillable { .. }` → insert as
+    ///        `Blocked { task, on: dep_hash }` so the auto-resume
+    ///        mechanism in `resume_blocked_on` re-activates this
+    ///        entry when the prereq's TaskCompleted fires.
+    ///      * Else any dep in `Pending { .. } / InFlight { .. } /
+    ///        Blocked { .. }` → insert as `Blocked { task, on:
+    ///        first-unresolved-dep-hash }`. The first non-terminal
+    ///        dep wins; later deps don't widen the `on` field
+    ///        because auto-resume fires whenever `on` matches the
+    ///        completing prereq's hash and a dependent that
+    ///        immediately re-blocks on a still-pending sibling is
+    ///        already covered by the next `TaskCompleted` apply.
+    ///      * Else (no deps OR all deps `Completed { .. }`) →
+    ///        insert as `Pending { task }`.
+    ///
+    /// Pre-apply validation in the originator's `apply_spawn_tasks`
+    /// rejects entries whose deps reference an unknown id (those
+    /// surface as `SpawnError::UnknownDependency` on the reply
+    /// oneshot, not as wire state); this apply rule trusts every
+    /// referenced id resolves and `panic!`s in debug-mode if it
+    /// doesn't (a contract violation by the originator).
+    ///
+    /// Returns `Applied` if AT LEAST ONE entry actually mutated the
+    /// ledger; `NoOp` if every entry was a duplicate (the whole batch
+    /// was already-applied — e.g. retransmission of a CRDT snapshot).
+    fn apply_tasks_spawned(&mut self, tasks: Vec<TaskInfo<I>>) -> ApplyOutcome {
+        let mut applied_any = false;
+        for task in tasks {
+            let hash = crate::primary::wire::compute_task_hash(&task);
+            if self.tasks.contains_key(&hash) {
+                // Idempotent: already present in the ledger.
+                continue;
+            }
+            // Resolve deps + classify in one pass. We scan deps in
+            // order; the first dep we hit that's in
+            // `Failed{NonRecoverable}` short-circuits to cascade-fail
+            // (the strongest blocker — no Blocked-then-cascade
+            // ordering anomaly is possible). The first
+            // `Unfulfillable` dep produces the Blocked-on-that-hash
+            // entry; any remaining non-terminal dep is recorded as a
+            // fallback `Blocked` target. Each replica reaches the
+            // same classification deterministically because the
+            // ledger they read is the same.
+            let mut cascade_fail = false;
+            let mut blocked_on_unfulfillable: Option<String> = None;
+            let mut blocked_on_pending: Option<String> = None;
+            for dep_id in &task.task_depends_on {
+                let dep_hash = match self.task_hash_for_task_id(dep_id) {
+                    Some(h) => h.to_string(),
+                    None => {
+                        // Originator-side pre-validation should have
+                        // caught this; log + treat as unblocked so
+                        // we don't lose the task. Defensive.
+                        tracing::warn!(
+                            target: "dynrunner_cluster_state",
+                            dep_id,
+                            "TasksSpawned: dep id not present in ledger; \
+                             treating as resolved (originator-side \
+                             pre-validation contract violated)"
+                        );
+                        continue;
+                    }
+                };
+                match self.tasks.get(&dep_hash) {
+                    Some(TaskState::Failed {
+                        kind: ErrorType::NonRecoverable,
+                        ..
+                    }) => {
+                        cascade_fail = true;
+                        break;
+                    }
+                    Some(TaskState::Failed { .. }) => {
+                        // Other ErrorType classes (Recoverable, OOM,
+                        // ResourceExhausted) are not cascade-fail
+                        // terminals — they're retry-eligible. A
+                        // dependent on a Recoverable failure is
+                        // effectively blocked until the retry passes
+                        // succeed or budget exhausts. Treat as
+                        // pending-blocked.
+                        if blocked_on_pending.is_none() {
+                            blocked_on_pending = Some(dep_hash);
+                        }
+                    }
+                    Some(TaskState::Unfulfillable { .. }) => {
+                        if blocked_on_unfulfillable.is_none() {
+                            blocked_on_unfulfillable = Some(dep_hash);
+                        }
+                    }
+                    Some(TaskState::Completed { .. }) => {
+                        // Resolved dep — contributes nothing to the
+                        // blocking decision.
+                    }
+                    Some(TaskState::Pending { .. })
+                    | Some(TaskState::InFlight { .. })
+                    | Some(TaskState::Blocked { .. }) => {
+                        if blocked_on_pending.is_none() {
+                            blocked_on_pending = Some(dep_hash);
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "dynrunner_cluster_state",
+                            dep_id,
+                            dep_hash = %dep_hash,
+                            "TasksSpawned: dep id resolved to hash but \
+                             hash not in ledger (concurrent removal?)"
+                        );
+                    }
+                }
+            }
+            let initial = if cascade_fail {
+                TaskState::Failed {
+                    task,
+                    kind: ErrorType::NonRecoverable,
+                    last_error: "upstream-failed".to_string(),
+                    attempts: 1,
+                }
+            } else if let Some(on) = blocked_on_unfulfillable {
+                TaskState::Blocked { task, on }
+            } else if let Some(on) = blocked_on_pending {
+                TaskState::Blocked { task, on }
+            } else {
+                TaskState::Pending { task }
+            };
+            tracing::debug!(
+                target: "dynrunner_cluster_state",
+                hash = %hash,
+                event = "task_spawned",
+                state = ?std::mem::discriminant(&initial),
+                "TasksSpawned: inserted entry"
+            );
+            self.tasks.insert(hash, initial);
+            applied_any = true;
+        }
+        if applied_any {
+            ApplyOutcome::Applied
+        } else {
+            ApplyOutcome::NoOp
         }
     }
 
