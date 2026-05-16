@@ -76,11 +76,17 @@ pub enum RoleAddressedAction<I> {
     ///   2. `send_to_peer(hint_to, hint)` — fire-and-forget cache-
     ///      warming so the originating sender stops misrouting on
     ///      the next send (Case B).
+    ///
+    /// `hint` is boxed so the Relay variant size stays close to
+    /// `Unwrap` (carries one `DistributedMessage`); leaving both
+    /// payloads inline doubled the variant to ~712 bytes and tripped
+    /// clippy::large_enum_variant. `forwarded` remains inline because
+    /// trimming one payload is already enough to close the size gap.
     Relay {
         forward_to: String,
         forwarded: DistributedMessage<I>,
         hint_to: String,
-        hint: DistributedMessage<I>,
+        hint: Box<DistributedMessage<I>>,
     },
     /// Drop and log. Covers Case C (no known holder for the role)
     /// and Case D (`attempts` exceeded the safety bound). The
@@ -173,7 +179,7 @@ pub fn decide_role_addressed<I: Identifier>(
         forward_to: holder,
         forwarded,
         hint_to: sender_id,
-        hint,
+        hint: Box::new(hint),
     }
 }
 
@@ -296,7 +302,7 @@ mod tests {
                     }
                     _ => panic!("forwarded must be RoleAddressed"),
                 }
-                match hint {
+                match *hint {
                     DistributedMessage::RoleMisaddressHint {
                         sender_id,
                         role,

@@ -99,7 +99,8 @@ impl<I: Identifier> PeerNetwork<I> {
                         }
                         if let Err(e) = self.router.send_to_peer(
                             &hint_to,
-                            hint,
+                            // Unbox once at the dispatch boundary.
+                            *hint,
                             &mut self.connections,
                             clocks,
                         ) {
@@ -221,7 +222,10 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                             if let Some(id) = redial_target {
                                 self.spawn_redial(&id);
                             }
-                            Some(msg)
+                            // Unbox once at the router/role-layer boundary
+                            // so the by-value role-layer signature stays
+                            // unchanged.
+                            Some(*msg)
                         }
                         InboundOutcome::Handled { redial_target } => {
                             if let Some(id) = redial_target {
@@ -286,7 +290,7 @@ impl<I: Identifier> PeerTransport<I> for PeerNetwork<I> {
                     if let Some(id) = redial_target {
                         self.spawn_redial(&id);
                     }
-                    msg
+                    *msg
                 }
                 InboundOutcome::Handled { redial_target } => {
                     if let Some(id) = redial_target {

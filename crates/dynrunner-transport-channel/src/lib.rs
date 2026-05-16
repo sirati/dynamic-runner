@@ -237,7 +237,9 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
                 .router
                 .process_inbound(msg, &mut self.outgoing, clocks)
             {
-                InboundOutcome::Deliver { msg, .. } => msg,
+                // `msg` is `Box<DistributedMessage<I>>`; unbox to feed
+                // the by-value role-layer entry point.
+                InboundOutcome::Deliver { msg, .. } => *msg,
                 InboundOutcome::Handled { .. } => continue,
             };
             match self.handle_role_layer(delivered, clocks) {
@@ -253,7 +255,7 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
             let delivered = match self.router.process_inbound_sync(msg, clocks) {
-                InboundOutcome::Deliver { msg, .. } => msg,
+                InboundOutcome::Deliver { msg, .. } => *msg,
                 InboundOutcome::Handled { .. } => continue,
             };
             match self.handle_role_layer(delivered, clocks) {
@@ -360,7 +362,10 @@ impl<I: Identifier> ChannelPeerTransport<I> {
                         }
                         if let Err(e) = self.router.send_to_peer(
                             &hint_to,
-                            hint,
+                            // Unbox once at the dispatch boundary so the
+                            // by-value send_to_peer signature stays
+                            // unchanged.
+                            *hint,
                             &mut self.outgoing,
                             clocks,
                         ) {

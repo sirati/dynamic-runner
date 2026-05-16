@@ -140,8 +140,13 @@ pub enum InboundOutcome<I> {
     /// background dial against that peer (receiver-side observation
     /// of an active relay relationship — same signal as
     /// [`SendOutcome::Relayed::redial_target`]).
+    ///
+    /// `msg` is boxed to keep the enum stack-size small: `Handled`
+    /// is 24 bytes and the unboxed `DistributedMessage` blew the
+    /// enum out to ~356 bytes (clippy::large_enum_variant). Boxing
+    /// the heavy variant shrinks the common-case copy.
     Deliver {
-        msg: DistributedMessage<I>,
+        msg: Box<DistributedMessage<I>>,
         redial_target: Option<String>,
     },
     /// Router consumed the message internally (forward / backoff /
@@ -416,7 +421,9 @@ impl<I: Identifier> Router<I> {
                     let redial_target =
                         self.observe_relay_recv(&sender_id, clocks.now);
                     return InboundOutcome::Deliver {
-                        msg: *inner,
+                        // `inner` is already `Box<DistributedMessage<I>>`;
+                        // forward the existing allocation.
+                        msg: inner,
                         redial_target,
                     };
                 }
@@ -464,7 +471,7 @@ impl<I: Identifier> Router<I> {
                 }
             }
             other => InboundOutcome::Deliver {
-                msg: other,
+                msg: Box::new(other),
                 redial_target: None,
             },
         }
@@ -498,7 +505,9 @@ impl<I: Identifier> Router<I> {
             } if target_id == self.self_id => {
                 let redial_target = self.observe_relay_recv(&sender_id, clocks.now);
                 InboundOutcome::Deliver {
-                    msg: *inner,
+                    // `inner` is already `Box<DistributedMessage<I>>`;
+                    // forward the existing allocation.
+                    msg: inner,
                     redial_target,
                 }
             }
@@ -516,7 +525,7 @@ impl<I: Identifier> Router<I> {
                 redial_target: None,
             },
             other => InboundOutcome::Deliver {
-                msg: other,
+                msg: Box::new(other),
                 redial_target: None,
             },
         }
@@ -1124,7 +1133,7 @@ mod tests {
         let outcome = router.process_inbound(inbound, &mut conns, clocks_at(now, 1.0));
         match outcome {
             InboundOutcome::Deliver { msg, redial_target } => {
-                assert!(matches!(msg, DistributedMessage::Keepalive { .. }));
+                assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
                 assert_eq!(redial_target.as_deref(), Some("d"));
             }
             other => panic!("expected Deliver with redial target d: {other:?}"),
@@ -1345,7 +1354,7 @@ mod tests {
         );
         match outcome {
             InboundOutcome::Deliver { msg, redial_target } => {
-                assert!(matches!(msg, DistributedMessage::Keepalive { .. }));
+                assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
                 assert!(redial_target.is_none());
             }
             other => panic!("expected Deliver: {other:?}"),
@@ -1375,7 +1384,7 @@ mod tests {
         let outcome = router.process_inbound_sync(inbound, clocks_at(now, 1.0));
         match outcome {
             InboundOutcome::Deliver { msg, redial_target } => {
-                assert!(matches!(msg, DistributedMessage::Keepalive { .. }));
+                assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
                 assert_eq!(redial_target.as_deref(), Some("d"));
             }
             other => panic!("expected Deliver: {other:?}"),
