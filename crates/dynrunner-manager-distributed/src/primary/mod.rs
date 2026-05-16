@@ -649,6 +649,26 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     pub(super) peer_lifecycle_listeners:
         Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
 
+    /// Handle to the peer-lifecycle dispatcher task spawned at
+    /// `run()` start. `Some` between the dispatcher's spawn and its
+    /// abort+await at run exit; `None` outside an active run (the
+    /// `cleanup_lifecycle_dispatcher` helper takes it and joins).
+    ///
+    /// Owning the handle is the load-bearing piece that distinguishes
+    /// "dispatcher exits on its own" (the `cluster_state` drop path,
+    /// which only happens when the whole coordinator drops) from
+    /// "dispatcher exits when `run()` returns" (this field's
+    /// abort+await). The dispatcher's input channel sender lives on
+    /// `cluster_state`, so a `run()` returning Err while the
+    /// coordinator object stays alive (the PyO3 wrapper keeps the
+    /// handle, the SLURM pipeline may inspect it) would leave the
+    /// dispatcher blocked on `rx.recv().await` forever — never seeing
+    /// a closed-channel `None`. The abort fires its
+    /// `JoinHandle::abort()`; the await catches the dispatcher's exit
+    /// (or the `JoinError::Cancelled` outcome) so cleanup is
+    /// synchronous with `run()` returning.
+    pub(super) lifecycle_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
+
     /// Matcher-trigger receiver, paired with the
     /// `matcher_trigger_tx` installed on `cluster_state` at
     /// construction. Taken out at `run()` start so the operational
@@ -824,6 +844,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             unfulfillable_reinject_remaining: HashMap::new(),
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
+            lifecycle_dispatcher_handle: None,
             matcher_trigger_rx: Some(matcher_trigger_rx),
             fulfillability_matcher: None,
             next_secondary_id,
@@ -885,6 +906,34 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         listener: Box<dyn crate::peer_lifecycle::LifecycleListener>,
     ) {
         self.peer_lifecycle_listeners.push(listener);
+    }
+
+    /// Tear down the peer-lifecycle dispatcher task spawned at
+    /// `run()` start. No-op when the dispatcher was never spawned
+    /// (e.g. the early-return path before the spawn site, or a
+    /// coordinator whose `run()` was never called).
+    ///
+    /// # Why explicit rather than Drop
+    ///
+    /// A `Drop` guard cannot abort + await — it has no async
+    /// context, and the host tokio runtime may already be torn down
+    /// by the time the coordinator is dropped (the PyO3 LocalSet is
+    /// scoped to the `py.detach` block). Calling `abort()` from
+    /// `Drop` without an awaiting reaper risks a runtime-gone panic
+    /// in the dispatcher's last-poll cleanup. Explicit
+    /// invocation from the `run()` outer wrapper keeps the abort and
+    /// the join inside the live LocalSet.
+    pub(super) async fn cleanup_lifecycle_dispatcher(&mut self) {
+        if let Some(handle) = self.lifecycle_dispatcher_handle.take() {
+            handle.abort();
+            // Ignore the `JoinError` — abort-cancelled is the
+            // expected shape (`JoinError::is_cancelled() == true`).
+            // The body of the task itself never returns a fallible
+            // value (it's `Future<Output = ()>`), so the only thing
+            // an Ok branch could carry is the unit value — nothing
+            // to consume.
+            let _ = handle.await;
+        }
     }
 
     /// Install the consumer-supplied fulfillability matcher. Must be
@@ -1180,6 +1229,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         &self.cluster_state
     }
 
+    /// Test-only inspector for whether the peer-lifecycle dispatcher
+    /// handle is still held by the coordinator. After a clean `run()`
+    /// exit (Ok OR Err), [`Self::cleanup_lifecycle_dispatcher`] must
+    /// have taken + aborted + joined the handle, leaving this `false`.
+    /// Used by `lifecycle_dispatcher_joinhandle_aborted_on_run_exit`
+    /// to pin the cleanup contract.
+    #[cfg(test)]
+    pub fn lifecycle_dispatcher_handle_present_for_test(&self) -> bool {
+        self.lifecycle_dispatcher_handle.is_some()
+    }
+
     /// Run the full coordination pipeline.
     ///
     /// `phase_deps` declares the per-phase `depends_on` graph. Items in
@@ -1189,7 +1249,37 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// pool's state machine transitions phases through
     /// `Blocked → Active → Drained → Done` — Phase 5B wires these
     /// closures to the Python `TaskDefinition` lifecycle hooks.
+    ///
+    /// # Cleanup discipline
+    ///
+    /// Thin wrapper around [`Self::run_pipeline`] whose secondary
+    /// concern is to drive `run()`'s cleanup contract — every exit
+    /// path (happy-path `Ok`, structured `RunError`, `?`-propagated
+    /// error) flows through `cleanup_lifecycle_dispatcher` before
+    /// returning, so the peer-lifecycle dispatcher task spawned in
+    /// `run_pipeline` is always aborted and joined before this method
+    /// returns. Without the wrapper, an error-return from inside the
+    /// pipeline would leave the dispatcher blocked on its input
+    /// channel forever (the channel's sender lives on `cluster_state`,
+    /// which the coordinator still owns post-`run`).
     pub async fn run(
+        &mut self,
+        binaries: Vec<TaskInfo<I>>,
+        phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
+        on_phase_start: OnPhaseStart,
+        on_phase_end: OnPhaseEnd,
+    ) -> Result<(), RunError> {
+        let result = self
+            .run_pipeline(binaries, phase_deps, on_phase_start, on_phase_end)
+            .await;
+        self.cleanup_lifecycle_dispatcher().await;
+        result
+    }
+
+    /// Original `run()` body, factored out so the public `run` wrapper
+    /// can drive cleanup-on-exit regardless of how this function
+    /// returns. See [`Self::run`] for the rationale.
+    async fn run_pipeline(
         &mut self,
         binaries: Vec<TaskInfo<I>>,
         phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
@@ -1219,11 +1309,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // has already been taken (defensive — `run()` is single-shot
         // by contract; this branch covers a future caller that
         // re-enters), the dispatcher is silently skipped.
+        //
+        // The returned `JoinHandle` is stored on `self` so
+        // `cleanup_lifecycle_dispatcher` (called from the `run()`
+        // outer wrapper on every exit path) can abort the task and
+        // await its termination, preventing a leaked dispatcher
+        // when `run()` returns Err with the coordinator still alive
+        // (the dispatcher's input channel sender lives on
+        // `cluster_state`, so it would otherwise never observe a
+        // closed-channel `None`).
         if let Some(rx) = self.lifecycle_rx.take() {
             let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
-            tokio::task::spawn_local(
+            let handle = tokio::task::spawn_local(
                 crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
             );
+            self.lifecycle_dispatcher_handle = Some(handle);
         }
 
         // Discover the phase set: union of (1) every phase referenced

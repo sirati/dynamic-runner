@@ -560,6 +560,18 @@ where
     /// rationale.
     pub(super) peer_lifecycle_listeners:
         Vec<Box<dyn crate::peer_lifecycle::LifecycleListener>>,
+
+    /// Handle to the peer-lifecycle dispatcher task spawned at
+    /// `run_until_setup_or_done`'s first entry. `Some` between spawn
+    /// and the `cleanup_lifecycle_dispatcher` abort+await at run
+    /// exit; `None` outside an active run. Mirrors the same field on
+    /// `PrimaryCoordinator` — see that doc for the leaked-dispatcher
+    /// failure mode this guards against. The re-entrant
+    /// `RunOutcome::SetupPending` yield path deliberately does NOT
+    /// clean up: the caller will re-enter and the dispatcher is
+    /// still useful (and the receiver has already been moved into
+    /// the task, so it can't be re-spawned).
+    pub(super) lifecycle_dispatcher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
@@ -646,6 +658,7 @@ where
             setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
+            lifecycle_dispatcher_handle: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -683,6 +696,21 @@ where
         listener: Box<dyn crate::peer_lifecycle::LifecycleListener>,
     ) {
         self.peer_lifecycle_listeners.push(listener);
+    }
+
+    /// Tear down the peer-lifecycle dispatcher task spawned at
+    /// `run_until_setup_or_done`'s first entry. No-op when the
+    /// dispatcher was never spawned (e.g. the coordinator's
+    /// `run_until_setup_or_done` was never called, or only the
+    /// SetupPending-yielding first entry ran and no second entry
+    /// reached the terminal cleanup). Mirrors the same helper on
+    /// `PrimaryCoordinator` — see that doc for the Drop-vs-explicit
+    /// design rationale.
+    pub(super) async fn cleanup_lifecycle_dispatcher(&mut self) {
+        if let Some(handle) = self.lifecycle_dispatcher_handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     /// Forward an observer-mode announcer attach onto the underlying
@@ -938,7 +966,40 @@ where
     /// and the next entry rebuilds a fresh `select!`. No state is
     /// dropped except those in-flight recv futures, which are
     /// cancel-safe by construction.
+    ///
+    /// # Cleanup discipline
+    ///
+    /// Thin wrapper around [`Self::run_until_setup_or_done_inner`]
+    /// whose secondary concern is to drive the peer-lifecycle
+    /// dispatcher's abort-on-exit contract. `Done` and any `Err`
+    /// path flow through `cleanup_lifecycle_dispatcher` before
+    /// returning, so the spawned dispatcher task is always aborted
+    /// and joined before the caller observes the result. The
+    /// `SetupPending` yield path deliberately bypasses cleanup —
+    /// the caller will re-enter, the dispatcher is still useful
+    /// across that boundary, and the receiver has been moved into
+    /// the task so a fresh spawn would be impossible anyway.
     pub async fn run_until_setup_or_done(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<RunOutcome, String> {
+        let result = self.run_until_setup_or_done_inner(factory).await;
+        // SetupPending is a re-entrant yield, not a terminal exit;
+        // the dispatcher must stay alive across the boundary so the
+        // next `run_until_setup_or_done` re-entry inherits it.
+        // Match on the borrow to keep the result move-back intact.
+        let cleanup = !matches!(&result, Ok(RunOutcome::SetupPending));
+        if cleanup {
+            self.cleanup_lifecycle_dispatcher().await;
+        }
+        result
+    }
+
+    /// Original `run_until_setup_or_done` body, factored out so the
+    /// public wrapper can drive cleanup-on-exit regardless of how
+    /// this function returns. See [`Self::run_until_setup_or_done`]
+    /// for the rationale.
+    async fn run_until_setup_or_done_inner(
         &mut self,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<RunOutcome, String> {
@@ -950,11 +1011,21 @@ where
         // the unbounded channel and drains here. `spawn_local`
         // matches the rest of the secondary's LocalSet-bound spawn
         // pattern.
+        //
+        // The returned `JoinHandle` is stored on `self` so
+        // `cleanup_lifecycle_dispatcher` (called from the outer
+        // wrapper on Done / Err exits — NOT on the re-entrant
+        // SetupPending yield) can abort the task and await its
+        // termination. Without this, an error-return from inside the
+        // run loop would leave the dispatcher blocked on its input
+        // channel forever (the sender on `cluster_state` is still
+        // alive as long as the coordinator object is).
         if let Some(rx) = self.lifecycle_rx.take() {
             let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
-            tokio::task::spawn_local(
+            let handle = tokio::task::spawn_local(
                 crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
             );
+            self.lifecycle_dispatcher_handle = Some(handle);
         }
         if !self.setup_phase_completed {
             tracing::info!(
