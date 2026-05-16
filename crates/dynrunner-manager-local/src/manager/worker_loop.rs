@@ -163,7 +163,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
         let max = self.max_resources();
-        let view = self.pool_ref().view_for_worker(worker_id);
+        let view = self.pool_ref().view_for_worker(worker_id, None);
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,
@@ -182,7 +182,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             }
             AssignmentDecision::NoFit => {
                 // Retry with retry_attempt=true
-                let view2 = self.pool_ref().view_for_worker(worker_id);
+                let view2 = self.pool_ref().view_for_worker(worker_id, None);
                 let decision2 = self.scheduler.assign_normal(
                     &worker_info,
                     &all_infos,
@@ -223,7 +223,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let worker_info = self.pool.workers[worker_id as usize].budget_info();
         let all_infos = self.pool.budget_infos();
         let max = self.max_resources();
-        let view = self.pool_ref().view_for_worker(worker_id);
+        let view = self.pool_ref().view_for_worker(worker_id, None);
         let decision = self.scheduler.assign_normal(
             &worker_info,
             &all_infos,

@@ -43,6 +43,16 @@ fn affinity_key<I>(item: &TaskInfo<I>) -> AffinityId {
 /// Composite bucket key.
 pub type BucketKey = (PhaseId, TypeId, AffinityId);
 
+/// Caller-supplied preference predicate for [`PendingPool::view_for_worker`].
+///
+/// The view's emission order is fixed at four priority classes (pin,
+/// typed, free-pool, co-pin) — this predicate orders items *within*
+/// each class only. Items mapped to `Ordering::Less` come first inside
+/// their class, then `Equal`, then `Greater`; equal-ordering items keep
+/// their construction-time FIFO order because the sort is stable. The
+/// predicate is never invoked to compare items from different classes.
+pub type PreferencePredicate<'a, I> = dyn Fn(&TaskInfo<I>) -> std::cmp::Ordering + 'a;
+
 /// Phase lifecycle. Transitions are monotonic in this order
 /// (with the one exception that `requeue` can flip
 /// `Draining → Active` when an item comes back into the queue).
@@ -138,6 +148,45 @@ impl<I: Identifier> WorkerView<I> {
         WorkerView {
             items: kept_items,
             locators: kept_locators,
+            worker_id,
+        }
+    }
+
+    /// Stably reorder the view's items by the key returned from `f`,
+    /// keeping every item paired with the locator that was produced
+    /// for it at view-construction time. Use to apply a caller-side
+    /// tie-break (preferred secondaries, recency, anything sortable)
+    /// without teaching the scheduler about that concern.
+    ///
+    /// Pairing invariant: `items[i]` and `locators[i]` are always
+    /// rearranged together, so a subsequent `take_from_view(view, i)`
+    /// removes precisely the item the caller sees at `as_slice()[i]`.
+    /// Stable sort (`slice::sort_by_key`) means equal-key items keep
+    /// their pre-sort relative order — the caller can layer this on
+    /// top of the construction-time priority order without scrambling
+    /// FIFO within a tie class.
+    pub fn sort_by_key<K, F>(self, mut f: F) -> Self
+    where
+        K: Ord,
+        F: FnMut(&TaskInfo<I>) -> K,
+    {
+        let WorkerView {
+            items,
+            locators,
+            worker_id,
+        } = self;
+        let mut paired: Vec<(TaskInfo<I>, (BucketKey, usize))> =
+            items.into_iter().zip(locators).collect();
+        paired.sort_by_key(|(t, _)| f(t));
+        let mut sorted_items = Vec::with_capacity(paired.len());
+        let mut sorted_locators = Vec::with_capacity(paired.len());
+        for (item, locator) in paired {
+            sorted_items.push(item);
+            sorted_locators.push(locator);
+        }
+        WorkerView {
+            items: sorted_items,
+            locators: sorted_locators,
             worker_id,
         }
     }
@@ -732,20 +781,39 @@ impl<I: Identifier> PendingPool<I> {
     /// view may become stale. The local manager's single-threaded loop
     /// satisfies this; multi-threaded callers must guard the pair with a
     /// lock.
-    pub fn view_for_worker(&self, worker_id: WorkerId) -> WorkerView<I> {
+    ///
+    /// When `preference_predicate` is `Some`, the items emitted for each
+    /// of the four priority classes (pin, typed, free-pool, co-pin) are
+    /// stably reordered by the predicate *within that class only* before
+    /// being appended to the output — the class ordering itself is
+    /// invariant, so a pin-class item is never displaced by a typed-class
+    /// item the predicate would otherwise prefer. `None` skips the sort
+    /// step entirely and produces the same byte-for-byte view a
+    /// no-predicate call would have built before this parameter was
+    /// introduced.
+    pub fn view_for_worker(
+        &self,
+        worker_id: WorkerId,
+        preference_predicate: Option<&PreferencePredicate<'_, I>>,
+    ) -> WorkerView<I> {
+        // Local alias for the paired `(item, locator)` scratch shape.
+        // Kept as a local type binding so it does not leak into the
+        // public surface of the module.
+        type Paired<I> = (TaskInfo<I>, (BucketKey, usize));
+
         let no_aff = no_affinity();
         let mut emitted: HashSet<BucketKey> = HashSet::new();
-        let mut items: Vec<TaskInfo<I>> = Vec::new();
-        let mut locators: Vec<(BucketKey, usize)> = Vec::new();
+        // Per-class chunks of paired (item, locator) entries. The four
+        // chunks correspond, in order, to: pin, typed, free-pool, co-pin.
+        let mut chunks: [Vec<Paired<I>>; 4] =
+            [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-        let emit_bucket = |key: &BucketKey,
-                           bucket: &Bucket<I>,
-                           emitted: &mut HashSet<BucketKey>,
-                           items: &mut Vec<TaskInfo<I>>,
-                           locators: &mut Vec<(BucketKey, usize)>| {
+        let collect_bucket = |key: &BucketKey,
+                              bucket: &Bucket<I>,
+                              emitted: &mut HashSet<BucketKey>,
+                              sink: &mut Vec<Paired<I>>| {
             for (idx, item) in bucket.items.iter().enumerate() {
-                items.push(item.clone());
-                locators.push((key.clone(), idx));
+                sink.push((item.clone(), (key.clone(), idx)));
             }
             emitted.insert(key.clone());
         };
@@ -760,16 +828,16 @@ impl<I: Identifier> PendingPool<I> {
             self.phase_state.get(phase) == Some(&PhaseState::Active)
         };
 
-        // Step 1: worker's pinned bucket if eligible.
+        // Class 0 (pin): worker's pinned bucket if eligible.
         if let Some(Some(key)) = self.worker_affinity.get(&worker_id)
             && phase_active_or_draining(&key.0)
             && let Some(bucket) = self.buckets.get(key)
             && !bucket.items.is_empty()
         {
-            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+            collect_bucket(key, bucket, &mut emitted, &mut chunks[0]);
         }
 
-        // Step 2: unpinned typed buckets in Active phases.
+        // Class 1 (typed): unpinned typed buckets in Active phases.
         for (key, bucket) in &self.buckets {
             if emitted.contains(key) || bucket.items.is_empty() {
                 continue;
@@ -783,10 +851,10 @@ impl<I: Identifier> PendingPool<I> {
             if !bucket.pinned_workers.is_empty() {
                 continue;
             }
-            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+            collect_bucket(key, bucket, &mut emitted, &mut chunks[1]);
         }
 
-        // Step 3: free-pool buckets in Active phases.
+        // Class 2 (free-pool): free-pool buckets in Active phases.
         for (key, bucket) in &self.buckets {
             if emitted.contains(key) || bucket.items.is_empty() {
                 continue;
@@ -797,10 +865,10 @@ impl<I: Identifier> PendingPool<I> {
             if !phase_active(&key.0) {
                 continue;
             }
-            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+            collect_bucket(key, bucket, &mut emitted, &mut chunks[2]);
         }
 
-        // Step 4: any remaining bucket with items in an Active phase.
+        // Class 3 (co-pin): any remaining bucket with items in an Active phase.
         for (key, bucket) in &self.buckets {
             if emitted.contains(key) || bucket.items.is_empty() {
                 continue;
@@ -808,7 +876,28 @@ impl<I: Identifier> PendingPool<I> {
             if !phase_active(&key.0) {
                 continue;
             }
-            emit_bucket(key, bucket, &mut emitted, &mut items, &mut locators);
+            collect_bucket(key, bucket, &mut emitted, &mut chunks[3]);
+        }
+
+        // Per-class stable sort with the caller's predicate, applied
+        // uniformly across every class. The class boundaries themselves
+        // are immutable — the predicate never lets a lower-class item
+        // overtake a higher-class one — because sorting happens inside
+        // each chunk before flattening.
+        if let Some(pred) = preference_predicate {
+            for chunk in &mut chunks {
+                chunk.sort_by_key(|(item, _)| pred(item));
+            }
+        }
+
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let mut items: Vec<TaskInfo<I>> = Vec::with_capacity(total);
+        let mut locators: Vec<(BucketKey, usize)> = Vec::with_capacity(total);
+        for chunk in chunks {
+            for (item, locator) in chunk {
+                items.push(item);
+                locators.push(locator);
+            }
         }
 
         WorkerView {
