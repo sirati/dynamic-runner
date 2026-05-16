@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, PhaseId, TypeId};
+use dynrunner_core::{TaskInfo, MessageReceiver, MessageSender, PhaseId, SoftPreferredSecondaries, TypeId};
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, SecondaryConfig, SecondaryCoordinator};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::{Command, Response};
@@ -48,6 +48,7 @@ fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }

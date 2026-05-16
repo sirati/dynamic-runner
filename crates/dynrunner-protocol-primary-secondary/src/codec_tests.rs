@@ -101,6 +101,7 @@ fn roundtrip_task_assignment() {
             payload_json: "{\"k\":1}".into(),
             task_id: None,
             task_depends_on: vec![],
+            preferred_secondaries: Default::default(),
         },
         local_path: "test".into(),
         file_hash: "abc123".into(),
@@ -283,6 +284,7 @@ fn roundtrip_all_message_types() {
                 payload_json: "null".into(),
                 task_id: None,
                 task_depends_on: vec![],
+                preferred_secondaries: Default::default(),
             },
             local_path: "l".into(),
             file_hash: "h".into(),
@@ -400,6 +402,7 @@ fn wire_format_flattened_identifier() {
             payload_json: "null".into(),
             task_id: None,
             task_depends_on: vec![],
+            preferred_secondaries: Default::default(),
         },
         local_path: "test".into(),
         file_hash: "h".into(),
@@ -441,6 +444,7 @@ fn roundtrip_distributed_binary_info_phase_tags() {
             payload_json: "{\"shard\":7,\"chunk\":\"abc\"}".into(),
             task_id: None,
             task_depends_on: vec![],
+            preferred_secondaries: Default::default(),
         },
         local_path: "x".into(),
         file_hash: "h".into(),
@@ -736,5 +740,76 @@ fn role_addressed_backcompat_default_attempts() {
             assert!(matches!(*payload, DistributedMessage::Keepalive { .. }));
         }
         other => panic!("expected RoleAddressed, got {:?}", other.msg_type()),
+    }
+}
+
+/// Wire-shape guarantee: an empty `preferred_secondaries` is omitted
+/// from the on-wire JSON (`skip_serializing_if = "…is_empty"`) so a
+/// pre-this-change peer that sees the field for the first time after
+/// rolling upgrade doesn't see an empty list. A non-empty hint, by
+/// contrast, MUST round-trip verbatim — that's the contract the
+/// sender-side dispatch later relies on.
+#[test]
+fn distributed_binary_info_omits_empty_field_on_wire() {
+    let empty = DistributedBinaryInfo {
+        path: "/tmp/x".into(),
+        size: 1,
+        identifier: test_id("empty"),
+        phase_id: "default".into(),
+        type_id: "default".into(),
+        affinity_id: None,
+        payload_json: "null".into(),
+        task_id: None,
+        task_depends_on: vec![],
+        preferred_secondaries: Default::default(),
+    };
+    let v = serde_json::to_value(&empty).unwrap();
+    assert!(
+        v.get("preferred_secondaries").is_none(),
+        "empty preferred_secondaries must be omitted (skip_serializing_if), got: {v}"
+    );
+
+    let populated = DistributedBinaryInfo {
+        path: "/tmp/y".into(),
+        size: 2,
+        identifier: test_id("populated"),
+        phase_id: "default".into(),
+        type_id: "default".into(),
+        affinity_id: None,
+        payload_json: "null".into(),
+        task_id: None,
+        task_depends_on: vec![],
+        preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::new(vec![
+            "sec-alpha".into(),
+            "sec-beta".into(),
+        ]),
+    };
+    let v = serde_json::to_value(&populated).unwrap();
+    assert_eq!(
+        v.get("preferred_secondaries").unwrap(),
+        &serde_json::json!(["sec-alpha", "sec-beta"])
+    );
+
+    // Full round-trip preserves the hint.
+    let bytes = serialize_message(&DistributedMessage::TaskAssignment {
+        sender_id: "p".into(),
+        timestamp: 0.0,
+        secondary_id: "s".into(),
+        worker_id: 0,
+        zip_file: None,
+        binary_info: populated.clone(),
+        local_path: "l".into(),
+        file_hash: "h".into(),
+    })
+    .unwrap();
+    let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { binary_info, .. } => {
+            assert_eq!(
+                binary_info.preferred_secondaries.as_slice(),
+                &["sec-alpha".to_string(), "sec-beta".to_string()],
+            );
+        }
+        _ => panic!("expected TaskAssignment"),
     }
 }

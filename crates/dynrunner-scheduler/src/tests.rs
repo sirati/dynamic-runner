@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use dynrunner_core::{PhaseId, TypeId, WorkerId};
+use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TypeId, WorkerId};
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -33,6 +33,7 @@ fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }

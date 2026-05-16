@@ -139,6 +139,7 @@ fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }
@@ -480,6 +481,7 @@ async fn stage_file_then_assign_task_succeeds() {
                                             payload_json: "null".into(),
                                             task_id: None,
                                             task_depends_on: vec![],
+                                            preferred_secondaries: Default::default(),
                                         },
                                         local_path: "/nowhere/staged_bin".into(),
                                         file_hash: real_hash_clone.clone(),
@@ -540,7 +542,7 @@ async fn stage_file_then_assign_task_succeeds() {
 /// call would find the queued item dispatchable.
 #[test]
 fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
-    use dynrunner_core::{PhaseId, TaskInfo, TypeId};
+    use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
     use dynrunner_scheduler_api::{PendingPool, PhaseState};
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
@@ -568,6 +570,7 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
     pool.extend(vec![item]).expect("valid extend");
@@ -1649,7 +1652,7 @@ mod setup_promote_discriminator {
 
     use super::super::test_helpers::{election_config, FixedEstimator, RecordingPeer, TestId};
     use super::*;
-    use dynrunner_core::{PhaseId, TaskInfo, TypeId};
+    use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
     use dynrunner_protocol_primary_secondary::ClusterMutation;
     use dynrunner_scheduler::ResourceStealingScheduler;
     use std::collections::HashMap;
@@ -1717,6 +1720,7 @@ mod setup_promote_discriminator {
             payload: serde_json::Value::Null,
             task_id: None,
             task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
         }
     }
@@ -2150,6 +2154,7 @@ mod late_joiner_observer {
                 payload: serde_json::Value::Null,
                 task_id: None,
                 task_depends_on: vec![],
+                preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
                 resolved_path: None,
             },
         };

@@ -8,6 +8,6 @@ pub use traits::{MessageReceiver, MessageSender};
 pub use path_resolve::{resolve_against_root, ResolvedPath};
 pub use types::{
     AffinityId, TaskInfo, ErrorType, FailedTask, Identifier, PhaseId,
-    ResourceAmount, ResourceKind, ResourceMap, RunnerIdentifier, TaskInput,
-    TaskResult, TypeId, WorkerId,
+    ResourceAmount, ResourceKind, ResourceMap, RunnerIdentifier,
+    SoftPreferredSecondaries, TaskInput, TaskResult, TypeId, WorkerId,
 };

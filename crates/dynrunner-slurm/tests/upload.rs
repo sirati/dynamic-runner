@@ -21,7 +21,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use dynrunner_core::{PhaseId, TaskInfo, TypeId};
+use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
 use dynrunner_gateway::traits::{CommandResult, Gateway, GatewayError};
 use dynrunner_slurm::{SlurmConfig, SlurmJobManager};
 
@@ -111,6 +111,7 @@ fn make_binary(path: impl Into<PathBuf>) -> TaskInfo<String> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }

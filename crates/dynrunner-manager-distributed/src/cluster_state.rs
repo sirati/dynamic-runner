@@ -1407,7 +1407,7 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dynrunner_core::{PhaseId, RunnerIdentifier, TypeId};
+    use dynrunner_core::{PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TypeId};
     use std::path::PathBuf;
 
     fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
@@ -1421,6 +1421,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: Some(name.into()),
             task_depends_on: Vec::new(),
+            preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
         }
     }

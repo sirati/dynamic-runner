@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process;
 
-use dynrunner_core::{TaskInfo, PhaseId, TypeId, WorkerId};
+use dynrunner_core::{TaskInfo, PhaseId, SoftPreferredSecondaries, TypeId, WorkerId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_socket::socketpair::{create_socketpair, SocketpairManagerEnd};
@@ -101,6 +101,7 @@ pub fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }

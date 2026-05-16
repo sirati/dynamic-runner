@@ -7,7 +7,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString};
 use pyo3::{Borrowed, FromPyObject};
 
-use dynrunner_core::{AffinityId, Identifier, TaskInfo, PhaseId, RunnerIdentifier, TypeId};
+use dynrunner_core::{
+    AffinityId, Identifier, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId,
+};
 
 /// FFI-boundary wrapper that accepts either a Python `str` or any
 /// `os.PathLike` (e.g. `pathlib.Path`) and stores the resolved path
@@ -187,6 +189,14 @@ pub(crate) struct PyTaskInfo {
     task_id: Option<String>,
     #[pyo3(get)]
     task_depends_on: Vec<String>,
+    /// Python-facing view of [`TaskInfo::preferred_secondaries`].
+    /// Exposed as a `list[str]` because PyO3 doesn't surface
+    /// `#[serde(transparent)]` newtype wrappers cleanly to Python;
+    /// the Rust-side `SoftPreferredSecondaries` newtype is reconstructed
+    /// at the `From<&PyTaskInfo> for TaskInfo<RunnerIdentifier>` boundary.
+    /// Empty list == no preference (free pool).
+    #[pyo3(get)]
+    preferred_secondaries: Vec<String>,
 }
 
 #[pymethods]
@@ -202,6 +212,7 @@ impl PyTaskInfo {
         payload_json = "null".to_string(),
         task_id = None,
         task_depends_on = Vec::new(),
+        preferred_secondaries = Vec::new(),
     ))]
     fn new(
         path: String,
@@ -213,6 +224,7 @@ impl PyTaskInfo {
         payload_json: String,
         task_id: Option<String>,
         task_depends_on: Vec<String>,
+        preferred_secondaries: Vec<String>,
     ) -> Self {
         Self {
             path,
@@ -224,6 +236,7 @@ impl PyTaskInfo {
             payload_json,
             task_id,
             task_depends_on,
+            preferred_secondaries,
         }
     }
 }
@@ -253,6 +266,7 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             payload,
             task_id: py.task_id.clone(),
             task_depends_on: py.task_depends_on.clone(),
+            preferred_secondaries: SoftPreferredSecondaries::new(py.preferred_secondaries.clone()),
             resolved_path: None,
         }
     }
@@ -278,6 +292,7 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             payload_json: serde_json::to_string(&bi.payload).unwrap_or_else(|_| "null".into()),
             task_id: bi.task_id.clone(),
             task_depends_on: bi.task_depends_on.clone(),
+            preferred_secondaries: bi.preferred_secondaries.as_slice().to_vec(),
         }
     }
 }
@@ -391,6 +406,7 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         payload_json: serde_json::to_string(&task.payload).unwrap_or_else(|_| "null".into()),
         task_id: task.task_id.clone(),
         task_depends_on: task.task_depends_on.clone(),
+        preferred_secondaries: task.preferred_secondaries.as_slice().to_vec(),
     }
 }
 
@@ -491,6 +507,15 @@ pub(crate) fn extract_binaries(
                 .ok()
                 .and_then(|v| v.extract::<Vec<String>>().ok())
                 .unwrap_or_default();
+            // Optional soft-preferred-secondaries hint. Missing /
+            // None / wrong-type all collapse to the empty default;
+            // the newtype keeps the soft-vs-strict semantic
+            // boundary explicit on the Rust side.
+            let preferred_secondaries: Vec<String> = item
+                .getattr("preferred_secondaries")
+                .ok()
+                .and_then(|v| v.extract::<Vec<String>>().ok())
+                .unwrap_or_default();
 
             Ok(TaskInfo {
                 path: PathBuf::from(path),
@@ -502,9 +527,74 @@ pub(crate) fn extract_binaries(
                 payload,
                 task_id,
                 task_depends_on,
+                preferred_secondaries: SoftPreferredSecondaries::new(preferred_secondaries),
                 resolved_path: None,
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure-Rust tests over the PyO3 conversion paths. The Python
+    //! interpreter is not required because the relevant conversions
+    //! cross the `&PyTaskInfo` → `TaskInfo<RunnerIdentifier>` boundary
+    //! without touching `pyo3::Python`. Tests that need the
+    //! interpreter belong in the integration-test layer.
+    use super::*;
+
+    fn sample_pytask(preferred: Vec<String>) -> PyTaskInfo {
+        PyTaskInfo {
+            path: "/tmp/x".into(),
+            size: 16,
+            identifier: PyBinaryIdentifier {
+                binary_name: "bin".into(),
+                platform: "x86_64".into(),
+                compiler: "gcc".into(),
+                version: "12".into(),
+                opt_level: "O2".into(),
+            },
+            phase_id: "default".into(),
+            type_id: "default".into(),
+            affinity_id: None,
+            payload_json: "null".into(),
+            task_id: None,
+            task_depends_on: Vec::new(),
+            preferred_secondaries: preferred,
+        }
+    }
+
+    #[test]
+    fn pytaskinfo_to_taskinfo_carries_preferred_secondaries() {
+        // Non-empty hint must survive the FFI-boundary conversion
+        // verbatim — the Python `list[str]` shape on `PyTaskInfo`
+        // becomes a Rust-side `SoftPreferredSecondaries` newtype
+        // wrapping the same list. Verifies the newtype boundary is
+        // crossed exactly once at the conversion point, not at every
+        // consumer.
+        let py = sample_pytask(vec!["sec-a".into(), "sec-b".into()]);
+        let rust: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py);
+        assert_eq!(
+            rust.preferred_secondaries.as_slice(),
+            &["sec-a".to_string(), "sec-b".to_string()],
+        );
+
+        // Reverse direction: the Rust-side newtype is rendered back
+        // as a `Vec<String>` for Python. Round-trip preserves the
+        // exact ordering.
+        let py_back: PyTaskInfo = PyTaskInfo::from(&rust);
+        assert_eq!(
+            py_back.preferred_secondaries,
+            vec!["sec-a".to_string(), "sec-b".to_string()],
+        );
+
+        // Empty hint: round-trip remains empty (no spurious values
+        // injected by `SoftPreferredSecondaries::default()`).
+        let py_empty = sample_pytask(Vec::new());
+        let rust_empty: TaskInfo<RunnerIdentifier> = TaskInfo::from(&py_empty);
+        assert!(rust_empty.preferred_secondaries.is_empty());
+        let py_empty_back: PyTaskInfo = PyTaskInfo::from(&rust_empty);
+        assert!(py_empty_back.preferred_secondaries.is_empty());
+    }
 }
 
