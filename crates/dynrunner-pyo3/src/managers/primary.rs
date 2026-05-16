@@ -74,30 +74,14 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `uses_file_based_items=False`, and remote-only primaries
     /// that never read the source from this filesystem.
     source_dir: Option<std::path::PathBuf>,
-    /// Shared cell carrying the per-task reinject cap. Seeded by
-    /// the `unfulfillable_reinject_max_per_task` `__init__` kwarg;
-    /// mutated by `PrimaryHandle::set_unfulfillable_reinject_max_per_task`
-    /// until `run()` flips the cell's `run_started` flag. Read at
-    /// `run()` start when building the inner `PrimaryConfig` so the
-    /// setter and the run-start reader stay in sync without
-    /// duplicating the field.
-    reinject_cap: crate::managers::primary_handle::ReinjectCapCell,
-    /// Command-channel pair created at `__init__` time so the
-    /// `PrimaryHandle` Python sees is the same channel the
-    /// (later-constructed) `PrimaryCoordinator` reads from. The
-    /// sender side is cloned into the `PrimaryHandle` exposed via
-    /// the `handle` getter; the receiver is taken at `run()` start
-    /// and passed into `PrimaryCoordinator::replace_command_channel`.
-    ///
-    /// `Option` only because `run()` moves the receiver into the
-    /// detached tokio runtime — after that the field is `None` and
-    /// repeat-calling `run()` raises (single-shot lifecycle).
-    command_tx: tokio::sync::mpsc::Sender<
-        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
-    >,
-    command_rx: Option<tokio::sync::mpsc::Receiver<
-        dynrunner_manager_distributed::primary::PrimaryCommand<RunnerIdentifier>,
-    >>,
+    /// Rust-side bundle of the command channel + reinject-cap cell
+    /// shared with every `PyPrimaryHandle` minted from this
+    /// coordinator. Single concern split out into
+    /// `crate::managers::control_plane` so the init/handle/run-take
+    /// sequence is owned in one place rather than re-implemented on
+    /// each primary-hosting manager. See that module's doc for the
+    /// lifecycle contract.
+    control_plane: crate::managers::control_plane::PrimaryControlPlane,
     /// Whether dispatched task items back to real files. Read at
     /// construction from `TaskDefinition.uses_file_based_items`
     /// (defaults to True). Propagated to secondaries via
@@ -218,25 +202,14 @@ impl PyPrimaryCoordinator {
             .ok()
             .and_then(|v| v.extract().ok())
             .unwrap_or(true);
-        // Channel pair built at __init__ so Python can fetch a
-        // `handle` BEFORE `run()` enters the detached tokio runtime.
-        // The receiver gets handed to `PrimaryCoordinator` via
-        // `replace_command_channel` once it's constructed inside
-        // the runtime; the sender lives here and is cloned into
-        // each `PrimaryHandle`.
-        let (command_tx, command_rx) = tokio::sync::mpsc::channel(
-            dynrunner_manager_distributed::primary::COMMAND_CHANNEL_CAPACITY,
+        // Build the command-channel + reinject-cap bundle. The helper
+        // owns the channel pair, seeds the cap cell from the kwarg,
+        // and (later) hands back the handle factory + run-start
+        // wiring through a single API. See
+        // `crate::managers::control_plane` for the lifecycle.
+        let control_plane = crate::managers::control_plane::PrimaryControlPlane::new(
+            unfulfillable_reinject_max_per_task,
         );
-
-        // Seed the shared cell from the constructor kwarg. The
-        // setter on `PrimaryHandle` can override this any number of
-        // times until `run()` enters and flips `run_started`.
-        let reinject_cap = crate::managers::primary_handle::ReinjectCapCell::default();
-        reinject_cap
-            .inner
-            .lock()
-            .expect("ReinjectCapCell poisoned")
-            .max_per_task = unfulfillable_reinject_max_per_task;
         Ok(Self {
             num_secondaries,
             estimator: topology.estimator,
@@ -253,9 +226,7 @@ impl PyPrimaryCoordinator {
             uses_file_based_items,
             max_concurrent_per_type: topology.max_concurrent_per_type,
             task_definition: task_definition.clone().unbind(),
-            reinject_cap,
-            command_tx,
-            command_rx: Some(command_rx),
+            control_plane,
             peer_lifecycle_listener,
             fulfillability_matcher,
             slurm_job_manager: None,
@@ -274,10 +245,7 @@ impl PyPrimaryCoordinator {
     /// handle off to its async executor / thread BEFORE the
     /// blocking `run()` starts.
     fn handle(&self) -> PyResult<crate::managers::primary_handle::PyPrimaryHandle> {
-        crate::managers::primary_handle::PyPrimaryHandle::from_sender(
-            self.command_tx.clone(),
-            self.reinject_cap.clone(),
-        )
+        self.control_plane.to_handle()
     }
 
     /// Whether items are file-backed (read at construction from
@@ -409,21 +377,15 @@ impl PyPrimaryCoordinator {
         // single source-of-truth they cannot accidentally re-derive.
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
-        // Read the cap value the handle (or constructor kwarg) most
-        // recently set, then flip `run_started` so subsequent handle-
-        // side setter calls raise.
-        let unfulfillable_reinject_max_per_task = self.reinject_cap.snapshot();
-        self.reinject_cap.mark_run_started();
-        // Take the receiver out for the detached runtime. The sender
-        // stays on `self` so future `handle()` calls keep cloning the
-        // same channel.
-        let command_tx = self.command_tx.clone();
-        let command_rx = self.command_rx.take().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "RustPrimaryCoordinator.run(): already entered — \
-                 a coordinator is single-shot",
-            )
-        })?;
+        // Snapshot the cap, flip `run_started`, and consume the
+        // receiver for the detached runtime in one step. The helper
+        // owns the single-shot guard and the snapshot ordering; the
+        // sender clone returned in `wiring` keeps backing future
+        // `handle()` calls.
+        let wiring = self.control_plane.take_for_run()?;
+        let unfulfillable_reinject_max_per_task = wiring.cap_snapshot;
+        let command_tx = wiring.command_tx;
+        let command_rx = wiring.command_rx;
         // Load-bearing flip for the setup-deferred run path. When
         // `--source-already-staged` is set on the submitter (so
         // `source_pre_staged_root.is_some()`) AND the Python pipeline

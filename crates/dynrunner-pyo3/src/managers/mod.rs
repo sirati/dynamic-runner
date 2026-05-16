@@ -1,3 +1,4 @@
+pub(crate) mod control_plane;
 pub(crate) mod distributed;
 pub(crate) mod factory_callback;
 pub(crate) mod lifecycle;
