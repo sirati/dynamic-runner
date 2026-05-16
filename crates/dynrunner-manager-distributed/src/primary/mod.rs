@@ -17,7 +17,10 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 pub use command_channel::{PrimaryCommand, COMMAND_CHANNEL_CAPACITY};
 
-use respawn::{RespawnEvent, RespawnOutcome};
+use respawn::{
+    respawn_dispatcher_listener, RespawnBudget, RespawnEvent, RespawnOutcome, RespawnRequest,
+    SecondarySpawner, RESPAWN_REQUEST_CHANNEL_CAPACITY,
+};
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
@@ -701,6 +704,47 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// overflow). For operator forensics and per-secondary cap
     /// consultation. Not cloned, snapshotted, or restored.
     pub(super) respawn_events: VecDeque<RespawnEvent>,
+
+    /// Per-provider respawn implementation, supplied by the
+    /// deployment layer (multi-process / SLURM). `None` disables the
+    /// respawn pipeline at construction; the operational `select!`
+    /// arm short-circuits (no dispatcher listener registered, no
+    /// `respawn_request_rx` to poll). The trait object is `Send +
+    /// Sync` so the operational arm can clone the `Arc` across
+    /// `spawn_local` boundaries.
+    pub(super) respawn_spawner: Option<Arc<dyn SecondarySpawner>>,
+
+    /// Active respawn budget. `None` mirrors `respawn_spawner = None`
+    /// — the policy is disabled at construction and the operational
+    /// arm never consults it.
+    pub(super) respawn_budget: Option<RespawnBudget>,
+
+    /// Sender side of the dispatcher → operational-loop respawn
+    /// request channel. Cloned into the registered listener at
+    /// `run()` start so synchronous `on_event` calls have a place
+    /// to enqueue. Held as `Option` so the channel is only
+    /// constructed when the respawn policy is enabled (avoids an
+    /// idle bounded channel sitting on every coordinator).
+    pub(super) respawn_request_tx:
+        Option<tokio::sync::mpsc::Sender<RespawnRequest>>,
+
+    /// Receiver side of the dispatcher → operational-loop respawn
+    /// request channel. Taken out for the duration of the
+    /// operational loop, the same shape as `command_rx` /
+    /// `matcher_trigger_rx`. `None` outside an active loop (or
+    /// when the respawn policy is disabled).
+    pub(super) respawn_request_rx:
+        Option<tokio::sync::mpsc::Receiver<RespawnRequest>>,
+
+    /// Construction-time primary endpoint and pubkey snapshot used
+    /// to build [`SecondarySpawnSpec`]. The per-provider spawner
+    /// adapters cache their own copies (see
+    /// `PyMultiProcessSpawner` constructor) and ignore the spec's
+    /// equivalent fields; carrying them on the spec keeps the trait
+    /// contract honest for future providers that don't have
+    /// adapter-side cache.
+    pub(super) respawn_primary_endpoint: String,
+    pub(super) respawn_primary_pubkey_pem: String,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -776,6 +820,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             slurm_job_manager: None,
             respawn_tasks: JoinSet::new(),
             respawn_events: VecDeque::new(),
+            respawn_spawner: None,
+            respawn_budget: None,
+            respawn_request_tx: None,
+            respawn_request_rx: None,
+            respawn_primary_endpoint: String::new(),
+            respawn_primary_pubkey_pem: String::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -879,6 +929,47 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// back to its concrete type at the call site.
     pub fn slurm_job_manager(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
         self.slurm_job_manager.as_ref()
+    }
+
+    /// Enable the secondary respawn pipeline. `spawner` is the
+    /// per-provider [`SecondarySpawner`] (multi-process or SLURM);
+    /// `budget` is the per-coordinator caps; `primary_endpoint` and
+    /// `primary_pubkey_pem` populate the [`SecondarySpawnSpec`]
+    /// fields handed to the spawner per respawn (today's adapters
+    /// cache their own copies and ignore the spec values; the
+    /// snapshot is held for forward-compat).
+    ///
+    /// Single concern: install the policy + provider on the
+    /// coordinator. Must be called BEFORE `run()` enters (same
+    /// pre-run contract as the other registration setters); the
+    /// operational loop captures the wiring at run start and never
+    /// looks for it elsewhere.
+    ///
+    /// Absence of this setter leaves the respawn pipeline disabled:
+    /// no peer-lifecycle listener is registered and the operational
+    /// `select!` arm is structurally unreachable. This matches the
+    /// CCD-5 contract — no hot-site `if policy_enabled` checks.
+    pub fn enable_respawn(
+        &mut self,
+        spawner: Arc<dyn SecondarySpawner>,
+        budget: RespawnBudget,
+        primary_endpoint: String,
+        primary_pubkey_pem: String,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(RESPAWN_REQUEST_CHANNEL_CAPACITY);
+        self.respawn_spawner = Some(spawner);
+        self.respawn_budget = Some(budget);
+        self.respawn_request_tx = Some(tx.clone());
+        self.respawn_request_rx = Some(rx);
+        self.respawn_primary_endpoint = primary_endpoint;
+        self.respawn_primary_pubkey_pem = primary_pubkey_pem;
+        // Register the dispatcher listener up-front; the
+        // peer-lifecycle dispatcher consumes the listener vector at
+        // `run()` start, so the registration MUST land before the
+        // run is entered. Same contract as
+        // `register_lifecycle_listener` (which this call delegates
+        // to under the hood).
+        self.register_lifecycle_listener(respawn_dispatcher_listener(tx));
     }
 
     /// Clone of the cross-thread `PrimaryCommand` sender. Callers

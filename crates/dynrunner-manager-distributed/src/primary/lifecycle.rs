@@ -215,6 +215,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // gates above.
         let mut matcher_arm_closed = false;
 
+        // Respawn-request receiver. Same shape + lifetime as
+        // `command_rx`: taken out for the duration of the loop so the
+        // arm's `recv().await` can borrow it without conflicting with
+        // the per-arm `&mut self` borrows. `None` when the respawn
+        // policy is disabled at construction (no spawner, no budget,
+        // no channel) — the arm parks on `pending().await` in that
+        // case, matching the command-channel disabled-arm shape.
+        let mut respawn_request_rx = self.respawn_request_rx.take();
+
         loop {
             // Check termination: all tasks accounted for AND no
             // worker is mid-dispatch. Both halves of the check are
@@ -623,6 +632,58 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         self.process_heartbeat_tick().await?;
                     }
                 }
+                req = async {
+                    match respawn_request_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        // Respawn policy disabled (or rx already
+                        // consumed by a prior loop entry): park
+                        // forever so this arm never fires. Mirrors
+                        // the `command_rx` / `matcher_trigger_rx`
+                        // closed-channel hot-loop guard.
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match req {
+                        Some(request) => {
+                            // Single-line delegation: the dispatch
+                            // logic (budget check + id mint +
+                            // spawner invocation + JoinSet push)
+                            // lives in `primary::respawn` /
+                            // `dispatch_respawn_request`. This arm
+                            // only translates "a request arrived"
+                            // into the call.
+                            self.dispatch_respawn_request(request);
+                        }
+                        None => {
+                            // Every sender dropped. Drop the
+                            // receiver locally; the loop's other
+                            // arms keep driving exit conditions.
+                            // Same shape as the command-channel
+                            // None arm.
+                            respawn_request_rx = None;
+                            tracing::debug!(
+                                "respawn request channel closed; disabling \
+                                 the respawn-request arm for the remainder \
+                                 of the loop"
+                            );
+                        }
+                    }
+                }
+                outcome = async {
+                    // `JoinSet::join_next` returns `None` when the
+                    // set is empty. To avoid hot-looping the select!
+                    // when no respawn is in flight, park on
+                    // `pending().await` while the JoinSet is empty.
+                    // The arm wakes again on the next iteration as
+                    // soon as a respawn task is pushed.
+                    if self.respawn_tasks.is_empty() {
+                        std::future::pending().await
+                    } else {
+                        self.respawn_tasks.join_next().await
+                    }
+                } => {
+                    self.handle_respawn_join(outcome);
+                }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
                     if active > 0 {
@@ -669,6 +730,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // the same channel so holdings-update bursts during retry
         // passes still drive the matcher.
         self.matcher_trigger_rx = matcher_trigger_rx;
+        // Same rationale for the respawn-request receiver: retry
+        // passes re-enter the operational loop and a death observed
+        // during a retry pass should still drive the dispatcher.
+        self.respawn_request_rx = respawn_request_rx;
+
+        // Drain any in-flight respawn tasks so the operational loop
+        // never exits with a tokio task quietly outliving the
+        // coordinator. The drain only fires when at least one task
+        // is in flight; an empty JoinSet is a fast no-op.
+        self.drain_respawn_tasks().await;
 
         Ok(())
     }
