@@ -449,7 +449,9 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use dynrunner_core::{BoundedString, TaskInfo, PhaseId, ResourceMap, TypeId};
+    use dynrunner_core::{
+        BoundedString, PhaseId, ResourceMap, SoftPreferredSecondaries, TaskInfo, TypeId,
+    };
     use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, RemovalCause};
     use dynrunner_scheduler::ResourceStealingScheduler;
     use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
@@ -585,6 +587,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: None,
             task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
         };
         primary.workers.push(RemoteWorkerState {
@@ -685,6 +688,7 @@ mod tests {
                 payload: serde_json::Value::Null,
                 task_id: None,
                 task_depends_on: vec![],
+                preferred_secondaries: SoftPreferredSecondaries::default(),
                 resolved_path: None,
             }),
             estimated_resources: ResourceMap::new(),

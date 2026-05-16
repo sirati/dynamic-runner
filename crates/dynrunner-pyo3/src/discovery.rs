@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{PhaseId, RunnerIdentifier, TaskInfo, TypeId};
+use dynrunner_core::{PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId};
 use dynrunner_discovery::{FileInfo, FolderInfo, VisitOutcome, Visitor, WalkError, walk};
 
 use crate::pytypes::{PyTaskInfo, identifier_from_pyobj};
@@ -179,6 +179,7 @@ fn pytaskinfo_from_mark(
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
     Ok(PyTaskInfo::from(&task))

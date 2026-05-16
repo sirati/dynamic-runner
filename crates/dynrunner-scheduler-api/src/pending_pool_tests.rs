@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use super::{PendingPool, PendingPoolError, PhaseState};
-use dynrunner_core::{AffinityId, PhaseId, TaskInfo, TypeId};
+use dynrunner_core::{AffinityId, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
 
 /// Test fixture: build a `TaskInfo<()>` with the provided phase / type / affinity.
 /// An empty affinity string is mapped to `None` so the bucket falls into the
@@ -25,6 +25,7 @@ fn t(phase: &str, ty: &str, affinity: &str, size: u64) -> TaskInfo<()> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }

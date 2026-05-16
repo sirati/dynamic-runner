@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use dynrunner_core::{
     TaskInfo, ErrorType, MessageReceiver, MessageSender, PhaseId, ResourceKind, ResourceMap,
-    TypeId, WorkerId,
+    SoftPreferredSecondaries, TypeId, WorkerId,
 };
 use dynrunner_protocol_manager_worker::{Command, Response};
 use dynrunner_scheduler_api::ResourceEstimator;
@@ -37,6 +37,7 @@ pub(super) fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     }
 }

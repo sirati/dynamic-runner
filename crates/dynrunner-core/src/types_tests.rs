@@ -134,6 +134,7 @@ fn task_info_generic() {
         payload: serde_json::Value::Null,
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
     assert_eq!(bi.size, 1024);
@@ -152,6 +153,7 @@ fn task_info_serde_roundtrip_with_phase_fields() {
         payload: serde_json::json!({"k": "v", "n": 42}),
         task_id: None,
         task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
     let json = serde_json::to_string(&bi).unwrap();
@@ -245,4 +247,83 @@ fn affinity_id_constructors_clone_display_serde() {
     assert_eq!(json, "\"x\"");
     let parsed: AffinityId = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed, AffinityId::from("x"));
+}
+
+#[test]
+fn soft_preferred_secondaries_round_trips_through_serde() {
+    // Transparent newtype: the wire form must be indistinguishable from
+    // a bare `Vec<String>`, otherwise pre-this-change peers that emit the
+    // bare-vec shape (or omit the field entirely, see the
+    // `task_info_preferred_secondaries_default_empty` test) would fail
+    // to decode. Pinning the wire shape as the bare list here means a
+    // future "strict" sibling newtype can ship without disturbing this
+    // wire contract — the boundary is the type, not the JSON shape.
+    let hint = SoftPreferredSecondaries::new(vec!["sec-a".into(), "sec-b".into()]);
+    let json = serde_json::to_string(&hint).unwrap();
+    assert_eq!(json, "[\"sec-a\",\"sec-b\"]");
+    let parsed: SoftPreferredSecondaries = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, hint);
+    assert_eq!(parsed.as_slice(), &["sec-a".to_string(), "sec-b".to_string()]);
+    assert!(!parsed.is_empty());
+
+    let empty = SoftPreferredSecondaries::default();
+    assert!(empty.is_empty());
+    let empty_json = serde_json::to_string(&empty).unwrap();
+    assert_eq!(empty_json, "[]");
+    let parsed_empty: SoftPreferredSecondaries = serde_json::from_str(&empty_json).unwrap();
+    assert_eq!(parsed_empty, empty);
+}
+
+#[test]
+fn task_info_preferred_secondaries_default_empty() {
+    // Regression: pre-this-change peers don't emit
+    // `preferred_secondaries` on the wire at all. `#[serde(default)]`
+    // on the field has to fill in the empty value during deserialise,
+    // otherwise rolling upgrades break in the receive direction. The
+    // matching `skip_serializing_if = "…is_empty"` on the host field
+    // keeps the wire silent for the common empty case on the send
+    // direction, so the wire is symmetrically backward-compatible.
+    let json = serde_json::json!({
+        "path": "/tmp/legacy",
+        "size": 64,
+        "identifier": {"old": "shape"},
+        "phase_id": "default",
+        "type_id": "default",
+        "affinity_id": null,
+        "payload": null,
+        "task_id": null,
+        "task_depends_on": [],
+        // NOTE: no `preferred_secondaries` key — simulates a
+        // pre-this-change peer.
+    });
+
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+    struct ShapeId {
+        old: String,
+    }
+
+    let parsed: TaskInfo<ShapeId> = serde_json::from_value(json).unwrap();
+    assert!(parsed.preferred_secondaries.is_empty());
+
+    // And: an empty hint serialises without emitting the key, so the
+    // wire round-trip pre→post→pre carries no extra field.
+    let bi = TaskInfo {
+        path: PathBuf::from("/tmp/x"),
+        size: 8,
+        identifier: ShapeId { old: "shape".into() },
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: None,
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    let re_json = serde_json::to_value(&bi).unwrap();
+    assert!(
+        re_json.get("preferred_secondaries").is_none(),
+        "empty preferred_secondaries must be omitted from the wire \
+         (skip_serializing_if), got: {re_json}"
+    );
 }

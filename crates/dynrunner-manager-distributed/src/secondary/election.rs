@@ -650,7 +650,7 @@ mod tests {
     /// re-grounded onto the CRDT-replicated ledger).
     #[tokio::test(flavor = "current_thread")]
     async fn promotion_hydrates_primary_tasks_from_cluster_state() {
-        use dynrunner_core::{PhaseId, TaskInfo, TypeId};
+        use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
         use dynrunner_protocol_primary_secondary::ClusterMutation;
         use std::collections::HashSet;
         use std::path::PathBuf;
@@ -673,6 +673,7 @@ mod tests {
             payload: serde_json::Value::Null,
             task_id: None,
             task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
         };
         sec.cluster_state.apply(ClusterMutation::PhaseDepsSet {

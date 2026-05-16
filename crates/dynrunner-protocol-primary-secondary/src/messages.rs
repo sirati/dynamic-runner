@@ -1,4 +1,4 @@
-use dynrunner_core::{ErrorType, Identifier, ResourceAmount, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, ResourceAmount, SoftPreferredSecondaries, TaskInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::address::Role;
@@ -177,6 +177,15 @@ pub struct DistributedBinaryInfo<I> {
     /// Defaults to empty for pre-task-deps senders.
     #[serde(default)]
     pub task_depends_on: Vec<String>,
+    /// Soft hint of preferred secondaries (see
+    /// [`TaskInfo::preferred_secondaries`]). Carried verbatim across
+    /// the wire so the receiving secondary's hydrated `TaskInfo`
+    /// keeps the same preference list. The `#[serde(default,
+    /// skip_serializing_if = "…is_empty")]` pair keeps the wire
+    /// backward-compatible with peers that don't emit the field, and
+    /// omits it from the wire in the common empty case.
+    #[serde(default, skip_serializing_if = "SoftPreferredSecondaries::is_empty")]
+    pub preferred_secondaries: SoftPreferredSecondaries,
 }
 
 fn default_phase_id_string() -> String {
@@ -216,6 +225,7 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             payload_json: task.payload.to_string(),
             task_id: task.task_id.clone(),
             task_depends_on: task.task_depends_on.clone(),
+            preferred_secondaries: task.preferred_secondaries.clone(),
         }
     }
 
@@ -240,6 +250,7 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             payload,
             task_id: self.task_id.clone(),
             task_depends_on: self.task_depends_on.clone(),
+            preferred_secondaries: self.preferred_secondaries.clone(),
             resolved_path: None,
         }
     }

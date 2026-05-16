@@ -165,6 +165,38 @@ impl From<String> for AffinityId {
     }
 }
 
+/// Soft hint of preferred secondaries (by peer name / id) for a task.
+///
+/// "Soft" is load-bearing: the scheduler MAY honour this list when picking
+/// a secondary, but is not obliged to — if no preferred peer is available
+/// the task still dispatches to whichever secondary the scheduler picks.
+/// A future "strict" requirement (must run on one of these peers, fail
+/// otherwise) MUST be a sibling type (e.g. `StrictRequiredSecondaries`),
+/// NOT a boolean flag on this type. The newtype boundary exists to keep
+/// soft and strict semantics from collapsing into one fragile field.
+///
+/// The wire shape is `#[serde(transparent)]` so the on-wire form is
+/// indistinguishable from a bare `Vec<String>` — that's what makes
+/// `#[serde(default, skip_serializing_if = "…is_empty")]` on the host
+/// field safely backward-compatible with pre-this-change peers.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SoftPreferredSecondaries(pub Vec<String>);
+
+impl SoftPreferredSecondaries {
+    pub fn new(secondaries: Vec<String>) -> Self {
+        Self(secondaries)
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A quantity of a specific resource.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceAmount {
@@ -350,6 +382,16 @@ pub struct TaskInfo<I> {
     /// than waiting forever for a satisfaction that will never come.
     #[serde(default)]
     pub task_depends_on: Vec<String>,
+    /// Soft hint of preferred secondaries (by peer name) for this task.
+    /// Empty == no preference (free pool); the scheduler is free to
+    /// pick any secondary. See [`SoftPreferredSecondaries`] for the
+    /// soft-vs-strict semantic boundary. `#[serde(default)]` keeps
+    /// the wire backward-compatible with peers that don't emit the
+    /// field; `skip_serializing_if = "…is_empty"` keeps the wire
+    /// quiet for the common empty case so a rolling upgrade is
+    /// indistinguishable on the wire.
+    #[serde(default, skip_serializing_if = "SoftPreferredSecondaries::is_empty")]
+    pub preferred_secondaries: SoftPreferredSecondaries,
     /// Local-only on-disk location, set by the secondary after
     /// resolving `path` through its extraction cache / pre-staged
     /// shared mount. `None` means "the worker should open `path`
