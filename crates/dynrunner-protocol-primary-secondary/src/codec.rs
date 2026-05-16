@@ -38,5 +38,5 @@ pub fn decode_frame<I: Identifier>(buf: &[u8]) -> Result<Option<(DistributedMess
 
 
 #[cfg(test)]
-#[path = "codec_tests.rs"]
+#[path = "codec_tests/mod.rs"]
 mod tests;
