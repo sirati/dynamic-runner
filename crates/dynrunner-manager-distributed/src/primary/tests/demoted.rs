@@ -277,6 +277,145 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
     }).await;
 }
 
+/// `completed_count()` / `failed_count()` read from the CRDT-replicated
+/// `cluster_state.outcome_counts()`, not from the local `completed_tasks`
+/// / `failed_tasks` HashSets.
+///
+/// Concrete bug class this pins (#88 follow-up): on a demoted observer
+/// the cross-secondary-completion mirror hop
+/// (`mirror_mutation_to_accounting`) can be bypassed in production —
+/// `cluster_state` converges via the CRDT broadcast but the local
+/// HashSet stays empty. Pre-fix the dispatcher's PyO3-facing
+/// `succeeded=N` stdout read `completed_count() = completed_tasks.len()`
+/// and reported 0 for runs that genuinely completed. The terminal log
+/// line was already migrated to `cluster_state.outcome_counts()` (Step
+/// 11 / commit 37d450d); this test pins the same migration at the
+/// `completed_count()` / `failed_count()` accessors.
+///
+/// The test artificially drives the divergence by directly populating
+/// `cluster_state` (via the same `ClusterMutation` apply path the wire
+/// uses) while leaving `completed_tasks` empty. A correct accessor
+/// reads CRDT-authoritative; a pre-fix accessor would read the empty
+/// HashSet and report 0.
+#[tokio::test(flavor = "current_thread")]
+async fn completed_and_failed_count_read_from_cluster_state_not_local_hashset() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, _ends) = setup_test(1);
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Seed cluster_state directly with two Completed entries +
+        // one Failed { Recoverable }. We DELIBERATELY do NOT touch
+        // `completed_tasks` or `failed_tasks` — that's the divergence
+        // the production bypass produces. A pre-fix accessor would
+        // return `completed_tasks.len() == 0`; the post-fix accessor
+        // routes through `cluster_state.outcome_counts()` and returns
+        // the CRDT count.
+        for i in 0..2 {
+            let bin = make_binary(&format!("done-{i}"), 100);
+            let hash = crate::primary::wire::compute_task_hash(&bin);
+            primary.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::TaskAdded {
+                    hash: hash.clone(),
+                    task: bin,
+                },
+            );
+            primary.cluster_state.apply(
+                dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::TaskCompleted {
+                    hash,
+                },
+            );
+        }
+        let failing_bin = make_binary("flaky", 100);
+        let failing_hash = crate::primary::wire::compute_task_hash(&failing_bin);
+        primary.cluster_state.apply(
+            dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::TaskAdded {
+                hash: failing_hash.clone(),
+                task: failing_bin,
+            },
+        );
+        primary.cluster_state.apply(
+            dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::TaskFailed {
+                hash: failing_hash,
+                kind: dynrunner_core::ErrorType::Recoverable,
+                error: "synthetic recoverable failure".into(),
+            },
+        );
+
+        // Pre-condition: HashSets are empty (we never touched them).
+        assert!(
+            primary.completed_tasks.is_empty(),
+            "test setup: completed_tasks must be empty to simulate \
+             the production mirror-bypass divergence"
+        );
+        assert!(
+            primary.failed_tasks.is_empty(),
+            "test setup: failed_tasks must be empty to simulate \
+             the production mirror-bypass divergence"
+        );
+
+        // Post-fix: the accessors read CRDT-authoritative counts even
+        // when the local HashSets are empty. Pre-fix these returned
+        // `0` / `0` because they read from `completed_tasks.len()` /
+        // `failed_tasks.len()`.
+        assert_eq!(
+            primary.completed_count(),
+            2,
+            "completed_count() must read the CRDT's succeeded partition \
+             (2 TaskCompleted applied above), not the empty local \
+             completed_tasks HashSet"
+        );
+        assert_eq!(
+            primary.failed_count(),
+            1,
+            "failed_count() must read the sum of CRDT failure buckets \
+             (1 TaskFailed Recoverable -> fail_retry == 1), not the empty \
+             local failed_tasks HashSet"
+        );
+
+        // Sanity: outcome_summary() and the new accessors agree (the
+        // accessors are thin views over the same outcome_counts()).
+        let outcome = primary.outcome_summary();
+        assert_eq!(
+            primary.completed_count(),
+            outcome.succeeded,
+            "completed_count() must equal outcome_summary().succeeded — \
+             both route through cluster_state.outcome_counts()"
+        );
+        assert_eq!(
+            primary.failed_count(),
+            outcome.fail_retry + outcome.fail_oom + outcome.fail_final,
+            "failed_count() must equal the sum of outcome_summary()'s \
+             failure buckets — same CRDT source"
+        );
+    }).await;
+}
+
 /// T-B — end-to-end. A demoted primary plus a real secondary (acting
 /// as the promoted primary) drive the run; the secondary fires
 /// `ClusterMutation::RunComplete` once its primary view drains, and
