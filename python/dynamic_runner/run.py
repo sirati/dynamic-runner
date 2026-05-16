@@ -610,6 +610,14 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         spawn_secondary,
         binaries,
         source_dir=str(config.source_dir),
+        # `output_dir` + `task_args` together unlock `on_run_start` on
+        # the primary side: the Rust shim fires the hook with a freshly-
+        # minted `PrimaryHandle` so consumers can drive
+        # `primary_handle.spawn_tasks(...)` from inside their lifecycle.
+        # Legacy task signatures without the kwarg fall back to the
+        # positional-only shape.
+        output_dir=str(config.output_dir),
+        task_args=args,
         source_pre_staged_root=args.source_already_staged,
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
         respawn_policy=respawn_policy,

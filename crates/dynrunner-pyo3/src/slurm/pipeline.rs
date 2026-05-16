@@ -1401,7 +1401,33 @@ fn drive_rust_primary<'py>(
         )?;
     }
 
-    coord.call_method1("run", (binaries,))?;
+    // Fire `on_run_start(source_dir, output_dir, args,
+    // primary_handle=...)` under the GIL before `coord.run(...)`
+    // enters its detached tokio runtime. The handle is minted off
+    // the coordinator pre-`run()` — `RustPrimaryCoordinator.handle`
+    // supports pre-run construction so the Python caller can hand
+    // the handle to an executor / thread before the blocking
+    // `run()` starts. Legacy tasks without the `primary_handle`
+    // kwarg fall back to the positional shape via the bridge
+    // (see `crate::managers::lifecycle::fire_on_run_start`).
+    // Failure aborts the run — consumer setup hasn't completed.
+    let on_run_start_source_dir: String = sel_result.getattr("source_dir")?.str()?.extract()?;
+    let on_run_start_output_dir: String = slurm_config
+        .call_method0("get_output_dir")?
+        .str()?
+        .extract()?;
+    let primary_handle = coord.call_method0("handle")?.unbind();
+    crate::managers::lifecycle::fire_on_run_start(
+        task,
+        &on_run_start_source_dir,
+        &on_run_start_output_dir,
+        args,
+        Some(primary_handle),
+    )?;
+
+    let run_outcome = coord.call_method1("run", (binaries,));
+    crate::managers::lifecycle::fire_on_run_end(task, run_outcome.is_ok());
+    run_outcome?;
     let completed = coord.getattr("completed")?;
     let failed = coord.getattr("failed")?;
     // Stranded mirrors `RustPrimaryCoordinator.stranded` and is zero on

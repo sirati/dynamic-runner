@@ -66,9 +66,16 @@ from argparse import ArgumentParser, Namespace
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Optional, Protocol, runtime_checkable
 
 from ._shared import TaskInfo
+
+if TYPE_CHECKING:
+    # `PrimaryHandle` is the in-flight runtime control surface minted
+    # off `RustPrimaryCoordinator.handle()`; imported here only for
+    # type-checking so the module doesn't carry a runtime dependency on
+    # the Rust extension at import time.
+    from . import PrimaryHandle
 
 
 PhaseId = str
@@ -166,8 +173,26 @@ class TaskDefinition(Protocol):
     # ── Lifecycle hooks ────────────────────────────────────────────────
 
     def on_run_start(
-        self, source_dir: Path, output_dir: Path, args: Namespace
-    ) -> None: ...
+        self,
+        source_dir: Path,
+        output_dir: Path,
+        args: Namespace,
+        primary_handle: Optional["PrimaryHandle"] = None,
+    ) -> None:
+        """Fire at run start, after the coordinator is constructed.
+
+        ``primary_handle`` is the in-flight runtime control surface for
+        the primary coordinator. It is ``None`` on secondaries (which
+        own no coordinator), and the live ``PrimaryHandle`` on the
+        primary so the task can drive
+        ``primary_handle.spawn_tasks(...)`` from inside ``on_run_start``.
+
+        The framework calls ``on_run_start`` with the kwarg on every
+        primary-side dispatcher; legacy task signatures that omit it
+        keep working via a positional-only fallback in the PyO3
+        bridge.
+        """
+        ...
 
     def on_run_end(self, success: bool) -> None: ...
 

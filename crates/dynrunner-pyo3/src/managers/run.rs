@@ -126,8 +126,11 @@ pub(crate) fn run_local<'py>(
     // Phase 5B: fire `on_run_start` synchronously under the GIL before
     // any item dispatches. A failure here aborts the run — the
     // consumer's setup hasn't completed, so dispatching would race
-    // half-built resources.
-    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args)?;
+    // half-built resources. The in-process local manager has no
+    // `PrimaryHandle` (single-node, no command-channel coordinator), so
+    // the kwarg is `None` and legacy + modern task signatures both go
+    // through the positional-only call path.
+    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args, None)?;
 
     let run_outcome = manager.call_method1("process_binaries", (binaries.clone(),));
 
@@ -158,6 +161,21 @@ pub(crate) fn run_local<'py>(
 /// staged-source mode, `uses_file_based_items=False`, and remote-
 /// only primaries.
 ///
+/// `output_dir` and `task_args` (optional, paired) are forwarded into
+/// `on_run_start` when both are `Some`. They are split out from
+/// `source_dir` so dispatch helpers that hold the per-run output
+/// directory + the parsed argparse Namespace can drive the modern
+/// `on_run_start(self, source_dir, output_dir, args, primary_handle)`
+/// signature on the primary side. The handle is the in-flight
+/// `PrimaryHandle` minted off the coordinator before `run()` enters,
+/// so the task's `on_run_start` can drive `primary_handle.spawn_tasks(...)`
+/// from inside its lifecycle. Legacy task signatures without the
+/// `primary_handle` kwarg are accepted via the bridge's positional-
+/// only fallback (see `crate::managers::lifecycle::fire_on_run_start`).
+/// When any of the three is missing, `on_run_start` is skipped
+/// entirely (back-compat for callers that don't own the dispatch
+/// surface).
+///
 /// `source_pre_staged_root` (optional) carries the
 /// `--source-already-staged` signal for the `--multi-computer local`
 /// path: when `Some`, the Python dispatch helper has already returned
@@ -174,6 +192,8 @@ pub(crate) fn run_local<'py>(
     spawn_secondary,
     binaries,
     source_dir = None,
+    output_dir = None,
+    task_args = None,
     source_pre_staged_root = None,
     unfulfillable_reinject_max_per_task = None,
     respawn_policy = None,
@@ -188,7 +208,9 @@ pub(crate) fn run_primary<'py>(
     task_definition: &Bound<'py, PyAny>,
     spawn_secondary: Py<PyAny>,
     binaries: &Bound<'py, PyList>,
-    source_dir: Option<std::path::PathBuf>,
+    source_dir: Option<String>,
+    output_dir: Option<String>,
+    task_args: Option<Py<PyAny>>,
     source_pre_staged_root: Option<std::path::PathBuf>,
     unfulfillable_reinject_max_per_task: Option<u32>,
     respawn_policy: Option<Py<PyAny>>,
@@ -228,12 +250,27 @@ pub(crate) fn run_primary<'py>(
     );
     let coord = cls.call(args, Some(&kwargs))?;
 
-    // Phase 5B: `run_primary` does not invoke `on_run_start` because
-    // the primary entrypoint does not own a source/output dir or
-    // task_args (those live on the secondaries' nodes — see
-    // `run_secondary`). The per-phase hooks still fire from inside the
-    // PrimaryCoordinator. `on_run_end` is fired at the end with just
-    // `success`, which is well-defined here.
+    // Fire `on_run_start` with a freshly-minted `PrimaryHandle` so the
+    // consumer can drive `primary_handle.spawn_tasks(...)` from inside
+    // their lifecycle. We mint the handle BEFORE `coord.run(...)`
+    // enters its detached tokio runtime — `RustPrimaryCoordinator.handle`
+    // explicitly supports pre-run construction so the Python caller can
+    // hand the handle to an executor / thread before the blocking
+    // `run()` starts.
+    //
+    // When any of (source_dir, output_dir, task_args) is absent the
+    // hook is skipped — the call signature would be ill-defined and
+    // back-compat with non-CLI callers that don't own a Namespace
+    // is preserved.
+    if let (Some(sd), Some(od), Some(ta)) = (
+        source_dir.as_ref(),
+        output_dir.as_ref(),
+        task_args.as_ref(),
+    ) {
+        let primary_handle = coord.call_method0("handle")?.unbind();
+        fire_on_run_start(task_definition, sd, od, ta.bind(py), Some(primary_handle))?;
+    }
+
     let run_outcome = coord.call_method1("run", (binaries.clone(),));
     fire_on_run_end(task_definition, run_outcome.is_ok());
     run_outcome?;
@@ -311,13 +348,14 @@ pub(crate) fn run_secondary<'py>(
     let coord = cls.call(args, Some(&kwargs))?;
 
     // Phase 5B: fire `on_run_start` synchronously under the GIL before
-    // entering the secondary's coordination loop. The secondary, not
-    // the primary, owns the source/output dirs and `task_args` (see
-    // the comment in `run_primary`); this is where the original Phase
-    // 5B design called for `on_run_start` to fire in network/SLURM
-    // mode. Failure aborts the run — consumer setup hasn't completed,
-    // dispatching would race half-built resources.
-    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args)?;
+    // entering the secondary's coordination loop. The secondary owns
+    // the source/output dirs and `task_args`; failure aborts the run
+    // (consumer setup hasn't completed; dispatching would race
+    // half-built resources). The secondary holds no `PrimaryHandle`
+    // (the handle is the primary's coordinator surface), so the
+    // bridge call goes through the positional-only path; legacy and
+    // modern task signatures both accept it.
+    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args, None)?;
 
     let run_outcome = coord.call_method0("run");
 
@@ -429,7 +467,17 @@ pub(crate) fn run_distributed<'py>(
 
     // Phase 5B: fire `on_run_start` under the GIL. Failure aborts the
     // run (consumer's setup hasn't completed; no point dispatching).
-    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args)?;
+    //
+    // TODO: thread a `PrimaryHandle` here so the in-process distributed
+    // path matches `run_primary`. Requires `PyDistributedManager` to
+    // expose a pre-run `handle()` factory (the inner
+    // `PrimaryCoordinator` is built inside `py.detach`; the wrapper
+    // would need to mint the command-channel pair at `__init__` like
+    // `PyPrimaryCoordinator` does and swap it in at `run()` start).
+    // Until that lands, modern tasks running under the in-process
+    // distributed pipeline see `primary_handle=None` and degrade to
+    // the legacy positional shape.
+    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args, None)?;
 
     let run_outcome = mgr.call_method1("run", (binaries.clone(),));
 
