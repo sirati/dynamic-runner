@@ -133,12 +133,12 @@ pub fn publish_one(
             // Surface that case with a targeted error so operators
             // immediately see the file-vs-directory collision rather
             // than chasing a "could not be created" generic.
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                if let Some(culprit) = first_existing_file_ancestor(parent) {
-                    return PublishError::DestinationParentIsFile {
-                        path: culprit,
-                    };
-                }
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && let Some(culprit) = first_existing_file_ancestor(parent)
+            {
+                return PublishError::DestinationParentIsFile {
+                    path: culprit,
+                };
             }
             PublishError::DestinationParentCreate {
                 path: parent.to_path_buf(),

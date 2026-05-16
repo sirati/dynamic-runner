@@ -494,10 +494,10 @@ impl<I: Identifier> PendingPool<I> {
         // Duplicate within batch.
         let mut seen_in_batch: HashSet<&str> = HashSet::new();
         for item in &new_items {
-            if let Some(id) = item.task_id.as_deref() {
-                if !seen_in_batch.insert(id) {
-                    return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
-                }
+            if let Some(id) = item.task_id.as_deref()
+                && !seen_in_batch.insert(id)
+            {
+                return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
             }
         }
         // Duplicate against existing state.

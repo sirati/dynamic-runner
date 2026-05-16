@@ -361,58 +361,58 @@ impl Gateway for SshGateway {
         // master lifetime. The `DYNRUNNER_SSH_CONTROL_PATH` env-var
         // hatch is also a workaround for the unresolved 2-min master
         // death symptom under PyO3+Python (see task #17).
-        if let Ok(external_cp) = std::env::var("DYNRUNNER_SSH_CONTROL_PATH") {
-            if std::path::Path::new(&external_cp).exists() {
-                tracing::info!(
-                    control_path = %external_cp,
-                    "using external SSH master (DYNRUNNER_SSH_CONTROL_PATH); skipping our own spawn"
-                );
-                self.control_path = Some(external_cp.clone());
-                self.connected = true;
-                self.adopted = true;
+        if let Ok(external_cp) = std::env::var("DYNRUNNER_SSH_CONTROL_PATH")
+            && std::path::Path::new(&external_cp).exists()
+        {
+            tracing::info!(
+                control_path = %external_cp,
+                "using external SSH master (DYNRUNNER_SSH_CONTROL_PATH); skipping our own spawn"
+            );
+            self.control_path = Some(external_cp.clone());
+            self.connected = true;
+            self.adopted = true;
 
-                // Add any registered reverse forwards dynamically via
-                // `ssh -O forward -R …`. The external master spawned
-                // before our process started doesn't know about
-                // forwarded_ports; OpenSSH supports adding them at
-                // runtime through the control socket.
-                for &(local_port, remote_port) in &self.forwarded_ports.clone() {
-                    let mut cmd = Command::new("ssh");
-                    for arg in self.base_ssh_args() {
-                        cmd.arg(&arg);
-                    }
-                    cmd.args([
-                        "-O",
-                        "forward",
-                        "-o",
-                        &format!("ControlPath={external_cp}"),
-                        "-R",
-                        &format!("0.0.0.0:{remote_port}:localhost:{local_port}"),
-                    ]);
-                    cmd.arg(self.ssh_target());
-                    let output = cmd.output().await?;
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        return Err(GatewayError::CommandFailed(format!(
-                            "Failed to add reverse forward {remote_port}:localhost:{local_port} \
-                             to external master: {}",
-                            stderr.trim()
-                        )));
-                    }
-                    tracing::info!(local_port, remote_port, "added reverse forward to external master");
+            // Add any registered reverse forwards dynamically via
+            // `ssh -O forward -R …`. The external master spawned
+            // before our process started doesn't know about
+            // forwarded_ports; OpenSSH supports adding them at
+            // runtime through the control socket.
+            for &(local_port, remote_port) in &self.forwarded_ports.clone() {
+                let mut cmd = Command::new("ssh");
+                for arg in self.base_ssh_args() {
+                    cmd.arg(&arg);
                 }
-
-                tracing::info!("SSH master connection established");
-
-                // Detect remote home (same as the regular path).
-                let home_result = self.ssh_command("echo $HOME", None).await?;
-                if home_result.success() {
-                    self.remote_home = Some(home_result.stdout.trim().to_string());
-                    tracing::info!(home = ?self.remote_home, "detected remote home");
+                cmd.args([
+                    "-O",
+                    "forward",
+                    "-o",
+                    &format!("ControlPath={external_cp}"),
+                    "-R",
+                    &format!("0.0.0.0:{remote_port}:localhost:{local_port}"),
+                ]);
+                cmd.arg(self.ssh_target());
+                let output = cmd.output().await?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(GatewayError::CommandFailed(format!(
+                        "Failed to add reverse forward {remote_port}:localhost:{local_port} \
+                         to external master: {}",
+                        stderr.trim()
+                    )));
                 }
-                self.check_gateway_ports().await;
-                return Ok(());
+                tracing::info!(local_port, remote_port, "added reverse forward to external master");
             }
+
+            tracing::info!("SSH master connection established");
+
+            // Detect remote home (same as the regular path).
+            let home_result = self.ssh_command("echo $HOME", None).await?;
+            if home_result.success() {
+                self.remote_home = Some(home_result.stdout.trim().to_string());
+                tracing::info!(home = ?self.remote_home, "detected remote home");
+            }
+            self.check_gateway_ports().await;
+            return Ok(());
         }
 
         // Stable control socket under /tmp. We deliberately do NOT

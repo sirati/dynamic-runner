@@ -209,18 +209,18 @@ pub fn parse_response(line: &str) -> Option<Response> {
         // error_type?}. Backwards compatible: senders that omit
         // `error_type` parse to `None`, which the runner treats as
         // NonRecoverable (legacy "worker is dead" semantic).
-        if let Ok(json_bytes) = BASE64.decode(rest.as_bytes()) {
-            if let Ok(wire) = serde_json::from_slice::<WorkerExceptionWire>(&json_bytes) {
-                return Some(Response::WorkerException {
-                    exception_type: wire.exception_type,
-                    message: wire.message,
-                    traceback: wire.traceback,
-                    error_type: wire
-                        .error_type
-                        .as_deref()
-                        .and_then(ErrorType::from_wire),
-                });
-            }
+        if let Ok(json_bytes) = BASE64.decode(rest.as_bytes())
+            && let Ok(wire) = serde_json::from_slice::<WorkerExceptionWire>(&json_bytes)
+        {
+            return Some(Response::WorkerException {
+                exception_type: wire.exception_type,
+                message: wire.message,
+                traceback: wire.traceback,
+                error_type: wire
+                    .error_type
+                    .as_deref()
+                    .and_then(ErrorType::from_wire),
+            });
         }
         return Some(Response::WorkerException {
             exception_type: "MalformedException".to_owned(),
