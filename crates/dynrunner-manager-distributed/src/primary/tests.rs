@@ -6,13 +6,15 @@ use super::test_helpers::{
     FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
 };
 use super::*;
-use dynrunner_protocol_primary_secondary::DistributedMessage;
+use dynrunner_core::TaskInfo;
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{
     ChannelPrimaryTransportEnd, ChannelSecondaryTransportEnd,
 };
 use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
 use std::collections::HashMap;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 /// Phase 4b: tests that don't care about phase lifecycle pass an empty
