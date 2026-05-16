@@ -691,7 +691,7 @@ async fn receiver_side_relay_observation_triggers_redial() {
             msg,
             redial_target,
         } => {
-            assert!(matches!(msg, DistributedMessage::Keepalive { .. }));
+            assert!(matches!(&*msg, DistributedMessage::Keepalive { .. }));
             assert_eq!(
                 redial_target.as_deref(),
                 Some("d"),

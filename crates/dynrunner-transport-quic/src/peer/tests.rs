@@ -378,8 +378,8 @@ async fn either_peer_transport_real_round_trips_a_message() {
             let cert_pem_a = pn_a.cert_pem().to_string();
             let cert_pem_b = pn_b.cert_pem().to_string();
 
-            let mut peer_a: EitherPeerTransport<TestId> = EitherPeerTransport::Real(pn_a);
-            let mut peer_b: EitherPeerTransport<TestId> = EitherPeerTransport::Real(pn_b);
+            let mut peer_a: EitherPeerTransport<TestId> = EitherPeerTransport::Real(Box::new(pn_a));
+            let mut peer_b: EitherPeerTransport<TestId> = EitherPeerTransport::Real(Box::new(pn_b));
 
             let peers = vec![
                 PeerConnectionInfo {
@@ -832,13 +832,8 @@ async fn silent_reconnect_partition_heals_with_two_transition_logs() {
             // endpoint; any keepalive it itself receives is
             // discarded silently.
             let forwarder_handle = tokio::task::spawn_local(async move {
-                loop {
-                    match peer_c.recv_peer().await {
-                        Some(m) => {
-                            tracing::warn!(target: "test_debug", "peer-c forwarder received: {m:?}");
-                        }
-                        None => break,
-                    }
+                while let Some(m) = peer_c.recv_peer().await {
+                    tracing::warn!(target: "test_debug", "peer-c forwarder received: {m:?}");
                 }
             });
 

@@ -1028,6 +1028,10 @@ mod tests {
     struct LocalDirReader;
 
     impl InfoFileReader for LocalDirReader {
+        // The trait pins `+ 'static` on the returned future; an
+        // `async fn` impl would infer `use<'_>` capturing `&self`
+        // and fail to satisfy the bound. Keep the manual shape.
+        #[allow(clippy::manual_async_fn)]
         fn read(
             &self,
             path: String,
@@ -1137,7 +1141,7 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         let result: Result<HashMap<String, u16>, PrepError> =
             rt.block_on(local.run_until(async move {
-                let mut prep = SlurmPreparation::new(opts);
+                let prep = SlurmPreparation::new(opts);
                 let r = prep.setup_ssh_tunnels(reader, 2, 9999).await;
                 prep.cleanup().await;
                 r
@@ -1173,7 +1177,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let mut prep = SlurmPreparation::new(opts);
+        let prep = SlurmPreparation::new(opts);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1702,7 +1706,7 @@ mod tests {
     /// returns Ok, the verified `Child` must be in the shared
     /// `ssh_tunnels` Vec and the port-map must carry the discovered
     /// `(id, port)`. Pre-fix this was tangled through `drive_one_watcher`
-    /// + `setup_ssh_tunnels`'s post-gather extend; the refactor moves
+    /// and `setup_ssh_tunnels`'s post-gather extend; the refactor moves
     /// it inside the inner so any single-tunnel caller observes the
     /// same effect.
     #[test]

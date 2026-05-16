@@ -21,7 +21,7 @@ pub fn create_socketpair() -> std::io::Result<(SocketpairManagerEnd, RawFd)> {
             None,
             nix::sys::socket::SockFlag::empty(),
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
 
     // Convert OwnedFd to RawFd, transferring ownership
     let parent_raw: RawFd = parent_fd.into_raw_fd();

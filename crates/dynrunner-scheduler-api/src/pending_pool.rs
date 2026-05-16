@@ -139,7 +139,7 @@ impl<I: Identifier> WorkerView<I> {
         } = self;
         let mut kept_items = Vec::with_capacity(items.len());
         let mut kept_locators = Vec::with_capacity(locators.len());
-        for (item, locator) in items.into_iter().zip(locators.into_iter()) {
+        for (item, locator) in items.into_iter().zip(locators) {
             if pred(&item) {
                 kept_items.push(item);
                 kept_locators.push(locator);
@@ -275,6 +275,7 @@ pub struct PendingPool<I: Identifier> {
     ///     hydration path (`populate_primary_from_cluster_state`)
     ///     to seed task_ids that are in flight on OTHER nodes,
     ///     learnt from the replicated cluster ledger.
+    ///
     /// Cleared by `on_item_finished` / `on_item_failed_permanent` on
     /// terminal observation.
     ///
@@ -494,10 +495,10 @@ impl<I: Identifier> PendingPool<I> {
         // Duplicate within batch.
         let mut seen_in_batch: HashSet<&str> = HashSet::new();
         for item in &new_items {
-            if let Some(id) = item.task_id.as_deref() {
-                if !seen_in_batch.insert(id) {
-                    return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
-                }
+            if let Some(id) = item.task_id.as_deref()
+                && !seen_in_batch.insert(id)
+            {
+                return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
             }
         }
         // Duplicate against existing state.

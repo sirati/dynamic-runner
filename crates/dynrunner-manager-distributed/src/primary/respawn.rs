@@ -689,10 +689,12 @@ mod respawn_dispatcher_tests {
             }
         }
 
+        #[allow(dead_code)]
         fn call_count(&self) -> u32 {
             self.calls.load(Ordering::SeqCst)
         }
 
+        #[allow(dead_code)]
         fn captured_ids(&self) -> Vec<String> {
             self.captured_ids.lock().unwrap().clone()
         }

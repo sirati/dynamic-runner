@@ -97,6 +97,9 @@ impl PySecondaryCoordinator {
         max_resources = None,
         peer_lifecycle_listener = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         primary_url: String,
@@ -404,7 +407,7 @@ impl PySecondaryCoordinator {
                     let cert_pem = pn.cert_pem().to_string();
                     let port = pn.port();
                     (
-                        dynrunner_transport_quic::EitherPeerTransport::Real(pn),
+                        dynrunner_transport_quic::EitherPeerTransport::Real(Box::new(pn)),
                         cert_pem,
                         port,
                     )

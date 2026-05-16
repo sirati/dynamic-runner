@@ -141,7 +141,7 @@ impl PrimaryControlPlane {
     /// The caller threads the returned values into the inner
     /// coordinator at the call site where it is already in scope —
     /// `replace_command_channel(wiring.command_tx, wiring.command_rx)`
-    /// + either the `PrimaryConfig` field assignment or the
+    /// followed by either the `PrimaryConfig` field assignment or the
     /// `set_unfulfillable_reinject_max_per_task` setter.
     pub(crate) fn take_for_run(&mut self) -> PyResult<RunWiring> {
         let command_rx = self.command_rx.take().ok_or_else(|| {
@@ -163,7 +163,12 @@ impl PrimaryControlPlane {
     /// `__init__` kwarg seeded the cell correctly without reaching
     /// into private fields. Production paths read through
     /// `take_for_run` instead.
-    #[cfg(test)]
+    ///
+    /// Gated on `test-with-python` because the only call sites live
+    /// in the python-linked test module; a plain `#[cfg(test)]` would
+    /// build the accessor even under default features (which exclude
+    /// the test module) and trip `dead_code`.
+    #[cfg(all(test, feature = "test-with-python"))]
     pub(crate) fn cap_snapshot(&self) -> Option<u32> {
         self.reinject_cap.snapshot()
     }
@@ -174,7 +179,9 @@ impl PrimaryControlPlane {
     /// minimal `Sender::same_channel` check the
     /// `handle_clones_share_same_command_channel` test phrases.
     /// Production paths never need this comparison.
-    #[cfg(test)]
+    ///
+    /// Same `test-with-python` gating rationale as `cap_snapshot`.
+    #[cfg(all(test, feature = "test-with-python"))]
     pub(crate) fn same_command_channel(
         &self,
         other: &tokio_mpsc::Sender<PrimaryCommand<RunnerIdentifier>>,

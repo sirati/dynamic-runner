@@ -83,10 +83,10 @@ impl Drop for CleanupGuard {
             // RustSlurmPreparation tunnel manager). Only present if
             // reverse-connection mode constructed one — non-reverse
             // runs skip this step.
-            if let Some(prep) = self.tunnel_manager.take() {
-                if let Err(e) = prep.bind(py).call_method0("cleanup") {
-                    tracing::warn!(error = ?e, "tunnel_manager.cleanup() failed");
-                }
+            if let Some(prep) = self.tunnel_manager.take()
+                && let Err(e) = prep.bind(py).call_method0("cleanup")
+            {
+                tracing::warn!(error = ?e, "tunnel_manager.cleanup() failed");
             }
             // Step 2: graceful gateway-master shutdown FIRST. This
             // takes the master and all its `-R` forwardings down via
@@ -94,10 +94,10 @@ impl Drop for CleanupGuard {
             // below — otherwise pkill SIGTERMs the master before its
             // graceful exit completes and we get spurious "Control
             // socket connect: No such file or directory" warnings.
-            if let Some(gw) = self.gateway.take() {
-                if let Err(e) = gw.bind(py).call_method0("disconnect") {
-                    tracing::warn!(error = ?e, "gateway.disconnect() failed");
-                }
+            if let Some(gw) = self.gateway.take()
+                && let Err(e) = gw.bind(py).call_method0("disconnect")
+            {
+                tracing::warn!(error = ?e, "gateway.disconnect() failed");
             }
             // Step 3: targeted pkill for any per-secondary reverse
             // tunnel that escaped `preparation.cleanup()` tracking.
@@ -1320,20 +1320,20 @@ fn drive_rust_primary<'py>(
     // kwargs so the SLURM pipeline matches the in-process local /
     // distributed paths — consumers don't have to construct
     // `RustPrimaryCoordinator` themselves to reach these hooks.
-    if let Ok(matcher) = task.getattr("fulfillability_matcher") {
-        if !matcher.is_none() {
-            coord_kwargs.set_item("fulfillability_matcher", matcher)?;
-        }
+    if let Ok(matcher) = task.getattr("fulfillability_matcher")
+        && !matcher.is_none()
+    {
+        coord_kwargs.set_item("fulfillability_matcher", matcher)?;
     }
-    if let Ok(listener) = task.getattr("peer_lifecycle_listener") {
-        if !listener.is_none() {
-            coord_kwargs.set_item("peer_lifecycle_listener", listener)?;
-        }
+    if let Ok(listener) = task.getattr("peer_lifecycle_listener")
+        && !listener.is_none()
+    {
+        coord_kwargs.set_item("peer_lifecycle_listener", listener)?;
     }
-    if let Ok(listener) = task.getattr("task_completed_listener") {
-        if !listener.is_none() {
-            coord_kwargs.set_item("task_completed_listener", listener)?;
-        }
+    if let Ok(listener) = task.getattr("task_completed_listener")
+        && !listener.is_none()
+    {
+        coord_kwargs.set_item("task_completed_listener", listener)?;
     }
 
     let num_secondaries = outcome.num_secondaries;
@@ -1353,15 +1353,15 @@ fn drive_rust_primary<'py>(
     // expected duck-typed shape (out-of-tree callers that subclass
     // the shim won't have a `_rust` attribute; logging it here would
     // be noise for those paths).
-    if let Ok(rust_handle) = job_manager.getattr("_rust") {
-        if let Ok(rust_jm) = rust_handle.cast::<crate::slurm::PyRustSlurmJobManager>() {
-            let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> =
-                rust_jm.borrow().arc_handle();
-            coord
-                .cast::<crate::managers::primary::PyPrimaryCoordinator>()?
-                .borrow_mut()
-                .set_slurm_job_manager_from_rust(arc);
-        }
+    if let Ok(rust_handle) = job_manager.getattr("_rust")
+        && let Ok(rust_jm) = rust_handle.cast::<crate::slurm::PyRustSlurmJobManager>()
+    {
+        let arc: std::sync::Arc<dyn std::any::Any + Send + Sync> =
+            rust_jm.borrow().arc_handle();
+        coord
+            .cast::<crate::managers::primary::PyPrimaryCoordinator>()?
+            .borrow_mut()
+            .set_slurm_job_manager_from_rust(arc);
     }
 
     let coord_uses_file_based: bool = coord.getattr("uses_file_based_items")?.extract()?;

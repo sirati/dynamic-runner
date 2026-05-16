@@ -91,13 +91,12 @@ fn read_meminfo_field(prefix: &str) -> u64 {
         return 0;
     };
     for line in content.lines() {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            // Format: "<prefix>       16384000 kB"
-            if let Some(kb_str) = rest.split_whitespace().next() {
-                if let Ok(kb) = kb_str.parse::<u64>() {
-                    return kb * 1024;
-                }
-            }
+        // Format: "<prefix>       16384000 kB"
+        if let Some(rest) = line.strip_prefix(prefix)
+            && let Some(kb_str) = rest.split_whitespace().next()
+            && let Ok(kb) = kb_str.parse::<u64>()
+        {
+            return kb * 1024;
         }
     }
     0
@@ -170,10 +169,10 @@ where
     let mut min: Option<T> = None;
     loop {
         let path = current.join(file);
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Some(v) = parse(&content) {
-                min = Some(min.map_or(v, |m| m.min(v)));
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Some(v) = parse(&content)
+        {
+            min = Some(min.map_or(v, |m| m.min(v)));
         }
         if current == root {
             break;

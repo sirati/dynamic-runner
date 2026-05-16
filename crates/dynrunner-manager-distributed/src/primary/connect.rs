@@ -242,23 +242,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             quic_port,
             ..
         } = msg
+            && let Some(state) = self.secondaries.remove(&secondary_id)
         {
-            if let Some(state) = self.secondaries.remove(&secondary_id) {
-                if let SecondaryConnectionState::Handshaking(conn) = state {
-                    let conn = conn.receive_cert_exchange(
-                        public_cert_pem,
-                        ipv4_address,
-                        ipv6_address,
-                        quic_port,
-                    );
-                    self.secondaries.insert(
-                        secondary_id.clone(),
-                        SecondaryConnectionState::CertExchanging(conn),
-                    );
-                    tracing::debug!(secondary = %secondary_id, "cert exchange received");
-                } else {
-                    self.secondaries.insert(secondary_id, state);
-                }
+            // The inner branch carries an else, so we keep it nested
+            // rather than chaining into the outer `&& let`.
+            if let SecondaryConnectionState::Handshaking(conn) = state {
+                let conn = conn.receive_cert_exchange(
+                    public_cert_pem,
+                    ipv4_address,
+                    ipv6_address,
+                    quic_port,
+                );
+                self.secondaries.insert(
+                    secondary_id.clone(),
+                    SecondaryConnectionState::CertExchanging(conn),
+                );
+                tracing::debug!(secondary = %secondary_id, "cert exchange received");
+            } else {
+                self.secondaries.insert(secondary_id, state);
             }
         }
     }

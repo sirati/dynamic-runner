@@ -902,10 +902,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let hash = super::wire::compute_task_hash(task);
             if let Some(crate::cluster_state::TaskState::Failed { kind, .. }) =
                 self.cluster_state.task_state(&hash)
+                && !self.completed_tasks.contains(&hash)
             {
-                if !self.completed_tasks.contains(&hash) {
-                    self.failed_tasks.insert(hash, kind.clone());
-                }
+                self.failed_tasks.insert(hash, kind.clone());
             }
         }
     }

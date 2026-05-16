@@ -35,10 +35,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
 
-                if result.success {
-                    if let Some(b) = binary.as_ref() {
-                        self.task_payloads.push((b.clone(), result_data));
-                    }
+                if result.success
+                    && let Some(b) = binary.as_ref()
+                {
+                    self.task_payloads.push((b.clone(), result_data));
                 }
 
                 self.handle_task_completed(
@@ -123,6 +123,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
     }
 
+    // Internal event handler — every arg comes from the destructured
+    // `WorkerEvent::TaskCompleted` variant or its immediate context;
+    // bundling them into a config struct would just move the unpack
+    // one frame out.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_task_completed(
         &mut self,
         worker_id: WorkerId,

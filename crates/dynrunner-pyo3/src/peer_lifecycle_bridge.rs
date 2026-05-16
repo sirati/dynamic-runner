@@ -61,7 +61,9 @@ impl PyPeerLifecycleListener {
     /// Boxed at the call site (returned as `Box<dyn LifecycleListener>`)
     /// so the manager-distributed registration API consumes a uniform
     /// trait-object shape and the caller doesn't need to spell out
-    /// the concrete type.
+    /// the concrete type. Returning `Box<dyn ...>` instead of `Self`
+    /// is the load-bearing API contract.
+    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new(listener: Py<PyAny>) -> Box<dyn LifecycleListener> {
         Box::new(Self { listener })
     }

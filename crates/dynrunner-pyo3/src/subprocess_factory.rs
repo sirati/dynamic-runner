@@ -244,7 +244,7 @@ impl SubprocessWorkerFactory {
     fn spawn_named(
         &mut self,
         worker_id: WorkerId,
-        socket_dir: &PathBuf,
+        socket_dir: &Path,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         let socket_path = self.log_paths.socket_path(socket_dir, worker_id);
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)

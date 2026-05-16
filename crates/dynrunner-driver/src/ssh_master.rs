@@ -822,10 +822,11 @@ fn build_auth_flags(config: &SshConfig) -> Vec<String> {
     opts
 }
 
-/// Construct the always-on argv prefix for ssh subprocesses (`-p`
-/// + auth flags). The master spawn appends `-M -N -o ControlPath=…
-/// <master_only_options> [-R …] <target>` after this; per-call
-/// ssh/scp invocations from the session layer compose differently.
+/// Construct the always-on argv prefix for ssh subprocesses
+/// (`-p` plus auth flags). The master spawn appends `-M -N -o
+/// ControlPath=… <master_only_options> [-R …] <target>` after this;
+/// per-call ssh/scp invocations from the session layer compose
+/// differently.
 fn build_base_args(port: u16, auth_flags: &[String]) -> Vec<String> {
     let mut args = Vec::new();
     if port != 22 {
@@ -1224,7 +1225,7 @@ mod tests {
     #[test]
     fn master_argv_threads_control_path_and_target() {
         let argv = build_master_argv(
-            &vec!["-p".to_string(), "2222".to_string()],
+            &["-p".to_string(), "2222".to_string()],
             "/tmp/dynrunner-m-42-7.sock",
             &[(1234, 5678)],
             "alice@host",

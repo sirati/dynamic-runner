@@ -9,7 +9,7 @@ use super::resources::PyResourceMap;
 
 /// Per-primary tuning. Combine with `DistributedConfig` for the shared
 /// connect/peer/keepalive knobs.
-#[pyclass(name = "PrimaryConfig")]
+#[pyclass(name = "PrimaryConfig", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PyPrimaryConfig {
     #[pyo3(get, set)]
@@ -42,6 +42,11 @@ impl PyPrimaryConfig {
 }
 
 impl PyPrimaryConfig {
+    /// Build the Rust-side config. Currently unused — the
+    /// `PyPrimaryCoordinator` constructor pulls each field
+    /// individually rather than through this wrapper. Kept as a
+    /// documented API for callers that prefer a one-step conversion.
+    #[allow(dead_code)]
     pub(crate) fn to_rust(&self) -> RustPrimaryConfig {
         RustPrimaryConfig {
             node_id: self.node_id.clone(),
@@ -84,7 +89,7 @@ impl PyPrimaryConfig {
 }
 
 /// Per-secondary tuning.
-#[pyclass(name = "SecondaryConfig")]
+#[pyclass(name = "SecondaryConfig", skip_from_py_object)]
 #[derive(Clone)]
 pub(crate) struct PySecondaryConfig {
     #[pyo3(get, set)]
@@ -171,6 +176,9 @@ impl PySecondaryConfig {
         output_dir = None,
         distributed_config = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         secondary_id: String,
         num_workers: Option<u32>,
@@ -265,6 +273,11 @@ fn default_secondary_dir(
 use crate::system_resources::{detect_logical_cpu_count as detect_num_workers, detect_total_memory_bytes};
 
 impl PySecondaryConfig {
+    /// Build the Rust-side config. Currently unused — the
+    /// `PySecondaryCoordinator` constructor pulls each field
+    /// individually rather than through this wrapper. Kept as a
+    /// documented API for callers that prefer a one-step conversion.
+    #[allow(dead_code)]
     pub(crate) fn to_rust(&self) -> RustSecondaryConfig {
         RustSecondaryConfig {
             secondary_id: self.secondary_id.clone(),

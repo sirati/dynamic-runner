@@ -1020,11 +1020,13 @@ impl<I: Identifier> ClusterState<I> {
     ) -> ApplyOutcome {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
-                if self.tasks.contains_key(&hash) {
-                    ApplyOutcome::NoOp
-                } else {
-                    self.tasks.insert(hash, TaskState::Pending { task });
+                if let std::collections::hash_map::Entry::Vacant(e) =
+                    self.tasks.entry(hash)
+                {
+                    e.insert(TaskState::Pending { task });
                     ApplyOutcome::Applied
+                } else {
+                    ApplyOutcome::NoOp
                 }
             }
             ClusterMutation::TaskAssigned {
@@ -1411,10 +1413,10 @@ impl<I: Identifier> ClusterState<I> {
     /// set actually shrinks. A `PeerLifecycleEvent::Removed` is
     /// emitted on every state-changing apply.
     fn apply_peer_removed(&mut self, id: String, cause: RemovalCause) -> ApplyOutcome {
-        if let Some(entry) = self.peer_state.get(&id) {
-            if entry.state == PeerState::Dead {
-                return ApplyOutcome::NoOp;
-            }
+        if let Some(entry) = self.peer_state.get(&id)
+            && entry.state == PeerState::Dead
+        {
+            return ApplyOutcome::NoOp;
         }
         let observer_set_changed = match self.peer_state.get_mut(&id) {
             None => {

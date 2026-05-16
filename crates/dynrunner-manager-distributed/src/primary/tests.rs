@@ -1024,7 +1024,11 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
     // share one FIFO, so a flush only fires AFTER every preceding
     // message has been forwarded.
     enum BufOut {
-        Msg(DistributedMessage<TestId>),
+        // Box keeps `BufOut` small: `DistributedMessage<TestId>` is
+        // ~360B while `Flush` is one oneshot::Sender — boxing the
+        // heavy variant stops the entire enum from carrying the
+        // worst-case payload through the writer's mpsc.
+        Msg(Box<DistributedMessage<TestId>>),
         Flush(oneshot::Sender<()>),
     }
 
@@ -1057,7 +1061,7 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
             msg: DistributedMessage<TestId>,
         ) -> Result<(), String> {
             self.outgoing_tx
-                .send(BufOut::Msg(msg))
+                .send(BufOut::Msg(Box::new(msg)))
                 .map_err(|_| "buffered transport writer task exited".to_string())
         }
 
@@ -1114,7 +1118,7 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
                             std::time::Duration::from_millis(50),
                         )
                         .await;
-                        if inner_tx.send(msg).is_err() {
+                        if inner_tx.send(*msg).is_err() {
                             break;
                         }
                     }
@@ -2012,6 +2016,9 @@ fn spawn_real_secondary_with_src_network(
 ///
 /// `flaky` is cloned (its `Rc<RefCell<HashMap>>` is shared) so the test
 /// caller can also inspect the per-task attempt counts after the run.
+// One-off test-helper return; the tuple shape is documented by the
+// doc comment above and isn't reused elsewhere.
+#[allow(clippy::type_complexity)]
 fn spawn_real_secondary_flaky(
     secondary_id: String,
     num_workers: u32,
@@ -3310,10 +3317,10 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         tokio::task::spawn_local(async move {
             let mut rx = sec1_inbound;
             while let Some(msg) = rx.recv().await {
-                if let DistributedMessage::PeerInfo { peers, .. } = &msg {
-                    if let Some(tx) = peer_info_tx.take() {
-                        let _ = tx.send(peers.clone());
-                    }
+                if let DistributedMessage::PeerInfo { peers, .. } = &msg
+                    && let Some(tx) = peer_info_tx.take()
+                {
+                    let _ = tx.send(peers.clone());
                 }
                 if sec1_inner_tx.send(msg).is_err() {
                     break;

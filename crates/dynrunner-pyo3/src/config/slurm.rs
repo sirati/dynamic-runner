@@ -98,6 +98,9 @@ impl PySlurmConfig {
         notify_email = None,
         prestaged_src_bins_path = None,
     ))]
+    // PyO3 kwargs surface — collapsing to a builder is a separate
+    // API refactor.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         root_folder: PyPathStr,
         image_subfolder: Option<String>,
