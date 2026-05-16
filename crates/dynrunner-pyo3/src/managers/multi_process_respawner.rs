@@ -39,6 +39,8 @@
 //! adapter's. ``SpawnError`` is reserved for callback failures
 //! (raised ``PyErr``), so a successful no-op return is ``Ok(())``.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -46,6 +48,25 @@ use pyo3::types::PyDict;
 use dynrunner_manager_distributed::primary::respawn::{
     SecondarySpawnSpec, SecondarySpawner, SpawnError,
 };
+
+/// Inner state, separated out from the pyclass so the coordinator
+/// can hold an `Arc<dyn SecondarySpawner>` cloned from this adapter
+/// without requiring `&PyCell` access. The pyclass itself owns one
+/// `Arc<MultiProcessSpawnerInner>`; calls to
+/// [`PyMultiProcessSpawner::as_arc`] (Rust-only) hand back a clone of
+/// that Arc upcast to the trait object the coordinator consumes.
+///
+/// Single concern: hold the Python callback + the construction-time
+/// snapshot. The `SecondarySpawner` impl below lives on this type
+/// (not on the pyclass wrapper) so the trait-object impl can move
+/// freely across thread / runtime boundaries — pyclass instances are
+/// pinned to the GIL-managed `PyCell` and cannot be sent as
+/// `Arc<dyn SecondarySpawner>` directly.
+pub(crate) struct MultiProcessSpawnerInner {
+    spawn_callable: Py<PyAny>,
+    primary_endpoint: String,
+    primary_pubkey_pem: String,
+}
 
 /// Adapter from the Rust [`SecondarySpawner`] trait to a Python
 /// ``spawn_secondary`` callable.
@@ -61,9 +82,7 @@ use dynrunner_manager_distributed::primary::respawn::{
 /// from the bound port) and ``secondary_id`` (formatted per call).
 #[pyclass(name = "PyMultiProcessSpawner")]
 pub(crate) struct PyMultiProcessSpawner {
-    spawn_callable: Py<PyAny>,
-    primary_endpoint: String,
-    primary_pubkey_pem: String,
+    inner: Arc<MultiProcessSpawnerInner>,
 }
 
 #[pymethods]
@@ -75,10 +94,24 @@ impl PyMultiProcessSpawner {
         primary_pubkey_pem: String,
     ) -> Self {
         Self {
-            spawn_callable,
-            primary_endpoint,
-            primary_pubkey_pem,
+            inner: Arc::new(MultiProcessSpawnerInner {
+                spawn_callable,
+                primary_endpoint,
+                primary_pubkey_pem,
+            }),
         }
+    }
+}
+
+impl PyMultiProcessSpawner {
+    /// Rust-side hand-off: clone the inner `Arc` and upcast it to the
+    /// trait object the coordinator's `enable_respawn` consumes.
+    /// Single concern: bridge the pyclass-owned `Arc<Inner>` to the
+    /// trait-object surface; the coordinator never sees the pyclass
+    /// type directly. Called by `PyPrimaryCoordinator::run` at
+    /// coordinator-construction time.
+    pub(crate) fn as_arc(&self) -> Arc<dyn SecondarySpawner> {
+        Arc::clone(&self.inner) as Arc<dyn SecondarySpawner>
     }
 }
 
@@ -118,7 +151,7 @@ fn invoke_python_callback(
 }
 
 #[async_trait(?Send)]
-impl SecondarySpawner for PyMultiProcessSpawner {
+impl SecondarySpawner for MultiProcessSpawnerInner {
     async fn spawn(&self, spec: SecondarySpawnSpec) -> Result<(), SpawnError> {
         // Snapshot the bits the blocking task needs. Cloning is cheap
         // (3 strings + one Py<PyAny> refcount bump) and keeps the
@@ -220,6 +253,7 @@ mod tests {
 
         rt().block_on(async {
             spawner
+                .as_arc()
                 .spawn(spec("sec-replacement-1"))
                 .await
                 .expect("spawn ok");
@@ -277,7 +311,8 @@ mod tests {
             "-----BEGIN PUBLIC KEY-----\n".to_owned(),
         );
 
-        let outcome = rt().block_on(async { spawner.spawn(spec("sec-replacement-1")).await });
+        let outcome =
+            rt().block_on(async { spawner.as_arc().spawn(spec("sec-replacement-1")).await });
 
         let err = outcome.expect_err("callback raised, adapter must report SpawnError");
         match err {
@@ -321,8 +356,9 @@ mod tests {
 
         let rt = rt();
         rt.block_on(async {
-            spawner.spawn(spec("sec-a-replacement")).await.unwrap();
-            spawner.spawn(spec("sec-b-replacement")).await.unwrap();
+            let arc = spawner.as_arc();
+            arc.spawn(spec("sec-a-replacement")).await.unwrap();
+            arc.spawn(spec("sec-b-replacement")).await.unwrap();
         });
 
         Python::attach(|py| {

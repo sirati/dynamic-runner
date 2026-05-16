@@ -25,6 +25,7 @@ use config::log_paths::LogPathConfig;
 use config::phase::PyPhase;
 use config::primary_secondary::{PyPrimaryConfig, PySecondaryConfig};
 use config::resources::PyResourceMap;
+use config::respawn::PyRespawnPolicy;
 use config::scheduler::SchedulerConfig;
 use config::slurm::PySlurmConfig;
 use config::worker_spec::WorkerSpec;
@@ -69,6 +70,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SchedulerConfig>()?;
     m.add_class::<PySlurmConfig>()?;
     m.add_class::<DistributedConfig>()?;
+    m.add_class::<PyRespawnPolicy>()?;
     m.add_class::<PyResourceMap>()?;
     m.add_class::<PyPhase>()?;
     m.add_class::<PyLocalManagerConfig>()?;
