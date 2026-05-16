@@ -2,6 +2,7 @@ use dynrunner_core::{
     ErrorType, Identifier, MessageReceiver, MessageSender, ResourceKind, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
@@ -20,9 +21,33 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub(super) async fn check_resource_pressure(&mut self, factory: &mut impl WorkerFactory<M>) {
+    /// Route the resource-pressure decision tick through the OOM
+    /// watcher (mirrors `LocalManager::check_resource_pressure_via_watcher`).
+    /// The watcher invokes `WorkerPool::check_resource_pressure`
+    /// internally so it can record kill events for the structured-log
+    /// trigger; the secondary-specific kill-outcome handling
+    /// (TaskFailed mesh broadcast + worker restart + request new
+    /// task) stays here.
+    pub(super) async fn check_resource_pressure_via_watcher(
+        &mut self,
+        watcher: &mut OomWatcher,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         let max = self.max_resources();
-        match self.pool.check_resource_pressure(&self.scheduler, &max, false) {
+        let result = watcher.on_decision(&mut self.pool, &self.scheduler, &max, false);
+        self.handle_resource_pressure_result(result, factory).await;
+    }
+
+    /// Secondary-specific outcome handler. Pulled out of the prior
+    /// `check_resource_pressure` body so both the watcher-driven path
+    /// and any future direct caller share the same TaskFailed-broadcast
+    /// + restart + request rules.
+    async fn handle_resource_pressure_result(
+        &mut self,
+        result: ResourcePressureResult<I>,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
+        match result {
             ResourcePressureResult::Killed {
                 worker_id,
                 reason,

@@ -3,6 +3,9 @@ use std::time::{Duration, Instant};
 
 use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
+use dynrunner_manager_local::oom::{
+    OomWatcher, OomWatcherConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL,
+};
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
@@ -30,7 +33,19 @@ where
         tracing::info!("entering task processing loop");
 
         let mut keepalive_interval = tokio::time::interval(self.config.keepalive_interval);
-        let mut oom_interval = tokio::time::interval(Duration::from_millis(100));
+        // Decouple sample cadence (50ms, 20Hz) from decision cadence
+        // (config-driven, default 100ms). Pre-extraction the decision
+        // cadence was a hardcoded 100ms literal here; now it reads
+        // from `SecondaryConfig::resource_check_interval` so the
+        // secondary and LocalManager use the same operator knob.
+        let mut oom_watcher = OomWatcher::new(OomWatcherConfig {
+            sample_interval: DEFAULT_SAMPLE_INTERVAL,
+            decision_interval: self.config.resource_check_interval,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            log_enabled: self.config.log_oom_watcher,
+        });
+        let mut oom_sample_interval = oom_watcher.sample_interval_ticker();
+        let mut oom_decision_interval = oom_watcher.decision_interval_ticker();
 
         // Tell the primary the peer-mesh has settled so it can release
         // `PromotePrimary`. For the single-secondary / no-peers case
@@ -334,8 +349,14 @@ where
                         let _ = self.peer_transport.broadcast(msg).await;
                     }
                 }
-                _ = oom_interval.tick() => {
-                    self.check_resource_pressure(factory).await;
+                _ = oom_sample_interval.tick() => {
+                    // Fast sample tick: refresh per-worker RSS, read
+                    // host + cgroup state, evaluate structured-log
+                    // triggers. No scheduler call.
+                    oom_watcher.on_sample(&mut self.pool);
+                }
+                _ = oom_decision_interval.tick() => {
+                    self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
                 }
             }
 

@@ -116,6 +116,8 @@ def build_subprocess_spawn(
             cmd += ["--cores", str(cores)]
         if getattr(args, "raw_logs", False):
             cmd.append("--raw-logs")
+        if getattr(args, "log_oom_watcher", False):
+            cmd.append("--log-oom-watcher")
         return SubprocessSpec(argv=cmd)
 
     return spawn_secondary
