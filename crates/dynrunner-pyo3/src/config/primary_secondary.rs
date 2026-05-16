@@ -290,6 +290,8 @@ impl PySecondaryConfig {
                 .primary_link_failure_window(),
             setup_deadline: self.distributed_config.setup_deadline(),
             is_observer: false,
+            resource_check_interval: self.distributed_config.resource_check_interval(),
+            log_oom_watcher: self.distributed_config.log_oom_watcher(),
         }
     }
 }

@@ -123,5 +123,6 @@ pub(super) fn test_config(num_workers: u32) -> LocalManagerConfig {
         low_resource_thresholds: ResourceMap::from([(ResourceKind::memory(), 300 * 1024 * 1024)]),
         resource_check_interval: std::time::Duration::from_millis(100),
         phase_status_log_intervals: Vec::new(),
+        log_oom_watcher: false,
     }
 }

@@ -111,6 +111,7 @@ pub(crate) fn run_local<'py>(
         config.phase_status_log_intervals_secs.clone(),
     )?;
     kwargs.set_item("stage_timeouts_secs", config.stage_timeouts_secs.clone())?;
+    kwargs.set_item("log_oom_watcher", config.log_oom_watcher)?;
 
     let cls = module(py)?.getattr("RustLocalManager")?;
     let args = (

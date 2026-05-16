@@ -42,6 +42,7 @@ async fn single_worker_subprocess_processes_all() {
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
+            log_oom_watcher: false,
         };
 
         let mut factory = PythonWorkerFactory {
@@ -215,6 +216,7 @@ async fn single_worker_named_socket_processes_all() {
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
+            log_oom_watcher: false,
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -279,6 +281,7 @@ async fn multi_worker_named_socket_processes_all() {
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
+            log_oom_watcher: false,
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -340,6 +343,7 @@ async fn multi_worker_subprocess_processes_all() {
             low_resource_thresholds: dynrunner_core::ResourceMap::from([(dynrunner_core::ResourceKind::memory(), 300 * 1024 * 1024)]),
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
+            log_oom_watcher: false,
         };
 
         let mut factory = PythonWorkerFactory {

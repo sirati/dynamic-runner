@@ -514,6 +514,8 @@ async fn setup_promote_run_with_retry_success_completes_via_runcomplete() {
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
                 is_observer: false,
+                resource_check_interval: Duration::from_millis(100),
+                log_oom_watcher: false,
             };
             let mut secondary = SecondaryCoordinator::new(
                 config,
@@ -835,6 +837,8 @@ async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete
                     primary_link_failure_window: Duration::from_secs(30),
                     setup_deadline: Duration::from_secs(60),
                     is_observer: false,
+                    resource_check_interval: Duration::from_millis(100),
+                    log_oom_watcher: false,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,
@@ -1213,6 +1217,8 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
                     primary_link_failure_window: std::time::Duration::from_secs(30),
                     setup_deadline: std::time::Duration::from_secs(60),
                     is_observer: false,
+                    resource_check_interval: std::time::Duration::from_millis(100),
+                    log_oom_watcher: false,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,
@@ -1454,6 +1460,8 @@ async fn setup_promote_multi_secondary_distributes_to_idle_peers_on_promote() {
                     primary_link_failure_window: Duration::from_secs(30),
                     setup_deadline: Duration::from_secs(60),
                     is_observer: false,
+                    resource_check_interval: Duration::from_millis(100),
+                    log_oom_watcher: false,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,
@@ -1984,6 +1992,8 @@ fn spawn_real_secondary_with_src_network(
             primary_link_failure_window: Duration::from_secs(30),
             setup_deadline: Duration::from_secs(60),
             is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -2051,6 +2061,8 @@ fn spawn_real_secondary_flaky(
             primary_link_failure_window: Duration::from_secs(30),
             setup_deadline: Duration::from_secs(60),
             is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -2430,6 +2442,8 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     primary_link_failure_window: Duration::from_secs(30),
                     setup_deadline: Duration::from_secs(60),
                     is_observer: false,
+                    resource_check_interval: Duration::from_millis(100),
+                    log_oom_watcher: false,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,

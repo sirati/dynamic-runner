@@ -120,6 +120,26 @@ pub struct SecondaryConfig {
     /// with this flag; tracked as a follow-up to this commit.
     pub is_observer: bool,
 
+    /// How often the OOM/resource-pressure check fires inside the
+    /// secondary's processing loop. Mirrors
+    /// `LocalManagerConfig::resource_check_interval`. Default: 100ms.
+    ///
+    /// Pre-extraction this was a hardcoded `Duration::from_millis(100)`
+    /// literal in `processing.rs` — the config-driven plumbing makes
+    /// secondary and LocalManager symmetric so operators can tune the
+    /// decision cadence via the same knob in both modes.
+    pub resource_check_interval: Duration,
+
+    /// Master switch for the structured OOM-watcher JSON log
+    /// (`target = "oom_watcher"`). When `true`, the per-secondary
+    /// watcher emits heartbeat + delta + kill log lines. When `false`
+    /// (default), the watcher still samples and drives the scheduler
+    /// decision but emits no log events. Mirrors
+    /// `LocalManagerConfig::log_oom_watcher`; surfaced to operators
+    /// via the `--log-oom-watcher` CLI flag and propagated to
+    /// secondaries through the SLURM wrapper's `forwarded_argv`.
+    pub log_oom_watcher: bool,
+
     /// Maximum wall-clock the secondary will spend in setup phases
     /// (send_welcome + send_cert_exchange + wait_for_setup) before
     /// concluding the cluster is dead and exiting cold. Default 60s.
@@ -163,6 +183,8 @@ impl Default for SecondaryConfig {
             primary_link_failure_threshold: primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: primary_link::DEFAULT_FAILURE_WINDOW,
             is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
             setup_deadline: Duration::from_secs(60),
         }
     }

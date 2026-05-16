@@ -40,6 +40,11 @@ pub(crate) struct PyLocalManagerConfig {
     pub(crate) phase_status_log_intervals_secs: Vec<f64>,
     #[pyo3(get, set)]
     pub(crate) scheduler_config: SchedulerConfig,
+    /// Surfaces `LocalManagerConfig.log_oom_watcher` through the
+    /// Python config so the CLI's `--log-oom-watcher` can flip it.
+    /// Default `false`.
+    #[pyo3(get, set)]
+    pub(crate) log_oom_watcher: bool,
 }
 
 #[pymethods]
@@ -58,6 +63,7 @@ impl PyLocalManagerConfig {
         resource_check_interval_secs = 0.1,
         phase_status_log_intervals_secs = None,
         scheduler_config = None,
+        log_oom_watcher = false,
     ))]
     fn new(
         num_workers: u32,
@@ -72,6 +78,7 @@ impl PyLocalManagerConfig {
         resource_check_interval_secs: f64,
         phase_status_log_intervals_secs: Option<Vec<f64>>,
         scheduler_config: Option<SchedulerConfig>,
+        log_oom_watcher: bool,
     ) -> Self {
         Self {
             num_workers,
@@ -88,6 +95,7 @@ impl PyLocalManagerConfig {
             phase_status_log_intervals_secs: phase_status_log_intervals_secs
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
             scheduler_config: scheduler_config.unwrap_or_default(),
+            log_oom_watcher,
         }
     }
 }
@@ -128,6 +136,7 @@ impl PyLocalManagerConfig {
                 .iter()
                 .map(|s| Duration::from_secs_f64(*s))
                 .collect(),
+            log_oom_watcher: self.log_oom_watcher,
         }
     }
 }

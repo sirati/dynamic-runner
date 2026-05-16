@@ -9,6 +9,7 @@ use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
 
+use crate::oom::OomWatcher;
 use crate::pool::ResourcePressureResult;
 
 use super::{LocalManager, WorkerFactory};
@@ -115,9 +116,29 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
     }
 
-    pub(super) fn check_resource_pressure(&mut self) {
+    /// Route the resource-pressure decision tick through the OOM
+    /// watcher. The watcher invokes
+    /// `WorkerPool::check_resource_pressure` itself (so kill events
+    /// can be recorded for the structured-log trigger) and returns
+    /// the verdict; the per-mode kill-outcome handling stays here in
+    /// monitor.rs, untouched from the pre-extraction shape.
+    pub(super) fn check_resource_pressure_via_watcher(&mut self, watcher: &mut OomWatcher) {
         let max = self.config.max_resources.clone();
-        match self.pool.check_resource_pressure(&self.scheduler, &max, self.in_pressure_phase) {
+        let result = watcher.on_decision(
+            &mut self.pool,
+            &self.scheduler,
+            &max,
+            self.in_pressure_phase,
+        );
+        self.handle_resource_pressure_result(result);
+    }
+
+    /// Caller-specific outcome handler for a [`ResourcePressureResult`].
+    /// Originally inlined in `check_resource_pressure`; pulled out so
+    /// both the watcher-driven path and any future direct caller share
+    /// the same Worker-0-vs-others / pressure-phase branching rules.
+    fn handle_resource_pressure_result(&mut self, result: ResourcePressureResult<I>) {
+        match result {
             ResourcePressureResult::Killed {
                 worker_id,
                 binary,

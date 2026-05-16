@@ -46,6 +46,10 @@ pub(crate) struct PyLocalManager {
     /// watchdog entirely (current default). Forwarded verbatim into
     /// `LocalManagerConfig.stage_timeouts`.
     stage_timeouts_secs: HashMap<String, f64>,
+    /// Surfaces `LocalManagerConfig.log_oom_watcher` through the
+    /// legacy pyclass so callers that bypass the typed
+    /// `LocalManagerConfig` path still pick up the flag.
+    log_oom_watcher: bool,
     types: TypeRegistry,
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
@@ -90,6 +94,7 @@ impl PyLocalManager {
         stage_timeouts_secs = None,
         max_resources = None,
         low_resource_thresholds = None,
+        log_oom_watcher = false,
     ))]
     fn new(
         py: Python<'_>,
@@ -115,6 +120,7 @@ impl PyLocalManager {
         stage_timeouts_secs: Option<HashMap<String, f64>>,
         max_resources: Option<PyResourceMap>,
         low_resource_thresholds: Option<PyResourceMap>,
+        log_oom_watcher: bool,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -205,6 +211,7 @@ impl PyLocalManager {
             phase_status_log_intervals_secs: phase_status_log_intervals_secs
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
             stage_timeouts_secs: stage_timeouts_secs.unwrap_or_default(),
+            log_oom_watcher,
             types: task.types,
             phase_deps: task.phase_deps,
             skip_existing,
@@ -276,6 +283,7 @@ impl PyLocalManager {
                 .iter()
                 .map(|s| std::time::Duration::from_secs_f64(*s))
                 .collect(),
+            log_oom_watcher: self.log_oom_watcher,
         };
 
         // TODO(phase-5a-followup): worker subprocesses currently use the

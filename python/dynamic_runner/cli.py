@@ -79,6 +79,18 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     )
     parser.add_argument("--pid", action="store_true", help="Print worker PIDs when (re)started")
     parser.add_argument(
+        "--log-oom-watcher",
+        action="store_true",
+        help=(
+            "Enable structured OOM-watcher JSON logging at "
+            "`target=oom_watcher`. The watcher emits a 10s heartbeat "
+            "plus delta-under-pressure (any tracked field +1GiB while "
+            "host RAM > 80%% full) and immediate kill events. Useful "
+            "for forensic diagnosis of OOM-killer activity; off by "
+            "default."
+        ),
+    )
+    parser.add_argument(
         "--manual-start-worker",
         action="store_true",
         help="Manually start worker processes (print command and wait)",

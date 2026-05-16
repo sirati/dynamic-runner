@@ -71,6 +71,13 @@ pub struct LocalManagerConfig {
     /// interval that the worker has just crossed will fire. Empty disables
     /// the reporter. Default: 60s, 5min, 10min, 30min, 1h.
     pub phase_status_log_intervals: Vec<Duration>,
+    /// Master switch for the structured OOM-watcher JSON log
+    /// (`target = "oom_watcher"`). When `true`, the watcher emits a
+    /// heartbeat line every 10s plus delta-under-pressure and kill
+    /// events. When `false` (default), the watcher still samples +
+    /// drives the scheduler decision but emits no log events. Surfaced
+    /// to operators via the `--log-oom-watcher` CLI flag.
+    pub log_oom_watcher: bool,
 }
 
 impl Default for LocalManagerConfig {
@@ -93,6 +100,7 @@ impl Default for LocalManagerConfig {
                 Duration::from_secs(1800),
                 Duration::from_secs(3600),
             ],
+            log_oom_watcher: false,
         }
     }
 }
