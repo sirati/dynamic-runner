@@ -404,7 +404,7 @@ impl PySecondaryCoordinator {
                     let cert_pem = pn.cert_pem().to_string();
                     let port = pn.port();
                     (
-                        dynrunner_transport_quic::EitherPeerTransport::Real(pn),
+                        dynrunner_transport_quic::EitherPeerTransport::Real(Box::new(pn)),
                         cert_pem,
                         port,
                     )

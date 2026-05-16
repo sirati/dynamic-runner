@@ -378,8 +378,8 @@ async fn either_peer_transport_real_round_trips_a_message() {
             let cert_pem_a = pn_a.cert_pem().to_string();
             let cert_pem_b = pn_b.cert_pem().to_string();
 
-            let mut peer_a: EitherPeerTransport<TestId> = EitherPeerTransport::Real(pn_a);
-            let mut peer_b: EitherPeerTransport<TestId> = EitherPeerTransport::Real(pn_b);
+            let mut peer_a: EitherPeerTransport<TestId> = EitherPeerTransport::Real(Box::new(pn_a));
+            let mut peer_b: EitherPeerTransport<TestId> = EitherPeerTransport::Real(Box::new(pn_b));
 
             let peers = vec![
                 PeerConnectionInfo {

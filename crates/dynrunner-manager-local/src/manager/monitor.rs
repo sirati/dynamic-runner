@@ -123,6 +123,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 reason,
             } => {
                 if let Some(binary) = binary {
+                    // `binary` is `Box<TaskInfo<I>>` (boxed in
+                    // `ResourcePressureResult::Killed` to shrink the
+                    // variant). Field access auto-derefs through the
+                    // box; we unbox only at the FailedTask/requeue
+                    // boundary where the by-value `TaskInfo<I>` is
+                    // required.
                     if worker_id == 0 {
                         // Worker 0 is the last resort — if it can't fit, the task
                         // is truly OOM and goes to the resource_pressure_tasks queue.
@@ -135,7 +141,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                             binary.task_id.as_deref(),
                         );
                         self.resource_pressure_tasks.push(FailedTask {
-                            binary,
+                            binary: *binary,
                             error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
                             error_message: reason,
                             retry_count: 0,
@@ -147,7 +153,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                         // The task was in-flight in the pool (take_from_view
                         // bumped in-flight); `requeue` decrements in-flight
                         // and pushes the item to the front of its bucket.
-                        self.pool_mut().requeue(binary);
+                        self.pool_mut().requeue(*binary);
                     } else {
                         // OOM phase for non-worker-0: task is dropped, matching
                         // Python's behavior where _handle_oom_killed_task is

@@ -144,7 +144,7 @@ pub(super) async fn dial_peer(
 
     if let Some((addr, conn)) = race_wss(&addrs, ATTEMPT_TIMEOUT).await {
         tracing::info!(peer = peer_id, %addr, "connected to peer via WSS");
-        return Some(PeerConnection::Wss(conn));
+        return Some(PeerConnection::Wss(Box::new(conn)));
     }
 
     tracing::error!(peer = peer_id, "WSS race to peer failed across all addresses");
