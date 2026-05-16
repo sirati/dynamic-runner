@@ -3,6 +3,7 @@
 
 use super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
 use super::*;
+use std::time::Duration;
 use dynrunner_core::TaskInfo;
 use dynrunner_protocol_primary_secondary::{DistributedBinaryInfo, MessageType};
 use dynrunner_scheduler::ResourceStealingScheduler;
