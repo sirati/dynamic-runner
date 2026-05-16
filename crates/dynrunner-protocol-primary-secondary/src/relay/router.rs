@@ -675,6 +675,13 @@ impl<I: Identifier> Router<I> {
     /// Apply the forward-step decision: deliver direct, send a new
     /// Relay envelope (recording bookkeeping for backoff), or send a
     /// `RelayBackoff` to our predecessor on dead-end.
+    ///
+    /// The argument list mirrors the `DistributedMessage::Relay`
+    /// envelope fields the caller just destructured plus the routing
+    /// context (connections + clocks). Collapsing them into a struct
+    /// would just move the destructure-then-rebuild one step out;
+    /// the helper is internal with a single call site.
+    #[allow(clippy::too_many_arguments)]
     fn apply_forward_decision<C: OutboundChannel<I>>(
         &mut self,
         decision: RouteDecision<I>,
