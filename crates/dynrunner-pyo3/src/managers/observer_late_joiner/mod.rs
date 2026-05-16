@@ -67,6 +67,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::config::distributed::DistributedConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::task_def::LoadedTopology;
 
 mod helpers;
@@ -126,6 +127,13 @@ pub(crate) struct PyObserverLateJoiner {
     /// order is stable regardless of insertion sequence on the
     /// Python side.
     pub(super) holdings: std::collections::HashSet<String>,
+    /// Scheduler tuning forwarded into the observer-mode
+    /// `SecondaryCoordinator`'s inner `ResourceStealingScheduler`. The
+    /// observer never spawns workers (`num_workers = 0`), but the
+    /// coordinator still constructs the scheduler at run start — keep
+    /// the tuning surface consistent with the other Rust manager-hosting
+    /// pyclasses so a single CLI flag pair drives every node uniformly.
+    pub(super) scheduler_config: SchedulerConfig,
     pub(super) completed: u32,
 }
 
@@ -140,6 +148,7 @@ pub(crate) struct PyObserverLateJoiner {
     observer_id = None,
     distributed_config = None,
     holdings = None,
+    scheduler_config = None,
 ))]
 pub(crate) fn run_observer_late_joiner<'py>(
     py: Python<'py>,
@@ -148,6 +157,7 @@ pub(crate) fn run_observer_late_joiner<'py>(
     observer_id: Option<String>,
     distributed_config: Option<DistributedConfig>,
     holdings: Option<Vec<String>>,
+    scheduler_config: Option<SchedulerConfig>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     if let Some(id) = observer_id.as_ref() {
@@ -158,6 +168,9 @@ pub(crate) fn run_observer_late_joiner<'py>(
     }
     if let Some(h) = holdings.as_ref() {
         kwargs.set_item("holdings", h.clone())?;
+    }
+    if let Some(sc) = scheduler_config.as_ref() {
+        kwargs.set_item("scheduler_config", sc.clone())?;
     }
     // Resolve the legacy class via the package, mirroring `run_secondary`
     // / `run_distributed`'s "build-via-Python-module-attribute" pattern

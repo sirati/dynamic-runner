@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::config::primary_secondary::PyPrimaryConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::managers::lifecycle::{fire_on_run_end, fire_on_run_start};
 
 use super::module;
@@ -60,6 +61,7 @@ use super::module;
     fulfillability_matcher = None,
     peer_lifecycle_listener = None,
     task_completed_listener = None,
+    scheduler_config = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_primary<'py>(
@@ -78,6 +80,7 @@ pub(crate) fn run_primary<'py>(
     fulfillability_matcher: Option<Py<PyAny>>,
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
+    scheduler_config: Option<SchedulerConfig>,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
@@ -104,6 +107,9 @@ pub(crate) fn run_primary<'py>(
     }
     if let Some(l) = task_completed_listener.as_ref() {
         kwargs.set_item("task_completed_listener", l)?;
+    }
+    if let Some(sc) = scheduler_config.as_ref() {
+        kwargs.set_item("scheduler_config", sc.clone())?;
     }
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;

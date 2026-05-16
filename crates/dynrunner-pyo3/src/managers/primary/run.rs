@@ -7,7 +7,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::{PrimaryConfig, PrimaryCoordinator, RunError};
-use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkServer;
 
 use crate::identifier::RunnerIdentifier;
@@ -95,6 +94,12 @@ impl PyPrimaryCoordinator {
         // single source-of-truth they cannot accidentally re-derive.
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
+        // Capture the scheduler-tuning snapshot here on the GIL thread so
+        // the detached-runtime block can build the inner
+        // `ResourceStealingScheduler` with the operator-supplied
+        // OOM-preempt margin / pressure threshold rather than the bare
+        // `ResourceStealingScheduler::memory()` default.
+        let scheduler_config = self.scheduler_config.clone();
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
         // owns the single-shot guard and the snapshot ordering; the
@@ -352,7 +357,7 @@ impl PyPrimaryCoordinator {
                         config,
                         server,
                         peer_transport,
-                        ResourceStealingScheduler::memory(),
+                        scheduler_config.build_memory_scheduler(),
                         estimator,
                     );
 

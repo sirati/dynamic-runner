@@ -25,6 +25,7 @@ use dynrunner_core::{PhaseId, ResourceMap};
 
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::task_def::TypeRegistry;
@@ -84,5 +85,13 @@ pub(crate) struct PySecondaryCoordinator {
     /// start. Constructor-only — see the matching field on
     /// `PyPrimaryCoordinator` for the rationale.
     pub(super) peer_lifecycle_listener: Option<Py<PyAny>>,
+    /// Scheduler tuning forwarded into the `ResourceStealingScheduler`
+    /// the coordinator constructs at `run()` start. Carries the
+    /// `cgroup_safety_margin` / `pressure_threshold` knobs so the
+    /// secondary's userland OOM-preempt fires before the kernel's
+    /// cgroup-OOM (mirrors the `PyLocalManager` / `PyPrimaryCoordinator`
+    /// surface so every Rust manager-hosting pyclass exposes the same
+    /// tuning shape).
+    pub(super) scheduler_config: SchedulerConfig,
     pub(super) completed: u32,
 }

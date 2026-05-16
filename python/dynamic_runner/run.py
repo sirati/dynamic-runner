@@ -218,6 +218,27 @@ def _build_respawn_args(args: argparse.Namespace, spawn_secondary) -> tuple:
     )
 
 
+def _build_scheduler_config(args: argparse.Namespace):
+    """Construct a ``SchedulerConfig`` from the OOM-preempt CLI knobs.
+
+    Single concern: turn the ``--oom-cgroup-safety-margin`` /
+    ``--oom-pressure-threshold`` argparse strings (M/G-suffixed) into a
+    typed PyO3 ``SchedulerConfig`` every Rust manager-hosting pyclass
+    accepts. Pulled out of every dispatcher so all six modes
+    (``--multi-computer local`` / ``slurm`` / ``single-process`` /
+    plain in-process, plus the secondary and observer late-joiner) feed
+    the same operator-supplied margins into their inner scheduler.
+    The argparse defaults (``"1G"`` / ``"500M"``) guarantee these
+    attributes always exist; callers don't need a fallback.
+    """
+    import dynamic_runner as _rs
+
+    return _rs.SchedulerConfig(
+        cgroup_safety_margin=_rs.parse_memory(args.oom_cgroup_safety_margin),
+        pressure_threshold=_rs.parse_memory(args.oom_pressure_threshold),
+    )
+
+
 def _dispatch_local(task, args, config, logger) -> None:
     """Standard in-process local manager."""
     import dynamic_runner as _rs
@@ -234,13 +255,10 @@ def _dispatch_local(task, args, config, logger) -> None:
 
     # SchedulerConfig surfaces the OOM headroom knobs operators need
     # to keep the framework's userland preempt ahead of the kernel's
-    # cgroup-OOM. Both `--oom-cgroup-safety-margin` and
-    # `--oom-pressure-threshold` are absolute byte counts parsed via
-    # the same `parse_memory` helper as `--max-memory` (M/G suffixes).
-    scheduler_config = _rs.SchedulerConfig(
-        cgroup_safety_margin=_rs.parse_memory(args.oom_cgroup_safety_margin),
-        pressure_threshold=_rs.parse_memory(args.oom_pressure_threshold),
-    )
+    # cgroup-OOM. Built once per dispatch via the shared helper so
+    # every mode (local / slurm / distributed / observer) consumes the
+    # same CLI surface.
+    scheduler_config = _build_scheduler_config(args)
     cfg = _rs.LocalManagerConfig(
         num_workers=num_cores,
         max_resources=_rs.ResourceMap({"memory": max_memory}),
@@ -444,6 +462,7 @@ def _dispatch_secondary(task, args, logger) -> None:
         str(cfg.output_dir),
         skip_existing=args.skip_existing,
         log_dir=getattr(args, "log_dir", None),
+        scheduler_config=_build_scheduler_config(args),
     )
 
 
@@ -497,6 +516,7 @@ def _dispatch_late_joiner(task, args, logger) -> None:
         args.observer_join_from_peer_info_dir,
         task,
         distributed_config=distributed_config,
+        scheduler_config=_build_scheduler_config(args),
     )
     logger.info(f"Observer Completed (observed): {result['completed']}")
 
@@ -580,6 +600,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         task_completed_listener=getattr(task, "task_completed_listener", None),
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
         log_dir=getattr(args, "log_dir", None),
+        scheduler_config=_build_scheduler_config(args),
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
@@ -640,6 +661,7 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         task,
         spawn_secondary,
         binaries,
+        scheduler_config=_build_scheduler_config(args),
         source_dir=str(config.source_dir),
         # `output_dir` + `task_args` together unlock `on_run_start` on
         # the primary side: the Rust shim fires the hook with a freshly-

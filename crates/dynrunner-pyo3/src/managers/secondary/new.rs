@@ -13,6 +13,7 @@ use dynrunner_core::{ResourceKind, ResourceMap};
 use crate::config::distributed::DistributedConfig;
 use crate::config::log_paths::LogPathConfig;
 use crate::config::resources::PyResourceMap;
+use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::task_def::LoadedTaskDefinition;
 
@@ -39,6 +40,7 @@ impl PySecondaryCoordinator {
         max_resources = None,
         peer_lifecycle_listener = None,
         log_dir = None,
+        scheduler_config = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -62,6 +64,7 @@ impl PySecondaryCoordinator {
         max_resources: Option<PyResourceMap>,
         peer_lifecycle_listener: Option<Py<PyAny>>,
         log_dir: Option<String>,
+        scheduler_config: Option<SchedulerConfig>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -126,6 +129,7 @@ impl PySecondaryCoordinator {
             task_definition_py: task_definition.clone().unbind(),
             task_args_py: task_args.clone().unbind(),
             peer_lifecycle_listener,
+            scheduler_config: scheduler_config.unwrap_or_default(),
             completed: 0,
         })
     }

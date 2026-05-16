@@ -5,6 +5,7 @@ use pyo3::types::PyDict;
 
 use crate::config::log_paths::LogPathConfig;
 use crate::config::primary_secondary::PySecondaryConfig;
+use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::managers::lifecycle::{fire_on_run_end, fire_on_run_start};
 
@@ -23,6 +24,7 @@ use super::module;
     log_paths = None,
     worker_spec = None,
     log_dir = None,
+    scheduler_config = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_secondary<'py>(
@@ -37,6 +39,7 @@ pub(crate) fn run_secondary<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
     log_dir: Option<String>,
+    scheduler_config: Option<SchedulerConfig>,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_bytes` retained for back-compat; the typed
     // path passes the full multi-resource map via the `max_resources`
@@ -61,6 +64,9 @@ pub(crate) fn run_secondary<'py>(
     // src_tmp is non-Optional on PySecondaryConfig (always
     // resolved by `__new__`); pass it through unconditionally.
     kwargs.set_item("src_tmp", config.src_tmp.clone())?;
+    if let Some(sc) = scheduler_config.as_ref() {
+        kwargs.set_item("scheduler_config", sc.clone())?;
+    }
 
     let cls = module(py)?.getattr("RustSecondaryCoordinator")?;
     let args = (

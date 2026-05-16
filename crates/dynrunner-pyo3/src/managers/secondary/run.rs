@@ -8,7 +8,6 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_manager_distributed::{RunOutcome, SecondaryConfig, SecondaryCoordinator};
-use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_quic::NetworkClient;
 
 use crate::config::connection::ConnectionMode;
@@ -34,6 +33,7 @@ impl PySecondaryCoordinator {
         let log_dir = self.log_dir.clone();
         let log_paths = self.log_paths.clone();
         let worker_spec = self.worker_spec.clone();
+        let scheduler_config = self.scheduler_config.clone();
         let dist_keepalive = self.distributed_config.keepalive_interval();
         let dist_peer_timeout = self.distributed_config.peer_timeout();
         let dist_connect_timeout = self.distributed_config.connect_timeout();
@@ -290,7 +290,7 @@ impl PySecondaryCoordinator {
                     config,
                     client,
                     peer_network,
-                    ResourceStealingScheduler::memory(),
+                    scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
 
