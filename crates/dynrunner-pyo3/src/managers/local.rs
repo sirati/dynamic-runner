@@ -305,25 +305,26 @@ impl PyLocalManager {
             log_oom_watcher: self.log_oom_watcher,
         };
 
-        // TODO(phase-5a-followup): worker subprocesses currently use the
-        // first type's worker_module + cmd_args; restart-on-type-shift
-        // (so each worker is bound to a single TypeId for its lifetime)
-        // is not yet implemented. The subprocess factory should grow a
-        // `spawn_worker(worker_id, type_id)` overload that consults the
-        // full `TypeRegistry` instead of a single string.
-        let first_type = self.types.first().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
+        // Per-type subprocess dispatch: the factory carries the full
+        // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
+        // for initial pool init (preserves pre-fix single-type
+        // behaviour); `spawn_worker_for_type` consults the registry
+        // for per-task respawn on TypeId mismatch. Multi-phase
+        // `TaskDefinition`s with one `TaskTypeSpec` per phase route
+        // through the latter automatically via
+        // `WorkerPool::ensure_worker_for_type`.
+        if self.types.first().is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
                 "task_definition.get_phases() yielded zero TaskTypeSpec entries",
-            )
-        })?;
+            ));
+        }
         let mut factory = SubprocessWorkerFactory {
             python_executable: self.python_executable.clone(),
             source_dir: self.source_dir.clone(),
             output_dir: self.output_dir.clone(),
             log_dir: self.log_dir.clone(),
             log_paths: self.log_paths.clone(),
-            worker_module: first_type.worker_module.clone(),
-            worker_cmd_args: first_type.cmd_args.clone(),
+            types: self.types.clone(),
             skip_existing: self.skip_existing,
             connection_mode: self.connection_mode.clone(),
             manual_start_worker: self.manual_start_worker,

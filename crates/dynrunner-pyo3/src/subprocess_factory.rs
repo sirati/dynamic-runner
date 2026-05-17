@@ -2,7 +2,7 @@ use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use dynrunner_core::WorkerId;
+use dynrunner_core::{TypeId, WorkerId};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
 use dynrunner_transport_socket::socketpair::create_socketpair;
@@ -10,6 +10,7 @@ use dynrunner_transport_socket::socketpair::create_socketpair;
 use crate::config::connection::ConnectionMode;
 use crate::config::log_paths::LogPathConfig;
 use crate::config::worker_spec::{RenderedCommand, WorkerSpec, WorkerVars};
+use crate::task_def::{TypeRegistry, TypeRuntime};
 use crate::transport::EitherManagerEnd;
 
 /// Grace period between SIGTERM and SIGKILL during teardown. Matches
@@ -154,14 +155,27 @@ enum FdOrSocket<'a> {
 }
 
 /// Subprocess worker factory: spawns Python workers via socketpair or named socket.
+///
+/// Per-type dispatch: each spawn resolves a [`TypeRuntime`] off of
+/// [`types`] (the full `TypeRegistry` from the loaded `TaskDefinition`)
+/// to pick the `worker_module` and `cmd_args` that match the task's
+/// `TypeId`. `spawn_worker` (initial pool init) uses `types.first()`
+/// to preserve the pre-fix single-type behaviour; `spawn_worker_for_type`
+/// (the per-type respawn entry the pool fires on TypeId mismatch)
+/// looks the requested `TypeId` up in the registry. Empty registries
+/// surface a clear error.
 pub(crate) struct SubprocessWorkerFactory {
     pub(crate) python_executable: PathBuf,
     pub(crate) source_dir: PathBuf,
     pub(crate) output_dir: PathBuf,
     pub(crate) log_dir: PathBuf,
     pub(crate) log_paths: LogPathConfig,
-    pub(crate) worker_module: String,
-    pub(crate) worker_cmd_args: Vec<String>,
+    /// All `TaskTypeSpec` runtimes extracted from
+    /// `TaskDefinition.get_phases()`. The single source of truth the
+    /// factory consults for per-spawn argv. Cloned in once at
+    /// construction so the factory does not borrow `TaskDefinition`
+    /// state for the run lifetime.
+    pub(crate) types: TypeRegistry,
     pub(crate) skip_existing: bool,
     pub(crate) connection_mode: ConnectionMode,
     pub(crate) manual_start_worker: bool,
@@ -173,14 +187,51 @@ pub(crate) struct SubprocessWorkerFactory {
 }
 
 impl SubprocessWorkerFactory {
+    /// Resolve the `TypeRuntime` for `type_id`, or surface a clear
+    /// error if the registry has no entry for it. The lookup error
+    /// indicates a `TaskDefinition.get_phases()` / `TaskInfo.type_id`
+    /// mismatch — every `type_id` the manager dispatches must have
+    /// come from the same `get_phases()` call that populated the
+    /// registry.
+    fn type_runtime_for(&self, type_id: &TypeId) -> Result<&TypeRuntime, String> {
+        self.types.get(type_id).ok_or_else(|| {
+            format!(
+                "no TypeRuntime registered for TypeId '{type_id}'; \
+                 TaskDefinition.get_phases() did not declare it"
+            )
+        })
+    }
+
+    /// Resolve a fallback `TypeRuntime` for initial-spawn paths that
+    /// have not yet observed a task's `type_id`. Returns the
+    /// `types.first()` entry — matching the pre-fix single-type
+    /// behaviour where every worker spawned with the first declared
+    /// type's argv. Errors when the registry is empty (a
+    /// programmer-error: every `TaskDefinition` declaring at least one
+    /// type was already validated at `LoadedTaskDefinition::from_python`
+    /// time; an empty registry can only happen in the observer
+    /// placeholder path where this fallback is unreachable anyway).
+    fn first_type_runtime(&self) -> Result<&TypeRuntime, String> {
+        self.types
+            .first()
+            .ok_or_else(|| "TypeRegistry is empty; cannot spawn worker".to_string())
+    }
+
     /// Build the legacy hardcoded argv when no explicit `WorkerSpec` was
-    /// provided. The first element is the executable.
-    fn legacy_argv(&self, worker_id: WorkerId, fd_or_socket: FdOrSocket<'_>) -> Vec<String> {
+    /// provided. `runtime` decides the `worker_module` + per-type
+    /// `cmd_args`; everything else is factory-global. The first
+    /// element is the executable.
+    fn legacy_argv(
+        &self,
+        worker_id: WorkerId,
+        runtime: &TypeRuntime,
+        fd_or_socket: FdOrSocket<'_>,
+    ) -> Vec<String> {
         let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
         let mut argv: Vec<String> = vec![
             self.python_executable.to_string_lossy().into_owned(),
             "-m".into(),
-            self.worker_module.clone(),
+            runtime.worker_module.clone(),
         ];
         match fd_or_socket {
             FdOrSocket::Fd(fd) => {
@@ -201,7 +252,7 @@ impl SubprocessWorkerFactory {
         if self.skip_existing {
             argv.push("--skip_existing".into());
         }
-        for arg in &self.worker_cmd_args {
+        for arg in &runtime.cmd_args {
             argv.push(arg.clone());
         }
         argv
@@ -209,10 +260,12 @@ impl SubprocessWorkerFactory {
 
     /// Build the rendered argv + env + cwd for a worker, picking the explicit
     /// `WorkerSpec` template when present and falling back to the legacy argv
-    /// otherwise.
+    /// otherwise. `runtime` carries the per-type `worker_module` and
+    /// `cmd_args` that drive the resulting argv.
     fn render_command(
         &self,
         worker_id: WorkerId,
+        runtime: &TypeRuntime,
         fd_or_socket: FdOrSocket<'_>,
     ) -> RenderedCommand {
         let worker_log = self.log_paths.worker_log(&self.log_dir, worker_id);
@@ -229,7 +282,7 @@ impl SubprocessWorkerFactory {
             })
         } else {
             RenderedCommand {
-                argv: self.legacy_argv(worker_id, fd_or_socket),
+                argv: self.legacy_argv(worker_id, runtime, fd_or_socket),
                 env: std::collections::HashMap::new(),
                 cwd: None,
             }
@@ -291,12 +344,26 @@ impl SubprocessWorkerFactory {
     }
 
     /// Store a freshly-spawned child in the per-worker slot.
+    ///
+    /// If the slot already holds a `Child` (per-type respawn — the
+    /// pool's `ensure_worker_for_type` SIGKILLed the prior worker
+    /// before this call), the prior occupant is taken out and given
+    /// the SIGTERM → grace → SIGKILL terminate ladder before the new
+    /// `Child` lands. This reaps the prior PID synchronously so the
+    /// kernel does not leak a zombie until the manager exits + init
+    /// reaps it. `std::process::Child::drop` is a no-op on Unix —
+    /// no implicit `wait()` — so without this the previous restart
+    /// path quietly leaked zombies on every slot replacement.
     fn track_child(&mut self, worker_id: WorkerId, child: std::process::Child) -> u32 {
         let pid = child.id();
         let idx = worker_id as usize;
         if self.child_processes.len() <= idx {
             self.child_processes.resize_with(idx + 1, || None);
         }
+        // Single-slot version of `terminate_children` — the prior
+        // occupant (if any) is reaped before its handle is dropped.
+        let mut prior = [self.child_processes[idx].take()];
+        terminate_children(&mut prior);
         self.child_processes[idx] = Some(child);
         pid
     }
@@ -305,11 +372,12 @@ impl SubprocessWorkerFactory {
     fn spawn_socketpair(
         &mut self,
         worker_id: WorkerId,
+        runtime: &TypeRuntime,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         let (manager_end, child_fd) =
             create_socketpair().map_err(|e| format!("failed to create socketpair: {e}"))?;
 
-        let rendered = self.render_command(worker_id, FdOrSocket::Fd(child_fd));
+        let rendered = self.render_command(worker_id, runtime, FdOrSocket::Fd(child_fd));
         let mut cmd = Self::command_from_rendered(&rendered);
 
         use std::os::unix::process::CommandExt;
@@ -335,13 +403,14 @@ impl SubprocessWorkerFactory {
     fn spawn_named(
         &mut self,
         worker_id: WorkerId,
+        runtime: &TypeRuntime,
         socket_dir: &Path,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         let socket_path = self.log_paths.socket_path(socket_dir, worker_id);
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)
             .map_err(|e| format!("failed to bind named socket: {e}"))?;
 
-        let rendered = self.render_command(worker_id, FdOrSocket::Socket(&socket_path));
+        let rendered = self.render_command(worker_id, runtime, FdOrSocket::Socket(&socket_path));
 
         if self.manual_start_worker {
             tracing::info!(
@@ -373,18 +442,49 @@ impl SubprocessWorkerFactory {
     }
 }
 
+impl SubprocessWorkerFactory {
+    /// Internal entry: spawn with an explicit `TypeRuntime` reference.
+    /// Both `spawn_worker` (first-type fallback for initial pool init)
+    /// and `spawn_worker_for_type` (per-type respawn for type-shift)
+    /// funnel through here so the connection-mode dispatch lives in
+    /// exactly one place.
+    fn spawn_with_runtime(
+        &mut self,
+        worker_id: WorkerId,
+        runtime: &TypeRuntime,
+    ) -> Result<(EitherManagerEnd, Option<u32>), String> {
+        match &self.connection_mode {
+            ConnectionMode::Socketpair => self.spawn_socketpair(worker_id, runtime),
+            ConnectionMode::Named { socket_dir } => {
+                let socket_dir = socket_dir.clone();
+                self.spawn_named(worker_id, runtime, &socket_dir)
+            }
+        }
+    }
+}
+
 impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
     fn spawn_worker(
         &mut self,
         worker_id: WorkerId,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
-        match &self.connection_mode {
-            ConnectionMode::Socketpair => self.spawn_socketpair(worker_id),
-            ConnectionMode::Named { socket_dir } => {
-                let socket_dir = socket_dir.clone();
-                self.spawn_named(worker_id, &socket_dir)
-            }
-        }
+        // Clone the first-type runtime so the immutable borrow against
+        // `self.types` is released before `spawn_with_runtime` takes
+        // `&mut self`. The clone is cheap — `TypeRuntime` holds Arc-
+        // backed strings + a `Vec<String>` of cmd_args; only the
+        // cmd_args vec actually copies, and at the once-per-restart
+        // cadence this is dominated by the cost of forking Python.
+        let runtime = self.first_type_runtime()?.clone();
+        self.spawn_with_runtime(worker_id, &runtime)
+    }
+
+    fn spawn_worker_for_type(
+        &mut self,
+        worker_id: WorkerId,
+        type_id: &TypeId,
+    ) -> Result<(EitherManagerEnd, Option<u32>), String> {
+        let runtime = self.type_runtime_for(type_id)?.clone();
+        self.spawn_with_runtime(worker_id, &runtime)
     }
 }
 

@@ -220,8 +220,14 @@ impl PyObserverLateJoiner {
                     output_dir: PathBuf::new(),
                     log_dir: PathBuf::new(),
                     log_paths: Default::default(),
-                    worker_module: String::new(),
-                    worker_cmd_args: Vec::new(),
+                    // Empty registry — the observer's factory is
+                    // unreachable (snapshot-restore latches
+                    // setup_phase_completed=true before any
+                    // `initialize_workers` would consult it). Empty is
+                    // the correct placeholder; first_type_runtime()
+                    // would surface a clear error if a future code
+                    // path accidentally reached spawn.
+                    types: Default::default(),
                     skip_existing: false,
                     connection_mode: ConnectionMode::Socketpair,
                     manual_start_worker: false,
