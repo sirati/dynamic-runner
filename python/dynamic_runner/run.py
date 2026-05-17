@@ -461,12 +461,22 @@ def _dispatch_secondary(task, args, logger) -> None:
     # string (operator opting out) collapses to None so
     # `SecondaryConfig.mem_manager_reserved_bytes` stays unset and
     # the legacy flat layout applies.
+    # `--mem-manager-reserved` arrives in two shapes: a human-readable
+    # spec ("500M" / "1G") from the operator-facing CLI, OR the
+    # already-parsed decimal byte count (`524288000`) rendered by the
+    # SLURM wrapper-script generator that consumed the operator's
+    # spec at dispatch time. The bytes form is the round-trip:
+    # dispatcher parses → wraps into argv → secondary reads it back.
+    # `parse_memory` only accepts the suffix form, so route raw
+    # decimals straight through `int()` and only fall back to the
+    # framework parser when there's an M/G suffix actually present.
     mem_manager_reserved_spec = getattr(args, "mem_manager_reserved", "")
-    mem_manager_reserved_bytes = (
-        _rs.parse_memory(mem_manager_reserved_spec)
-        if mem_manager_reserved_spec
-        else None
-    )
+    if not mem_manager_reserved_spec:
+        mem_manager_reserved_bytes = None
+    elif mem_manager_reserved_spec.isdigit():
+        mem_manager_reserved_bytes = int(mem_manager_reserved_spec)
+    else:
+        mem_manager_reserved_bytes = _rs.parse_memory(mem_manager_reserved_spec)
     logger.info(
         f"resolved per-machine resources: args.cores={args.cores!r} → "
         f"num_workers={num_workers}, args.max_memory={args.max_memory!r} → "
