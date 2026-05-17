@@ -536,6 +536,162 @@ mod tests {
         );
     }
 
+    /// Build a two-type `TypeRegistry` fixture for the per-type
+    /// dispatch tests below. `worker_module` is the only field these
+    /// tests inspect; the rest match the defaults
+    /// `LoadedTaskDefinition::from_python` would emit.
+    fn make_two_type_registry() -> TypeRegistry {
+        use std::collections::HashMap;
+        let mut types = Vec::new();
+        let mut index_by_id: HashMap<TypeId, usize> = HashMap::new();
+        for (i, (id, module)) in [
+            ("tokenize", "asm_tokenizer.worker_tokenize"),
+            ("unify_vocab", "asm_tokenizer.worker_unify_vocab"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let type_id = TypeId::from(*id);
+            index_by_id.insert(type_id.clone(), i);
+            types.push(TypeRuntime {
+                type_id,
+                worker_module: (*module).to_string(),
+                cmd_args: Vec::new(),
+                timeout: None,
+                reserved_memory_per_worker: 0,
+            });
+        }
+        TypeRegistry { types, index_by_id }
+    }
+
+    /// Build a `SubprocessWorkerFactory` backed by the two-type
+    /// registry, with a `manual_start_worker=true` named-socket
+    /// connection mode. The manual-start flag short-circuits the
+    /// child-spawn step so the test exercises the registry lookup +
+    /// argv-render path WITHOUT actually executing Python — important
+    /// because the dynrunner-pyo3 lib test target cannot link against
+    /// CPython (see `task_def.rs`'s phase-5a-followup note). Tests
+    /// that want to assert "which TypeRuntime did the factory pick
+    /// for this spawn?" wrap the call through `render_command` or
+    /// the public trait method and inspect the resulting argv.
+    fn make_factory_with_two_types() -> SubprocessWorkerFactory {
+        SubprocessWorkerFactory {
+            python_executable: PathBuf::from("/usr/bin/python3"),
+            source_dir: PathBuf::from("/tmp/src"),
+            output_dir: PathBuf::from("/tmp/out"),
+            log_dir: PathBuf::from("/tmp/log"),
+            log_paths: Default::default(),
+            types: make_two_type_registry(),
+            skip_existing: false,
+            connection_mode: ConnectionMode::Named {
+                socket_dir: PathBuf::from("/tmp/sockets"),
+            },
+            manual_start_worker: true,
+            worker_spec: None,
+            child_processes: Vec::new(),
+        }
+    }
+
+    /// Regression pin: `type_runtime_for` returns the registered
+    /// `TypeRuntime` for declared `TypeId`s and a structured error
+    /// for unknown ones. This is the lookup `spawn_worker_for_type`
+    /// funnels through; without it, an unknown `TypeId` would silently
+    /// fall back to `first()` and load the wrong module — the exact
+    /// bug this commit set out to fix.
+    #[test]
+    fn type_runtime_for_resolves_declared_types() {
+        let factory = make_factory_with_two_types();
+        let tokenize = TypeId::from("tokenize");
+        let unify = TypeId::from("unify_vocab");
+        assert_eq!(
+            factory.type_runtime_for(&tokenize).unwrap().worker_module,
+            "asm_tokenizer.worker_tokenize"
+        );
+        assert_eq!(
+            factory.type_runtime_for(&unify).unwrap().worker_module,
+            "asm_tokenizer.worker_unify_vocab"
+        );
+    }
+
+    #[test]
+    fn type_runtime_for_unknown_type_id_errors_with_clear_message() {
+        let factory = make_factory_with_two_types();
+        let unknown = TypeId::from("memmap");
+        let err = factory.type_runtime_for(&unknown).unwrap_err();
+        assert!(
+            err.contains("no TypeRuntime registered") && err.contains("memmap"),
+            "error message should name the missing TypeId; got: {err}"
+        );
+    }
+
+    /// Regression pin: `first_type_runtime` returns the first-declared
+    /// type (preserving the pre-fix single-type `types.first()`
+    /// fallback) and surfaces an empty-registry error rather than
+    /// panicking. The empty-registry case is hit by the observer
+    /// placeholder factory and any other unreachable-spawn site.
+    #[test]
+    fn first_type_runtime_uses_first_declared_type() {
+        let factory = make_factory_with_two_types();
+        assert_eq!(
+            factory.first_type_runtime().unwrap().worker_module,
+            "asm_tokenizer.worker_tokenize"
+        );
+    }
+
+    #[test]
+    fn first_type_runtime_on_empty_registry_errors() {
+        let factory = SubprocessWorkerFactory {
+            python_executable: PathBuf::from("/usr/bin/python3"),
+            source_dir: PathBuf::new(),
+            output_dir: PathBuf::new(),
+            log_dir: PathBuf::new(),
+            log_paths: Default::default(),
+            types: TypeRegistry::default(),
+            skip_existing: false,
+            connection_mode: ConnectionMode::Named {
+                socket_dir: PathBuf::new(),
+            },
+            manual_start_worker: true,
+            worker_spec: None,
+            child_processes: Vec::new(),
+        };
+        let err = factory.first_type_runtime().unwrap_err();
+        assert!(
+            err.contains("empty"),
+            "empty-registry error should say so; got: {err}"
+        );
+    }
+
+    /// End-to-end pin on the per-type argv-render path: render twice,
+    /// once with each type's `TypeRuntime`, and confirm the resulting
+    /// argv carries the matching `-m <worker_module>` segment. This is
+    /// the wire-level proof that a type-shift respawn produces
+    /// observably different command lines — i.e. the worker
+    /// subprocess actually loads the correct Python module for the
+    /// task's `type_id`.
+    #[test]
+    fn render_command_emits_per_type_worker_module() {
+        let factory = make_factory_with_two_types();
+        let tokenize = factory
+            .type_runtime_for(&TypeId::from("tokenize"))
+            .unwrap()
+            .clone();
+        let unify = factory
+            .type_runtime_for(&TypeId::from("unify_vocab"))
+            .unwrap()
+            .clone();
+
+        let tmp = std::path::PathBuf::from("/tmp/sock");
+        let rendered_a = factory.render_command(0, &tokenize, FdOrSocket::Socket(&tmp));
+        let rendered_b = factory.render_command(0, &unify, FdOrSocket::Socket(&tmp));
+
+        // The `-m <module>` pair sits right after the executable.
+        assert_eq!(rendered_a.argv[1], "-m");
+        assert_eq!(rendered_a.argv[2], "asm_tokenizer.worker_tokenize");
+        assert_eq!(rendered_b.argv[1], "-m");
+        assert_eq!(rendered_b.argv[2], "asm_tokenizer.worker_unify_vocab");
+    }
+
     /// A child that ignores SIGTERM must be escalated to SIGKILL once
     /// the grace window expires. Bounds the total wait so the test
     /// fails fast if the escalation ladder breaks.
