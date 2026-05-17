@@ -63,6 +63,14 @@ impl PySecondaryCoordinator {
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
+        // Bound from the secondary's control plane in Commit B
+        // (the PyO3 follow-up). Until then, hardcoded to `None`
+        // (unbounded) — same default a Python caller would get
+        // by omitting the kwarg. Keeps the Rust-side struct
+        // construction below well-typed against the new
+        // `SecondaryConfig` field without forcing the PyO3 surface
+        // change into the same commit as the Rust-side primitive.
+        let unfulfillable_reinject_max_per_task: Option<u32> = None;
 
         // Setup-promote yield captures: cloned here so the `py.detach`
         // closure (which runs without the GIL) owns its own handles
@@ -314,6 +322,7 @@ impl PySecondaryCoordinator {
                     resource_check_interval: dist_resource_check_interval,
                     log_oom_watcher: dist_log_oom_watcher,
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
+                    unfulfillable_reinject_max_per_task,
                 };
 
                 let mut factory = SubprocessWorkerFactory {

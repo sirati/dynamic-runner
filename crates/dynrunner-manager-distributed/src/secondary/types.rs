@@ -204,6 +204,27 @@ pub struct SecondaryConfig {
     /// a wire signal from the demoted primary saying "I'm done
     /// publishing", which the protocol does not have today.
     pub promoted_primary_quiesce_grace: Duration,
+
+    /// Per-task cap for externally-controlled `ReinjectTask`
+    /// re-injections (i.e. the `PrimaryHandle::reinject_task` Python
+    /// surface, dispatched through the secondary-side command
+    /// channel). Mirrors `PrimaryConfig::unfulfillable_reinject_max_per_task`
+    /// — same semantics, same operator knob — only this copy is
+    /// consulted when this node is acting as the promoted primary
+    /// (when external reinject commands arrive on the secondary's
+    /// command channel rather than the live primary's).
+    ///
+    /// `None` (default) means unbounded: the operator can re-inject
+    /// the same Unfulfillable hash indefinitely. `Some(N)` caps the
+    /// per-task budget; once a task hash has been re-injected `N`
+    /// times via this surface, subsequent calls fail with the
+    /// `unfulfillable_reinject_budget_exhausted` structured-log
+    /// event and the entry stays in `TaskState::Unfulfillable`.
+    ///
+    /// Independent of the primary's counter — see
+    /// `secondary/primary/reinject_task.rs` for the budget-reset-at-
+    /// promotion semantics.
+    pub unfulfillable_reinject_max_per_task: Option<u32>,
 }
 
 impl Default for SecondaryConfig {
@@ -226,6 +247,7 @@ impl Default for SecondaryConfig {
             log_oom_watcher: false,
             setup_deadline: Duration::from_secs(60),
             promoted_primary_quiesce_grace: Duration::from_secs(2),
+            unfulfillable_reinject_max_per_task: None,
         }
     }
 }

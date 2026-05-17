@@ -35,6 +35,23 @@
 //!   unknown-dep rules cannot drift; routes the post-apply state into
 //!   `primary_pending` / `primary_failed` so a runtime-injected batch
 //!   reaches the live pool on the promoted-secondary path too.
+//! - [`fail_permanent`] — `apply_fail_permanent`: promoted-secondary's
+//!   analog of `PrimaryCoordinator::apply_fail_permanent`. Drives the
+//!   pool cascade primitive against `primary_pending`, records into
+//!   `primary_failed`, fires `process_primary_phase_lifecycle`, and
+//!   broadcasts `TaskFailed` + cascade-paused `TaskBlocked`s through
+//!   the same `apply_and_broadcast_mutations` helper.
+//! - [`reinject_task`] — `apply_reinject_task`: promoted-secondary's
+//!   analog of `PrimaryCoordinator::apply_reinject_task`. Owns the
+//!   secondary-side `unfulfillable_reinject_remaining` counter +
+//!   `SecondaryConfig::unfulfillable_reinject_max_per_task` budget;
+//!   transitions Unfulfillable → Pending via `primary_pending::reinject`
+//!   and broadcasts `TaskReinjected`.
+//! - [`update_preferred_secondaries`] —
+//!   `apply_update_preferred_secondaries`: promoted-secondary's analog
+//!   of the same primary method. Mirrors the new preference list onto
+//!   the live `primary_pending` entry via `update_first_match_in_place`
+//!   and broadcasts `TaskPreferredSecondariesUpdated`.
 //!
 //! Free helpers `task_file_hash` and `cascade_drain_done` live in
 //! this `mod.rs` because every submodule references them — pulling
@@ -45,12 +62,15 @@ use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_scheduler_api::PendingPool;
 
 mod broadcast;
+mod fail_permanent;
 mod hydrate;
 mod ledger_ops;
 mod lifecycle;
 mod recovery;
+mod reinject_task;
 mod spawn_tasks;
 mod task_request;
+mod update_preferred_secondaries;
 
 /// Stable hash of a `TaskInfo`'s path+identifier, matching the wire
 /// `file_hash` shape used elsewhere in the secondary. Pulled out as a

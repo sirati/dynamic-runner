@@ -71,6 +71,15 @@ where
         // installation rationale as `lifecycle_tx`.
         let (task_completed_tx, task_completed_rx) =
             tokio::sync::mpsc::unbounded_channel();
+        // Command channel for the PyO3 `PrimaryHandle` surface.
+        // Mirrors `PrimaryCoordinator::new` exactly: bounded capacity
+        // sized so a noisy caller can't OOM the secondary, but with
+        // enough slack to absorb a batch of commands before
+        // backpressure surfaces. The receiver is taken out for the
+        // duration of `process_tasks` and put back at loop exit so
+        // `SetupPending` re-entries keep the channel.
+        let (command_tx, command_rx) =
+            tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
         let mut this = Self {
             config,
             primary_transport,
@@ -125,6 +134,9 @@ where
             primary_phase_completed: HashMap::new(),
             primary_phase_failed: HashMap::new(),
             primary_phase_started_emitted: HashSet::new(),
+            command_rx: Some(command_rx),
+            command_tx,
+            unfulfillable_reinject_remaining: HashMap::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -403,6 +415,44 @@ where
     /// if peer-to-peer QUIC is enabled.
     pub fn set_peer_cert_info(&mut self, info: PeerCertInfo) {
         self.peer_cert_info = Some(info);
+    }
+
+    /// Clone of the cross-thread `PrimaryCommand` sender. Callers
+    /// (PyO3 `PrimaryHandle` minted from a `PySecondaryCoordinator`,
+    /// future Rust-side control planes) clone this BEFORE invoking
+    /// `run_until_setup_or_done()` so they have an ingress for "from
+    /// outside the operational loop, please apply this mutation".
+    /// The sender itself is `Clone` and `Send` so the returned handle
+    /// is freely passable across threads / async runtimes. Mirrors
+    /// `PrimaryCoordinator::command_sender` exactly.
+    pub fn command_sender(
+        &self,
+    ) -> tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>> {
+        self.command_tx.clone()
+    }
+
+    /// Swap the internal command-channel pair for an externally-
+    /// supplied one. The PyO3 layer uses this so the
+    /// `PrimaryHandle` it exposes to Python at `__init__` time is the
+    /// same channel the (later-constructed) `SecondaryCoordinator`
+    /// reads from — without this, the channel created in `new()`
+    /// can't be reached from Python before
+    /// `run_until_setup_or_done()` starts because the coordinator
+    /// itself is built inside the detached tokio runtime.
+    ///
+    /// Must be called BEFORE `run_until_setup_or_done()` enters the
+    /// `process_tasks` loop; calling it after the loop has taken the
+    /// receiver out (via `command_rx.take()`) replaces the stored-
+    /// back receiver but the loop has already moved on to the local
+    /// copy. The PyO3 surface enforces this with the same
+    /// "before run() only" contract `PrimaryCoordinator` uses.
+    pub fn replace_command_channel(
+        &mut self,
+        tx: tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
+        rx: tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>,
+    ) {
+        self.command_tx = tx;
+        self.command_rx = Some(rx);
     }
 
     /// Late-joiner bootstrap entry: install a snapshot received from a

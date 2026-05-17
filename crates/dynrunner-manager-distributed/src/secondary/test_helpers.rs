@@ -217,6 +217,11 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // 2-second default. Production code-path semantics are
         // identical; only the wall-clock threshold differs.
         promoted_primary_quiesce_grace: Duration::from_millis(100),
+        // Tests that drive ReinjectTask explicitly populate the
+        // budget per fixture; the election-state default leaves it
+        // unbounded (None) so tests not exercising the budget see
+        // the production-default semantics.
+        unfulfillable_reinject_max_per_task: None,
     }
 }
 
