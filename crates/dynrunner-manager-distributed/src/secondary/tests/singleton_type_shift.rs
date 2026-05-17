@@ -405,6 +405,7 @@ async fn run_singleton_chain_with_factory(
         promoted_primary_quiesce_grace: Duration::from_millis(100),
         unfulfillable_reinject_max_per_task: None,
         mem_manager_reserved_bytes: None,
+        oom_retry_max_passes: 1,
     };
 
     let keepalive_arrivals: std::rc::Rc<std::cell::RefCell<Vec<Duration>>> =
