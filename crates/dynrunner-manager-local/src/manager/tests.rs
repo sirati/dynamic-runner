@@ -605,3 +605,223 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
         })
         .await;
 }
+
+/// Integration test for `KillReason`-based no-fault requeue routing.
+///
+/// Drives the LocalManager's `handle_resource_pressure_result` with a
+/// synthesised `ResourcePressureResult::Killed` carrying each of the
+/// four `KillReason` variants and asserts the routing contract:
+///   * No-fault reasons → pool requeue (item back in the pool, no
+///     `failed_tasks` / `resource_pressure_tasks` entry).
+///   * `OomLastResort` / `OomOverBudget` outside pressure phase →
+///     `resource_pressure_tasks` entry.
+#[tokio::test(flavor = "current_thread")]
+async fn killed_routing_by_kill_reason() {
+    use dynrunner_core::PhaseId;
+    use dynrunner_scheduler_api::{KillReason, PendingPool};
+    use std::collections::HashSet;
+
+    // No worker pool needed: `handle_resource_pressure_result` reads
+    // only `pool_mut()` (the PendingPool, NOT the WorkerPool),
+    // `failed_tasks`, `resource_pressure_tasks`, `in_pressure_phase`,
+    // and `record_phase_completion`. Build a bare manager, install a
+    // pre-built PendingPool via the test seam, inject synthesised
+    // kill results, and assert the routing contract.
+
+    // No-fault routing: requeue at the pool front, NO failure-side
+    // entry, retry budget preserved.
+    for reason in [
+        KillReason::NoFaultMemoryStealing,
+        KillReason::NoFaultUnderBudget,
+    ] {
+        let config = test_config(1);
+        let mut manager: LocalManager<
+            ChannelManagerEnd,
+            _,
+            _,
+            super::test_helpers::TestId,
+        > = LocalManager::new(
+            config,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        let mut phase_ids = HashSet::new();
+        phase_ids.insert(PhaseId::from("default"));
+        let pool = PendingPool::new(phase_ids, std::collections::HashMap::new())
+            .expect("pool new");
+        manager.install_pool_for_test(pool);
+        let binary = make_binary("victim", 50);
+        let phase = binary.phase_id.clone();
+        manager.pool_mut().extend(vec![binary.clone()]).expect("extend");
+        // Simulate `take_from_view`'s in-flight bump so `requeue`
+        // decrements correctly (requeue saturates at 0 either way,
+        // but this matches the production sequencing).
+        manager.pool_mut().mark_in_flight(&phase);
+        manager.handle_resource_pressure_result(
+            crate::pool::ResourcePressureResult::Killed {
+                worker_id: 1,
+                binary: Some(Box::new(binary)),
+                reason,
+            },
+        );
+        assert!(
+            manager.failed_tasks().is_empty(),
+            "{reason:?}: no failed_tasks entry expected"
+        );
+        assert!(
+            manager.resource_pressure_tasks().is_empty(),
+            "{reason:?}: no resource_pressure_tasks entry expected"
+        );
+        assert!(
+            !manager.pool_ref().is_empty(),
+            "{reason:?}: pool should hold the requeued item"
+        );
+    }
+
+    // At-fault `OomOverBudget` / `OomLastResort` outside the
+    // pressure phase → `resource_pressure_tasks` entry, NOT
+    // `failed_tasks`.
+    for reason in [KillReason::OomOverBudget, KillReason::OomLastResort] {
+        let config = test_config(1);
+        let mut manager: LocalManager<
+            ChannelManagerEnd,
+            _,
+            _,
+            super::test_helpers::TestId,
+        > = LocalManager::new(
+            config,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        let mut phase_ids = HashSet::new();
+        phase_ids.insert(PhaseId::from("default"));
+        let pool = PendingPool::new(phase_ids, std::collections::HashMap::new())
+            .expect("pool new");
+        manager.install_pool_for_test(pool);
+        let binary = make_binary("over_budget", 50);
+        manager.handle_resource_pressure_result(
+            crate::pool::ResourcePressureResult::Killed {
+                worker_id: 0,
+                binary: Some(Box::new(binary)),
+                reason,
+            },
+        );
+        assert!(
+            manager.failed_tasks().is_empty(),
+            "{reason:?}: not a Recoverable failure, must not land in failed_tasks"
+        );
+        assert_eq!(
+            manager.resource_pressure_tasks().len(),
+            1,
+            "{reason:?}: expected 1 resource_pressure_tasks entry"
+        );
+        let entry = &manager.resource_pressure_tasks()[0];
+        match &entry.error_type {
+            ErrorType::ResourceExhausted(k) if k.as_str() == "memory" => {}
+            other => panic!(
+                "{reason:?}: expected ResourceExhausted(memory), got {other:?}"
+            ),
+        }
+    }
+}
+
+/// Regression pin for the retry-phase leftover mis-tag fix.
+///
+/// Before the fix, tasks that couldn't fit any worker's reserved
+/// budget at the end of the retry phase were pushed to
+/// `resource_pressure_tasks` with `ErrorType::ResourceExhausted(memory)`
+/// — wrong bucket: the failure class is scheduling-fit, not
+/// memory-pressure. The fix re-tags them as `ErrorType::Recoverable`
+/// so they ride the recoverable retry channel.
+///
+/// Construction: 1 worker (gets the full 1 GiB reserved budget from
+/// `ResourceStealingScheduler::initial_budget(0, max)`), then ask the
+/// estimator to return a per-task memory request that exceeds 1 GiB.
+/// No worker accepts the task; it sits in the pool through main +
+/// retry phases; the retry-phase drain at the end of
+/// `process_worker_loop` re-tags it.
+#[tokio::test(flavor = "current_thread")]
+async fn retry_phase_leftover_lands_in_failed_tasks_as_recoverable() {
+    use dynrunner_core::PhaseId;
+    use dynrunner_scheduler_api::PendingPool;
+    use std::collections::HashSet;
+
+    // The retry-phase leftover-drain at the tail of
+    // `process_worker_loop` fires when:
+    //   1. `phase == ProcessingPhase::RetryPhase`, AND
+    //   2. `!pool.is_empty()` at loop exit.
+    //
+    // To exercise the post-fix tag without spinning the full
+    // process_binaries pipeline (and risk a different code path
+    // catching the leftover first), call `process_worker_loop`
+    // directly on a seeded pool with zero active workers. The
+    // outer `while !active_workers.is_empty()` exits immediately,
+    // the pool still holds the seeded task, and the drain block
+    // re-tags it.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let config = test_config(1);
+            let mut manager: LocalManager<
+                ChannelManagerEnd,
+                _,
+                _,
+                super::test_helpers::TestId,
+            > = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut phase_ids = HashSet::new();
+            phase_ids.insert(PhaseId::from("default"));
+            let pool =
+                PendingPool::new(phase_ids, std::collections::HashMap::new())
+                    .expect("pool new");
+            manager.install_pool_for_test(pool);
+            manager
+                .pool_mut()
+                .extend(vec![make_binary("leftover", 100)])
+                .expect("extend");
+
+            let mut active_workers: HashSet<WorkerId> = HashSet::new();
+            let mut factory = FakeWorkerFactory {
+                mode: FakeWorkerMode::AlwaysSucceed,
+            };
+            manager
+                .process_worker_loop(
+                    &mut active_workers,
+                    false,
+                    false,
+                    dynrunner_scheduler_api::ProcessingPhase::RetryPhase,
+                    &mut factory,
+                )
+                .await;
+
+            // Pre-fix: this would have been 1 entry in
+            // resource_pressure_tasks tagged ResourceExhausted(memory).
+            assert!(
+                manager.resource_pressure_tasks().is_empty(),
+                "retry-phase leftover must NOT land in resource_pressure_tasks; got {} entries",
+                manager.resource_pressure_tasks().len()
+            );
+            let failed = manager.failed_tasks();
+            assert_eq!(
+                failed.len(),
+                1,
+                "expected 1 task in failed_tasks after retry-phase drain"
+            );
+            assert!(
+                matches!(failed[0].error_type, ErrorType::Recoverable),
+                "expected ErrorType::Recoverable, got {:?}",
+                failed[0].error_type
+            );
+            assert!(
+                failed[0]
+                    .error_message
+                    .contains("Could not fit in any worker budget"),
+                "error_message should preserve the scheduling-fit reason; got {:?}",
+                failed[0].error_message
+            );
+        })
+        .await;
+}

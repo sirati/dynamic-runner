@@ -1,6 +1,7 @@
 use dynrunner_core::{TaskInfo, Identifier, ResourceKind, ResourceMap};
 use dynrunner_scheduler_api::{
-    AssignmentDecision, ResourceEstimator, ResourcePressureDecision, Scheduler, WorkerBudgetInfo,
+    AssignmentDecision, KillReason, ResourceEstimator, ResourcePressureDecision, Scheduler,
+    WorkerBudgetInfo,
 };
 
 /// Resource-constrained, resource-stealing scheduler.
@@ -230,13 +231,13 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
             if !opp.is_empty() {
                 opp.sort_by_key(|w| self.get(&w.estimated_usage));
                 let victim = opp[opp.len() / 2];
+                // Opportunistic workers explicitly opted in to being
+                // killable when they were assigned a temp-budget task;
+                // the displaced task is no-fault from the retry-budget
+                // perspective.
                 return ResourcePressureDecision::Kill {
                     worker_id: victim.worker_id,
-                    reason: format!(
-                        "Median opportunistic worker killed under {} pressure (usage: {}MB)",
-                        self.resource_kind,
-                        actual_usage / (1024 * 1024)
-                    ),
+                    reason: KillReason::NoFaultMemoryStealing,
                 };
             }
         }
@@ -247,13 +248,31 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
                 .filter(|w| w.current_task.is_some())
                 .collect();
             if let Some(smallest) = active.iter().min_by_key(|w| self.get(&w.estimated_usage)) {
+                // Classify the smallest-active victim:
+                //   * under reserved budget → another worker (or
+                //     external pressure) caused the overshoot; this
+                //     task is no-fault and should requeue silently.
+                //   * at or above reserved budget → the task itself
+                //     overshot its estimate; counts against retry
+                //     budget. `OomLastResort` records the
+                //     no-alternative-candidate edge so operators can
+                //     correlate "framework had no smaller victim" with
+                //     the at-fault outcome; otherwise (multiple active
+                //     candidates existed and the framework picked the
+                //     smallest) → `OomOverBudget`.
+                let reserved = self.get(&smallest.reserved_budgets);
+                let actual = self.get(&smallest.actual_usage);
+                let only_candidate = active.len() == 1;
+                let reason = if actual < reserved {
+                    KillReason::NoFaultUnderBudget
+                } else if only_candidate {
+                    KillReason::OomLastResort
+                } else {
+                    KillReason::OomOverBudget
+                };
                 return ResourcePressureDecision::Kill {
                     worker_id: smallest.worker_id,
-                    reason: format!(
-                        "Smallest active worker killed under {} pressure (usage: {}MB)",
-                        self.resource_kind,
-                        actual_usage / (1024 * 1024)
-                    ),
+                    reason,
                 };
             }
         }

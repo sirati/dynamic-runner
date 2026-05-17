@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dynrunner_core::{
     TaskInfo, ErrorType, FailedTask, Identifier, ResourceKind, ResourceMap, TaskResult, WorkerId,
@@ -9,11 +9,26 @@ use dynrunner_scheduler_api::{
     ResourceEstimator, ProcessingPhase, Scheduler,
 };
 
+use crate::oom::{classify_disconnect, OomWatcher};
 use crate::worker::WorkerEvent;
 
 use super::{LocalManager, WorkerFactory};
 
+/// Wall-clock window the disconnect reclassifier uses to correlate a
+/// worker pipe-EOF with a kernel cgroup-OOM event. At the production
+/// 50ms sample cadence this is ~10 samples of tolerance — long
+/// enough to absorb scheduling jitter on either side of the EOF, short
+/// enough to avoid attributing a later disconnect to an earlier
+/// kernel-OOM that already killed a different worker.
+const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
+
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+    // Same justification as `handle_task_completed` below — every
+    // argument either destructures one variant of `WorkerEvent` or
+    // threads loop-scoped state (active_workers / phase / factory /
+    // oom_watcher) that the per-event handlers reference exactly
+    // once. Bundling into a struct just shifts the unpack frame.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn handle_event(
         &mut self,
         event: WorkerEvent<I>,
@@ -22,6 +37,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         on_failure_increment_failed: bool,
         phase: ProcessingPhase,
         factory: &mut impl WorkerFactory<M>,
+        oom_watcher: &OomWatcher,
     ) {
         match event {
             WorkerEvent::TaskCompleted {
@@ -88,6 +104,24 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     let est = worker.estimated_resources.clone();
                     self.total_assigned_resources.sub(&est);
                 }
+
+                // Disconnect reclassifier — upgrade the protocol's
+                // default `Recoverable` synthesis when the kernel-OOM
+                // watcher saw an `oom_kill` increment on the workers
+                // subgroup, or downgrade to `NonRecoverable` for
+                // deterministic-bug signals (SIGSEGV, etc.). See
+                // [`crate::oom::disconnect`].
+                let kernel_oom_recent =
+                    oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
+                let reclassified_type = classify_disconnect(
+                    result.error_type.clone().unwrap_or(ErrorType::Recoverable),
+                    exit_status.as_ref(),
+                    kernel_oom_recent,
+                );
+                let result = TaskResult {
+                    error_type: Some(reclassified_type),
+                    ..result
+                };
 
                 self.record_result(&result, binary.as_ref());
 

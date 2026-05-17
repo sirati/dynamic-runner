@@ -360,6 +360,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             .expect("pending pool not initialised; called outside process_binaries")
     }
 
+    /// Test seam: install a pre-built [`PendingPool`] so unit tests
+    /// of the per-event handlers can exercise the routing logic
+    /// without bootstrapping a full `process_binaries` run.
+    /// Compiled only under `#[cfg(test)]` so the dead-code lint
+    /// doesn't surface it in release builds.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(super) fn install_pool_for_test(&mut self, pool: PendingPool<I>) {
+        self.pending = Some(pool);
+    }
+
     /// Bookkeeping for a finished task: bumps the per-phase counter and
     /// notifies the pool. Drives `on_phase_end` indirectly via the
     /// `process_drain_transitions` call inside the worker loop (which

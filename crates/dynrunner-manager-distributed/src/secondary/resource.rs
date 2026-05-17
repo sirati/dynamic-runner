@@ -8,6 +8,18 @@ use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
+/// Wire marker used when a secondary's worker is killed by a no-fault
+/// resource-stealing preempt (`KillReason::is_no_fault()`). The primary
+/// recognises this string in [`PrimaryCoordinator::handle_task_failed`]
+/// as a backpressure-shaped TaskFailed — re-queue the task at the
+/// pool front WITHOUT consuming retry budget. Same shape as the
+/// pre-existing `"No idle worker available"` and `"worker pipe broken;
+/// respawning"` markers. The string is the public contract between
+/// secondary and primary; do not change it without updating the
+/// primary's `is_backpressure` predicate in the same commit.
+pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str =
+    "worker no-fault preempt; resource stealing";
+
 
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
@@ -42,6 +54,23 @@ where
     /// `check_resource_pressure` body so both the watcher-driven path
     /// and any future direct caller share the same TaskFailed-broadcast
     /// + restart + request rules.
+    ///
+    /// Routing is keyed on [`KillReason`]:
+    ///
+    ///   * No-fault preempt (memory stealing or under-budget) →
+    ///     broadcast a backpressure-shaped `TaskFailed` carrying
+    ///     [`NO_FAULT_PREEMPT_WIRE_MESSAGE`]. The primary's
+    ///     `handle_task_failed` recognises this marker, requeues the
+    ///     task at the pool front, and skips the `failed_tasks`
+    ///     insert — retry budget is preserved.
+    ///   * At-fault OOM (over budget / last resort) → today's path:
+    ///     broadcast `TaskFailed { ErrorType::ResourceExhausted(memory) }`.
+    ///     Consumes one retry attempt and surfaces in
+    ///     `resource_pressure_tasks` for the OOM retry pass.
+    ///
+    /// Worker restart + new-task request runs in both arms — the
+    /// killed worker is gone either way, so the slot needs a fresh
+    /// subprocess and a new assignment from the primary.
     async fn handle_resource_pressure_result(
         &mut self,
         result: ResourcePressureResult<I>,
@@ -63,14 +92,23 @@ where
                 if let Some(hash) = file_hash {
                     self.active_tasks.remove(&hash);
 
+                    let (error_type, error_message) = if reason.is_no_fault() {
+                        (ErrorType::Recoverable, NO_FAULT_PREEMPT_WIRE_MESSAGE.into())
+                    } else {
+                        (
+                            ErrorType::ResourceExhausted(ResourceKind::memory()),
+                            reason.as_str().into(),
+                        )
+                    };
+
                     let msg = DistributedMessage::TaskFailed {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
                         secondary_id: self.config.secondary_id.clone(),
                         worker_id,
                         task_hash: hash,
-                        error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
-                        error_message: reason,
+                        error_type,
+                        error_message,
                     };
                     let _ = self.send_to_current_primary(msg.clone()).await;
                     let _ = self.peer_transport.broadcast(msg).await;

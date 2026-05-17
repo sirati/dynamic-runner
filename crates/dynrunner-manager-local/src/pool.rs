@@ -1,6 +1,6 @@
 use dynrunner_core::{Identifier, ResourceMap, TypeId, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_scheduler_api::{ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
+use dynrunner_scheduler_api::{KillReason, ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc;
 
 use crate::cgroup::{self, NestedCgroupHandle};
@@ -20,7 +20,7 @@ pub enum ResourcePressureResult<I: Identifier> {
     Killed {
         worker_id: WorkerId,
         binary: Option<Box<dynrunner_core::TaskInfo<I>>>,
-        reason: String,
+        reason: KillReason,
     },
     /// No action needed — resources are within limits.
     NoAction,
@@ -380,7 +380,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
                     worker_id,
                     reason = %reason,
                     in_pressure_phase,
-                    "killing worker under resource pressure"
+                    "killing worker under resource pressure ({reason})"
                 );
                 let worker = &mut self.workers[worker_id as usize];
                 let binary = worker.current_binary.take().map(Box::new);

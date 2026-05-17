@@ -7,13 +7,22 @@
 //! cluster-mutation apply-and-broadcast path for every authoritative
 //! task-outcome the local worker emits.
 
+use std::time::Duration;
+
 use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_manager_local::oom::{classify_disconnect, OomWatcher};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
+
+/// Same window as the LocalManager path — 500ms covers ~10 samples
+/// worth of correlation tolerance at the production 50ms sample
+/// cadence between kernel `oom_kill` counter increment and the
+/// worker pipe-EOF observation.
+const KERNEL_OOM_CORRELATION_WINDOW: Duration = Duration::from_millis(500);
 
 use crate::primary::PrimaryCommand;
 
@@ -38,6 +47,7 @@ where
         event: WorkerEvent<I>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
         factory: &mut impl WorkerFactory<M>,
+        oom_watcher: &OomWatcher,
     ) -> Result<Option<WorkerId>, String> {
         match event {
             WorkerEvent::TaskCompleted {
@@ -257,12 +267,26 @@ where
                     // NonRecoverable → real failure (A); anything
                     // else (Recoverable + transport-disconnected
                     // synthesis) → comm failure (B).
-                    let error_type = result
-                        .error_type
-                        .clone()
-                        .unwrap_or(ErrorType::Recoverable);
+                    //
+                    // Before discrimination, reclassify using the
+                    // exit-status + OOM watcher: a SIGKILL with a
+                    // recent kernel `oom_kill` increment upgrades
+                    // the synthesised `Recoverable` to
+                    // `ResourceExhausted(memory)`; SIGSEGV / SIGABRT
+                    // / SIGBUS / SIGFPE / SIGILL downgrade to
+                    // `NonRecoverable`. See [`classify_disconnect`].
+                    let kernel_oom_recent =
+                        oom_watcher.kernel_oom_recent(KERNEL_OOM_CORRELATION_WINDOW);
+                    let error_type = classify_disconnect(
+                        result
+                            .error_type
+                            .clone()
+                            .unwrap_or(ErrorType::Recoverable),
+                        exit_status.as_ref(),
+                        kernel_oom_recent,
+                    );
                     let is_comm_failure =
-                        !matches!(error_type, ErrorType::NonRecoverable);
+                        matches!(error_type, ErrorType::Recoverable);
 
                     let (wire_error_type, wire_error_message) = if is_comm_failure {
                         (

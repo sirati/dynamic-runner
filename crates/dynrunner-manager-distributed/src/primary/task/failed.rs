@@ -56,7 +56,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // requeued or has already been requeued by an
             // earlier landing).
             let dedup_is_backpressure = error_message == "No idle worker available"
-                || error_message == "worker pipe broken; respawning";
+                || error_message == "worker pipe broken; respawning"
+                || error_message
+                    == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
             if !dedup_is_backpressure
                 && (self.completed_tasks.contains(task_hash)
                     || self.failed_tasks.contains_key(task_hash))
@@ -127,8 +129,18 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             //      attempt at a peer secondary (#46 secondary-
             //      side fix needed this primary-side companion
             //      to actually requeue rather than mark-as-failed).
+            // The third marker (`NO_FAULT_PREEMPT_WIRE_MESSAGE`) signals
+            // a no-fault scheduler-driven preempt — the secondary's
+            // worker was killed by `ResourceStealingScheduler` because
+            // the task was opportunistic or the worker was still under
+            // its reserved budget. The displaced task is innocent;
+            // routing it through the backpressure path (re-queue, no
+            // retry-budget consumption) preserves the same contract as
+            // the other two markers.
             let is_backpressure = error_message == "No idle worker available"
-                || error_message == "worker pipe broken; respawning";
+                || error_message == "worker pipe broken; respawning"
+                || error_message
+                    == crate::secondary::resource::NO_FAULT_PREEMPT_WIRE_MESSAGE;
             if is_backpressure {
                 let backoff_ms = 500;
                 self.backpressured_secondaries.insert(

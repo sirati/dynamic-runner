@@ -7,6 +7,16 @@
 //!
 //! Tests inject a mock probe (see `mod tests` in `super`) so unit tests
 //! don't depend on the host's cgroup-v2 layout.
+//!
+//! Kernel-OOM detection: when a `<workers>/memory.events` path is
+//! supplied (via the nested workers cgroup the manager owns; see
+//! [`crate::cgroup::NestedCgroupHandle`]), the probe parses the
+//! `oom_kill <count>` line on each [`SystemProbe::read`] and surfaces
+//! the cumulative counter in `kernel_oom_kill_count`. The watcher
+//! converts the counter to a delta across samples; downstream
+//! reclassifies a worker disconnect from `Recoverable` to
+//! `ResourceExhausted(memory)` when an oom_kill landed in the same
+//! sample window.
 
 /// Host RAM / swap / cgroup-v2 memory readout.
 ///
@@ -33,6 +43,13 @@ pub struct HostMemoryReading {
     pub container_swap_current: Option<u64>,
     /// `/sys/fs/cgroup/memory.swap.max` (cgroup v2). "max" → `None`.
     pub container_swap_max: Option<u64>,
+    /// Cumulative `oom_kill` count from the workers-subgroup
+    /// `memory.events` file (cgroup v2). `None` when the probe was
+    /// constructed without a workers-events path (no nested cgroup,
+    /// graceful-fallback flat layout) or the read failed. The watcher
+    /// computes a delta across samples and routes a worker disconnect
+    /// reclassification when the delta is positive in the same window.
+    pub kernel_oom_kill_count: Option<u64>,
 }
 
 /// Trait the OOM watcher uses to read host + cgroup memory state.
@@ -60,6 +77,11 @@ pub struct ProcSysProbe {
     cgroup_memory_max: Option<&'static str>,
     cgroup_swap_current: Option<&'static str>,
     cgroup_swap_max: Option<&'static str>,
+    /// Absolute path to the workers cgroup `memory.events` file
+    /// (`<workers>/memory.events`), if the manager materialised a
+    /// nested workers subgroup. `None` for the flat-layout fallback;
+    /// `kernel_oom_kill_count` then stays `None` on every read.
+    workers_memory_events: Option<std::path::PathBuf>,
 }
 
 impl ProcSysProbe {
@@ -103,7 +125,20 @@ impl ProcSysProbe {
             cgroup_memory_max,
             cgroup_swap_current,
             cgroup_swap_max,
+            workers_memory_events: None,
         }
+    }
+
+    /// Attach the workers cgroup `memory.events` path so subsequent
+    /// reads populate `kernel_oom_kill_count`. Caller passes
+    /// `<workers>/memory.events`; the probe stores the absolute path
+    /// verbatim and reads it on each `read()` call. Pass `None` (or
+    /// skip this call) to keep the kernel-oom field unpopulated —
+    /// the watcher then never sees a positive delta and never
+    /// reclassifies a disconnect.
+    pub fn with_workers_memory_events(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.workers_memory_events = path;
+        self
     }
 }
 
@@ -136,8 +171,37 @@ impl SystemProbe for ProcSysProbe {
             container_memory_max: self.cgroup_memory_max.and_then(read_cgroup_max),
             container_swap_current: self.cgroup_swap_current.and_then(read_cgroup_u64),
             container_swap_max: self.cgroup_swap_max.and_then(read_cgroup_max),
+            kernel_oom_kill_count: self
+                .workers_memory_events
+                .as_deref()
+                .and_then(read_memory_events_oom_kill),
         }
     }
+}
+
+/// Read `<cgroup>/memory.events` and extract the cumulative `oom_kill`
+/// counter. The file is a `<key> <value>` newline-delimited table
+/// (`low <n>`, `high <n>`, `max <n>`, `oom <n>`, `oom_kill <n>`,
+/// `oom_group_kill <n>`). Returns `None` on missing file, IO error,
+/// or absent `oom_kill` line.
+pub(crate) fn read_memory_events_oom_kill(path: &std::path::Path) -> Option<u64> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_memory_events_oom_kill(&contents)
+}
+
+/// Parse the `oom_kill <count>` line out of a `memory.events`-shaped
+/// blob. Split into its own function so the unit test can exercise
+/// the parser without touching the filesystem.
+pub(crate) fn parse_memory_events_oom_kill(contents: &str) -> Option<u64> {
+    for line in contents.lines() {
+        let mut parts = line.split_ascii_whitespace();
+        let Some(key) = parts.next() else { continue };
+        if key != "oom_kill" {
+            continue;
+        }
+        return parts.next().and_then(|v| v.parse::<u64>().ok());
+    }
+    None
 }
 
 /// Read `/proc/meminfo` once and return `(MemTotal, MemAvailable,
@@ -224,5 +288,34 @@ mod tests {
     fn parse_meminfo_line_rejects_other_keys() {
         let line = "SwapTotal:      0 kB";
         assert_eq!(parse_meminfo_line(line, "MemTotal:"), None);
+    }
+
+    #[test]
+    fn parse_memory_events_oom_kill_extracts_count() {
+        // Real cgroup-v2 memory.events shape (Linux ≥ 5.2).
+        let contents = "\
+            low 0\n\
+            high 0\n\
+            max 0\n\
+            oom 3\n\
+            oom_kill 2\n\
+            oom_group_kill 0\n";
+        assert_eq!(parse_memory_events_oom_kill(contents), Some(2));
+    }
+
+    #[test]
+    fn parse_memory_events_oom_kill_returns_none_when_absent() {
+        // Older kernels (cgroup-v2 ≤ 5.1) omit oom_kill; the watcher
+        // must accept that as "field unavailable" rather than 0.
+        let contents = "low 0\nhigh 0\nmax 0\noom 0\n";
+        assert_eq!(parse_memory_events_oom_kill(contents), None);
+    }
+
+    #[test]
+    fn parse_memory_events_oom_kill_handles_trailing_blank_lines() {
+        // Defensive: tolerant of empty lines in the file (some
+        // pseudo-fs implementations emit them).
+        let contents = "\n\noom_kill 5\n\n";
+        assert_eq!(parse_memory_events_oom_kill(contents), Some(5));
     }
 }

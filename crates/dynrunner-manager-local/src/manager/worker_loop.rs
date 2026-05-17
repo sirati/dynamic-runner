@@ -25,12 +25,26 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // decision cadence (config-driven, default 100ms). Both ticks
         // are driven by `OomWatcher` so the secondary's processing
         // loop can use the same surface. See `crate::oom`.
-        let mut oom_watcher = OomWatcher::new(OomWatcherConfig {
-            sample_interval: DEFAULT_SAMPLE_INTERVAL,
-            decision_interval: self.config.resource_check_interval,
-            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
-            log_enabled: self.config.log_oom_watcher,
-        });
+        // Derive the workers cgroup `memory.events` path from the
+        // pool's nested cgroup handle (when present). This activates
+        // the OomWatcher's kernel-OOM detection so the disconnect
+        // reclassifier in `handle_event` can upgrade pipe-EOF events
+        // from `Recoverable` to `ResourceExhausted(memory)` whenever
+        // the kernel's `oom_kill` counter incremented in the same
+        // sample window.
+        let workers_memory_events_path = self
+            .pool
+            .workers_cgroup()
+            .map(|h| h.workers_path().join("memory.events"));
+        let mut oom_watcher = OomWatcher::new_with_workers_cgroup(
+            OomWatcherConfig {
+                sample_interval: DEFAULT_SAMPLE_INTERVAL,
+                decision_interval: self.config.resource_check_interval,
+                heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+                log_enabled: self.config.log_oom_watcher,
+            },
+            workers_memory_events_path,
+        );
         let mut sample_interval = oom_watcher.sample_interval_ticker();
         let mut decision_interval = oom_watcher.decision_interval_ticker();
 
@@ -64,6 +78,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                             on_failure_increment_failed,
                             phase,
                             factory,
+                            &oom_watcher,
                         )
                         .await;
                         // Per-event drain-transition flush. A finishing
@@ -111,16 +126,29 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             }
         }
 
-        // Move remaining pending to resource pressure queue at end of retry phase
-        // (Main phase leftovers go to unassigned_tasks in run_main_phase)
+        // Move remaining pending to the recoverable retry channel at
+        // the end of the retry phase (main-phase leftovers go to
+        // `unassigned_tasks` in `run_main_phase`).
+        //
+        // Tag: `ErrorType::Recoverable`. The previous shape tagged
+        // these as `ResourceExhausted(memory)`, which is wrong — the
+        // leftover items are tasks that no worker's RESERVED budget
+        // accepted at scheduling time (a scheduling-fit failure). The
+        // OOM channel is reserved for actual memory-pressure kills
+        // surfaced via `KillReason::OomOverBudget` /
+        // `KillReason::OomLastResort`. Routing the scheduling-fit
+        // leftovers to the Recoverable channel sends them through
+        // `record_result`'s `failed_tasks` branch instead of
+        // `resource_pressure_tasks`, matching the actual failure
+        // class.
         if phase == ProcessingPhase::RetryPhase
             && !self.pool_ref().is_empty()
         {
             let remaining: Vec<TaskInfo<I>> = self.pool_mut().drain_queued();
             for binary in remaining {
-                self.resource_pressure_tasks.push(FailedTask {
+                self.failed_tasks.push(FailedTask {
                     binary,
-                    error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
+                    error_type: ErrorType::Recoverable,
                     error_message: "Could not fit in any worker budget".into(),
                     retry_count: 0,
                 });
