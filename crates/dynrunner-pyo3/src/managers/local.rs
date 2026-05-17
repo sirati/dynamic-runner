@@ -390,6 +390,18 @@ impl PyLocalManager {
                         dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                             paths: panik_watcher_paths,
                             poll_interval: panik_watcher_poll_interval,
+                            // LOCAL-role spawner (single-process,
+                            // no SLURM container, no host
+                            // shutdown-manager): SIGTERM listening
+                            // OFF per the original feature scope.
+                            // The local manager runs on operator
+                            // hardware where SIGTERM = "user
+                            // pressed Ctrl-C / kill", and we want
+                            // the default Unix disposition
+                            // (terminate process) to remain
+                            // visible rather than be absorbed by
+                            // the watcher.
+                            listen_for_sigterm: false,
                         },
                     );
                 let panik_rx = panik_watcher.take_signal_rx();

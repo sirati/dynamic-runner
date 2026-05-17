@@ -306,6 +306,7 @@ dependencies = [
  "dynrunner-transport-channel",
  "dynrunner-transport-quic",
  "dynrunner-transport-tunnel",
+ "nix",
  "serde",
  "serde_json",
  "sha2",

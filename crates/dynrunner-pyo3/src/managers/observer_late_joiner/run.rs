@@ -287,6 +287,15 @@ impl PyObserverLateJoiner {
                     dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                         paths: panik_watcher_paths,
                         poll_interval: panik_watcher_poll_interval,
+                        // OBSERVER-role spawner: SIGTERM listening
+                        // OFF. The observer late-joiner doesn't
+                        // own SLURM-allocated workers and isn't
+                        // a target of the host shutdown-manager's
+                        // SIGTERM forwarding. Sentinel-file
+                        // trigger plus cluster-wide panik
+                        // broadcast cover its emergency-stop
+                        // needs.
+                        listen_for_sigterm: false,
                     },
                 );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
