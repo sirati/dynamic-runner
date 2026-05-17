@@ -273,6 +273,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             pending = self.pool().len(),
             "dead secondary cleaned up"
         );
+
+        // Kickstart dispatch to surviving idle workers. Secondaries
+        // only emit `TaskRequest` after they finish a task; the
+        // workers idle on survivors right now have nothing in flight
+        // to complete, so without an explicit nudge the just-
+        // requeued tasks would sit in the pool forever. Mirrors the
+        // identical kickstart at the end of `run_retry_passes`,
+        // `handle_task_complete`, and `handle_task_failed` — every
+        // path that puts a task back into the pool owns the
+        // re-dispatch step. Swallowed via `.ok()` like the task-
+        // outcome paths: a transient send failure to one survivor
+        // is logged + rolled back inside `dispatch_to_idle_workers`
+        // and must not abort the heartbeat-tick's outer requeue
+        // bookkeeping.
+        self.dispatch_to_idle_workers().await.ok();
         Ok(())
     }
 
