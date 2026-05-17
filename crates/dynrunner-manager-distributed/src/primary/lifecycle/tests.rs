@@ -210,6 +210,7 @@ async fn reinject_clears_failed_tasks_entry_for_hash() {
                 hash: hash.clone(),
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         assert!(
@@ -283,6 +284,7 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
                 hash: hash.clone(),
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         assert!(reply_rx.await.unwrap().is_ok());

@@ -96,6 +96,7 @@ async fn fail_permanent_via_channel() {
                 reason: "test".into(),
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         let reply = reply_rx.await.expect("reply oneshot closed");
@@ -130,6 +131,7 @@ async fn fail_permanent_unknown_hash() {
                 reason: "test".into(),
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         let reply = reply_rx.await.expect("reply oneshot closed");
@@ -177,6 +179,7 @@ async fn reinject_task_budget_exhaustion() {
                 hash: hash.clone(),
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         assert!(reply_rx.await.unwrap().is_ok(), "first reinject accepts");
@@ -201,6 +204,7 @@ async fn reinject_task_budget_exhaustion() {
                 hash: hash.clone(),
                 reply: reply_tx2,
             },
+            &mut None,
         )
         .await;
         let r2 = reply_rx2.await.unwrap();
@@ -246,6 +250,7 @@ async fn update_preferred_secondaries_smoke() {
                 secondaries: vec!["sec-1".into(), "sec-2".into()],
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         assert!(reply_rx.await.unwrap().is_ok());
@@ -296,7 +301,7 @@ async fn command_channel_end_to_end() {
         // command, dispatch it.
         let mut rx = coordinator.command_rx.take().expect("rx present");
         let command = rx.recv().await.expect("first command");
-        super::handle_primary_command(&mut coordinator, command).await;
+        super::handle_primary_command(&mut coordinator, command, &mut None).await;
         coordinator.command_rx = Some(rx);
         let reply = reply_rx.await.expect("reply oneshot closed");
         assert!(reply.is_ok(), "{reply:?}");
@@ -369,6 +374,7 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
                 reason: "no peer holds the resource".into(),
                 reply: reply_tx,
             },
+            &mut None,
         )
         .await;
         let reply = reply_rx.await.expect("reply oneshot closed");
@@ -461,6 +467,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
                 reason: "no peer".into(),
                 reply: rx1,
             },
+            &mut None,
         )
         .await;
         assert!(rxr1.await.unwrap().is_ok());
@@ -481,6 +488,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
                 hash: prereq_hash.clone(),
                 reply: rx2,
             },
+            &mut None,
         )
         .await;
         assert!(rxr2.await.unwrap().is_ok());
@@ -597,6 +605,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
                 reason: "no peer".into(),
                 reply: tx1,
             },
+            &mut None,
         )
         .await;
         assert!(rx1.await.unwrap().is_ok());
@@ -609,6 +618,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
                 hash: prereq_hash.clone(),
                 reply: tx2,
             },
+            &mut None,
         )
         .await;
         assert!(rx2.await.unwrap().is_ok());
@@ -695,6 +705,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
                 secondaries: vec!["sec-a".into(), "sec-b".into()],
                 reply: tx,
             },
+            &mut None,
         )
         .await;
         assert!(rx.await.unwrap().is_ok());
@@ -783,6 +794,7 @@ async fn spawn_via_handler(
             tasks,
             reply: reply_tx,
         },
+        &mut None,
     )
     .await;
     reply_rx.await.expect("reply oneshot closed")

@@ -304,7 +304,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tokio::select! {
                 msg = self.transport.recv(), if !transport_closed => {
                     match msg {
-                        Some(m) => self.dispatch_message(m).await?,
+                        Some(m) => self.dispatch_message(m, &mut command_rx).await?,
                         None => {
                             // Legacy `transport.recv()` returned None —
                             // the per-secondary SecondaryTransport bridge
@@ -374,6 +374,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                             crate::primary::command_channel::handle_primary_command(
                                 self,
                                 command,
+                                &mut command_rx,
                             )
                             .await;
                         }
@@ -453,7 +454,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                             // `completed_tasks.contains(hash)`. Safe
                             // by construction; no extra dedup needed
                             // at this layer.
-                            self.dispatch_message(m).await?;
+                            self.dispatch_message(m, &mut command_rx).await?;
                         }
                         None => {
                             // Peer transport closed (only when every
@@ -882,7 +883,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let poll_window = std::cmp::min(quiet_window, remaining);
             match tokio::time::timeout(poll_window, self.transport.recv()).await {
                 Ok(Some(msg)) => {
-                    self.dispatch_message(msg).await?;
+                    // Post-loop drain: no operational loop is running to
+                    // service callback-queued spawn_tasks, so passing
+                    // &mut None here avoids broadcasting CRDT mutations
+                    // for tasks that would never get dispatched. A
+                    // callback that issues spawn_tasks at this point has
+                    // its command silently dropped when the coordinator
+                    // is torn down — same behaviour as any other post-
+                    // run handle write.
+                    self.dispatch_message(msg, &mut None).await?;
                     drained += 1;
                 }
                 Ok(None) => {

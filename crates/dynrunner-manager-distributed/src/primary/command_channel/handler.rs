@@ -9,6 +9,7 @@ use dynrunner_protocol_primary_secondary::{
     ClusterMutation, PeerTransport, SecondaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
@@ -19,9 +20,19 @@ use super::types::{validate_spawn_tasks, PrimaryCommand, SpawnError};
 /// Dispatch one received command to its handler. Single line at the
 /// `select!` call site keeps the operational-loop's match arm
 /// transport-shape-pure.
+///
+/// `command_rx` threads the operational-loop's command-channel receiver
+/// into the `FailPermanent` cascade so a callback-issued `spawn_tasks`
+/// fired by an `on_phase_end` running inside `apply_fail_permanent`'s
+/// recursive `note_item_failed` step applies inline. The same receiver
+/// is also threaded into the in-cascade drain step that called us in
+/// the first place (when the dispatcher was invoked from inside
+/// `process_phase_lifecycle`), so the drain remains a single source
+/// of truth across nested cascade levels.
 pub async fn handle_primary_command<T, P, S, E, I>(
     coordinator: &mut PrimaryCoordinator<T, P, S, E, I>,
     command: PrimaryCommand<I>,
+    command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
 ) where
     T: SecondaryTransport<I>,
     P: PeerTransport<I>,
@@ -37,7 +48,7 @@ pub async fn handle_primary_command<T, P, S, E, I>(
             reply,
         } => {
             let result = coordinator
-                .apply_fail_permanent(hash, error, reason)
+                .apply_fail_permanent(hash, error, reason, command_rx)
                 .await;
             let _ = reply.send(result);
         }
@@ -124,6 +135,7 @@ where
         hash: String,
         error: ErrorType,
         reason: String,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
         let Some((phase_id, task_id)) = self.task_meta_for_hash(&hash) else {
             return Err(format!(
@@ -165,7 +177,7 @@ where
         // Phase + lifecycle bookkeeping. Must run AFTER the pool
         // mutation so `process_phase_lifecycle` observes the post-
         // cascade pool state.
-        self.note_item_failed(&phase_id, task_id.as_deref());
+        self.note_item_failed(&phase_id, task_id.as_deref(), command_rx).await;
 
         // Broadcast the terminal state for the originating task plus
         // any cascade-paused dependents (Unfulfillable case only).

@@ -7,7 +7,9 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
+use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::primary::command_channel::PrimaryCommand;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
@@ -38,7 +40,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tokio::select! {
                 msg = self.transport.recv() => {
                     match msg {
-                        Some(m) => self.dispatch_message(m).await?,
+                        // Pre-operational-loop site: PyPrimaryHandle
+                        // hasn't been issuing commands yet (run() hasn't
+                        // entered the operational loop). Pass &mut None
+                        // so the cascade's drain step is a no-op.
+                        Some(m) => self.dispatch_message(m, &mut None).await?,
                         None => return Err("transport closed".into()),
                     }
                 }
@@ -119,7 +125,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     /// Central message dispatcher — routes incoming messages by type.
-    pub(super) async fn dispatch_message(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+    ///
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the TaskComplete / TaskFailed cascade so a
+    /// callback-issued `spawn_tasks` applies inline before the next
+    /// `drain_empty_active_phases` poll. Pre-loop callers
+    /// (`wait_for_connections`, `wait_for_mesh_ready`) and post-loop
+    /// callers (`drain_pending_messages`) pass `&mut None`: at those
+    /// moments PyPrimaryHandle is either dormant (run hasn't entered
+    /// the operational loop yet) or the loop has already exited and
+    /// won't re-enter, so no in-runtime callback path needs draining.
+    pub(super) async fn dispatch_message(
+        &mut self,
+        msg: DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> Result<(), String> {
         // Every cross-secondary message bumps the per-secondary heartbeat,
         // not just `Keepalive`. A secondary that's actively processing
         // tasks shouldn't be falsely declared dead just because keepalives
@@ -130,8 +150,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             MessageType::SecondaryWelcome => self.handle_welcome(msg).await,
             MessageType::CertExchange => self.handle_cert_exchange(msg),
             MessageType::TaskRequest => self.handle_task_request(msg).await?,
-            MessageType::TaskComplete => self.handle_task_complete(msg).await,
-            MessageType::TaskFailed => self.handle_task_failed(msg).await,
+            MessageType::TaskComplete => self.handle_task_complete(msg, command_rx).await,
+            MessageType::TaskFailed => self.handle_task_failed(msg, command_rx).await,
             MessageType::MeshReady => self.handle_mesh_ready(msg),
             MessageType::Keepalive => { /* tracked above, no further action */ }
             MessageType::SecondaryFatalError => self.handle_secondary_fatal_error(msg).await?,
