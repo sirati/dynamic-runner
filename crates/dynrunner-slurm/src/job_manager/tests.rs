@@ -194,9 +194,17 @@ impl Gateway for SubmitRecordingGateway {
 ///     previously omitted it — a parity gap that this assertion
 ///     locks down so `sbatch` defaults can't drift the launched
 ///     proc count on partitions whose default ntasks is > 1).
+/// (f) `--signal=B:SIGTERM@<N>` IS emitted at the Rust-side default
+///     lead time (60s), giving the wrapper's trap → shutdown-manager
+///     chain a deterministic warning window before SLURM's
+///     `KillWait`-driven SIGKILL. Python never emitted this flag —
+///     it's a Rust-only behavioural improvement, locked down here so
+///     default-config callers can't silently regress to the
+///     no-warning shape.
 #[tokio::test]
 async fn submit_job_matches_python_invocation_shape() {
-    // Case A+B+D: defaults — no mem, mail=ALL on notify, script in root.
+    // Case A+B+D+F: defaults — no mem, mail=ALL on notify, script in
+    // root, --signal at the default 60s lead time.
     let gw = SubmitRecordingGateway::default();
     let cfg = SlurmConfig {
         root_folder: "/srv/slurm".into(),
@@ -247,6 +255,15 @@ async fn submit_job_matches_python_invocation_shape() {
         sbatch.contains("--ntasks=1"),
         "--ntasks=1 must be emitted for Python-parity; got: {sbatch}",
     );
+    // (f) Default-config --signal lead time. `SlurmConfig::default()`
+    // sets `signal_lead_seconds = 60`; we assert against the named
+    // default rather than the literal `60` so a deliberate default
+    // change updates the test through one well-known field.
+    let default_lead = SlurmConfig::default().signal_lead_seconds;
+    assert!(
+        sbatch.contains(&format!("--signal=B:SIGTERM@{default_lead}")),
+        "expected --signal=B:SIGTERM@{default_lead} (default lead) in sbatch; got: {sbatch}",
+    );
     // sbatch line ends with the script path argument.
     assert!(
         sbatch.ends_with("/srv/slurm/job_myjob.sh"),
@@ -268,5 +285,51 @@ async fn submit_job_matches_python_invocation_shape() {
     assert!(
         sbatch.contains("--mem=32G"),
         "expected --mem=32G when memory_per_node is set; got: {sbatch}",
+    );
+}
+
+/// `signal_lead_seconds` is plumbed verbatim into the sbatch flag.
+/// Locks the override path: setting a non-default lead time on the
+/// config must produce `--signal=B:SIGTERM@<that value>` so operators
+/// tuning the teardown window get the value they configured.
+#[tokio::test]
+async fn submit_job_emits_signal_lead_time_flag() {
+    let gw = SubmitRecordingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        signal_lead_seconds: 90,
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    mgr.submit_job("#!/bin/sh", "j-lead", 1, "/srv/slurm/log/run-lead")
+        .await
+        .expect("submit succeeds");
+    let sbatch = mgr.gateway().sbatch_command();
+    assert!(
+        sbatch.contains("--signal=B:SIGTERM@90"),
+        "expected --signal=B:SIGTERM@90 when signal_lead_seconds=90; got: {sbatch}",
+    );
+}
+
+/// `signal_lead_seconds = 0` skips the flag entirely. Rationale:
+/// `sbatch(1)` requires `@N > 0`; passing `--signal=B:SIGTERM@0`
+/// would be a hard-error from sbatch. The `0` value is the documented
+/// opt-out for clusters whose `slurm.conf` disables `--signal`.
+#[tokio::test]
+async fn submit_job_skips_signal_flag_when_lead_seconds_is_zero() {
+    let gw = SubmitRecordingGateway::default();
+    let cfg = SlurmConfig {
+        root_folder: "/srv/slurm".into(),
+        signal_lead_seconds: 0,
+        ..SlurmConfig::default()
+    };
+    let mut mgr = SlurmJobManager::new(cfg, gw);
+    mgr.submit_job("#!/bin/sh", "j-no-signal", 1, "/srv/slurm/log/run-x")
+        .await
+        .expect("submit succeeds");
+    let sbatch = mgr.gateway().sbatch_command();
+    assert!(
+        !sbatch.contains("--signal="),
+        "--signal must be omitted when signal_lead_seconds is 0; got: {sbatch}",
     );
 }

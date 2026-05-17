@@ -83,6 +83,13 @@ fn slurm_config_from_python(
         .getattr("prestaged_src_bins_path")
         .ok()
         .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() });
+    // Pre-SIGKILL warning window — defaults to the Rust core's default
+    // when the Python config doesn't carry the attribute (matches the
+    // duck-typed pattern used for the other optional-shape fields).
+    let signal_lead_seconds = bound
+        .getattr("signal_lead_seconds")
+        .ok()
+        .and_then(|v| v.extract::<u32>().ok());
 
     Ok(SlurmConfig {
         root_folder,
@@ -96,6 +103,8 @@ fn slurm_config_from_python(
         nodes: nodes.unwrap_or(1),
         notify_email: email,
         prestaged_src_bins_path,
+        signal_lead_seconds: signal_lead_seconds
+            .unwrap_or(SlurmConfig::default().signal_lead_seconds),
     })
 }
 

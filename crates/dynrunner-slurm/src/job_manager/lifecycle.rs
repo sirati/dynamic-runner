@@ -104,9 +104,31 @@ impl<G: Gateway> SlurmJobManager<G> {
             format!("--cpus-per-task={}", self.config.cpus_per_task),
             format!("--partition={}", self.config.partition),
             format!("--time={}", self.config.time_limit),
-            format!("--output={run_log_dir}/slurm_%j.out"),
-            format!("--error={run_log_dir}/slurm_%j.err"),
         ];
+
+        // Pre-SIGKILL warning window: `--signal=B:SIGTERM@<N>` tells
+        // SLURM to deliver SIGTERM to the batch script (`B:` prefix —
+        // not the srun steps) `<N>` seconds before the `--time` limit.
+        // Placed directly after `--time` because the lead time is
+        // expressed relative to that limit; operators reading the
+        // rendered command see the two related flags adjacent.
+        //
+        // The wrapper's trap → shutdown-manager forwarding chain uses
+        // this window for container teardown + secondary signalling +
+        // `/tmp` cleanup before SLURM's `KillWait`-driven SIGKILL.
+        //
+        // `signal_lead_seconds = 0` skips the flag (sbatch(1) requires
+        // `@N` > 0); operators on clusters whose `slurm.conf` disables
+        // `--signal` set 0 to opt out. Same opt-in shape as `--mem`.
+        if self.config.signal_lead_seconds > 0 {
+            sbatch_args.push(format!(
+                "--signal=B:SIGTERM@{}",
+                self.config.signal_lead_seconds
+            ));
+        }
+
+        sbatch_args.push(format!("--output={run_log_dir}/slurm_%j.out"));
+        sbatch_args.push(format!("--error={run_log_dir}/slurm_%j.err"));
 
         // `--mem` is intentionally opt-in (Python never emits it). See
         // the method doc-comment for the rationale; default-config
