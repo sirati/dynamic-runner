@@ -39,7 +39,6 @@ use pyo3::types::{PyDict, PyList, PyTuple};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::identifier::RunnerIdentifier;
-use crate::pytypes::PyTaskInfo;
 
 /// Shared mutable cell carrying the per-task reinject cap. Held by
 /// both `PyPrimaryCoordinator` (which threads the cap into
@@ -251,47 +250,110 @@ impl PyPrimaryHandle {
     ///     "dep_task_id": str}` — `task_depends_on` references a
     ///     task_id not known to the ledger.
     ///
+    /// Two call contexts must work:
+    ///
+    /// 1. **Outside any tokio runtime** (e.g. from `on_run_start`
+    ///    which fires synchronously under the GIL BEFORE the
+    ///    coordinator's runtime starts driving): uses the handle's
+    ///    own `current_thread` runtime to send the command + await
+    ///    the reply oneshot synchronously. Per-task validation
+    ///    errors are returned in the result list.
+    /// 2. **Inside the coordinator's runtime** (e.g. from
+    ///    `on_phase_end` which fires from `process_phase_lifecycle`
+    ///    while the coordinator's operational loop has yielded to
+    ///    Python): `rt.block_on(...)` from this path would panic
+    ///    ("Cannot start a runtime from within a runtime"), and the
+    ///    coordinator's runtime is `new_current_thread` so neither
+    ///    `Handle::block_on` nor `tokio::task::block_in_place`
+    ///    work either. Switches to a `try_send` fire-and-forget
+    ///    shape: the command lands on the coordinator's `command_rx`
+    ///    immediately, the operational loop's `select!` picks it up
+    ///    the next time the Python callback returns and the
+    ///    coordinator resumes. The reply oneshot is dropped (no one
+    ///    awaits it on this path); per-task validation errors are
+    ///    therefore NOT surfaced through the sync return value in
+    ///    this call context — the coordinator's handler still
+    ///    enforces them and the tasks land correctly. Documented as
+    ///    a contract trade-off here; the alternative (block_on on a
+    ///    current_thread runtime nested inside another runtime) is
+    ///    fundamentally impossible.
+    ///
     /// Releases the GIL across the `tokio::block_on(...)` wait so
     /// the operational loop in the coordinator's runtime can drive
     /// the command (acquiring the GIL elsewhere is undeadlocked).
     /// Raises `PyRuntimeError` for vec-wide failure modes (command
     /// channel closed, oneshot dropped).
+    ///
+    /// Item extraction goes through `crate::pytypes::extract_binaries`
+    /// — the same duck-typed `getattr` walker every other framework
+    /// entry point uses (`run_local`, `run_distributed`,
+    /// `run_secondary` via `process_binaries`). This accepts both the
+    /// `dynamic_runner._native.TaskInfo` pyclass AND the
+    /// `dynamic_runner._shared.task_info.TaskInfo` Python dataclass;
+    /// strict `item.extract::<PyTaskInfo>()` would reject the
+    /// dataclass shape with `TypeError: 'TaskInfo' object is not an
+    /// instance of 'TaskInfo'` (the two-class name collision
+    /// documented on `PyTaskInfo`).
     fn spawn_tasks<'py>(
         &self,
         py: Python<'py>,
         tasks: &Bound<'py, PyList>,
     ) -> PyResult<Bound<'py, PyList>> {
         // Convert the Python list into Rust `TaskInfo<RunnerIdentifier>`
-        // entries BEFORE releasing the GIL. The PyO3 conversion
-        // touches Python-allocated objects (string interning, dict
-        // payloads); doing it inside `allow_threads` would re-acquire
-        // the GIL implicitly. Pre-convert + ship the typed vec into
-        // the runtime, then re-acquire only to build the return list.
-        let mut typed: Vec<TaskInfo<RunnerIdentifier>> = Vec::with_capacity(tasks.len());
-        for item in tasks.iter() {
-            let py_task: PyTaskInfo = item.extract()?;
-            typed.push(TaskInfo::from(&py_task));
-        }
+        // entries BEFORE releasing the GIL — the conversion touches
+        // Python-allocated objects (string interning, dict payloads)
+        // and `getattr` calls require the GIL.
+        let typed: Vec<TaskInfo<RunnerIdentifier>> =
+            crate::pytypes::extract_binaries(tasks)?;
 
         let sender = self.sender.clone();
         let rt = self.rt.clone();
         let (reply_tx, reply_rx) = oneshot::channel();
+        let command = PrimaryCommand::SpawnTasks {
+            tasks: typed,
+            reply: reply_tx,
+        };
+
+        // Discriminate the two call contexts (see the rustdoc above
+        // for the full rationale). `Handle::try_current()` succeeds
+        // iff we're being called from within a tokio runtime — i.e.
+        // from inside a callback the coordinator's loop just fired.
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+
         let outcome: Result<Result<Vec<(usize, SpawnError)>, String>, String> = py.detach(|| {
-            rt.block_on(async move {
-                sender
-                    .send(PrimaryCommand::SpawnTasks {
-                        tasks: typed,
-                        reply: reply_tx,
-                    })
-                    .await
-                    .map_err(|_| {
+            if in_runtime {
+                // Fire-and-forget into the coordinator's command
+                // channel. `try_send` is sync; the command lands
+                // immediately. The reply oneshot's receiver
+                // (`reply_rx`) is dropped at end-of-scope; the
+                // coordinator's handler sees a dropped receiver and
+                // silently skips the reply send — no panic, no
+                // resource leak. Per-task validation errors flow
+                // through the handler's existing tracing path
+                // instead of the sync return.
+                match sender.try_send(command) {
+                    Ok(()) => Ok(Ok(Vec::new())),
+                    Err(tokio_mpsc::error::TrySendError::Closed(_)) => Err(
+                        "PrimaryHandle: command channel closed (coordinator dropped?)"
+                            .to_string(),
+                    ),
+                    Err(tokio_mpsc::error::TrySendError::Full(_)) => Err(
+                        "PrimaryHandle: command channel full — coordinator \
+                         is not draining commands"
+                            .to_string(),
+                    ),
+                }
+            } else {
+                rt.block_on(async move {
+                    sender.send(command).await.map_err(|_| {
                         "PrimaryHandle: command channel closed (coordinator dropped?)"
                             .to_string()
                     })?;
-                reply_rx
-                    .await
-                    .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
-            })
+                    reply_rx
+                        .await
+                        .map_err(|_| "PrimaryHandle: reply oneshot dropped".to_string())
+                })
+            }
         });
         let errors = match outcome {
             Ok(Ok(errors)) => errors,
