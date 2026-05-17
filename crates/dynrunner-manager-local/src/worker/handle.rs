@@ -221,10 +221,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// Send SIGKILL to the worker's entire process group.
     ///
     /// Used as the escalation step after a `sigterm_process_tree`
-    /// + grace-period wait did not bring the group down. Same
+    /// plus grace-period wait did not bring the group down. Same
     /// negative-pgid idiom as the SIGTERM path; same factory-side
-    /// contract about process-group leadership. Idempotent on
-    /// absence.
+    /// contract about process-group leadership applies. Idempotent
+    /// on absence.
     #[cfg(unix)]
     pub fn sigkill_process_tree(&self) {
         use nix::sys::signal::{kill, Signal};

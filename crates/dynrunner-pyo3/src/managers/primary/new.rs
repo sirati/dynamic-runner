@@ -30,6 +30,8 @@ impl PyPrimaryCoordinator {
         respawn_spawner = None,
         task_completed_listener = None,
         scheduler_config = None,
+        panik_watcher_paths = None,
+        panik_watcher_poll_interval_secs = 10.0,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -50,6 +52,8 @@ impl PyPrimaryCoordinator {
         respawn_spawner: Option<Py<PyAny>>,
         task_completed_listener: Option<Py<PyAny>>,
         scheduler_config: Option<SchedulerConfig>,
+        panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
+        panik_watcher_poll_interval_secs: f64,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         let uses_file_based_items: bool = task_definition
@@ -90,6 +94,8 @@ impl PyPrimaryCoordinator {
             respawn_spawner,
             task_completed_listener,
             scheduler_config: scheduler_config.unwrap_or_default(),
+            panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
+            panik_watcher_poll_interval_secs,
         })
     }
 

@@ -134,6 +134,13 @@ pub(crate) struct PyObserverLateJoiner {
     /// the tuning surface consistent with the other Rust manager-hosting
     /// pyclasses so a single CLI flag pair drives every node uniformly.
     pub(super) scheduler_config: SchedulerConfig,
+    /// Panik-watcher paths — same shape as on
+    /// `PySecondaryCoordinator`. An observer that runs on its own
+    /// host can be told to bail by a per-host panik file; observers
+    /// share the same shared-network sentinel as the rest of the
+    /// cluster, so an operator can trip every node at once.
+    pub(super) panik_watcher_paths: Vec<PathBuf>,
+    pub(super) panik_watcher_poll_interval_secs: f64,
     pub(super) completed: u32,
 }
 
@@ -149,7 +156,10 @@ pub(crate) struct PyObserverLateJoiner {
     distributed_config = None,
     holdings = None,
     scheduler_config = None,
+    panik_watcher_paths = None,
+    panik_watcher_poll_interval_secs = 10.0,
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_observer_late_joiner<'py>(
     py: Python<'py>,
     peer_info_dir: PathBuf,
@@ -158,6 +168,8 @@ pub(crate) fn run_observer_late_joiner<'py>(
     distributed_config: Option<DistributedConfig>,
     holdings: Option<Vec<String>>,
     scheduler_config: Option<SchedulerConfig>,
+    panik_watcher_paths: Option<Vec<PathBuf>>,
+    panik_watcher_poll_interval_secs: f64,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     if let Some(id) = observer_id.as_ref() {
@@ -172,6 +184,13 @@ pub(crate) fn run_observer_late_joiner<'py>(
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }
+    if let Some(paths) = panik_watcher_paths.as_ref() {
+        kwargs.set_item("panik_watcher_paths", paths.clone())?;
+    }
+    kwargs.set_item(
+        "panik_watcher_poll_interval_secs",
+        panik_watcher_poll_interval_secs,
+    )?;
     // Resolve the legacy class via the package, mirroring `run_secondary`
     // / `run_distributed`'s "build-via-Python-module-attribute" pattern
     // so the wiring stays uniform across runner modes.

@@ -41,6 +41,18 @@ impl PyDistributedManager {
         // the per-secondary task closure below preserves the same
         // budget shape across the cluster.
         let scheduler_config = self.scheduler_config.clone();
+        // Panik-watcher config — same kwarg surface as the standalone
+        // primary/secondary pyclasses. Shared verbatim by the
+        // in-process primary AND every spawned secondary so a panik
+        // file appearing on the host triggers the SAME response on
+        // every coordinator in the process; without that the in-
+        // process secondaries would silently outlive a primary panik
+        // (their workers are spawned in their own pgids and survive
+        // their parent's exit).
+        let panik_watcher_paths = self.panik_watcher_paths.clone();
+        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
+            self.panik_watcher_poll_interval_secs,
+        );
 
         // Pre-compute per-secondary log directories under the GIL —
         // `resolve_log_dir` calls into Python's `datetime` module —
@@ -168,6 +180,10 @@ impl PyDistributedManager {
         // same translation so a collapse here surfaces as a
         // `RuntimeError` to the Python caller of `run_distributed`.
         let mut cluster_collapsed: Option<RunError> = None;
+        // Panik outcome carried out of the detached tokio runtime —
+        // same shape as `PyPrimaryCoordinator::run`. `Some` iff the
+        // in-process primary's `run` returned `RunError::PanikShutdown`.
+        let mut panik_shutdown_path: Option<std::path::PathBuf> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -265,6 +281,8 @@ impl PyDistributedManager {
                     let sec_estimator = estimator.clone();
                     let sec_max_resources = max_resources_per_secondary.clone();
                     let sec_scheduler_config = scheduler_config.clone();
+                    let sec_panik_paths = panik_watcher_paths.clone();
+                    let sec_panik_poll = panik_watcher_poll_interval;
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -337,6 +355,27 @@ impl PyDistributedManager {
                             sec_scheduler_config.build_memory_scheduler(),
                             estimator,
                         );
+
+                        // Per-secondary panik watcher. One watcher per
+                        // coordinator is the simplest correct shape: a
+                        // single shared `oneshot::Sender` couldn't
+                        // fan out to N receivers, and broadcasting
+                        // through a different channel type would
+                        // complicate the framework API. Polling
+                        // overhead at the user-spec'd 10s cadence is
+                        // negligible (one stat per path per 10s, per
+                        // secondary).
+                        let mut panik_watcher =
+                            dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                                dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                                    paths: sec_panik_paths,
+                                    poll_interval: sec_panik_poll,
+                                },
+                            );
+                        if let Some(rx) = panik_watcher.take_signal_rx() {
+                            secondary.register_panik_signal_rx(rx);
+                        }
+
                         let result = secondary.run(&mut factory).await;
                         if let Err(e) = &result {
                             tracing::error!(error = %e, "secondary failed");
@@ -435,6 +474,22 @@ impl PyDistributedManager {
                     primary.register_task_completed_listener(listener);
                 }
 
+                // Panik watcher for the in-process primary. Each
+                // in-process secondary spawn_local closure above also
+                // wires its own watcher — every coordinator on this
+                // process polls independently and fires its own
+                // teardown when its file appears. Handle held in
+                // scope for `Drop::abort()` at loop exit.
+                let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                    dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                        paths: panik_watcher_paths,
+                        poll_interval: panik_watcher_poll_interval,
+                    },
+                );
+                if let Some(rx) = panik_watcher.take_signal_rx() {
+                    primary.register_panik_signal_rx(rx);
+                }
+
                 // Initial staging is now driven by
                 // `PrimaryCoordinator::run` itself: with
                 // `PrimaryConfig.source_dir = Some(source_dir)`
@@ -464,8 +519,21 @@ impl PyDistributedManager {
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary failed");
                 }
-                if let Err(RunError::ClusterCollapsed { .. }) = &result {
-                    cluster_collapsed = result.err();
+                match result {
+                    Err(RunError::ClusterCollapsed { .. }) => {
+                        cluster_collapsed = result.err();
+                    }
+                    Err(RunError::PanikShutdown {
+                        matched_path,
+                        reason: _,
+                    }) => {
+                        panik_shutdown_path = Some(matched_path);
+                    }
+                    Err(RunError::Other(_)) | Ok(()) => {
+                        // Legacy log-and-swallow for non-structured
+                        // errors — see `PyPrimaryCoordinator::run`
+                        // for the rationale.
+                    }
                 }
 
                 completed = primary.completed_count() as u32;
@@ -493,6 +561,23 @@ impl PyDistributedManager {
         self.completed = completed;
         self.failed = failed;
         self.stranded = stranded;
+
+        if let Some(matched_path) = panik_shutdown_path {
+            // GIL is back. Exit(137) — same shape as
+            // `PyPrimaryCoordinator::run`. Skips the
+            // cluster-collapsed path because a panik shutdown is a
+            // strictly-stronger terminal (the operator declared the
+            // whole cluster unwanted; partial accounting is
+            // irrelevant). The secondaries spawned above have each
+            // already run their own panik-react path (kill_all_workers_with_grace)
+            // before joining; their workers' pgids are reaped before
+            // we exit.
+            tracing::error!(
+                matched_path = %matched_path.display(),
+                "panik shutdown: distributed manager exiting with code 137"
+            );
+            std::process::exit(137);
+        }
 
         if let Some(err) = cluster_collapsed {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));

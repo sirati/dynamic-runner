@@ -175,6 +175,29 @@ pub(super) fn drive_rust_primary<'py>(
         coord_kwargs.set_item("scheduler_config", sc)?;
     }
 
+    // Panik-watcher CLI flags from the argparse Namespace.
+    // `args.panik_file_paths` is a `list[str]` (action="append" on
+    // the CLI), `args.panik_poll_interval_secs` is `Optional[float]`.
+    // Mirrors the OOM safety-margin plumbing above: read the
+    // Namespace, parse/convert, attach to `coord_kwargs`. Missing
+    // attribute / `None` value keeps the
+    // `RustPrimaryCoordinator.__init__` default (10s poll, empty
+    // paths = no watcher).
+    if let Ok(v) = args.getattr("panik_file_paths")
+        && !v.is_none()
+    {
+        let paths: Vec<String> = v.extract()?;
+        let path_bufs: Vec<std::path::PathBuf> =
+            paths.into_iter().map(std::path::PathBuf::from).collect();
+        coord_kwargs.set_item("panik_watcher_paths", path_bufs)?;
+    }
+    if let Ok(v) = args.getattr("panik_poll_interval_secs")
+        && !v.is_none()
+    {
+        let secs: f64 = v.extract()?;
+        coord_kwargs.set_item("panik_watcher_poll_interval_secs", secs)?;
+    }
+
     let num_secondaries = outcome.num_secondaries;
     let args_tuple = PyTuple::new(py, [
         num_secondaries.into_pyobject(py)?.into_any().unbind(),

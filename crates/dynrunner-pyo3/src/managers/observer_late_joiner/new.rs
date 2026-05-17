@@ -24,7 +24,10 @@ impl PyObserverLateJoiner {
         peer_lifecycle_listener = None,
         holdings = None,
         scheduler_config = None,
+        panik_watcher_paths = None,
+        panik_watcher_poll_interval_secs = 10.0,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         peer_info_dir: PathBuf,
         task_definition: &Bound<'_, PyAny>,
@@ -33,6 +36,8 @@ impl PyObserverLateJoiner {
         peer_lifecycle_listener: Option<Py<PyAny>>,
         holdings: Option<Vec<String>>,
         scheduler_config: Option<SchedulerConfig>,
+        panik_watcher_paths: Option<Vec<PathBuf>>,
+        panik_watcher_poll_interval_secs: f64,
     ) -> PyResult<Self> {
         let topology = LoadedTopology::from_python(task_definition)?;
         // Default observer-id includes a small random suffix so two
@@ -67,6 +72,8 @@ impl PyObserverLateJoiner {
             peer_lifecycle_listener,
             holdings,
             scheduler_config: scheduler_config.unwrap_or_default(),
+            panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
+            panik_watcher_poll_interval_secs,
             completed: 0,
         })
     }

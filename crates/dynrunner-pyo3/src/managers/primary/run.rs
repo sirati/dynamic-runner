@@ -100,6 +100,13 @@ impl PyPrimaryCoordinator {
         // OOM-preempt margin / pressure threshold rather than the bare
         // `ResourceStealingScheduler::memory()` default.
         let scheduler_config = self.scheduler_config.clone();
+        // Panik-watcher config captured here so the `py.detach` closure
+        // owns its own copy. Empty paths yields a no-op watcher and
+        // the operational-loop arm parks on `pending().await`.
+        let panik_watcher_paths = self.panik_watcher_paths.clone();
+        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
+            self.panik_watcher_poll_interval_secs,
+        );
         // Snapshot the cap, flip `run_started`, and consume the
         // receiver for the detached runtime in one step. The helper
         // owns the single-shot guard and the snapshot ordering; the
@@ -258,6 +265,12 @@ impl PyPrimaryCoordinator {
         // swallow behaviour to minimise the blast radius of this
         // accounting-only patch.
         let mut cluster_collapsed: Option<RunError> = None;
+        // Panik outcome carried out of the detached tokio runtime.
+        // `Some(matched_path)` iff the inner `PrimaryCoordinator::run`
+        // returned `RunError::PanikShutdown { .. }`. The GIL-side tail
+        // of this method calls `std::process::exit(137)` so the SLURM
+        // wrapper reaps the container.
+        let mut panik_shutdown_path: Option<std::path::PathBuf> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -421,6 +434,24 @@ impl PyPrimaryCoordinator {
                     primary.set_fulfillability_matcher(matcher);
                 }
 
+                // Spawn the panik watcher and hand its signal
+                // receiver to the inner coordinator. Empty
+                // `panik_watcher_paths` yields a never-firing
+                // receiver (no-op task), so callers that don't pass
+                // any `--panik-file` flags pay zero runtime cost.
+                // Held in scope so its `Drop::abort()` runs at loop
+                // exit and cleans up the polling task on every
+                // termination path.
+                let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                    dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                        paths: panik_watcher_paths,
+                        poll_interval: panik_watcher_poll_interval,
+                    },
+                );
+                if let Some(rx) = panik_watcher.take_signal_rx() {
+                    primary.register_panik_signal_rx(rx);
+                }
+
                 for (sec_id, file_hash, content_hash, src, dest) in pending_stage_files {
                     primary.queue_stage_file(sec_id, file_hash, content_hash, src, dest);
                 }
@@ -434,8 +465,23 @@ impl PyPrimaryCoordinator {
                 if let Err(e) = &result {
                     tracing::error!(error = %e, "primary coordinator failed");
                 }
-                if let Err(RunError::ClusterCollapsed { .. }) = &result {
-                    cluster_collapsed = result.err();
+                match result {
+                    Err(RunError::ClusterCollapsed { .. }) => {
+                        cluster_collapsed = result.err();
+                    }
+                    Err(RunError::PanikShutdown {
+                        matched_path,
+                        reason: _,
+                    }) => {
+                        panik_shutdown_path = Some(matched_path);
+                    }
+                    Err(RunError::Other(_)) | Ok(()) => {
+                        // Legacy log-and-swallow behaviour for
+                        // non-structured errors is preserved here:
+                        // these surface through the per-counter
+                        // accounting below (stranded count + the
+                        // log line above), not as a PyErr.
+                    }
                 }
 
                 completed = primary.completed_count() as u32;
@@ -461,6 +507,23 @@ impl PyPrimaryCoordinator {
         self.completed = completed;
         self.failed = failed;
         self.stranded = stranded;
+
+        if let Some(matched_path) = panik_shutdown_path {
+            // GIL is back. Log + exit(137) so the SLURM wrapper
+            // sees the container-stop signal and reaps. No Python
+            // stack unwinds — `exit` runs atexit handlers then
+            // `_exit`. This path supersedes the cluster-collapsed
+            // translation below because a panik shutdown is a
+            // strictly-stronger terminal: the operator already
+            // declared the entire cluster unwanted, so the partial
+            // accounting that drives `ClusterCollapsed` is
+            // irrelevant.
+            tracing::error!(
+                matched_path = %matched_path.display(),
+                "panik shutdown: primary exiting with code 137"
+            );
+            std::process::exit(137);
+        }
 
         if let Some(err) = cluster_collapsed {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));

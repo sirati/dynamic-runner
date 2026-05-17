@@ -82,6 +82,13 @@ impl PySecondaryCoordinator {
         let task_args_py = self.task_args_py.clone_ref(py);
         let phase_deps_for_ingest = self.phase_deps.clone();
         let setup_discover_root = self.src_network.clone();
+        // Panik-watcher config captured before `py.detach` so the
+        // tokio-runtime closure owns its own copy. Cloning a `Vec<PathBuf>`
+        // is cheap; the watcher only needs read-only access.
+        let panik_watcher_paths = self.panik_watcher_paths.clone();
+        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
+            self.panik_watcher_poll_interval_secs,
+        );
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
         // Wrapped through `PyPeerLifecycleListener::new` into a
@@ -100,7 +107,17 @@ impl PySecondaryCoordinator {
         // `self.completed` was set from a zero counter, causing the
         // secondary to exit `0` despite the work never starting; the
         // dispatcher then chained the next task on a missing input.
-        let result: Result<u32, PyErr> = py.detach(|| -> Result<u32, PyErr> {
+        // Terminal-outcome shapes for the secondary's `run()`. The
+        // `py.detach` closure returns one of these; the outer scope
+        // (with the GIL re-acquired) translates to the Python-side
+        // surface — completed count for `Done`, `std::process::exit(137)`
+        // for `Panik`.
+        enum SecondaryRunOutcome {
+            Done(u32),
+            Panik(std::path::PathBuf),
+        }
+        let result: Result<SecondaryRunOutcome, PyErr> =
+            py.detach(|| -> Result<SecondaryRunOutcome, PyErr> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -324,6 +341,28 @@ impl PySecondaryCoordinator {
                     },
                 );
 
+                // Spawn the panik watcher and register its signal
+                // receiver on the coordinator BEFORE entering the
+                // setup-promote loop. The watcher polls
+                // `panik_watcher_paths` every `panik_watcher_poll_interval`;
+                // empty paths config yields a never-firing receiver
+                // (the spawn helper returns a no-op task), so callers
+                // that don't pass `--panik-file` flags get a
+                // structurally-disabled watcher with zero runtime
+                // cost. The `PanikWatcher` handle is held in this
+                // scope so its `Drop::abort()` runs at loop exit and
+                // cleans up the polling task.
+                let mut panik_watcher =
+                    dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                        dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                            paths: panik_watcher_paths,
+                            poll_interval: panik_watcher_poll_interval,
+                        },
+                    );
+                if let Some(rx) = panik_watcher.take_signal_rx() {
+                    secondary.register_panik_signal_rx(rx);
+                }
+
                 // Setup-promote outer loop: drive
                 // `run_until_setup_or_done` to a terminal state,
                 // bouncing back through Python's `discover_items` on
@@ -359,7 +398,26 @@ impl PySecondaryCoordinator {
                 // call. No coordinator state is dropped across the
                 // yield (`setup_phase_completed` is latched, workers
                 // stay running, transports remain connected).
-                let loop_result: Result<(), PyErr> = loop {
+                // Loop result carries the three distinct terminal
+                // shapes the coordinator can produce:
+                //   - `Ok(())`: clean shutdown, return to Python normally.
+                //   - `Err(PyErr)`: typed run failure, surfaced to
+                //     Python as the wrapping exception.
+                //   - `Panik(PathBuf)`: operator-initiated emergency
+                //     stop; the outer `run()` calls
+                //     `std::process::exit(137)` after reacquiring
+                //     the GIL.
+                //
+                // Modelled as an enum (rather than a sentinel string
+                // smuggled through `Err(PyErr)`) so the boundary
+                // remains typed and the exit-on-panik decision is
+                // a structural match, not a string compare.
+                enum LoopResult {
+                    Ok(()),
+                    Err(PyErr),
+                    Panik(std::path::PathBuf),
+                }
+                let loop_result: LoopResult = loop {
                     let outcome = match secondary
                         .run_until_setup_or_done(&mut factory)
                         .await
@@ -367,7 +425,7 @@ impl PySecondaryCoordinator {
                         Ok(o) => o,
                         Err(e) => {
                             tracing::error!(error = %e, "secondary failed");
-                            break Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            break LoopResult::Err(pyo3::exceptions::PyRuntimeError::new_err(
                                 format!("secondary failed: {e}"),
                             ));
                         }
@@ -375,7 +433,27 @@ impl PySecondaryCoordinator {
                     match outcome {
                         RunOutcome::Done => {
                             tracing::info!("secondary finished successfully");
-                            break Ok(());
+                            break LoopResult::Ok(());
+                        }
+                        RunOutcome::PanikShutdown {
+                            matched_path,
+                            reason,
+                        } => {
+                            // The coordinator has already broadcast
+                            // `ClusterMutation::PanikRequested` and
+                            // killed every worker pgid in this
+                            // secondary. The PyO3 outer scope owns
+                            // the actual `exit(137)` call (and the
+                            // log) so this arm just propagates the
+                            // matched_path through the loop's typed
+                            // result; see [`LoopResult`] above.
+                            tracing::warn!(
+                                matched_path = %matched_path.display(),
+                                reason = %reason,
+                                "secondary panik shutdown; propagating \
+                                 to PyO3 boundary for exit(137)"
+                            );
+                            break LoopResult::Panik(matched_path);
                         }
                         RunOutcome::SetupPending => {
                             // Re-acquire the GIL ONLY for the duration
@@ -473,7 +551,7 @@ impl PySecondaryCoordinator {
                                         "task.discover_items raised during \
                                          setup-promote; aborting secondary"
                                     );
-                                    break Err(e);
+                                    break LoopResult::Err(e);
                                 }
                             };
                             tracing::info!(
@@ -492,9 +570,11 @@ impl PySecondaryCoordinator {
                                     error = %e,
                                     "ingest_setup_discovery failed; aborting secondary"
                                 );
-                                break Err(pyo3::exceptions::PyRuntimeError::new_err(
-                                    format!("ingest_setup_discovery: {e}"),
-                                ));
+                                break LoopResult::Err(
+                                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                        "ingest_setup_discovery: {e}"
+                                    )),
+                                );
                             }
                             // Loop continues; the next
                             // `run_until_setup_or_done` call short-
@@ -512,14 +592,48 @@ impl PySecondaryCoordinator {
                 // `subprocess_factory::terminate_children` for why
                 // straight SIGKILL is the wrong default for
                 // podman-launched workers.
-                factory.cleanup_all();
+                //
+                // Skipped on the panik path: the coordinator's
+                // `pool.kill_all_workers_with_grace` already took down
+                // every worker pgid (including descendants), and we
+                // want the `exit(137)` decision to fire as soon as
+                // the outer scope picks up the Panik variant — no
+                // additional grace ladder.
+                if !matches!(loop_result, LoopResult::Panik(_)) {
+                    factory.cleanup_all();
+                }
 
-                loop_result.map(|()| completed)
+                match loop_result {
+                    LoopResult::Ok(()) => Ok(SecondaryRunOutcome::Done(completed)),
+                    LoopResult::Err(e) => Err(e),
+                    LoopResult::Panik(matched_path) => {
+                        Ok(SecondaryRunOutcome::Panik(matched_path))
+                    }
+                }
             }))
         });
 
-        self.completed = result?;
-        Ok(())
+        match result? {
+            SecondaryRunOutcome::Done(completed) => {
+                self.completed = completed;
+                Ok(())
+            }
+            SecondaryRunOutcome::Panik(matched_path) => {
+                // GIL has been re-acquired (the `py.detach` block
+                // returned). Log the cause one last time at the
+                // PyO3 boundary so operators see the exit signal
+                // in the dispatcher log, then exit(137). The
+                // SLURM wrapper sees that code and reaps the
+                // podman container; no Python stack unwinds
+                // because we never return — `exit` calls libc
+                // `_exit` after running atexit handlers.
+                tracing::error!(
+                    matched_path = %matched_path.display(),
+                    "panik shutdown: secondary exiting with code 137"
+                );
+                std::process::exit(137);
+            }
+        }
     }
 
     #[getter]

@@ -27,6 +27,8 @@ use super::module;
     log_paths = None,
     worker_spec = None,
     log_dir = None,
+    panik_watcher_paths = None,
+    panik_watcher_poll_interval_secs = 10.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_local<'py>(
@@ -44,6 +46,8 @@ pub(crate) fn run_local<'py>(
     log_paths: Option<LogPathConfig>,
     worker_spec: Option<WorkerSpec>,
     log_dir: Option<String>,
+    panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
+    panik_watcher_poll_interval_secs: f64,
 ) -> PyResult<Py<PyAny>> {
     // The legacy positional `max_memory` is kept for back-compat with
     // direct `RustLocalManager(...)` callers; the typed-config path
@@ -86,6 +90,13 @@ pub(crate) fn run_local<'py>(
     )?;
     kwargs.set_item("stage_timeouts_secs", config.stage_timeouts_secs.clone())?;
     kwargs.set_item("log_oom_watcher", config.log_oom_watcher)?;
+    if let Some(paths) = panik_watcher_paths.as_ref() {
+        kwargs.set_item("panik_watcher_paths", paths.clone())?;
+    }
+    kwargs.set_item(
+        "panik_watcher_poll_interval_secs",
+        panik_watcher_poll_interval_secs,
+    )?;
 
     let cls = module(py)?.getattr("RustLocalManager")?;
     let args = (
