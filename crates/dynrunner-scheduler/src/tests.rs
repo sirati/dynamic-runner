@@ -522,6 +522,167 @@ fn memory_constructor_default_margin_is_1gib() {
 
 // ── Multi-idle worker temp_factor tests ──
 
+// ── KillReason classification tests ──
+//
+// Pin the four-way discriminator at the decision site. Each scenario
+// builds a synthetic worker set, drives `check_resource_pressure`
+// once, and asserts the `KillReason` carried by the returned `Kill`
+// variant. Margin is set to zero so the proxy-byte numbers don't
+// saturate `effective_max` (same convention as the legacy pressure
+// tests above).
+
+use dynrunner_scheduler_api::KillReason;
+
+fn worker_active(
+    id: WorkerId,
+    reserved: u64,
+    actual: u64,
+    opportunistic: bool,
+) -> WorkerBudgetInfo<TestId> {
+    WorkerBudgetInfo {
+        worker_id: id,
+        reserved_budgets: mem(reserved),
+        actual_usage: mem(actual),
+        is_idle: false,
+        is_opportunistic: opportunistic,
+        has_initial_assignment: true,
+        current_task: Some(make_binary("t", 10)),
+        estimated_usage: mem(actual),
+    }
+}
+
+#[test]
+fn kill_reason_no_fault_memory_stealing_when_opportunistic_picked() {
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
+    let workers = vec![
+        // Non-opportunistic worker under its budget — present so the
+        // opportunistic-branch threshold is crossed.
+        worker_active(0, 500, 400, false),
+        // Opportunistic victim — median of one is itself.
+        worker_active(1, 500, 400, true),
+    ];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, reason } => {
+            assert_eq!(worker_id, 1);
+            assert_eq!(reason, KillReason::NoFaultMemoryStealing);
+        }
+        _ => panic!("expected Kill(NoFaultMemoryStealing), got {decision:?}"),
+    }
+}
+
+#[test]
+fn kill_reason_no_fault_under_budget_when_smallest_active_is_below_reserved() {
+    // Two non-opportunistic workers. Worker 1 is the smallest active
+    // by estimated_usage but its actual_usage is below its reserved
+    // budget — another worker drove the cgroup into pressure, the
+    // victim is innocent. Note: actual_usage sum (1200 > 1000)
+    // crosses effective_max so the smallest-active branch fires.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        pressure_threshold: 5,
+        ..sched()
+    };
+    let workers = vec![
+        worker_active(0, 500, 800, false),
+        // Reserved 500, actual 400, estimated 100 (smallest).
+        WorkerBudgetInfo {
+            worker_id: 1,
+            reserved_budgets: mem(500),
+            actual_usage: mem(400),
+            is_idle: false,
+            is_opportunistic: false,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("b", 10)),
+            estimated_usage: mem(100),
+        },
+    ];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, reason } => {
+            assert_eq!(worker_id, 1);
+            assert_eq!(reason, KillReason::NoFaultUnderBudget);
+        }
+        _ => panic!("expected Kill(NoFaultUnderBudget), got {decision:?}"),
+    }
+}
+
+#[test]
+fn kill_reason_oom_over_budget_when_smallest_active_is_over_reserved() {
+    // Two non-opportunistic workers, both over their reserved budget.
+    // The smallest-active (by estimated_usage) is the victim and its
+    // actual_usage >= reserved → OomOverBudget.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
+    let workers = vec![
+        WorkerBudgetInfo {
+            worker_id: 0,
+            reserved_budgets: mem(500),
+            actual_usage: mem(600),
+            is_idle: false,
+            is_opportunistic: false,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("a", 10)),
+            estimated_usage: mem(600),
+        },
+        WorkerBudgetInfo {
+            worker_id: 1,
+            reserved_budgets: mem(500),
+            actual_usage: mem(550),
+            is_idle: false,
+            is_opportunistic: false,
+            has_initial_assignment: true,
+            current_task: Some(make_binary("b", 10)),
+            estimated_usage: mem(300),
+        },
+    ];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, reason } => {
+            assert_eq!(worker_id, 1);
+            assert_eq!(reason, KillReason::OomOverBudget);
+        }
+        _ => panic!("expected Kill(OomOverBudget), got {decision:?}"),
+    }
+}
+
+#[test]
+fn kill_reason_oom_last_resort_when_single_active_over_budget() {
+    // Single non-opportunistic active worker, over its reserved
+    // budget, no alternative candidate exists → OomLastResort.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
+    let workers = vec![WorkerBudgetInfo {
+        worker_id: 7,
+        reserved_budgets: mem(100),
+        actual_usage: mem(200),
+        is_idle: false,
+        is_opportunistic: false,
+        has_initial_assignment: true,
+        current_task: Some(make_binary("solo", 10)),
+        estimated_usage: mem(200),
+    }];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+    match decision {
+        ResourcePressureDecision::Kill { worker_id, reason } => {
+            assert_eq!(worker_id, 7);
+            assert_eq!(reason, KillReason::OomLastResort);
+        }
+        _ => panic!("expected Kill(OomLastResort), got {decision:?}"),
+    }
+}
+
 #[test]
 fn assign_normal_temp_factor_ordering() {
     let s = sched();

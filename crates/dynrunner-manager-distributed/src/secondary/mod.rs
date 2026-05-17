@@ -45,7 +45,7 @@ mod peer;
 mod primary;
 mod primary_link;
 mod processing;
-mod resource;
+pub(crate) mod resource;
 mod retry_budget;
 mod setup;
 mod staging;

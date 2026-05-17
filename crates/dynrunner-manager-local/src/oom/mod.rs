@@ -32,7 +32,10 @@
 //! Sample updates always run `pool.update_all_resource_usage()` so the
 //! watcher's `tracked_workers_rss_sum` is fresh on every sample tick.
 
+pub mod disconnect;
 pub mod probe;
+
+pub use disconnect::classify_disconnect;
 
 use std::time::{Duration, Instant};
 
@@ -173,6 +176,20 @@ pub struct OomWatcher {
     /// Field values at the time of the last emission. Used to
     /// evaluate the ≥1 GiB delta trigger.
     last_log_values: TrackedDeltaFields,
+    /// Previous sample's `kernel_oom_kill_count`. `None` before the
+    /// first sample, or when the probe's workers `memory.events` is
+    /// unavailable. Used to compute the per-sample delta — a positive
+    /// delta means the kernel ran the OOM-killer on the workers
+    /// subgroup in the window since the last sample.
+    last_kernel_oom_count: Option<u64>,
+    /// Wall-clock time of the most recent positive kernel-oom delta.
+    /// Consumed by [`Self::kernel_oom_recent`] so the manager-side
+    /// disconnect reclassifier can ask "did a kernel-OOM land within
+    /// the last N milliseconds?". `None` until the first positive
+    /// delta. Production sample cadence is 50ms; a 500ms window
+    /// covers ~10 samples worth of race tolerance between
+    /// `oom_kill` counter increment and pipe-EOF observation.
+    recent_kernel_oom_at: Option<Instant>,
 }
 
 /// The three fields the delta trigger compares against their value
@@ -191,6 +208,23 @@ impl OomWatcher {
         Self::with_probe(config, Box::new(ProcSysProbe::new()))
     }
 
+    /// Construct with the production [`ProcSysProbe`] AND a path to
+    /// the workers cgroup `memory.events` file so kernel-OOM detection
+    /// becomes active. Pass `None` (or use [`Self::new`]) when the
+    /// nested workers cgroup was not materialised (flat-layout
+    /// fallback, non-cgroup-v2 host) — the probe then leaves
+    /// `kernel_oom_kill_count` as `None` and no upgrade ever fires.
+    ///
+    /// The path is typically `<workers-cgroup>/memory.events` derived
+    /// from [`crate::cgroup::NestedCgroupHandle::workers_path`].
+    pub fn new_with_workers_cgroup(
+        config: OomWatcherConfig,
+        workers_memory_events_path: Option<std::path::PathBuf>,
+    ) -> Self {
+        let probe = ProcSysProbe::new().with_workers_memory_events(workers_memory_events_path);
+        Self::with_probe(config, Box::new(probe))
+    }
+
     /// Construct with a caller-supplied probe. Used by unit tests to
     /// inject deterministic mock readings without touching `/proc`.
     pub fn with_probe(config: OomWatcherConfig, probe: Box<dyn SystemProbe>) -> Self {
@@ -201,6 +235,28 @@ impl OomWatcher {
             last_snapshot: OomWatcherSnapshot::default(),
             last_log_at: None,
             last_log_values: TrackedDeltaFields::default(),
+            last_kernel_oom_count: None,
+            recent_kernel_oom_at: None,
+        }
+    }
+
+    /// True iff a positive `oom_kill` delta on the workers cgroup was
+    /// observed within the last `window`. Consumed by the manager's
+    /// disconnect reclassifier: when a worker's pipe-EOF lands in the
+    /// same window as a kernel-OOM event, the disconnect upgrades
+    /// from `Recoverable` to `ResourceExhausted(memory)` (the kernel
+    /// beat the userland scheduler — see [`crate::oom::disconnect`]
+    /// for the full classifier).
+    pub fn kernel_oom_recent(&self, window: Duration) -> bool {
+        self.kernel_oom_recent_at(Instant::now(), window)
+    }
+
+    /// Test seam for [`Self::kernel_oom_recent`] with an explicit
+    /// `now`. Production callers use the wall-clock form.
+    pub fn kernel_oom_recent_at(&self, now: Instant, window: Duration) -> bool {
+        match self.recent_kernel_oom_at {
+            Some(at) => now.duration_since(at) <= window,
+            None => false,
         }
     }
 
@@ -245,6 +301,22 @@ impl OomWatcher {
     {
         pool.update_all_resource_usage();
         let host = self.probe.read();
+        // Kernel-OOM detection: compute the per-sample delta of the
+        // workers-cgroup `oom_kill` counter. A positive delta means
+        // the kernel ran the OOM-killer on that subgroup since the
+        // last sample. The window is wall-clock-based (see
+        // `kernel_oom_recent`) so the manager's disconnect
+        // reclassifier can correlate a worker pipe-EOF with the
+        // kernel event regardless of how many samples landed
+        // between them.
+        if let Some(current) = host.kernel_oom_kill_count {
+            if let Some(prev) = self.last_kernel_oom_count
+                && current > prev
+            {
+                self.recent_kernel_oom_at = Some(now);
+            }
+            self.last_kernel_oom_count = Some(current);
+        }
         let tracked_workers_rss_sum = sum_worker_rss(pool);
         let tracked_workers_count = pool.workers.len() as u32;
         self.last_snapshot = OomWatcherSnapshot {

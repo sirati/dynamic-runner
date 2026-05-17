@@ -48,12 +48,22 @@ where
         // cadence was a hardcoded 100ms literal here; now it reads
         // from `SecondaryConfig::resource_check_interval` so the
         // secondary and LocalManager use the same operator knob.
-        let mut oom_watcher = OomWatcher::new(OomWatcherConfig {
-            sample_interval: DEFAULT_SAMPLE_INTERVAL,
-            decision_interval: self.config.resource_check_interval,
-            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
-            log_enabled: self.config.log_oom_watcher,
-        });
+        // Activate kernel-OOM detection by passing the workers cgroup
+        // `memory.events` path (when the nested workers subgroup was
+        // materialised; flat-layout fallback leaves it `None`).
+        let workers_memory_events_path = self
+            .pool
+            .workers_cgroup()
+            .map(|h| h.workers_path().join("memory.events"));
+        let mut oom_watcher = OomWatcher::new_with_workers_cgroup(
+            OomWatcherConfig {
+                sample_interval: DEFAULT_SAMPLE_INTERVAL,
+                decision_interval: self.config.resource_check_interval,
+                heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+                log_enabled: self.config.log_oom_watcher,
+            },
+            workers_memory_events_path,
+        );
         let mut oom_sample_interval = oom_watcher.sample_interval_ticker();
         let mut oom_decision_interval = oom_watcher.decision_interval_ticker();
 
@@ -137,7 +147,7 @@ where
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
-                        let restart = self.handle_worker_event(event, &mut command_rx, factory).await?;
+                        let restart = self.handle_worker_event(event, &mut command_rx, factory, &oom_watcher).await?;
                         if let Some(wid) = restart {
                             workers_to_restart.push(wid);
                         }

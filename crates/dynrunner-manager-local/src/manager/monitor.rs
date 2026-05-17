@@ -6,7 +6,7 @@ use dynrunner_core::{
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
-    ResourceEstimator, Scheduler,
+    KillReason, ResourceEstimator, Scheduler,
 };
 
 use crate::oom::OomWatcher;
@@ -133,60 +133,69 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     }
 
     /// Caller-specific outcome handler for a [`ResourcePressureResult`].
-    /// Originally inlined in `check_resource_pressure`; pulled out so
-    /// both the watcher-driven path and any future direct caller share
-    /// the same Worker-0-vs-others / pressure-phase branching rules.
-    fn handle_resource_pressure_result(&mut self, result: ResourcePressureResult<I>) {
+    ///
+    /// Routing is keyed on [`KillReason`], not worker id. The previous
+    /// shape special-cased `worker_id == 0` because worker 0 holds the
+    /// largest reserved budget (see [`Scheduler::initial_budget`]) so a
+    /// kill there was a proxy for "no smaller candidate, truly OOM";
+    /// `KillReason::OomLastResort` now carries that signal directly, and
+    /// `worker_id` is no longer a routing input.
+    ///
+    /// Four buckets:
+    ///   * `NoFaultMemoryStealing` / `NoFaultUnderBudget` — requeue at
+    ///     the pool front, no `resource_pressure_tasks` entry. The task
+    ///     is innocent; retry budget is preserved. Runs in both normal
+    ///     and pressure phases because the task may still fit elsewhere.
+    ///   * `OomLastResort` — push to `resource_pressure_tasks` even in
+    ///     pressure phase (last-resort always retries via that channel).
+    ///   * `OomOverBudget` — push to `resource_pressure_tasks` in normal
+    ///     phase; drop in pressure phase (matches Python's skip of
+    ///     `_handle_oom_killed_task` for non-last-resort kills during
+    ///     OOM phase, which would otherwise loop forever).
+    pub(super) fn handle_resource_pressure_result(
+        &mut self,
+        result: ResourcePressureResult<I>,
+    ) {
         match result {
             ResourcePressureResult::Killed {
-                worker_id,
+                worker_id: _,
                 binary,
                 reason,
             } => {
-                if let Some(binary) = binary {
-                    // `binary` is `Box<TaskInfo<I>>` (boxed in
-                    // `ResourcePressureResult::Killed` to shrink the
-                    // variant). Field access auto-derefs through the
-                    // box; we unbox only at the FailedTask/requeue
-                    // boundary where the by-value `TaskInfo<I>` is
-                    // required.
-                    if worker_id == 0 {
-                        // Worker 0 is the last resort — if it can't fit, the task
-                        // is truly OOM and goes to the resource_pressure_tasks queue.
-                        // This happens even during OOM phase (matching Python).
-                        // Mark the task finished from the pool's perspective so
-                        // its phase can drain; bump the failed counter.
-                        self.record_phase_completion(
-                            &binary.phase_id,
-                            false,
-                            binary.task_id.as_deref(),
-                        );
-                        self.resource_pressure_tasks.push(FailedTask {
-                            binary: *binary,
-                            error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
-                            error_message: reason,
-                            retry_count: 0,
-                        });
-                    } else if !self.in_pressure_phase {
-                        // Other workers: requeue for local retry.
-                        // During OOM phase, Python skips _handle_oom_killed_task
-                        // (which does the requeue), so we also skip requeuing.
-                        // The task was in-flight in the pool (take_from_view
-                        // bumped in-flight); `requeue` decrements in-flight
-                        // and pushes the item to the front of its bucket.
-                        self.pool_mut().requeue(*binary);
-                    } else {
-                        // OOM phase for non-worker-0: task is dropped, matching
-                        // Python's behavior where _handle_oom_killed_task is
-                        // skipped. The task was in-flight; finalise it so the
-                        // phase can drain.
-                        self.record_phase_completion(
-                            &binary.phase_id,
-                            false,
-                            binary.task_id.as_deref(),
-                        );
-                    }
+                let Some(binary) = binary else { return };
+                // `binary` is `Box<TaskInfo<I>>` (boxed in
+                // `ResourcePressureResult::Killed` to shrink the
+                // variant). Field access auto-derefs through the box;
+                // we unbox at the FailedTask / requeue boundary where
+                // the by-value `TaskInfo<I>` is required.
+                if reason.is_no_fault() {
+                    // Pool's `requeue` decrements in-flight (set by
+                    // `take_from_view`) and pushes to the bucket front.
+                    self.pool_mut().requeue(*binary);
+                    return;
                 }
+                // At-fault kill (OomOverBudget / OomLastResort).
+                let drop_in_pressure_phase =
+                    self.in_pressure_phase && reason == KillReason::OomOverBudget;
+                if drop_in_pressure_phase {
+                    self.record_phase_completion(
+                        &binary.phase_id,
+                        false,
+                        binary.task_id.as_deref(),
+                    );
+                    return;
+                }
+                self.record_phase_completion(
+                    &binary.phase_id,
+                    false,
+                    binary.task_id.as_deref(),
+                );
+                self.resource_pressure_tasks.push(FailedTask {
+                    binary: *binary,
+                    error_type: ErrorType::ResourceExhausted(ResourceKind::memory()),
+                    error_message: reason.as_str().into(),
+                    retry_count: 0,
+                });
             }
             ResourcePressureResult::NoAction => {}
         }
