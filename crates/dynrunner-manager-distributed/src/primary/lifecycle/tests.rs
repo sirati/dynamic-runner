@@ -44,6 +44,7 @@ fn make_coordinator(
         required_setup_on_promote: false,
         max_concurrent_per_type: HashMap::new(),
         retry_max_passes,
+        oom_retry_max_passes: retry_max_passes,
         fleet_dead_timeout: Duration::from_secs(1),
         mesh_ready_timeout: Duration::from_secs(1),
         mass_death_grace: Duration::from_secs(1),
@@ -88,24 +89,29 @@ fn install_pool_for_phase(
         .insert(binary.phase_id.clone(), 0);
 }
 
-/// `run_retry_passes` must NOT reinject entries whose
-/// `ErrorType` is `Unfulfillable { .. }`. Those are the operator-
-/// resolvable failure class — `TaskState::Unfulfillable` in the
-/// CRDT — and reinjection is reserved for the explicit
-/// `PrimaryCommand::ReinjectTask` path. Pre-fix, the snapshot
-/// `mem::take(&mut self.failed_tasks)` drained EVERY entry
-/// (including Unfulfillable) into the pool, sidestepping the
-/// per-task `unfulfillable_reinject_max_per_task` budget that
-/// gates the operator path. This test pins the partition.
+/// The per-phase retry bucket primitive must NOT reinject entries
+/// whose `ErrorType` is `Unfulfillable { .. }`. Those are the
+/// operator-resolvable failure class — `TaskState::Unfulfillable` in
+/// the CRDT — and reinjection is reserved for the explicit
+/// `PrimaryCommand::ReinjectTask` path. The bucket's partition
+/// predicate (`BucketKind::Recoverable`) only matches
+/// `ErrorType::Recoverable`; everything else stays in `failed_tasks`.
+///
+/// This was historically owned by the post-pipeline `run_retry_passes`
+/// (now a no-op). The semantic moved into
+/// [`PrimaryCoordinator::try_run_phase_retry_bucket`] with the 2026-05-17
+/// per-phase redesign; the assertions are unchanged because the
+/// failure-bucket partition has not.
 #[tokio::test(flavor = "current_thread")]
-async fn retry_pass_skips_unfulfillable_failures() {
+async fn retry_bucket_skips_unfulfillable_failures() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let mut coordinator = make_coordinator(/* retry_max_passes = */ 3);
 
-        // Seed two binaries: one Unfulfillable, one Recoverable.
-        // `all_binaries` is the lookup table `run_retry_passes`
-        // uses to map hashes back to dispatchable `TaskInfo`s.
+        // Seed two binaries in the same phase: one Unfulfillable, one
+        // Recoverable. `all_binaries` is the lookup table the bucket
+        // primitive uses to map hashes back to dispatchable
+        // `TaskInfo`s.
         let unfulfillable_bin = make_binary("operator-only", 50);
         let recoverable_bin = make_binary("retriable", 40);
         let unfulfillable_hash = compute_task_hash(&unfulfillable_bin);
@@ -125,28 +131,31 @@ async fn retry_pass_skips_unfulfillable_failures() {
             .failed_tasks
             .insert(recoverable_hash.clone(), ErrorType::Recoverable);
 
-        // No connected secondaries + no in-flight workers ⇒ the
-        // operational loop run inside the retry pass returns
-        // immediately (counter check trips at
-        // `0 + len(failed) >= 0` for total_tasks=0 with
-        // active_workers=0). That's enough to observe the
-        // partition behaviour: the recoverable entry is drained
-        // into the pool, the Unfulfillable entry stays in
-        // `failed_tasks`.
-        coordinator.run_retry_passes().await.unwrap();
+        // Drive the Recoverable bucket directly. With no connected
+        // secondaries the `dispatch_to_idle_workers` kickstart inside
+        // the bucket is a no-op, but the partition + reinject step
+        // happens unconditionally.
+        let phase = unfulfillable_bin.phase_id.clone();
+        let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> =
+            None;
+        let reinjected = coordinator
+            .try_run_phase_retry_bucket(
+                &phase,
+                crate::primary::retry_bucket::BucketKind::Recoverable,
+                &mut no_cmd_rx,
+            )
+            .await
+            .expect("retry bucket runs cleanly");
+        assert!(reinjected, "Recoverable failure should reinject");
 
-        // Retriable entry was drained and reinjected (would land
-        // back in `failed_tasks` only if the operational loop
-        // observed another failure — with zero workers no such
-        // observation can happen).
+        // Retriable entry was drained from the failed-set into the
+        // pool; the Unfulfillable entry stayed because the
+        // Recoverable bucket's predicate doesn't match it.
         assert!(
             !coordinator.failed_tasks.contains_key(&recoverable_hash),
-            "retry pass should drain Recoverable entries from \
+            "retry bucket should drain Recoverable entries from \
              failed_tasks before reinjecting"
         );
-
-        // Unfulfillable entry stayed — and kept its ErrorType so
-        // end-of-run accounting still classifies it correctly.
         match coordinator.failed_tasks.get(&unfulfillable_hash) {
             Some(ErrorType::Unfulfillable { reason }) => {
                 assert_eq!(reason.as_ref(), "missing toolchain");
@@ -307,18 +316,28 @@ async fn unfulfillable_reinjected_task_can_use_retry_pass() {
             .failed_tasks
             .insert(hash.clone(), ErrorType::Recoverable);
 
-        // Step 4: retry-pass drains the Recoverable entry into
-        // the pool. The fresh Recoverable kind — not the carried
-        // Unfulfillable — is what determines retry-pass
+        // Step 4: per-phase Recoverable bucket drains the entry
+        // into the pool. The fresh Recoverable kind — not the
+        // carried Unfulfillable — is what determines bucket
         // eligibility.
-        coordinator.run_retry_passes().await.unwrap();
+        let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> =
+            None;
+        let reinjected = coordinator
+            .try_run_phase_retry_bucket(
+                &binary.phase_id,
+                crate::primary::retry_bucket::BucketKind::Recoverable,
+                &mut no_cmd_rx,
+            )
+            .await
+            .expect("retry bucket runs cleanly");
+        assert!(reinjected, "Recoverable failure should reinject");
 
         // The hash was drained (no zero-worker re-failure can
-        // re-populate it), confirming the retry pass picked it up.
+        // re-populate it), confirming the retry bucket picked it up.
         assert!(
             !coordinator.failed_tasks.contains_key(&hash),
             "Recoverable failure on a previously-reinjected hash \
-             must still be retry-pass-eligible"
+             must still be retry-bucket-eligible"
         );
     }).await;
 }

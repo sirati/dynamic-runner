@@ -63,6 +63,7 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 required_setup_on_promote: false,
                 max_concurrent_per_type: std::collections::HashMap::new(),
                 retry_max_passes: 1,
+                oom_retry_max_passes: 1,
                 fleet_dead_timeout: std::time::Duration::from_secs(30),
                 // Generous timeout so the test can fire triggers
                 // sequentially without racing the deadline.
@@ -348,6 +349,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -488,6 +490,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
