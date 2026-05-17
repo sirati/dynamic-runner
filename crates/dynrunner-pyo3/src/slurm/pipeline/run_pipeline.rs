@@ -290,6 +290,20 @@ pub(crate) fn run_slurm_pipeline<'py>(
         .and_then(|v| v.extract::<String>().ok())
         .unwrap_or_else(|| "-2G".into());
 
+    // `--mem-manager-reserved` flows verbatim from the dispatcher
+    // argparse through here into the rendered wrapper-script flag.
+    // Argparse default `"500M"` parses via `_native.parse_memory`;
+    // `None` (operator passed an empty / null override) collapses to
+    // skipping the flag, in which case the secondary's argparse
+    // default takes over. Symmetric with `cores_spec` /
+    // `max_memory_spec` extraction above; same dispatcher → wrapper
+    // → secondary plumbing pattern.
+    let mem_manager_reserved_bytes: Option<u64> = args
+        .getattr("mem_manager_reserved")
+        .ok()
+        .and_then(|v| if v.is_none() { None } else { v.extract::<String>().ok() })
+        .and_then(|s| crate::system_resources::parse_memory(&s).ok());
+
     // `args.forwarded_argv` is the dispatcher's `sys.argv[1:]` minus
     // the framework-regenerated flags (`--secondary`, `--cores`, …)
     // that the wrapper emits afresh per job. Threaded opaquely through
@@ -395,6 +409,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
             primary_quic_port,
             use_reverse_connection,
             skip_image_build,
+            mem_manager_reserved_bytes,
             log,
         )?;
         // Snapshot the tunnel manager Py-ref for the respawn wiring
@@ -461,6 +476,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
             &max_memory_spec,
             &forwarded_argv,
             use_reverse_connection,
+            mem_manager_reserved_bytes,
             log,
         )?;
 

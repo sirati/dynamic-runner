@@ -199,6 +199,11 @@ impl PyObserverLateJoiner {
                     // primary path), so the cap is structurally inert
                     // — leave at the default `None` (unbounded).
                     unfulfillable_reinject_max_per_task: None,
+                    // Observer runs zero workers (factory is a no-op
+                    // placeholder); nesting the workers cgroup would
+                    // be a write against a path no PID ever attaches
+                    // to. Leave unset.
+                    mem_manager_reserved_bytes: None,
                 };
 
                 // No-op factory: the run loop's only `factory`
@@ -233,6 +238,7 @@ impl PyObserverLateJoiner {
                     manual_start_worker: false,
                     worker_spec: None,
                     child_processes: Vec::new(),
+                    workers_cgroup_procs: None,
                 };
 
                 let mut secondary: SecondaryCoordinator<

@@ -92,6 +92,7 @@ pub(super) fn run_preparation<'py>(
     primary_quic_port: u16,
     use_reverse_connection: bool,
     skip_image_build: bool,
+    mem_manager_reserved_bytes: Option<u64>,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<(PreparationOutcome, Option<Py<PyAny>>)> {
     let base_log_dir: String = slurm_config
@@ -217,6 +218,9 @@ pub(super) fn run_preparation<'py>(
             "shutdown_manager_bin_path",
             shutdown_manager_remote_path.as_deref(),
         )?;
+        if let Some(reserved) = mem_manager_reserved_bytes {
+            wrapper_kwargs.set_item("mem_manager_reserved_bytes", reserved)?;
+        }
         let wrapper =
             job_manager.call_method("generate_wrapper_script", (), Some(&wrapper_kwargs))?;
 
@@ -358,6 +362,7 @@ pub(super) fn run_preparation<'py>(
     max_memory_spec,
     forwarded_argv,
     log,
+    mem_manager_reserved_bytes = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_preparation_py<'py>(
@@ -376,6 +381,7 @@ pub(crate) fn run_preparation_py<'py>(
     max_memory_spec: String,
     forwarded_argv: Vec<String>,
     log: &Bound<'py, PyAny>,
+    mem_manager_reserved_bytes: Option<u64>,
 ) -> PyResult<Py<PyTuple>> {
     let (outcome, tunnel_manager) = run_preparation(
         py,
@@ -392,6 +398,7 @@ pub(crate) fn run_preparation_py<'py>(
         primary_quic_port,
         use_reverse_connection,
         skip_image_build,
+        mem_manager_reserved_bytes,
         log,
     )?;
 

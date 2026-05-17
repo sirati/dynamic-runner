@@ -359,6 +359,7 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
         forwarded_argv: &[],
         is_observer: false,
         shutdown_manager_bin_path: Some(bin_path),
+        mem_manager_reserved_bytes: None,
     };
     let script = generate_wrapper_script(&cfg);
 

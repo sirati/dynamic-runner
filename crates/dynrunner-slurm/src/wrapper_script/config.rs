@@ -138,6 +138,18 @@ pub struct WrapperScriptConfig<'a> {
     /// it. Cluster prerequisite: `loginctl enable-linger` for the
     /// SLURM user (LMU Krater has this set).
     pub shutdown_manager_bin_path: Option<&'a Path>,
+    /// Bytes to reserve for the secondary process itself when the
+    /// nested workers cgroup is enabled. `Some(n)` renders an
+    /// extra `--mem-manager-reserved=<n>` flag onto the
+    /// secondary's container-command argv; the secondary's argparse
+    /// stores it on `args.mem_manager_reserved`, the dispatcher
+    /// hands it to `SecondaryConfig(mem_manager_reserved_bytes=...)`,
+    /// and the `WorkerPool::initialize` cgroup-setup picks it up.
+    /// `None` omits the flag and the secondary falls through to its
+    /// argparse default (`"500M"` parsed via `parse_memory`). See
+    /// `dynrunner_manager_distributed::SecondaryConfig::mem_manager_reserved_bytes`
+    /// for the contract.
+    pub mem_manager_reserved_bytes: Option<u64>,
 }
 
 /// How the secondary connects to the primary.

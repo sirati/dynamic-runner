@@ -125,6 +125,7 @@ async fn setup_promote_run_with_retry_success_completes_via_runcomplete() {
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
             };
             let mut secondary = SecondaryCoordinator::new(
                 config,
@@ -457,6 +458,7 @@ async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete
                     log_oom_watcher: false,
                     promoted_primary_quiesce_grace: Duration::from_millis(100),
                     unfulfillable_reinject_max_per_task: None,
+                    mem_manager_reserved_bytes: None,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,
@@ -850,6 +852,7 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
                     log_oom_watcher: false,
                     promoted_primary_quiesce_grace: Duration::from_millis(100),
                     unfulfillable_reinject_max_per_task: None,
+                    mem_manager_reserved_bytes: None,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,
@@ -1102,6 +1105,7 @@ async fn setup_promote_multi_secondary_distributes_to_idle_peers_on_promote() {
                     log_oom_watcher: false,
                     promoted_primary_quiesce_grace: Duration::from_millis(100),
                     unfulfillable_reinject_max_per_task: None,
+                    mem_manager_reserved_bytes: None,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,

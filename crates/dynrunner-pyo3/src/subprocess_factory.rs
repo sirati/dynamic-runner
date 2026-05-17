@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dynrunner_core::{TypeId, WorkerId};
-use dynrunner_manager_local::WorkerFactory;
+use dynrunner_manager_local::{NestedCgroupHandle, WorkerFactory};
 use dynrunner_transport_socket::named_socket::NamedSocketManagerEnd;
 use dynrunner_transport_socket::socketpair::create_socketpair;
 
@@ -184,6 +184,17 @@ pub(crate) struct SubprocessWorkerFactory {
     /// factory falls back to the legacy hardcoded argv shape.
     pub(crate) worker_spec: Option<WorkerSpec>,
     pub(crate) child_processes: Vec<Option<std::process::Child>>,
+    /// Path to `<workers-cgroup>/cgroup.procs` injected by
+    /// [`WorkerFactory::set_workers_cgroup`] when the worker pool's
+    /// nested-cgroup setup succeeded. `None` covers both "pool didn't
+    /// nest" (operator passed no `--mem-manager-reserved`) and "host
+    /// doesn't support cgroup-v2 delegation" (graceful fallback from
+    /// the `dynrunner_manager_local::cgroup` orchestrator). When
+    /// `Some`, [`Self::command_from_rendered`] adds a `pre_exec`
+    /// closure that writes the child's pid into this file
+    /// post-`fork(2)` / pre-`execve(2)` so the worker subprocess
+    /// lands in the nested workers cgroup BEFORE its binary runs.
+    pub(crate) workers_cgroup_procs: Option<std::path::PathBuf>,
 }
 
 impl SubprocessWorkerFactory {
@@ -305,7 +316,21 @@ impl SubprocessWorkerFactory {
     /// would leave them alive after a tree-kill, blocking container
     /// teardown and orphaning compute that the operator already
     /// declared unwanted.
-    fn command_from_rendered(rendered: &RenderedCommand) -> std::process::Command {
+    ///
+    /// Worker attached to nested cgroup on `fork(2)` /
+    /// pre-`execve(2)`: when [`Self::workers_cgroup_procs`] is set,
+    /// a `pre_exec` closure writes the child's pid to the workers/
+    /// subgroup's `cgroup.procs`. The kernel migrates the child into
+    /// that cgroup at the moment of the write, so the worker binary
+    /// runs with the tightened `memory.max` from its first
+    /// instruction. The `pre_exec` closure is `Send + 'static`, does
+    /// not capture any owned heap state (only a `PathBuf` clone of
+    /// the procs path), and only performs a single `std::fs::write`
+    /// syscall — fork-safe under the documented `pre_exec` rules
+    /// (no allocator activity that could deadlock against a parent
+    /// holding the heap mutex at fork time). When the path is `None`
+    /// no `pre_exec` is set and behaviour is unchanged.
+    fn command_from_rendered(&self, rendered: &RenderedCommand) -> std::process::Command {
         use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(&rendered.argv[0]);
         cmd.args(&rendered.argv[1..]);
@@ -319,6 +344,60 @@ impl SubprocessWorkerFactory {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .process_group(0);
+
+        if let Some(procs) = self.workers_cgroup_procs.clone() {
+            // `pre_exec` runs in the forked child after `fork(2)` but
+            // before `execve(2)`. `std::process::id()` returns the
+            // CHILD'S pid in that context. The single `std::fs::write`
+            // call opens, writes, and closes `cgroup.procs` — atomic
+            // from the kernel's perspective and the only side-effect
+            // is migrating the child into the workers cgroup.
+            //
+            // SAFETY: `pre_exec` is unsafe because the closure runs
+            // in the forked child where most async-signal-unsafe
+            // library calls (allocator-touching, mutex-acquiring)
+            // would deadlock. The closure here writes the pid through
+            // a stack-allocated `itoa::Buffer`: no heap activity, no
+            // mutex acquisition. `std::fs::write` invokes
+            // `open` → `write` → `close` syscalls only; all
+            // async-signal-safe. The captured `PathBuf` was cloned
+            // by the parent BEFORE the fork — the child only reads
+            // it, never reallocates.
+            // Stack-formatted pid to avoid any allocator activity in
+            // the forked child between `fork(2)` and `execve(2)`. A
+            // u32 in decimal is at most 10 digits; the buffer is
+            // sized to 16 for headroom. Generating digits in reverse
+            // into a temporary then copying forward gives the
+            // canonical decimal representation. `std::fs::write`
+            // itself opens-writes-closes via direct syscalls (no
+            // heap activity for byte slices), satisfying the
+            // pre-exec async-signal-safety contract.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let pid = std::process::id();
+                    let mut tmp = [0u8; 16];
+                    let mut tmp_len = 0usize;
+                    let mut n = pid;
+                    loop {
+                        tmp[tmp_len] = b'0' + (n % 10) as u8;
+                        tmp_len += 1;
+                        n /= 10;
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    let mut buf = [0u8; 16];
+                    let mut len = 0usize;
+                    while tmp_len > 0 {
+                        tmp_len -= 1;
+                        buf[len] = tmp[tmp_len];
+                        len += 1;
+                    }
+                    std::fs::write(&procs, &buf[..len])
+                });
+            }
+        }
+
         cmd
     }
 
@@ -378,7 +457,7 @@ impl SubprocessWorkerFactory {
             create_socketpair().map_err(|e| format!("failed to create socketpair: {e}"))?;
 
         let rendered = self.render_command(worker_id, runtime, FdOrSocket::Fd(child_fd));
-        let mut cmd = Self::command_from_rendered(&rendered);
+        let mut cmd = self.command_from_rendered(&rendered);
 
         use std::os::unix::process::CommandExt;
         unsafe {
@@ -428,7 +507,7 @@ impl SubprocessWorkerFactory {
             return Ok((endpoint, None));
         }
 
-        let mut cmd = Self::command_from_rendered(&rendered);
+        let mut cmd = self.command_from_rendered(&rendered);
         let child = cmd
             .spawn()
             .map_err(|e| format!("failed to exec worker {worker_id}: {e}"))?;
@@ -464,6 +543,18 @@ impl SubprocessWorkerFactory {
 }
 
 impl WorkerFactory<EitherManagerEnd> for SubprocessWorkerFactory {
+    /// Stash the workers/ cgroup path so every subsequent spawn
+    /// installs a `pre_exec` closure attaching the child to that
+    /// cgroup. Called once per pool lifetime by
+    /// [`dynrunner_manager_local::pool::WorkerPool::initialize`]. A
+    /// `None` argument (graceful fallback or operator opt-out) is
+    /// stored as `None`, leaving spawns at the legacy flat-cgroup
+    /// behaviour.
+    fn set_workers_cgroup(&mut self, handle: Option<NestedCgroupHandle>) {
+        self.workers_cgroup_procs =
+            handle.map(|h| h.workers_path().join("cgroup.procs"));
+    }
+
     fn spawn_worker(
         &mut self,
         worker_id: WorkerId,
@@ -589,6 +680,7 @@ mod tests {
             manual_start_worker: true,
             worker_spec: None,
             child_processes: Vec::new(),
+            workers_cgroup_procs: None,
         }
     }
 
@@ -654,6 +746,7 @@ mod tests {
             manual_start_worker: true,
             worker_spec: None,
             child_processes: Vec::new(),
+            workers_cgroup_procs: None,
         };
         let err = factory.first_type_runtime().unwrap_err();
         assert!(
@@ -734,5 +827,43 @@ mod tests {
             elapsed < TERMINATE_GRACE + Duration::from_secs(2),
             "SIGKILL fallback took too long: {elapsed:?}"
         );
+    }
+
+    /// `WorkerFactory::set_workers_cgroup` stashes the workers/
+    /// cgroup procs path on the factory when given a handle, and
+    /// clears it when given `None`. This is the boundary the worker
+    /// pool's cgroup-setup hands the path across so every subsequent
+    /// `command_from_rendered` call can install a `pre_exec` closure
+    /// (or skip installing one in the `None` case).
+    ///
+    /// We can't easily introspect `std::process::Command`'s
+    /// `pre_exec` field — it's an opaque sealed-box closure — so the
+    /// test asserts on the factory field directly. The `pre_exec`
+    /// install itself is exercised end-to-end in the SLURM smoke /
+    /// e2e tests where a real worker subprocess attaches to a real
+    /// nested cgroup; here we only pin the wiring.
+    #[test]
+    fn set_workers_cgroup_stashes_procs_path_or_clears() {
+        use dynrunner_manager_local::WorkerFactory;
+        let mut factory = make_factory_with_two_types();
+        // Default: no nesting.
+        assert!(factory.workers_cgroup_procs.is_none());
+
+        // Build a synthetic handle pointing at a tempdir path.
+        let root = tempfile::tempdir().unwrap();
+        let workers = root.path().join("workers");
+        std::fs::create_dir_all(&workers).unwrap();
+        let handle = NestedCgroupHandle::from_workers_path_for_test(workers.clone());
+
+        factory.set_workers_cgroup(Some(handle));
+        assert_eq!(
+            factory.workers_cgroup_procs.as_deref(),
+            Some(workers.join("cgroup.procs").as_path())
+        );
+
+        // Setting back to None clears the path so subsequent spawns
+        // fall back to the flat layout.
+        factory.set_workers_cgroup(None);
+        assert!(factory.workers_cgroup_procs.is_none());
     }
 }

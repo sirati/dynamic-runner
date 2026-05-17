@@ -34,6 +34,7 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
     max_memory_spec: &str,
     forwarded_argv: &[String],
     use_reverse_connection: bool,
+    mem_manager_reserved_bytes: Option<u64>,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<Option<(Py<PyAny>, Py<PyAny>)>> {
     // --- Budget from CLI flags. ---
@@ -166,6 +167,7 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
             use_reverse_connection,
             outcome.run_log_dir.clone(),
             outcome.shutdown_manager_remote_path.clone(),
+            mem_manager_reserved_bytes,
         );
 
     // --- Build the PySlurmSpawner pyclass. ---

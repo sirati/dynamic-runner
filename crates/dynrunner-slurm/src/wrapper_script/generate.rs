@@ -526,6 +526,19 @@ echo "  Secondary ID: {secondary_id}"
     let container_command = cfg.container_command;
     let cores_spec = cfg.cores_spec;
     let max_memory_spec = cfg.max_memory_spec;
+    // Render `--mem-manager-reserved=<bytes>` ONLY when the caller
+    // explicitly set the field. Omitting the flag lets the
+    // secondary's argparse default (parsed via `parse_memory`) take
+    // over — operator can either drive the value from the
+    // dispatcher CLI (single source of truth via the pipeline) OR
+    // let the secondary apply its own default per-secondary. Empty
+    // string for the `None` case keeps the rendered argv shape
+    // identical to pre-flag wrappers when the operator doesn't opt
+    // in. Mirrors the `forwarded_argv_block` empty-collapse shape.
+    let mem_manager_reserved_block: String = match cfg.mem_manager_reserved_bytes {
+        Some(bytes) => format!(" --mem-manager-reserved={bytes}"),
+        None => String::new(),
+    };
     // Container-internal bind-mount path for the staged-source drive.
     // Forwarded as `--src-network={path}` so the secondary's argparse
     // stores it on `args.src_network` and the dispatcher hands it to
@@ -617,7 +630,7 @@ podman --root "$PODMAN_STORAGE" --runroot "$PODMAN_RUN" --cgroup-manager=cgroupf
     -v "{log_network}:/app/log-network" \
 {dynrunner_volume_block}    -v "{socket_dir}:/app/sockets" \
 {extra_run_args_block}    {image_ref} \
-    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec} --src-network={src_network_path} --log-dir=/app/log-network{forwarded_argv_block}"##
+    {container_command} --secondary {secondary_url} --secondary-id {sid} --secondary-quic-port $QUIC_PORT --cores={cores_spec} --max-memory={max_memory_spec} --src-network={src_network_path} --log-dir=/app/log-network{mem_manager_reserved_block}{forwarded_argv_block}"##
     ));
 
     script.push_str(

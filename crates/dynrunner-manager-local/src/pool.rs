@@ -3,6 +3,7 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc;
 
+use crate::cgroup::{self, NestedCgroupHandle};
 use crate::manager::WorkerFactory;
 use crate::worker::{WorkerEvent, WorkerHandle};
 
@@ -34,6 +35,17 @@ pub struct WorkerPool<M: ManagerEndpoint, I: Identifier> {
     pub workers: Vec<WorkerHandle<M, I>>,
     event_tx: mpsc::UnboundedSender<WorkerEvent<I>>,
     event_rx: mpsc::UnboundedReceiver<WorkerEvent<I>>,
+    /// Nested cgroup-v2 workers subgroup, materialised by
+    /// [`Self::initialize`] when the caller supplies a
+    /// `mem_manager_reserved_bytes` value AND the runtime environment
+    /// supports a delegated cgroup-v2 tree. `None` covers both "caller
+    /// opted out" (passed `None` to `initialize`) and "environment
+    /// doesn't support nesting" (the [`cgroup::setup_worker_cgroup`]
+    /// graceful-fallback case). Kept alive on the pool so the
+    /// directory persists for the whole run; dropped when the pool is
+    /// dropped, which is fine — the kernel reaps the empty cgroup
+    /// directory automatically once all attached pids have exited.
+    workers_cgroup: Option<NestedCgroupHandle>,
 }
 
 impl<M: ManagerEndpoint + 'static, I: Identifier> Default for WorkerPool<M, I> {
@@ -49,7 +61,17 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             workers: Vec::new(),
             event_tx,
             event_rx,
+            workers_cgroup: None,
         }
+    }
+
+    /// Accessor for the materialised workers/ cgroup handle, if any.
+    /// Exposed for tests + diagnostic logging; production callers do
+    /// not need this — the factory is wired with the handle through
+    /// [`WorkerFactory::set_workers_cgroup`] at [`Self::initialize`]
+    /// time.
+    pub fn workers_cgroup(&self) -> Option<&NestedCgroupHandle> {
+        self.workers_cgroup.as_ref()
     }
 
     /// Shared event sender — needed when constructing WorkerHandles externally.
@@ -64,6 +86,30 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
     /// Initialize N workers using the factory, assigning budgets via the scheduler.
     /// Returns an error if any spawn fails — the caller should abort the run.
+    ///
+    /// `mem_manager_reserved_bytes` controls the nested cgroup-v2
+    /// workers subgroup:
+    ///
+    ///   * `None`: skip nesting entirely. Workers stay in the parent
+    ///     leaf and a kernel cgroup-OOM in the parent reaps the
+    ///     secondary too (legacy behaviour, preserved for back-compat
+    ///     and for tests / in-process channel modes that don't spawn
+    ///     subprocesses).
+    ///   * `Some(0)`: create the workers subgroup with NO cap
+    ///     tightening (the secondary process gets no protected slice).
+    ///     Useful for measuring the kernel-OOM-isolation benefit
+    ///     without the budget hit.
+    ///   * `Some(n)`: create the workers subgroup and set
+    ///     `workers/memory.max = parent_memory.max - n`. Reserves
+    ///     `n` bytes for the secondary process itself; a workers-
+    ///     side memory blow-up trips kernel-OOM on the workers
+    ///     subgroup, leaving the secondary alive.
+    ///
+    /// On graceful-fallback conditions (not under cgroup-v2, missing
+    /// memory controller, leaf not writable) the function logs a
+    /// `tracing::warn!` line via the [`crate::cgroup`] orchestrator
+    /// and proceeds with the flat layout (`workers_cgroup = None`).
+    /// Genuine I/O errors propagate as `Err(...)`.
     pub async fn initialize<S: Scheduler<I>>(
         &mut self,
         num_workers: u32,
@@ -71,7 +117,21 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         scheduler: &S,
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
+        mem_manager_reserved_bytes: Option<u64>,
     ) -> Result<(), String> {
+        // Set up the nested workers cgroup once per pool, BEFORE the
+        // spawn loop. If the caller opted out (`None`) or the
+        // environment doesn't support nesting (graceful fallback),
+        // the factory receives `None` and falls back to the flat
+        // pre-fix behaviour. Errors here are I/O-level (corrupted
+        // /proc or sysfs) and bubble up so the caller can abort the
+        // run with a clear cause.
+        if let Some(reserved) = mem_manager_reserved_bytes {
+            self.workers_cgroup = cgroup::setup_worker_cgroup_default(reserved)
+                .map_err(|e| format!("nested workers cgroup setup failed: {e}"))?;
+        }
+        factory.set_workers_cgroup(self.workers_cgroup.clone());
+
         for i in 0..num_workers {
             let (transport, pid) = factory
                 .spawn_worker(i)
@@ -414,6 +474,120 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
                  for {escalated}/{count} worker pgid(s) that ignored \
                  SIGTERM within the grace window"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cgroup_wiring_tests {
+    use super::*;
+    use crate::manager::WorkerFactory;
+    use dynrunner_core::WorkerId;
+    use dynrunner_protocol_manager_worker::ManagerEndpoint;
+
+    /// Minimal stand-in transport: `ManagerEndpoint` is implemented
+    /// for the unit type via `dynrunner-transport-channel`. We avoid
+    /// pulling that crate's full setup just to test the wiring; the
+    /// fake factory below never returns a transport (its
+    /// `spawn_worker` errors), which is enough to exercise the
+    /// pre-spawn cgroup wiring without running real workers.
+    struct CgroupCallTracker {
+        last_handle_set: Option<Option<NestedCgroupHandle>>,
+    }
+
+    impl<M: ManagerEndpoint> WorkerFactory<M> for CgroupCallTracker {
+        fn set_workers_cgroup(&mut self, handle: Option<NestedCgroupHandle>) {
+            self.last_handle_set = Some(handle);
+        }
+        fn spawn_worker(
+            &mut self,
+            _worker_id: WorkerId,
+        ) -> Result<(M, Option<u32>), String> {
+            // Force `initialize` to abort BEFORE any spawn —
+            // we only want to confirm the pre-spawn cgroup wiring,
+            // not actually run workers.
+            Err("test factory: never spawns".into())
+        }
+    }
+
+    /// `WorkerPool::initialize(None)` skips the cgroup setup entirely
+    /// and hands the factory `None`. Verifies the opt-out arm.
+    #[tokio::test]
+    async fn initialize_none_skips_cgroup_setup_and_forwards_none() {
+        use dynrunner_scheduler::ResourceStealingScheduler;
+        use dynrunner_transport_channel::ChannelManagerEnd;
+
+        let mut pool: WorkerPool<ChannelManagerEnd, ()> = WorkerPool::new();
+        let mut factory = CgroupCallTracker { last_handle_set: None };
+        let scheduler = ResourceStealingScheduler::memory();
+        let max = ResourceMap::new();
+
+        // Spawn will error, but `set_workers_cgroup` MUST have been
+        // called BEFORE the spawn loop, so we can assert on it via
+        // the tracker regardless of the spawn outcome.
+        let _ = pool
+            .initialize(1, &max, &scheduler, &mut factory, false, None)
+            .await;
+
+        assert!(matches!(factory.last_handle_set, Some(None)));
+        assert!(pool.workers_cgroup().is_none());
+    }
+
+    /// `WorkerPool::initialize(Some(reserved))` invokes the cgroup
+    /// orchestrator. In CI / dev environments the orchestrator
+    /// typically returns `Ok(None)` via one of the three documented
+    /// graceful-fallback predicates (no cgroup-v2 leaf, missing
+    /// `memory` controller on the leaf, non-writable
+    /// `subtree_control`), in which case `factory.set_workers_cgroup`
+    /// is called with `None` BEFORE the spawn loop. If the host
+    /// happens to expose a writable cgroup-v2 leaf with the memory
+    /// controller delegated, the orchestrator MAY actually
+    /// materialise the workers subgroup — in which case
+    /// `factory.set_workers_cgroup(Some(_))` fires. Either way the
+    /// factory MUST have been called with `Some(_)` (an outer
+    /// `Option<Option<NestedCgroupHandle>>` whose outer `Some` records
+    /// the call itself).
+    ///
+    /// Real I/O failures (rare; mostly hosts where the kernel
+    /// rejects a child-cgroup write because the parent has internal
+    /// processes) propagate as `Err(_)` from `initialize`. The
+    /// contract for "graceful degrade is not an error" is exercised
+    /// by the `None` arm of `last_handle_set` when the orchestrator
+    /// returns `Ok(None)`; the I/O-error arm bubbles up uniformly
+    /// with any other spawn failure and is acceptable here. The
+    /// test's load-bearing assertion is therefore the pre-spawn
+    /// `set_workers_cgroup` call shape.
+    #[tokio::test]
+    async fn initialize_some_invokes_cgroup_orchestrator() {
+        use dynrunner_scheduler::ResourceStealingScheduler;
+        use dynrunner_transport_channel::ChannelManagerEnd;
+
+        let mut pool: WorkerPool<ChannelManagerEnd, ()> = WorkerPool::new();
+        let mut factory = CgroupCallTracker { last_handle_set: None };
+        let scheduler = ResourceStealingScheduler::memory();
+        let max = ResourceMap::new();
+
+        let outcome = pool
+            .initialize(1, &max, &scheduler, &mut factory, false, Some(500 * 1024 * 1024))
+            .await;
+
+        match outcome {
+            // Happy path 1: orchestrator returned Ok (Some or None)
+            // and the factory's spawn errored — we observed
+            // `set_workers_cgroup` getting called.
+            Err(msg) if msg.starts_with("failed to spawn worker") => {
+                assert!(factory.last_handle_set.is_some());
+            }
+            // Happy path 2: orchestrator's setup hit a real I/O
+            // error (kernel rejected the workers/ mkdir or the
+            // controller-delegate write because processes are in
+            // the parent leaf). The factory was NOT called because
+            // setup failed early. That's the documented "Err on
+            // unexpected I/O" contract.
+            Err(msg) if msg.contains("cgroup") => {
+                assert!(factory.last_handle_set.is_none());
+            }
+            other => panic!("unexpected initialize outcome: {other:?}"),
         }
     }
 }

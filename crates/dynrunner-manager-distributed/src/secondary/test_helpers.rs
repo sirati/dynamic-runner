@@ -222,6 +222,7 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // unbounded (None) so tests not exercising the budget see
         // the production-default semantics.
         unfulfillable_reinject_max_per_task: None,
+        mem_manager_reserved_bytes: None,
     }
 }
 

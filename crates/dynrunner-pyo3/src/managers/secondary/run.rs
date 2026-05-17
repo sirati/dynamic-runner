@@ -49,6 +49,7 @@ impl PySecondaryCoordinator {
         let dist_disable_peer_overlay = self.distributed_config.disable_peer_overlay();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
+        let cfg_mem_manager_reserved_bytes = self.mem_manager_reserved_bytes;
         // Per-type subprocess dispatch: the factory carries the full
         // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
         // for initial pool init (preserves pre-fix single-type
@@ -327,6 +328,7 @@ impl PySecondaryCoordinator {
                     log_oom_watcher: dist_log_oom_watcher,
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
                     unfulfillable_reinject_max_per_task,
+                    mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,
                 };
 
                 let mut factory = SubprocessWorkerFactory {
@@ -341,6 +343,7 @@ impl PySecondaryCoordinator {
                     manual_start_worker: false,
                     worker_spec,
                     child_processes: Vec::new(),
+                    workers_cgroup_procs: None,
                 };
 
                 let mut secondary: SecondaryCoordinator<_, _, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(

@@ -225,6 +225,33 @@ pub struct SecondaryConfig {
     /// `secondary/primary/reinject_task.rs` for the budget-reset-at-
     /// promotion semantics.
     pub unfulfillable_reinject_max_per_task: Option<u32>,
+
+    /// Bytes to reserve for the secondary process itself when nesting
+    /// the workers subgroup under cgroup-v2.
+    ///
+    /// `None` (default) means "skip nesting": the workers run in the
+    /// same flat cgroup as the secondary, which is the pre-fix
+    /// behaviour. A kernel cgroup-OOM at the parent cap then reaps
+    /// the secondary alongside its workers — fine for development
+    /// but bad in production because the framework loses the
+    /// chance to observe the kill, requeue the displaced task, and
+    /// report cleanly.
+    ///
+    /// `Some(0)` creates the nested workers subgroup but does NOT
+    /// tighten its `memory.max` — useful for measuring the
+    /// kernel-OOM-isolation benefit without giving up any of the
+    /// container's RAM. `Some(n)` reserves `n` bytes for the
+    /// secondary's own state and sets `workers/memory.max =
+    /// parent.memory.max - n`. The framework's standard default
+    /// (surfaced via the `--mem-manager-reserved` CLI flag) is
+    /// `500 MiB`, sized for the estimator scratch + the per-
+    /// secondary HashMaps + a comfortable margin.
+    ///
+    /// The actual cgroup write happens in
+    /// [`crate::pool::WorkerPool::initialize`] via the
+    /// [`crate::cgroup`] module; this field is the wire-shape
+    /// the secondary-side config carries.
+    pub mem_manager_reserved_bytes: Option<u64>,
 }
 
 impl Default for SecondaryConfig {
@@ -248,6 +275,7 @@ impl Default for SecondaryConfig {
             setup_deadline: Duration::from_secs(60),
             promoted_primary_quiesce_grace: Duration::from_secs(2),
             unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: None,
         }
     }
 }

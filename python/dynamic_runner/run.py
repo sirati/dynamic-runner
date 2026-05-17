@@ -453,10 +453,26 @@ def _dispatch_secondary(task, args, logger) -> None:
     # single-process` (which divides cluster-wide).
     num_workers = _rs.parse_cores(args.cores)
     max_memory_bytes = _rs.parse_memory(args.max_memory)
+    # `--mem-manager-reserved` opts the secondary into the nested
+    # workers cgroup: workers run in `<container-cgroup>/workers/`
+    # with `memory.max = container_max - reserved_bytes` so a kernel
+    # cgroup-OOM in the workers subgroup spares the secondary. The
+    # argparse default ("500M") parses to a concrete u64; an empty
+    # string (operator opting out) collapses to None so
+    # `SecondaryConfig.mem_manager_reserved_bytes` stays unset and
+    # the legacy flat layout applies.
+    mem_manager_reserved_spec = getattr(args, "mem_manager_reserved", "")
+    mem_manager_reserved_bytes = (
+        _rs.parse_memory(mem_manager_reserved_spec)
+        if mem_manager_reserved_spec
+        else None
+    )
     logger.info(
         f"resolved per-machine resources: args.cores={args.cores!r} → "
         f"num_workers={num_workers}, args.max_memory={args.max_memory!r} → "
-        f"max_memory_bytes={max_memory_bytes}"
+        f"max_memory_bytes={max_memory_bytes}, "
+        f"args.mem_manager_reserved={mem_manager_reserved_spec!r} → "
+        f"mem_manager_reserved_bytes={mem_manager_reserved_bytes}"
     )
     cfg = _rs.SecondaryConfig(
         secondary_id=args.secondary_id,
@@ -465,6 +481,7 @@ def _dispatch_secondary(task, args, logger) -> None:
         src_network=args.src_network,
         src_tmp=args.src_tmp,
         distributed_config=distributed_config,
+        mem_manager_reserved_bytes=mem_manager_reserved_bytes,
     )
 
     logger.info(f"Secondary ID: {cfg.secondary_id}")

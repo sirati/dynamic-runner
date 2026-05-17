@@ -249,6 +249,7 @@ class SlurmJobManager:
         run_log_dir: str | None = None,
         is_observer: bool = False,
         shutdown_manager_bin_path: str | None = None,
+        mem_manager_reserved_bytes: int | None = None,
     ) -> str:
         """Generate the bash wrapper script for a SLURM job.
 
@@ -336,6 +337,7 @@ class SlurmJobManager:
             connection_info_dir=connection_info_dir,
             is_observer=is_observer,
             shutdown_manager_bin_path=shutdown_manager_bin_path,
+            mem_manager_reserved_bytes=mem_manager_reserved_bytes,
         )
 
     def generate_test_wrapper_script(self, image_metadata: PodmanImageMetadata) -> str:

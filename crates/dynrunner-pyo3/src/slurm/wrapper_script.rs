@@ -67,6 +67,7 @@ fn build_slurm_config(root_folder: &str) -> SlurmConfig {
     connection_info_dir = None,
     is_observer = false,
     shutdown_manager_bin_path = None,
+    mem_manager_reserved_bytes = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_wrapper_script(
@@ -92,6 +93,7 @@ pub fn generate_wrapper_script(
     connection_info_dir: Option<&str>,
     is_observer: bool,
     shutdown_manager_bin_path: Option<&str>,
+    mem_manager_reserved_bytes: Option<u64>,
 ) -> PyResult<String> {
     let slurm_config = build_slurm_config(root_folder);
 
@@ -153,6 +155,7 @@ pub fn generate_wrapper_script(
         forwarded_argv: &forwarded_argv,
         is_observer,
         shutdown_manager_bin_path,
+        mem_manager_reserved_bytes,
     };
     Ok(rust_generate_wrapper_script(&cfg))
 }

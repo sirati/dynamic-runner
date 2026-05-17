@@ -126,6 +126,7 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
     reverse_connection: bool,
     run_log_dir: String,
     shutdown_manager_bin_path: Option<String>,
+    mem_manager_reserved_bytes: Option<u64>,
 ) -> WrapperScriptGenerator {
     Arc::new(move |spec: &SecondarySpawnSpec| -> Result<String, String> {
         // Append the primary's cert PEM to forwarded_argv so the
@@ -160,6 +161,9 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
                 "shutdown_manager_bin_path",
                 shutdown_manager_bin_path.as_deref(),
             )?;
+            if let Some(reserved) = mem_manager_reserved_bytes {
+                kwargs.set_item("mem_manager_reserved_bytes", reserved)?;
+            }
             let script = py_job_manager
                 .bind(py)
                 .call_method("generate_wrapper_script", (), Some(&kwargs))?
@@ -228,6 +232,7 @@ mod tests {
             vec!["--source".to_owned(), "/src".to_owned()],
             true,
             "/log/run-1".to_owned(),
+            None,
             None,
         );
 
@@ -317,6 +322,7 @@ mod tests {
             vec!["--source".to_owned()],
             true,
             "/log/run-1".to_owned(),
+            None,
             None,
         );
 
