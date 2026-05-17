@@ -1,4 +1,4 @@
-use dynrunner_core::{Identifier, ResourceMap, WorkerId};
+use dynrunner_core::{Identifier, ResourceMap, TypeId, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc;
@@ -158,6 +158,114 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         }
 
         tracing::info!(worker_id, "worker restarted and ready");
+        Ok(())
+    }
+
+    /// Ensure the given worker's subprocess is bound to `required_type`.
+    ///
+    /// Per-type subprocess dispatch primitive: when a multi-phase
+    /// `TaskDefinition` declares one `TaskTypeSpec` (and therefore one
+    /// `worker_module`) per phase, the worker subprocess that ran
+    /// phase N's tasks cannot execute phase N+1's tasks — its argv
+    /// loaded the wrong module. This call compares the worker's
+    /// recorded `loaded_type_id` against the next task's `type_id`
+    /// and, on mismatch, kills + respawns the slot through
+    /// [`WorkerFactory::spawn_worker_for_type`] before the assignment
+    /// proceeds.
+    ///
+    /// Same-type fast path: when the recorded `loaded_type_id`
+    /// matches `required_type` (the dominant case in a single-type
+    /// run), this is a no-op — no kill, no spawn, no Ready wait.
+    /// The pre-existing single-type observable behaviour (one
+    /// process per slot for the lifetime of the run) is preserved
+    /// bit-for-bit.
+    ///
+    /// Empty-state path: a freshly-initialised worker has
+    /// `loaded_type_id == None` because [`initialize`] cannot
+    /// generally know which `TypeId` the first assignment will pick.
+    /// The mismatch arm fires once on the first assignment per slot,
+    /// binding the worker to that type. Subsequent same-type
+    /// assignments hit the fast path.
+    ///
+    /// Preserves `reserved_budgets` and `assignment_failure_count`
+    /// across the respawn — same contract as
+    /// [`restart_worker`] — and waits for the freshly-spawned worker
+    /// to reach Ready before returning.
+    pub async fn ensure_worker_for_type(
+        &mut self,
+        worker_id: WorkerId,
+        required_type: &TypeId,
+        factory: &mut impl WorkerFactory<M>,
+        print_pid: bool,
+    ) -> Result<(), String> {
+        let idx = worker_id as usize;
+        if self
+            .workers
+            .get(idx)
+            .and_then(|w| w.loaded_type_id.as_ref())
+            == Some(required_type)
+        {
+            return Ok(());
+        }
+
+        let old = &mut self.workers[idx];
+        if !old.is_stopped() {
+            old.stop().await;
+        }
+        // Eagerly SIGKILL the prior subprocess so the type-shift
+        // respawn does not race against a still-running worker
+        // continuing to load the previous type's worker_module. The
+        // restart-pre-respawn SIGKILL on `WorkerHandle` is the same
+        // primitive `worker_loop::handle_assignment_failure`'s
+        // restart path implicitly relies on via the factory's child
+        // tracking; surfacing it explicitly here also covers
+        // factories whose `spawn_worker_for_type` overwrites slot
+        // tracking without reaping the prior `Child` (no zombie
+        // race window).
+        old.kill_subprocess();
+
+        let (transport, pid) = factory
+            .spawn_worker_for_type(worker_id, required_type)
+            .map_err(|e| {
+                format!(
+                    "failed to respawn worker {worker_id} for type {required_type}: {e}"
+                )
+            })?;
+        if print_pid
+            && let Some(pid) = pid
+        {
+            tracing::info!(
+                worker_id,
+                pid,
+                type_id = %required_type,
+                "worker PID (type-shift respawn)"
+            );
+        }
+
+        let reserved_budgets = self.workers[idx].reserved_budgets.clone();
+        let failure_count = self.workers[idx].assignment_failure_count;
+
+        let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
+        handle.pid = pid;
+        handle.reserved_budgets = reserved_budgets;
+        handle.assignment_failure_count = failure_count;
+        handle.loaded_type_id = Some(required_type.clone());
+        self.workers[idx] = handle;
+
+        // Wait for ready — same shape as `restart_worker`.
+        loop {
+            if self.workers[idx].is_ready() {
+                break;
+            }
+            self.workers[idx].poll_ready().await;
+            tokio::task::yield_now().await;
+        }
+
+        tracing::info!(
+            worker_id,
+            type_id = %required_type,
+            "worker respawned for type-shift and ready"
+        );
         Ok(())
     }
 

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use dynrunner_core::{
-    FailedTask, Identifier, PhaseId, ResourceKind, ResourceMap, TaskInfo, WorkerId,
+    FailedTask, Identifier, PhaseId, ResourceKind, ResourceMap, TaskInfo, TypeId, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
@@ -116,6 +116,31 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
     /// Returns an error string if the spawn fails (caller decides whether to
     /// abort the run, log and continue with fewer workers, etc.).
     fn spawn_worker(&mut self, worker_id: WorkerId) -> Result<(M, Option<u32>), String>;
+
+    /// Spawn (or respawn) a worker bound to a specific `TypeId`.
+    ///
+    /// Called by [`WorkerPool::ensure_worker_for_type`] when an
+    /// upcoming task's `type_id` does not match the worker's currently
+    /// loaded type — typically because a multi-phase run is
+    /// transitioning into a phase whose `TaskTypeSpec` has a distinct
+    /// `worker_module`. The factory is expected to look the type up in
+    /// whatever per-type registry it maintains and spawn the matching
+    /// argv; factories that don't distinguish per-type argv (the
+    /// in-process channel-based test factories, single-type real
+    /// factories) inherit the default impl that delegates to
+    /// [`spawn_worker`], which keeps single-type runs and the test
+    /// matrix observably unchanged.
+    ///
+    /// Returning an error here mirrors `spawn_worker`'s contract:
+    /// the caller decides whether the slot is fatally dead (abort
+    /// the run) or recoverable on the next pass.
+    fn spawn_worker_for_type(
+        &mut self,
+        worker_id: WorkerId,
+        _type_id: &TypeId,
+    ) -> Result<(M, Option<u32>), String> {
+        self.spawn_worker(worker_id)
+    }
 }
 
 /// The local manager: owns workers, scheduler, and the 5-phase pipeline.
