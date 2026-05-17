@@ -537,4 +537,20 @@ where
             crate::observer::announcer::AnnouncerOutboxItem<I>,
         >,
     >,
+
+    /// Panik-watcher signal receiver. Installed via
+    /// [`Self::register_panik_signal_rx`] before `run_until_setup_or_done`
+    /// (typically from the PyO3 wrapper which spawns
+    /// [`crate::panik_watcher::spawn_panik_watcher`] at `run()` start
+    /// and threads the receiver into the inner coordinator). `None`
+    /// when the operator did not pass any panik-file paths — the
+    /// `process_tasks` select! arm parks on `pending().await` and
+    /// never fires in that case.
+    ///
+    /// Taken out for the duration of `process_tasks` so the arm's
+    /// `await` can own the receiver across `select!` iterations
+    /// (re-attaching `Option` from a struct field on every iteration
+    /// would race the take/put with cancel-on-arm-fire semantics).
+    pub(super) panik_signal_rx:
+        Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 }

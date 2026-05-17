@@ -156,6 +156,138 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     #[cfg(not(unix))]
     pub fn kill_subprocess(&self) {}
 
+    /// Send SIGTERM to the worker's entire process group.
+    ///
+    /// The signed-negative-PID idiom (`kill(-pgid, …)`) delivers the
+    /// signal to every process in that group — the worker itself
+    /// plus every child it spawned (subprocess pools, helper
+    /// processes, etc.). For this to do the right thing the worker
+    /// must have been started as its own process-group leader,
+    /// which is the contract the factory layer establishes via
+    /// `Command::process_group(0)` at spawn time. Workers spawned
+    /// by external `WorkerFactory` implementations that don't
+    /// enforce that (e.g. the PyO3 `PyCallbackWorkerFactory`,
+    /// which delegates spawn to Python) are expected to apply the
+    /// equivalent `subprocess.Popen(start_new_session=True)` on
+    /// their side; absent that, this SIGTERM only reaches the
+    /// worker process itself, matching the legacy
+    /// `kill_subprocess` semantic — best-effort, never worse than
+    /// the pre-tree-kill behaviour.
+    ///
+    /// Idempotent on absence: no-op if `pid` is None or the kernel
+    /// has already reaped the group (ESRCH).
+    ///
+    /// Distinct from `kill_subprocess`: that path sends SIGKILL
+    /// only to the worker process for the restart-pre-respawn
+    /// flow (the worker is going to be replaced; no grace
+    /// period). The tree-kill path is the panik / emergency-stop
+    /// lever where we DO want the worker's children to receive a
+    /// chance to clean up (SIGTERM-first; the pool's
+    /// grace-then-SIGKILL escalation lives on `WorkerPool`).
+    #[cfg(unix)]
+    pub fn sigterm_process_tree(&self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let pgid = Pid::from_raw(-(pid as i32));
+        match kill(pgid, Signal::SIGTERM) {
+            Ok(()) => {
+                tracing::debug!(
+                    worker_id = self.worker_id,
+                    pgid = pid,
+                    "worker: sent SIGTERM to process group"
+                );
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                // Group already gone — kernel reaped the leader
+                // and every descendant inherited its termination.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = self.worker_id,
+                    pgid = pid,
+                    error = %e,
+                    "worker: SIGTERM to process group failed"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn sigterm_process_tree(&self) {}
+
+    /// Send SIGKILL to the worker's entire process group.
+    ///
+    /// Used as the escalation step after a `sigterm_process_tree`
+    /// plus grace-period wait did not bring the group down. Same
+    /// negative-pgid idiom as the SIGTERM path; same factory-side
+    /// contract about process-group leadership applies. Idempotent
+    /// on absence.
+    #[cfg(unix)]
+    pub fn sigkill_process_tree(&self) {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let Some(pid) = self.pid else {
+            return;
+        };
+        let pgid = Pid::from_raw(-(pid as i32));
+        match kill(pgid, Signal::SIGKILL) {
+            Ok(()) => {
+                tracing::debug!(
+                    worker_id = self.worker_id,
+                    pgid = pid,
+                    "worker: sent SIGKILL to process group"
+                );
+            }
+            Err(nix::errno::Errno::ESRCH) => {
+                // Group already gone — clean grace-period exit.
+            }
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = self.worker_id,
+                    pgid = pid,
+                    error = %e,
+                    "worker: SIGKILL to process group failed"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn sigkill_process_tree(&self) {}
+
+    /// Probe whether the worker's process group still has at
+    /// least one live member, by sending signal 0 to the
+    /// negative pgid. `kill(-pgid, 0)` returns Ok iff the group
+    /// contains at least one process that the caller is
+    /// permitted to signal; ESRCH means the entire group has
+    /// terminated (i.e. SIGKILL succeeded or the group exited
+    /// on its own).
+    ///
+    /// Used by the pool's grace-then-SIGKILL escalation to
+    /// decide whether the escalation is actually needed.
+    #[cfg(unix)]
+    pub fn process_tree_alive(&self) -> bool {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+        let Some(pid) = self.pid else {
+            return false;
+        };
+        let pgid = Pid::from_raw(-(pid as i32));
+        match kill(pgid, None) {
+            Ok(()) => true,
+            Err(nix::errno::Errno::ESRCH) => false,
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn process_tree_alive(&self) -> bool {
+        false
+    }
+
     pub fn is_idle_state(&self) -> bool {
         self.protocol.is_idle()
     }

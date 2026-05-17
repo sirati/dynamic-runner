@@ -88,6 +88,27 @@ where
         // exits via Done) re-attaches the same channel.
         let mut announcer_outbox_rx = self.announcer_outbox_rx.take();
 
+        // Same shape for the panik-watcher signal: taken out of `self`
+        // for the duration of the loop so the panik arm's `await` can
+        // own the receiver. `None` when the PyO3 wrapper did not call
+        // `register_panik_signal_rx` (operator passed no `--panik-file`
+        // flags / Rust-only tests skip the watcher); the arm parks on
+        // `pending().await` and never fires in that case. `Some` only
+        // fires once (oneshot); after the signal arrives the receiver
+        // is dropped — subsequent iterations of the loop find the local
+        // `Option` empty and re-park, but the panik handler returns
+        // `RunOutcome::PanikShutdown` immediately so the loop is about
+        // to exit anyway.
+        //
+        // Grace for the SIGTERM → SIGKILL escalation on the worker
+        // pool is 5s — same window the SubprocessWorkerFactory uses
+        // for its own teardown ladder, so the framework's two
+        // shutdown paths (clean exit and panik) give workers the
+        // same amount of time to flush.
+        let mut panik_signal_rx = self.panik_signal_rx.take();
+        const PANIK_KILL_GRACE: std::time::Duration =
+            std::time::Duration::from_secs(5);
+
         loop {
             // Workers that need restart after disconnect
             let mut workers_to_restart: Vec<WorkerId> = Vec::new();
@@ -368,6 +389,56 @@ where
                 _ = oom_decision_interval.tick() => {
                     self.check_resource_pressure_via_watcher(&mut oom_watcher, factory).await;
                 }
+                // Panik (operator-initiated emergency stop) arm. The
+                // watcher's `oneshot::Receiver<PanikSignal>` resolves
+                // with `Ok(signal)` the moment the watcher task
+                // observes any of its configured sentinel paths. `Err`
+                // means the sender dropped (watcher task aborted or
+                // configured with empty paths); we ignore the Err
+                // arm and let the future never re-fire — taking the
+                // `Option<_>` to `None` after the first resolution
+                // would otherwise hot-loop the select. The
+                // `pending().await` closure is the same idiom the
+                // announcer arm uses for the "no-receiver-attached"
+                // case.
+                //
+                // Cancel-safety: `oneshot::Receiver` IS cancel-safe by
+                // construction (it owns a single slot, no mid-send
+                // partial state to lose); when a sibling arm wins the
+                // race the in-flight await is dropped and re-built
+                // next iteration, against the same receiver.
+                panik = async {
+                    match panik_signal_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Drop the rx slot so a subsequent loop iteration
+                    // (if any — the panik handler returns immediately
+                    // below) finds it None and re-parks on
+                    // `pending().await`.
+                    panik_signal_rx = None;
+                    if let Ok(signal) = panik {
+                        let (matched_path, reason) = self
+                            .handle_panik_signal(
+                                signal.matched_path,
+                                PANIK_KILL_GRACE,
+                            )
+                            .await;
+                        return Ok(crate::secondary::RunOutcome::PanikShutdown {
+                            matched_path,
+                            reason,
+                        });
+                    }
+                    // Err(_) from the receiver — the watcher's sender
+                    // dropped before firing. This is the normal
+                    // shape on "watcher disabled" (empty paths
+                    // config) and a benign one on "watcher task
+                    // aborted by drop": no panik happened, the loop
+                    // continues as if the arm hadn't fired. Without
+                    // the take-to-None above this would resolve
+                    // Err immediately on every subsequent poll.
+                }
             }
 
             // Flush any deferred peer messages
@@ -432,6 +503,15 @@ where
                 // teardown in the outer wrapper aborts the announcer
                 // task before its next outbox push.
                 self.announcer_outbox_rx = announcer_outbox_rx;
+                // Same shape for the panik-signal receiver: a
+                // SetupPending yield can be followed by a re-entry
+                // that needs the same watcher signal channel still
+                // wired up. Put it back; the next `process_tasks`
+                // re-entry takes it again. `None` here is the
+                // common case (watcher disabled OR signal already
+                // fired+consumed) and round-trips through the
+                // field unchanged.
+                self.panik_signal_rx = panik_signal_rx;
                 return Ok(RunOutcome::SetupPending);
             }
 

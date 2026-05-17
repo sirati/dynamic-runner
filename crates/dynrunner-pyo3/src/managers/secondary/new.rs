@@ -41,6 +41,8 @@ impl PySecondaryCoordinator {
         peer_lifecycle_listener = None,
         log_dir = None,
         scheduler_config = None,
+        panik_watcher_paths = None,
+        panik_watcher_poll_interval_secs = 10.0,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -65,6 +67,8 @@ impl PySecondaryCoordinator {
         peer_lifecycle_listener: Option<Py<PyAny>>,
         log_dir: Option<String>,
         scheduler_config: Option<SchedulerConfig>,
+        panik_watcher_paths: Option<Vec<PathBuf>>,
+        panik_watcher_poll_interval_secs: f64,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -130,6 +134,8 @@ impl PySecondaryCoordinator {
             task_args_py: task_args.clone().unbind(),
             peer_lifecycle_listener,
             scheduler_config: scheduler_config.unwrap_or_default(),
+            panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
+            panik_watcher_poll_interval_secs,
             completed: 0,
         })
     }

@@ -62,6 +62,8 @@ use super::module;
     peer_lifecycle_listener = None,
     task_completed_listener = None,
     scheduler_config = None,
+    panik_watcher_paths = None,
+    panik_watcher_poll_interval_secs = 10.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_primary<'py>(
@@ -81,6 +83,8 @@ pub(crate) fn run_primary<'py>(
     peer_lifecycle_listener: Option<Py<PyAny>>,
     task_completed_listener: Option<Py<PyAny>>,
     scheduler_config: Option<SchedulerConfig>,
+    panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
+    panik_watcher_poll_interval_secs: f64,
 ) -> PyResult<Py<PyAny>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("distributed_config", config.distributed_config.clone())?;
@@ -111,6 +115,13 @@ pub(crate) fn run_primary<'py>(
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }
+    if let Some(paths) = panik_watcher_paths.as_ref() {
+        kwargs.set_item("panik_watcher_paths", paths.clone())?;
+    }
+    kwargs.set_item(
+        "panik_watcher_poll_interval_secs",
+        panik_watcher_poll_interval_secs,
+    )?;
 
     let cls = module(py)?.getattr("RustPrimaryCoordinator")?;
     let args = (

@@ -25,6 +25,8 @@ use super::module;
     worker_spec = None,
     log_dir = None,
     scheduler_config = None,
+    panik_watcher_paths = None,
+    panik_watcher_poll_interval_secs = 10.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_secondary<'py>(
@@ -40,6 +42,8 @@ pub(crate) fn run_secondary<'py>(
     worker_spec: Option<WorkerSpec>,
     log_dir: Option<String>,
     scheduler_config: Option<SchedulerConfig>,
+    panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
+    panik_watcher_poll_interval_secs: f64,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_bytes` retained for back-compat; the typed
     // path passes the full multi-resource map via the `max_resources`
@@ -67,6 +71,13 @@ pub(crate) fn run_secondary<'py>(
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }
+    if let Some(paths) = panik_watcher_paths.as_ref() {
+        kwargs.set_item("panik_watcher_paths", paths.clone())?;
+    }
+    kwargs.set_item(
+        "panik_watcher_poll_interval_secs",
+        panik_watcher_poll_interval_secs,
+    )?;
 
     let cls = module(py)?.getattr("RustSecondaryCoordinator")?;
     let args = (

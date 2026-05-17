@@ -38,6 +38,13 @@ pub(crate) struct PyLocalManager {
     log_paths: LogPathConfig,
     worker_spec: Option<WorkerSpec>,
     scheduler_config: SchedulerConfig,
+    /// Panik-watcher paths — same shape as on the distributed
+    /// pyclasses. The 2026-05-17 design has "every node polls
+    /// independently", and single-host local mode IS a node — so a
+    /// per-host panik file trips the watcher and we exit(137) the
+    /// same way.
+    panik_watcher_paths: Vec<PathBuf>,
+    panik_watcher_poll_interval_secs: f64,
     phase_status_log_intervals_secs: Vec<f64>,
     /// Per-phase keepalive watchdog. The map key is the phase name as
     /// reported by `Task.set_phase(...)`; the value is the maximum
@@ -96,6 +103,8 @@ impl PyLocalManager {
         low_resource_thresholds = None,
         log_oom_watcher = false,
         log_dir = None,
+        panik_watcher_paths = None,
+        panik_watcher_poll_interval_secs = 10.0,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -126,6 +135,8 @@ impl PyLocalManager {
         low_resource_thresholds: Option<PyResourceMap>,
         log_oom_watcher: bool,
         log_dir: Option<String>,
+        panik_watcher_paths: Option<Vec<PathBuf>>,
+        panik_watcher_poll_interval_secs: f64,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -214,6 +225,8 @@ impl PyLocalManager {
             log_paths: task.log_paths,
             worker_spec,
             scheduler_config: scheduler_config.unwrap_or_default(),
+            panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
+            panik_watcher_poll_interval_secs,
             phase_status_log_intervals_secs: phase_status_log_intervals_secs
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
             stage_timeouts_secs: stage_timeouts_secs.unwrap_or_default(),
@@ -319,6 +332,22 @@ impl PyLocalManager {
         };
 
         let phase_deps = self.phase_deps.clone();
+        // Panik-watcher config captured before `py.detach`. The
+        // LocalManager has no inner `panik_signal_rx` field — there's
+        // only one operational loop (`process_binaries`) and the
+        // PyO3 wrapper races the panik signal against it directly.
+        // Empty paths yields a no-op watcher whose receiver resolves
+        // to `Err` (sender dropped); the race arm filters that with
+        // `if let Ok(signal) = …` and the select! falls through to
+        // the manager-future arm.
+        let panik_watcher_paths = self.panik_watcher_paths.clone();
+        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
+            self.panik_watcher_poll_interval_secs,
+        );
+        // Panik-grace window for the worker tree-kill. 5s matches
+        // the SubprocessWorkerFactory's `TERMINATE_GRACE` and the
+        // secondary's `PANIK_KILL_GRACE`.
+        const PANIK_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
         // GIL-reacquiring closures that dispatch to the Python
         // TaskDefinition's on_phase_start / on_phase_end. Each closure
         // owns its own ref-bumped Py<PyAny> so the manager's lifetime
@@ -328,48 +357,148 @@ impl PyLocalManager {
         let on_phase_end =
             crate::managers::lifecycle::make_on_phase_end(self.task_definition.clone_ref(py));
 
+        // Terminal-outcome enum for the local manager's run. Mirrors
+        // the structured-outcome pattern the secondary / observer
+        // pyclasses use: regular `Done(())` is the happy path,
+        // `Panik(PathBuf)` signals the outer scope (GIL re-acquired)
+        // to call `exit(137)` after the factory's process-tree
+        // teardown has run.
+        enum LocalRunOutcome {
+            Done(Result<(), String>),
+            Panik(std::path::PathBuf),
+        }
+
         // Run the async manager on a current-thread tokio runtime,
         // releasing the GIL during processing.
-        let run_result: Result<(), String> = py.detach(|| {
+        let run_outcome: LocalRunOutcome = py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("failed to create tokio runtime");
 
             let local = tokio::task::LocalSet::new();
-            let result = rt.block_on(local.run_until(async {
+            rt.block_on(local.run_until(async {
+                // Spawn the panik watcher BEFORE constructing the
+                // manager so its receiver is available for the
+                // race below. Empty `panik_watcher_paths` yields a
+                // never-firing receiver (the spawn helper returns a
+                // no-op task), which races as `Err` immediately
+                // and falls through to the manager future.
+                let mut panik_watcher =
+                    dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                        dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                            paths: panik_watcher_paths,
+                            poll_interval: panik_watcher_poll_interval,
+                        },
+                    );
+                let panik_rx = panik_watcher.take_signal_rx();
+
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
                     LocalManager::new(config, scheduler, estimator);
                 // phase_deps comes from LoadedTaskDefinition (5A);
                 // on_phase_* closures bridge to Python (5B).
-                let outcome = manager
-                    .process_binaries(
+                //
+                // Race the panik signal against `process_binaries`
+                // in an inner scoped block. The block returns either
+                // `Some(panik_path)` (panik fired) or `None` (manager
+                // ran to completion and outputs were already collected
+                // off `manager`). Done in a scope so the
+                // `process_binaries` future and its borrows are
+                // dropped before we hand `&mut manager` /
+                // `&mut factory` to the post-race teardown step —
+                // overlapping the mutable borrows is the rustc
+                // pitfall the select! tries to nest in.
+                //
+                // The LocalManager has no per-loop panik arm — only
+                // one entry point, so the race lives here at the
+                // PyO3 boundary. On panik we drop the manager future
+                // (cancels in-flight worker selects), then fall
+                // through to the panik teardown step.
+                // Race outcome carries either the manager's terminal
+                // `Result<(), String>` or the panik-matched path.
+                // The inner scope drops `manager_future` (and its
+                // mutable borrows of `manager` / `factory`) before
+                // the post-race teardown reads stats / kills workers.
+                enum RaceOutcome {
+                    ManagerDone(Result<(), String>),
+                    Panik(std::path::PathBuf),
+                }
+                let race: RaceOutcome = {
+                    let manager_future = manager.process_binaries(
                         rust_binaries,
                         phase_deps,
                         on_phase_start,
                         on_phase_end,
                         &mut factory,
-                    )
-                    .await;
+                    );
+                    tokio::pin!(manager_future);
 
-                self.stats = Some(manager.stats().clone());
-                self.failed_tasks = manager.failed_tasks().to_vec();
-                self.oom_tasks = manager.resource_pressure_tasks().to_vec();
-                self.task_payloads = manager.task_payloads().to_vec();
-                outcome
-            }));
+                    tokio::select! {
+                        biased;
+                        // Bias toward the panik arm so a signal that
+                        // resolves in the same tick as a manager
+                        // event wins. Operational stop-now must not
+                        // be starved by a busy worker event loop.
+                        panik = async {
+                            match panik_rx {
+                                Some(rx) => rx.await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match panik {
+                                Ok(signal) => RaceOutcome::Panik(signal.matched_path),
+                                // Sender dropped (watcher disabled
+                                // or aborted): fall back to running
+                                // the manager future to completion.
+                                Err(_) => {
+                                    let r = (&mut manager_future).await;
+                                    RaceOutcome::ManagerDone(r)
+                                }
+                            }
+                        }
+                        r = &mut manager_future => {
+                            RaceOutcome::ManagerDone(r)
+                        }
+                    }
+                };
 
-            // Tear down tracked worker subprocesses via the shared
-            // SIGTERM → grace → SIGKILL primitive. SIGKILL with no
-            // grace orphans podman-launched workers because podman
-            // traps SIGTERM to remove the container; SIGKILL skips
-            // that path. Per project rule "no special-casing", the
-            // teardown policy is uniform across worker kinds.
-            factory.cleanup_all();
-            result
+                // Manager future is now either completed or dropped;
+                // borrows are released. Safe to read `&manager` and
+                // `&mut factory`.
+                match race {
+                    RaceOutcome::ManagerDone(result) => {
+                        self.stats = Some(manager.stats().clone());
+                        self.failed_tasks = manager.failed_tasks().to_vec();
+                        self.oom_tasks = manager.resource_pressure_tasks().to_vec();
+                        self.task_payloads = manager.task_payloads().to_vec();
+                        factory.cleanup_all();
+                        LocalRunOutcome::Done(result)
+                    }
+                    RaceOutcome::Panik(matched_path) => {
+                        tracing::warn!(
+                            matched_path = %matched_path.display(),
+                            "panik signal observed on local manager; \
+                             tearing down worker process trees"
+                        );
+                        factory.cleanup_all_process_trees(PANIK_KILL_GRACE);
+                        LocalRunOutcome::Panik(matched_path)
+                    }
+                }
+            }))
         });
 
-        run_result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
+        match run_outcome {
+            LocalRunOutcome::Done(result) => {
+                result.map_err(pyo3::exceptions::PyRuntimeError::new_err)
+            }
+            LocalRunOutcome::Panik(matched_path) => {
+                tracing::error!(
+                    matched_path = %matched_path.display(),
+                    "panik shutdown: local manager exiting with code 137"
+                );
+                std::process::exit(137);
+            }
+        }
     }
 
     #[getter]

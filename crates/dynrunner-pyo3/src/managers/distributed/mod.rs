@@ -124,4 +124,14 @@ pub(crate) struct PyDistributedManager {
     /// SLURM operators tune the framework: one CLI flag pair, applied
     /// uniformly to whichever Rust coordinator is the local one.
     pub(super) scheduler_config: SchedulerConfig,
+
+    /// Panik-watcher paths shared by both the in-process primary
+    /// AND every in-process secondary. Same shape and rationale as
+    /// `scheduler_config`: one operator surface, applied uniformly to
+    /// whichever Rust coordinator runs on the local node. Empty
+    /// vector disables the watcher (a never-firing oneshot receiver
+    /// is what `spawn_panik_watcher` returns).
+    pub(super) panik_watcher_paths: Vec<PathBuf>,
+    /// Poll cadence (seconds) for the panik watcher.
+    pub(super) panik_watcher_poll_interval_secs: f64,
 }

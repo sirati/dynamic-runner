@@ -85,8 +85,23 @@ impl PyObserverLateJoiner {
         // anyway (the snapshot RPC + restore latch are also one-shot).
         let holdings = std::mem::take(&mut self.holdings);
         let scheduler_config = self.scheduler_config.clone();
+        let panik_watcher_paths = self.panik_watcher_paths.clone();
+        let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
+            self.panik_watcher_poll_interval_secs,
+        );
 
-        let result: Result<u32, PyErr> = py.detach(|| -> Result<u32, PyErr> {
+        // Terminal-outcome shapes for the observer late-joiner's run.
+        // `Done` returns the observed-completion count; `Panik`
+        // signals the outer scope to call `std::process::exit(137)`
+        // after the GIL is re-acquired. Same shape the regular
+        // secondary uses — keeps the two pyclasses' panik response
+        // structurally aligned.
+        enum ObserverRunOutcome {
+            Done(u32),
+            Panik(std::path::PathBuf),
+        }
+        let result: Result<ObserverRunOutcome, PyErr> =
+            py.detach(|| -> Result<ObserverRunOutcome, PyErr> {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -250,6 +265,23 @@ impl PyObserverLateJoiner {
                     quic_port: peer_port,
                 });
 
+                // Wire the panik watcher in the same shape as the
+                // regular secondary. The observer doesn't own
+                // workers but still participates in the
+                // cluster-wide stop: its `process_tasks` panik arm
+                // broadcasts `PanikRequested` (peers that haven't
+                // tripped their own file learn about the stop
+                // here) and the post-loop scope below exits 137.
+                let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
+                    dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
+                        paths: panik_watcher_paths,
+                        poll_interval: panik_watcher_poll_interval,
+                    },
+                );
+                if let Some(rx) = panik_watcher.take_signal_rx() {
+                    secondary.register_panik_signal_rx(rx);
+                }
+
                 // Attach the resource-holdings announcer's hook +
                 // outbox BEFORE the snapshot restore: the restore's
                 // `cluster_state.restore` path fires
@@ -312,14 +344,15 @@ impl PyObserverLateJoiner {
                 // error-return would skip the cleanup and leak the
                 // announcer task into the next observer dispatcher
                 // run.
-                let loop_result: Result<u32, PyErr> = async {
-                    // `RunOutcome` is currently two-variant
-                    // (Done | SetupPending) and both arms terminate,
-                    // so clippy sees the loop as never iterating. The
-                    // loop is retained as defensive scaffolding for a
-                    // future "retry on SetupPending" branch — same
-                    // shape the in-process distributed manager will
-                    // need if observers ever become promotable.
+                let loop_result: Result<ObserverRunOutcome, PyErr> = async {
+                    // `RunOutcome` adds the `PanikShutdown` arm but
+                    // both terminal arms (Done | Panik) still
+                    // terminate the loop — clippy still sees it as
+                    // never iterating. The loop is retained as
+                    // defensive scaffolding for a future "retry on
+                    // SetupPending" branch — same shape the in-process
+                    // distributed manager will need if observers ever
+                    // become promotable.
                     #[allow(clippy::never_loop)]
                     loop {
                         let outcome = secondary
@@ -332,6 +365,18 @@ impl PyObserverLateJoiner {
                             })?;
                         match outcome {
                             RunOutcome::Done => break,
+                            RunOutcome::PanikShutdown {
+                                matched_path,
+                                reason,
+                            } => {
+                                tracing::warn!(
+                                    matched_path = %matched_path.display(),
+                                    reason = %reason,
+                                    "observer panik shutdown; propagating \
+                                     to PyO3 boundary for exit(137)"
+                                );
+                                return Ok(ObserverRunOutcome::Panik(matched_path));
+                            }
                             RunOutcome::SetupPending => {
                                 // Defensive: a late-joiner observer
                                 // should never see SetupPending — that
@@ -356,7 +401,7 @@ impl PyObserverLateJoiner {
                         }
                     }
 
-                    Ok(secondary.completed_count() as u32)
+                    Ok(ObserverRunOutcome::Done(secondary.completed_count() as u32))
                 }
                 .await;
 
@@ -381,8 +426,23 @@ impl PyObserverLateJoiner {
             }))
         });
 
-        self.completed = result?;
-        Ok(())
+        match result? {
+            ObserverRunOutcome::Done(completed) => {
+                self.completed = completed;
+                Ok(())
+            }
+            ObserverRunOutcome::Panik(matched_path) => {
+                // GIL re-acquired (the `py.detach` block returned).
+                // Surface the cause to the dispatcher log one last
+                // time then exit(137) — same exit-on-panik shape as
+                // `PySecondaryCoordinator::run`.
+                tracing::error!(
+                    matched_path = %matched_path.display(),
+                    "panik shutdown: observer exiting with code 137"
+                );
+                std::process::exit(137);
+            }
+        }
     }
 
     /// Observed completion count read off the snapshot + any live

@@ -184,6 +184,16 @@ pub(crate) struct PyPrimaryCoordinator {
     /// `Arc<dyn SecondarySpawner>` is extracted via `as_arc` at
     /// `run()` entry.
     pub(super) respawn_spawner: Option<Py<PyAny>>,
+
+    /// Panik-watcher paths — same shape as on `PySecondaryCoordinator`.
+    /// Empty means "no watcher" — the operator passed no
+    /// `--panik-file` flags. Forwarded into
+    /// [`dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig::paths`]
+    /// at `run()` entry.
+    pub(super) panik_watcher_paths: Vec<std::path::PathBuf>,
+    /// Poll cadence (seconds) for the panik watcher. Default 10.0
+    /// per the 2026-05-17 design thread.
+    pub(super) panik_watcher_poll_interval_secs: f64,
 }
 
 // Rust-only surface for the SLURM-pipeline orchestrator. Not exposed

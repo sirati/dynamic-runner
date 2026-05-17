@@ -239,6 +239,36 @@ def _build_scheduler_config(args: argparse.Namespace):
     )
 
 
+def _panik_kwargs(args: argparse.Namespace) -> dict:
+    """Pull the operator-supplied panik-watcher CLI flags into the
+    kwargs shape every Rust manager-hosting pyclass / pyfunction
+    accepts (``panik_watcher_paths`` and
+    ``panik_watcher_poll_interval_secs``).
+
+    Single concern: read the argparse Namespace once, return the
+    kwarg dict the dispatcher splats into the ``_rs.run_*`` call.
+    Each dispatcher pairs this with ``_build_scheduler_config(args)``
+    — both share the same "translate CLI flags into per-call
+    kwargs" pattern, both default to empty / default values when
+    unset, neither dispatcher special-cases panik-disabled mode.
+
+    Returns an empty dict when no `--panik-file` flags were supplied
+    AND the poll interval is at its default — both sides treat that
+    as "watcher off" by passing an empty paths list. Returning the
+    dict (rather than calling ``set_item`` style on a passed-in
+    dict) keeps every dispatch call site readable as
+    ``**_panik_kwargs(args)``.
+    """
+    out: dict = {}
+    paths = getattr(args, "panik_file_paths", None) or []
+    if paths:
+        out["panik_watcher_paths"] = list(paths)
+    poll = getattr(args, "panik_poll_interval_secs", None)
+    if poll is not None:
+        out["panik_watcher_poll_interval_secs"] = float(poll)
+    return out
+
+
 def _dispatch_local(task, args, config, logger) -> None:
     """Standard in-process local manager."""
     import dynamic_runner as _rs
@@ -279,6 +309,7 @@ def _dispatch_local(task, args, config, logger) -> None:
         socket_dir=args.socket_dir,
         manual_start_worker=args.manual_start_worker,
         log_dir=getattr(args, "log_dir", None),
+        **_panik_kwargs(args),
     )
     _log_local_result(result, logger)
 
@@ -463,6 +494,7 @@ def _dispatch_secondary(task, args, logger) -> None:
         skip_existing=args.skip_existing,
         log_dir=getattr(args, "log_dir", None),
         scheduler_config=_build_scheduler_config(args),
+        **_panik_kwargs(args),
     )
 
 
@@ -517,6 +549,7 @@ def _dispatch_late_joiner(task, args, logger) -> None:
         task,
         distributed_config=distributed_config,
         scheduler_config=_build_scheduler_config(args),
+        **_panik_kwargs(args),
     )
     logger.info(f"Observer Completed (observed): {result['completed']}")
 
@@ -601,6 +634,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         unfulfillable_reinject_max_per_task=unfulfillable_cap,
         log_dir=getattr(args, "log_dir", None),
         scheduler_config=_build_scheduler_config(args),
+        **_panik_kwargs(args),
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")
@@ -678,6 +712,7 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
         fulfillability_matcher=getattr(task, "fulfillability_matcher", None),
         peer_lifecycle_listener=getattr(task, "peer_lifecycle_listener", None),
         task_completed_listener=getattr(task, "task_completed_listener", None),
+        **_panik_kwargs(args),
     )
     logger.info(f"Completed: {result['completed']}")
     logger.info(f"Failed: {result['failed']}")

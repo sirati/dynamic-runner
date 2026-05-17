@@ -46,6 +46,8 @@ use super::module;
     unfulfillable_reinject_max_per_task = None,
     log_dir = None,
     scheduler_config = None,
+    panik_watcher_paths = None,
+    panik_watcher_poll_interval_secs = 10.0,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_distributed<'py>(
@@ -67,6 +69,8 @@ pub(crate) fn run_distributed<'py>(
     unfulfillable_reinject_max_per_task: Option<u32>,
     log_dir: Option<String>,
     scheduler_config: Option<SchedulerConfig>,
+    panik_watcher_paths: Option<Vec<std::path::PathBuf>>,
+    panik_watcher_poll_interval_secs: f64,
 ) -> PyResult<Py<PyAny>> {
     // Legacy positional `ram_per_secondary` retained for back-compat; the
     // typed path passes the full multi-resource map via the
@@ -115,6 +119,13 @@ pub(crate) fn run_distributed<'py>(
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }
+    if let Some(paths) = panik_watcher_paths.as_ref() {
+        kwargs.set_item("panik_watcher_paths", paths.clone())?;
+    }
+    kwargs.set_item(
+        "panik_watcher_poll_interval_secs",
+        panik_watcher_poll_interval_secs,
+    )?;
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
     let args = (

@@ -41,6 +41,68 @@ pub(crate) fn terminate_children(children: &mut [Option<std::process::Child>]) {
     }
 }
 
+/// Tear down a vector of tracked worker children AND every
+/// descendant they spawned, using the SIGTERM → grace → SIGKILL
+/// ladder against each child's process GROUP.
+///
+/// Distinct from [`terminate_children`]: that path signals each
+/// worker's PID directly, which only reaches the worker process
+/// itself. The negative-PGID idiom used here (`kill(-pgid, ...)`)
+/// reaches every descendant sharing the pgid — the contract the
+/// factory's `process_group(0)` spawn flag set up. This is the
+/// primitive the panik (emergency-stop) path uses on the
+/// LocalManager flow (where there's no `WorkerPool` to fan-out
+/// through): a single sweep that takes down workers plus their
+/// helper subprocesses (subprocess pools, container exec children,
+/// etc.) before the manager process exits 137.
+///
+/// Wall-clock teardown is bounded by `grace` (one sleep across the
+/// whole vec, not `grace * num_children`). Idempotent.
+pub(crate) fn terminate_children_with_process_group(
+    children: &mut [Option<std::process::Child>],
+    grace: Duration,
+) {
+    use nix::errno::Errno;
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    if children.iter().all(Option::is_none) {
+        return;
+    }
+    // Pass 1: SIGTERM each pgid in one fan-out.
+    for slot in children.iter() {
+        if let Some(child) = slot.as_ref() {
+            let pgid = Pid::from_raw(-(child.id() as i32));
+            match kill(pgid, Signal::SIGTERM) {
+                Ok(()) | Err(Errno::ESRCH) => {}
+                Err(e) => tracing::debug!(
+                    pgid = pgid.as_raw(),
+                    error = %e,
+                    "SIGTERM to worker pgid failed"
+                ),
+            }
+        }
+    }
+    // Single sleep across the whole batch — wall-clock teardown is
+    // bounded by `grace`, not `grace * num_children`.
+    std::thread::sleep(grace);
+    // Pass 2: SIGKILL any pgid still alive + reap the leader Child.
+    for slot in children.iter_mut() {
+        if let Some(mut child) = slot.take() {
+            let pgid = Pid::from_raw(-(child.id() as i32));
+            // Probe with signal 0 — if the group is gone we skip
+            // the SIGKILL.
+            if !matches!(kill(pgid, None), Err(Errno::ESRCH)) {
+                let _ = kill(pgid, Signal::SIGKILL);
+            }
+            // Reap the leader. The descendants the SIGKILL just
+            // hit are inherited by init (PID 1) and reaped there;
+            // the framework only owns the leader's `Child`.
+            let _ = child.wait();
+        }
+    }
+}
+
 /// SIGTERM → up to `TERMINATE_GRACE` poll → SIGKILL → reap one child.
 /// Errors are logged at debug/warn but never propagated: teardown is a
 /// best-effort lattice, and the only sane fallback if SIGKILL itself
@@ -177,7 +239,21 @@ impl SubprocessWorkerFactory {
     /// Build a `std::process::Command` from a rendered template. Stdio is
     /// silenced; callers add transport-specific extras (e.g. socketpair
     /// `pre_exec` hooks) afterwards.
+    ///
+    /// Worker as its own process-group leader: `process_group(0)` asks the
+    /// kernel to create a fresh process group with `pgid == child_pid` at
+    /// exec time. Every descendant the worker forks inherits that pgid
+    /// (unless it explicitly creates its own). This is the contract the
+    /// manager-local layer's `sigterm_process_tree` /
+    /// `sigkill_process_tree` rely on: a single `kill(-pgid, ...)`
+    /// reaches the worker AND every child it spawned, which is the
+    /// load-bearing primitive for the panik (emergency-stop) shutdown
+    /// path. Without this, a worker that forked helper subprocesses
+    /// would leave them alive after a tree-kill, blocking container
+    /// teardown and orphaning compute that the operator already
+    /// declared unwanted.
     fn command_from_rendered(rendered: &RenderedCommand) -> std::process::Command {
+        use std::os::unix::process::CommandExt;
         let mut cmd = std::process::Command::new(&rendered.argv[0]);
         cmd.args(&rendered.argv[1..]);
         for (k, v) in &rendered.env {
@@ -188,7 +264,8 @@ impl SubprocessWorkerFactory {
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
         cmd
     }
 
@@ -197,6 +274,20 @@ impl SubprocessWorkerFactory {
     /// manager run loop has exited regardless of why it exited.
     pub(crate) fn cleanup_all(&mut self) {
         terminate_children(&mut self.child_processes);
+    }
+
+    /// Tear down every tracked worker subprocess AND its child
+    /// process tree with the negative-pgid SIGTERM → grace → SIGKILL
+    /// ladder. Used by the panik (operator-emergency-stop) path on
+    /// the LocalManager flow where there's no `WorkerPool` to fan-out
+    /// through. Idempotent; safe to call before exit(137) so the
+    /// manager process and every worker pgid go down in one bounded
+    /// sweep.
+    pub(crate) fn cleanup_all_process_trees(
+        &mut self,
+        grace: Duration,
+    ) {
+        terminate_children_with_process_group(&mut self.child_processes, grace);
     }
 
     /// Store a freshly-spawned child in the per-worker slot.

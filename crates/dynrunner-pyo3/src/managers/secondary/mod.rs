@@ -93,5 +93,16 @@ pub(crate) struct PySecondaryCoordinator {
     /// surface so every Rust manager-hosting pyclass exposes the same
     /// tuning shape).
     pub(super) scheduler_config: SchedulerConfig,
+    /// Filesystem paths the operator-initiated panik watcher polls.
+    /// Empty means "no watcher" — `spawn_panik_watcher` returns a
+    /// never-firing receiver and the coordinator's panik arm never
+    /// hits. Forwarded into
+    /// [`dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig::paths`]
+    /// verbatim; resolving consumer-specific filenames (e.g.
+    /// `/tmp/<consumer>.panik`) is the Python caller's concern.
+    pub(super) panik_watcher_paths: Vec<PathBuf>,
+    /// Poll cadence (seconds) for the panik watcher. Default 10.0
+    /// per the 2026-05-17 design thread.
+    pub(super) panik_watcher_poll_interval_secs: f64,
     pub(super) completed: u32,
 }

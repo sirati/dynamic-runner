@@ -119,6 +119,40 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--panik-file",
+        action="append",
+        dest="panik_file_paths",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Operator-initiated emergency stop sentinel path. Every "
+            "node polls each --panik-file at --panik-poll-interval-secs "
+            "cadence; the first existing path triggers a "
+            "ClusterMutation::PanikRequested broadcast, kills all "
+            "workers AND their child trees (SIGTERM → 5s grace → "
+            "SIGKILL on each worker's process group), and exits the "
+            "container with code 137 so the SLURM/podman wrapper reaps "
+            "cleanly. May be passed multiple times — first match wins. "
+            "Per the 2026-05-17 design, operators typically pair a "
+            "per-host path (e.g. /tmp/<consumer>.panik) with a "
+            "shared-network path (e.g. /app/log-network/<consumer>.panik) "
+            "so they can trip a single node or the entire cluster "
+            "without re-deploying. Off by default (no sentinels)."
+        ),
+    )
+    parser.add_argument(
+        "--panik-poll-interval-secs",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help=(
+            "Poll cadence for the --panik-file watcher. Default 10s per "
+            "the 2026-05-17 design thread; lower values give faster "
+            "operator response at the cost of more fs.stat traffic. "
+            "Ignored when --panik-file is not set."
+        ),
+    )
+    parser.add_argument(
         "--manual-start-worker",
         action="store_true",
         help="Manually start worker processes (print command and wait)",
