@@ -135,6 +135,62 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
     }
 }
 
+/// Worker factory whose per-task latency is driven by a substring match
+/// on `relative_path`. Tasks whose `relative_path` contains any of the
+/// `slow_markers` keys sleep for the matched value before responding
+/// `Done`; all others respond instantly.
+///
+/// Single concern: per-task synthetic latency. The marker matching is
+/// substring-based on the wire path (`TaskInfo.path.to_string_lossy()`)
+/// so callers can drive timing entirely from `make_binary("slow_X", _)`-
+/// style fixture names with no extra plumbing into the wire shape.
+///
+/// Single-threaded (`Rc`); only safe inside a `tokio::task::LocalSet`.
+#[derive(Clone)]
+pub(super) struct SlowFakeWorkerFactory {
+    slow_markers: std::rc::Rc<Vec<(String, std::time::Duration)>>,
+}
+
+impl SlowFakeWorkerFactory {
+    pub(super) fn with_markers(slow_markers: Vec<(String, std::time::Duration)>) -> Self {
+        Self {
+            slow_markers: std::rc::Rc::new(slow_markers),
+        }
+    }
+}
+
+impl WorkerFactory<ChannelManagerEnd> for SlowFakeWorkerFactory {
+    fn spawn_worker(
+        &mut self,
+        _worker_id: u32,
+    ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        let (manager_end, runner_end) = channel_pair();
+        let markers = self.slow_markers.clone();
+        tokio::task::spawn_local(async move {
+            let mut runner = runner_end;
+            let _ = runner.send(Response::Ready).await;
+            loop {
+                match MessageReceiver::<Command>::recv(&mut runner).await {
+                    Some(Command::Stop) => break,
+                    Some(Command::ProcessTask { relative_path, .. }) => {
+                        let delay = markers
+                            .iter()
+                            .find(|(needle, _)| relative_path.contains(needle))
+                            .map(|(_, d)| *d)
+                            .unwrap_or_else(|| std::time::Duration::from_millis(0));
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let _ = runner.send(Response::Done { result_data: None }).await;
+                    }
+                    None => break,
+                }
+            }
+        });
+        Ok((manager_end, None))
+    }
+}
+
 /// Worker factory that fails the first N Recoverable attempts on each
 /// task whose `relative_path` is in `failure_quotas`, then succeeds.
 /// Tasks not in the map always succeed. Shared state is a single
