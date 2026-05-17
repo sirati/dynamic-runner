@@ -15,6 +15,6 @@ pub use manager::{
 };
 pub use monitor::{ProcStatmMonitor, ResourceMonitor};
 pub use oom::{OomWatcher, OomWatcherConfig, OomWatcherSnapshot, LogTrigger};
-pub use pool::{WorkerPool, ResourcePressureResult};
+pub use pool::{EnsureWorkerOutcome, ResourcePressureResult, WorkerPool};
 pub use stats::ProcessingStats;
 pub use worker::{WorkerEvent, WorkerExitStatus, WorkerHandle};

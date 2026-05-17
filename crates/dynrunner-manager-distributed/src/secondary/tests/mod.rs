@@ -47,3 +47,4 @@ mod promoted_primary_quiesce_gate;
 mod r1;
 mod retry_bucket_cascade;
 mod setup_promote_discriminator;
+mod singleton_type_shift;

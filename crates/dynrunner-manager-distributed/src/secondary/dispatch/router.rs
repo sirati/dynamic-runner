@@ -142,16 +142,104 @@ where
                     // target worker if its currently-loaded type does
                     // not match this task's `type_id` (no-op fast
                     // path on type match — the dominant case for
-                    // single-type runs). Failures here are treated as
-                    // peer-assign failures: queue the worker for
-                    // respawn and report the task as backpressure-
-                    // shaped to the primary, mirroring the existing
-                    // Bug B/C recovery shape below.
-                    if let Err(e) = self
-                        .pool
-                        .ensure_worker_for_type(target_wid, &binary.type_id, factory, false)
-                        .await
-                    {
+                    // single-type runs).
+                    //
+                    // **First-bind vs true type-shift discrimination.**
+                    // A slot whose `loaded_type_id` is `None` is in
+                    // initial-pool-init state — never been bound to
+                    // any type. The respawn here is type-BINDING
+                    // (rebuilds the slot for the first type) and
+                    // happens at most once per worker slot per run;
+                    // the synchronous wait is bounded by the
+                    // initial-spawn timeline of the worker
+                    // subprocess (typically sub-second under
+                    // production conditions) and matches the
+                    // pre-extraction observable behaviour the
+                    // existing test fixtures rely on (fake-primary
+                    // mocks send TaskAssignment in response to
+                    // TaskRequest and expect a synchronous
+                    // TaskComplete back, with no backpressure-
+                    // requeue handling).
+                    //
+                    // A slot whose `loaded_type_id` is `Some(T1)`
+                    // entering a `Some(T2)` assignment is a TRUE
+                    // type-shift — the production wedge scenario.
+                    // The freshly-respawned worker subprocess can
+                    // legitimately take arbitrary time to send
+                    // `Response::Ready` (Python import, container
+                    // startup, slow filesystem); a synchronous wait
+                    // here would block the secondary's `select!`
+                    // for the entire duration, observed at 300+s
+                    // on asm-tokenizer's LMU dispatch.
+                    //
+                    // True type-shifts route through the async-Ready
+                    // event flow: kill+spawn synchronously, bounce
+                    // the task as backpressure (same wire shape as
+                    // the "worker pipe broken; respawning" arm
+                    // below), and rely on the standard
+                    // `WorkerEvent::Ready` handler to reclaim the
+                    // protocol and fire a fresh TaskRequest once
+                    // the new subprocess is ready. The primary's
+                    // `handle_primary_peer_rejection` recognises the
+                    // marker and requeues the binary without
+                    // consuming retry budget.
+                    let prior_type = self.pool.loaded_type_id(target_wid).cloned();
+                    let is_true_type_shift =
+                        prior_type.as_ref().is_some_and(|t| t != &binary.type_id);
+                    let ensure_result: Result<(), String> = if is_true_type_shift {
+                        match self
+                            .pool
+                            .ensure_worker_for_type_async(target_wid, &binary.type_id, factory, false)
+                            .await
+                        {
+                            Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
+                            Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
+                                tracing::info!(
+                                    worker_id = target_wid,
+                                    type_id = %binary.type_id,
+                                    "type-shift respawn issued; bouncing task as backpressure \
+                                     until WorkerEvent::Ready arrives on the event channel"
+                                );
+                                // The slot is occupied by a Transitioning
+                                // worker with the new type bound; do NOT
+                                // queue another restart through
+                                // `pending_worker_restarts` — that would
+                                // SIGKILL the just-spawned subprocess and
+                                // start a third respawn cycle.
+                                let task_failed = DistributedMessage::TaskFailed {
+                                    sender_id: self.config.secondary_id.clone(),
+                                    timestamp: timestamp_now(),
+                                    secondary_id: self.config.secondary_id.clone(),
+                                    worker_id: target_wid,
+                                    task_hash: file_hash.clone(),
+                                    error_type: ErrorType::Recoverable,
+                                    // Use the exact marker the primary's
+                                    // `is_backpressure` predicate
+                                    // recognises (peer/message_handler.rs).
+                                    error_message: "worker pipe broken; respawning".into(),
+                                };
+                                self.send_to_current_primary(task_failed.clone()).await?;
+                                let _ = self.peer_transport.broadcast(task_failed).await;
+                                return Ok(());
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        // First-bind path (loaded_type_id == None) OR
+                        // same-type fast-path (loaded_type_id ==
+                        // required_type). Both are handled by the
+                        // blocking `ensure_worker_for_type` — the
+                        // fast-path short-circuits with AlreadyLoaded,
+                        // the first-bind goes through the same
+                        // background-watcher spawn but reclaims
+                        // synchronously to preserve the pre-fix
+                        // observable behaviour callers (tests + Python
+                        // wrappers) rely on.
+                        self.pool
+                            .ensure_worker_for_type(target_wid, &binary.type_id, factory, false)
+                            .await
+                    };
+                    if let Err(e) = ensure_result {
                         tracing::warn!(
                             worker_id = target_wid,
                             error = %e,
@@ -167,7 +255,7 @@ where
                             task_hash: file_hash.clone(),
                             error_type: ErrorType::Recoverable,
                             error_message: format!(
-                                "No idle worker available (type-shift respawn failed): {e}"
+                                "No idle worker available (respawn failed): {e}"
                             ),
                         };
                         // Mirror the "no idle worker available" arm:
