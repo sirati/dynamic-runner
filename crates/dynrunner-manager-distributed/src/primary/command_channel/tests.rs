@@ -1088,6 +1088,140 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
     .await;
 }
 
+/// Live-primary regression: a `SpawnTasks` command must refresh
+/// `total_tasks` from the post-apply CRDT `task_count()`, symmetric
+/// with the receive-side mirror in `handle_cluster_mutation`. Pins
+/// the asm-tokenizer phase-3 memmap race: pre-seeded total reflects
+/// the run-start binary count N; a callback fires
+/// `spawn_tasks(memmap_items)` with M brand-new tasks; without the
+/// refresh `total_tasks` stays at N and the operational-loop exit
+/// check (`completed + failed >= total_tasks`) trips the moment all
+/// N pre-spawn tasks finish — the post-spawn task sits dispatchable
+/// in the pool but the loop has already signalled RunComplete.
+///
+/// Asserts both faces of the contract:
+///   (1) `total_tasks` grew to `N + M` after the spawn applied.
+///   (2) The exit-check predicate that the operational loop reads
+///       (`completed + failed >= total_tasks`) returns `false` when
+///       `completed == N` and `failed == 0` — proving the loop
+///       stays alive long enough to see the post-spawn task through.
+///
+/// The pre-spawn fixture seeds the same shape `run()` would: N
+/// tasks land in `cluster_state` via `TaskAdded` and the field
+/// `total_tasks = N` is set explicitly (the seed_cluster_state path
+/// writes the same value at `coordinator.rs:1238`). The pool is
+/// seeded with the spawned task's phase so the post-apply reinject
+/// has a destination — same shape every other spawn_tasks test in
+/// this file uses.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let mut coordinator = make_coordinator();
+
+        // Pre-spawn: N=4 binaries seeded into the CRDT, exactly the
+        // shape `seed_cluster_state` produces at run start.
+        let mut pre_spawn: Vec<dynrunner_core::TaskInfo<TestId>> = Vec::new();
+        for i in 0..4 {
+            let mut b = make_binary(&format!("pre_{i}"), 100);
+            b.task_id = Some(format!("pre_{i}_id"));
+            let h = compute_task_hash(&b);
+            coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
+                hash: h,
+                task: b.clone(),
+            });
+            pre_spawn.push(b);
+        }
+        // Mirror `run()`s explicit set at coordinator.rs:1238 — the
+        // field starts as a derived view written from `binaries.len()`.
+        coordinator.total_tasks = pre_spawn.len();
+        let n = coordinator.total_tasks;
+        assert_eq!(
+            n,
+            coordinator.cluster_state.task_count(),
+            "fixture invariant: pre-spawn total_tasks matches CRDT view"
+        );
+
+        // Seed the pool covering the spawned task's phase so the
+        // post-apply reinject has a destination. Every other
+        // spawn_tasks test uses the same `seed_pool` helper.
+        let mut spawned = make_binary("memmap_0", 100);
+        spawned.task_id = Some("memmap_0_id".into());
+        seed_pool(&mut coordinator, &[&spawned.phase_id]);
+
+        // M=1 brand-new task with no deps: the asm-tokenizer phase-3
+        // memmap discovery surfaced exactly 1 item.
+        let m = 1usize;
+        let spawned_hash = compute_task_hash(&spawned);
+
+        let errors = spawn_via_handler(&mut coordinator, vec![spawned.clone()])
+            .await
+            .expect("spawn_tasks succeeds on well-formed input");
+        assert!(
+            errors.is_empty(),
+            "no per-index errors expected on a no-deps freshly-Pending task: {errors:?}"
+        );
+
+        // (1) The CRDT grew by M; total_tasks mirrors that growth.
+        assert_eq!(
+            coordinator.cluster_state.task_count(),
+            n + m,
+            "CRDT task_count grew by the spawn batch size"
+        );
+        assert_eq!(
+            coordinator.total_tasks,
+            n + m,
+            "total_tasks must refresh from cluster_state.task_count() after \
+             apply_spawn_tasks; without this refresh the operational loop's \
+             exit check (`completed + failed >= total_tasks`) trips at the \
+             pre-spawn total the moment all N initial tasks finish"
+        );
+
+        // Pin the surface of the contract: the spawned task is in
+        // the CRDT as Pending AND reinjected into the pool — the
+        // existing spawn_tasks_all_pending_dispatched test already
+        // pins this for the no-prior-state case; we re-assert here
+        // because the asm-tokenizer bug specifically required BOTH
+        // the pool reinject AND the total_tasks refresh to land:
+        // the pool reinject alone would still see the loop exit
+        // before the dispatch tick if total_tasks lagged.
+        assert!(
+            matches!(
+                coordinator.cluster_state.task_state(&spawned_hash),
+                Some(TaskState::Pending { .. })
+            ),
+            "spawned task lands as Pending in the CRDT"
+        );
+        assert!(
+            coordinator
+                .pool()
+                .iter()
+                .any(|t| t.task_id == spawned.task_id),
+            "spawned task is re-injected into the live pool"
+        );
+
+        // (2) Exit-check predicate at the pre-spawn-success
+        // boundary: `completed == N, failed == 0`. The operational
+        // loop's check is `completed_tasks.len() + failed_tasks.len()
+        // >= total_tasks` (see lifecycle/operational_loop.rs:166).
+        // With the refresh in place this evaluates to `4 + 0 >= 5`
+        // = false; without it the read was `4 + 0 >= 4` = true, and
+        // RunComplete fired before memmap dispatched.
+        let succeeded = n; // simulate the post-pre-spawn-completion state
+        let failed = 0usize;
+        let would_exit = succeeded + failed >= coordinator.total_tasks;
+        assert!(
+            !would_exit,
+            "exit predicate must be false when only the N pre-spawn tasks \
+             have completed; got succeeded={succeeded} failed={failed} \
+             total_tasks={} — if this fires, the refresh did NOT happen and \
+             the loop would exit before the spawned task dispatches",
+            coordinator.total_tasks
+        );
+    })
+    .await;
+}
+
 /// `ClusterMutation::TasksSpawned` round-trips through serde.
 /// Pins wire-codec compatibility for the new variant.
 #[test]
