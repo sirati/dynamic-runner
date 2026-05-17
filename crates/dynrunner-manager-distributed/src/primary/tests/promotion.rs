@@ -71,6 +71,7 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
                 mass_death_min_count: 2,
                 source_dir: None,
                 unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
 
             let mut primary = PrimaryCoordinator::new(
@@ -353,6 +354,7 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -492,6 +494,7 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,

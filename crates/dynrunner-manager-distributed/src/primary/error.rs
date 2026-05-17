@@ -61,6 +61,25 @@ pub enum RunError {
         matched_path: std::path::PathBuf,
         reason: String,
     },
+    /// Demoted submitter in setup-promote mode (`required_setup_on_promote
+    /// = true`) timed out waiting for the promoted secondary to broadcast
+    /// its first `ClusterMutation::TaskAdded` / `TasksSpawned` /
+    /// `RunComplete`. The operational loop's setup-pending arm
+    /// (`config.setup_promote_deadline`) fired with `setup_pending`
+    /// still latched true.
+    ///
+    /// Distinct from `Other(String)` so the PyO3 boundary can render a
+    /// clear, structured failure (rather than the legacy log-and-swallow
+    /// path that surfaces as a stranded-count discrepancy or a silent
+    /// 4-hour hang). Distinct from `ClusterCollapsed` because no task
+    /// was ever assigned — there is no per-category breakdown to render,
+    /// only the elapsed wall-clock that pins the operator's diagnostic
+    /// pointer at "the promoted secondary never started broadcasting".
+    SetupDeadlineExpired {
+        /// Wall-clock duration the demoted submitter spent in the
+        /// setup-pending wait before the arm fired.
+        elapsed: std::time::Duration,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
     Other(String),
@@ -85,6 +104,16 @@ impl fmt::Display for RunError {
                 f,
                 "primary panik shutdown: {reason} (matched_path={})",
                 matched_path.display()
+            ),
+            Self::SetupDeadlineExpired { elapsed } => write!(
+                f,
+                "setup-promote deadline expired after {:.1}s: the promoted \
+                 secondary never broadcast TaskAdded / TasksSpawned / RunComplete \
+                 — discovery may be hung on the consumer side, or the secondary's \
+                 SLURM job died before its first broadcast. Tune \
+                 `setup_promote_deadline` upward if the consumer's `discover_items` \
+                 walk is legitimately long-running.",
+                elapsed.as_secs_f64()
             ),
             Self::Other(msg) => f.write_str(msg),
         }

@@ -93,6 +93,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -216,6 +217,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -304,6 +306,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -415,6 +418,7 @@ async fn retry_max_passes_zero_disables_retry() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(

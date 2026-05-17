@@ -31,6 +31,7 @@ impl PyPrimaryCoordinator {
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
         let dist_mass_death_grace = self.distributed_config.mass_death_grace();
         let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
+        let dist_setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         let pending_stage_files = std::mem::take(&mut self.pending_stage_files);
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         let source_dir = self.source_dir.clone();
@@ -271,6 +272,17 @@ impl PyPrimaryCoordinator {
         // of this method calls `std::process::exit(137)` so the SLURM
         // wrapper reaps the container.
         let mut panik_shutdown_path: Option<std::path::PathBuf> = None;
+        // Setup-promote deadline carried out of the detached tokio
+        // runtime. `Some(RunError::SetupDeadlineExpired { .. })` iff
+        // the inner `PrimaryCoordinator::run` exited via the demoted-
+        // primary setup-deadline arm — the promoted secondary never
+        // broadcast TaskAdded / TasksSpawned / RunComplete within
+        // `setup_promote_deadline`. The GIL-side tail of this method
+        // translates this into a `PyRuntimeError` carrying the
+        // diagnostic Display so the consumer's Python wrapper raises
+        // a clean exception instead of returning exit 0 with empty
+        // counters.
+        let mut setup_deadline_expired: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -363,6 +375,7 @@ impl PyPrimaryCoordinator {
                     // remote-only primaries).
                     source_dir,
                     unfulfillable_reinject_max_per_task,
+                    setup_promote_deadline: dist_setup_promote_deadline,
                 };
 
                 let mut primary: PrimaryCoordinator<_, _, _, _, RunnerIdentifier> =
@@ -475,6 +488,9 @@ impl PyPrimaryCoordinator {
                     }) => {
                         panik_shutdown_path = Some(matched_path);
                     }
+                    Err(e @ RunError::SetupDeadlineExpired { .. }) => {
+                        setup_deadline_expired = Some(e);
+                    }
                     Err(RunError::Other(_)) | Ok(()) => {
                         // Legacy log-and-swallow behaviour for
                         // non-structured errors is preserved here:
@@ -523,6 +539,27 @@ impl PyPrimaryCoordinator {
                 "panik shutdown: primary exiting with code 137"
             );
             std::process::exit(137);
+        }
+
+        if let Some(err) = setup_deadline_expired {
+            // GIL is back. Surface the structured deadline-expiry as
+            // a `PyRuntimeError` carrying the Display of the
+            // `SetupDeadlineExpired` variant (the diagnostic message
+            // is composed in `error.rs::Display`). The consumer's
+            // Python wrapper observes a non-zero exit instead of the
+            // pre-fix silent hang.
+            //
+            // Sequenced after `panik_shutdown_path` (panik is a
+            // strictly-stronger terminal) but BEFORE
+            // `cluster_collapsed` because the setup-deadline path
+            // exits with zero tasks dispatched — there's nothing for
+            // the stranded-count accounting to surface. Surfacing
+            // setup-deadline first keeps the operator's diagnostic
+            // pointer at the actual cause ("discovery never started")
+            // instead of letting the run trickle through to a
+            // `ClusterCollapsed { stranded = 0 }` shape that's
+            // technically correct but operationally misleading.
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
         if let Some(err) = cluster_collapsed {

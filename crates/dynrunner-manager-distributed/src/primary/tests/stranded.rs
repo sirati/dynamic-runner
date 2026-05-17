@@ -36,6 +36,7 @@ async fn stranded_count_is_zero_on_clean_run() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -231,6 +232,7 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -348,6 +350,7 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -464,6 +467,7 @@ async fn drain_pending_messages_updates_completed_set() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -567,6 +571,7 @@ async fn clean_run_does_not_false_positive_stranded() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
