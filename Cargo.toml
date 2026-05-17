@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# `shutdown-manager/` is a standalone subproject with its own Cargo.toml
+# and flake — it is intentionally NOT part of this workspace so the
+# stable musl-static teardown binary does not get rebuilt every time a
+# framework crate changes.
+exclude = ["shutdown-manager"]
 members = [
     "crates/dynrunner-core",
     "crates/dynrunner-protocol-manager-worker",

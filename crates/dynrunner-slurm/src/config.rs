@@ -43,6 +43,18 @@ pub struct SlurmConfig {
     /// `root_folder`. Mirrors the Python field of the same name on
     /// `slurm_config.SlurmConfig`.
     pub prestaged_src_bins_path: Option<String>,
+    /// Lead time in seconds before time-limit at which SLURM delivers
+    /// SIGTERM to the batch script (`--signal=B:SIGTERM@<N>`). The
+    /// shutdown-manager scope uses this window to stop the container,
+    /// signal the secondary, and clean up `/tmp` before SLURM's
+    /// `KillWait`-driven SIGKILL fires. Default 60s; tune up if your
+    /// teardown sequence reliably exceeds that.
+    ///
+    /// Special case: `0` skips the flag entirely, because
+    /// `--signal=B:SIGTERM@0` is malformed per `sbatch(1)` (`@N` must
+    /// be > 0). Use `0` to opt out on clusters whose `slurm.conf`
+    /// disables `--signal`.
+    pub signal_lead_seconds: u32,
 }
 
 impl SlurmConfig {
@@ -131,6 +143,7 @@ impl Default for SlurmConfig {
             nodes: 1,
             notify_email: None,
             prestaged_src_bins_path: None,
+            signal_lead_seconds: 60,
         }
     }
 }

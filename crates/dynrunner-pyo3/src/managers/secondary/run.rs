@@ -404,6 +404,19 @@ impl PySecondaryCoordinator {
                         dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                             paths: panik_watcher_paths,
                             poll_interval: panik_watcher_poll_interval,
+                            // SECONDARY-role spawner: the host-side
+                            // shutdown-manager forwards SLURM
+                            // time-limit / scancel as
+                            // `podman exec <c> kill -TERM <pid>`
+                            // into the secondary process. Listening
+                            // for SIGTERM here routes that into the
+                            // same panik cascade as a sentinel-file
+                            // trigger — worker-teardown +
+                            // exit(137) — so the secondary releases
+                            // SLURM-allocated resources cleanly
+                            // before the kernel SIGKILLs at the
+                            // SLURM grace deadline.
+                            listen_for_sigterm: true,
                         },
                     );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
