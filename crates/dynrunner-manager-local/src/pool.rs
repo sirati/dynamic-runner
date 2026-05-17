@@ -313,41 +313,80 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
     ) -> Result<(), String> {
-        // Funnel through the async-event variant for the kill+spawn
-        // half; same-type fast path returns AlreadyLoaded and we
-        // short-circuit without touching the Ready wait at all.
-        match self
-            .ensure_worker_for_type_async(worker_id, required_type, factory, print_pid)
-            .await?
+        let idx = worker_id as usize;
+        if self
+            .workers
+            .get(idx)
+            .and_then(|w| w.loaded_type_id.as_ref())
+            == Some(required_type)
         {
-            EnsureWorkerOutcome::AlreadyLoaded => Ok(()),
-            EnsureWorkerOutcome::RespawnInProgress => {
-                // Synchronously drive the just-spawned worker to
-                // Ready. `ensure_worker_for_type_async` stashed a
-                // wait-for-Ready background task into
-                // `WorkerHandle::poll_task`; reclaiming it here is
-                // the inverse of the operational-loop's
-                // `handle_worker_event::Ready` arm and gives the
-                // same Idle protocol state without going through
-                // the event channel.
-                //
-                // We don't drain `recv_event` from here because
-                // `LocalManager` (the production caller of the
-                // blocking variant) owns its own event loop and
-                // expects events to arrive there; consuming them
-                // ahead of the loop would skip the standard
-                // `WorkerEvent::Ready` handler. The reclaim is
-                // sufficient because `spawn_ready_watcher`'s
-                // background task already wrote the Ready event to
-                // the channel before its `await` completed, and the
-                // protocol state is recovered from the task's
-                // return value — exactly the same pair of
-                // side effects the synchronous loop produced before.
-                let idx = worker_id as usize;
-                self.workers[idx].reclaim_protocol().await;
-                Ok(())
-            }
+            return Ok(());
         }
+
+        // Mismatch path — same kill+spawn shape as the async
+        // variant, but the wait-for-Ready strategy diverges to
+        // preserve the pre-extraction observable behaviour. This
+        // path drives `poll_ready` inline, so no
+        // [`crate::worker::WorkerEvent::Ready`] lands in the pool's
+        // event channel and the operational-loop's Ready arm is
+        // NOT triggered downstream. (The async variant emits the
+        // event so the distributed-secondary's `select!`-driven
+        // handler can reclaim + repoll without blocking other arms;
+        // a sync caller — LocalManager pipeline, in-process
+        // distributed dispatch where the kill+spawn-bind is fast —
+        // owns its own follow-up sequencing and does not need a
+        // channel event.)
+        let old = &mut self.workers[idx];
+        if !old.is_stopped() {
+            old.stop().await;
+        }
+        old.kill_subprocess();
+
+        let (transport, pid) = factory
+            .spawn_worker_for_type(worker_id, required_type)
+            .map_err(|e| {
+                format!(
+                    "failed to respawn worker {worker_id} for type {required_type}: {e}"
+                )
+            })?;
+        if print_pid
+            && let Some(pid) = pid
+        {
+            tracing::info!(
+                worker_id,
+                pid,
+                type_id = %required_type,
+                "worker PID (type-shift respawn, sync)"
+            );
+        }
+
+        let reserved_budgets = self.workers[idx].reserved_budgets.clone();
+        let failure_count = self.workers[idx].assignment_failure_count;
+
+        let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
+        handle.pid = pid;
+        handle.reserved_budgets = reserved_budgets;
+        handle.assignment_failure_count = failure_count;
+        handle.loaded_type_id = Some(required_type.clone());
+        self.workers[idx] = handle;
+
+        // Drive `poll_ready` directly — no background task, no
+        // event-channel emission. The synchronous loop mirrors the
+        // pre-extraction implementation bit-for-bit.
+        loop {
+            if self.workers[idx].is_ready() {
+                break;
+            }
+            self.workers[idx].poll_ready().await;
+            tokio::task::yield_now().await;
+        }
+
+        tracing::info!(
+            worker_id,
+            type_id = %required_type,
+            "worker respawned for type-shift and ready (sync)"
+        );
+        Ok(())
     }
 
     /// Ensure the given worker's subprocess is bound to `required_type`,
