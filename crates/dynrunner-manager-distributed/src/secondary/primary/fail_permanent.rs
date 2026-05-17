@@ -40,9 +40,11 @@ use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use super::super::SecondaryCoordinator;
 use crate::cluster_state::TaskState;
+use crate::primary::PrimaryCommand;
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
@@ -105,6 +107,7 @@ where
         hash: String,
         error: ErrorType,
         reason: String,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<(), String> {
         let Some((phase_id, task_id, _binary)) =
             self.task_meta_for_hash_with_binary(&hash)
@@ -180,7 +183,7 @@ where
         if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id, task_id.as_deref());
         }
-        self.process_primary_phase_lifecycle();
+        self.process_primary_phase_lifecycle(command_rx).await;
 
         // Broadcast the terminal state for the originating task plus
         // any cascade-paused dependents (Unfulfillable case only).

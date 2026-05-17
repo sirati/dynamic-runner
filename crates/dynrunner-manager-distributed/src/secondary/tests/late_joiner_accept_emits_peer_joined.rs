@@ -97,7 +97,7 @@
                     sender_id: "late-observer-1".into(),
                     timestamp: 0.0,
                 };
-                sec.dispatch_message(req)
+                sec.dispatch_message(req, &mut None)
                     .await
                     .expect("RequestClusterSnapshot handler succeeds");
 

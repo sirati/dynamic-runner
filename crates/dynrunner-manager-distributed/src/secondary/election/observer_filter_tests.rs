@@ -94,7 +94,7 @@
             epoch: 1,
             required_setup: false,
         };
-        let result = sec.dispatch_message(promote).await;
+        let result = sec.dispatch_message(promote, &mut None).await;
 
         // Handler returns Ok(()) (silently rejects) — we don't
         // upgrade to Err because Err propagates to the processing
@@ -200,7 +200,7 @@
             epoch: 99,
             required_setup: false,
         };
-        sec.dispatch_message(promote)
+        sec.dispatch_message(promote, &mut None)
             .await
             .expect("PromotePrimary handler returns Ok even when rejecting");
         assert!(

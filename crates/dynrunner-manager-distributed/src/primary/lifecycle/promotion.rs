@@ -83,7 +83,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tokio::select! {
                 msg = self.transport.recv() => {
                     match msg {
-                        Some(m) => self.dispatch_message(m).await?,
+                        // Pre-operational-loop site (see
+                        // wait_for_connections for matching rationale):
+                        // pass &mut None — the operational loop hasn't
+                        // started, so the in-runtime PrimaryHandle
+                        // path isn't issuing commands yet.
+                        Some(m) => self.dispatch_message(m, &mut None).await?,
                         None => return Err("transport closed during wait_for_mesh_ready".into()),
                     }
                 }

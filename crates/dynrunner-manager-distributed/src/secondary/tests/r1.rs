@@ -573,7 +573,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
 
             // The critical call: route via peer_transport handler.
             // Pre-fix this fell into the catch-all and was lost.
-            secondary.handle_peer_message(assignment).await;
+            secondary.handle_peer_message(assignment, &mut None).await;
 
             // Worker received the assignment → `active_tasks` records it.
             // (The `dispatch_message` body inserts on the assign_task

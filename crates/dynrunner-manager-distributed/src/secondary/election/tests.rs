@@ -221,7 +221,7 @@
             epoch: 1,
             required_setup: false,
         };
-        sec.dispatch_message(promote)
+        sec.dispatch_message(promote, &mut None)
             .await
             .expect("PromotePrimary handler succeeds");
         assert_eq!(sec.primary_link.current_primary(), Some("sec-a"));
@@ -267,7 +267,7 @@
             epoch: 1,
             required_setup: false,
         };
-        sec.dispatch_message(promote)
+        sec.dispatch_message(promote, &mut None)
             .await
             .expect("PromotePrimary handler succeeds");
         assert!(sec.is_primary);
@@ -308,7 +308,7 @@
             epoch: 1,
             required_setup: false,
         };
-        sec.dispatch_message(promote)
+        sec.dispatch_message(promote, &mut None)
             .await
             .expect("PromotePrimary handler succeeds");
 
@@ -333,7 +333,7 @@
             epoch: 5,
             required_setup: false,
         };
-        sec.dispatch_message(high).await.unwrap();
+        sec.dispatch_message(high, &mut None).await.unwrap();
         assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
         assert_eq!(sec.cluster_state.primary_epoch(), 5);
         assert_eq!(sec.primary_link.current_primary(), Some("sec-c"));
@@ -347,7 +347,7 @@
             epoch: 2,
             required_setup: false,
         };
-        sec.dispatch_message(stale).await.unwrap();
+        sec.dispatch_message(stale, &mut None).await.unwrap();
         assert_eq!(
             sec.cluster_state.current_primary(),
             Some("sec-c"),

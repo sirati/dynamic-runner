@@ -12,6 +12,9 @@ use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
+
+use crate::primary::PrimaryCommand;
 
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
@@ -25,9 +28,14 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the cascade so a callback-issued `spawn_tasks`
+    /// applies inline before the next `drain_empty_active_phases`
+    /// poll. Off-loop callers pass `&mut None`.
     pub(in crate::secondary) async fn handle_worker_event(
         &mut self,
         event: WorkerEvent<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<Option<WorkerId>, String> {
         match event {
             WorkerEvent::TaskCompleted {
@@ -89,7 +97,7 @@ where
                         // the task — a no-op otherwise. Mid-run
                         // firing is what unblocks chained phases in
                         // the primary pool.
-                        self.note_primary_item_completed(&hash);
+                        self.note_primary_item_completed(&hash, command_rx).await;
                         // Report completion to the current primary
                         // (whichever node currently holds authority).
                         let msg = DistributedMessage::TaskComplete {
@@ -119,7 +127,7 @@ where
                         // retry pass. Phase-machine in-flight
                         // bookkeeping is identical to the success
                         // case (decrement + cascade).
-                        self.note_primary_item_failed(&hash, &error_type);
+                        self.note_primary_item_failed(&hash, &error_type, command_rx).await;
                         // Synchronous drain-check (see peer.rs for
                         // rationale): immediately re-inject if this
                         // was the last in-flight task and there's

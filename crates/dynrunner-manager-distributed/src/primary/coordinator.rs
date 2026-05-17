@@ -1255,7 +1255,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `on_phase_end(.., 0, 0)` for each empty phase via the
         // lifecycle cascade.
         self.pool_mut().drain_empty_active_phases();
-        self.process_phase_lifecycle();
+        // Take/put-back the command-channel receiver around the cascade
+        // call: the cascade's per-iteration drain step needs `&mut
+        // Receiver` AND the cascade itself needs `&mut self`, which
+        // would alias if we passed `&mut self.command_rx` directly.
+        // Mirrors the discipline `operational_loop` uses (see
+        // `lifecycle/operational_loop.rs:51`); the brief window between
+        // take and put-back is benign here because we're still in `run`
+        // before the operational loop has started — no concurrent
+        // sender access path exists.
+        //
+        // Required at this pre-loop site (not optional): a consumer
+        // `on_phase_end` callback fired by the initial-empty-phase
+        // cascade can itself queue `spawn_tasks(next_phase_items)`,
+        // and the cascade's next `drain_empty_active_phases` poll
+        // would otherwise false-fire `on_phase_end(.., 0, 0)` on the
+        // successor phase exactly the way the in-loop bug class did.
+        let mut command_rx = self.command_rx.take();
+        self.process_phase_lifecycle(&mut command_rx).await;
+        self.command_rx = command_rx;
 
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections().await?;
@@ -1505,7 +1523,29 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// running until no phase is in `Drained` — phases with empty
     /// dependency chains can transition through several states in
     /// one tick.
-    pub(super) fn process_phase_lifecycle(&mut self) {
+    ///
+    /// `command_rx` carries the operational-loop's command-channel
+    /// receiver (the `take`n local; see `operational_loop.rs:51`). After
+    /// each cascade iteration's `on_phase_end` fires, we drain any
+    /// commands the user callback queued via the in-runtime
+    /// `PrimaryHandle` path (e.g. `spawn_tasks(next_phase_items)`) and
+    /// dispatch each through the existing `handle_primary_command`
+    /// chokepoint BEFORE the next `drain_empty_active_phases` poll. The
+    /// drain is the load-bearing step: without it the cascade's next
+    /// poll observes the not-yet-applied spawn as an empty successor
+    /// phase and false-fires `on_phase_end(.., 0, 0)` for it,
+    /// dropping every callback-injected task.
+    ///
+    /// Pre-loop / post-loop callers (`coordinator.rs:1258`,
+    /// `drain_pending_messages`, `wait_for_connections`,
+    /// `wait_for_mesh_ready`) pass `&mut None` — at those moments
+    /// PyPrimaryHandle is either dormant (run hasn't started yet) or
+    /// the operational loop has already exited and won't re-enter, so
+    /// there is no in-runtime callback path to drain.
+    pub(super) async fn process_phase_lifecycle(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         loop {
             let drained = self.pool_mut().poll_drain_transitions();
             if drained.is_empty() {
@@ -1516,6 +1556,50 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 let failed = self.phase_failed.get(p).copied().unwrap_or(0);
                 if let Some(cb) = self.on_phase_end.as_mut() {
                     cb(p, completed, failed);
+                }
+                // Apply any commands the on_phase_end callback queued
+                // via the in-runtime PrimaryHandle path. Without this,
+                // a queued SpawnTasks would sit on the channel until
+                // the next operational-loop select! tick — but the
+                // cascade's next drain_empty_active_phases poll runs
+                // BEFORE that tick and would see the not-yet-applied
+                // next phase as empty, false-firing on_phase_end(.., 0,
+                // 0) and dropping every callback-injected task. Drain-
+                // dispatch is the same handler the operational loop's
+                // command arm uses, so the per-command CRDT broadcast
+                // + pool reinjection semantics are identical to a
+                // channel-delivered command (no parallel apply path,
+                // no shape divergence).
+                // Drain one command at a time so each `try_recv` borrow
+                // releases before the dispatch re-borrows `command_rx`
+                // (the recursive cascade fired by e.g.
+                // `apply_fail_permanent` needs `&mut command_rx` to
+                // drain its OWN post-callback queue). Using
+                // `.ok()` collapses the recv result into an
+                // `Option<Cmd>` so the match-borrow on `command_rx`
+                // doesn't escape the let-binding.
+                //
+                // `Box::pin` breaks the async-recursion cycle
+                // (process_phase_lifecycle → handle_primary_command →
+                // apply_fail_permanent → note_item_failed →
+                // process_phase_lifecycle); without it the compiler
+                // can't size the future. Pinned at THIS site (rather
+                // than e.g. on `apply_fail_permanent`) because the
+                // cascade re-entry only happens via this dispatch
+                // call — so the box allocation is gated on a
+                // callback actually queueing a command.
+                loop {
+                    let cmd = match command_rx.as_mut() {
+                        Some(rx) => rx.try_recv().ok(),
+                        None => None,
+                    };
+                    let Some(cmd) = cmd else { break };
+                    Box::pin(
+                        crate::primary::command_channel::handle_primary_command(
+                            self, cmd, command_rx,
+                        ),
+                    )
+                    .await;
                 }
                 self.pool_mut().mark_phase_done(p);
             }
@@ -1541,14 +1625,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// `task_depends_on` edges. Pass `Some(id)` for successful
     /// completions; transient failures should call `note_item_failed`
     /// instead (which suppresses the dep-resolution side-effect).
-    pub(super) fn note_item_completed(
+    ///
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the cascade so callback-issued in-runtime
+    /// `PrimaryHandle` commands apply inline (see
+    /// `process_phase_lifecycle` doc).
+    pub(super) async fn note_item_completed(
         &mut self,
         phase_id: &PhaseId,
         task_id: Option<&str>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         *self.phase_completed.entry(phase_id.clone()).or_insert(0) += 1;
         self.pool_mut().on_item_finished(phase_id, task_id);
-        self.process_phase_lifecycle();
+        self.process_phase_lifecycle(command_rx).await;
     }
 
     /// Per-failure bookkeeping. Same shape as `note_item_completed`.
@@ -1562,13 +1652,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// (→ `pool.on_item_failed_permanent`, owned by the retry-budget
     /// exhaustion path). Param kept so future callers can route via a
     /// uniform helper without a signature change.
-    pub(super) fn note_item_failed(
+    pub(super) async fn note_item_failed(
         &mut self,
         phase_id: &PhaseId,
         _task_id: Option<&str>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         *self.phase_failed.entry(phase_id.clone()).or_insert(0) += 1;
         self.pool_mut().on_item_finished(phase_id, None);
-        self.process_phase_lifecycle();
+        self.process_phase_lifecycle(command_rx).await;
     }
 }

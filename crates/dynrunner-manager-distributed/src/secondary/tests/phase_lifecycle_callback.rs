@@ -83,8 +83,8 @@ fn one_phase_pool_with_one_item(phase: &PhaseId) -> PendingPool<TestId> {
 
 /// (1) Single-phase happy path: the only item completes, the phase
 /// drains, and the callback observes `(completed=1, failed=0)`.
-#[test]
-fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
+#[tokio::test(flavor = "current_thread")]
+async fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
     let phase = PhaseId::from("phase-a");
     let mut sec = make_secondary(election_config("sec-0"));
     sec.primary_pending = Some(one_phase_pool_with_one_item(&phase));
@@ -111,7 +111,7 @@ fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
         }),
     );
 
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
 
     let recorded = calls.lock().expect("poisoned");
     assert_eq!(
@@ -133,8 +133,8 @@ fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
 
 /// (2) Mixed-class drain: 1 completion + 1 failure in the same phase
 /// drain the pool; the final cascade-fire reports both counts.
-#[test]
-fn note_primary_item_failed_contributes_to_phase_end_counters() {
+#[tokio::test(flavor = "current_thread")]
+async fn note_primary_item_failed_contributes_to_phase_end_counters() {
     let phase = PhaseId::from("phase-a");
     let mut sec = make_secondary(election_config("sec-0"));
     // Two-item phase: the pool needs two in-flight markers so the
@@ -167,7 +167,7 @@ fn note_primary_item_failed_contributes_to_phase_end_counters() {
 
     // First: hash-a completes. Phase still has 1 in_flight; should NOT
     // fire `on_phase_end` yet.
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
     assert!(
         calls.lock().expect("poisoned").is_empty(),
         "first completion does not drain the phase; no callback yet"
@@ -178,7 +178,7 @@ fn note_primary_item_failed_contributes_to_phase_end_counters() {
     // reaches 0 but the failed-ledger is non-empty. The phase
     // transitions to Drained either way (the failed ledger is
     // primary's retry-pass concern, not the pool's state).
-    sec.note_primary_item_failed("hash-b", &ErrorType::Recoverable);
+    sec.note_primary_item_failed("hash-b", &ErrorType::Recoverable, &mut None).await;
 
     let recorded = calls.lock().expect("poisoned");
     assert_eq!(
@@ -196,8 +196,8 @@ fn note_primary_item_failed_contributes_to_phase_end_counters() {
 /// (3) No registered callback: cascade still walks the pool, phase
 /// reaches `Done`. The Option-guarded fire-site is the only thing
 /// that changes; the pool-side state machine is unaffected.
-#[test]
-fn no_callback_registered_still_drives_cascade_silently() {
+#[tokio::test(flavor = "current_thread")]
+async fn no_callback_registered_still_drives_cascade_silently() {
     let phase = PhaseId::from("phase-a");
     let mut sec = make_secondary(election_config("sec-0"));
     sec.primary_pending = Some(one_phase_pool_with_one_item(&phase));
@@ -205,7 +205,7 @@ fn no_callback_registered_still_drives_cascade_silently() {
         .insert("hash-a".into(), make_in_flight("a", "phase-a"));
 
     // No `register_phase_lifecycle_callbacks` call.
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
 
     assert_eq!(
         sec.primary_pending.as_ref().expect("pool present").phase_state(&phase),
@@ -219,8 +219,8 @@ fn no_callback_registered_still_drives_cascade_silently() {
 /// pins the non-promoted secondary path so installing a callback
 /// before promotion can never trip a panic from the apparent
 /// absence of a pool.
-#[test]
-fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
+#[tokio::test(flavor = "current_thread")]
+async fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
     let mut sec = make_secondary(election_config("sec-0"));
     assert!(sec.primary_pending.is_none(), "fixture starts pre-promotion");
 
@@ -240,7 +240,7 @@ fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
     // (the entry is not in `primary_in_flight`), so this call alone
     // wouldn't drive the cascade. Drive `process_primary_phase_lifecycle`
     // directly to exercise the pool-None branch.
-    sec.process_primary_phase_lifecycle();
+    sec.process_primary_phase_lifecycle(&mut None).await;
     assert!(
         calls.lock().expect("poisoned").is_empty(),
         "no pool ⇒ no cascade ⇒ no callback firings"
@@ -267,7 +267,7 @@ fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
 ///   2. Registers a callback that, on `on_phase_end`, calls
 ///      `apply_spawn_tasks` to inject a third task targeted at the
 ///      now-active phase-b.
-///   3. Triggers `note_primary_item_completed("hash-a")` and verifies:
+///   3. Triggers `note_primary_item_completed("hash-a", &mut None)` and verifies:
 ///       (a) the callback fired with `(phase-a, completed=1, failed=0)`,
 ///       (b) the cluster_state now contains the spawned task,
 ///       (c) the spawned task landed in `primary_pending` (Pending).
@@ -404,7 +404,7 @@ async fn callback_can_invoke_apply_spawn_tasks_and_cluster_state_grows() {
         }),
     );
 
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
 
     // The callback fired.
     let recorded = calls.lock().expect("poisoned").clone();
@@ -457,5 +457,266 @@ async fn callback_can_invoke_apply_spawn_tasks_and_cluster_state_grows() {
             .is_empty()
             || matches!(state, TaskState::Blocked { .. }),
         "spawned task is either pool-resident or Blocked-pending-deps"
+    );
+}
+
+/// Regression: a phase-end callback that issues `spawn_tasks` for the
+/// successor phase via the command channel must see the spawn applied
+/// INLINE within the cascade — BEFORE the cascade's next
+/// `drain_empty_active_phases` poll. Without the in-cascade drain step
+/// added in this commit chain, the cascade would see the successor
+/// phase as empty (the SpawnTasks command sits unapplied on
+/// `command_rx`), false-fire `on_phase_end(.., 0, 0)` on it, and the
+/// spawned task would be silently dropped — exactly the asm-tokenizer
+/// "P|FullPipelineTask: phase memmap discovered 0 item(s)" failure
+/// from the brief.
+///
+/// Setup:
+///   1. Phase-a holds one in-flight task (`hash-a`).
+///   2. Phase-b is declared as a dependent of phase-a, but starts
+///      EMPTY in the pool — there is no placeholder. Pre-fix, this
+///      is the load-bearing condition: the cascade's
+///      `drain_empty_active_phases` would observe phase-b as
+///      empty post-mark-done(phase-a) and false-fire on_phase_end.
+///   3. The cascade-time `on_phase_end(phase-a, ..)` callback queues a
+///      `PrimaryCommand::SpawnTasks` onto the secondary's
+///      `command_tx` — the same channel `PrimaryHandle::spawn_tasks`
+///      writes to from the consumer's PyO3 callback. The cascade's
+///      per-iteration drain picks it up via the
+///      `&mut Some(command_rx)` arg, dispatches through
+///      `handle_secondary_command` → `apply_spawn_tasks`, which
+///      reinjects into `primary_pending` BEFORE the next
+///      `drain_empty_active_phases` poll sees phase-b.
+///
+/// Asserts:
+///   * `on_phase_end` fires for phase-a exactly once with the right
+///     counts.
+///   * `on_phase_end` does NOT fire for phase-b (the spawned task
+///     keeps the successor non-empty, so the cascade does not
+///     transition phase-b to Drained).
+///   * `cluster_state` shows the spawned task as Pending (the apply
+///     path's CRDT mutation landed inline).
+///   * The pool now holds the spawned task (post-apply pool reinjection
+///     fired inline).
+#[tokio::test(flavor = "current_thread")]
+async fn cascade_drains_callback_queued_spawn_tasks_inline() {
+    use std::collections::HashMap as StdHashMap;
+    use std::collections::HashSet as StdHashSet;
+
+    use crate::cluster_state::TaskState;
+    use crate::primary::PrimaryCommand;
+
+    let phase_a = PhaseId::from("phase-a");
+    let phase_b = PhaseId::from("phase-b");
+    let mut sec = make_secondary(election_config("sec-0"));
+    sec.is_primary = true;
+
+    // Seed cluster_state with the prereq task so apply_spawn_tasks'
+    // dep-resolution finds task-a. PhaseDepsSet declares phase-b
+    // dependent on phase-a — same shape populate_primary_from_cluster_state
+    // produces post-promotion.
+    let task_a = TaskInfo {
+        path: PathBuf::from("/tmp/a"),
+        size: 100,
+        identifier: TestId("a".into()),
+        phase_id: phase_a.clone(),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: Some("task-a".into()),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    sec.cluster_state
+        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::PhaseDepsSet {
+            deps: {
+                let mut m = StdHashMap::new();
+                m.insert(phase_b.clone(), vec![phase_a.clone()]);
+                m
+            },
+        });
+    sec.cluster_state
+        .apply(dynrunner_protocol_primary_secondary::ClusterMutation::TaskAdded {
+            hash: "hash-a".into(),
+            task: task_a.clone(),
+        });
+
+    // Pool: phase-a has 1 in-flight (task-a), phase-b is declared but
+    // EMPTY. This is the load-bearing condition the regression test
+    // pins — pre-fix, phase-b's emptiness post-mark-done(phase-a)
+    // would false-Drain it.
+    let mut phase_ids = StdHashSet::new();
+    phase_ids.insert(phase_a.clone());
+    phase_ids.insert(phase_b.clone());
+    let mut deps = StdHashMap::new();
+    deps.insert(phase_b.clone(), vec![phase_a.clone()]);
+    let mut pool = PendingPool::<TestId>::new(phase_ids, deps).expect("graph valid");
+    pool.mark_tasks_in_flight(vec![("task-a".into(), phase_a.clone())]);
+    sec.primary_pending = Some(pool);
+    sec.primary_in_flight
+        .insert("hash-a".into(), make_in_flight("a", "phase-a"));
+
+    // Spawn target: phase-b task with NO task-level dep on task-a.
+    // Task-level deps would make `apply_spawn_tasks` route the entry
+    // into CRDT `Blocked` (waiting for task-a's TaskCompleted), and
+    // the secondary's apply_spawn_tasks routing rule "Blocked → no
+    // pool-side action" would leave the pool empty. The PHASE-level
+    // dep (PhaseDepsSet earlier) is what keeps phase-b Blocked in
+    // the pool's phase-state machine until mark_phase_done(phase-a)
+    // flips it. The pool's task-spawn path treats Pending tasks as
+    // pool-resident regardless of phase activation — they're picked
+    // up by view_for_worker once the phase activates.
+    //
+    // This is the production-natural shape for the asm-tokenizer
+    // FullPipelineTask bug: the per-phase callback discovers items
+    // dynamically (e.g. `phase memmap discovered 1 item(s)`) and
+    // they don't carry task-level deps because the per-phase
+    // dependency is already encoded in PhaseDepsSet.
+    let task_b_to_spawn = TaskInfo {
+        path: PathBuf::from("/tmp/b"),
+        size: 100,
+        identifier: TestId("b".into()),
+        phase_id: phase_b.clone(),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: Some("task-b".into()),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    let hash_b = crate::primary::wire::compute_task_hash(&task_b_to_spawn);
+
+    // Take the receiver out of the coordinator and wire the sender
+    // into the callback. The receiver lives in this test's local
+    // scope for the duration of the cascade — same discipline
+    // process_tasks uses to drive its select! arms.
+    let mut command_rx = sec.command_rx.take();
+    let command_tx = sec.command_sender();
+
+    let calls: Arc<Mutex<Vec<(String, u32, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls_inner = calls.clone();
+    // The reply oneshots from the queued commands need to live for the
+    // duration of the cascade so the handler can fulfill them; collect
+    // them in a Vec the test holds across the cascade call.
+    let captured_replies: Arc<Mutex<Vec<tokio::sync::oneshot::Receiver<_>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let captured_replies_inner = captured_replies.clone();
+    sec.register_phase_lifecycle_callbacks(
+        Box::new(|_: &PhaseId| {}),
+        Box::new(move |p: &PhaseId, c: u32, f: u32| {
+            calls_inner
+                .lock()
+                .expect("poisoned")
+                .push((p.as_str().to_string(), c, f));
+            // Mirror the PyO3 PrimaryHandle.spawn_tasks shape: build a
+            // SpawnTasks command with a oneshot reply, try_send onto
+            // the channel. Production's channel-into-cascade path is
+            // exactly this; only the callback issuer is different
+            // (PyO3 wrapper vs this test).
+            if p.as_str() == "phase-a" {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cmd = PrimaryCommand::SpawnTasks {
+                    tasks: vec![task_b_to_spawn.clone()],
+                    reply: reply_tx,
+                };
+                command_tx
+                    .try_send(cmd)
+                    .expect("command channel must accept the queued spawn");
+                captured_replies_inner
+                    .lock()
+                    .expect("poisoned")
+                    .push(reply_rx);
+            }
+        }),
+    );
+
+    let initial_count = sec.cluster_state.task_count();
+    assert_eq!(initial_count, 1, "fixture starts with task-a only");
+
+    // Drive the cascade. This is the exact call shape
+    // secondary/processing/process_tasks.rs:140 makes for a worker
+    // event that produces a TaskComplete. The `&mut command_rx` is the
+    // load-bearing parameter — without it the inline drain step
+    // sees `None` and the queued SpawnTasks would sit on the channel
+    // until a later select! tick, exactly recreating the bug.
+    sec.note_primary_item_completed("hash-a", &mut command_rx).await;
+
+    // Asserts:
+
+    // (1) on_phase_end fired for phase-a exactly once.
+    let recorded = calls.lock().expect("poisoned").clone();
+    let phase_a_calls: Vec<_> = recorded
+        .iter()
+        .filter(|(p, _, _)| p == "phase-a")
+        .collect();
+    assert_eq!(
+        phase_a_calls.len(),
+        1,
+        "on_phase_end fires once for phase-a; got {recorded:?}"
+    );
+    assert_eq!(
+        phase_a_calls[0],
+        &("phase-a".to_string(), 1, 0),
+        "phase-a callback observes (completed=1, failed=0)"
+    );
+
+    // (2) on_phase_end does NOT fire for phase-b. This is THE
+    // regression-pin: pre-fix, the cascade's
+    // drain_empty_active_phases poll observed phase-b as empty
+    // post-mark-done(phase-a) and false-fired on_phase_end here.
+    let phase_b_calls: Vec<_> = recorded
+        .iter()
+        .filter(|(p, _, _)| p == "phase-b")
+        .collect();
+    assert!(
+        phase_b_calls.is_empty(),
+        "on_phase_end MUST NOT fire for phase-b: the callback-queued \
+         spawn_tasks(task-b) applies inline within the cascade, so \
+         phase-b is non-empty when drain_empty_active_phases polls. \
+         Pre-fix: phase-b false-fired on_phase_end(.., 0, 0). \
+         Got {recorded:?}"
+    );
+
+    // (3) cluster_state grew by 1 — the spawn's CRDT mutation landed
+    // inside the cascade (via apply_spawn_tasks ->
+    // apply_and_broadcast_cluster_mutations).
+    assert_eq!(
+        sec.cluster_state.task_count(),
+        initial_count + 1,
+        "task_count grew by 1: the inline-applied SpawnTasks broadcast \
+         landed during the cascade"
+    );
+
+    // (4) The spawned task is Pending in the CRDT (task-a's prereq is
+    // already InFlight at this point in the cascade — apply_spawn_tasks
+    // observes the post-cascade ledger where task-a is about to
+    // complete, but the on_item_finished hasn't broadcast TaskCompleted
+    // yet, so task-b lands Blocked-on-task-a or Pending depending on
+    // CRDT apply order). Either terminal state proves the apply
+    // path executed.
+    let state = sec
+        .cluster_state
+        .task_state(&hash_b)
+        .expect("spawned task present in CRDT ledger");
+    assert!(
+        matches!(state, TaskState::Pending { .. } | TaskState::Blocked { .. }),
+        "spawned task lands Pending or Blocked-pending-deps; got {state:?}"
+    );
+
+    // (5) The reply oneshot fired with Ok — apply_spawn_tasks succeeded
+    // (no per-index errors). Drop the Mutex guard in a tight scope
+    // BEFORE awaiting so the std::sync::Mutex isn't held across an
+    // await point (clippy::await_holding_lock).
+    let reply = {
+        let mut replies = captured_replies.lock().expect("poisoned");
+        assert_eq!(replies.len(), 1, "callback queued exactly one SpawnTasks");
+        replies.pop().expect("one reply")
+    };
+    let result = reply.await.expect("reply oneshot fires inline");
+    assert!(
+        result.as_ref().is_ok_and(|errs| errs.is_empty()),
+        "apply_spawn_tasks succeeded with no per-index errors: {result:?}"
     );
 }

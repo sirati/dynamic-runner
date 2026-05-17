@@ -137,7 +137,7 @@ where
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
-                        let restart = self.handle_worker_event(event).await?;
+                        let restart = self.handle_worker_event(event, &mut command_rx).await?;
                         if let Some(wid) = restart {
                             workers_to_restart.push(wid);
                         }
@@ -146,7 +146,7 @@ where
                 msg = self.primary_transport.recv(), if !self.primary_disconnected => {
                     match msg {
                         Some(m) => {
-                            self.dispatch_message(m).await?;
+                            self.dispatch_message(m, &mut command_rx).await?;
                         }
                         None => {
                             // Primary's transport returned None — the
@@ -275,7 +275,7 @@ where
                 }
                 peer_msg = self.peer_transport.recv_peer() => {
                     if let Some(m) = peer_msg {
-                        self.handle_peer_message(m).await;
+                        self.handle_peer_message(m, &mut command_rx).await;
                     }
                 }
                 // Announcer-outbox drain. The observer-mode
@@ -489,6 +489,7 @@ where
                             crate::secondary::command_channel::handle_secondary_command(
                                 self,
                                 command,
+                                &mut command_rx,
                             )
                             .await;
                         }

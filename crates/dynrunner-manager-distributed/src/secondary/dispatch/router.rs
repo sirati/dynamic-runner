@@ -20,8 +20,10 @@ use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::ClusterStateSnapshot;
+use crate::primary::PrimaryCommand;
 use super::super::election::ElectionState;
 use super::super::wire::{distributed_to_binary, timestamp_now};
 use super::super::SecondaryCoordinator;
@@ -35,7 +37,15 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub(in crate::secondary) async fn dispatch_message(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the TaskComplete / TaskFailed arms so a callback-
+    /// issued `spawn_tasks` applies inline. Off-loop callers pass
+    /// `&mut None`.
+    pub(in crate::secondary) async fn dispatch_message(
+        &mut self,
+        msg: DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> Result<(), String> {
         // Any message from the primary side resets the election state and
         // bumps the keepalive timestamp (F2).
         self.record_primary_message();
@@ -465,7 +475,7 @@ where
                 // own completion just re-inserts the hash that's
                 // already there.
                 self.completed_tasks.insert(task_hash.clone());
-                self.note_primary_item_completed(&task_hash);
+                self.note_primary_item_completed(&task_hash, command_rx).await;
                 Ok(())
             }
             DistributedMessage::TaskFailed {
@@ -485,7 +495,7 @@ where
                     // processing.rs); for non-Recoverable inputs
                     // this is identical to `note_primary_item_completed`
                     // (no entry added to `primary_failed`).
-                    self.note_primary_item_failed(&task_hash, &error_type);
+                    self.note_primary_item_failed(&task_hash, &error_type, command_rx).await;
                     // Drain-check is harmless even when no entry
                     // was added (no-op when ledger is empty); kept
                     // for symmetry with the other TaskFailed sites

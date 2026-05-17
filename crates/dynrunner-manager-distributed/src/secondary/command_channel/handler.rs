@@ -16,6 +16,7 @@ use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCommand;
 use crate::secondary::SecondaryCoordinator;
@@ -23,9 +24,16 @@ use crate::secondary::SecondaryCoordinator;
 /// Dispatch one received command to its secondary-side handler. Single
 /// line at the `select!` call site in `process_tasks` keeps the loop's
 /// match arm transport-shape-pure.
+///
+/// `command_rx` threads the operational-loop's command-channel receiver
+/// into the `FailPermanent` cascade so a callback-issued `spawn_tasks`
+/// fired by an `on_phase_end` running inside `apply_fail_permanent`'s
+/// recursive `note_primary_item_failed` step applies inline. Mirrors
+/// the primary-side `handle_primary_command` threading 1:1.
 pub(in crate::secondary) async fn handle_secondary_command<PT, P, M, S, E, I>(
     coordinator: &mut SecondaryCoordinator<PT, P, M, S, E, I>,
     command: PrimaryCommand<I>,
+    command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
 ) where
     PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
     P: PeerTransport<I>,
@@ -42,7 +50,7 @@ pub(in crate::secondary) async fn handle_secondary_command<PT, P, M, S, E, I>(
             reply,
         } => {
             let result = coordinator
-                .apply_fail_permanent(hash, error, reason)
+                .apply_fail_permanent(hash, error, reason, command_rx)
                 .await;
             let _ = reply.send(result);
         }

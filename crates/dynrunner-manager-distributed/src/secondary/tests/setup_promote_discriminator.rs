@@ -135,7 +135,7 @@
                     epoch: 1,
                     required_setup: true,
                 };
-                sec.dispatch_message(promote)
+                sec.dispatch_message(promote, &mut None)
                     .await
                     .expect("PromotePrimary handler succeeds");
 
@@ -238,7 +238,7 @@
                     epoch: 1,
                     required_setup: false,
                 };
-                sec.dispatch_message(promote)
+                sec.dispatch_message(promote, &mut None)
                     .await
                     .expect("PromotePrimary handler succeeds");
 
@@ -393,7 +393,7 @@
                     epoch: 1,
                     required_setup: false,
                 };
-                sec.dispatch_message(promote)
+                sec.dispatch_message(promote, &mut None)
                     .await
                     .expect("PromotePrimary handler succeeds");
 

@@ -160,7 +160,7 @@ async fn promotion_grace_suppresses_then_releases_eligibility() {
                 epoch: 1,
                 required_setup: false,
             };
-            sec.dispatch_message(promote)
+            sec.dispatch_message(promote, &mut None)
                 .await
                 .expect("PromotePrimary handler succeeds");
             assert!(sec.is_primary, "promotion flipped is_primary");
@@ -231,7 +231,7 @@ async fn partial_mirror_during_grace_blocks_spurious_fire() {
                 epoch: 1,
                 required_setup: false,
             };
-            sec.dispatch_message(promote)
+            sec.dispatch_message(promote, &mut None)
                 .await
                 .expect("PromotePrimary handler succeeds");
 

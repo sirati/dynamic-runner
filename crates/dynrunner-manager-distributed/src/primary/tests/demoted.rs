@@ -132,7 +132,7 @@ async fn demoted_primary_suppresses_taskrequest_relay_after_promotion() {
                 amount: 1024 * 1024 * 1024,
             }],
         };
-        let result = primary.dispatch_message(request).await;
+        let result = primary.dispatch_message(request, &mut None).await;
         assert!(
             result.is_ok(),
             "dispatch_message on a demoted primary must not propagate \
@@ -156,7 +156,7 @@ async fn demoted_primary_suppresses_taskrequest_relay_after_promotion() {
             ],
         };
         primary
-            .dispatch_message(run_complete)
+            .dispatch_message(run_complete, &mut None)
             .await
             .expect("ClusterMutation::RunComplete must still apply on demoted primary");
         assert!(
@@ -239,7 +239,7 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
             ],
         };
         primary
-            .dispatch_message(seed_msg)
+            .dispatch_message(seed_msg, &mut None)
             .await
             .expect("seed TaskAdded must dispatch");
 
@@ -253,7 +253,7 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
             }],
         };
         primary
-            .dispatch_message(msg)
+            .dispatch_message(msg, &mut None)
             .await
             .expect("dispatch_message must accept a ClusterMutation");
 

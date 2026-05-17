@@ -7,13 +7,23 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
+use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
 
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
 
-    pub(crate) async fn handle_task_complete(&mut self, msg: DistributedMessage<I>) {
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the cascade so a callback-issued `spawn_tasks`
+    /// applies inline before the next `drain_empty_active_phases`
+    /// poll. Pre-loop / post-loop callers pass `&mut None`.
+    pub(crate) async fn handle_task_complete(
+        &mut self,
+        msg: DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         if let DistributedMessage::TaskComplete {
             secondary_id,
             worker_id,
@@ -133,7 +143,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
             if let Some((phase, type_id, task_id)) = completed_meta {
                 self.release_type_slot(&type_id);
-                self.note_item_completed(&phase, task_id.as_deref());
+                self.note_item_completed(&phase, task_id.as_deref(), command_rx).await;
             }
 
             // Kickstart dispatch to every idle worker. After
