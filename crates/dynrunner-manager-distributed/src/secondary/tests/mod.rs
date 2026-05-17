@@ -25,6 +25,12 @@
 //!   `note_primary_item_failed`'s drain cascade (Pins the
 //!   single-process / SLURM gap reported by consumer:
 //!   `on_phase_end` was silent on the post-promotion path).
+//! - [`retry_bucket_cascade`] — promoted-secondary's per-phase
+//!   Recoverable + OOM retry-bucket cascade. Mirrors the live-
+//!   primary's `primary/tests/retry.rs` shape against the
+//!   secondary's `primary_failed` / `primary_retry_passes_used`
+//!   state via the shared core in
+//!   `primary/retry_bucket.rs::try_phase_retry_bucket_core`.
 
 #![cfg(test)]
 
@@ -39,4 +45,5 @@ mod phase_lifecycle_callback;
 mod processing;
 mod promoted_primary_quiesce_gate;
 mod r1;
+mod retry_bucket_cascade;
 mod setup_promote_discriminator;

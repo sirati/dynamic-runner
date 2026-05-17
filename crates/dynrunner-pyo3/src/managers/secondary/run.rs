@@ -41,6 +41,7 @@ impl PySecondaryCoordinator {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
+        let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let dist_primary_link_failure_threshold =
             self.distributed_config.primary_link_failure_threshold();
         let dist_primary_link_failure_window =
@@ -320,6 +321,7 @@ impl PySecondaryCoordinator {
                     peer_timeout: dist_peer_timeout,
                     keepalive_miss_threshold: dist_keepalive_miss_threshold,
                     retry_max_passes: dist_retry_max_passes,
+                    oom_retry_max_passes: dist_oom_retry_max_passes,
                     primary_link_failure_threshold: dist_primary_link_failure_threshold,
                     primary_link_failure_window: dist_primary_link_failure_window,
                     setup_deadline: dist_setup_deadline,

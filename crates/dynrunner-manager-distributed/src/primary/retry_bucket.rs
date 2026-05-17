@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, TaskInfo};
 use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
-use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
@@ -74,8 +74,24 @@ impl BucketKind {
         }
     }
 
-    /// Per-bucket budget from the coordinator config.
+    /// Per-bucket budget from the live-primary's config.
     pub(crate) fn max_passes(self, config: &PrimaryConfig) -> u32 {
+        match self {
+            BucketKind::Recoverable => config.retry_max_passes,
+            BucketKind::Oom => config.oom_retry_max_passes,
+        }
+    }
+
+    /// Per-bucket budget from the promoted-secondary's config.
+    /// Mirrors `max_passes` exactly — the secondary surfaces the
+    /// same two knobs (`retry_max_passes` /
+    /// `oom_retry_max_passes`) so the cap-resolution semantics
+    /// don't drift across the live-primary / promoted-secondary
+    /// boundary.
+    pub(crate) fn max_passes_secondary(
+        self,
+        config: &crate::secondary::SecondaryConfig,
+    ) -> u32 {
         match self {
             BucketKind::Recoverable => config.retry_max_passes,
             BucketKind::Oom => config.oom_retry_max_passes,
@@ -94,6 +110,95 @@ impl BucketKind {
 /// includes `PhaseId`, so phase A's counter is structurally
 /// independent of phase B's.
 pub(crate) type RetryPassesUsed = HashMap<(PhaseId, BucketKind), u32>;
+
+/// Pure retry-bucket primitive shared between the live-primary and
+/// the promoted-secondary's primary path. Owns ONLY the three
+/// load-bearing semantics:
+///   1. Empty `candidates` returns `false` without touching the
+///      counter (an empty bucket pass is not a "used" pass).
+///   2. Exhausted budget returns `false` and leaves the failed
+///      entries intact (the caller will fire `on_phase_end` and
+///      let the run's outcome summary surface them).
+///   3. Available budget + at least one candidate: remove each
+///      candidate from the caller's failed-store via
+///      `on_remove_from_failed`, `pool.reinject(binary)`, bump the
+///      counter BEFORE the caller's kickstart so a kickstart-side
+///      error does not burn a second pass.
+///
+/// Caller responsibilities:
+///   * Build `candidates` from its own failed-store (the primary
+///     walks `all_binaries` + `failed_tasks`; the secondary walks
+///     `primary_failed` directly because each entry carries the
+///     binary).
+///   * Drive the post-reinject kickstart of idle workers (the two
+///     paths have different worker-fan-out helpers).
+///
+/// Returns `true` iff at least one binary was reinjected — the
+/// caller uses this to skip `on_phase_end` + `mark_phase_done` for
+/// this phase (the pool just flipped `Drained → Active` via
+/// `PendingPool::reinject` and the next `poll_drain_transitions`
+/// will be empty for this phase until the freshly-active items
+/// terminate).
+pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
+    phase: &PhaseId,
+    kind: BucketKind,
+    candidates: Vec<TaskInfo<I>>,
+    pool: &mut PendingPool<I>,
+    retry_passes_used: &mut RetryPassesUsed,
+    max_passes: u32,
+    mut on_remove_from_failed: impl FnMut(&str),
+) -> bool {
+    if candidates.is_empty() {
+        // No failures of this kind for this phase. Caller moves
+        // on. We intentionally do NOT touch the counter here:
+        // an empty bucket pass is not a "used" pass — a future
+        // re-arrival of a failure (e.g. the cascade triggered
+        // by an `apply_fail_permanent` cross-cut) should still
+        // get a fresh budget if the counter was at 0.
+        return false;
+    }
+
+    let key = (phase.clone(), kind);
+    let used = retry_passes_used.get(&key).copied().unwrap_or(0);
+    if used >= max_passes {
+        // Budget exhausted. Surviving failures stay in the
+        // caller's failed-store; caller fires `on_phase_end` and
+        // the phase advances. The fail_* count in the run's
+        // outcome summary surfaces these to the operator.
+        tracing::debug!(
+            phase = %phase,
+            bucket = ?kind,
+            used,
+            cap = max_passes,
+            pending_failures = candidates.len(),
+            "per-phase retry bucket: budget exhausted; failures permanent"
+        );
+        return false;
+    }
+
+    let count = candidates.len();
+    for binary in candidates {
+        let h = compute_task_hash(&binary);
+        on_remove_from_failed(&h);
+        pool.reinject(binary);
+    }
+
+    // Bump counter BEFORE the caller's kickstart so a kickstart-
+    // side error path leaving the system in an inconsistent state
+    // does not burn a second pass on the same set of failures.
+    retry_passes_used.insert(key, used + 1);
+
+    tracing::info!(
+        phase = %phase,
+        bucket = ?kind,
+        pass = used + 1,
+        cap = max_passes,
+        count,
+        "per-phase retry bucket: re-injecting failed tasks"
+    );
+
+    true
+}
 
 impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
 where
@@ -140,11 +245,14 @@ where
         kind: BucketKind,
         _command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<bool, String> {
-        // 1. Filter binaries by (phase, kind). Walk `all_binaries`
-        //    (the run-start snapshot) and consult `failed_tasks` for
-        //    each hash. `all_binaries` is the only source of truth
-        //    for the `TaskInfo<I>` payload — `failed_tasks` is keyed
-        //    by hash and carries the latest `ErrorType` only.
+        // Build candidates from `all_binaries` (the run-start
+        // snapshot) cross-referenced against `failed_tasks` (the
+        // hash-keyed ErrorType ledger). `all_binaries` is the only
+        // source of truth for the `TaskInfo<I>` payload on the
+        // live-primary side; the secondary's mirror stores the
+        // binary inside its FailedTaskEntry instead, so the two
+        // sides have different candidate-build code paths but
+        // share the core via `try_phase_retry_bucket_core`.
         let candidates: Vec<TaskInfo<I>> = self
             .all_binaries
             .iter()
@@ -157,71 +265,31 @@ where
             })
             .cloned()
             .collect();
-        if candidates.is_empty() {
-            // No failures of this kind for this phase. Caller moves
-            // on. We intentionally do NOT touch the counter here:
-            // an empty bucket pass is not a "used" pass — a future
-            // re-arrival of a failure (e.g. the cascade triggered
-            // by an `apply_fail_permanent` cross-cut) should still
-            // get a fresh budget if the counter was at 0.
-            return Ok(false);
-        }
-
-        // 2. Per-(phase, kind) counter.
-        let key = (phase.clone(), kind);
-        let used = self.retry_passes_used.get(&key).copied().unwrap_or(0);
         let cap = kind.max_passes(&self.config);
-        if used >= cap {
-            // Budget exhausted. Surviving failures stay in
-            // `failed_tasks`; caller fires `on_phase_end` and the
-            // phase advances. The fail_* count in the run's outcome
-            // summary surfaces these to the operator.
-            tracing::debug!(
-                phase = %phase,
-                bucket = ?kind,
-                used,
+        let reinjected = {
+            let failed_tasks = &mut self.failed_tasks;
+            try_phase_retry_bucket_core(
+                phase,
+                kind,
+                candidates,
+                self.pending.as_mut().expect("pool must be initialised"),
+                &mut self.retry_passes_used,
                 cap,
-                pending_failures = candidates.len(),
-                "per-phase retry bucket: budget exhausted; failures permanent"
-            );
-            return Ok(false);
+                |h| {
+                    failed_tasks.remove(h);
+                },
+            )
+        };
+        if reinjected {
+            // Kickstart dispatch: the workers won't request a new
+            // task on their own (they already sent their last
+            // `TaskRequest` which got `nothing-to-do` because the
+            // failure hadn't been reinjected yet). Same rationale
+            // as the legacy `run_retry_passes` body — without the
+            // kickstart, reinjected binaries sit in the pool
+            // forever.
+            self.dispatch_to_idle_workers().await?;
         }
-
-        // 3. Reinject. `pool.reinject` flips Drained → Active for
-        //    this phase and drops any pending drained-notification,
-        //    so `process_phase_lifecycle`'s next
-        //    `poll_drain_transitions` returns an empty list and the
-        //    cascade exits. Control returns to the operational loop
-        //    which dispatches the freshly-reinjected items.
-        let count = candidates.len();
-        for binary in candidates {
-            let h = compute_task_hash(&binary);
-            self.failed_tasks.remove(&h);
-            self.pool_mut().reinject(binary);
-        }
-
-        // 4. Bump counter BEFORE the kickstart so a kickstart-side
-        //    error path leaving us in an inconsistent state doesn't
-        //    burn a second pass on the same set of failures.
-        self.retry_passes_used.insert(key, used + 1);
-
-        tracing::info!(
-            phase = %phase,
-            bucket = ?kind,
-            pass = used + 1,
-            cap,
-            count,
-            "per-phase retry bucket: re-injecting failed tasks"
-        );
-
-        // 5. Kickstart dispatch: the workers won't request a new
-        //    task on their own (they already sent their last
-        //    `TaskRequest` which got `nothing-to-do` because the
-        //    failure hadn't been reinjected yet). Same rationale as
-        //    the legacy `run_retry_passes` body — without the
-        //    kickstart, reinjected binaries sit in the pool forever.
-        self.dispatch_to_idle_workers().await?;
-
-        Ok(true)
+        Ok(reinjected)
     }
 }

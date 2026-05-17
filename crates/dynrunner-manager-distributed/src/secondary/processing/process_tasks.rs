@@ -368,18 +368,15 @@ where
                     // failure window has elapsed. If yes, arm
                     // failover the same way the recv-arm path does.
                     self.check_primary_link_threshold();
-                    // primary retry pass. When this node is
-                    // acting as primary and the main pass has
-                    // drained with Recoverable failures still
-                    // pending, re-inject them into `primary_pending`
-                    // and bump the pass counter (no-op for
-                    // non-promoted secondaries or when the budget
-                    // is exhausted). Runs BEFORE `repoll_idle_workers`
-                    // so re-injected items are seen by the same
-                    // tick's re-poll without waiting for the next
-                    // keepalive cycle. Mirrors the local primary's
-                    // `run_retry_passes` — see primary.rs.
-                    self.primary_drain_check_and_retry(factory).await;
+                    // Re-poll any worker that's been idle since its
+                    // last unsatisfied request. Per-phase retry
+                    // re-injection is driven inline by the cascade
+                    // inside `process_primary_phase_lifecycle`
+                    // (fires from `note_primary_item_completed`
+                    // / `note_primary_item_failed` at each phase
+                    // drain edge), so this keepalive arm no longer
+                    // needs a separate retry-pass call — only the
+                    // safety-net idle-worker re-poll remains.
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (in `primary_link`, doubles on each

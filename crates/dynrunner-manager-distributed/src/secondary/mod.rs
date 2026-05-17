@@ -306,24 +306,38 @@ where
     /// terminal at the cluster level.
     primary_failed: HashMap<String, FailedTaskEntry<I>>,
 
+    /// Per-(phase, retry-bucket) pass counter for the
+    /// promoted-secondary's primary path. Mirrors
+    /// `PrimaryCoordinator::retry_passes_used` 1:1 — the same
+    /// per-phase Recoverable + OOM partition the live primary
+    /// runs at each phase drain edge also runs on this node when
+    /// it acts as primary. The shared core lives in
+    /// [`crate::primary::retry_bucket::try_phase_retry_bucket_core`];
+    /// the candidate-build is per-side (the secondary's
+    /// `primary_failed` stores the binary on the entry, the
+    /// primary's `failed_tasks` cross-references `all_binaries`).
+    ///
+    /// Initialised empty on construction; entries appear when a
+    /// bucket runs for the first time on a given (phase, kind)
+    /// pair. The map keys include `PhaseId`, so phase A's counter
+    /// is structurally independent of phase B's.
+    primary_retry_passes_used: crate::primary::retry_bucket::RetryPassesUsed,
+
     /// Retry budget for the primary-side re-injection loop. Owns
     /// both the attempt counter (originally `retry_max_passes`) and
     /// the optional SLURM-wallclock deadline (read once at
-    /// construction from `$SLURM_JOB_END_TIME`). Consulted via
-    /// `RetryBudget::should_retry()` from `primary_drain_check_and_retry`
-    /// and the two drain-down exit predicates in `processing.rs`;
-    /// bumped via `record_attempt()` once per completed re-injection
-    /// cycle. See `retry_budget.rs` for the dual-axis design.
+    /// construction from `$SLURM_JOB_END_TIME`). Consulted by the
+    /// two drain-down exit predicates in `processing.rs` to bound
+    /// the post-disconnect wait-for-quiesce window. Per-phase
+    /// retry-bucket admission is now driven by
+    /// `primary_retry_passes_used` + `config.retry_max_passes` /
+    /// `config.oom_retry_max_passes` (mirroring the live primary);
+    /// this field's `should_retry()` axis acts purely as a SLURM-
+    /// wallclock guard so the secondary doesn't sit on a stale
+    /// `primary_failed` ledger forever after the job hits its
+    /// wall-clock deadline. See `retry_budget.rs` for the dual-
+    /// axis design.
     primary_retry_budget: retry_budget::RetryBudget,
-
-    /// One-shot guard for the budget-exhausted WARN emitted by
-    /// `primary_drain_check_and_retry`. The drain-check fires
-    /// every keepalive tick (and synchronously after every
-    /// `note_primary_item_failed`); without this flag the warning would
-    /// duplicate every tick for the rest of the run. Pure logging
-    /// hygiene — the actual failure count lives in
-    /// `primary_failed`.
-    exhaustion_warning_emitted: bool,
 
     /// Per-peer backpressure backoff for the primary path.
     /// Mirrors `PrimaryCoordinator::backpressured_secondaries` — when

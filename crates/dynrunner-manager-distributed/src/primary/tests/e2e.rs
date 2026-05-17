@@ -304,6 +304,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     peer_timeout: Duration::from_secs(120),
                     keepalive_miss_threshold: 3,
                     retry_max_passes: 1,
+                    oom_retry_max_passes: 1,
                     primary_link_failure_threshold: 5,
                     primary_link_failure_window: Duration::from_secs(30),
                     setup_deadline: Duration::from_secs(60),

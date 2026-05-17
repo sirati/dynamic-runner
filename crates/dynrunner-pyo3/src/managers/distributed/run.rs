@@ -360,6 +360,7 @@ impl PyDistributedManager {
                             peer_timeout: dist_peer_timeout,
                             keepalive_miss_threshold: dist_keepalive_miss_threshold,
                             retry_max_passes: dist_retry_max_passes,
+                            oom_retry_max_passes: dist_oom_retry_max_passes,
                             primary_link_failure_threshold:
                                 dist_primary_link_failure_threshold,
                             primary_link_failure_window:
