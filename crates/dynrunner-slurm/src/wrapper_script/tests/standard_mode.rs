@@ -239,94 +239,18 @@ fn standard_mode_script_contains_gateway() {
     assert!(script.contains("--ulimit nproc=32768:32768"));
     // Cleanup trap covers SLURM-induced signals (commit 485629c).
     assert!(script.contains("trap cleanup EXIT TERM HUP INT"));
-    // Watchdog block (commit a12f84a + #40 state-aware +
-    // graceful redesign).
-    assert!(script.contains("setsid -f bash -c"));
-    assert!(script.contains("podman teardown watchdog"));
-    // #40: state-aware polling — the watchdog must check
-    // SLURM job STATE (`squeue -o %T`), not job presence
-    // (`squeue -o %i`). Presence-polling misses the
-    // COMPLETING (CG) case where a stuck container blocks
-    // slurmctld cleanup and the job stays in queue.
-    assert!(
-        script.contains("squeue -j \"$job_id\" -h -o \"%T\""),
-        "watchdog must poll job state via -o %T, not presence \
-         via -o %i; render did not contain the state probe"
-    );
-    assert!(
-        script.contains("\"$state\" = \"RUNNING\""),
-        "watchdog must treat RUNNING as the only \"keep going\" \
-         state; render did not contain the state comparison"
-    );
-    // Debounce: two consecutive non-running observations.
-    // Single observation is not sufficient — slurmctld can
-    // emit transient state inconsistencies during RPC stalls.
-    assert!(
-        script.contains("state_threshold=2"),
-        "watchdog must declare state_threshold=2 (debounce \
-         count); render did not contain it"
-    );
-    assert!(
-        script.contains("nonrunning_count=$((nonrunning_count + 1))"),
-        "watchdog must increment nonrunning_count on each \
-         non-running observation, NOT trigger immediately; \
-         render did not contain the increment"
-    );
-    // Graceful teardown: SIGTERM then 60s grace then SIGKILL.
-    // SIGTERM gives the dispatcher a chance to flush
-    // in-flight task state before the container dies.
-    assert!(
-        script.contains("grace_seconds=60"),
-        "watchdog must declare grace_seconds=60 (SIGTERM grace \
-         before SIGKILL); render did not contain it"
-    );
-    assert!(
-        script.contains("--signal TERM"),
-        "watchdog must send SIGTERM first; render did not \
-         contain the TERM signal"
-    );
-    assert!(
-        script.contains("--signal KILL"),
-        "watchdog must escalate to SIGKILL after grace expires; \
-         render did not contain the KILL signal"
-    );
-    // Log line: operators grep "WATCHDOG:" to attribute
-    // container teardown post-hoc. Pin the SIGTERM-trigger
-    // and the SIGKILL-escalation log lines.
-    assert!(
-        script.contains("WATCHDOG: job $job_id state="),
-        "watchdog must log the SIGTERM trigger with the \
-         observed job state; render did not contain the log"
-    );
-    assert!(
-        script.contains("did not exit within ${grace_seconds}s of SIGTERM"),
-        "watchdog must log SIGKILL escalation when grace \
-         expires; render did not contain the escalation log"
-    );
-    // Spawn-confirmation echo surfaces the watchdog tunables
-    // so operators see them without reading the bash.
-    assert!(
-        script.contains("poll=5s debounce=2 grace=60s"),
-        "spawn-confirmation echo must surface the watchdog \
-         tunables; render did not contain them"
-    );
-    // The watchdog must NEVER issue `podman rm`. The
-    // container is started with `podman run --rm`, so a
-    // clean exit auto-removes; `rm -f` would be both
-    // redundant and a force-escalation that masks
-    // runtime/kernel issues. Anchor by the watchdog's
-    // bash-arg variable `"$cname"` which the wrapper's
-    // other `podman` calls (run, kill) reference too — so
-    // we are specifically pinning that the kill ladder
-    // does not append a `podman rm` step.
-    assert!(
-        !script.contains("podman --root \"$storage\" --runroot \"$runroot\" rm"),
-        "watchdog must NOT issue `podman rm` — container is \
-         started with --rm; rm -f would be force-escalation \
-         that masks runtime/kernel issues. Render contained \
-         a `podman rm` call against $storage/$runroot which \
-         must be removed."
-    );
+    // The pre-2026-05 inline `setsid -f bash` watchdog has been
+    // removed; teardown is now owned by the out-of-cgroup
+    // `dynrunner-slurm-shutdown` binary spawned via
+    // `systemd-run --user --scope` when the caller plumbs
+    // `WrapperScriptConfig::shutdown_manager_bin_path`. See
+    // `wrapper_script::tests::shutdown_manager` for the
+    // positive assertions on the new shape; the negative
+    // assertions (watchdog must not reappear) live in
+    // `no_watchdog_block_present`. The baseline `standard_cfg`
+    // helper renders with `shutdown_manager_bin_path=None` so
+    // this end-to-end test deliberately exercises the
+    // CMD_RELAY-only cleanup variant.
     // Memory-cap block: both probes (NodeRAM + wrapper cgroup
     // memory.max) must be present so the min() logic engages on
     // any cluster where SLURM imposes a per-job cap tighter than
