@@ -125,6 +125,7 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
     forwarded_argv: Vec<String>,
     reverse_connection: bool,
     run_log_dir: String,
+    shutdown_manager_bin_path: Option<String>,
 ) -> WrapperScriptGenerator {
     Arc::new(move |spec: &SecondarySpawnSpec| -> Result<String, String> {
         // Append the primary's cert PEM to forwarded_argv so the
@@ -155,6 +156,10 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
             kwargs.set_item("forwarded_argv", argv)?;
             kwargs.set_item("reverse_connection", reverse_connection)?;
             kwargs.set_item("run_log_dir", &run_log_dir)?;
+            kwargs.set_item(
+                "shutdown_manager_bin_path",
+                shutdown_manager_bin_path.as_deref(),
+            )?;
             let script = py_job_manager
                 .bind(py)
                 .call_method("generate_wrapper_script", (), Some(&kwargs))?
@@ -223,6 +228,7 @@ mod tests {
             vec!["--source".to_owned(), "/src".to_owned()],
             true,
             "/log/run-1".to_owned(),
+            None,
         );
 
         let spec = SecondarySpawnSpec {
@@ -311,6 +317,7 @@ mod tests {
             vec!["--source".to_owned()],
             true,
             "/log/run-1".to_owned(),
+            None,
         );
 
         let spec = SecondarySpawnSpec {

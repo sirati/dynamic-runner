@@ -11,6 +11,8 @@
 //! `python/dynamic_runner/packaging/job_manager.py` is the only
 //! caller; it preserves the public Python signature for back-compat.
 
+use std::path::Path;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -64,6 +66,7 @@ fn build_slurm_config(root_folder: &str) -> SlurmConfig {
     reverse_connection = false,
     connection_info_dir = None,
     is_observer = false,
+    shutdown_manager_bin_path = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn generate_wrapper_script(
@@ -88,6 +91,7 @@ pub fn generate_wrapper_script(
     reverse_connection: bool,
     connection_info_dir: Option<&str>,
     is_observer: bool,
+    shutdown_manager_bin_path: Option<&str>,
 ) -> PyResult<String> {
     let slurm_config = build_slurm_config(root_folder);
 
@@ -120,6 +124,15 @@ pub fn generate_wrapper_script(
         }
     };
 
+    // Resolve the shutdown-manager binary path the wrapper renderer
+    // expects (`Option<&Path>`) from the kwarg's string shape. The
+    // Python side passes the value the Rust job-manager recorded after
+    // `upload_shutdown_manager_binary` ran; `None` means the upload
+    // step was skipped (env var unset) and the rendered wrapper omits
+    // the systemd-run spawn block entirely (legacy CMD_RELAY-only
+    // teardown — no /tmp cleanup on SLURM-induced termination).
+    let shutdown_manager_bin_path = shutdown_manager_bin_path.map(Path::new);
+
     let cfg = WrapperScriptConfig {
         slurm_config: &slurm_config,
         image_path,
@@ -139,16 +152,7 @@ pub fn generate_wrapper_script(
         extra_run_args: &extra_run_args,
         forwarded_argv: &forwarded_argv,
         is_observer,
-        // TODO(dispatcher-integration): plumb the resolved
-        // `dynrunner-slurm-shutdown` binary path from the Python
-        // dispatcher (e.g. via a new kwarg on
-        // `SlurmJobManager.generate_wrapper_script`). When this is
-        // `None` the rendered wrapper has NO /tmp cleanup on
-        // SLURM-induced termination — the out-of-cgroup shutdown
-        // manager owns that responsibility now. The pre-2026-05
-        // inline watchdog was removed because it never worked
-        // (signalled bash pid 1, lived in the slurmd cgroup).
-        shutdown_manager_bin_path: None,
+        shutdown_manager_bin_path,
     };
     Ok(rust_generate_wrapper_script(&cfg))
 }

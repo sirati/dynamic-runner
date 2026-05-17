@@ -52,6 +52,18 @@ pub struct SlurmJobManager<G: Gateway> {
     pub config: SlurmConfig,
     pub(super) gateway: G,
     pub(super) job_ids: Vec<String>,
+    /// Remote (gateway-side) absolute path of the uploaded
+    /// `dynrunner-slurm-shutdown` binary, or `None` if the upload was
+    /// skipped (env var unset; see
+    /// [`SlurmJobManager::upload_shutdown_manager_binary`]).
+    ///
+    /// Populated once during preparation by
+    /// `upload_shutdown_manager_binary`; subsequent wrapper-script
+    /// renders (initial cohort + respawn) read it via
+    /// [`SlurmJobManager::shutdown_manager_remote_path`] so the
+    /// uploaded binary is referenced by the same path every secondary
+    /// the run produces uses.
+    pub(super) shutdown_manager_remote_path: Option<String>,
 }
 
 
@@ -63,5 +75,17 @@ pub enum SlurmError {
     Command(String),
     #[error("packaging error: {0}")]
     Packaging(#[from] PackagingError),
+    /// Local-source path supplied by
+    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` did not exist on the
+    /// dispatcher filesystem. The upload step surfaces this as a hard
+    /// error rather than silently skipping: the operator set the env
+    /// var, so they meant for the binary to deploy, and the only
+    /// failure modes are misconfiguration (wrong path) or a build that
+    /// did not produce the expected output (broken consumer flake).
+    /// Both deserve loud surfacing at dispatch time, not a silent
+    /// "orphan cleanup disabled" warning that surfaces only after the
+    /// first stuck container.
+    #[error("shutdown-manager source binary not found: {0}")]
+    ShutdownBinaryNotFound(std::path::PathBuf),
 }
 

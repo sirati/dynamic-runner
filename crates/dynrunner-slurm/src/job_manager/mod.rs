@@ -14,13 +14,20 @@
 //!   upload source binaries) that delegate to [`PodmanPackaging`].
 //! - [`lifecycle`] — SLURM-specific methods (prepare directories,
 //!   submit / cancel / status).
+//! - [`shutdown_binary`] — staging primitive for the
+//!   `dynrunner-slurm-shutdown` musl-static binary (uploaded to the
+//!   gateway alongside the per-job wrapper scripts so out-of-cgroup
+//!   orphan-container cleanup survives `/nix/store` not being shared
+//!   between dispatcher and compute node).
 //! - [`tests`] — module-internal tests.
 
 mod images;
 mod lifecycle;
 mod manager;
+mod shutdown_binary;
 #[cfg(test)]
 mod tests;
 mod types;
 
+pub use shutdown_binary::{SHUTDOWN_BIN_REMOTE_BASENAME, SHUTDOWN_BIN_SOURCE_ENV};
 pub use types::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};

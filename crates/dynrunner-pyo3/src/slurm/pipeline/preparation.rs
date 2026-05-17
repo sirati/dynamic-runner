@@ -46,6 +46,14 @@ pub(super) struct PreparationOutcome {
     /// Run-scoped log dir. The per-respawn `submit_job` call uses it
     /// for the regenerated `--output=`/`--error=` paths.
     pub(super) run_log_dir: String,
+    /// Gateway-side path of the uploaded `dynrunner-slurm-shutdown`
+    /// binary, or `None` when the upload step was skipped (env var
+    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` unset). Captured here so
+    /// the per-respawn wrapper-script generator closure threads the
+    /// same path the initial cohort received into every respawned
+    /// secondary's wrapper, without re-reading the env var or
+    /// re-uploading the binary.
+    pub(super) shutdown_manager_remote_path: Option<String>,
 }
 
 /// Drive the SLURM preparation steps in order, directly from the
@@ -96,6 +104,21 @@ pub(super) fn run_preparation<'py>(
     // / log roots) — delegated to the Rust job_manager.
     job_manager.call_method0("prepare_directories")?;
     gateway.call_method1("create_directory", (&run_log_dir,))?;
+
+    // Stage the `dynrunner-slurm-shutdown` musl-static binary on the
+    // gateway so per-job wrapper scripts can spawn it via
+    // `systemd-run --user --scope` and have it survive cgroup
+    // teardown. The upload step reads the local source path from
+    // `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` (set by the consumer's
+    // nix flake); unset → warn-and-skip, set-but-missing → error.
+    // The resolved gateway-side path is stored on the Rust manager
+    // and surfaced via the `shutdown_manager_remote_path` getter so
+    // every wrapper render in this run (initial cohort + respawn)
+    // sees the same path without re-reading the env var or
+    // re-uploading the binary.
+    let shutdown_manager_remote_path: Option<String> = job_manager
+        .call_method0("upload_shutdown_manager_binary")?
+        .extract()?;
 
     // Image build + transfer, or skip-build path. Mirrors the legacy
     // `_prepare_docker_images` helper: both paths produce a
@@ -190,6 +213,10 @@ pub(super) fn run_preparation<'py>(
         wrapper_kwargs.set_item("forwarded_argv", forwarded_argv.to_vec())?;
         wrapper_kwargs.set_item("reverse_connection", use_reverse_connection)?;
         wrapper_kwargs.set_item("run_log_dir", &run_log_dir)?;
+        wrapper_kwargs.set_item(
+            "shutdown_manager_bin_path",
+            shutdown_manager_remote_path.as_deref(),
+        )?;
         let wrapper =
             job_manager.call_method("generate_wrapper_script", (), Some(&wrapper_kwargs))?;
 
@@ -292,6 +319,7 @@ pub(super) fn run_preparation<'py>(
             image_metadata: Some(image_metadata.clone().unbind()),
             gateway_host: gateway_host.clone(),
             run_log_dir: run_log_dir.clone(),
+            shutdown_manager_remote_path: shutdown_manager_remote_path.clone(),
         },
         tunnel_manager_handle,
     ))
