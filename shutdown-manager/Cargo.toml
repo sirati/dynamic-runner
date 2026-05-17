@@ -1,0 +1,43 @@
+[package]
+name = "dynrunner-slurm-shutdown"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone musl-static binary that tears down the rootless-podman container of a SLURM job after the job exits, from a systemd-user-scope cgroup that outlives proctrack."
+license = "Apache-2.0"
+repository = "https://github.com/sirati/dynamic-runner"
+
+# Intentionally NOT a member of the parent Cargo workspace at the repo root.
+# This binary is fixed infrastructure: it depends on no framework types and
+# should not rebuild whenever the framework workspace changes.
+[workspace]
+
+[[bin]]
+name = "dynrunner-slurm-shutdown"
+path = "src/main.rs"
+
+[lib]
+name = "dynrunner_slurm_shutdown"
+path = "src/lib.rs"
+
+[dependencies]
+# Single signal-safe atomic-flag dependency. Default features disabled to
+# avoid pulling in optional integrations (channel, iterator, extended-siginfo).
+# We only need low_level::register.
+signal-hook = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+# Cross-platform temp dir for filesystem cleanup tests. Tiny crate, no proc-macros.
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+strip = true
+codegen-units = 1
+overflow-checks = false
+debug = false
+incremental = false
+
+[profile.release.package."*"]
+opt-level = "z"
