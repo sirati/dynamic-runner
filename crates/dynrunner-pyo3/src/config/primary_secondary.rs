@@ -314,6 +314,11 @@ impl PySecondaryConfig {
             // Rust crate directly; surfacing through the Python CLI
             // is queued behind operator demand.
             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
+            // Plumbed through the PyO3 constructor as a kwarg on
+            // `PySecondaryCoordinator` (defaulting to None / unbounded).
+            // `PySecondaryConfig` does not currently surface this knob
+            // — the live secondary-construction sites set it directly.
+            unfulfillable_reinject_max_per_task: None,
         }
     }
 }

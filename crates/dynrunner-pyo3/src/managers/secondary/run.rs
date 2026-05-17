@@ -64,6 +64,17 @@ impl PySecondaryCoordinator {
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
 
+        // Snapshot the cap, flip `run_started`, and consume the
+        // command-channel receiver for the detached runtime in one
+        // step. The helper owns the single-shot guard and the
+        // snapshot ordering; the sender clone returned in `wiring`
+        // keeps backing future `handle()` calls. Mirrors
+        // `PyPrimaryCoordinator::run` and `PyDistributedManager::run`.
+        let wiring = self.control_plane.take_for_run()?;
+        let unfulfillable_reinject_max_per_task = wiring.cap_snapshot;
+        let command_tx = wiring.command_tx;
+        let command_rx = wiring.command_rx;
+
         // Setup-promote yield captures: cloned here so the `py.detach`
         // closure (which runs without the GIL) owns its own handles
         // without borrowing `self`. `task_definition_py` /
@@ -314,6 +325,7 @@ impl PySecondaryCoordinator {
                     resource_check_interval: dist_resource_check_interval,
                     log_oom_watcher: dist_log_oom_watcher,
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
+                    unfulfillable_reinject_max_per_task,
                 };
 
                 let mut factory = SubprocessWorkerFactory {
@@ -338,6 +350,13 @@ impl PySecondaryCoordinator {
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
+
+                // Swap in the Python-facing command channel so the
+                // `PrimaryHandle` Python is holding talks to the same
+                // receiver this secondary's `process_tasks` loop
+                // reads from. Same pre-run contract as
+                // `PyPrimaryCoordinator`.
+                secondary.replace_command_channel(command_tx, command_rx);
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE `run_until_setup_or_done` enters — the

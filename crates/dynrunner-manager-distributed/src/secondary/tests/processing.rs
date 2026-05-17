@@ -180,6 +180,7 @@ async fn secondary_with_real_workers_processes_tasks() {
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
             };
 
             let binaries = vec![
@@ -246,6 +247,7 @@ async fn secondary_multi_worker_processes_tasks() {
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..6)
@@ -318,6 +320,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..15)
@@ -416,6 +419,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
+                unfulfillable_reinject_max_per_task: None,
             };
 
             let secondary_id_clone = config.secondary_id.clone();

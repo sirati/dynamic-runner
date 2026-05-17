@@ -37,6 +37,7 @@ use crate::zip_extract::ExtractionCache;
 
 use self::primary_link::PrimaryLink;
 
+mod command_channel;
 mod coordinator;
 mod dispatch;
 mod election;
@@ -595,4 +596,48 @@ where
     /// semantics as `on_phase_end`.
     pub(super) on_phase_start:
         Option<crate::primary::OnPhaseStart>,
+
+    /// Cross-thread / cross-runtime ingress for the
+    /// `PrimaryHandle` PyO3 surface (when the handle was minted from
+    /// a `PySecondaryCoordinator`). Each handler is co-located with
+    /// the coordinator's per-mutation semantics under
+    /// `secondary/primary/{fail_permanent,reinject_task,
+    /// update_preferred_secondaries,spawn_tasks}.rs`; the receiver is
+    /// read inside `process_tasks`' `select!` arm and the sender is
+    /// cloned out via `command_sender()` before
+    /// `run_until_setup_or_done` enters.
+    ///
+    /// Mirrors the `command_rx` / `command_tx` pair on
+    /// `PrimaryCoordinator`. Held as `Option` so the operational loop
+    /// can take the receiver out for the duration of the
+    /// select-driven phase (Rust's borrow checker won't let us hold a
+    /// `&mut Receiver` inside the same `&mut self` that the per-arm
+    /// handlers need) and put it back when the loop exits. Outside
+    /// the loop, the option is `Some` so cloned senders keep working
+    /// across `SetupPending` re-entries.
+    pub(super) command_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
+
+    /// Sender side of the secondary's command channel, cloned to
+    /// consumers via `command_sender()`. Stored on `Self` so the
+    /// lifetime is tied to the coordinator — when the coordinator is
+    /// dropped, all cloned senders return `SendError` on subsequent
+    /// `send()` calls and the PyO3 side surfaces that as a Python
+    /// exception.
+    pub(super) command_tx:
+        tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
+
+    /// Per-task reinject counter, paired with
+    /// `SecondaryConfig::unfulfillable_reinject_max_per_task`. Lazily
+    /// initialised on first reinject for a hash; counts DOWN from the
+    /// configured cap (so 0 means "exhausted, refuse"). The map is
+    /// keyed by task hash, not task_id, because external-control
+    /// callers use the hash as the canonical identifier (mirroring the
+    /// rest of the wire protocol).
+    ///
+    /// Independent of the primary's same-name counter: at promotion
+    /// the freshly-promoted secondary starts with a fresh `HashMap`,
+    /// so the budget effectively resets across the demotion boundary.
+    /// Documented in `secondary/primary/reinject_task.rs`.
+    pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
 }

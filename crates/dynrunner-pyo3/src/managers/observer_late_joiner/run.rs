@@ -194,6 +194,11 @@ impl PyObserverLateJoiner {
                     resource_check_interval: std::time::Duration::from_millis(100),
                     log_oom_watcher: false,
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
+                    // Observers never promote (the election filter +
+                    // setup-promote dispatch reject keep them off the
+                    // primary path), so the cap is structurally inert
+                    // — leave at the default `None` (unbounded).
+                    unfulfillable_reinject_max_per_task: None,
                 };
 
                 // No-op factory: the run loop's only `factory`

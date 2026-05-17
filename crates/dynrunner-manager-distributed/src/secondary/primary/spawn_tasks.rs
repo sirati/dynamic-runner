@@ -62,16 +62,15 @@ where
     /// runtime emits ONE `TasksSpawned` mutation, not 100. Idempotent
     /// under repetition by the CRDT's apply-time dedupe.
     ///
-    /// `#[allow(dead_code)]`: the production caller is the
-    /// secondary-side `PrimaryCommand::SpawnTasks` arm — that wiring
-    /// lands in the PyO3 follow-up that mints a secondary-bound
-    /// `PrimaryHandle`. The method is reachable today via the
-    /// `phase_lifecycle_callback` regression tests (which validate
-    /// the Rust-side contract independently of the PyO3 bridge); the
-    /// dead-code lint fires on non-test compilation units until the
-    /// production wiring lands.
-    #[allow(dead_code)]
-    pub(crate) async fn apply_spawn_tasks(
+    /// Production caller: the secondary-side
+    /// `PrimaryCommand::SpawnTasks` arm in
+    /// `secondary/command_channel/handler.rs`, dispatched from the
+    /// `command_rx` `select!` arm in `process_tasks` when a
+    /// `PySecondaryCoordinator`-minted `PyPrimaryHandle` issues
+    /// `spawn_tasks(...)` from inside a Python `on_phase_end`
+    /// callback. The `phase_lifecycle_callback` regression tests
+    /// pin the Rust-side contract independently of the PyO3 bridge.
+    pub(in crate::secondary) async fn apply_spawn_tasks(
         &mut self,
         tasks: Vec<TaskInfo<I>>,
     ) -> Result<Vec<(usize, SpawnError)>, String> {

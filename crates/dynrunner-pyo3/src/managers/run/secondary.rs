@@ -92,15 +92,30 @@ pub(crate) fn run_secondary<'py>(
     );
     let coord = cls.call(args, Some(&kwargs))?;
 
-    // Phase 5B: fire `on_run_start` synchronously under the GIL before
-    // entering the secondary's coordination loop. The secondary owns
-    // the source/output dirs and `task_args`; failure aborts the run
-    // (consumer setup hasn't completed; dispatching would race
-    // half-built resources). The secondary holds no `PrimaryHandle`
-    // (the handle is the primary's coordinator surface), so the
-    // bridge call goes through the positional-only path; legacy and
-    // modern task signatures both accept it.
-    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args, None)?;
+    // Phase 5B: fire `on_run_start` synchronously under the GIL
+    // before entering the secondary's coordination loop. The
+    // secondary owns the source/output dirs and `task_args`; failure
+    // aborts the run (consumer setup hasn't completed; dispatching
+    // would race half-built resources).
+    //
+    // Pre-run handle factory: the secondary mints its own
+    // command-channel pair at `__init__` (mirroring
+    // `PyPrimaryCoordinator`), so we fetch a `PrimaryHandle` BEFORE
+    // blocking on `run()`. Modern tasks can drive
+    // `primary_handle.spawn_tasks(...)` from inside their
+    // `on_run_start` / `on_phase_end` hooks; the commands dispatch
+    // against THIS secondary's `command_rx`, so post-promotion the
+    // calls land on the promoted-secondary's `primary_pending` pool.
+    // Legacy positional-only `on_run_start` signatures fall back via
+    // the TypeError-retry path inside `fire_on_run_start`.
+    let primary_handle = coord.call_method0("handle")?.unbind();
+    fire_on_run_start(
+        task_definition,
+        &source_dir,
+        &output_dir,
+        task_args,
+        Some(primary_handle),
+    )?;
 
     let run_outcome = coord.call_method0("run");
 

@@ -362,6 +362,16 @@ impl PyDistributedManager {
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
                             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
+                            // In-process distributed manager: see
+                            // `secondary/primary/reinject_task.rs` for the
+                            // budget-reset-at-promotion semantics. The
+                            // in-process primary holds the same cap on
+                            // the shared `control_plane`; the spawned
+                            // in-process secondaries inherit the same
+                            // configured value so an externally-issued
+                            // `reinject_task` post-promotion honours the
+                            // operator's knob symmetrically.
+                            unfulfillable_reinject_max_per_task,
                         };
 
                         let estimator = sec_estimator;
