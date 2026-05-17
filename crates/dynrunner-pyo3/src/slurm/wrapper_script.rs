@@ -128,11 +128,13 @@ pub fn generate_wrapper_script(
 
     // Resolve the shutdown-manager binary path the wrapper renderer
     // expects (`Option<&Path>`) from the kwarg's string shape. The
-    // Python side passes the value the Rust job-manager recorded after
-    // `upload_shutdown_manager_binary` ran; `None` means the upload
-    // step was skipped (env var unset) and the rendered wrapper omits
-    // the systemd-run spawn block entirely (legacy CMD_RELAY-only
-    // teardown — no /tmp cleanup on SLURM-induced termination).
+    // Python side passes the value the Rust job-manager recorded
+    // after `upload_shutdown_manager_binary_from` ran. In production
+    // the SLURM dispatch path always populates this (the Python
+    // bridge raises on missing source binary rather than skipping);
+    // the `None` branch exists for renderer-internal unit tests and
+    // back-compat callers that do not exercise the SLURM dispatch
+    // path.
     let shutdown_manager_bin_path = shutdown_manager_bin_path.map(Path::new);
 
     let cfg = WrapperScriptConfig {

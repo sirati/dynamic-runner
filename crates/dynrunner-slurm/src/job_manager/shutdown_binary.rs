@@ -16,14 +16,16 @@
 //! guarantees the wrapper finds the binary regardless of nix-store
 //! sharing.
 //!
-//! Why an env var (`DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`) for the
-//! source path: the consumer's `flake.nix` builds the
-//! `shutdown-manager` subproject and pipes the
-//! `result/bin/dynrunner-slurm-shutdown` path into the dispatcher's
-//! env. The framework reads it here. No build-time coupling between
-//! the framework crate and the shutdown-manager crate (they live in
-//! the same repo but are intentionally NOT in the same Cargo
-//! workspace — see workspace `exclude = ["shutdown-manager"]`).
+//! Source-path resolution lives one layer up, in the Python bridge
+//! (``dynamic_runner._shutdown_manager.bundled_binary_path``):
+//! env-var override (``DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE``) >
+//! wheel-bundled artifact under ``dynamic_runner/_shutdown_manager/``.
+//! This Rust primitive takes the already-resolved local path and
+//! performs only the upload + chmod + path-record mechanics. Keeping
+//! the resolution policy on the Python side lets the framework wheel
+//! ship the binary as bundled data (the nix-wheel postInstall copies
+//! it into the site-packages tree) without coupling the Rust crate
+//! to ``importlib.resources``.
 
 use std::path::PathBuf;
 
@@ -32,35 +34,21 @@ use tracing;
 
 use super::types::{SlurmError, SlurmJobManager};
 
-/// Environment variable the dispatcher consults for the local
-/// (head-node-side) path to the built `dynrunner-slurm-shutdown`
-/// binary. Set by the consumer's nix flake (`result/bin/dynrunner-
-/// slurm-shutdown`); unset means "skip the upload — orphan-container
-/// cleanup is disabled for this run".
-pub const SHUTDOWN_BIN_SOURCE_ENV: &str = "DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE";
-
 /// Basename of the binary on the gateway. Lives alongside
 /// `job_<name>.sh` under `root_folder`.
 pub const SHUTDOWN_BIN_REMOTE_BASENAME: &str = "dynrunner-slurm-shutdown";
 
 impl<G: Gateway> SlurmJobManager<G> {
-    /// Stage the `dynrunner-slurm-shutdown` binary on the gateway.
+    /// Stage the `dynrunner-slurm-shutdown` binary on the gateway,
+    /// reading it from the caller-supplied local source path.
     ///
-    /// Reads the local source path from
-    /// [`SHUTDOWN_BIN_SOURCE_ENV`]. On the unset path: logs a warning
-    /// and returns `Ok(None)` so callers continue without orphan
-    /// cleanup (the warning surfaces the missing integration to
-    /// operators; the run still proceeds because the cleanup feature
-    /// is an opt-in production integration, not a correctness
-    /// prerequisite).
+    /// Behaviour:
     ///
-    /// On the set path:
-    ///
-    /// * Verifies the local file exists. A misconfigured env var or a
-    ///   broken consumer flake surfaces as
-    ///   [`SlurmError::ShutdownBinaryNotFound`] rather than a silent
-    ///   skip — the operator opted into the feature, so a failure
-    ///   deserves loud surfacing at dispatch time.
+    /// * Verifies the local file exists. A path that does not point
+    ///   at a real file surfaces as
+    ///   [`SlurmError::ShutdownBinaryNotFound`] — the caller already
+    ///   decided this is the binary to deploy, so a missing source
+    ///   deserves a hard failure rather than a silent skip.
     /// * Transfers the binary to
     ///   `<root_folder>/dynrunner-slurm-shutdown` via the gateway's
     ///   `transfer_file` primitive (same path the per-job wrapper
@@ -74,35 +62,23 @@ impl<G: Gateway> SlurmJobManager<G> {
     ///   renders (both initial cohort and respawn) read it back via
     ///   [`SlurmJobManager::shutdown_manager_remote_path`].
     ///
-    /// Returns the resolved remote path on success, or `None` when
-    /// the env var was unset.
+    /// Returns the resolved remote path on success. There is no
+    /// "skip" branch: the previous opt-in env-var model silently
+    /// disabled orphan-container cleanup whenever the var was unset,
+    /// which is exactly the failure mode this binary was built to
+    /// prevent. Source resolution (env-var override vs wheel-bundled
+    /// artifact) is the Python bridge's concern; this primitive only
+    /// uploads what it was given.
     ///
     /// Idempotency: this is a write-once per `SlurmJobManager`
     /// lifetime. Calling twice re-uploads the same artifact — same
     /// shape as the image-transfer and source-binary upload paths
     /// (neither has a "skip if exists" short-circuit; that's a
     /// gateway-layer concern, not a manager-layer concern).
-    pub async fn upload_shutdown_manager_binary(
+    pub async fn upload_shutdown_manager_binary_from(
         &mut self,
-    ) -> Result<Option<String>, SlurmError> {
-        let local = match std::env::var(SHUTDOWN_BIN_SOURCE_ENV) {
-            Ok(s) if !s.is_empty() => PathBuf::from(s),
-            _ => {
-                // Env var unset OR explicitly empty. Treat both as
-                // "operator did not opt into the feature" and continue
-                // without orphan cleanup. The warning surfaces the
-                // missing integration so an operator who DID intend
-                // to enable it sees the gap.
-                tracing::warn!(
-                    env_var = SHUTDOWN_BIN_SOURCE_ENV,
-                    "{SHUTDOWN_BIN_SOURCE_ENV} not set; orphan-container cleanup \
-                     disabled for this run"
-                );
-                self.shutdown_manager_remote_path = None;
-                return Ok(None);
-            }
-        };
-
+        local: PathBuf,
+    ) -> Result<String, SlurmError> {
         if !local.exists() {
             return Err(SlurmError::ShutdownBinaryNotFound(local));
         }
@@ -142,6 +118,6 @@ impl<G: Gateway> SlurmJobManager<G> {
         );
 
         self.shutdown_manager_remote_path = Some(remote_path.clone());
-        Ok(Some(remote_path))
+        Ok(remote_path)
     }
 }

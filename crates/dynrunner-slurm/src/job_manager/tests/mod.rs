@@ -4,10 +4,10 @@
 //!   regression tests (one big flat file, kept verbatim to avoid
 //!   semantic drift during the directory split).
 //! - [`shutdown_binary`] — exercises
-//!   [`SlurmJobManager::upload_shutdown_manager_binary`] across the
-//!   three documented branches (env var unset → skip; set + missing
-//!   → error; set + present → transfer_file + chmod 755 + remote
-//!   path recorded on the manager).
+//!   [`SlurmJobManager::upload_shutdown_manager_binary_from`] across
+//!   its two documented branches (missing source → error; present
+//!   source → transfer_file + chmod 755 + remote path recorded on
+//!   the manager) plus the manager → wrapper-renderer wiring.
 
 mod legacy;
 mod shutdown_binary;

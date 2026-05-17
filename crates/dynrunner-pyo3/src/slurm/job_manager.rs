@@ -241,23 +241,31 @@ impl PyRustSlurmJobManager {
     /// wrapper-script renders pick it up via
     /// `shutdown_manager_remote_path`).
     ///
-    /// Reads the local source path from
-    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`. Unset → warn-and-return
-    /// `None`; set-but-missing → raises a Python `RuntimeError` so
-    /// the misconfigured dispatch surfaces loudly rather than
-    /// silently disabling orphan-container cleanup.
+    /// Takes the already-resolved local source path. Source-path
+    /// resolution (env-var override
+    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` > wheel-bundled
+    /// artifact under `dynamic_runner/_shutdown_manager/`) lives in
+    /// the Python bridge (`dynamic_runner._shutdown_manager.
+    /// bundled_binary_path`); the Rust side reads no process state.
+    /// Missing source → raises a Python `RuntimeError` (via
+    /// `SlurmError::ShutdownBinaryNotFound`) so misconfigured
+    /// dispatch surfaces loudly.
     ///
-    /// Single-concern delegate: `SlurmJobManager::upload_shutdown_manager_binary`
+    /// Single-concern delegate: `SlurmJobManager::upload_shutdown_manager_binary_from`
     /// in `dynrunner-slurm/src/job_manager/shutdown_binary.rs` owns
     /// the upload mechanics; this method is the GIL-release +
     /// tokio-runtime wrapper.
-    fn upload_shutdown_manager_binary(&self, py: Python<'_>) -> PyResult<Option<String>> {
+    fn upload_shutdown_manager_binary_from(
+        &self,
+        py: Python<'_>,
+        local: String,
+    ) -> PyResult<String> {
         let inner = self.inner.clone();
         py.detach(|| {
             block_on_local(async move {
                 lock_manager(&inner)
                     .await
-                    .upload_shutdown_manager_binary()
+                    .upload_shutdown_manager_binary_from(std::path::PathBuf::from(local))
                     .await
                     .map_err(slurm_err_to_py)
             })
@@ -265,14 +273,15 @@ impl PyRustSlurmJobManager {
     }
 
     /// Read the gateway-side path of the previously-uploaded
-    /// shutdown-manager binary. Returns `None` when
-    /// `upload_shutdown_manager_binary` was skipped (env var unset)
-    /// or has not been invoked yet on this manager.
+    /// shutdown-manager binary. Returns `None` only when
+    /// `upload_shutdown_manager_binary_from` has not yet been
+    /// invoked on this manager — a successful upload always records
+    /// a path (the upload step raises on missing source rather than
+    /// skipping silently).
     ///
     /// Exposed so the Python preparation step can thread the resolved
     /// path into every per-secondary `generate_wrapper_script` kwarg
-    /// (including the respawn path) without re-reading the env var or
-    /// re-uploading the binary.
+    /// (including the respawn path) without re-uploading the binary.
     #[getter]
     fn shutdown_manager_remote_path(&self, py: Python<'_>) -> PyResult<Option<String>> {
         let inner = self.inner.clone();

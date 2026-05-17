@@ -47,11 +47,14 @@ pub(super) struct PreparationOutcome {
     /// for the regenerated `--output=`/`--error=` paths.
     pub(super) run_log_dir: String,
     /// Gateway-side path of the uploaded `dynrunner-slurm-shutdown`
-    /// binary, or `None` when the upload step was skipped (env var
-    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` unset). Captured here so
-    /// the per-respawn wrapper-script generator closure threads the
-    /// same path the initial cohort received into every respawned
-    /// secondary's wrapper, without re-reading the env var or
+    /// binary. Always populated on a successful preparation run:
+    /// the Python bridge raises on missing source binary rather than
+    /// skipping silently. Modelled as `Option` only because the field
+    /// type matches the wrapper-renderer's
+    /// `shutdown_manager_bin_path: Option<&Path>` kwarg shape
+    /// downstream. Captured here so the per-respawn wrapper-script
+    /// generator closure threads the same path the initial cohort
+    /// received into every respawned secondary's wrapper, without
     /// re-uploading the binary.
     pub(super) shutdown_manager_remote_path: Option<String>,
 }
@@ -109,14 +112,16 @@ pub(super) fn run_preparation<'py>(
     // Stage the `dynrunner-slurm-shutdown` musl-static binary on the
     // gateway so per-job wrapper scripts can spawn it via
     // `systemd-run --user --scope` and have it survive cgroup
-    // teardown. The upload step reads the local source path from
-    // `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` (set by the consumer's
-    // nix flake); unset → warn-and-skip, set-but-missing → error.
+    // teardown. The Python bridge resolves the local source path
+    // (`DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` override > wheel-bundled
+    // artifact under `dynamic_runner/_shutdown_manager/`) and raises
+    // a `RuntimeError` when neither is available — orphan-container
+    // cleanup is no longer opt-in.
+    //
     // The resolved gateway-side path is stored on the Rust manager
     // and surfaced via the `shutdown_manager_remote_path` getter so
     // every wrapper render in this run (initial cohort + respawn)
-    // sees the same path without re-reading the env var or
-    // re-uploading the binary.
+    // sees the same path without re-uploading the binary.
     let shutdown_manager_remote_path: Option<String> = job_manager
         .call_method0("upload_shutdown_manager_binary")?
         .extract()?;

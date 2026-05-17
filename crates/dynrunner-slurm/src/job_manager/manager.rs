@@ -35,16 +35,16 @@ impl<G: Gateway> SlurmJobManager<G> {
 
     /// Gateway-side path of the uploaded `dynrunner-slurm-shutdown`
     /// binary, set by
-    /// [`SlurmJobManager::upload_shutdown_manager_binary`].
+    /// [`SlurmJobManager::upload_shutdown_manager_binary_from`].
     ///
-    /// Returns `None` when the upload step was skipped (env var
-    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` unset) or has not been
-    /// invoked yet on this manager. Wrapper-script renderers consume
-    /// the value via
+    /// Returns `None` only when the upload step has not yet been
+    /// invoked on this manager (a successful upload always records a
+    /// path; the upload step raises on missing source rather than
+    /// skipping silently). Wrapper-script renderers consume the value
+    /// via
     /// [`WrapperScriptConfig::shutdown_manager_bin_path`](crate::wrapper_script::WrapperScriptConfig::shutdown_manager_bin_path);
-    /// `None` here means the rendered wrapper omits the
-    /// `systemd-run`-based shutdown-manager spawn block (legacy
-    /// CMD_RELAY-only teardown).
+    /// the `None` branch in the renderer exists for unit tests and
+    /// back-compat callers only.
     pub fn shutdown_manager_remote_path(&self) -> Option<&str> {
         self.shutdown_manager_remote_path.as_deref()
     }

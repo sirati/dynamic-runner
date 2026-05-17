@@ -1,99 +1,22 @@
-//! Tests for [`SlurmJobManager::upload_shutdown_manager_binary`].
+//! Tests for [`SlurmJobManager::upload_shutdown_manager_binary_from`].
 //!
-//! The upload primitive reads
-//! `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` to discover the local
-//! source path. Env-var-mutating tests cannot run in parallel — env
-//! is process-global, so a sibling test that sets the var while
-//! another expects it unset would race. Cargo's default test runner
-//! IS multi-threaded; we serialise the env-var-touching tests
-//! through a module-local `tokio::sync::Mutex`. The lock is acquired
-//! at the top of every test that reads or writes
-//! `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`, and released on the test's
-//! drop.
-//!
-//! Why `tokio::sync::Mutex` rather than `std::sync::Mutex`: the
-//! upload primitive is `async`, and the workspace lint
-//! `await_holding_lock = "deny"` forbids holding a `std` mutex guard
-//! across `.await`. `tokio::sync::Mutex` is async-aware and not
-//! caught by the lint. (Functionally we don't need yield-on-
-//! contention — every test is on a current-thread runtime — but the
-//! lint serves the broader async-Rust hygiene of the workspace and
-//! we conform.)
-//!
-//! Why module-local mutex and not `serial_test`: the workspace
-//! doesn't carry the `serial_test` dev-dep today, and pulling it in
-//! for a three-test cluster adds a build-time dependency for every
-//! sibling crate that test-compiles `dynrunner-slurm`. A local mutex
-//! is a single-purpose primitive scoped exactly to the env-var
-//! contention we know about.
-//!
-//! Why `std::env::set_var` is `unsafe` in tests: edition 2024 marks
-//! these as unsafe to surface the process-wide effect. We wrap each
-//! call in an `unsafe { … }` block guarded by the module mutex so
-//! the safety contract ("no concurrent reads/writes from other
-//! threads") is locally enforced.
+//! The upload primitive takes the local source path as an argument
+//! (resolution policy lives in the Python bridge:
+//! ``dynamic_runner._shutdown_manager.bundled_binary_path`` chooses
+//! between the env-var override and the wheel-bundled artifact). The
+//! Rust primitive itself reads no process state, so these tests are
+//! free of env-var serialisation concerns — no module mutex, no
+//! ``EnvVarGuard``.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use tempfile::TempDir;
-use tokio::sync::Mutex as AsyncMutex;
-use tracing_test::traced_test;
 
-use super::super::shutdown_binary::{
-    SHUTDOWN_BIN_REMOTE_BASENAME, SHUTDOWN_BIN_SOURCE_ENV,
-};
+use super::super::shutdown_binary::SHUTDOWN_BIN_REMOTE_BASENAME;
 use crate::config::SlurmConfig;
 use crate::job_manager::{SlurmError, SlurmJobManager};
 use dynrunner_gateway::traits::{CommandResult, Gateway, GatewayError};
-
-/// Process-wide serialisation lock for tests that mutate
-/// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`. Init-on-first-use to keep
-/// the cost off the non-env-mutating tests. Async-aware to avoid
-/// `await_holding_lock` (the workspace clippy lint is `deny` —
-/// holding the guard across `.upload_shutdown_manager_binary()` is
-/// intentional but a `std` mutex guard would trip the lint).
-fn env_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
-
-/// RAII guard: snapshots the current value of
-/// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` on construction and
-/// restores it on drop. Combined with the module mutex this gives
-/// each test a clean env-var state regardless of execution order.
-struct EnvVarGuard {
-    previous: Option<String>,
-}
-
-impl EnvVarGuard {
-    fn new() -> Self {
-        let previous = std::env::var(SHUTDOWN_BIN_SOURCE_ENV).ok();
-        Self { previous }
-    }
-
-    fn set(&self, value: &str) {
-        // SAFETY: the module mutex guarantees no other test thread
-        // is concurrently reading or writing this env var while the
-        // guard is alive.
-        unsafe { std::env::set_var(SHUTDOWN_BIN_SOURCE_ENV, value) };
-    }
-
-    fn unset(&self) {
-        // SAFETY: same as `set` — module mutex serialisation.
-        unsafe { std::env::remove_var(SHUTDOWN_BIN_SOURCE_ENV) };
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            // SAFETY: same as `set` — module mutex serialisation.
-            Some(v) => unsafe { std::env::set_var(SHUTDOWN_BIN_SOURCE_ENV, v) },
-            None => unsafe { std::env::remove_var(SHUTDOWN_BIN_SOURCE_ENV) },
-        }
-    }
-}
 
 /// Records every gateway call the upload primitive makes so each
 /// test can assert (a) the operations issued and (b) their order.
@@ -159,67 +82,17 @@ impl Gateway for ShutdownBinaryRecordingGateway {
     }
 }
 
-/// Env var unset → upload is skipped (`Ok(None)`), no gateway
-/// operations issued, and a WARN-level log surfaces the missing
-/// integration so an operator who DID intend to enable cleanup sees
-/// the gap.
-#[tokio::test(flavor = "current_thread")]
-#[traced_test]
-async fn upload_shutdown_manager_binary_skipped_when_env_unset() {
-    let _g = env_lock().lock().await;
-    let env = EnvVarGuard::new();
-    env.unset();
-
-    let gw = ShutdownBinaryRecordingGateway::default();
-    let cfg = SlurmConfig {
-        root_folder: "/srv/slurm".into(),
-        ..SlurmConfig::default()
-    };
-    let mut mgr = SlurmJobManager::new(cfg, gw);
-
-    let resolved = mgr
-        .upload_shutdown_manager_binary()
-        .await
-        .expect("unset env must not error");
-
-    assert!(
-        resolved.is_none(),
-        "unset env must return Ok(None); got: {resolved:?}",
-    );
-    assert!(
-        mgr.shutdown_manager_remote_path().is_none(),
-        "unset env must leave shutdown_manager_remote_path unset on the manager",
-    );
-    assert!(
-        mgr.gateway().events().is_empty(),
-        "unset env must not issue any gateway operations; got: {:?}",
-        mgr.gateway().events(),
-    );
-    assert!(
-        logs_contain(SHUTDOWN_BIN_SOURCE_ENV),
-        "warn-log must mention the env-var name so operators can grep for it",
-    );
-    assert!(
-        logs_contain("orphan-container cleanup disabled"),
-        "warn-log must surface the user-visible consequence",
-    );
-}
-
-/// Env var set + local file present → upload issues exactly one
+/// Local source exists → upload issues exactly one
 /// `transfer_file(local, root/dynrunner-slurm-shutdown)` followed
 /// by one `chmod 755 root/dynrunner-slurm-shutdown` (in that order),
-/// returns `Ok(Some(remote_path))`, and records the resolved path
-/// on the manager so subsequent wrapper renders pick it up via
+/// returns `Ok(remote_path)`, and records the resolved path on the
+/// manager so subsequent wrapper renders pick it up via
 /// `shutdown_manager_remote_path`.
 #[tokio::test(flavor = "current_thread")]
-async fn upload_shutdown_manager_binary_uploads_and_chmods_when_env_set() {
-    let _g = env_lock().lock().await;
-    let env = EnvVarGuard::new();
-
+async fn upload_shutdown_manager_binary_uploads_and_chmods() {
     let tmp = TempDir::new().expect("tmpdir");
     let local_path = tmp.path().join("dynrunner-slurm-shutdown");
     std::fs::write(&local_path, b"#!/bin/sh\nexit 0\n").expect("write fake binary");
-    env.set(local_path.to_str().expect("ascii path"));
 
     let gw = ShutdownBinaryRecordingGateway::default();
     let cfg = SlurmConfig {
@@ -229,14 +102,13 @@ async fn upload_shutdown_manager_binary_uploads_and_chmods_when_env_set() {
     let mut mgr = SlurmJobManager::new(cfg, gw);
 
     let resolved = mgr
-        .upload_shutdown_manager_binary()
+        .upload_shutdown_manager_binary_from(local_path.clone())
         .await
         .expect("upload must succeed when source exists");
 
     let expected_remote = format!("/srv/slurm/{SHUTDOWN_BIN_REMOTE_BASENAME}");
     assert_eq!(
-        resolved.as_deref(),
-        Some(expected_remote.as_str()),
+        resolved, expected_remote,
         "remote path must be `<root_folder>/{SHUTDOWN_BIN_REMOTE_BASENAME}`",
     );
     assert_eq!(
@@ -266,19 +138,16 @@ async fn upload_shutdown_manager_binary_uploads_and_chmods_when_env_set() {
     }
 }
 
-/// Env var set to a non-existent path → hard error, NO transfer_file
-/// call (we must not partially upload a phantom file). Surfaces a
-/// misconfigured dispatch loudly: the operator opted into the
-/// feature so a missing source binary deserves a hard failure, not
-/// a silent "cleanup disabled" warning.
+/// Local source path does not point at a real file → hard error,
+/// NO transfer_file call (we must not partially upload a phantom
+/// file). Surfaces a misconfigured dispatch loudly: the caller
+/// already decided this is the binary to deploy, so a missing
+/// source deserves a hard failure, not a silent "cleanup disabled"
+/// warning.
 #[tokio::test(flavor = "current_thread")]
 async fn upload_shutdown_manager_binary_surfaces_missing_source() {
-    let _g = env_lock().lock().await;
-    let env = EnvVarGuard::new();
-
     let tmp = TempDir::new().expect("tmpdir");
     let missing = tmp.path().join("does-not-exist");
-    env.set(missing.to_str().expect("ascii path"));
 
     let gw = ShutdownBinaryRecordingGateway::default();
     let cfg = SlurmConfig {
@@ -288,7 +157,7 @@ async fn upload_shutdown_manager_binary_surfaces_missing_source() {
     let mut mgr = SlurmJobManager::new(cfg, gw);
 
     let err = mgr
-        .upload_shutdown_manager_binary()
+        .upload_shutdown_manager_binary_from(missing.clone())
         .await
         .expect_err("missing source must surface as Err");
     match err {
