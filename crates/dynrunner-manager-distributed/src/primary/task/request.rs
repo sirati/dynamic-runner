@@ -74,16 +74,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     );
                     return Ok(());
                 }
-                // Backpressure guard: if the secondary is in backoff
-                // (recently returned "No idle worker available"),
-                // skip dispatch to its workers. The TaskRequest may
-                // be for a worker that's actually idle, but since
-                // we're not 100% confident the secondary's pool will
-                // accept new work right now, defer until the backoff
-                // window expires (cleared on the next successful
-                // TaskComplete from this secondary, or when the
-                // 500ms backoff naturally elapses).
-                if self.is_backpressured(secondary_id) {
+                // Composed dispatch-shape gate: backpressure backoff
+                // + OOM-bucket single-worker masking. See
+                // `should_skip_worker_for_dispatch` for the
+                // per-reason documentation. Replaces the historical
+                // bare backpressure check so the OOM bucket's "only
+                // worker 0 of each secondary may serve a retry"
+                // shape applies here too; without that the
+                // TaskRequest path would happily hand a memory-
+                // pressed retry to worker N>0 and defeat the bucket.
+                if self.should_skip_worker_for_dispatch(idx) {
                     return Ok(());
                 }
                 // Mark worker idle
@@ -94,24 +94,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     self.workers[idx].resource_budgets = available_res.clone();
                 }
 
-                // Try to assign from local pending. The pool's
-                // `view_for_worker` returns the soft-pin priority order
-                // for this worker; the scheduler picks the index, the
-                // pool commits the take.
-                let global_wid = self.workers[idx].worker_id;
-                // Soft preference tie-break: tasks whose
-                // `preferred_secondaries` lists this worker's secondary
-                // sort first within their priority class. Applied
-                // AFTER `cap_filter_view` so caps remain hard.
-                let req_secondary_id = self.workers[idx].secondary_id.clone();
-                let preference_predicate =
-                    crate::primary::preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
-                        &req_secondary_id,
-                    );
-                let view = self.cap_filter_view(
-                    self.pool()
-                        .view_for_worker(global_wid, Some(&preference_predicate)),
-                );
+                // Try to assign from local pending. The dispatch-
+                // shape view pipeline lives behind a single accessor
+                // on the coordinator so this site stays agnostic to
+                // soft/strict preferred-secondaries and per-type
+                // caps. See `dispatch_view_for_worker`.
+                let view = self.dispatch_view_for_worker(idx);
                 if !view.is_empty() {
                     let worker_info = self.workers[idx].budget_info();
                     let all_infos: Vec<WorkerBudgetInfo<I>> =

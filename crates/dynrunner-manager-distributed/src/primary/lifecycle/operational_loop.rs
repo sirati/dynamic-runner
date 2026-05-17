@@ -664,7 +664,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                _ = tokio::time::sleep(Duration::from_secs(300)),
+                    if !self.single_worker_mode() => {
+                    // 5-min stuck-worker watchdog. Disabled while
+                    // the OOM retry bucket is active: a single-
+                    // worker-per-secondary pass on a memory-pressed
+                    // workload can legitimately exceed 5 minutes,
+                    // and the blanket Recoverable re-tag here would
+                    // poison the bucket's hand-tuned dispatch shape
+                    // mid-flight (every in-flight task gets re-
+                    // classified Recoverable, the OOM-bucket
+                    // accounting goes off the rails). The flag
+                    // [`single_worker_mode`] is the gate;
+                    // `try_run_phase_retry_bucket` is its sole
+                    // writer. Outside the OOM bucket the arm runs
+                    // unchanged.
                     let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
                     if active > 0 {
                         let outcome = self.outcome_summary();

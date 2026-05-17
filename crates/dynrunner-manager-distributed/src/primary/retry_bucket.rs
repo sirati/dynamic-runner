@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo};
 use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -140,6 +140,24 @@ where
         kind: BucketKind,
         _command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<bool, String> {
+        // OOM-bucket dispatch shape. Entry-side: flip the
+        // coordinator into single-worker mode for the duration of
+        // the bucket so the dispatch pipeline masks workers !=
+        // local-id-0 and promotes `preferred_secondaries` to a
+        // strict filter. Exit-side: every `Ok(false)` return below
+        // clears the flag. `Ok(true)` keeps it set — the
+        // operational loop will re-enter and the next drain edge
+        // re-runs this bucket. See `single_worker_mode` field doc
+        // on `PrimaryCoordinator` for the user-spec rationale
+        // (2026-05-17).
+        //
+        // No-op for the Recoverable bucket: those retries do not
+        // need single-worker mode and inherit whatever state a
+        // concurrent OOM bucket on another phase left behind
+        // (accepted per the user spec).
+        if matches!(kind, BucketKind::Oom) {
+            self.single_worker_mode = true;
+        }
         // 1. Filter binaries by (phase, kind). Walk `all_binaries`
         //    (the run-start snapshot) and consult `failed_tasks` for
         //    each hash. `all_binaries` is the only source of truth
@@ -164,6 +182,14 @@ where
             // re-arrival of a failure (e.g. the cascade triggered
             // by an `apply_fail_permanent` cross-cut) should still
             // get a fresh budget if the counter was at 0.
+            if matches!(kind, BucketKind::Oom) {
+                // OOM bucket settled with no remaining candidates
+                // (all retries succeeded, or there were never any
+                // OOM failures for this phase). Lift the dispatch-
+                // shape gate so the normal pass resumes full
+                // throughput.
+                self.single_worker_mode = false;
+            }
             return Ok(false);
         }
 
@@ -184,10 +210,30 @@ where
                 pending_failures = candidates.len(),
                 "per-phase retry bucket: budget exhausted; failures permanent"
             );
+            if matches!(kind, BucketKind::Oom) {
+                // OOM bucket exhausted its budget; lift the
+                // dispatch-shape gate so subsequent phases'
+                // normal-pass dispatch (and this phase's permanent
+                // failures' downstream accounting) run unmasked.
+                self.single_worker_mode = false;
+            }
             return Ok(false);
         }
 
-        // 3. Reinject. `pool.reinject` flips Drained → Active for
+        // 3. OOM bucket: bind each retry to a specific secondary
+        //    BEFORE reinjecting so the dispatch pipeline's strict
+        //    `preferred_secondaries` gate routes each task to its
+        //    pinned node. Pairing: tasks sorted by estimated memory
+        //    DESC, secondaries sorted by advertised memory DESC,
+        //    zipped cyclically (biggest task → biggest secondary).
+        //    Snapshotted at this entry — a secondary dying mid-
+        //    bucket will fail dispatch naturally; the next bucket
+        //    entry re-samples. The Recoverable bucket leaves the
+        //    candidates' `preferred_secondaries` untouched (its
+        //    retries run on whoever's idle).
+        let candidates = self.assign_oom_preferred_secondaries(kind, candidates);
+
+        // 4. Reinject. `pool.reinject` flips Drained → Active for
         //    this phase and drops any pending drained-notification,
         //    so `process_phase_lifecycle`'s next
         //    `poll_drain_transitions` returns an empty list and the
@@ -200,7 +246,7 @@ where
             self.pool_mut().reinject(binary);
         }
 
-        // 4. Bump counter BEFORE the kickstart so a kickstart-side
+        // 5. Bump counter BEFORE the kickstart so a kickstart-side
         //    error path leaving us in an inconsistent state doesn't
         //    burn a second pass on the same set of failures.
         self.retry_passes_used.insert(key, used + 1);
@@ -214,7 +260,7 @@ where
             "per-phase retry bucket: re-injecting failed tasks"
         );
 
-        // 5. Kickstart dispatch: the workers won't request a new
+        // 6. Kickstart dispatch: the workers won't request a new
         //    task on their own (they already sent their last
         //    `TaskRequest` which got `nothing-to-do` because the
         //    failure hadn't been reinjected yet). Same rationale as
@@ -223,5 +269,51 @@ where
         self.dispatch_to_idle_workers().await?;
 
         Ok(true)
+    }
+
+    /// OOM-bucket dispatch-shape preprocessor: sort retries by
+    /// estimated memory DESC and bind each to a secondary cycling
+    /// through the cluster's memory-DESC order. Pure transformation
+    /// — modifies `preferred_secondaries` on each `TaskInfo<I>` and
+    /// returns the rebound vector in the new dispatch order.
+    ///
+    /// No-op for non-OOM kinds (returns the input unchanged) and
+    /// for an empty cluster (no secondaries means no rebinding;
+    /// dispatch will fail naturally at the next worker iteration,
+    /// matching the snapshot-at-entry semantics).
+    ///
+    /// Single concern: per-task target binding for the OOM bucket.
+    /// The strict `preferred_secondaries` gate in the dispatch
+    /// pipeline reads what this method writes; neither side learns
+    /// the other's internals.
+    fn assign_oom_preferred_secondaries(
+        &self,
+        kind: BucketKind,
+        candidates: Vec<TaskInfo<I>>,
+    ) -> Vec<TaskInfo<I>> {
+        if !matches!(kind, BucketKind::Oom) {
+            return candidates;
+        }
+        let mem_kind = ResourceKind::memory();
+        let secondaries = self.secondaries_sorted_by_memory_desc();
+        if secondaries.is_empty() {
+            return candidates;
+        }
+        // Sort tasks by estimated memory DESC so the biggest task
+        // pairs with the biggest secondary. The estimator is the
+        // only authority on per-task resource cost; reusing it
+        // keeps the OOM dispatch shape consistent with the
+        // scheduler's normal-pass assignment math.
+        let mut tasks = candidates;
+        tasks.sort_by(|a, b| {
+            let mem_a = self.estimator.estimate(a).get(&mem_kind);
+            let mem_b = self.estimator.estimate(b).get(&mem_kind);
+            mem_b.cmp(&mem_a)
+        });
+        for (i, task) in tasks.iter_mut().enumerate() {
+            let target = secondaries[i % secondaries.len()].clone();
+            task.preferred_secondaries = SoftPreferredSecondaries::new(vec![target]);
+        }
+        tasks
     }
 }
