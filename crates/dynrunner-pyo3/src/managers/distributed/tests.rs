@@ -109,6 +109,9 @@ task_args = SimpleNamespace()
             /* task_completed_listener */ None,
             /* unfulfillable_reinject_max_per_task */ cap,
             /* log_dir */ None,
+            /* scheduler_config */ None,
+            /* panik_watcher_paths */ None,
+            /* panik_watcher_poll_interval_secs */ 10.0,
         )?;
         Py::new(py, mgr)
     }
