@@ -385,6 +385,28 @@ where
         ])
         .await;
 
+        // Symmetric with the receive-side mirror in
+        // `handle_cluster_mutation` (primary/task/mutation.rs): every
+        // path that grows the CRDT ledger via TasksSpawned must
+        // refresh the operational-loop's exit-counter denominator from
+        // the post-apply CRDT view. The CRDT is authoritative;
+        // `total_tasks` is a derived view that mirrors
+        // `cluster_state.task_count()`. Without this refresh the
+        // live-primary's exit check (`completed + failed >=
+        // total_tasks`) trips against the pre-spawn total the moment
+        // every pre-spawn task terminates — the asm-tokenizer phase-3
+        // memmap race where `on_phase_end("unify_vocab")` issues
+        // `spawn_tasks(memmap_items)`, the CRDT grows, the pool
+        // accepts the reinject below, but the loop exits before the
+        // post-spawn task dispatches because `total_tasks` still
+        // reads its run-start value.
+        //
+        // Idempotent against the no-spawn-grew case: the early-return
+        // on `valid_tasks.is_empty()` above means we only reach here
+        // when the apply actually grew the ledger; even if it didn't,
+        // re-reading `task_count()` is a same-value write.
+        self.total_tasks = self.cluster_state.task_count();
+
         // Pool-side bookkeeping for the live primary. Read every
         // valid entry's post-apply state and route by classification:
         //   * Pending → reinject into the pool so the next dispatch
