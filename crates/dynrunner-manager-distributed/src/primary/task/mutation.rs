@@ -82,9 +82,48 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     _ => None,
                 })
                 .collect();
+            // Receive-side pool growth surface: every `TasksSpawned`
+            // entry the apply rule classifies as freshly `Pending`
+            // (no deps, or all deps already `Completed`) is cloned
+            // into `newly_pending`. A primary that still locally owns
+            // a pool (`self.pending.is_some()`) reinjects each entry
+            // so the pool stays coherent with the CRDT ledger across
+            // wire-received batches.
+            //
+            // This matters for the re-promotion path: a demoted
+            // primary applying a promoted-secondary's TasksSpawned
+            // broadcast keeps the post-spawn tasks dispatchable in
+            // its local pool, so a later re-election (the demoted
+            // primary becomes live again) finds the pool already
+            // aligned with the cluster's view. Without it, re-
+            // election would resurrect the pool from its pre-spawn
+            // snapshot and the post-spawn tasks would never
+            // dispatch on this node.
+            //
+            // `resumed` is not consumed here for the same reason the
+            // promoted-secondary's receive path discards it — the
+            // pool's own dep machinery dispatches Blocked entries on
+            // the prereq's `on_item_finished` event.
+            let mut resumed: Vec<TaskInfo<I>> = Vec::new();
+            let mut newly_pending: Vec<TaskInfo<I>> = Vec::new();
             for m in mutations {
                 self.mirror_mutation_to_accounting(&m);
-                self.cluster_state.apply(m);
+                self.cluster_state.apply_with_resumed_blocked(
+                    m,
+                    &mut resumed,
+                    &mut newly_pending,
+                );
+            }
+            if self.pending.is_some() {
+                for task in newly_pending {
+                    tracing::debug!(
+                        phase = %task.phase_id,
+                        task_id = ?task.task_id,
+                        "pool: reinject freshly-Pending task from \
+                         wire-received TasksSpawned"
+                    );
+                    self.pool_mut().reinject(task);
+                }
             }
             for batch in &spawned_task_batches {
                 self.mirror_tasks_spawned_post_apply(batch);
