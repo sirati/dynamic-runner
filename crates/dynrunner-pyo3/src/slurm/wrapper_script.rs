@@ -139,6 +139,16 @@ pub fn generate_wrapper_script(
         extra_run_args: &extra_run_args,
         forwarded_argv: &forwarded_argv,
         is_observer,
+        // TODO(dispatcher-integration): plumb the resolved
+        // `dynrunner-slurm-shutdown` binary path from the Python
+        // dispatcher (e.g. via a new kwarg on
+        // `SlurmJobManager.generate_wrapper_script`). When this is
+        // `None` the rendered wrapper has NO /tmp cleanup on
+        // SLURM-induced termination — the out-of-cgroup shutdown
+        // manager owns that responsibility now. The pre-2026-05
+        // inline watchdog was removed because it never worked
+        // (signalled bash pid 1, lived in the slurmd cgroup).
+        shutdown_manager_bin_path: None,
     };
     Ok(rust_generate_wrapper_script(&cfg))
 }

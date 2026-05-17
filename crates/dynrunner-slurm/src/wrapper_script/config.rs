@@ -5,6 +5,8 @@
 //! See the module-level docs in [`super`] for the generator's
 //! design rationale.
 
+use std::path::Path;
+
 use crate::config::SlurmConfig;
 
 /// Configuration for generating a SLURM wrapper script.
@@ -114,6 +116,28 @@ pub struct WrapperScriptConfig<'a> {
     /// see that this peer cannot host the primary role. Defaults to
     /// `false` at the callers; observer-mode is opted into explicitly.
     pub is_observer: bool,
+    /// Absolute path to the `dynrunner-slurm-shutdown` binary on the
+    /// compute-node filesystem. When `Some`, the rendered wrapper
+    /// spawns the shutdown manager via `systemd-run --user --scope`
+    /// right after scratch-dir creation; the wrapper's signal trap
+    /// forwards SIGTERM/SIGCONT/etc. to the scope via
+    /// `systemctl --user kill`. When `None`, the wrapper emits no
+    /// shutdown-manager spawn block and the cleanup trap is a
+    /// minimal CMD_RELAY-only teardown (legacy behavior, NO /tmp
+    /// cleanup on SLURM-induced termination — caller's responsibility
+    /// to ensure they wanted that).
+    ///
+    /// Replaces the pre-2026-05 inline `setsid -f bash -c '...'`
+    /// watchdog, which signalled pid 1 of the container (= bash, no
+    /// signal forwarding) and lived inside the slurmd cgroup (so it
+    /// died alongside the wrapper on cgroup teardown — defeating the
+    /// "survives wrapper exit" purpose). The out-of-cgroup
+    /// shutdown-manager process started via `systemd-run --user`
+    /// inherits the user's `user@<uid>.service` cgroup instead, so
+    /// SLURM cgroup-v2 teardown of the job's pidtree does not reap
+    /// it. Cluster prerequisite: `loginctl enable-linger` for the
+    /// SLURM user (LMU Krater has this set).
+    pub shutdown_manager_bin_path: Option<&'a Path>,
 }
 
 /// How the secondary connects to the primary.

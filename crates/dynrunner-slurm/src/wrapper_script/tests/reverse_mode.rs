@@ -29,6 +29,7 @@ fn reverse_mode_script_contains_tunnel_port() {
         extra_run_args: &extra,
         forwarded_argv: &[],
         is_observer: false,
+        shutdown_manager_bin_path: None,
     };
     let script = generate_wrapper_script(&cfg);
     assert!(script.contains("TUNNEL_PORT"));
@@ -83,6 +84,7 @@ fn reverse_mode_script_renders_is_observer_true() {
         extra_run_args: &extra,
         forwarded_argv: &[],
         is_observer: true,
+        shutdown_manager_bin_path: None,
     };
     let script = generate_wrapper_script(&cfg);
     assert!(script.contains("printf 'is_observer=true\\n'"));

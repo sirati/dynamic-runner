@@ -10,6 +10,7 @@ mod argv_quoting;
 mod cleanup;
 mod preflight_podman;
 mod reverse_mode;
+mod shutdown_manager;
 mod standard_mode;
 mod syntax_and_quote;
 mod test_wrapper;
@@ -40,5 +41,12 @@ pub(super) fn standard_cfg<'a>(
         extra_run_args,
         forwarded_argv: &[],
         is_observer: false,
+        // Disabled by default for the test baseline: the
+        // out-of-cgroup shutdown-manager spawn block is a separate
+        // concern asserted by `tests::shutdown_manager`. Other
+        // tests get the legacy CMD_RELAY-only cleanup trap so
+        // unrelated regressions don't trip the new feature's
+        // assertions.
+        shutdown_manager_bin_path: None,
     }
 }

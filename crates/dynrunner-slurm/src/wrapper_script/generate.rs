@@ -1,12 +1,25 @@
 //! [`generate_wrapper_script`]: the canonical secondary-mode wrapper
-//! generator. ~670 lines of sequentially-built bash heredocs spanning
-//! scratch-dir setup, podman storage, FIFO command-relay,
-//! conmon-watchdog fallback, image load, container run, and cleanup
-//! traps. Splitting further would fracture the linearly-constructed
-//! bash payload (each section depends on shell variables defined
-//! upstream); the file sits above the 300-line target because the
-//! script body it emits is itself one cohesive bash program. See
-//! [`super`] for the higher-level rationale.
+//! generator. Sequentially-built bash heredocs span scratch-dir
+//! setup, podman storage, FIFO command-relay, optional shutdown-
+//! manager spawn (out-of-cgroup, via `systemd-run --user --scope`),
+//! image load, container run, and cleanup traps. Splitting further
+//! would fracture the linearly-constructed bash payload (each
+//! section depends on shell variables defined upstream); the file
+//! sits above the 300-line target because the script body it emits
+//! is itself one cohesive bash program. See [`super`] for the
+//! higher-level rationale.
+//!
+//! The pre-2026-05 inline watchdog (a `setsid -f bash -c '...'`
+//! subshell that polled `squeue %T` and signalled the container)
+//! has been removed. It signalled the container's pid 1 (= bash,
+//! which doesn't forward signals to children), and `setsid -f`
+//! does NOT escape the slurmd cgroup — so on cgroup teardown the
+//! watchdog died alongside everything else, defeating its
+//! "survives wrapper exit" purpose. The replacement is an
+//! out-of-cgroup shutdown-manager process spawned via
+//! `systemd-run --user --scope`, addressed by name via
+//! `systemctl --user kill` from the wrapper's signal trap. See
+//! [`WrapperScriptConfig::shutdown_manager_bin_path`].
 
 use super::config::{ConnectionMode, WrapperScriptConfig, WRAPPER_SRC_NETWORK_CONTAINER_PATH};
 use super::quote::{bash_quote, rand_hex8};
@@ -14,8 +27,9 @@ use super::quote::{bash_quote, rand_hex8};
 /// Generate the bash wrapper script for a SLURM job.
 ///
 /// The script sets up scratch /tmp dirs, podman storage, the FIFO
-/// command relay, the conmon-watchdog fallback, loads the docker
-/// image, and runs the container in the requested connection mode.
+/// command relay, optionally spawns the out-of-cgroup shutdown
+/// manager, loads the docker image, and runs the container in the
+/// requested connection mode.
 pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     let rnd_suffix = rand_hex8();
     let rndtmp = format!("/tmp/asm-{rnd_suffix}");
@@ -68,6 +82,73 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
         .map(|arg| format!("    {} \\\n", bash_quote(arg)))
         .collect();
 
+    // Out-of-cgroup shutdown-manager spawn block. When the caller
+    // supplies `shutdown_manager_bin_path`, the wrapper:
+    //   1. Spawns `<bin> --container-name … --storage-root … …` in a
+    //      transient systemd-user scope so the process lives in the
+    //      user's `user@<uid>.service` cgroup, NOT the slurmd job
+    //      cgroup. SLURM cgroup-v2 teardown of the job pidtree
+    //      therefore does not reap the manager (the inline
+    //      `setsid -f` watchdog this replaces died on cgroup
+    //      teardown — defeating its purpose).
+    //   2. Forwards SIGCONT to the scope from the wrapper's signal
+    //      trap (idle-wake the manager's poll loop so it observes
+    //      "wrapper gone, container gone, time to clean up").
+    //
+    // When `None`, neither the spawn block nor the systemctl forward
+    // are rendered — the cleanup trap reduces to the CMD_RELAY-only
+    // teardown (no /tmp cleanup; callers opting in here accept that
+    // tradeoff explicitly).
+    //
+    // Bash safety: the binary path is `bash_quote`-d at format!-time
+    // (literal substitution, no env-var indirection) so paths with
+    // spaces/metacharacters survive intact. The systemd-run `--unit`
+    // name is the same hex suffix `$rnd_suffix` the rest of the
+    // wrapper uses, prefixed with `dynrunner-shutdown-`, so the unit
+    // is uniquely named per job and can be re-targeted by
+    // `systemctl --user kill` later.
+    let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
+        match cfg.shutdown_manager_bin_path {
+            Some(path) => {
+                let bin_q = bash_quote(&path.display().to_string());
+                (
+                    format!(
+                        r##"SHUTDOWN_SCOPE="dynrunner-shutdown-{rnd_suffix}"
+if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user --scope --quiet --collect --unit="$SHUTDOWN_SCOPE" -- \
+        {bin_q} \
+            --container-name "$CONTAINER_NAME" \
+            --storage-root "$PODMAN_STORAGE" \
+            --runroot "$PODMAN_RUN" \
+            --tmp-prefix "$RNDTMP" \
+            --pid-file "$RNDTMP/shutdown-manager.pid" \
+            </dev/null >>"$RNDTMP/shutdown-manager.log" 2>&1 &
+    SHUTDOWN_SPAWN_PID=$!
+    # `systemd-run --user --scope` is foreground-by-default; the
+    # `&` backgrounds the wait-for-scope-process, not the scope
+    # itself. The scope's lifetime is the shutdown manager's.
+    echo "Spawned shutdown manager in scope $SHUTDOWN_SCOPE"
+else
+    echo "WARNING: systemd-run not available; orphan-container cleanup will be missing on signal" >&2
+    SHUTDOWN_SCOPE=""
+fi
+"##,
+                    ),
+                    // SIGCONT (cannot be blocked/ignored, doesn't
+                    // terminate) is the wake signal: the shutdown
+                    // manager's poll loop observes it and re-runs
+                    // its idle-shutdown check. The manager owns the
+                    // actual tmp-cleanup and orphan-container
+                    // teardown — the wrapper only nudges it.
+                    "    if [ -n \"${SHUTDOWN_SCOPE:-}\" ]; then\n        \
+                     systemctl --user kill --signal=SIGCONT \"$SHUTDOWN_SCOPE\" 2>/dev/null || true\n    \
+                     fi\n"
+                        .to_string(),
+                )
+            }
+            None => (String::new(), String::new()),
+        };
+
     let mut script = format!(
         r##"#!/usr/bin/env bash
 set -e
@@ -84,62 +165,6 @@ echo "Creating temporary directory: $RNDTMP"
 mkdir -p "$RNDTMP"
 mkdir -p "{src_tmp}" "{out_tmp}" "{log_tmp}" "{socket_dir}"
 
-cleanup() {{
-    # Terminate the command-relay subshell and WAIT for it to exit
-    # before removing its FIFO. Without `wait`, kill is racy with
-    # the rm-rf below — and the relay loop is designed to exit 1
-    # with a loud diagnostic if its FIFO disappears unexpectedly
-    # (so a careless ops mistake gets noticed instead of silently
-    # neutering the secondary). During intentional cleanup we don't
-    # want that diagnostic; we want the subshell killed cleanly via
-    # SIGTERM before the FIFO vanishes.
-    # `${{CMD_RELAY_PID:-}}` guard handles early-failure paths where
-    # the relay was never started.
-    if [ -n "${{CMD_RELAY_PID:-}}" ]; then
-        kill -TERM "$CMD_RELAY_PID" 2>/dev/null || true
-        wait "$CMD_RELAY_PID" 2>/dev/null || true
-    fi
-    echo "Cleaning up temporary directory: $RNDTMP"
-    # Per-file unlink for the image tarball: it's host-UID owned
-    # (cp'd in by this wrapper before any container ran), so a
-    # plain `rm -f` reaches it without entering the user-namespace.
-    # Guarded with `${{LOCAL_IMAGE:-}}` because the trap is installed
-    # before LOCAL_IMAGE gets assigned, so early-failure paths
-    # (port probe, etc.) reach cleanup with the variable unset.
-    # `--` stops accidental flag interpretation. The "rm -rf in
-    # scripts is dangerous" rule pushes us toward per-file unlink
-    # wherever feasible — recursive tree-rm is reserved for
-    # $RNDTMP itself, where there's no other mechanism.
-    if [ -n "${{LOCAL_IMAGE:-}}" ] && [ -e "$LOCAL_IMAGE" ]; then
-        rm -f -- "$LOCAL_IMAGE" 2>/dev/null \
-            || echo "WARNING: failed to unlink $LOCAL_IMAGE" >&2
-    fi
-    # Tmp-tree teardown via `podman unshare`: rootless podman
-    # writes files into $RNDTMP/storage owned by mapped subuids
-    # the host operator's UID can't unlink directly (this leaked
-    # ~3.2 GB per run on slurm-test-env workers — bug AA in the
-    # field log). `podman unshare` enters the user-namespace where
-    # those files are reachable. Plain `rm -rf` is a defensive
-    # fallback for the no-podman case; shouldn't fire on real
-    # workers but keeps the wrapper safe to dry-run on a host
-    # without podman installed. `--` guards against $RNDTMP ever
-    # starting with a dash. Result is logged after the rm
-    # completes so a silent leak is impossible to miss in logs.
-    if podman unshare rm -rf -- "$RNDTMP" 2>/dev/null \
-        || rm -rf -- "$RNDTMP" 2>/dev/null; then
-        echo "Cleaned up temporary directory: $RNDTMP"
-    else
-        echo "ERROR: failed to clean up $RNDTMP — /tmp scratch leaked on $(hostname)" >&2
-    fi
-}}
-# Also cleanup on SLURM-induced signals: SIGTERM is sent by sbatch
-# at time-limit / scancel, SIGHUP by an ssh disconnect, SIGINT by
-# Ctrl+C from interactive jobs. Without these, the trap fires only
-# on graceful exit and SLURM-killed jobs leak /tmp/asm-XXXX dirs
-# until the node's /tmp fills (observed in the field on multi-day
-# clusters). EXIT alone misses every non-graceful termination.
-trap cleanup EXIT TERM HUP INT
-
 PODMAN_STORAGE="{podman_storage}"
 PODMAN_RUN="{podman_run}"
 mkdir -p "$PODMAN_STORAGE" "$PODMAN_RUN"
@@ -148,6 +173,34 @@ export XDG_RUNTIME_DIR="$PODMAN_RUN"
 echo "Podman storage: $PODMAN_STORAGE"
 echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
+
+CONTAINER_NAME="{container_name}"
+
+# Shutdown-manager spawn block follows immediately below. It is
+# rendered only when the caller plumbs the binary path through
+# WrapperScriptConfig::shutdown_manager_bin_path; otherwise the
+# block collapses to empty and the cleanup trap reduces to a
+# CMD_RELAY-only teardown. See the wrapper-script module-level
+# Rust docs for the design rationale.
+{shutdown_manager_spawn_block}
+cleanup() {{
+{shutdown_manager_cleanup_forward}    # CMD_RELAY teardown stays in the wrapper's signal trap —
+    # the FIFO is in the wrapper's own process group, not in the
+    # shutdown-manager's concern. `${{CMD_RELAY_PID:-}}` guard
+    # handles early-failure paths where the relay was never
+    # started. `wait` here is important: it lets the relay
+    # subshell flush before the out-of-cgroup shutdown manager
+    # eventually tears down the socket FIFOs.
+    if [ -n "${{CMD_RELAY_PID:-}}" ]; then
+        kill -TERM "$CMD_RELAY_PID" 2>/dev/null || true
+        wait "$CMD_RELAY_PID" 2>/dev/null || true
+    fi
+}}
+# Cleanup trap covers SLURM-induced signals: SIGTERM is sent by
+# sbatch at time-limit / scancel, SIGHUP by an ssh disconnect,
+# SIGINT by Ctrl+C from interactive jobs. EXIT alone misses every
+# non-graceful termination.
+trap cleanup EXIT TERM HUP INT
 echo ""
 
 # ============================================================================
@@ -446,181 +499,6 @@ if ! {load_command}; then
     exit 1
 fi
 echo "Image loaded successfully"
-
-CONTAINER_NAME="{container_name}"
-
-# Detached fallback teardown for the conmon-double-fork-escapes-
-# cgroup case observed in the field: when SLURM proctrack/cgroup
-# either isn't in use or doesn't track the container monitor's
-# detached pid, scancel/timeout/SIGTERM doesn't propagate into
-# the container — conmon and its children survive both the
-# wrapper's death and the SLURM job's termination, leaking
-# storage and worker processes on the compute node.
-#
-# Two trigger conditions must BOTH hold before any kill action:
-#
-#   1. SLURM job state is no longer RUNNING. Probed via
-#      `squeue -j $JOBID -h -o "%T"` — verbose state code per
-#      `squeue(1)`. A job leaving RUNNING means slurmctld has
-#      decided to terminate it (COMPLETING after time limit /
-#      scancel, FAILED, TIMEOUT, CANCELLED) or the job has
-#      already left the queue (empty stdout). Crucially, a job
-#      in COMPLETING (CG) state — slurmctld trying to clean up
-#      a stuck cgroup, often because the container itself is
-#      blocking cleanup — is the case this watchdog exists for.
-#      Polling for state, not presence, catches that case;
-#      presence-polling would miss it because the job is still
-#      in the queue.
-#
-#   2. Container is still alive. If the dispatcher exited
-#      cleanly with the workload, the container is gone and
-#      there is nothing to tear down.
-#
-# Teardown is graceful: SIGTERM first, then up to 60s for the
-# dispatcher to flush in-flight task state, peer disconnects,
-# and exit; only if the container is still alive after 60s does
-# the watchdog escalate to SIGKILL. This preserves the
-# dispatcher's ability to surface partial results when the job
-# is terminated mid-run rather than discarding them.
-#
-# The watchdog never issues `podman rm`. The container is
-# started with `podman run --rm`, so a clean exit (whether from
-# SIGTERM, SIGKILL, or natural workload completion) auto-removes
-# it. If a container somehow survives SIGKILL that is a
-# runtime/kernel issue worth surfacing in slurm_*.out, not
-# papering over with `rm -f`.
-#
-# Debounce: two consecutive non-running observations at 5s
-# interval (10s confirm) before triggering. slurmctld can
-# return transient state inconsistencies during RPC stalls or
-# accounting flushes; the debounce rides those out. squeue
-# command failures (rc!=0) are skipped entirely — they
-# indicate slurmctld is unreachable, not that the job ended.
-#
-# Watchdog actions log to the wrapper's stdout via fd 3 (the
-# wrapper redirects its own stdout to the .out file before the
-# watchdog spawns; the watchdog inherits fd 3 → same .out
-# file). Operators grepping `slurm_*.out` for "WATCHDOG:" can
-# attribute container teardown to the watchdog post-hoc.
-#
-# Detached via `setsid -f` so it survives wrapper exit and
-# (where possible) cgroup teardown of the wrapper's pidtree.
-# If proctrack/cgroup is in fact tracking the watchdog too,
-# the watchdog dies alongside the rest — but in that case the
-# container is also dead, so there's nothing to clean up.
-#
-# Skipped when SLURM_JOB_ID is empty (running outside SLURM):
-# squeue would never find a matching job so the watchdog could
-# never exit cleanly.
-#
-# Operator escape hatch: setting `DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1`
-# in the wrapper's environment skips spawning the watchdog
-# entirely. Two use cases:
-#   - **A/B diagnostic** when an operator suspects the watchdog
-#     is the source of a phantom SIGTERM (the kill target is
-#     PID 1 of the container, but operators inspecting a
-#     cross-cluster signal source may want to rule it out
-#     definitively).
-#   - **Healthy proctrack/cgroup clusters** where SLURM's own
-#     cgroup teardown reliably reaps conmon's double-forked
-#     containers and the watchdog is redundant. Pre-2026-04-29
-#     watchdog's only purpose was the conmon-escape-cgroup
-#     fallback; on a cluster where proctrack/cgroup catches
-#     that case (confirmed working on slurm-test-env per
-#     2bf8410), the watchdog is belt-and-suspenders only.
-#
-# Default behaviour (env var unset or set to "0") is
-# unchanged — watchdog spawns and runs the state-aware
-# polling.
-if [ -n "${{SLURM_JOB_ID:-}}" ] \
-   && [ "${{DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG:-0}}" != "1" ]; then
-    # Duplicate the wrapper's stdout to fd 3 so the detached
-    # watchdog can log its actions to the .out file even
-    # after the wrapper exits and its main stdout chain may be
-    # torn down (setsid'd subshell's stdout goes to /dev/null
-    # via the spawn line). The exec is bash-local; the
-    # subshell inherits open fds.
-    exec 3>&1
-    setsid -f bash -c '
-        job_id="$1"
-        cname="$2"
-        storage="$3"
-        runroot="$4"
-        # State-poll cadence and debounce. 5s sleep × 2-strike
-        # confirm = ~10s to act after a real state change, which
-        # is fast enough on the operator side and long enough to
-        # ride out slurmctld inconsistencies.
-        state_poll_seconds=5
-        state_threshold=2
-        nonrunning_count=0
-        last_state="<unknown>"
-        while true; do
-            sleep "$state_poll_seconds"
-            # %T renders the verbose job state (RUNNING, COMPLETING,
-            # FAILED, TIMEOUT, CANCELLED, PREEMPTED, ...). Empty
-            # stdout means the job has left the queue entirely.
-            # squeue rc!=0 indicates slurmctld is unreachable, not
-            # that the job ended — skip those ticks.
-            if out=$(squeue -j "$job_id" -h -o "%T" 2>/dev/null); then
-                state=$(printf "%s" "$out" | head -n1)
-                if [ "$state" = "RUNNING" ] || [ "$state" = "R" ]; then
-                    nonrunning_count=0
-                else
-                    nonrunning_count=$((nonrunning_count + 1))
-                    if [ "$nonrunning_count" -ge "$state_threshold" ]; then
-                        last_state="${{state:-<empty>}}"
-                        break
-                    fi
-                fi
-            fi
-        done
-
-        # Container already gone — workload finished, nothing
-        # to do.
-        if ! podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs container exists "$cname" 2>/dev/null; then
-            exit 0
-        fi
-
-        # Phase 2: graceful SIGTERM. The dispatcher inside gets a
-        # chance to flush in-flight state, signal peers, and exit
-        # cleanly before we escalate. The container was started
-        # with `podman run --rm`, so a clean exit auto-removes
-        # the container; the watchdog never issues `podman rm`.
-        grace_seconds=60
-        echo "WATCHDOG: job $job_id state=$last_state; sending SIGTERM to container $cname (${{grace_seconds}}s grace before SIGKILL)" >&3 2>/dev/null || true
-        podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs kill --signal TERM "$cname" 2>/dev/null
-
-        # Phase 3: wait up to grace_seconds for graceful exit.
-        # Poll once a second so we exit promptly when the
-        # dispatcher finishes. `container exists` returning non-
-        # zero means `--rm` has already reaped the container,
-        # which is the only termination path we care about.
-        elapsed=0
-        while [ "$elapsed" -lt "$grace_seconds" ]; do
-            sleep 1
-            elapsed=$((elapsed + 1))
-            if ! podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs container exists "$cname" 2>/dev/null; then
-                echo "WATCHDOG: container $cname exited gracefully after ${{elapsed}}s" >&3 2>/dev/null || true
-                exit 0
-            fi
-        done
-
-        # Phase 4: still alive after grace — escalate to SIGKILL.
-        # SIGKILL cannot be trapped; the kernel terminates pid 1
-        # in the container namespace and --rm reaps the container.
-        # No `podman rm`: if a container somehow survives SIGKILL
-        # that is a runtime/kernel issue worth surfacing loudly,
-        # not papering over with rm -f.
-        # (Comments here must avoid ASCII apostrophes because this
-        # whole block runs inside a bash -c single-quoted string.)
-        echo "WATCHDOG: container $cname did not exit within ${{grace_seconds}}s of SIGTERM; force-killing (SIGKILL)" >&3 2>/dev/null || true
-        podman --root "$storage" --runroot "$runroot" --cgroup-manager=cgroupfs kill --signal KILL "$cname" 2>/dev/null
-    ' watchdog "$SLURM_JOB_ID" "$CONTAINER_NAME" "$PODMAN_STORAGE" "$PODMAN_RUN" \
-        </dev/null >/dev/null 2>&1
-    echo "Spawned podman teardown watchdog (poll=5s debounce=2 grace=60s)"
-elif [ "${{DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG:-0}}" = "1" ]; then
-    echo "Skipped podman teardown watchdog (DYNRUNNER_DISABLE_TEARDOWN_WATCHDOG=1)"
-fi
 
 echo "Starting Docker container..."
 echo "  Volumes:"
