@@ -15,7 +15,10 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 use super::PrimaryCoordinator;
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
-    pub(super) async fn wait_for_connections(&mut self) -> Result<(), String> {
+    pub(super) async fn wait_for_connections(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> Result<(), String> {
         tracing::info!("waiting for {} secondaries", self.config.num_secondaries);
 
         let deadline = tokio::time::Instant::now() + self.config.connect_timeout;
@@ -40,11 +43,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tokio::select! {
                 msg = self.transport.recv() => {
                     match msg {
-                        // Pre-operational-loop site: PyPrimaryHandle
-                        // hasn't been issuing commands yet (run() hasn't
-                        // entered the operational loop). Pass &mut None
-                        // so the cascade's drain step is a no-op.
-                        Some(m) => self.dispatch_message(m, &mut None).await?,
+                        // Pre-operational-loop site. Threading
+                        // `command_rx` through so an `on_phase_end`
+                        // callback fired by an in-cascade TaskComplete
+                        // can queue a `PrimaryCommand::SpawnTasks` and
+                        // the cascade's per-iteration drain step
+                        // applies it inline before the wait returns.
+                        // Without this, the spawn lands on the channel
+                        // but `operational_loop`'s `completed+failed >=
+                        // total_tasks` exit check trips on entry before
+                        // the select! polls the command arm — the
+                        // spawn is dropped and the run completes with
+                        // the post-spawn tasks never dispatching. The
+                        // PyO3 `PrimaryHandle` IS reachable before
+                        // operational-loop entry (it shares the
+                        // pre-`run` `command_sender()` clone), and
+                        // `on_phase_end` fires off any TaskComplete
+                        // that arrives during connect — both producers
+                        // converge on the same channel here.
+                        Some(m) => self.dispatch_message(m, command_rx).await?,
                         None => return Err("transport closed".into()),
                     }
                 }

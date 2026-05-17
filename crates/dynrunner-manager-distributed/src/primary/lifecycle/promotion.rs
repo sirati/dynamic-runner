@@ -8,8 +8,10 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
 };
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
+use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::wire::timestamp_now;
 
 
@@ -38,7 +40,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// mpsc bridge; `sleep_until` is one-shot cancel-safe per
     /// tokio docs. The `select!` here mirrors the same shape
     /// `wait_for_connections` uses one phase up.
-    pub(crate) async fn wait_for_mesh_ready(&mut self) -> Result<(), String> {
+    pub(crate) async fn wait_for_mesh_ready(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> Result<(), String> {
         // The expected set is the live-secondaries set captured
         // AT this moment (post-quorum, post-cert-exchange). It is
         // not `config.num_secondaries` because the connect phase
@@ -83,12 +88,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tokio::select! {
                 msg = self.transport.recv() => {
                     match msg {
-                        // Pre-operational-loop site (see
-                        // wait_for_connections for matching rationale):
-                        // pass &mut None — the operational loop hasn't
-                        // started, so the in-runtime PrimaryHandle
-                        // path isn't issuing commands yet.
-                        Some(m) => self.dispatch_message(m, &mut None).await?,
+                        // Pre-operational-loop site. See
+                        // `wait_for_connections` for the matching
+                        // rationale: thread `command_rx` through so an
+                        // `on_phase_end` callback fired by a
+                        // TaskComplete arriving during this wait can
+                        // queue `SpawnTasks` and have it applied
+                        // inline, refreshing `total_tasks` BEFORE
+                        // `operational_loop`'s entry-time exit check
+                        // sees the post-spawn ledger.
+                        Some(m) => self.dispatch_message(m, command_rx).await?,
                         None => return Err("transport closed during wait_for_mesh_ready".into()),
                     }
                 }
