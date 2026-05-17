@@ -92,8 +92,21 @@ pub(crate) fn apply_locally_for_broadcast<I: Identifier>(
 ) -> AppliedBatch<I> {
     let mut applied: Vec<ClusterMutation<I>> = Vec::with_capacity(mutations.len());
     let mut resumed_for_dispatch: Vec<TaskInfo<I>> = Vec::new();
+    // The originator paths (live primary's `apply_spawn_tasks`,
+    // promoted-secondary's `apply_spawn_tasks`) already walk the
+    // post-apply CRDT via `task_state(&hash)` lookups to reinject
+    // freshly-Pending entries; the apply rule's
+    // `newly_pending_from_spawn` surface targets the receive-side
+    // callers (`apply_cluster_mutations`) instead, so we accept the
+    // surface here and discard. The scratch buffer is allocated once
+    // and reused across the batch.
+    let mut _newly_pending_scratch: Vec<TaskInfo<I>> = Vec::new();
     for m in mutations {
-        let outcome = state.apply_with_resumed_blocked(m.clone(), &mut resumed_for_dispatch);
+        let outcome = state.apply_with_resumed_blocked(
+            m.clone(),
+            &mut resumed_for_dispatch,
+            &mut _newly_pending_scratch,
+        );
         if outcome == ApplyOutcome::Applied {
             applied.push(m);
         }

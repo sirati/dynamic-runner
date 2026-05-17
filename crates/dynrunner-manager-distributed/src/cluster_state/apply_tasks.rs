@@ -113,7 +113,30 @@ impl<I: Identifier> ClusterState<I> {
     /// Returns `Applied` if AT LEAST ONE entry actually mutated the
     /// ledger; `NoOp` if every entry was a duplicate (the whole batch
     /// was already-applied — e.g. retransmission of a CRDT snapshot).
-    pub(super) fn apply_tasks_spawned(&mut self, tasks: Vec<TaskInfo<I>>) -> ApplyOutcome {
+    ///
+    /// `newly_pending_from_spawn` accumulates a clone of every input
+    /// task whose post-classify state is `Pending` (i.e. no deps, or
+    /// all deps already `Completed`). This is the receiver-side
+    /// surface for derived-view pool growth: a coordinator that
+    /// applies a TasksSpawned observed on the wire AND locally owns a
+    /// dispatch pool (live primary's `pending`, promoted-secondary's
+    /// `primary_pending`) uses the surfaced clones to extend the pool
+    /// so the CRDT ledger and the pool stay coherent. The originator
+    /// path (live primary's / promoted-secondary's own
+    /// `apply_spawn_tasks`) already performs an equivalent post-apply
+    /// walk via `task_state` lookup and chooses to ignore this surface
+    /// — keeping the originator's behaviour byte-identical avoids
+    /// double-inject.
+    ///
+    /// Duplicate-hash entries NoOp on the ledger AND are NOT surfaced
+    /// (re-applying a TasksSpawned snapshot does not re-grow the
+    /// pool). Cascade-failed and Blocked entries are not surfaced
+    /// because they should not enter a dispatch pool.
+    pub(super) fn apply_tasks_spawned(
+        &mut self,
+        tasks: Vec<TaskInfo<I>>,
+        newly_pending_from_spawn: &mut Vec<TaskInfo<I>>,
+    ) -> ApplyOutcome {
         let mut applied_any = false;
         for task in tasks {
             let hash = crate::primary::wire::compute_task_hash(&task);
@@ -227,6 +250,12 @@ impl<I: Identifier> ClusterState<I> {
             } else if let Some(on) = blocked_on_pending {
                 TaskState::Blocked { task, on }
             } else {
+                // Surface a clone of the freshly-Pending task so a
+                // receive-side caller can grow its local dispatch
+                // pool. The clone is independent of the CRDT entry —
+                // callers may move it into a pool via `reinject`
+                // without disturbing the ledger.
+                newly_pending_from_spawn.push(task.clone());
                 TaskState::Pending { task }
             };
             tracing::debug!(
