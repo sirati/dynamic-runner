@@ -1254,7 +1254,33 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // work — never become visible to `view_for_worker`. Triggers
         // `on_phase_end(.., 0, 0)` for each empty phase via the
         // lifecycle cascade.
-        self.pool_mut().drain_empty_active_phases();
+        //
+        // Gated on `!self.setup_pending` because in setup-defer mode
+        // the local primary enters `run()` with `binaries = []` and
+        // every declared phase is `Active` with zero items — but only
+        // transiently: the setup-promoted secondary will broadcast
+        // `TaskAdded` once its discovery completes and populate the
+        // cluster ledger. Running the initial-empty-phase cascade now
+        // would mark every phase `Drained` and fire spurious
+        // `on_phase_end(.., 0, 0)` callbacks for phases that haven't
+        // had a chance to receive items yet. Both halves of the
+        // cascade (`drain_empty_active_phases` flipping `Active` →
+        // `Drained`, and `process_phase_lifecycle` firing
+        // `on_phase_end`) must be skipped together to keep the pool
+        // in a coherent state while setup is pending; gating only the
+        // cascade would leave phases stuck in `Drained` with no
+        // organic re-activation path on a setup-defer demoted primary
+        // (TaskAdded mirrors into `cluster_state`, not the local pool,
+        // so `reinject` never runs to unwind `Drained` → `Active`).
+        //
+        // `process_phase_lifecycle` carries its own `setup_pending`
+        // early-return for defence-in-depth at every other call site
+        // (note_item_completed / note_item_failed), but here we keep
+        // the explicit pre-call `drain_empty_active_phases` and the
+        // ALSO-redundant cascade invocation paired under a single
+        // gate — the two are one logical unit (the pre-call exists
+        // only to feed the cascade).
+        //
         // Take/put-back the command-channel receiver around the cascade
         // call: the cascade's per-iteration drain step needs `&mut
         // Receiver` AND the cascade itself needs `&mut self`, which
@@ -1271,9 +1297,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // and the cascade's next `drain_empty_active_phases` poll
         // would otherwise false-fire `on_phase_end(.., 0, 0)` on the
         // successor phase exactly the way the in-loop bug class did.
-        let mut command_rx = self.command_rx.take();
-        self.process_phase_lifecycle(&mut command_rx).await;
-        self.command_rx = command_rx;
+        if !self.setup_pending {
+            self.pool_mut().drain_empty_active_phases();
+            let mut command_rx = self.command_rx.take();
+            self.process_phase_lifecycle(&mut command_rx).await;
+            self.command_rx = command_rx;
+        }
 
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
         self.wait_for_connections().await?;
@@ -1546,6 +1575,26 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
+        // Pre-discovery transient state in setup-defer mode. While
+        // `setup_pending == true` the local primary has `total_tasks = 0`
+        // and every declared phase is `Active` with zero items — not
+        // because they're truly empty, but because the
+        // setup-promoted secondary has not yet broadcast its first
+        // `TaskAdded` / `TasksSpawned`. Firing `on_phase_end(.., 0, 0)`
+        // now would surface a spurious "empty drain" for every phase
+        // before the chosen secondary has had a chance to populate them
+        // (a consumer callback walking just-discovered outputs would
+        // OSError on missing paths). The `setup_pending` latch flips
+        // false the moment a `TaskAdded`, `TasksSpawned`, or
+        // `RunComplete` mutation lands via the mirror path; subsequent
+        // cascade calls resume normal operation. See the
+        // `setup_pending` field doc on `PrimaryCoordinator`.
+        //
+        // Idempotent on the legacy bootstrap path: `setup_pending`
+        // starts `false` there, so the gate is always satisfied.
+        if self.setup_pending {
+            return;
+        }
         loop {
             let drained = self.pool_mut().poll_drain_transitions();
             if drained.is_empty() {

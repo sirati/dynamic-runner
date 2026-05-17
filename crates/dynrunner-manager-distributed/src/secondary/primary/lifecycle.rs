@@ -93,6 +93,29 @@ where
     /// Pre-loop / off-loop callers (e.g. tests, or any
     /// `fail_permanent` path running outside `process_tasks`) pass
     /// `&mut None`.
+    ///
+    /// No setup-pending gate (deliberately): the primary-side mirror
+    /// (`PrimaryCoordinator::process_phase_lifecycle`) early-returns
+    /// while `setup_pending = true` because the demoted submitter
+    /// enters `run()` with `total_tasks = 0` and the chosen secondary
+    /// has not yet broadcast `TaskAdded` — firing
+    /// `on_phase_end(.., 0, 0)` there would be spurious. The
+    /// promoted-secondary path is structurally different: by the time
+    /// `primary_pending` is `Some` (set inside
+    /// `populate_primary_from_cluster_state` in `primary/hydrate.rs`),
+    /// the setup-promoted secondary has ALREADY (a) run Python
+    /// discovery on its bind-mounted source filesystem and
+    /// (b) applied `PhaseDepsSet` + `N×TaskAdded` mutations to its
+    /// own `cluster_state` via `ingest_setup_discovery`. The hydrate
+    /// step reads those items out of `cluster_state` and `extend()`s
+    /// them into the new pool, so `primary_pending`'s phases reflect
+    /// the post-discovery item population from frame zero. A cascade
+    /// firing here observes the legitimate phase state, not a
+    /// pre-discovery transient. The non-promote-setup paths
+    /// (pre-seeded bootstrap, failover-election) reach this point
+    /// with `cluster_state` already populated from the live primary's
+    /// broadcasts, so the same invariant holds — no transient
+    /// empty-phase window exists for the secondary to gate against.
     pub(in crate::secondary) async fn process_primary_phase_lifecycle(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
