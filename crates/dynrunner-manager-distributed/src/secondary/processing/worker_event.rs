@@ -332,7 +332,54 @@ where
                 Ok(None)
             }
             WorkerEvent::Ready { worker_id } => {
-                tracing::debug!(worker_id, "worker ready");
+                // Reclaim the protocol state from the background
+                // `wait_ready` watcher task that
+                // `WorkerPool::ensure_worker_for_type_async` spawned
+                // when it issued the type-shift respawn. The
+                // watcher already wrote the Ready event (this
+                // arm) to the channel before returning the new
+                // `RunnerProtocolState::Idle`; `reclaim_protocol`
+                // installs that state synchronously so the slot
+                // observably transitions Transitioning → Idle and
+                // is_idle_state returns true on the very next
+                // assignment attempt.
+                //
+                // Idempotent on slots that didn't go through
+                // spawn_ready_watcher: `reclaim_protocol` only
+                // takes / awaits the JoinHandle if one is set,
+                // otherwise it's a no-op. The
+                // initial-pool-init Ready events (from
+                // `pool.initialize`'s `wait_for_all_ready` path)
+                // go through `poll_ready` directly without a
+                // background task, so they hit this arm with
+                // `poll_task = None` and pass through cleanly.
+                self.pool.workers[worker_id as usize].reclaim_protocol().await;
+                // Drop the per-worker `TaskRequest` backoff window.
+                // The slot just transitioned out of the
+                // type-shift Transitioning state — any backoff
+                // accrued against the PRIOR Ready cycle (e.g. the
+                // TaskRequest the setup loop fired before the
+                // respawn happened) is stale; gating the
+                // post-Ready repoll on it would freeze the
+                // bounced-task pickup for up to `MAX_BACKOFF`
+                // seconds. Mirrors the `reset_backoff` call in
+                // the assign_task success path and the
+                // `on_primary_changed` reset on
+                // primary-identity flips — the rule is "any
+                // observable transition that revives the slot's
+                // pull semantic resets the rate-limiter".
+                self.primary_link.reset_backoff(worker_id);
+                // Repoll for a task now that the slot is Idle
+                // again. Mirrors the post-TaskCompleted repoll
+                // (line 165 above) so the type-shift respawn
+                // path picks up its bounced task on the next
+                // primary round-trip without waiting for the
+                // periodic `repoll_idle_workers` keepalive tick.
+                // Errors are propagated through `?` since a
+                // send-to-primary failure here is the same wire
+                // error class as elsewhere in this handler.
+                self.request_task_for_worker(worker_id, factory).await?;
+                tracing::debug!(worker_id, "worker ready (post-respawn reclaim)");
                 Ok(None)
             }
         }

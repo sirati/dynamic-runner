@@ -367,6 +367,115 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         }
     }
 
+    /// Spawn a background task that drives `wait_ready` to completion
+    /// and emits the resulting [`WorkerEvent`] to the shared event
+    /// channel.
+    ///
+    /// # Single concern
+    ///
+    /// Replace the synchronous poll-loop callers (which block the
+    /// owning task while a freshly-spawned worker subprocess takes
+    /// arbitrary time to send `Response::Ready`) with the same
+    /// event-driven primitive `assign_task` already uses for the
+    /// per-task poll loop. The protocol moves into the spawned task;
+    /// the JoinHandle is stashed in `poll_task` so
+    /// [`reclaim_protocol`] can recover the resulting state when the
+    /// terminal event lands.
+    ///
+    /// # Boundary
+    ///
+    /// Returns `Ok(())` if the watcher was spawned (the worker was in
+    /// `WaitingForReady`); `Err(_)` if the worker is not in that
+    /// state — a programmer-error contract violation the caller is
+    /// responsible for not triggering. The pool's
+    /// `ensure_worker_for_type` is the sole production caller and
+    /// constructs the handle in `WaitingForReady` immediately before
+    /// the call, satisfying the contract.
+    ///
+    /// # Wedge prevention (production-bug pin)
+    ///
+    /// Before this method existed, [`super::super::pool::WorkerPool::ensure_worker_for_type`]
+    /// drove `wait_ready` synchronously inside the secondary's
+    /// `select!`-driven operational loop. A new worker subprocess
+    /// that took 300+ seconds to send `Response::Ready` (e.g. wedged
+    /// at Python import time, or a fork that legitimately needed
+    /// longer than the keepalive interval to make progress) froze the
+    /// entire tokio runtime: no keepalive ticks, no router events, no
+    /// worker activity. The primary's keepalive_timeout (300s) was
+    /// the only thing that woke things up. By emitting the Ready /
+    /// Disconnected event through the existing channel, the
+    /// operational loop's other arms keep running and the
+    /// post-Ready repoll is wired through the standard
+    /// `handle_worker_event` path.
+    pub fn spawn_ready_watcher(&mut self) -> Result<(), String> {
+        let waiting = self.protocol.take_waiting().ok_or_else(|| {
+            "spawn_ready_watcher requires WaitingForReady state".to_string()
+        })?;
+        let worker_id = self.worker_id;
+        let tx = self.event_tx.clone();
+        let handle = tokio::task::spawn_local(async move {
+            match waiting.wait_ready().await {
+                WaitReadyResult::Ready(idle) => {
+                    // Send first so the operational loop can react
+                    // immediately on the next select! iteration even
+                    // before `reclaim_protocol` runs. The returned
+                    // protocol state is the manager-side handle the
+                    // reclaim path will re-install.
+                    let _ = tx.send(WorkerEvent::Ready { worker_id });
+                    RunnerProtocolState::Idle(idle)
+                }
+                WaitReadyResult::NotYet(_) => {
+                    // `wait_ready` is documented to return Ready,
+                    // Disconnected, or NotYet (the latter only on a
+                    // non-Ready response — e.g. the worker sent a
+                    // PhaseUpdate before Ready, which the protocol
+                    // discards in `wait_ready`'s match arm). For the
+                    // background-task shape we have to fold NotYet
+                    // into "still waiting". Mark the slot Stopped so
+                    // the operational loop's restart machinery can
+                    // observe and recover; emit Disconnected as the
+                    // wire-level shape for "worker never reached
+                    // Ready". This case is genuinely rare and the
+                    // alternative (looping back into wait_ready) would
+                    // resurrect the wedge this method exists to
+                    // prevent — bounded recovery via the restart path
+                    // is the correct fail-safe.
+                    let _ = tx.send(WorkerEvent::Disconnected {
+                        worker_id,
+                        result: TaskResult::error(
+                            ErrorType::Recoverable,
+                            "Worker emitted non-Ready response \
+                             before Ready; treating as disconnect"
+                                .into(),
+                        ),
+                        binary: None,
+                    });
+                    RunnerProtocolState::Unconnected
+                }
+                WaitReadyResult::Disconnected(stopped) => {
+                    let _ = tx.send(WorkerEvent::Disconnected {
+                        worker_id,
+                        result: TaskResult::error(
+                            ErrorType::Recoverable,
+                            "Disconnected before Ready".into(),
+                        ),
+                        binary: None,
+                    });
+                    RunnerProtocolState::Stopped(stopped)
+                }
+            }
+        });
+        self.poll_task = Some(handle);
+        // Protocol is now owned by the spawned task; mark as
+        // Transitioning. `is_ready()` returns false in this state
+        // (protocol.is_idle / is_processing both false) so the
+        // dispatch arm correctly treats the slot as "not yet
+        // assignable" until the Ready event arrives and
+        // `reclaim_protocol` installs the Idle protocol.
+        self.protocol = RunnerProtocolState::Transitioning;
+        Ok(())
+    }
+
     /// Assign a task to this worker. Transitions Idle → Processing.
     ///
     /// Spawns a background task that reads from the transport and sends

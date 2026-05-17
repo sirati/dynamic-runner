@@ -171,18 +171,45 @@ where
                 let estimated = self.estimator.estimate(&actual_binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
                 if self.pool.workers[wid as usize].is_idle_state() {
-                    // Per-type subprocess dispatch: bind the worker's
-                    // loaded TypeId to this task's `type_id` before
-                    // assignment (no-op fast path when they already
-                    // match). On error, recover the binary the same
-                    // way as a `SendFailed` outcome — the binary
-                    // belongs back in the pool and the worker slot is
-                    // queued for respawn.
-                    if let Err(e) = self
-                        .pool
-                        .ensure_worker_for_type(wid, &actual_binary.type_id, factory, false)
-                        .await
-                    {
+                    // Per-type subprocess dispatch with the same
+                    // first-bind / type-shift discrimination as
+                    // dispatch.rs. First-bind (None →
+                    // required_type) uses the synchronous variant
+                    // to preserve the pre-fix observable behaviour
+                    // tests rely on; true type-shifts (Some(T1) →
+                    // Some(T2)) route through the async-event flow
+                    // and re-queue the binary to the local pool so
+                    // the worker's eventual Ready event picks it
+                    // up on the next request_task_for_worker tick.
+                    let prior_type = self.pool.loaded_type_id(wid).cloned();
+                    let is_true_type_shift = prior_type
+                        .as_ref()
+                        .is_some_and(|t| t != &actual_binary.type_id);
+                    let ensure_result: Result<(), String> = if is_true_type_shift {
+                        match self
+                            .pool
+                            .ensure_worker_for_type_async(wid, &actual_binary.type_id, factory, false)
+                            .await
+                        {
+                            Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
+                            Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
+                                tracing::info!(
+                                    worker_id = wid,
+                                    type_id = %actual_binary.type_id,
+                                    "primary self-assign: type-shift respawn issued; \
+                                     re-queuing binary so the eventual Ready event picks it up"
+                                );
+                                self.recover_in_flight_to_pool(&file_hash);
+                                return Ok(());
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        self.pool
+                            .ensure_worker_for_type(wid, &actual_binary.type_id, factory, false)
+                            .await
+                    };
+                    if let Err(e) = ensure_result {
                         tracing::warn!(
                             worker_id = wid,
                             error = %e,

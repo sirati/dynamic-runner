@@ -7,6 +7,41 @@ use crate::cgroup::{self, NestedCgroupHandle};
 use crate::manager::WorkerFactory;
 use crate::worker::{WorkerEvent, WorkerHandle};
 
+/// Outcome of [`WorkerPool::ensure_worker_for_type`].
+///
+/// Two-axis discriminator: was the slot already bound to the required
+/// type (`AlreadyLoaded`, the dominant single-type fast path), or did
+/// the call SIGKILL the prior subprocess and spawn a new one whose
+/// readiness is still pending (`RespawnInProgress`)? The caller MUST
+/// branch on this so it can bounce in-flight tasks as backpressure
+/// rather than try to assign onto a worker that hasn't sent its
+/// `Response::Ready` yet.
+///
+/// See [`WorkerPool::ensure_worker_for_type`]'s rustdoc for the
+/// wedge-prevention rationale: pre-fix the wait-for-Ready was
+/// synchronous and held the secondary's `select!` arm body open for
+/// the entire duration the new subprocess took to start (300+s
+/// production wedge on slow Python init). The async-Ready event flow
+/// is what removes that wedge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnsureWorkerOutcome {
+    /// Same-type fast path — the slot's `loaded_type_id` already
+    /// matched `required_type`. No kill, no spawn, no Ready wait. The
+    /// caller may immediately proceed with `assign_task`.
+    AlreadyLoaded,
+    /// Type-shift respawn was issued. The prior subprocess was
+    /// SIGKILLed and a fresh one has been spawned for the new type;
+    /// a background task is driving `wait_ready` and will emit
+    /// [`crate::worker::WorkerEvent::Ready`] (or `Disconnected`)
+    /// through the pool's event channel when the new subprocess
+    /// reports its protocol-level Ready response. **The slot is NOT
+    /// assignable until the Ready event lands.** Callers should treat
+    /// this as transient unavailability and route in-flight work
+    /// elsewhere (backpressure-bounce to the primary in the
+    /// distributed-mode case).
+    RespawnInProgress,
+}
+
 /// Result of a resource pressure check — tells the caller what happened so it
 /// can take manager-specific action (requeue task, report to primary, etc.).
 pub enum ResourcePressureResult<I: Identifier> {
@@ -243,17 +278,18 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         Ok(())
     }
 
-    /// Ensure the given worker's subprocess is bound to `required_type`.
+    /// Ensure the given worker's subprocess is bound to `required_type`,
+    /// **blocking the calling task until the freshly-respawned worker
+    /// reports `Response::Ready`**.
     ///
-    /// Per-type subprocess dispatch primitive: when a multi-phase
-    /// `TaskDefinition` declares one `TaskTypeSpec` (and therefore one
-    /// `worker_module`) per phase, the worker subprocess that ran
-    /// phase N's tasks cannot execute phase N+1's tasks — its argv
-    /// loaded the wrong module. This call compares the worker's
-    /// recorded `loaded_type_id` against the next task's `type_id`
-    /// and, on mismatch, kills + respawns the slot through
-    /// [`WorkerFactory::spawn_worker_for_type`] before the assignment
-    /// proceeds.
+    /// Used by callers that are not driving a `select!`-shaped event
+    /// loop — typically the in-process [`crate::manager::LocalManager`]
+    /// pipeline, which expects "ensure returned Ok ⇒ slot is
+    /// assignable now". The blocking wait is bounded by the
+    /// subprocess's own startup time; for the distributed-mode
+    /// `select!` callers see
+    /// [`Self::ensure_worker_for_type_async`] which does NOT block
+    /// the operational loop on the new worker's Ready.
     ///
     /// Same-type fast path: when the recorded `loaded_type_id`
     /// matches `required_type` (the dominant case in a single-type
@@ -263,16 +299,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     /// bit-for-bit.
     ///
     /// Empty-state path: a freshly-initialised worker has
-    /// `loaded_type_id == None` because [`initialize`] cannot
+    /// `loaded_type_id == None` because [`Self::initialize`] cannot
     /// generally know which `TypeId` the first assignment will pick.
     /// The mismatch arm fires once on the first assignment per slot,
-    /// binding the worker to that type. Subsequent same-type
-    /// assignments hit the fast path.
+    /// binding the worker to that type.
     ///
     /// Preserves `reserved_budgets` and `assignment_failure_count`
-    /// across the respawn — same contract as
-    /// [`restart_worker`] — and waits for the freshly-spawned worker
-    /// to reach Ready before returning.
+    /// across the respawn — same contract as [`Self::restart_worker`].
     pub async fn ensure_worker_for_type(
         &mut self,
         worker_id: WorkerId,
@@ -280,6 +313,102 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         factory: &mut impl WorkerFactory<M>,
         print_pid: bool,
     ) -> Result<(), String> {
+        // Funnel through the async-event variant for the kill+spawn
+        // half; same-type fast path returns AlreadyLoaded and we
+        // short-circuit without touching the Ready wait at all.
+        match self
+            .ensure_worker_for_type_async(worker_id, required_type, factory, print_pid)
+            .await?
+        {
+            EnsureWorkerOutcome::AlreadyLoaded => Ok(()),
+            EnsureWorkerOutcome::RespawnInProgress => {
+                // Synchronously drive the just-spawned worker to
+                // Ready. `ensure_worker_for_type_async` stashed a
+                // wait-for-Ready background task into
+                // `WorkerHandle::poll_task`; reclaiming it here is
+                // the inverse of the operational-loop's
+                // `handle_worker_event::Ready` arm and gives the
+                // same Idle protocol state without going through
+                // the event channel.
+                //
+                // We don't drain `recv_event` from here because
+                // `LocalManager` (the production caller of the
+                // blocking variant) owns its own event loop and
+                // expects events to arrive there; consuming them
+                // ahead of the loop would skip the standard
+                // `WorkerEvent::Ready` handler. The reclaim is
+                // sufficient because `spawn_ready_watcher`'s
+                // background task already wrote the Ready event to
+                // the channel before its `await` completed, and the
+                // protocol state is recovered from the task's
+                // return value — exactly the same pair of
+                // side effects the synchronous loop produced before.
+                let idx = worker_id as usize;
+                self.workers[idx].reclaim_protocol().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensure the given worker's subprocess is bound to `required_type`,
+    /// **without blocking the calling task on the freshly-respawned
+    /// worker's Ready**.
+    ///
+    /// Per-type subprocess dispatch primitive: when a multi-phase
+    /// `TaskDefinition` declares one `TaskTypeSpec` (and therefore one
+    /// `worker_module`) per phase, the worker subprocess that ran
+    /// phase N's tasks cannot execute phase N+1's tasks — its argv
+    /// loaded the wrong module. This call compares the worker's
+    /// recorded `loaded_type_id` against the next task's `type_id`
+    /// and, on mismatch, kills + respawns the slot through
+    /// [`WorkerFactory::spawn_worker_for_type`].
+    ///
+    /// # Return outcomes
+    ///
+    /// * `Ok(EnsureWorkerOutcome::AlreadyLoaded)` — same-type fast
+    ///   path. No kill, no spawn, no Ready wait. The slot is
+    ///   immediately assignable.
+    /// * `Ok(EnsureWorkerOutcome::RespawnInProgress)` — the prior
+    ///   subprocess was SIGKILLed and a new one has been spawned for
+    ///   `required_type`. The slot is **not yet assignable**: the
+    ///   new worker hasn't reported `Response::Ready` yet. The caller
+    ///   MUST treat this as "no idle worker available right now" —
+    ///   e.g. bounce the task to the primary as backpressure — and
+    ///   wait for the standard [`crate::worker::WorkerEvent::Ready`]
+    ///   arrival via the pool's event channel before re-trying.
+    /// * `Err(_)` — the spawn syscall failed. The slot is in an
+    ///   indeterminate state; the caller should requeue the worker
+    ///   for restart via the standard `pending_worker_restarts`
+    ///   machinery.
+    ///
+    /// # Wedge prevention (production-bug pin)
+    ///
+    /// Pre-split, the secondary's distributed-dispatch arm awaited
+    /// the new worker's `Response::Ready` inline. When invoked from
+    /// inside the secondary's `select!`-driven operational loop, the
+    /// await blocked every other arm — keepalives, peer messages,
+    /// worker events, OOM ticks — for the entire duration the new
+    /// subprocess took to start. In production this manifested as a
+    /// 300s tokio-runtime silence on asm-tokenizer's LMU dispatch
+    /// when a singleton-typed phase chain (one task per phase, each
+    /// phase a distinct `TypeId`) forced a respawn on every phase
+    /// boundary and one of the new Python subprocesses took longer
+    /// than the primary's keepalive_timeout to send Ready. The
+    /// `RespawnInProgress` shape pushes the wait into a background
+    /// task that emits its terminal event through the standard event
+    /// channel, so the operational loop's other arms keep running
+    /// and the primary observes a steady keepalive stream regardless
+    /// of how slow the new subprocess is.
+    ///
+    /// Preserves `reserved_budgets` and `assignment_failure_count`
+    /// across the respawn — same contract as [`Self::restart_worker`].
+    pub async fn ensure_worker_for_type_async(
+        &mut self,
+        worker_id: WorkerId,
+        required_type: &TypeId,
+        factory: &mut impl WorkerFactory<M>,
+        print_pid: bool,
+    ) -> Result<EnsureWorkerOutcome, String> {
         let idx = worker_id as usize;
         if self
             .workers
@@ -287,7 +416,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             .and_then(|w| w.loaded_type_id.as_ref())
             == Some(required_type)
         {
-            return Ok(());
+            return Ok(EnsureWorkerOutcome::AlreadyLoaded);
         }
 
         let old = &mut self.workers[idx];
@@ -332,23 +461,36 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
         handle.loaded_type_id = Some(required_type.clone());
+        // Spawn the wait-for-Ready background task BEFORE handing
+        // the handle to `self.workers[idx]` so the protocol moves
+        // into `Transitioning` and the slot's `is_idle_state()`
+        // correctly reports false until the Ready event lands.
+        // Failure here ("not in WaitingForReady") is a programmer
+        // error — `WorkerHandle::new` constructed the handle in
+        // WaitingForReady one statement ago — but we propagate the
+        // error rather than panic so the caller can surface a clean
+        // failure to the primary.
+        handle.spawn_ready_watcher()?;
         self.workers[idx] = handle;
-
-        // Wait for ready — same shape as `restart_worker`.
-        loop {
-            if self.workers[idx].is_ready() {
-                break;
-            }
-            self.workers[idx].poll_ready().await;
-            tokio::task::yield_now().await;
-        }
 
         tracing::info!(
             worker_id,
             type_id = %required_type,
-            "worker respawned for type-shift and ready"
+            "worker respawned for type-shift; wait_ready running in background"
         );
-        Ok(())
+        Ok(EnsureWorkerOutcome::RespawnInProgress)
+    }
+
+    /// Snapshot the slot's currently-bound `TypeId`, or `None` if the
+    /// slot has never been bound to a type (initial pool-init state,
+    /// or a restart that lost the binding). Callers can use this to
+    /// distinguish first-bind (`None`) from true type-shift
+    /// (`Some(T1)` → `Some(T2)`) before invoking
+    /// [`Self::ensure_worker_for_type_async`].
+    pub fn loaded_type_id(&self, worker_id: WorkerId) -> Option<&TypeId> {
+        self.workers
+            .get(worker_id as usize)
+            .and_then(|w| w.loaded_type_id.as_ref())
     }
 
     /// Update actual resource usage for all workers from /proc/[pid]/statm.
