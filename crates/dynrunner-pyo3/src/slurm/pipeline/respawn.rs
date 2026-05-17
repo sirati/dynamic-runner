@@ -165,6 +165,7 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
             forwarded_argv.to_vec(),
             use_reverse_connection,
             outcome.run_log_dir.clone(),
+            outcome.shutdown_manager_remote_path.clone(),
         );
 
     // --- Build the PySlurmSpawner pyclass. ---

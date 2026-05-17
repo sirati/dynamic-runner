@@ -236,6 +236,56 @@ impl PyRustSlurmJobManager {
         })
     }
 
+    /// Stage the `dynrunner-slurm-shutdown` binary on the gateway and
+    /// record the resolved remote path on the Rust manager (so later
+    /// wrapper-script renders pick it up via
+    /// `shutdown_manager_remote_path`).
+    ///
+    /// Reads the local source path from
+    /// `DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`. Unset → warn-and-return
+    /// `None`; set-but-missing → raises a Python `RuntimeError` so
+    /// the misconfigured dispatch surfaces loudly rather than
+    /// silently disabling orphan-container cleanup.
+    ///
+    /// Single-concern delegate: `SlurmJobManager::upload_shutdown_manager_binary`
+    /// in `dynrunner-slurm/src/job_manager/shutdown_binary.rs` owns
+    /// the upload mechanics; this method is the GIL-release +
+    /// tokio-runtime wrapper.
+    fn upload_shutdown_manager_binary(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .upload_shutdown_manager_binary()
+                    .await
+                    .map_err(slurm_err_to_py)
+            })
+        })
+    }
+
+    /// Read the gateway-side path of the previously-uploaded
+    /// shutdown-manager binary. Returns `None` when
+    /// `upload_shutdown_manager_binary` was skipped (env var unset)
+    /// or has not been invoked yet on this manager.
+    ///
+    /// Exposed so the Python preparation step can thread the resolved
+    /// path into every per-secondary `generate_wrapper_script` kwarg
+    /// (including the respawn path) without re-reading the env var or
+    /// re-uploading the binary.
+    #[getter]
+    fn shutdown_manager_remote_path(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.inner.clone();
+        Ok(py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .shutdown_manager_remote_path()
+                    .map(str::to_owned)
+            })
+        }))
+    }
+
     /// Cancel a single SLURM job via `scancel`.
     fn cancel_job(&self, py: Python<'_>, job_id: String) -> PyResult<()> {
         let inner = self.inner.clone();

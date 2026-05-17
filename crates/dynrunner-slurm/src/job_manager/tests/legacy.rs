@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use super::types::{SlurmError, SlurmJobManager};
+use super::super::types::{SlurmError, SlurmJobManager};
 use crate::config::SlurmConfig;
 use crate::packaging::{PackagingError, PodmanImageMetadata, PodmanPackaging};
 use dynrunner_gateway::local::LocalGateway;

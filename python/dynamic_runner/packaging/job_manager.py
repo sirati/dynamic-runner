@@ -97,6 +97,54 @@ class SlurmJobManager:
         self._rust.prepare_directories()
         logger.info("Directories created successfully")
 
+    def upload_shutdown_manager_binary(self) -> str | None:
+        """Stage the ``dynrunner-slurm-shutdown`` binary on the gateway.
+
+        Pure delegation to Rust for the upload mechanics. The Rust
+        side reads ``DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`` (set by
+        the consumer's nix flake to
+        ``result/bin/dynrunner-slurm-shutdown``), uploads the binary
+        to ``<root_folder>/dynrunner-slurm-shutdown`` on the gateway,
+        ``chmod 755``s it, and records the (raw, possibly
+        tilde-prefixed) remote path on the manager.
+
+        Returns the tilde-expanded remote path for the caller's use
+        (the wrapper-script template ``bash_quote``s the path, which
+        wraps tilde-bearing paths in single quotes and DEFEATS bash's
+        tilde expansion at script runtime). Resolving the tilde here
+        — at the Python bridge boundary — mirrors :meth:`submit_job`'s
+        ``run_log_dir`` expansion: tilde resolution needs the
+        gateway's ``remote_home`` attribute, which the Rust core
+        can't see through ``PyGatewayAdapter``. The Rust manager
+        retains the raw path verbatim; the expansion is a one-way
+        Python-side concern.
+
+        Returns ``None`` when the env var was unset (orphan-container
+        cleanup disabled — Rust side emits a tracing warning so the
+        missing integration is operator-visible).
+        """
+        raw = self._rust.upload_shutdown_manager_binary()
+        if raw is None:
+            return None
+        return self._expand_path(raw)
+
+    @property
+    def shutdown_manager_remote_path(self) -> str | None:
+        """Gateway-side path of the uploaded shutdown-manager binary.
+
+        Tilde-expanded (mirrors the
+        :meth:`upload_shutdown_manager_binary` return shape — see
+        that method's docstring for the rationale). ``None`` when
+        the upload was skipped (env var unset) or hasn't been called
+        yet. Read by the Rust preparation step when threading the
+        value into per-secondary ``generate_wrapper_script`` kwargs
+        (initial cohort + respawn paths).
+        """
+        raw = self._rust.shutdown_manager_remote_path
+        if raw is None:
+            return None
+        return self._expand_path(raw)
+
     def upload_source_binaries(
         self,
         binaries: list[Any],
@@ -200,6 +248,7 @@ class SlurmJobManager:
         reverse_connection: bool = False,
         run_log_dir: str | None = None,
         is_observer: bool = False,
+        shutdown_manager_bin_path: str | None = None,
     ) -> str:
         """Generate the bash wrapper script for a SLURM job.
 
@@ -241,6 +290,17 @@ class SlurmJobManager:
         ``--compiler``, ``--name-regex``, …) and ``task.discover_items``
         sees them. Defaults to an empty list (back-compat with callers
         that haven't been updated).
+
+        ``shutdown_manager_bin_path`` is the gateway-side absolute path
+        of the ``dynrunner-slurm-shutdown`` binary (as recorded by
+        :meth:`upload_shutdown_manager_binary`). When set, the rendered
+        wrapper spawns the shutdown manager under
+        ``systemd-run --user --scope`` so it survives slurmd cgroup
+        teardown. When ``None`` the wrapper omits the spawn block and
+        the cleanup trap is a minimal CMD_RELAY-only teardown (no
+        ``/tmp`` cleanup on SLURM-induced termination — Rust side
+        emits a warning at upload time so the missing integration is
+        operator-visible).
         """
         connection_info_dir = (
             self._expand_path(f"{run_log_dir or self.slurm_config.get_log_dir()}/connection_info")
@@ -275,6 +335,7 @@ class SlurmJobManager:
             reverse_connection=reverse_connection,
             connection_info_dir=connection_info_dir,
             is_observer=is_observer,
+            shutdown_manager_bin_path=shutdown_manager_bin_path,
         )
 
     def generate_test_wrapper_script(self, image_metadata: PodmanImageMetadata) -> str:
