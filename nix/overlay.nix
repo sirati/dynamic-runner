@@ -5,7 +5,17 @@ final: prev: {
   # set), exactly like an upstream nixpkgs Python package.
   pythonPackagesExtensions = (prev.pythonPackagesExtensions or [ ]) ++ [
     (pyFinal: pyPrev: {
-      dynamic-runner = pyFinal.callPackage ./wheel.nix { };
+      dynamic-runner = pyFinal.callPackage ./wheel.nix {
+        # Build the musl-static shutdown-manager binary on the
+        # consumer's nixpkgs and pass it through. The binary's
+        # derivation is shared with `flake.nix` — single source of
+        # truth in `./shutdown-manager-bin.nix`.
+        #
+        # `final` (not `pyFinal`) is the right pkgs scope: the
+        # shutdown-manager-bin derivation needs `pkgsCross`, which
+        # lives on the top-level pkgs, not on the Python package set.
+        shutdownManagerBin = final.callPackage ./shutdown-manager-bin.nix { };
+      };
     })
   ];
 }
