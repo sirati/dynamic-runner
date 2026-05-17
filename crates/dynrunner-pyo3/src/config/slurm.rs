@@ -35,6 +35,7 @@ pub(crate) struct PySlurmConfig {
     nodes: u32,
     notify_email: Option<String>,
     prestaged_src_bins_path: Option<PyPathStr>,
+    signal_lead_seconds: u32,
 }
 
 impl Default for PySlurmConfig {
@@ -57,6 +58,7 @@ impl From<SlurmConfig> for PySlurmConfig {
             nodes: c.nodes,
             notify_email: c.notify_email,
             prestaged_src_bins_path: c.prestaged_src_bins_path.map(PyPathStr::from),
+            signal_lead_seconds: c.signal_lead_seconds,
         }
     }
 }
@@ -78,6 +80,7 @@ impl From<&PySlurmConfig> for SlurmConfig {
                 .prestaged_src_bins_path
                 .as_ref()
                 .map(|p| p.as_str().to_owned()),
+            signal_lead_seconds: c.signal_lead_seconds,
         }
     }
 }
@@ -97,6 +100,7 @@ impl PySlurmConfig {
         nodes = None,
         notify_email = None,
         prestaged_src_bins_path = None,
+        signal_lead_seconds = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -113,6 +117,7 @@ impl PySlurmConfig {
         nodes: Option<u32>,
         notify_email: Option<String>,
         prestaged_src_bins_path: Option<PyPathStr>,
+        signal_lead_seconds: Option<u32>,
     ) -> Self {
         let d = SlurmConfig::default();
         Self {
@@ -131,6 +136,7 @@ impl PySlurmConfig {
             nodes: nodes.unwrap_or(d.nodes),
             notify_email,
             prestaged_src_bins_path,
+            signal_lead_seconds: signal_lead_seconds.unwrap_or(d.signal_lead_seconds),
         }
     }
 
@@ -223,7 +229,8 @@ impl PySlurmConfig {
             "SlurmConfig(root_folder={:?}, image_subfolder={:?}, \
              output_subfolder={:?}, log_subfolder={:?}, partition={:?}, \
              time_limit={:?}, cpus_per_task={}, memory_per_node={:?}, \
-             nodes={}, notify_email={:?}, prestaged_src_bins_path={:?})",
+             nodes={}, notify_email={:?}, prestaged_src_bins_path={:?}, \
+             signal_lead_seconds={})",
             self.root_folder.as_str(),
             self.image_subfolder,
             self.output_subfolder,
@@ -235,6 +242,7 @@ impl PySlurmConfig {
             self.nodes,
             self.notify_email,
             self.prestaged_src_bins_path.as_ref().map(PyPathStr::as_str),
+            self.signal_lead_seconds,
         )
     }
 }
