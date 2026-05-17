@@ -81,7 +81,7 @@ where
                     tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
                     return;
                 }
-                let _ = self.request_task_for_worker(worker_id).await;
+                let _ = self.request_task_for_worker(worker_id, factory).await;
             }
             ResourcePressureResult::NoAction => {}
         }
@@ -91,7 +91,11 @@ where
     ///
     /// Returns `Some(worker_id)` if the worker needs to be restarted (e.g.
     /// after disconnect). The caller is responsible for calling
-    pub(super) async fn request_task_for_worker(&mut self, worker_id: WorkerId) -> Result<(), String> {
+    pub(super) async fn request_task_for_worker(
+        &mut self,
+        worker_id: WorkerId,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<(), String> {
         // When primary, handle task requests locally
         if self.is_primary && !self.primary_pending_is_empty() {
             let available_memory = if (worker_id as usize) < self.pool.workers.len() {
@@ -104,6 +108,7 @@ where
                     self.config.secondary_id.clone(),
                     worker_id,
                     available_memory,
+                    factory,
                 )
                 .await;
         }
@@ -210,11 +215,14 @@ where
     /// completions and the primary's kickstart targeted only one of
     /// them). Regular live-primary runs see most polls suppressed by
     /// the backoff because the kickstart already covers the path.
-    pub(super) async fn repoll_idle_workers(&mut self) {
+    pub(super) async fn repoll_idle_workers(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         let n = self.pool.workers.len();
         for wid in 0..n {
             if self.pool.workers[wid].is_idle_state() {
-                let _ = self.request_task_for_worker(wid as WorkerId).await;
+                let _ = self.request_task_for_worker(wid as WorkerId, factory).await;
             }
         }
     }

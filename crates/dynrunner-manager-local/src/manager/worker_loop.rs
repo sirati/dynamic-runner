@@ -265,6 +265,22 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let binary = self.pool_mut().take_from_view(view, binary_index);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
+                // Per-type subprocess dispatch: if the worker's loaded
+                // type does not match this task's `type_id`, the pool
+                // kills + respawns the subprocess through
+                // `WorkerFactory::spawn_worker_for_type` before the
+                // assignment proceeds. Same-type assignments are a
+                // no-op fast path.
+                let print_pid = self.config.print_pid;
+                if let Err(e) = self
+                    .pool
+                    .ensure_worker_for_type(worker_id, &binary.type_id, factory, print_pid)
+                    .await
+                {
+                    self.pool_mut().requeue(binary);
+                    self.handle_assignment_failure(worker_id, &e, factory).await;
+                    return;
+                }
                 let worker = &mut self.pool.workers[worker_id as usize];
                 match worker
                     .assign_task(binary.clone(), estimated_usage.clone(), opportunistic)

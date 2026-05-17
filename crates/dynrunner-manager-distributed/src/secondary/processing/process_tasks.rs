@@ -71,7 +71,7 @@ where
         // Request tasks only for workers that didn't get initial assignments
         for i in 0..self.pool.workers.len() {
             if self.pool.workers[i].is_idle_state() {
-                self.request_task_for_worker(i as WorkerId).await?;
+                self.request_task_for_worker(i as WorkerId, factory).await?;
             }
         }
 
@@ -137,7 +137,7 @@ where
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
-                        let restart = self.handle_worker_event(event, &mut command_rx).await?;
+                        let restart = self.handle_worker_event(event, &mut command_rx, factory).await?;
                         if let Some(wid) = restart {
                             workers_to_restart.push(wid);
                         }
@@ -146,7 +146,7 @@ where
                 msg = self.primary_transport.recv(), if !self.primary_disconnected => {
                     match msg {
                         Some(m) => {
-                            self.dispatch_message(m, &mut command_rx).await?;
+                            self.dispatch_message(m, &mut command_rx, factory).await?;
                         }
                         None => {
                             // Primary's transport returned None — the
@@ -275,7 +275,7 @@ where
                 }
                 peer_msg = self.peer_transport.recv_peer() => {
                     if let Some(m) = peer_msg {
-                        self.handle_peer_message(m, &mut command_rx).await;
+                        self.handle_peer_message(m, &mut command_rx, factory).await;
                     }
                 }
                 // Announcer-outbox drain. The observer-mode
@@ -369,7 +369,7 @@ where
                     // tick's re-poll without waiting for the next
                     // keepalive cycle. Mirrors the local primary's
                     // `run_retry_passes` — see primary.rs.
-                    self.primary_drain_check_and_retry().await;
+                    self.primary_drain_check_and_retry(factory).await;
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (in `primary_link`, doubles on each
@@ -386,7 +386,7 @@ where
                     // primary path doesn't track per-peer worker
                     // idleness, so the periodic re-poll is the
                     // failover-safe wakeup.
-                    self.repoll_idle_workers().await;
+                    self.repoll_idle_workers(factory).await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
                         let _ = self.peer_transport.broadcast(msg).await;
@@ -880,7 +880,7 @@ where
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
                 }
-                let _ = self.request_task_for_worker(wid).await;
+                let _ = self.request_task_for_worker(wid, factory).await;
             }
         }
 

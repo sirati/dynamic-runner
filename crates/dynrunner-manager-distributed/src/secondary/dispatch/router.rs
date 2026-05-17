@@ -15,6 +15,7 @@
 //! `secondary/dispatch/mod.rs`.
 
 use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
@@ -45,6 +46,7 @@ where
         &mut self,
         msg: DistributedMessage<I>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         // Any message from the primary side resets the election state and
         // bumps the keepalive timestamp (F2).
@@ -133,10 +135,50 @@ where
                         .unwrap_or(wid)
                 };
 
-                let worker = &mut self.pool.workers[target_wid as usize];
-                if worker.is_idle_state() {
+                if self.pool.workers[target_wid as usize].is_idle_state() {
                     let estimated_mb = estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     let log_task_hash = file_hash.clone();
+                    // Per-type subprocess dispatch: kill+respawn the
+                    // target worker if its currently-loaded type does
+                    // not match this task's `type_id` (no-op fast
+                    // path on type match — the dominant case for
+                    // single-type runs). Failures here are treated as
+                    // peer-assign failures: queue the worker for
+                    // respawn and report the task as backpressure-
+                    // shaped to the primary, mirroring the existing
+                    // Bug B/C recovery shape below.
+                    if let Err(e) = self
+                        .pool
+                        .ensure_worker_for_type(target_wid, &binary.type_id, factory, false)
+                        .await
+                    {
+                        tracing::warn!(
+                            worker_id = target_wid,
+                            error = %e,
+                            type_id = %binary.type_id,
+                            "ensure_worker_for_type failed for peer-assigned task; queuing respawn"
+                        );
+                        self.pending_worker_restarts.insert(target_wid);
+                        let task_failed = DistributedMessage::TaskFailed {
+                            sender_id: self.config.secondary_id.clone(),
+                            timestamp: timestamp_now(),
+                            secondary_id: self.config.secondary_id.clone(),
+                            worker_id: target_wid,
+                            task_hash: file_hash.clone(),
+                            error_type: ErrorType::Recoverable,
+                            error_message: format!(
+                                "No idle worker available (type-shift respawn failed): {e}"
+                            ),
+                        };
+                        // Mirror the "no idle worker available" arm:
+                        // unicast to the current primary, broadcast to
+                        // peers (belt-and-suspenders for primary
+                        // changeover mid-flight).
+                        self.send_to_current_primary(task_failed.clone()).await?;
+                        let _ = self.peer_transport.broadcast(task_failed).await;
+                        return Ok(());
+                    }
+                    let worker = &mut self.pool.workers[target_wid as usize];
                     match worker.assign_task(binary, estimated, false).await {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
@@ -455,7 +497,7 @@ where
                 // hang fix. This repoll closes the structural race
                 // independent of that fix.
                 if !self.setup_pending {
-                    self.repoll_idle_workers().await;
+                    self.repoll_idle_workers(factory).await;
                 }
                 Ok(())
             }
@@ -501,7 +543,7 @@ where
                     // for symmetry with the other TaskFailed sites
                     // so future maintainers don't have to remember
                     // a per-site filter.
-                    self.primary_drain_check_and_retry().await;
+                    self.primary_drain_check_and_retry(factory).await;
                 }
                 Ok(())
             }
@@ -618,7 +660,7 @@ where
                     .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
                     .map(|r| r.amount)
                     .unwrap_or(0);
-                self.handle_primary_task_request(secondary_id, worker_id, available_memory)
+                self.handle_primary_task_request(secondary_id, worker_id, available_memory, factory)
                     .await
             }
             _ => {

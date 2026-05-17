@@ -9,6 +9,7 @@
 //! recovery all flow through this method.
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, PeerTransport,
@@ -35,6 +36,7 @@ where
         requesting_secondary_id: String,
         worker_id: WorkerId,
         available_memory: u64,
+        factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         if self.primary_pending_is_empty() {
             tracing::debug!(
@@ -169,6 +171,28 @@ where
                 let estimated = self.estimator.estimate(&actual_binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
                 if self.pool.workers[wid as usize].is_idle_state() {
+                    // Per-type subprocess dispatch: bind the worker's
+                    // loaded TypeId to this task's `type_id` before
+                    // assignment (no-op fast path when they already
+                    // match). On error, recover the binary the same
+                    // way as a `SendFailed` outcome — the binary
+                    // belongs back in the pool and the worker slot is
+                    // queued for respawn.
+                    if let Err(e) = self
+                        .pool
+                        .ensure_worker_for_type(wid, &actual_binary.type_id, factory, false)
+                        .await
+                    {
+                        tracing::warn!(
+                            worker_id = wid,
+                            error = %e,
+                            type_id = %actual_binary.type_id,
+                            "primary self-assign: ensure_worker_for_type failed; re-queuing binary"
+                        );
+                        self.pending_worker_restarts.insert(wid);
+                        self.recover_in_flight_to_pool(&file_hash);
+                        return Ok(());
+                    }
                     match self.pool.workers[wid as usize]
                         .assign_task(actual_binary, estimated, false)
                         .await

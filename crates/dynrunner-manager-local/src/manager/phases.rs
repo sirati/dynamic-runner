@@ -76,6 +76,23 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
 
+                // Per-type subprocess dispatch: see worker_loop's
+                // `try_assign_normal` for the full rationale. Initial
+                // assignment binds each freshly-spawned worker to the
+                // first task's `type_id`; the same-type fast path
+                // covers every subsequent assignment to that slot
+                // until a `type_id` shift.
+                let print_pid = self.config.print_pid;
+                if let Err(e) = self
+                    .pool
+                    .ensure_worker_for_type(worker_id, &binary.type_id, factory, print_pid)
+                    .await
+                {
+                    self.pool_mut().requeue(binary);
+                    self.total_assigned_resources.sub(&estimated_usage);
+                    self.handle_assignment_failure(worker_id, &e, factory).await;
+                    return;
+                }
                 let worker = &mut self.pool.workers[worker_id as usize];
                 match worker.assign_task(binary.clone(), estimated_usage.clone(), opportunistic).await {
                     Ok(()) => {

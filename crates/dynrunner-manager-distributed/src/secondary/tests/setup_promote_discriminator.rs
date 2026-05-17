@@ -5,7 +5,7 @@
     //! `record_promotion_confirm` directly so the assertions are on
     //! the state-machine outcome, not on a select! loop's timing.
 
-    use super::super::test_helpers::{election_config, FixedEstimator, RecordingPeer, TestId};
+    use super::super::test_helpers::{election_config, FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId};
     use super::super::*;
     use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
     use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
@@ -135,7 +135,7 @@
                     epoch: 1,
                     required_setup: true,
                 };
-                sec.dispatch_message(promote, &mut None)
+                sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
                     .await
                     .expect("PromotePrimary handler succeeds");
 
@@ -238,7 +238,7 @@
                     epoch: 1,
                     required_setup: false,
                 };
-                sec.dispatch_message(promote, &mut None)
+                sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
                     .await
                     .expect("PromotePrimary handler succeeds");
 
@@ -393,7 +393,7 @@
                     epoch: 1,
                     required_setup: false,
                 };
-                sec.dispatch_message(promote, &mut None)
+                sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
                     .await
                     .expect("PromotePrimary handler succeeds");
 

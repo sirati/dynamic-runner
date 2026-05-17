@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-    use super::super::test_helpers::{election_config, make_secondary};
+    use super::super::test_helpers::{election_config, make_secondary, FakeWorkerFactory};
     use super::super::wire::timestamp_now;
     use super::*;
     use std::time::Duration;
@@ -94,7 +94,7 @@
             epoch: 1,
             required_setup: false,
         };
-        let result = sec.dispatch_message(promote, &mut None).await;
+        let result = sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory).await;
 
         // Handler returns Ok(()) (silently rejects) — we don't
         // upgrade to Err because Err propagates to the processing
@@ -200,7 +200,7 @@
             epoch: 99,
             required_setup: false,
         };
-        sec.dispatch_message(promote, &mut None)
+        sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
             .await
             .expect("PromotePrimary handler returns Ok even when rejecting");
         assert!(

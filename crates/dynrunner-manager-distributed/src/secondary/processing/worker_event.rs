@@ -8,6 +8,7 @@
 //! task-outcome the local worker emits.
 
 use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
@@ -36,6 +37,7 @@ where
         &mut self,
         event: WorkerEvent<I>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        factory: &mut impl WorkerFactory<M>,
     ) -> Result<Option<WorkerId>, String> {
         match event {
             WorkerEvent::TaskCompleted {
@@ -132,7 +134,7 @@ where
                         // rationale): immediately re-inject if this
                         // was the last in-flight task and there's
                         // retry budget left.
-                        self.primary_drain_check_and_retry().await;
+                        self.primary_drain_check_and_retry(factory).await;
                         // Report error to the current primary.
                         let msg = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),
@@ -150,7 +152,7 @@ where
                     }
 
                     // Request next task for this worker
-                    self.request_task_for_worker(worker_id).await?;
+                    self.request_task_for_worker(worker_id, factory).await?;
                 }
 
                 // Operator-facing INFO: did the worker finish a

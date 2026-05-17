@@ -8,6 +8,7 @@
 //! failed"; this module owns the bookkeeping side effects).
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender, TaskInfo};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -190,7 +191,10 @@ where
     /// next request. Only the primary's own workers need an
     /// immediate kick — they're the ones whose `request_task_for_worker`
     /// short-circuits through `handle_primary_task_request` directly.
-    pub(in crate::secondary) async fn primary_drain_check_and_retry(&mut self) {
+    pub(in crate::secondary) async fn primary_drain_check_and_retry(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) {
         if !self.is_primary {
             return;
         }
@@ -264,7 +268,7 @@ where
 
         // Kick our own idle workers — see method-level doc. Peer
         // workers self-recover on their next keepalive-driven repoll.
-        self.repoll_idle_workers().await;
+        self.repoll_idle_workers(factory).await;
     }
 
     /// Test/inspection helper: whether the pool has zero queued items.

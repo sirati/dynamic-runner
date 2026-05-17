@@ -119,6 +119,19 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
     /// preserve budget and assignment_failure_count, wait for Ready.
     /// Returns an error if the spawn fails — the caller decides how to react
     /// (typically: log, mark the slot dead, continue with remaining workers).
+    ///
+    /// Preserves the worker's recorded `loaded_type_id` across the
+    /// respawn: if the slot was bound to a particular `TypeId` before
+    /// the restart, the replacement is spawned via
+    /// `WorkerFactory::spawn_worker_for_type` for the same type so the
+    /// fresh subprocess's argv matches. Without this, the next
+    /// `ensure_worker_for_type` would see `loaded_type_id == None`,
+    /// pessimistically assume mismatch, and trigger a redundant
+    /// kill+respawn — turning every always_restart-driven cycle into
+    /// two spawns instead of one. The fallback to `spawn_worker`
+    /// preserves the legacy initial-spawn semantic for slots that
+    /// were never bound (e.g. a restart triggered before any
+    /// assignment landed).
     pub async fn restart_worker(
         &mut self,
         worker_id: WorkerId,
@@ -130,9 +143,17 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             old.stop().await;
         }
 
-        let (transport, pid) = factory
-            .spawn_worker(worker_id)
-            .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?;
+        let preserved_type = self.workers[worker_id as usize].loaded_type_id.clone();
+        let (transport, pid) = match &preserved_type {
+            Some(type_id) => factory
+                .spawn_worker_for_type(worker_id, type_id)
+                .map_err(|e| {
+                    format!("failed to respawn worker {worker_id} for type {type_id}: {e}")
+                })?,
+            None => factory
+                .spawn_worker(worker_id)
+                .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?,
+        };
         if print_pid
             && let Some(pid) = pid
         {
@@ -146,6 +167,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         handle.pid = pid;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
+        handle.loaded_type_id = preserved_type;
         self.workers[worker_id as usize] = handle;
 
         // Wait for ready
