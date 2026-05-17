@@ -418,6 +418,40 @@ impl PyDistributedManager {
                                 dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                                     paths: sec_panik_paths,
                                     poll_interval: sec_panik_poll,
+                                    // SECONDARY-role spawner (in-
+                                    // process, alongside an in-
+                                    // process primary). Same
+                                    // rationale as the standalone
+                                    // secondary in
+                                    // `managers/secondary/run.rs`:
+                                    // host-side shutdown-manager
+                                    // forwards SLURM signals as
+                                    // `kill -TERM` into this
+                                    // process, and the secondary's
+                                    // watcher must route that into
+                                    // the panik cascade. NOTE the
+                                    // primary running in the SAME
+                                    // process has a SEPARATE
+                                    // watcher (below) with
+                                    // SIGTERM listening OFF —
+                                    // primary's shutdown
+                                    // semantics are out of scope.
+                                    // Because only ONE handler is
+                                    // installed process-wide and
+                                    // multiple `Signal` instances
+                                    // share it, the per-secondary
+                                    // watchers in a
+                                    // multiple-secondary
+                                    // in-process deployment ALL
+                                    // see the same SIGTERM and
+                                    // ALL fire panik together —
+                                    // which is exactly the
+                                    // semantics we want: SIGTERM
+                                    // is a process-level signal,
+                                    // panik is cluster-level,
+                                    // every coordinator in this
+                                    // process should cascade.
+                                    listen_for_sigterm: true,
                                 },
                             );
                         if let Some(rx) = panik_watcher.take_signal_rx() {
@@ -557,6 +591,18 @@ impl PyDistributedManager {
                     dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                         paths: panik_watcher_paths,
                         poll_interval: panik_watcher_poll_interval,
+                        // PRIMARY-role spawner: SIGTERM listening
+                        // OFF. The host-driven SIGTERM cascade is
+                        // a secondary-side concern (SLURM
+                        // time-limit applies to allocations
+                        // running secondary jobs; the primary
+                        // typically runs on the operator host,
+                        // not in a SLURM-allocated container).
+                        // Primary shutdown is driven by the
+                        // sentinel-file path, by orchestrator
+                        // teardown, or by panik broadcast from a
+                        // secondary that hit SIGTERM.
+                        listen_for_sigterm: false,
                     },
                 );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
