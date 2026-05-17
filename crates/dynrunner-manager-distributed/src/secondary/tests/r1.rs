@@ -370,6 +370,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 // Tight deadline so the test reaps in ~200ms.
@@ -458,6 +459,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_millis(200),
@@ -535,6 +537,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
                 retry_max_passes: 1,
+                oom_retry_max_passes: 1,
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),

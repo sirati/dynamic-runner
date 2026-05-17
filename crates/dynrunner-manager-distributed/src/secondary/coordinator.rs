@@ -109,8 +109,8 @@ where
             primary_completed: HashSet::new(),
             primary_in_flight: HashMap::new(),
             primary_failed: HashMap::new(),
+            primary_retry_passes_used: HashMap::new(),
             primary_retry_budget,
-            exhaustion_warning_emitted: false,
             backpressured_secondaries: HashMap::new(),
             pre_staged_mode: false,
             uses_file_based_items: true,
@@ -508,16 +508,24 @@ where
         self.completed_tasks.len()
     }
 
-    /// Test-only inspector for the primary retry budget
-    /// counter. Lets tests assert that the retry pass actually
-    /// consumed budget (vs. e.g. the success arriving without
-    /// re-injection because the test fixture fixed the worker
-    /// behaviour after one pass anyway). Public-but-test-gated so
-    /// production callers don't depend on this internal counter
-    /// shape. Forwards through the encapsulated `RetryBudget`.
+    /// Test-only inspector for the primary retry-pass budget
+    /// usage. Returns the SUM of consumed passes across all
+    /// `(phase, bucket)` keys in `primary_retry_passes_used`.
+    /// Lets tests assert that the per-phase retry-bucket cascade
+    /// actually drove re-injection (vs. e.g. the success arriving
+    /// without re-injection because the test fixture fixed the
+    /// worker behaviour before the bucket fired).
+    ///
+    /// Post-refactor (2026-05-17): the counter shape moved from a
+    /// single `RetryBudget::attempts_used` (run-wide) to a per-
+    /// (phase, bucket) HashMap mirroring
+    /// `PrimaryCoordinator::retry_passes_used`. The aggregate
+    /// surfaced through this helper matches the legacy run-wide
+    /// shape so existing test assertions (`passes_used == 1`)
+    /// keep their meaning on single-phase fixtures.
     #[cfg(test)]
     pub fn primary_retry_passes_used_for_test(&self) -> u32 {
-        self.primary_retry_budget.attempts_used()
+        self.primary_retry_passes_used.values().sum()
     }
 
     /// Test-only inspector for the primary's residual

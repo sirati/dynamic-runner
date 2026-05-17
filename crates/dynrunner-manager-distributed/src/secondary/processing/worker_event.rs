@@ -140,11 +140,16 @@ where
                         // bookkeeping is identical to the success
                         // case (decrement + cascade).
                         self.note_primary_item_failed(&hash, &error_type, command_rx).await;
-                        // Synchronous drain-check (see peer.rs for
-                        // rationale): immediately re-inject if this
-                        // was the last in-flight task and there's
-                        // retry budget left.
-                        self.primary_drain_check_and_retry(factory).await;
+                        // Synchronous kickstart (see peer.rs for
+                        // rationale): the per-phase retry-bucket
+                        // cascade fired inside
+                        // `note_primary_item_failed` may have just
+                        // reinjected this task into the pool. Re-
+                        // poll our own idle workers so a freshly
+                        // reinjected item reaches a worker on this
+                        // tick rather than waiting up to one
+                        // keepalive interval.
+                        self.repoll_idle_workers(factory).await;
                         // Report error to the current primary.
                         let msg = DistributedMessage::TaskFailed {
                             sender_id: self.config.secondary_id.clone(),

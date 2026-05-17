@@ -83,6 +83,21 @@ pub struct SecondaryConfig {
     /// drives retry while the live primary is still authoritative.
     pub retry_max_passes: u32,
 
+    /// Number of retry passes for the per-phase OOM-retry bucket on
+    /// the promoted-secondary's primary path. Mirrors
+    /// `PrimaryConfig::oom_retry_max_passes` so the same per-phase
+    /// (Recoverable + OOM) partition the live primary drives also
+    /// applies on this node once it acts as primary. Default 1.
+    /// `oom_retry_max_passes = 0` disables the OOM bucket entirely
+    /// — `ResourceExhausted(memory)` failures stay in
+    /// `primary_failed` and are surfaced via the outcome summary
+    /// without a second-chance dispatch.
+    ///
+    /// Only consulted when this secondary is acting as primary
+    /// (`is_primary == true`). Inert on non-promoted secondaries
+    /// for the same reason `retry_max_passes` is.
+    pub oom_retry_max_passes: u32,
+
     /// Number of consecutive primary-link recv-None probes after
     /// which the secondary arms failover (i.e. sets
     /// `primary_disconnected = true` and lets the election state
@@ -267,6 +282,11 @@ impl Default for SecondaryConfig {
             peer_timeout: Duration::from_secs(120),
             keepalive_miss_threshold: 3,
             retry_max_passes: 1,
+            // Mirrors `retry_max_passes` so OOM tasks keep their
+            // own retry budget by default; flip to 0 for a
+            // fail-fast OOM response without disabling Recoverable
+            // retries.
+            oom_retry_max_passes: 1,
             primary_link_failure_threshold: super::primary_link::DEFAULT_FAILURE_THRESHOLD,
             primary_link_failure_window: super::primary_link::DEFAULT_FAILURE_WINDOW,
             is_observer: false,

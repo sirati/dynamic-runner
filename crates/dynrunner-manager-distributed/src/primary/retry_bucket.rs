@@ -37,7 +37,7 @@ use std::collections::HashMap;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo};
 use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
-use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
@@ -74,8 +74,24 @@ impl BucketKind {
         }
     }
 
-    /// Per-bucket budget from the coordinator config.
+    /// Per-bucket budget from the live-primary's config.
     pub(crate) fn max_passes(self, config: &PrimaryConfig) -> u32 {
+        match self {
+            BucketKind::Recoverable => config.retry_max_passes,
+            BucketKind::Oom => config.oom_retry_max_passes,
+        }
+    }
+
+    /// Per-bucket budget from the promoted-secondary's config.
+    /// Mirrors `max_passes` exactly — the secondary surfaces the
+    /// same two knobs (`retry_max_passes` /
+    /// `oom_retry_max_passes`) so the cap-resolution semantics
+    /// don't drift across the live-primary / promoted-secondary
+    /// boundary.
+    pub(crate) fn max_passes_secondary(
+        self,
+        config: &crate::secondary::SecondaryConfig,
+    ) -> u32 {
         match self {
             BucketKind::Recoverable => config.retry_max_passes,
             BucketKind::Oom => config.oom_retry_max_passes,
@@ -94,6 +110,95 @@ impl BucketKind {
 /// includes `PhaseId`, so phase A's counter is structurally
 /// independent of phase B's.
 pub(crate) type RetryPassesUsed = HashMap<(PhaseId, BucketKind), u32>;
+
+/// Pure retry-bucket primitive shared between the live-primary and
+/// the promoted-secondary's primary path. Owns ONLY the three
+/// load-bearing semantics:
+///   1. Empty `candidates` returns `false` without touching the
+///      counter (an empty bucket pass is not a "used" pass).
+///   2. Exhausted budget returns `false` and leaves the failed
+///      entries intact (the caller will fire `on_phase_end` and
+///      let the run's outcome summary surface them).
+///   3. Available budget + at least one candidate: remove each
+///      candidate from the caller's failed-store via
+///      `on_remove_from_failed`, `pool.reinject(binary)`, bump the
+///      counter BEFORE the caller's kickstart so a kickstart-side
+///      error does not burn a second pass.
+///
+/// Caller responsibilities:
+///   * Build `candidates` from its own failed-store (the primary
+///     walks `all_binaries` + `failed_tasks`; the secondary walks
+///     `primary_failed` directly because each entry carries the
+///     binary).
+///   * Drive the post-reinject kickstart of idle workers (the two
+///     paths have different worker-fan-out helpers).
+///
+/// Returns `true` iff at least one binary was reinjected — the
+/// caller uses this to skip `on_phase_end` + `mark_phase_done` for
+/// this phase (the pool just flipped `Drained → Active` via
+/// `PendingPool::reinject` and the next `poll_drain_transitions`
+/// will be empty for this phase until the freshly-active items
+/// terminate).
+pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
+    phase: &PhaseId,
+    kind: BucketKind,
+    candidates: Vec<TaskInfo<I>>,
+    pool: &mut PendingPool<I>,
+    retry_passes_used: &mut RetryPassesUsed,
+    max_passes: u32,
+    mut on_remove_from_failed: impl FnMut(&str),
+) -> bool {
+    if candidates.is_empty() {
+        // No failures of this kind for this phase. Caller moves
+        // on. We intentionally do NOT touch the counter here:
+        // an empty bucket pass is not a "used" pass — a future
+        // re-arrival of a failure (e.g. the cascade triggered
+        // by an `apply_fail_permanent` cross-cut) should still
+        // get a fresh budget if the counter was at 0.
+        return false;
+    }
+
+    let key = (phase.clone(), kind);
+    let used = retry_passes_used.get(&key).copied().unwrap_or(0);
+    if used >= max_passes {
+        // Budget exhausted. Surviving failures stay in the
+        // caller's failed-store; caller fires `on_phase_end` and
+        // the phase advances. The fail_* count in the run's
+        // outcome summary surfaces these to the operator.
+        tracing::debug!(
+            phase = %phase,
+            bucket = ?kind,
+            used,
+            cap = max_passes,
+            pending_failures = candidates.len(),
+            "per-phase retry bucket: budget exhausted; failures permanent"
+        );
+        return false;
+    }
+
+    let count = candidates.len();
+    for binary in candidates {
+        let h = compute_task_hash(&binary);
+        on_remove_from_failed(&h);
+        pool.reinject(binary);
+    }
+
+    // Bump counter BEFORE the caller's kickstart so a kickstart-
+    // side error path leaving the system in an inconsistent state
+    // does not burn a second pass on the same set of failures.
+    retry_passes_used.insert(key, used + 1);
+
+    tracing::info!(
+        phase = %phase,
+        bucket = ?kind,
+        pass = used + 1,
+        cap = max_passes,
+        count,
+        "per-phase retry bucket: re-injecting failed tasks"
+    );
+
+    true
+}
 
 impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
 where
@@ -140,29 +245,29 @@ where
         kind: BucketKind,
         _command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<bool, String> {
-        // OOM-bucket dispatch shape. Entry-side: flip the
-        // coordinator into single-worker mode for the duration of
-        // the bucket so the dispatch pipeline masks workers !=
-        // local-id-0 and promotes `preferred_secondaries` to a
-        // strict filter. Exit-side: every `Ok(false)` return below
-        // clears the flag. `Ok(true)` keeps it set — the
-        // operational loop will re-enter and the next drain edge
-        // re-runs this bucket. See `single_worker_mode` field doc
+        // OOM-bucket dispatch shape (live-primary only — the secondary
+        // wrapper at `secondary/primary/lifecycle.rs` does NOT touch
+        // single_worker_mode because the field lives on
+        // PrimaryCoordinator). Entry-side: flip the coordinator into
+        // single-worker mode for the duration of the bucket so the
+        // dispatch pipeline masks workers != local-id-0 and promotes
+        // `preferred_secondaries` to a strict filter. Exit-side: every
+        // `Ok(false)` return below clears the flag. `Ok(true)` keeps it
+        // set — the operational loop will re-enter and the next drain
+        // edge re-runs this bucket. See `single_worker_mode` field doc
         // on `PrimaryCoordinator` for the user-spec rationale
-        // (2026-05-17).
-        //
-        // No-op for the Recoverable bucket: those retries do not
-        // need single-worker mode and inherit whatever state a
-        // concurrent OOM bucket on another phase left behind
-        // (accepted per the user spec).
+        // (2026-05-17). No-op for the Recoverable bucket.
         if matches!(kind, BucketKind::Oom) {
             self.single_worker_mode = true;
         }
-        // 1. Filter binaries by (phase, kind). Walk `all_binaries`
-        //    (the run-start snapshot) and consult `failed_tasks` for
-        //    each hash. `all_binaries` is the only source of truth
-        //    for the `TaskInfo<I>` payload — `failed_tasks` is keyed
-        //    by hash and carries the latest `ErrorType` only.
+
+        // Build candidates from `all_binaries` (the run-start snapshot)
+        // cross-referenced against `failed_tasks` (the hash-keyed
+        // ErrorType ledger). The secondary's mirror at
+        // `secondary/primary/lifecycle.rs` stores the binary inside
+        // its FailedTaskEntry instead, so the two sides have different
+        // candidate-build code paths but share the core via
+        // `try_phase_retry_bucket_core`.
         let candidates: Vec<TaskInfo<I>> = self
             .all_binaries
             .iter()
@@ -175,100 +280,50 @@ where
             })
             .cloned()
             .collect();
-        if candidates.is_empty() {
-            // No failures of this kind for this phase. Caller moves
-            // on. We intentionally do NOT touch the counter here:
-            // an empty bucket pass is not a "used" pass — a future
-            // re-arrival of a failure (e.g. the cascade triggered
-            // by an `apply_fail_permanent` cross-cut) should still
-            // get a fresh budget if the counter was at 0.
-            if matches!(kind, BucketKind::Oom) {
-                // OOM bucket settled with no remaining candidates
-                // (all retries succeeded, or there were never any
-                // OOM failures for this phase). Lift the dispatch-
-                // shape gate so the normal pass resumes full
-                // throughput.
-                self.single_worker_mode = false;
-            }
-            return Ok(false);
-        }
 
-        // 2. Per-(phase, kind) counter.
-        let key = (phase.clone(), kind);
-        let used = self.retry_passes_used.get(&key).copied().unwrap_or(0);
-        let cap = kind.max_passes(&self.config);
-        if used >= cap {
-            // Budget exhausted. Surviving failures stay in
-            // `failed_tasks`; caller fires `on_phase_end` and the
-            // phase advances. The fail_* count in the run's outcome
-            // summary surfaces these to the operator.
-            tracing::debug!(
-                phase = %phase,
-                bucket = ?kind,
-                used,
-                cap,
-                pending_failures = candidates.len(),
-                "per-phase retry bucket: budget exhausted; failures permanent"
-            );
-            if matches!(kind, BucketKind::Oom) {
-                // OOM bucket exhausted its budget; lift the
-                // dispatch-shape gate so subsequent phases'
-                // normal-pass dispatch (and this phase's permanent
-                // failures' downstream accounting) run unmasked.
-                self.single_worker_mode = false;
-            }
-            return Ok(false);
-        }
-
-        // 3. OOM bucket: bind each retry to a specific secondary
-        //    BEFORE reinjecting so the dispatch pipeline's strict
-        //    `preferred_secondaries` gate routes each task to its
-        //    pinned node. Pairing: tasks sorted by estimated memory
-        //    DESC, secondaries sorted by advertised memory DESC,
-        //    zipped cyclically (biggest task → biggest secondary).
-        //    Snapshotted at this entry — a secondary dying mid-
-        //    bucket will fail dispatch naturally; the next bucket
-        //    entry re-samples. The Recoverable bucket leaves the
-        //    candidates' `preferred_secondaries` untouched (its
-        //    retries run on whoever's idle).
+        // OOM bucket: bind each retry to a specific secondary BEFORE
+        // handing to the core so the dispatch pipeline's strict
+        // `preferred_secondaries` gate routes each task to its pinned
+        // node. Pairing: tasks sorted by estimated memory DESC,
+        // secondaries sorted by advertised memory DESC, zipped
+        // cyclically (biggest task → biggest secondary). Snapshotted at
+        // entry — a secondary dying mid-bucket fails dispatch
+        // naturally; the next bucket entry re-samples. No-op on
+        // Recoverable / empty.
         let candidates = self.assign_oom_preferred_secondaries(kind, candidates);
 
-        // 4. Reinject. `pool.reinject` flips Drained → Active for
-        //    this phase and drops any pending drained-notification,
-        //    so `process_phase_lifecycle`'s next
-        //    `poll_drain_transitions` returns an empty list and the
-        //    cascade exits. Control returns to the operational loop
-        //    which dispatches the freshly-reinjected items.
-        let count = candidates.len();
-        for binary in candidates {
-            let h = compute_task_hash(&binary);
-            self.failed_tasks.remove(&h);
-            self.pool_mut().reinject(binary);
+        let cap = kind.max_passes(&self.config);
+        let reinjected = {
+            let failed_tasks = &mut self.failed_tasks;
+            try_phase_retry_bucket_core(
+                phase,
+                kind,
+                candidates,
+                self.pending.as_mut().expect("pool must be initialised"),
+                &mut self.retry_passes_used,
+                cap,
+                |h| {
+                    failed_tasks.remove(h);
+                },
+            )
+        };
+        if reinjected {
+            // Kickstart dispatch: the workers won't request a new task
+            // on their own (they already sent their last `TaskRequest`
+            // which got `nothing-to-do` because the failure hadn't been
+            // reinjected yet). Same rationale as the legacy
+            // `run_retry_passes` body — without the kickstart,
+            // reinjected binaries sit in the pool forever.
+            self.dispatch_to_idle_workers().await?;
+        } else if matches!(kind, BucketKind::Oom) {
+            // No reinjection happened — either empty candidates or
+            // budget exhausted. Lift the single-worker dispatch-shape
+            // gate so subsequent phases' normal-pass dispatch (and
+            // this phase's permanent failures' downstream accounting)
+            // run unmasked.
+            self.single_worker_mode = false;
         }
-
-        // 5. Bump counter BEFORE the kickstart so a kickstart-side
-        //    error path leaving us in an inconsistent state doesn't
-        //    burn a second pass on the same set of failures.
-        self.retry_passes_used.insert(key, used + 1);
-
-        tracing::info!(
-            phase = %phase,
-            bucket = ?kind,
-            pass = used + 1,
-            cap,
-            count,
-            "per-phase retry bucket: re-injecting failed tasks"
-        );
-
-        // 6. Kickstart dispatch: the workers won't request a new
-        //    task on their own (they already sent their last
-        //    `TaskRequest` which got `nothing-to-do` because the
-        //    failure hadn't been reinjected yet). Same rationale as
-        //    the legacy `run_retry_passes` body — without the
-        //    kickstart, reinjected binaries sit in the pool forever.
-        self.dispatch_to_idle_workers().await?;
-
-        Ok(true)
+        Ok(reinjected)
     }
 
     /// OOM-bucket dispatch-shape preprocessor: sort retries by
