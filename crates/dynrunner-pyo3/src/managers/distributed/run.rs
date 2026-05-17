@@ -84,6 +84,7 @@ impl PyDistributedManager {
         let dist_keepalive_miss_threshold =
             self.distributed_config.keepalive_miss_threshold();
         let dist_retry_max_passes = self.distributed_config.retry_max_passes();
+        let dist_oom_retry_max_passes = self.distributed_config.oom_retry_max_passes();
         let dist_mass_death_grace = self.distributed_config.mass_death_grace();
         let dist_mass_death_min_count = self.distributed_config.mass_death_min_count();
         let dist_primary_link_failure_threshold =
@@ -533,6 +534,7 @@ impl PyDistributedManager {
                     required_setup_on_promote,
                     max_concurrent_per_type: max_concurrent_per_type.clone(),
                     retry_max_passes: dist_retry_max_passes,
+                    oom_retry_max_passes: dist_oom_retry_max_passes,
                     fleet_dead_timeout: std::time::Duration::from_secs(30),
                     mesh_ready_timeout: std::time::Duration::from_secs(60),
                     mass_death_grace: dist_mass_death_grace,
