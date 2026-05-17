@@ -84,6 +84,7 @@ impl PyPrimaryConfig {
                     // unbounded; consumers that need a cap go via
                     // `PyPrimaryCoordinator`.
                     unfulfillable_reinject_max_per_task: None,
+                    setup_promote_deadline: self.distributed_config.setup_promote_deadline(),
         }
     }
 }

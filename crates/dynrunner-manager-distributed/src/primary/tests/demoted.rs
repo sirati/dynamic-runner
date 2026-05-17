@@ -65,6 +65,7 @@ async fn demoted_primary_suppresses_taskrequest_relay_after_promotion() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -200,6 +201,7 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -320,6 +322,7 @@ async fn completed_and_failed_count_read_from_cluster_state_not_local_hashset() 
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -469,6 +472,7 @@ async fn demoted_primary_exits_on_run_complete_broadcast() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -589,6 +593,7 @@ async fn demoted_primary_exits_on_clean_completion() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -731,6 +736,7 @@ async fn step6_demoted_primary_observes_cluster_mutation_via_recv_peer_arm() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -935,6 +941,7 @@ async fn step6_demoted_primary_stays_alive_when_legacy_transport_closes_but_peer
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,
@@ -1068,6 +1075,7 @@ async fn demoted_primary_ignores_partial_crdt_view_waits_for_run_complete() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
             config,

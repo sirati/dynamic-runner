@@ -51,6 +51,7 @@ async fn e2e_primary_and_secondary_single_node() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -132,6 +133,7 @@ async fn e2e_primary_and_two_secondaries() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -209,6 +211,7 @@ async fn notify_stage_file_emits_wire_message() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
@@ -354,6 +357,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 mass_death_min_count: 2,
                 source_dir: None,
                 unfulfillable_reinject_max_per_task: None,
+                setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -505,6 +509,7 @@ async fn e2e_pre_staged_source_mode() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -588,6 +593,7 @@ async fn e2e_uses_file_based_items_false() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -689,6 +695,7 @@ async fn e2e_per_type_max_concurrent() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
             };
             let mut primary = PrimaryCoordinator::new(
                 config,
@@ -790,6 +797,7 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(
@@ -927,6 +935,7 @@ async fn run_with_initial_staging_succeeds() {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
         let mut primary = PrimaryCoordinator::new(

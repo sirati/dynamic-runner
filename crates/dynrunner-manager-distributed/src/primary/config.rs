@@ -209,6 +209,49 @@ pub struct PrimaryConfig {
     /// external-control-plane budget for the
     /// operator-resolvable-failure (`Unfulfillable`) class.
     pub unfulfillable_reinject_max_per_task: Option<u32>,
+
+    /// Maximum wall-clock a demoted submitter in setup-promote mode
+    /// (`required_setup_on_promote = true`) will sit in the operational
+    /// loop waiting for the promoted secondary's first
+    /// `ClusterMutation::TaskAdded` / `TasksSpawned` / `RunComplete`
+    /// broadcast. The latch consulted by this timer is `setup_pending`,
+    /// initialised from `required_setup_on_promote` and cleared by the
+    /// first of those three mutations arriving via the mirror path
+    /// (see `setup_pending` doc on `PrimaryCoordinator`).
+    ///
+    /// Rationale: in setup-promote mode the demoted submitter has no
+    /// load-bearing exit path while `setup_pending = true` — the
+    /// counter-based and pool-drain exits are gated off behind the
+    /// latch, `cluster_state.run_complete()` requires the promoted
+    /// secondary to broadcast first, the fleet-dead timer is gated
+    /// behind `secondaries.is_empty()` which never becomes true on a
+    /// demoted primary (heartbeat tick is skipped on `self.demoted`),
+    /// and the `both transports closed` fallback only fires once every
+    /// QUIC writer has finished its tear-down (which can take hours
+    /// after a SLURM hard-kill). If the promoted secondary's discovery
+    /// hangs, or its SLURM job dies before broadcasting any progress,
+    /// the demoted submitter has nothing to break the wait. This
+    /// deadline is the explicit, observable backstop.
+    ///
+    /// On expiry the operational loop exits and the outer
+    /// `run_pipeline` surfaces `RunError::SetupDeadlineExpired`. The
+    /// deadline is auto-cancelled (the arm parks on `pending().await`)
+    /// the moment `setup_pending` clears, so a long-but-eventually-
+    /// successful discovery does not false-fire.
+    ///
+    /// Default `600s` (10 minutes) — comfortably larger than typical
+    /// `discover_items` walks (file-tree scans, hash computations) on
+    /// production source trees, and well under the SLURM 60-min job
+    /// time-limit so the operator gets a clear failure before the
+    /// container is reaped. Set to a long value (e.g. `3600s`) if the
+    /// consumer's discovery is genuinely long-running and the operator
+    /// has scheduled a correspondingly large SLURM time-limit.
+    ///
+    /// Non-setup-promote runs (`required_setup_on_promote = false`)
+    /// start with `setup_pending = false`, so the arm parks
+    /// immediately and never fires regardless of this value — the
+    /// field is harmless for the legacy bootstrap path.
+    pub setup_promote_deadline: Duration,
 }
 
 impl Default for PrimaryConfig {
@@ -231,6 +274,7 @@ impl Default for PrimaryConfig {
             mass_death_min_count: 2,
             source_dir: None,
             unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: Duration::from_secs(600),
         }
     }
 }

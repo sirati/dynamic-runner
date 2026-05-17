@@ -91,6 +91,7 @@ impl PyDistributedManager {
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
         let dist_setup_deadline = self.distributed_config.setup_deadline();
+        let dist_setup_promote_deadline = self.distributed_config.setup_promote_deadline();
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let worker_spec = self.worker_spec.clone();
@@ -216,6 +217,11 @@ impl PyDistributedManager {
         // same shape as `PyPrimaryCoordinator::run`. `Some` iff the
         // in-process primary's `run` returned `RunError::PanikShutdown`.
         let mut panik_shutdown_path: Option<std::path::PathBuf> = None;
+        // Setup-promote deadline carried out of the detached tokio
+        // runtime — same shape as `PyPrimaryCoordinator::run`. `Some`
+        // iff the in-process primary's `run` returned
+        // `RunError::SetupDeadlineExpired`.
+        let mut setup_deadline_expired: Option<RunError> = None;
 
         py.detach(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -508,6 +514,7 @@ impl PyDistributedManager {
                     // handle side, so the value frozen here is the
                     // single source of truth for the inner loop.
                     unfulfillable_reinject_max_per_task,
+                    setup_promote_deadline: dist_setup_promote_deadline,
                 };
 
                 let mut primary = PrimaryCoordinator::new(
@@ -595,6 +602,9 @@ impl PyDistributedManager {
                     }) => {
                         panik_shutdown_path = Some(matched_path);
                     }
+                    Err(e @ RunError::SetupDeadlineExpired { .. }) => {
+                        setup_deadline_expired = Some(e);
+                    }
                     Err(RunError::Other(_)) | Ok(()) => {
                         // Legacy log-and-swallow for non-structured
                         // errors — see `PyPrimaryCoordinator::run`
@@ -643,6 +653,15 @@ impl PyDistributedManager {
                 "panik shutdown: distributed manager exiting with code 137"
             );
             std::process::exit(137);
+        }
+
+        if let Some(err) = setup_deadline_expired {
+            // Surface setup-promote deadline expiry — same shape as
+            // `PyPrimaryCoordinator::run`. Sequenced after panik
+            // (strictly stronger) and before cluster-collapsed
+            // (deadline expiry means zero tasks dispatched, so
+            // stranded accounting carries no useful operator pointer).
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(err.to_string()));
         }
 
         if let Some(err) = cluster_collapsed {

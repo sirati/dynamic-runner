@@ -26,6 +26,30 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // their first keepalive yet at the moment we enter the loop.
         heartbeat_tick.tick().await;
 
+        // Setup-promote deadline anchor. Pinned at operational-loop
+        // entry so a coordinator that re-enters the loop on a retry
+        // pass measures the deadline against THIS pass's start, not
+        // a long-elapsed earlier one. The arm below consults
+        // `setup_pending` at fire time: if the latch is already cleared
+        // (TaskAdded / TasksSpawned / RunComplete arrived in time), the
+        // arm is a no-op. The deadline only ever surfaces when
+        // discovery genuinely never started.
+        //
+        // `setup_promote_loop_start` is captured locally so the
+        // `setup_deadline_outcome` write at fire time can record the
+        // exact wall-clock elapsed for diagnostic logging.
+        let setup_promote_loop_start = Instant::now();
+        let setup_promote_deadline_at =
+            setup_promote_loop_start + self.config.setup_promote_deadline;
+        // One-shot gate so the arm fires at most once per loop entry.
+        // After firing (whether we exit on a real expiry OR re-iterate
+        // because setup_pending cleared in the same tick window) the
+        // flag flips true and the arm parks on `pending().await` for
+        // the rest of this loop entry, preventing a spurious second
+        // fire after a retry-pass legitimately re-runs the loop with
+        // `setup_pending = false`.
+        let mut setup_promote_deadline_consumed = false;
+
         // One-shot gates on the two recv arms. Each flips true the
         // first time its channel returns `None`. Mirrors
         // `SecondaryCoordinator.primary_disconnected` (see
@@ -590,6 +614,54 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         tracing::warn!(
                             "primary operational loop exiting via panik path"
                         );
+                        break;
+                    }
+                }
+                // Setup-promote-deadline arm. Gated by the
+                // `if self.setup_pending && !setup_promote_deadline_consumed`
+                // arm condition (the same shape `matcher_trigger_rx`
+                // uses) so the arm is *disabled* the moment the
+                // latch clears (a long-but-eventually-successful
+                // discovery does NOT false-fire), and so a
+                // coordinator re-entering the loop on a retry pass
+                // with `setup_pending = false` doesn't observe a
+                // stale resolved sleep.
+                //
+                // Single-concern: this arm OWNS the
+                // setup-promote-deadline timer. It reads only
+                // `setup_pending` (the latch the rest of the
+                // primary already maintains) and writes only
+                // `setup_deadline_outcome` (a new field the outer
+                // `run_pipeline` consumes). It does NOT touch
+                // dead-detection, heartbeat tracking, transport
+                // teardown, or any other concern.
+                //
+                // Cancellation safety: `tokio::time::sleep_until`
+                // is one-shot cancel-safe per tokio docs (same
+                // primitive `wait_for_connections` /
+                // `wait_for_mesh_ready` use).
+                _ = tokio::time::sleep_until(setup_promote_deadline_at.into()),
+                    if self.setup_pending && !setup_promote_deadline_consumed => {
+                    setup_promote_deadline_consumed = true;
+                    // Re-check the latch at fire time. The
+                    // `select!` doesn't guarantee the arm-condition
+                    // was true at the exact moment the inner
+                    // future resolved — a TaskAdded mutation could
+                    // land on the transport arm in the same tick
+                    // the sleep elapses. If the latch cleared,
+                    // treat the firing as a no-op and let the
+                    // next iteration's exit checks decide.
+                    if self.setup_pending {
+                        let elapsed = setup_promote_loop_start.elapsed();
+                        tracing::error!(
+                            elapsed_s = elapsed.as_secs_f64(),
+                            deadline_s = self.config.setup_promote_deadline.as_secs_f64(),
+                            "setup-promote deadline expired: promoted secondary \
+                             never broadcast TaskAdded / TasksSpawned / RunComplete. \
+                             Exiting operational loop; outer run_pipeline will \
+                             surface RunError::SetupDeadlineExpired."
+                        );
+                        self.setup_deadline_outcome = Some(elapsed);
                         break;
                     }
                 }

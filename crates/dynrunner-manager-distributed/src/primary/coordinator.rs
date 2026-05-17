@@ -515,6 +515,18 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// so the PyO3 boundary can match the structured variant and
     /// call `exit(137)`.
     pub(super) panik_outcome: Option<(std::path::PathBuf, String)>,
+
+    /// Set by the setup-promote-deadline arm in the operational
+    /// `select!` loop when the deadline fires while `setup_pending`
+    /// is still true. Carries the wall-clock elapsed since
+    /// operational-loop entry so the outer `run_pipeline` can surface
+    /// `RunError::SetupDeadlineExpired { elapsed }` with the diagnostic
+    /// duration.
+    ///
+    /// Same write-only/read-only discipline as `panik_outcome`: the
+    /// arm WRITES, the outer wrapper READS. Avoids touching the
+    /// `Result<(), String>` signature of the inner loop.
+    pub(super) setup_deadline_outcome: Option<std::time::Duration>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -613,6 +625,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 preferred_secondaries::PreferredSecondariesValidator::new(),
             panik_signal_rx: None,
             panik_outcome: None,
+            setup_deadline_outcome: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -1144,6 +1157,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // can't leak into this one. Populated below after both loops
         // drain; the structured-error path consults it.
         self.stranded_count = 0;
+        // Reset the setup-promote-deadline outcome so a previous
+        // run's residue (the field is only written when the deadline
+        // arm fires; a clean run leaves it untouched, but a coordinator
+        // re-used across runs must not inherit a stale outcome).
+        self.setup_deadline_outcome = None;
 
         // Refresh the setup-pending gate from the current config so a
         // reused coordinator (or one whose config was mutated between
@@ -1414,6 +1432,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 matched_path,
                 reason,
             });
+        }
+
+        // Setup-promote-deadline check: if the operational loop's
+        // deadline arm fired (the promoted secondary never broadcast
+        // TaskAdded / TasksSpawned / RunComplete within
+        // `config.setup_promote_deadline`), surface as
+        // `RunError::SetupDeadlineExpired`. Skip the retry-pass /
+        // drain / accounting tail — no task ever entered the pool, so
+        // there's nothing to retry, drain, or account for. The RunComplete
+        // broadcast tail is also skipped: the cluster never reached an
+        // operational state to begin with, so no peers are sitting on
+        // a "run-is-over" cue.
+        if let Some(elapsed) = self.setup_deadline_outcome.take() {
+            tracing::error!(
+                elapsed_s = elapsed.as_secs_f64(),
+                "primary run aborted by setup-promote deadline expiry; \
+                 surfacing SetupDeadlineExpired"
+            );
+            return Err(RunError::SetupDeadlineExpired { elapsed });
         }
 
         // Phase 10: Retry pass(es). Each Recoverable / NonRecoverable
