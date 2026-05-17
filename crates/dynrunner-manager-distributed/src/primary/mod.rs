@@ -45,7 +45,9 @@ mod test_helpers;
 #[cfg(test)]
 mod tests;
 
-pub use command_channel::{PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY};
+pub use command_channel::{
+    validate_spawn_tasks, PrimaryCommand, SpawnError, COMMAND_CHANNEL_CAPACITY,
+};
 pub use config::{OnPhaseEnd, OnPhaseStart, PrimaryConfig};
 pub use coordinator::PrimaryCoordinator;
 pub use error::RunError;

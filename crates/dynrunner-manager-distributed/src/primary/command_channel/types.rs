@@ -59,6 +59,8 @@
 use dynrunner_core::{ErrorType, Identifier, TaskInfo};
 use tokio::sync::oneshot;
 
+use crate::cluster_state::ClusterState;
+
 /// Bounded capacity for the command channel. Sized so a noisy caller
 /// can't OOM the primary while still giving multi-command batches
 /// (e.g. a control-plane that emits N `UpdatePreferredSecondaries`
@@ -91,6 +93,92 @@ pub enum SpawnError {
         task_hash: String,
         dep_task_id: String,
     },
+}
+
+/// Pre-apply validation for a `SpawnTasks` batch against the current
+/// cluster ledger. Single concern: walk the input vec, partition into
+/// `(valid, errors)` by the same rules `apply_spawn_tasks` enforces —
+/// duplicate-hash and unknown-dependency — without touching either
+/// coordinator's pool / failed-task ledger. Shared between
+/// `PrimaryCoordinator::apply_spawn_tasks` (live primary path) and
+/// `SecondaryCoordinator::apply_spawn_tasks` (promoted-secondary path)
+/// so the rules cannot drift.
+///
+/// Module boundary:
+///   * Owns: the per-task validation rules and the wire-canonical
+///     hashing recipe (delegated to `primary::wire::compute_task_hash`).
+///   * Does NOT own: the broadcast, the post-apply pool routing, the
+///     `failed_tasks` ledger bookkeeping. Each coordinator owns those
+///     steps because each holds the live pool / per-pass ledger.
+///
+/// `task_depends_on` references resolve against (a) every task_id in
+/// the existing ledger AND (b) every task_id contributed by the input
+/// batch itself, so within-batch dependencies validate.
+pub fn validate_spawn_tasks<I: Identifier>(
+    cluster_state: &ClusterState<I>,
+    tasks: Vec<TaskInfo<I>>,
+) -> (Vec<TaskInfo<I>>, Vec<(usize, SpawnError)>) {
+    let mut errors: Vec<(usize, SpawnError)> = Vec::new();
+    let mut valid_tasks: Vec<TaskInfo<I>> = Vec::with_capacity(tasks.len());
+    // Build a set of task_ids the pre-validation pass treats as
+    // known: every task_id in the existing ledger PLUS every task_id
+    // contributed by the input batch (so within-batch dependencies
+    // validate). The wire-side apply rule does its own dep resolution
+    // per-task; this pre-pass surfaces failures for the caller before
+    // the broadcast happens.
+    let mut known_task_ids: std::collections::HashSet<String> = cluster_state
+        .tasks_iter()
+        .filter_map(|(_, s)| {
+            let task = match s {
+                crate::cluster_state::TaskState::Pending { task }
+                | crate::cluster_state::TaskState::InFlight { task, .. }
+                | crate::cluster_state::TaskState::Completed { task }
+                | crate::cluster_state::TaskState::Failed { task, .. }
+                | crate::cluster_state::TaskState::Unfulfillable { task, .. }
+                | crate::cluster_state::TaskState::Blocked { task, .. }
+                | crate::cluster_state::TaskState::Cancelled { task, .. } => task,
+            };
+            task.task_id.clone()
+        })
+        .collect();
+    for task in &tasks {
+        if let Some(id) = task.task_id.as_deref() {
+            known_task_ids.insert(id.to_string());
+        }
+    }
+    // Per-task validation pass. A task can fail multiple checks
+    // (duplicate hash AND unknown dep); we surface the FIRST failure
+    // per index so the caller sees one error per rejected task.
+    // Duplicate-hash is checked first because it short-circuits the
+    // rest of the task's checks: a hash collision means the task is
+    // already in the ledger and re-validating its deps against the
+    // existing entry would be redundant.
+    for (idx, task) in tasks.into_iter().enumerate() {
+        let hash = crate::primary::wire::compute_task_hash(&task);
+        if cluster_state.task_state(&hash).is_some() {
+            errors.push((idx, SpawnError::DuplicateTaskHash(hash)));
+            continue;
+        }
+        let mut bad_dep: Option<String> = None;
+        for dep_id in &task.task_depends_on {
+            if !known_task_ids.contains(dep_id) {
+                bad_dep = Some(dep_id.clone());
+                break;
+            }
+        }
+        if let Some(dep_task_id) = bad_dep {
+            errors.push((
+                idx,
+                SpawnError::UnknownDependency {
+                    task_hash: hash,
+                    dep_task_id,
+                },
+            ));
+            continue;
+        }
+        valid_tasks.push(task);
+    }
+    (valid_tasks, errors)
 }
 
 /// One in-flight command on the `PrimaryHandle` → coordinator channel.

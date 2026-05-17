@@ -13,7 +13,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 
-use super::types::{PrimaryCommand, SpawnError};
+use super::types::{validate_spawn_tasks, PrimaryCommand, SpawnError};
 
 
 /// Dispatch one received command to its handler. Single line at the
@@ -341,67 +341,13 @@ where
         &mut self,
         tasks: Vec<TaskInfo<I>>,
     ) -> Result<Vec<(usize, SpawnError)>, String> {
-        let mut errors: Vec<(usize, SpawnError)> = Vec::new();
-        let mut valid_tasks: Vec<TaskInfo<I>> = Vec::with_capacity(tasks.len());
-        // Build a set of task_ids the pre-validation pass treats as
-        // known: every task_id in the existing ledger PLUS every
-        // task_id contributed by the input batch (so within-batch
-        // dependencies validate). The wire-side apply rule does its
-        // own dep resolution per-task; this pre-pass surfaces failures
-        // for the caller before the broadcast happens.
-        let mut known_task_ids: std::collections::HashSet<String> = self
-            .cluster_state
-            .tasks_iter()
-            .filter_map(|(_, s)| {
-                let task = match s {
-                    crate::cluster_state::TaskState::Pending { task }
-                    | crate::cluster_state::TaskState::InFlight { task, .. }
-                    | crate::cluster_state::TaskState::Completed { task }
-                    | crate::cluster_state::TaskState::Failed { task, .. }
-                    | crate::cluster_state::TaskState::Unfulfillable { task, .. }
-                    | crate::cluster_state::TaskState::Blocked { task, .. }
-                    | crate::cluster_state::TaskState::Cancelled { task, .. } => task,
-                };
-                task.task_id.clone()
-            })
-            .collect();
-        for task in &tasks {
-            if let Some(id) = task.task_id.as_deref() {
-                known_task_ids.insert(id.to_string());
-            }
-        }
-        // Per-task validation pass. A task can fail multiple checks
-        // (duplicate hash AND unknown dep); we surface the FIRST
-        // failure per index so the caller sees one error per rejected
-        // task. Duplicate-hash is checked first because it short-
-        // circuits the rest of the task's checks: a hash collision
-        // means the task is already in the ledger and re-validating
-        // its deps against the existing entry would be redundant.
-        for (idx, task) in tasks.into_iter().enumerate() {
-            let hash = crate::primary::wire::compute_task_hash(&task);
-            if self.cluster_state.task_state(&hash).is_some() {
-                errors.push((idx, SpawnError::DuplicateTaskHash(hash)));
-                continue;
-            }
-            let mut bad_dep: Option<String> = None;
-            for dep_id in &task.task_depends_on {
-                if !known_task_ids.contains(dep_id) {
-                    bad_dep = Some(dep_id.clone());
-                    break;
-                }
-            }
-            if let Some(dep_task_id) = bad_dep {
-                errors.push((
-                    idx,
-                    SpawnError::UnknownDependency {
-                        task_hash: hash,
-                        dep_task_id,
-                    },
-                ));
-                continue;
-            }
-            valid_tasks.push(task);
-        }
+        // Shared validator: pure read against `cluster_state` —
+        // mirrored on the promoted-secondary path
+        // (`SecondaryCoordinator::apply_spawn_tasks`) so the
+        // duplicate-hash + unknown-dep rules can't drift between the
+        // two apply sites. See `validate_spawn_tasks` for the
+        // single-writer contract.
+        let (valid_tasks, errors) = validate_spawn_tasks(&self.cluster_state, tasks);
 
         if valid_tasks.is_empty() {
             // No mutation to broadcast; the per-index errors are the
