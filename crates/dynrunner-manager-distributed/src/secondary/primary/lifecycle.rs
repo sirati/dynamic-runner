@@ -26,6 +26,9 @@ use dynrunner_core::{Identifier, MessageReceiver, MessageSender, PhaseId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
+
+use crate::primary::PrimaryCommand;
 
 use super::super::SecondaryCoordinator;
 
@@ -75,7 +78,25 @@ where
     /// guards each fire-site so a coordinator without a registered
     /// hook walks the cascade silently (preserving the pool's state
     /// machine transitions while skipping the user-callback work).
-    pub(in crate::secondary) fn process_primary_phase_lifecycle(&mut self) {
+    ///
+    /// `command_rx` carries the operational-loop's command-channel
+    /// receiver (the `take`n local; see
+    /// `secondary/processing/process_tasks.rs:122`). After each
+    /// cascade iteration's `on_phase_end` fires, we drain any commands
+    /// the user callback queued via the in-runtime `PrimaryHandle`
+    /// path (e.g. `spawn_tasks(next_phase_items)`) and dispatch each
+    /// through the existing `handle_secondary_command` chokepoint
+    /// BEFORE the next `drain_empty_active_phases` poll. Mirrors the
+    /// primary's drain step 1:1; same false-empty-successor bug,
+    /// same fix shape.
+    ///
+    /// Pre-loop / off-loop callers (e.g. tests, or any
+    /// `fail_permanent` path running outside `process_tasks`) pass
+    /// `&mut None`.
+    pub(in crate::secondary) async fn process_primary_phase_lifecycle(
+        &mut self,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         loop {
             let drained: Vec<PhaseId> = match self.primary_pending.as_mut() {
                 Some(pool) => pool.poll_drain_transitions(),
@@ -93,6 +114,30 @@ where
                 let failed = self.primary_phase_failed.get(p).copied().unwrap_or(0);
                 if let Some(cb) = self.on_phase_end.as_mut() {
                     cb(p, completed, failed);
+                }
+                // Drain queued commands one-at-a-time so each
+                // `try_recv` borrow releases before the dispatch
+                // re-borrows `command_rx` (the recursive cascade
+                // fired by e.g. `apply_fail_permanent` needs
+                // `&mut command_rx` to drain its own post-callback
+                // queue). `Box::pin` breaks the async-recursion cycle
+                // (cascade → handle_secondary_command →
+                // apply_fail_permanent → note_primary_item_failed →
+                // cascade). See primary-side mirror in
+                // `primary/coordinator.rs::process_phase_lifecycle`
+                // for the load-bearing-property rationale.
+                loop {
+                    let cmd = match command_rx.as_mut() {
+                        Some(rx) => rx.try_recv().ok(),
+                        None => None,
+                    };
+                    let Some(cmd) = cmd else { break };
+                    Box::pin(
+                        crate::secondary::command_channel::handle_secondary_command(
+                            self, cmd, command_rx,
+                        ),
+                    )
+                    .await;
                 }
                 if let Some(pool) = self.primary_pending.as_mut() {
                     pool.mark_phase_done(p);

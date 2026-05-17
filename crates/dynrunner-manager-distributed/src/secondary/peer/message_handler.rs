@@ -14,6 +14,9 @@ use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
+
+use crate::primary::PrimaryCommand;
 
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
@@ -27,7 +30,15 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    pub(in crate::secondary) async fn handle_peer_message(&mut self, msg: DistributedMessage<I>) {
+    /// `command_rx` threads the operational-loop's command-channel
+    /// receiver into the TaskComplete / TaskFailed cascade (see
+    /// `process_primary_phase_lifecycle` doc). Off-loop callers pass
+    /// `&mut None`.
+    pub(in crate::secondary) async fn handle_peer_message(
+        &mut self,
+        msg: DistributedMessage<I>,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         match msg {
             DistributedMessage::Keepalive {
                 secondary_id,
@@ -60,7 +71,7 @@ where
                 // node dispatched the task as primary, the
                 // peer's completion message is the only signal the
                 // pool gets that the item is no longer in flight.
-                self.note_primary_item_completed(&task_hash);
+                self.note_primary_item_completed(&task_hash, command_rx).await;
                 tracing::debug!(
                     peer = %secondary_id,
                     task_hash,
@@ -175,7 +186,7 @@ where
                     // Recoverable failures land in
                     // `primary_failed` for the retry pass,
                     // others just decrement in-flight as before.
-                    self.note_primary_item_failed(&task_hash, &error_type);
+                    self.note_primary_item_failed(&task_hash, &error_type, command_rx).await;
                     // Synchronous drain-check: if THIS failure was
                     // the last in-flight item AND the pool is
                     // empty, immediately re-inject the failed-task
@@ -334,7 +345,7 @@ where
             // primary-link's failure tracking is also correct (the
             // primary is reachable via the peer mesh now).
             msg @ DistributedMessage::TaskAssignment { .. } => {
-                if let Err(e) = self.dispatch_message(msg).await {
+                if let Err(e) = self.dispatch_message(msg, command_rx).await {
                     tracing::warn!(
                         error = %e,
                         "post-promotion peer TaskAssignment dispatch failed"

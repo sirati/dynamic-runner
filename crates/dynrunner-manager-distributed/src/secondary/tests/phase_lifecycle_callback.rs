@@ -83,8 +83,8 @@ fn one_phase_pool_with_one_item(phase: &PhaseId) -> PendingPool<TestId> {
 
 /// (1) Single-phase happy path: the only item completes, the phase
 /// drains, and the callback observes `(completed=1, failed=0)`.
-#[test]
-fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
+#[tokio::test(flavor = "current_thread")]
+async fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
     let phase = PhaseId::from("phase-a");
     let mut sec = make_secondary(election_config("sec-0"));
     sec.primary_pending = Some(one_phase_pool_with_one_item(&phase));
@@ -111,7 +111,7 @@ fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
         }),
     );
 
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
 
     let recorded = calls.lock().expect("poisoned");
     assert_eq!(
@@ -133,8 +133,8 @@ fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
 
 /// (2) Mixed-class drain: 1 completion + 1 failure in the same phase
 /// drain the pool; the final cascade-fire reports both counts.
-#[test]
-fn note_primary_item_failed_contributes_to_phase_end_counters() {
+#[tokio::test(flavor = "current_thread")]
+async fn note_primary_item_failed_contributes_to_phase_end_counters() {
     let phase = PhaseId::from("phase-a");
     let mut sec = make_secondary(election_config("sec-0"));
     // Two-item phase: the pool needs two in-flight markers so the
@@ -167,7 +167,7 @@ fn note_primary_item_failed_contributes_to_phase_end_counters() {
 
     // First: hash-a completes. Phase still has 1 in_flight; should NOT
     // fire `on_phase_end` yet.
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
     assert!(
         calls.lock().expect("poisoned").is_empty(),
         "first completion does not drain the phase; no callback yet"
@@ -178,7 +178,7 @@ fn note_primary_item_failed_contributes_to_phase_end_counters() {
     // reaches 0 but the failed-ledger is non-empty. The phase
     // transitions to Drained either way (the failed ledger is
     // primary's retry-pass concern, not the pool's state).
-    sec.note_primary_item_failed("hash-b", &ErrorType::Recoverable);
+    sec.note_primary_item_failed("hash-b", &ErrorType::Recoverable, &mut None).await;
 
     let recorded = calls.lock().expect("poisoned");
     assert_eq!(
@@ -196,8 +196,8 @@ fn note_primary_item_failed_contributes_to_phase_end_counters() {
 /// (3) No registered callback: cascade still walks the pool, phase
 /// reaches `Done`. The Option-guarded fire-site is the only thing
 /// that changes; the pool-side state machine is unaffected.
-#[test]
-fn no_callback_registered_still_drives_cascade_silently() {
+#[tokio::test(flavor = "current_thread")]
+async fn no_callback_registered_still_drives_cascade_silently() {
     let phase = PhaseId::from("phase-a");
     let mut sec = make_secondary(election_config("sec-0"));
     sec.primary_pending = Some(one_phase_pool_with_one_item(&phase));
@@ -205,7 +205,7 @@ fn no_callback_registered_still_drives_cascade_silently() {
         .insert("hash-a".into(), make_in_flight("a", "phase-a"));
 
     // No `register_phase_lifecycle_callbacks` call.
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
 
     assert_eq!(
         sec.primary_pending.as_ref().expect("pool present").phase_state(&phase),
@@ -219,8 +219,8 @@ fn no_callback_registered_still_drives_cascade_silently() {
 /// pins the non-promoted secondary path so installing a callback
 /// before promotion can never trip a panic from the apparent
 /// absence of a pool.
-#[test]
-fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
+#[tokio::test(flavor = "current_thread")]
+async fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
     let mut sec = make_secondary(election_config("sec-0"));
     assert!(sec.primary_pending.is_none(), "fixture starts pre-promotion");
 
@@ -240,7 +240,7 @@ fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
     // (the entry is not in `primary_in_flight`), so this call alone
     // wouldn't drive the cascade. Drive `process_primary_phase_lifecycle`
     // directly to exercise the pool-None branch.
-    sec.process_primary_phase_lifecycle();
+    sec.process_primary_phase_lifecycle(&mut None).await;
     assert!(
         calls.lock().expect("poisoned").is_empty(),
         "no pool ⇒ no cascade ⇒ no callback firings"
@@ -267,7 +267,7 @@ fn no_pool_yields_silent_no_op_in_process_primary_phase_lifecycle() {
 ///   2. Registers a callback that, on `on_phase_end`, calls
 ///      `apply_spawn_tasks` to inject a third task targeted at the
 ///      now-active phase-b.
-///   3. Triggers `note_primary_item_completed("hash-a")` and verifies:
+///   3. Triggers `note_primary_item_completed("hash-a", &mut None)` and verifies:
 ///       (a) the callback fired with `(phase-a, completed=1, failed=0)`,
 ///       (b) the cluster_state now contains the spawned task,
 ///       (c) the spawned task landed in `primary_pending` (Pending).
@@ -404,7 +404,7 @@ async fn callback_can_invoke_apply_spawn_tasks_and_cluster_state_grows() {
         }),
     );
 
-    sec.note_primary_item_completed("hash-a");
+    sec.note_primary_item_completed("hash-a", &mut None).await;
 
     // The callback fired.
     let recorded = calls.lock().expect("poisoned").clone();

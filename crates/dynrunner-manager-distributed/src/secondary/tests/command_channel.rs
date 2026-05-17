@@ -89,6 +89,7 @@ async fn spawn_tasks_via_command_channel_grows_cluster_state() {
     };
     crate::secondary::command_channel::handle_secondary_command(
         &mut sec, cmd,
+    &mut None,
     )
     .await;
 
@@ -174,6 +175,7 @@ async fn fail_permanent_via_command_channel_records_into_primary_failed() {
     };
     crate::secondary::command_channel::handle_secondary_command(
         &mut sec, cmd,
+    &mut None,
     )
     .await;
 
@@ -278,6 +280,7 @@ async fn reinject_task_via_command_channel_respects_budget() {
             hash: hash.clone(),
             reply: reply_tx,
         },
+    &mut None,
     )
     .await;
     reply_rx
@@ -317,6 +320,7 @@ async fn reinject_task_via_command_channel_respects_budget() {
             hash: hash.clone(),
             reply: reply_tx,
         },
+    &mut None,
     )
     .await;
     let err = reply_rx
@@ -383,6 +387,7 @@ async fn update_preferred_secondaries_via_command_channel_mirrors_to_pool() {
             secondaries: new_prefs.clone(),
             reply: reply_tx,
         },
+    &mut None,
     )
     .await;
     reply_rx

@@ -11,6 +11,9 @@ use dynrunner_core::{Identifier, MessageReceiver, MessageSender, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
+
+use crate::primary::PrimaryCommand;
 
 use super::super::SecondaryCoordinator;
 
@@ -48,7 +51,11 @@ where
     /// this loop the primary would stop one phase short and
     /// the next phase's items would sit in the pool with the phase
     /// still `Blocked`.
-    pub(in crate::secondary) fn note_primary_item_completed(&mut self, file_hash: &str) {
+    pub(in crate::secondary) async fn note_primary_item_completed(
+        &mut self,
+        file_hash: &str,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) {
         let (phase_id, task_id) = match self.primary_in_flight.remove(file_hash) {
             Some(item) => (item.phase_id, item.binary.task_id),
             None => return,
@@ -77,8 +84,9 @@ where
         // Cascade drain + fire the registered `on_phase_end` /
         // `on_phase_start` callbacks (no-ops when no callback is
         // registered or `primary_pending` is `None`). See
-        // `secondary/primary/lifecycle.rs` for the cascade semantics.
-        self.process_primary_phase_lifecycle();
+        // `secondary/primary/lifecycle.rs` for the cascade semantics
+        // and the `command_rx` thread-through rationale.
+        self.process_primary_phase_lifecycle(command_rx).await;
     }
 
     /// Sibling to `note_primary_item_completed` for the failure path.
@@ -107,10 +115,11 @@ where
     /// forward, no-op for Recoverable). The Recoverable filter is
     /// inside this function so the callers don't have to special-case
     /// the retry path.
-    pub(in crate::secondary) fn note_primary_item_failed(
+    pub(in crate::secondary) async fn note_primary_item_failed(
         &mut self,
         file_hash: &str,
         error_type: &dynrunner_core::ErrorType,
+        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         let item = match self.primary_in_flight.remove(file_hash) {
             Some(item) => item,
@@ -147,7 +156,7 @@ where
         if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id, task_id.as_deref());
         }
-        self.process_primary_phase_lifecycle();
+        self.process_primary_phase_lifecycle(command_rx).await;
     }
 
     /// Primary-side equivalent of the local primary's
