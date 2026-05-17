@@ -1506,3 +1506,283 @@ async fn pre_seeded_counter_exit_unchanged() {
         }
     }).await;
 }
+
+/// T3 — setup-promote: the initial-empty-phase cascade does NOT fire
+/// `on_phase_end` while `setup_pending = true`, and phases remain
+/// `Active` (not `Drained`). After a `TaskAdded` mutation flips
+/// `setup_pending` to `false`, a subsequent cascade legitimately
+/// drains the still-empty phases and fires `on_phase_end(.., 0, 0)`.
+///
+/// Pre-fix shape of the bug: a setup-defer submitter enters `run()`
+/// with `binaries = []` (no items to discover locally) so every
+/// declared phase is `Active` with zero items as a TRANSIENT
+/// pre-discovery state. The pre-loop cascade
+/// (`drain_empty_active_phases` + `process_phase_lifecycle`) fires
+/// `on_phase_end(.., 0, 0)` for every phase before the promoted
+/// secondary has had a chance to broadcast its first `TaskAdded`.
+/// In asm-tokenizer's full-pipeline mode the consumer's
+/// `on_phase_end` callback walks the just-finished phase's output
+/// tree to spawn next-phase items; firing it on phases whose outputs
+/// don't yet exist surfaces as `OSError: No such file or directory`,
+/// crashes through the catch-all "TaskDefinition.on_phase_end raised;
+/// continuing" log, and leaves the run with `total = 0` work after
+/// all 15 SLURM jobs spawn and exit clean.
+///
+/// Fix: the cascade gates on `!self.setup_pending` at both the
+/// pre-loop call site (`coordinator.rs:1257` area, the explicit
+/// drain + cascade pair) and at the top of `process_phase_lifecycle`
+/// (defence-in-depth for every other caller). While the gate is up
+/// neither side-effect runs — phases stay `Active`, no callback
+/// fires, no `drained_pending` accumulates. The latch clears via
+/// the `TaskAdded` / `TasksSpawned` / `RunComplete` mirror in
+/// `mirror_mutation_to_accounting`, after which the SAME cascade
+/// shape (drain + process) legitimately fires `on_phase_end` on
+/// the now-truly-empty phases.
+///
+/// Test rig: builds a `PrimaryCoordinator` directly (no operational
+/// loop, no wire), seeds a 2-phase pool, attaches an `on_phase_end`
+/// callback that records every fire, and calls the cascade pair
+/// twice — once with `setup_pending = true`, once after a
+/// `TaskAdded` mutation has cleared the latch. Asserts on (a) the
+/// callback fire-counts pre- and post-clear, (b) the `phase_state`
+/// reading on the pool (Active before, Done after), and (c) the
+/// latch transition itself.
+#[tokio::test(flavor = "current_thread")]
+async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, _secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            // Setup-promote intent: the gate's invariant is keyed off
+            // this. With `false` the gate is always satisfied and the
+            // bug cannot manifest — that case is covered by the
+            // pre-seeded-bootstrap regression above.
+            required_setup_on_promote: true,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_secs(5),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
+        };
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        // Sanity: setup_pending must be initialised from the config.
+        // If this fails the rest of the test's reasoning is wrong.
+        assert!(
+            primary.setup_pending,
+            "setup_pending must be initialised from config.required_setup_on_promote at construction"
+        );
+
+        // Two declared phases (no deps between them; both start
+        // `Active`). Mirrors the asm-tokenizer full-pipeline shape
+        // where `phase_deps` registers e.g. `tokenize` and
+        // `unify_vocab` as separate top-level phases. Both start with
+        // zero items — the promoted secondary will later seed items
+        // via wire-received TaskAdded, but at this point the local
+        // pool is empty.
+        let phase_a = dynrunner_core::PhaseId::from("tokenize");
+        let phase_b = dynrunner_core::PhaseId::from("unify_vocab");
+        let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+            [phase_a.clone(), phase_b.clone()],
+            std::collections::HashMap::new(),
+        )
+        .expect("two-phase pool");
+        primary.pending = Some(pool);
+        primary.phase_completed.insert(phase_a.clone(), 0);
+        primary.phase_completed.insert(phase_b.clone(), 0);
+        primary.phase_failed.insert(phase_a.clone(), 0);
+        primary.phase_failed.insert(phase_b.clone(), 0);
+        primary.total_tasks = 0;
+
+        // Record every on_phase_end invocation in a shared ledger
+        // the test can inspect after each cascade attempt.
+        // Arc<Mutex<...>> not Rc<RefCell<...>> because OnPhaseEnd is
+        // `Send`-bounded (see `primary/config.rs::OnPhaseEnd =
+        // Box<dyn FnMut(...) + Send>`).
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<(String, u32, u32)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_inner = calls.clone();
+        primary.on_phase_end = Some(Box::new(move |p, c, f| {
+            calls_inner
+                .lock()
+                .expect("poisoned")
+                .push((p.as_str().to_string(), c, f));
+        }));
+
+        // -------- Phase 1: cascade-while-setup-pending --------
+        // Exercise the cascade GATE on `process_phase_lifecycle`
+        // directly: pre-populate `drained_pending` by calling
+        // `drain_empty_active_phases` UNCONDITIONALLY (mimicking the
+        // pre-fix production flow where the call-site gate did not
+        // exist), then invoke the cascade. With the fix, the cascade
+        // early-returns and the queued drained-phase entries sit
+        // untouched in `drained_pending` — no `on_phase_end` fires,
+        // no `mark_phase_done` runs. Without the fix, the cascade
+        // would walk the queue and fire `on_phase_end(.., 0, 0)`
+        // for each phase + flip them to Done.
+        //
+        // This pins the DEFENCE-IN-DEPTH guard inside
+        // `process_phase_lifecycle` independently of the
+        // call-site gate at `coordinator.rs:1257`. A future
+        // refactor that drops the call-site gate but leaves the
+        // cascade gate intact still passes this test; the
+        // production pre-loop drain at 1257 is conditional on
+        // `!self.setup_pending` purely to avoid the
+        // `Active → Drained` pool-state flip (the cascade-level
+        // gate alone would leave a stale queue of drained phases
+        // that fire all at once whenever the latch clears, which
+        // is exactly the post-clear scenario Phase 2 below pins).
+        primary.pool_mut().drain_empty_active_phases();
+        primary.process_phase_lifecycle(&mut None).await;
+
+        // Assertion (1): no on_phase_end fires while setup is pending.
+        // This is the load-bearing assertion against unfixed code —
+        // pre-fix, the cascade walks the queued drained_pending and
+        // fires two callbacks here (one per phase).
+        {
+            let recorded = calls.lock().expect("poisoned");
+            assert!(
+                recorded.is_empty(),
+                "on_phase_end must NOT fire while setup_pending=true \
+                 even when drained_pending is non-empty; observed \
+                 calls = {:?}",
+                *recorded
+            );
+        }
+        // Assertion (2): phases sit at `Drained` (the drain DID
+        // mark them, since we called it unconditionally in this
+        // test) but have NOT reached `Done` — `mark_phase_done`
+        // only runs inside the cascade after `on_phase_end` fires,
+        // and the cascade early-returned. Pre-fix, the phases
+        // would be `Done` at this point.
+        for phase in [&phase_a, &phase_b] {
+            assert_eq!(
+                primary.pool().phase_state(phase),
+                Some(dynrunner_scheduler_api::PhaseState::Drained),
+                "phase {phase} must sit at Drained (drained but not \
+                 marked Done) while setup_pending=true; the cascade \
+                 gate must suppress mark_phase_done together with the \
+                 on_phase_end fire"
+            );
+        }
+
+        // -------- Transition: apply a TaskAdded mutation --------
+        // The mirror path (`mirror_mutation_to_accounting`) flips
+        // `setup_pending = false` on TaskAdded / TasksSpawned /
+        // RunComplete. We synthesise the mutation locally and route
+        // it through `handle_cluster_mutation` — the same chokepoint
+        // the operational loop uses when a TaskAdded arrives off the
+        // wire from the promoted secondary. Using a task in
+        // `phase_a` so the post-apply ledger has at least one entry;
+        // `phase_b` stays empty to pin "still-empty phases fire
+        // on_phase_end legitimately post-discovery".
+        let bin = TaskInfo {
+            path: std::path::PathBuf::from("/tmp/discovered"),
+            size: 100,
+            identifier: TestId("discovered".into()),
+            phase_id: phase_a.clone(),
+            type_id: dynrunner_core::TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: Some("task-discovered".into()),
+            task_depends_on: vec![],
+            preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+            resolved_path: None,
+        };
+        let hash = crate::primary::wire::compute_task_hash(&bin);
+        primary
+            .handle_cluster_mutation(DistributedMessage::ClusterMutation {
+                sender_id: "sec-promoted".into(),
+                timestamp: 0.0,
+                mutations: vec![ClusterMutation::TaskAdded {
+                    hash: hash.clone(),
+                    task: bin.clone(),
+                }],
+            })
+            .await;
+
+        // Pin the mid-test invariants: the mirror path cleared the
+        // latch and refreshed total_tasks.
+        assert!(
+            !primary.setup_pending,
+            "setup_pending must be cleared by the TaskAdded mirror; \
+             if this fails the latch is stuck and the rest of the test \
+             reasoning collapses"
+        );
+        assert_eq!(
+            primary.total_tasks, 1,
+            "total_tasks must refresh from cluster_state.task_count() \
+             after the TaskAdded batch applies (mirror path's \
+             post-apply refresh in handle_cluster_mutation)"
+        );
+
+        // -------- Phase 2: cascade-after-setup-cleared --------
+        // Re-invoke `process_phase_lifecycle`. The `drained_pending`
+        // queue Phase 1's drain populated is STILL pending (the
+        // early-return suppressed both the callback fire AND the
+        // mark_phase_done step, so poll_drain_transitions never ran
+        // to consume the queue). With the gate cleared, the cascade
+        // now consumes the queue and fires `on_phase_end(.., 0, 0)`
+        // per phase, then marks each Done. This pins the
+        // post-discovery behaviour: the gate is a strict superset of
+        // the historical semantics; once cleared, the cascade
+        // exhibits the same shape a legacy bootstrap pre-loop
+        // cascade would have.
+        //
+        // Note: cluster_state now holds 1 task in phase_a, but the
+        // LOCAL pool is still empty for both phases — TaskAdded
+        // mirrors into cluster_state, not the local pool (see the
+        // `if self.pending.is_some() { reinject }` arm in
+        // handle_cluster_mutation: it gates on TasksSpawned, not
+        // TaskAdded). The locally-empty phases are therefore the
+        // right cascade subject — and exactly the shape the
+        // demoted-primary observer view exhibits.
+        primary.process_phase_lifecycle(&mut None).await;
+
+        // Assertion (3): on_phase_end fires exactly once per declared
+        // phase, with (completed=0, failed=0). Order is not pinned
+        // (the cascade walks `drained_pending` whose ordering is
+        // implementation-defined); we sort-and-compare to keep the
+        // assertion deterministic.
+        {
+            let mut recorded = calls.lock().expect("poisoned").clone();
+            recorded.sort();
+            assert_eq!(
+                recorded,
+                vec![
+                    ("tokenize".to_string(), 0, 0),
+                    ("unify_vocab".to_string(), 0, 0),
+                ],
+                "post-setup_pending cascade must fire on_phase_end once \
+                 per declared phase with (completed=0, failed=0); \
+                 observed calls = {recorded:?}"
+            );
+        }
+        // Assertion (4): the pool has fully cascaded — both phases
+        // reached Done (mark_phase_done ran post-on_phase_end).
+        for phase in [&phase_a, &phase_b] {
+            assert_eq!(
+                primary.pool().phase_state(phase),
+                Some(dynrunner_scheduler_api::PhaseState::Done),
+                "phase {phase} must reach Done after the post-clear cascade"
+            );
+        }
+    }).await;
+}
