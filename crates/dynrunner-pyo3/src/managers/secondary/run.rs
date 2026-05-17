@@ -100,6 +100,34 @@ impl PySecondaryCoordinator {
                 .take()
                 .map(crate::peer_lifecycle_bridge::PyPeerLifecycleListener::new);
 
+        // Phase-lifecycle callbacks for the post-promotion path. Built
+        // here under the GIL (the `make_on_phase_*` constructors
+        // capture a `Py<PyAny>` clone of `task_definition_py` that the
+        // closure body re-binds via `Python::attach` at each fire).
+        // Threaded into the inner `SecondaryCoordinator` via
+        // `register_phase_lifecycle_callbacks` BEFORE
+        // `run_until_setup_or_done` enters so the closures are visible
+        // to `note_primary_item_completed` from the first cascade.
+        //
+        // The secondary's `on_phase_end` invocation fires ONLY when
+        // this secondary owns the promoted-primary's `primary_pending`
+        // pool — i.e. after `PromotePrimary` (setup-promote or
+        // failover) flips `is_primary` true. Non-promoted secondaries
+        // hold the closures dormant and never call into Python, so the
+        // GIL-reacquiring cost is paid only on the post-promotion
+        // path. See
+        // `dynrunner-manager-distributed/src/secondary/primary/lifecycle.rs`.
+        let sec_on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
+            crate::managers::lifecycle::make_on_phase_start(
+                self.task_definition_py.clone_ref(py),
+            ),
+        );
+        let sec_on_phase_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+            crate::managers::lifecycle::make_on_phase_end(
+                self.task_definition_py.clone_ref(py),
+            ),
+        );
+
         // Errors produced inside the async block — including
         // `task.discover_items` raising in setup-promote — must surface
         // as `PyErr` here so the Python-side `run()` returns non-zero.
@@ -362,6 +390,19 @@ impl PySecondaryCoordinator {
                 if let Some(rx) = panik_watcher.take_signal_rx() {
                     secondary.register_panik_signal_rx(rx);
                 }
+
+                // Install the phase-lifecycle callbacks for the
+                // post-promotion path. Pre-`run_until_setup_or_done`
+                // contract — same shape as `register_lifecycle_listener`
+                // and `register_panik_signal_rx` above. Non-promoted
+                // secondaries never fire either closure; the GIL cost
+                // is paid only when the secondary holds the primary
+                // pool. The closures themselves were constructed under
+                // the GIL above.
+                secondary.register_phase_lifecycle_callbacks(
+                    sec_on_phase_start,
+                    sec_on_phase_end,
+                );
 
                 // Setup-promote outer loop: drive
                 // `run_until_setup_or_done` to a terminal state,
