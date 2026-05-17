@@ -94,17 +94,18 @@ impl PyDistributedManager {
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let worker_spec = self.worker_spec.clone();
-        // TODO(phase-5a-followup): worker subprocesses currently use the
-        // first type's worker_module + cmd_args; restart-on-type-shift
-        // is not yet implemented. The factory will need a per-type
-        // dispatch path that consults the full TypeRegistry.
-        let first_type = self.types.first().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(
+        // Per-type subprocess dispatch: the factory carries the full
+        // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
+        // for initial pool init (preserves pre-fix single-type
+        // behaviour); `spawn_worker_for_type` consults the registry
+        // for per-task respawn on TypeId mismatch. Cloned per
+        // secondary below in the spawn loop.
+        if self.types.first().is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
                 "task_definition.get_phases() yielded zero TaskTypeSpec entries",
-            )
-        })?;
-        let worker_module = first_type.worker_module.clone();
-        let worker_cmd_args = first_type.cmd_args.clone();
+            ));
+        }
+        let types = self.types.clone();
         let skip_existing = self.skip_existing;
         let uses_file_based_items = self.uses_file_based_items;
         let max_concurrent_per_type = self.max_concurrent_per_type.clone();
@@ -309,8 +310,7 @@ impl PyDistributedManager {
                     let sec_source = source_dir.clone();
                     let sec_output = output_dir.clone();
                     let sec_log_paths = log_paths.clone();
-                    let sec_worker_module = worker_module.clone();
-                    let sec_worker_args = worker_cmd_args.clone();
+                    let sec_types = types.clone();
                     let sec_estimator = estimator.clone();
                     let sec_max_resources = max_resources_per_secondary.clone();
                     let sec_scheduler_config = scheduler_config.clone();
@@ -382,8 +382,7 @@ impl PyDistributedManager {
                             output_dir: sec_output,
                             log_dir: sec_log,
                             log_paths: sec_log_paths,
-                            worker_module: sec_worker_module,
-                            worker_cmd_args: sec_worker_args,
+                            types: sec_types,
                             skip_existing,
                             connection_mode: ConnectionMode::Socketpair,
                             manual_start_worker: false,

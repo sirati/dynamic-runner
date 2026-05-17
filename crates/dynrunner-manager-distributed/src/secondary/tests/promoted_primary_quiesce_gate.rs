@@ -26,7 +26,7 @@
 //!      closed) keeps eligibility false even when every other gate
 //!      holds.
 
-use super::super::test_helpers::{election_config, FixedEstimator, RecordingPeer, TestId};
+use super::super::test_helpers::{election_config, FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId};
 use super::super::*;
 use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
@@ -160,7 +160,7 @@ async fn promotion_grace_suppresses_then_releases_eligibility() {
                 epoch: 1,
                 required_setup: false,
             };
-            sec.dispatch_message(promote, &mut None)
+            sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
                 .await
                 .expect("PromotePrimary handler succeeds");
             assert!(sec.is_primary, "promotion flipped is_primary");
@@ -231,7 +231,7 @@ async fn partial_mirror_during_grace_blocks_spurious_fire() {
                 epoch: 1,
                 required_setup: false,
             };
-            sec.dispatch_message(promote, &mut None)
+            sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
                 .await
                 .expect("PromotePrimary handler succeeds");
 

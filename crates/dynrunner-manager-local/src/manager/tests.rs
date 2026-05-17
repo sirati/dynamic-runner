@@ -235,9 +235,18 @@ async fn always_restart_worker_respawns_after_success() {
         assert!(manager.failed_tasks().is_empty());
 
         // With always_restart_worker=true and 3 binaries with 1 worker:
-        // 1 initial spawn + 2 restarts (after "a" and "b" complete, "c" is the last so no restart)
+        // 1 initial spawn + 1 type-shift respawn (worker's loaded_type_id
+        // starts None; `ensure_worker_for_type` cannot prove the factory
+        // chose the right type so it respawns once to bind the slot)
+        // + 2 restarts (after "a" and "b" complete; "c" is last → no
+        // restart). The post-respawn `loaded_type_id` is preserved
+        // across `restart_worker`, so subsequent same-type tasks hit
+        // the no-op fast path inside `ensure_worker_for_type`.
         let spawns = spawn_count.load(Ordering::SeqCst);
-        assert_eq!(spawns, 3, "expected 3 spawns (1 initial + 2 restarts), got {spawns}");
+        assert_eq!(
+            spawns, 4,
+            "expected 4 spawns (1 initial + 1 first-task type-bind + 2 restarts), got {spawns}"
+        );
     }).await;
 }
 
@@ -421,4 +430,178 @@ async fn multiple_workers_with_mixed_results() {
         assert!(manager.failed_tasks().is_empty());
         assert!(manager.resource_pressure_tasks().is_empty());
     }).await;
+}
+
+/// Regression pin: when a worker takes tasks of two distinct
+/// `TypeId`s, `WorkerPool::ensure_worker_for_type` kills + respawns
+/// the slot through `WorkerFactory::spawn_worker_for_type` on each
+/// type-shift — and the same-type fast path stays a no-op. This is
+/// the exact scenario the brief identifies: a multi-phase
+/// `TaskDefinition` whose phases each declare a distinct
+/// `worker_module`. Without per-type dispatch, phase 2's task would
+/// arrive on phase 1's worker subprocess (wrong Python module
+/// loaded), surfacing as the `payload['variant']` KeyError the
+/// downstream pipeline saw.
+///
+/// We use a tracking factory that records the sequence of (spawn,
+/// type_id) tuples it observes. The test asserts:
+///   1. Initial `spawn_worker` (None — no type hint yet).
+///   2. First `spawn_worker_for_type("tokenize")` when the first
+///      "tokenize" task assigns.
+///   3. Second `spawn_worker_for_type("unify_vocab")` when the
+///      type-shifting task arrives.
+///   4. No additional spawn for the second "unify_vocab" task — the
+///      worker's `loaded_type_id` already matches.
+#[tokio::test(flavor = "current_thread")]
+async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_match() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+    use dynrunner_core::TypeId;
+
+    /// Spawn-history entry: `None` means `spawn_worker` (no type),
+    /// `Some(_)` means `spawn_worker_for_type(_)`.
+    type SpawnEntry = Option<TypeId>;
+
+    struct TrackingFactory {
+        spawns: Arc<Mutex<Vec<SpawnEntry>>>,
+        next_pid: Arc<AtomicU32>,
+    }
+
+    impl WorkerFactory<ChannelManagerEnd> for TrackingFactory {
+        fn spawn_worker(
+            &mut self,
+            _worker_id: WorkerId,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            self.spawns.lock().unwrap().push(None);
+            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            let (manager_end, runner_end) = channel_pair();
+            tokio::task::spawn_local(fake_worker_loop_succeeds(runner_end));
+            Ok((manager_end, Some(pid)))
+        }
+
+        fn spawn_worker_for_type(
+            &mut self,
+            _worker_id: WorkerId,
+            type_id: &TypeId,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            self.spawns.lock().unwrap().push(Some(type_id.clone()));
+            let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
+            let (manager_end, runner_end) = channel_pair();
+            tokio::task::spawn_local(fake_worker_loop_succeeds(runner_end));
+            Ok((manager_end, Some(pid)))
+        }
+    }
+
+    async fn fake_worker_loop_succeeds(mut runner: ChannelRunnerEnd) {
+        let _ = runner.send(Response::Ready).await;
+        loop {
+            match MessageReceiver::<Command>::recv(&mut runner).await {
+                Some(Command::Stop) => break,
+                Some(Command::ProcessTask { .. }) => {
+                    let _ = runner.send(Response::Done { result_data: None }).await;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn make_binary_typed(name: &str, type_str: &str) -> TaskInfo<TestId> {
+        TaskInfo {
+            path: std::path::PathBuf::from(name),
+            size: 100,
+            identifier: TestId(name.into()),
+            phase_id: dynrunner_core::PhaseId::from(type_str),
+            type_id: TypeId::from(type_str),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: None,
+            task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
+            resolved_path: None,
+        }
+    }
+
+    use dynrunner_core::SoftPreferredSecondaries;
+    use dynrunner_transport_channel::ChannelRunnerEnd;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let spawns: Arc<Mutex<Vec<SpawnEntry>>> = Arc::new(Mutex::new(Vec::new()));
+            let next_pid = Arc::new(AtomicU32::new(1000));
+            let mut factory = TrackingFactory {
+                spawns: spawns.clone(),
+                next_pid,
+            };
+
+            // Two tokenize binaries followed by two unify_vocab
+            // binaries — type-shift after the first two. One worker
+            // so the type-shift definitely lands on the same slot.
+            let config = test_config(1);
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+            let binaries = vec![
+                make_binary_typed("tok_0", "tokenize"),
+                make_binary_typed("tok_1", "tokenize"),
+                make_binary_typed("uv_0", "unify_vocab"),
+                make_binary_typed("uv_1", "unify_vocab"),
+            ];
+
+            // Two phase ids — same shape the brief's `FullPipelineTask`
+            // declares: each phase carries one TaskTypeSpec. No
+            // explicit dep graph needed for the pool's per-type
+            // dispatch — the type_id alone is what drives respawn.
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(manager.stats().completed, 4);
+            assert!(manager.failed_tasks().is_empty());
+
+            let history = spawns.lock().unwrap().clone();
+            // Initial: `spawn_worker` (no type hint).
+            assert_eq!(history[0], None, "initial spawn must be type-less");
+            // The slot binds to "tokenize" on the first task. Then
+            // the first unify_vocab task triggers a type-shift
+            // respawn through `spawn_worker_for_type("unify_vocab")`.
+            // Two same-type assignments in a row hit the no-op
+            // ensure-fast-path, so no extra spawn appears between
+            // tok_0 and tok_1, nor between uv_0 and uv_1.
+            let typed: Vec<_> = history.iter().filter_map(|e| e.clone()).collect();
+            assert!(
+                typed.contains(&TypeId::from("tokenize")),
+                "expected a spawn_worker_for_type(tokenize); history: {history:?}"
+            );
+            assert!(
+                typed.contains(&TypeId::from("unify_vocab")),
+                "expected a spawn_worker_for_type(unify_vocab); history: {history:?}"
+            );
+            // Idempotence on match: exactly one spawn for each type
+            // (the initial type-binding spawn). Anything beyond that
+            // would mean the same-type fast path stopped firing —
+            // turning every assignment into a respawn, which would
+            // crush throughput.
+            let tokenize_count = typed.iter().filter(|t| **t == TypeId::from("tokenize")).count();
+            let unify_count = typed.iter().filter(|t| **t == TypeId::from("unify_vocab")).count();
+            assert_eq!(
+                tokenize_count, 1,
+                "expected exactly 1 tokenize spawn (same-type fast path must be a no-op); history: {history:?}"
+            );
+            assert_eq!(
+                unify_count, 1,
+                "expected exactly 1 unify_vocab spawn (same-type fast path must be a no-op); history: {history:?}"
+            );
+        })
+        .await;
 }

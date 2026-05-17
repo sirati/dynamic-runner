@@ -113,7 +113,10 @@ where
     /// removes that hazard. If a future change reintroduces blocking
     /// inside this function, prefer spawning a separate keepalive-
     /// emitter task over racing the recv with select.
-    pub(super) async fn wait_for_setup(&mut self) -> Result<(), String> {
+    pub(super) async fn wait_for_setup(
+        &mut self,
+        factory: &mut impl WorkerFactory<M>,
+    ) -> Result<(), String> {
         tracing::debug!("waiting for setup messages from primary");
 
         let mut got_peer_info = false;
@@ -182,6 +185,7 @@ where
                                 zip_files,
                                 workers_ready,
                                 staged_files,
+                                factory,
                             )
                             .await;
                         }
@@ -230,6 +234,7 @@ where
         zip_files: Vec<dynrunner_protocol_primary_secondary::ZipFileAssignment<I>>,
         workers_ready: Vec<dynrunner_protocol_primary_secondary::WorkerReadyInfo>,
         staged_files: Vec<dynrunner_protocol_primary_secondary::StagedFileRecord>,
+        factory: &mut impl WorkerFactory<M>,
     ) {
         for record in &staged_files {
             self.stage_and_register(
@@ -308,6 +313,22 @@ where
             let estimated = self.estimator.estimate(&binary);
 
             if (wid as usize) < self.pool.workers.len() && self.pool.workers[wid as usize].is_idle_state() {
+                // Per-type subprocess dispatch: bind the worker's
+                // loaded TypeId to this task's `type_id` (no-op fast
+                // path when they already match — the dominant case).
+                if let Err(e) = self
+                    .pool
+                    .ensure_worker_for_type(wid, &binary.type_id, factory, false)
+                    .await
+                {
+                    tracing::error!(
+                        worker_id = wid,
+                        error = %e,
+                        type_id = %binary.type_id,
+                        "failed to ensure worker type for initial task; skipping"
+                    );
+                    continue;
+                }
                 match self.pool.workers[wid as usize]
                     .assign_task(binary, estimated, false)
                     .await

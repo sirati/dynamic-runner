@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo, TaskResult, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo, TaskResult, TypeId, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_manager_worker::state::{
     AssignResult, PollResult, Processing, RunnerProtocol, RunnerProtocolState, WaitReadyResult,
@@ -41,6 +41,20 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub actual_usage: ResourceMap,
     pub assignment_failure_count: u32,
     pub pid: Option<u32>,
+    /// `TypeId` the worker subprocess was last spawned (or respawned)
+    /// for. `None` until the pool has loaded a type into this slot —
+    /// typically because the factory's freshly-initialised spawn did
+    /// not advertise which `TypeId` its argv corresponds to, and the
+    /// first assignment is what binds the slot.
+    ///
+    /// The pool's `ensure_worker_for_type` compares this against the
+    /// next task's `type_id` and, on mismatch, kills + respawns the
+    /// subprocess through `WorkerFactory::spawn_worker_for_type`
+    /// before the assignment proceeds. The default-impl `WorkerFactory`
+    /// flow (test factories that don't distinguish per-type argv)
+    /// still records the requested `TypeId` here so the same-type
+    /// fast path stays observably correct without any real spawn.
+    pub loaded_type_id: Option<TypeId>,
     /// Current processing phase name (set by PhaseUpdate messages).
     pub phase: Option<String>,
     /// Timestamp of the last keepalive or phase update.
@@ -75,6 +89,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             actual_usage: ResourceMap::new(),
             assignment_failure_count: 0,
             pid: None,
+            loaded_type_id: None,
             phase: None,
             last_keepalive: None,
             phase_started_at: None,

@@ -721,7 +721,7 @@ where
             let setup = async {
                 self.send_welcome().await?;
                 self.send_cert_exchange().await?;
-                self.wait_for_setup().await?;
+                self.wait_for_setup(factory).await?;
                 Ok::<(), String>(())
             };
             match tokio::time::timeout(deadline, setup).await {

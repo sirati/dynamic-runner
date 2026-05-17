@@ -11,6 +11,7 @@
 //! primary-transport variants use.
 
 use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender};
+use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -38,6 +39,7 @@ where
         &mut self,
         msg: DistributedMessage<I>,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+        factory: &mut impl WorkerFactory<M>,
     ) {
         match msg {
             DistributedMessage::Keepalive {
@@ -199,7 +201,7 @@ where
                     // doesn't wait). No-op when there's still
                     // pending work or no Recoverable failures
                     // logged.
-                    self.primary_drain_check_and_retry().await;
+                    self.primary_drain_check_and_retry(factory).await;
                     tracing::debug!(
                         peer = %secondary_id,
                         task_hash,
@@ -318,7 +320,7 @@ where
                     .map(|r| r.amount)
                     .unwrap_or(0);
                 if let Err(e) = self
-                    .handle_primary_task_request(secondary_id, worker_id, available_memory)
+                    .handle_primary_task_request(secondary_id, worker_id, available_memory, factory)
                     .await
                 {
                     tracing::warn!(error = %e, "post-promotion peer TaskRequest dispatch failed");
@@ -345,7 +347,7 @@ where
             // primary-link's failure tracking is also correct (the
             // primary is reachable via the peer mesh now).
             msg @ DistributedMessage::TaskAssignment { .. } => {
-                if let Err(e) = self.dispatch_message(msg, command_rx).await {
+                if let Err(e) = self.dispatch_message(msg, command_rx, factory).await {
                     tracing::warn!(
                         error = %e,
                         "post-promotion peer TaskAssignment dispatch failed"

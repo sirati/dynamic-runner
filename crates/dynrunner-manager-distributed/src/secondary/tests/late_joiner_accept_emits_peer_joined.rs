@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-    use super::super::test_helpers::{election_config, FixedEstimator, RecordingPeer, TestId};
+    use super::super::test_helpers::{election_config, FakeWorkerFactory, FixedEstimator, RecordingPeer, TestId};
     use super::super::*;
     use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage};
     use dynrunner_scheduler::ResourceStealingScheduler;
@@ -97,7 +97,7 @@
                     sender_id: "late-observer-1".into(),
                     timestamp: 0.0,
                 };
-                sec.dispatch_message(req, &mut None)
+                sec.dispatch_message(req, &mut None, &mut FakeWorkerFactory)
                     .await
                     .expect("RequestClusterSnapshot handler succeeds");
 
