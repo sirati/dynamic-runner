@@ -43,6 +43,7 @@ impl PySecondaryCoordinator {
         scheduler_config = None,
         panik_watcher_paths = None,
         panik_watcher_poll_interval_secs = 10.0,
+        unfulfillable_reinject_max_per_task = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -69,6 +70,7 @@ impl PySecondaryCoordinator {
         scheduler_config: Option<SchedulerConfig>,
         panik_watcher_paths: Option<Vec<PathBuf>>,
         panik_watcher_poll_interval_secs: f64,
+        unfulfillable_reinject_max_per_task: Option<u32>,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -136,7 +138,37 @@ impl PySecondaryCoordinator {
             scheduler_config: scheduler_config.unwrap_or_default(),
             panik_watcher_paths: panik_watcher_paths.unwrap_or_default(),
             panik_watcher_poll_interval_secs,
+            // Build the command-channel + reinject-cap bundle.
+            // Mirrors `PyPrimaryCoordinator::new` — the helper owns
+            // the channel pair, seeds the cap cell from the kwarg,
+            // and (later) hands back the run-start wiring through
+            // `take_for_run`. See `managers::control_plane` for the
+            // lifecycle.
+            control_plane: crate::managers::control_plane::PrimaryControlPlane::new(
+                unfulfillable_reinject_max_per_task,
+            ),
             completed: 0,
         })
+    }
+
+    /// `PrimaryHandle` factory. Each call returns a freshly-built
+    /// handle (with its own in-handle tokio runtime); the underlying
+    /// `command_tx` and reinject-cap cell are cloned so multiple
+    /// Python control planes / threads can share one coordinator.
+    /// Callable BEFORE `run()` so a Python caller can hand the
+    /// handle off (e.g. into `task.on_run_start(..., primary_handle=...)`)
+    /// before the blocking `run()` starts. Mirrors
+    /// `PyPrimaryCoordinator::handle` exactly — same return type,
+    /// same Python-visible surface.
+    ///
+    /// The minted handle dispatches against THIS secondary's
+    /// `command_rx`; commands issued from `on_phase_end` against the
+    /// captured handle therefore land on the post-promotion
+    /// `primary_pending` pool, not on the (potentially demoted)
+    /// in-process primary's. This is the load-bearing primitive for
+    /// SLURM-mode `primary_handle.spawn_tasks(...)` from inside a
+    /// promoted-secondary's `on_phase_end` callback.
+    fn handle(&self) -> PyResult<crate::managers::primary_handle::PyPrimaryHandle> {
+        self.control_plane.to_handle()
     }
 }

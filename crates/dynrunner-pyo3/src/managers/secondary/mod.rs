@@ -104,5 +104,25 @@ pub(crate) struct PySecondaryCoordinator {
     /// Poll cadence (seconds) for the panik watcher. Default 10.0
     /// per the 2026-05-17 design thread.
     pub(super) panik_watcher_poll_interval_secs: f64,
+    /// Rust-side bundle of the secondary's command channel +
+    /// reinject-cap cell, shared with every `PyPrimaryHandle` minted
+    /// from this coordinator. Mirrors
+    /// `PyPrimaryCoordinator::control_plane` exactly — same helper
+    /// type, same lifecycle (`new()` at `__init__`, `to_handle()`
+    /// from `handle()` pymethod, `take_for_run()` consumed at
+    /// `run()` entry).
+    ///
+    /// The minted handle reaches the SECONDARY's `command_rx` (via
+    /// `replace_command_channel` at `run()` start), so a Python
+    /// `on_run_start` captures a handle whose `spawn_tasks` /
+    /// `fail_permanent` / `reinject_task` /
+    /// `update_preferred_secondaries` calls dispatch through THIS
+    /// secondary's coordinator. Post-promotion the calls land on
+    /// the live `primary_pending` pool / `primary_failed` ledger;
+    /// pre-promotion the per-variant handlers either short-circuit
+    /// with a typed error or silently skip pool-side mirror steps
+    /// (the originator's CRDT broadcast still fires so every
+    /// receiver converges).
+    pub(super) control_plane: crate::managers::control_plane::PrimaryControlPlane,
     pub(super) completed: u32,
 }

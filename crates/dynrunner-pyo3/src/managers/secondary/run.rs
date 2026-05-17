@@ -63,14 +63,17 @@ impl PySecondaryCoordinator {
         let skip_existing = self.skip_existing;
         let cfg_src_network = self.src_network.clone();
         let cfg_src_tmp = self.src_tmp.clone();
-        // Bound from the secondary's control plane in Commit B
-        // (the PyO3 follow-up). Until then, hardcoded to `None`
-        // (unbounded) — same default a Python caller would get
-        // by omitting the kwarg. Keeps the Rust-side struct
-        // construction below well-typed against the new
-        // `SecondaryConfig` field without forcing the PyO3 surface
-        // change into the same commit as the Rust-side primitive.
-        let unfulfillable_reinject_max_per_task: Option<u32> = None;
+
+        // Snapshot the cap, flip `run_started`, and consume the
+        // command-channel receiver for the detached runtime in one
+        // step. The helper owns the single-shot guard and the
+        // snapshot ordering; the sender clone returned in `wiring`
+        // keeps backing future `handle()` calls. Mirrors
+        // `PyPrimaryCoordinator::run` and `PyDistributedManager::run`.
+        let wiring = self.control_plane.take_for_run()?;
+        let unfulfillable_reinject_max_per_task = wiring.cap_snapshot;
+        let command_tx = wiring.command_tx;
+        let command_rx = wiring.command_rx;
 
         // Setup-promote yield captures: cloned here so the `py.detach`
         // closure (which runs without the GIL) owns its own handles
@@ -347,6 +350,13 @@ impl PySecondaryCoordinator {
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );
+
+                // Swap in the Python-facing command channel so the
+                // `PrimaryHandle` Python is holding talks to the same
+                // receiver this secondary's `process_tasks` loop
+                // reads from. Same pre-run contract as
+                // `PyPrimaryCoordinator`.
+                secondary.replace_command_channel(command_tx, command_rx);
 
                 // Register the Python peer-lifecycle listener (if any)
                 // BEFORE `run_until_setup_or_done` enters — the
