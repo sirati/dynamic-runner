@@ -19,7 +19,13 @@ dynrunner-scheduler-api = { workspace = true }
 dynrunner-scheduler = { workspace = true }
 dynrunner-manager-local = { workspace = true }
 dynrunner-transport-quic = { workspace = true }
-tokio = { workspace = true }
+# `signal` feature: `panik_watcher::wait_for_sigterm_if_enabled` uses
+# `tokio::signal::unix::signal(SignalKind::terminate())` so the
+# secondary path can react to host-driven SIGTERM (SLURM time-limit /
+# scancel via `podman exec kill -TERM`) by firing the same panik
+# cascade as a sentinel-file trigger. Not in the workspace base
+# feature set because this crate is currently the only consumer.
+tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
@@ -37,7 +43,13 @@ tempfile = "3"
 # `test-util` exposes `tokio::time::pause` + `#[tokio::test(start_paused=true)]`
 # so the observer-announcer retry test can advance virtual time past the
 # 100 ms initial backoff without burning real wall-clock seconds.
-tokio = { workspace = true, features = ["test-util"] }
+# `signal` is also enabled here for the panik-watcher SIGTERM tests
+# (dev-dep features are unioned with the main dep's features).
+tokio = { workspace = true, features = ["test-util", "signal"] }
+# `panik_watcher` SIGTERM tests raise SIGTERM to self via
+# `nix::sys::signal::raise(Signal::SIGTERM)`. The workspace `nix`
+# pin already enables the `signal` feature.
+nix = { workspace = true }
 
 [lints]
 workspace = true

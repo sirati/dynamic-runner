@@ -1,10 +1,30 @@
-//! Filesystem-poll watcher for operator-initiated emergency shutdown.
+//! Emergency-shutdown trigger watcher.
 //!
-//! Single concern: poll a fixed set of paths at a configurable cadence
-//! until ANY of them exists (`fs::metadata` succeeds), then signal the
-//! coordinator via a oneshot channel and exit. The coordinator is the
-//! sole consumer; it owns the actual broadcast + worker-teardown +
-//! exit response.
+//! Single concern: observe any of N trigger sources for an
+//! operator-initiated emergency stop and, on FIRST trigger, fire a
+//! [`PanikSignal`] through a oneshot channel and exit. The coordinator
+//! is the sole consumer; it owns the actual broadcast + worker-teardown
+//! + exit response.
+//!
+//! Trigger sources currently implemented:
+//!   - **filesystem**: poll a fixed set of paths at
+//!     [`PanikWatcherConfig::poll_interval`] cadence; first matching
+//!     `fs::metadata` succeeds → fire (carrying the matched path).
+//!   - **SIGTERM**: opt-in via
+//!     [`PanikWatcherConfig::listen_for_sigterm`]; installs a
+//!     `tokio::signal::unix::signal(SignalKind::terminate())` stream;
+//!     first SIGTERM → fire with sentinel path
+//!     [`SIGTERM_SENTINEL_PATH`] so log readers can distinguish the
+//!     source. Enabled on the secondary path so a SIGTERM from a host
+//!     shutdown-manager (SLURM time-limit / scancel forwarding via
+//!     `podman exec <c> kill -TERM <pid>`) triggers the same
+//!     worker-teardown + exit(137) cascade as a file panik.
+//!
+//! Trigger sources race inside a single watcher task via
+//! `tokio::select!` — first source wins, sender fires, task returns.
+//! Adding a new source means adding a `select!` arm and an enabling
+//! flag in the config; the coordinator-facing API (one oneshot
+//! receiver carrying a `PanikSignal`) is unchanged.
 //!
 //! # Why a polling watcher rather than `inotify`?
 //!
@@ -29,15 +49,16 @@
 //! `JoinHandle::abort()` on drop. The watcher task's body is
 //! cancellation-safe at every yield point: `std::fs::metadata` is
 //! synchronous and brief (sub-millisecond), `tokio::time::sleep`
-//! abort-safe by Tokio's contract. Dropping a [`PanikWatcher`] aborts
-//! the task; the in-task `signal_tx: oneshot::Sender` is dropped as
-//! the task's stack unwinds, and the receiver observes
+//! abort-safe by Tokio's contract, and `Signal::recv` is
+//! cancellation-safe per Tokio's docs. Dropping a [`PanikWatcher`]
+//! aborts the task; the in-task `signal_tx: oneshot::Sender` is
+//! dropped as the task's stack unwinds, and the receiver observes
 //! `Err(RecvError)` on its next poll — matching the "watcher
 //! gracefully shut down" semantics the coordinator expects.
 //!
 //! # Module ownership
 //!
-//! Single concern strictly: filesystem stat → oneshot signal. The
+//! Single concern strictly: any trigger source → oneshot signal. The
 //! coordinator (`PrimaryCoordinator` / `SecondaryCoordinator` /
 //! observer-mode `SecondaryCoordinator`) owns:
 //!   - selecting against the signal in its operational loop,
@@ -47,22 +68,48 @@
 //!   - returning a panik outcome to the PyO3 wrapper, which calls
 //!     `exit(137)`.
 //!
-//! Keeping the boundary thin means tests can exercise the watcher
-//! standalone (touch a temp file, assert signal arrives within 2
-//! polls) without spinning up a cluster.
+//! Adding a new trigger source is purely internal to this module —
+//! the coordinator-facing API does not change. Tests can exercise
+//! each trigger standalone (touch a temp file / raise a signal) and
+//! assert signal arrives within bounded wait, without spinning up a
+//! cluster.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+
+/// Sentinel `matched_path` carried by a [`PanikSignal`] that was
+/// triggered by SIGTERM rather than by a filesystem path. Documented
+/// as a non-path string (angle-bracketed) so it cannot collide with
+/// any real path operators pass via `--panik-file`. Downstream log
+/// readers and `ClusterMutation::PanikRequested.reason` use this to
+/// attribute the shutdown source.
+pub const SIGTERM_SENTINEL_PATH: &str = "<SIGTERM>";
+
+/// Construct the sentinel as a `PathBuf` for downstream comparison
+/// without exposing the literal at every consumer.
+pub fn sigterm_sentinel_path() -> PathBuf {
+    PathBuf::from(SIGTERM_SENTINEL_PATH)
+}
+
+/// `true` iff a [`PanikSignal`] was triggered by SIGTERM rather than
+/// by a filesystem path. Used by log/audit consumers that want to
+/// branch on source without re-checking the sentinel literal.
+pub fn is_sigterm_signal(matched_path: &Path) -> bool {
+    matched_path == Path::new(SIGTERM_SENTINEL_PATH)
+}
 
 /// Caller-supplied watcher configuration.
 #[derive(Debug, Clone)]
 pub struct PanikWatcherConfig {
     /// Filesystem paths to poll. Every path is checked on every tick;
-    /// the FIRST matching one fires the signal. Empty vector means
-    /// "no watcher" — [`spawn_panik_watcher`] returns a never-firing
+    /// the FIRST matching one fires the signal. Empty vector disables
+    /// the file-trigger source — the watcher still runs if any other
+    /// source is configured (e.g. SIGTERM); if NO source is
+    /// configured, [`spawn_panik_watcher`] returns a never-firing
     /// receiver without spawning a polling loop (the coordinator's
     /// `select!` arm just stays unhit forever).
     ///
@@ -77,6 +124,23 @@ pub struct PanikWatcherConfig {
     /// Poll cadence. User-spec'd default is 10s; configurable so
     /// tests can pin behaviour at sub-second timing.
     pub poll_interval: Duration,
+    /// When `true`, also install a
+    /// `tokio::signal::unix::signal(SignalKind::terminate())` stream
+    /// alongside the file polling loop and fire the panik signal on
+    /// first SIGTERM. The fired
+    /// [`PanikSignal::matched_path`] is [`SIGTERM_SENTINEL_PATH`] so
+    /// downstream logging /
+    /// `ClusterMutation::PanikRequested.reason` records the source.
+    ///
+    /// Default `false` preserves existing behavior for any caller
+    /// that hasn't been migrated. Enabled on the secondary path so a
+    /// SIGTERM from the host shutdown-manager (e.g. SLURM time-limit
+    /// or scancel forwarded as `podman exec <c> kill -TERM <pid>`)
+    /// triggers the same worker-teardown + exit(137) cascade as a
+    /// file panik. Primary/local/observer paths leave this `false`
+    /// because their shutdown semantics are out of scope for the
+    /// host-driven secondary cascade.
+    pub listen_for_sigterm: bool,
 }
 
 impl Default for PanikWatcherConfig {
@@ -84,6 +148,7 @@ impl Default for PanikWatcherConfig {
         Self {
             paths: Vec::new(),
             poll_interval: Duration::from_secs(10),
+            listen_for_sigterm: false,
         }
     }
 }
@@ -138,25 +203,88 @@ impl Drop for PanikWatcher {
     }
 }
 
+/// Future returning the path observed to exist by polling, or
+/// `pending()` forever when no paths are configured. Loops:
+/// stat every path, return first match; sleep `poll_interval`; repeat.
+/// Cancellation-safe at every yield (`tokio::time::sleep`).
+async fn wait_for_file_match(paths: Vec<PathBuf>, poll_interval: Duration) -> PathBuf {
+    if paths.is_empty() {
+        // Structurally present `select!` arm that never fires when
+        // file-trigger is unconfigured. Keeps the spawn body
+        // source-agnostic.
+        std::future::pending::<PathBuf>().await
+    } else {
+        loop {
+            for path in &paths {
+                if std::fs::metadata(path).is_ok() {
+                    return path.clone();
+                }
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+/// Future returning [`sigterm_sentinel_path`] on first SIGTERM, or
+/// `pending()` forever when SIGTERM listening is disabled or the
+/// `tokio::signal::unix::signal(SignalKind::terminate())` install
+/// fails. Cancellation-safe (`Signal::recv` is documented as such).
+///
+/// Install-failure handling: log at `tracing::error!` and degrade to
+/// `pending()`. File polling stays functional; the operator can still
+/// trigger via sentinel file. We avoid panicking inside the watcher
+/// task because that would propagate as `JoinHandle` failure and drop
+/// the sender, which the coordinator's `select!` would observe as a
+/// silent `RecvError` — indistinguishable from clean abort. Logging +
+/// pending is the explicit "degraded but still alive" shape.
+async fn wait_for_sigterm_if_enabled(enabled: bool) -> PathBuf {
+    if !enabled {
+        return std::future::pending::<PathBuf>().await;
+    }
+    let mut stream = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "panik watcher: failed to install SIGTERM handler; \
+                 SIGTERM trigger disabled (file trigger still active)"
+            );
+            return std::future::pending::<PathBuf>().await;
+        }
+    };
+    // `recv().await` returns `None` only when the stream is dropped,
+    // which doesn't happen here because we own it on the stack.
+    // First `Some(())` is the first SIGTERM delivered to this
+    // process after the handler was installed.
+    let _ = stream.recv().await;
+    sigterm_sentinel_path()
+}
+
 /// Spawn the watcher task. Returns a [`PanikWatcher`] handle.
 ///
 /// Behaviour:
-/// - Empty `cfg.paths`: returns immediately with a never-firing
-///   receiver and a no-op task. The coordinator's `select!` arm is
-///   structurally present but never hits, which matches the
-///   "panik-disabled" operational mode.
-/// - Non-empty `cfg.paths`: spawns a background task that loops:
-///   stat every path, fire signal + return on first match; sleep
-///   `poll_interval`; repeat.
+/// - **All triggers unconfigured** (`cfg.paths.is_empty() &&
+///   !cfg.listen_for_sigterm`): returns immediately with a
+///   never-firing receiver and a no-op task. The coordinator's
+///   `select!` arm is structurally present but never hits, which
+///   matches the "panik-disabled" operational mode.
+/// - **Otherwise**: spawns a single task that races configured
+///   trigger sources via `tokio::select!`. First trigger wins, the
+///   `PanikSignal` is fired with the appropriate `matched_path` (the
+///   filesystem path for a file trigger, [`SIGTERM_SENTINEL_PATH`]
+///   for SIGTERM), and the task returns. Adding a new trigger source
+///   means adding a `select!` arm and an enabling flag in the
+///   config; no caller changes.
 pub fn spawn_panik_watcher(cfg: PanikWatcherConfig) -> PanikWatcher {
     let (signal_tx, signal_rx) = oneshot::channel();
 
-    if cfg.paths.is_empty() {
-        // No watcher; the caller's `select!` arm will never hit. A
-        // no-op task is the cleanest shape — when the caller calls
-        // `take_signal_rx` and awaits, the receiver resolves to
-        // `Err(_)` immediately because the dropped `signal_tx` here
-        // closes the channel. Matches the "watcher unwired" semantic.
+    if cfg.paths.is_empty() && !cfg.listen_for_sigterm {
+        // No trigger source configured; the caller's `select!` arm
+        // will never hit. A no-op task is the cleanest shape — when
+        // the caller calls `take_signal_rx` and awaits, the receiver
+        // resolves to `Err(_)` immediately because the dropped
+        // `signal_tx` here closes the channel. Matches the
+        // "watcher unwired" semantic.
         drop(signal_tx);
         let join = tokio::spawn(async move {});
         return PanikWatcher {
@@ -166,27 +294,17 @@ pub fn spawn_panik_watcher(cfg: PanikWatcherConfig) -> PanikWatcher {
     }
 
     let join = tokio::spawn(async move {
-        // Take signal_tx by value once; the future code uses
-        // `.is_some()` for the fired-already check (defensive — a
-        // task that observes a stat-success twice in one iteration
-        // due to multiple matching paths should still send only
-        // once).
-        let mut signal_tx = Some(signal_tx);
-        loop {
-            for path in &cfg.paths {
-                if std::fs::metadata(path).is_ok()
-                    && let Some(tx) = signal_tx.take()
-                {
-                    let _ = tx.send(PanikSignal {
-                        matched_path: path.clone(),
-                    });
-                    return;
-                }
-            }
-            // `tokio::time::sleep` is cancellation-safe by contract;
-            // aborting the task during the sleep cleanly unwinds.
-            tokio::time::sleep(cfg.poll_interval).await;
-        }
+        // Race configured trigger sources. Both arms are cancellation
+        // -safe at every yield (`sleep` per tokio contract,
+        // `Signal::recv` per tokio docs), so the loser future is
+        // dropped cleanly when the winner returns. Each arm returns
+        // `PathBuf`; the task body is source-agnostic — adding a new
+        // trigger means a new helper + a new `select!` arm.
+        let matched_path = tokio::select! {
+            p = wait_for_file_match(cfg.paths, cfg.poll_interval) => p,
+            p = wait_for_sigterm_if_enabled(cfg.listen_for_sigterm) => p,
+        };
+        let _ = signal_tx.send(PanikSignal { matched_path });
     });
     PanikWatcher {
         signal_rx: Some(signal_rx),
@@ -227,6 +345,7 @@ mod tests {
         let mut w = spawn_panik_watcher(PanikWatcherConfig {
             paths: vec![panik_path.clone()],
             poll_interval: Duration::from_millis(20),
+            ..Default::default()
         });
         let signal_rx = w.take_signal_rx().unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -252,6 +371,7 @@ mod tests {
         let mut w = spawn_panik_watcher(PanikWatcherConfig {
             paths: vec![path_a.clone(), path_b.clone()],
             poll_interval: Duration::from_millis(20),
+            ..Default::default()
         });
         let signal_rx = w.take_signal_rx().unwrap();
         let signal = tokio::time::timeout(Duration::from_millis(200), signal_rx)
@@ -270,6 +390,7 @@ mod tests {
         let mut w = spawn_panik_watcher(PanikWatcherConfig {
             paths: vec![path.clone()],
             poll_interval: Duration::from_secs(60),
+            ..Default::default()
         });
         let signal_rx = w.take_signal_rx().unwrap();
         // Drop the handle BEFORE the watcher's first poll completes.
@@ -291,5 +412,191 @@ mod tests {
         let mut w = spawn_panik_watcher(PanikWatcherConfig::default());
         assert!(w.take_signal_rx().is_some());
         assert!(w.take_signal_rx().is_none());
+    }
+
+    // ----- SIGTERM trigger tests -----
+    //
+    // SIGTERM is process-global. `cargo test` runs tests on multiple
+    // threads in one process, and `tokio::signal::unix::signal(...)`
+    // registers a process-global driver that fans the signal out to
+    // every live `Signal` instance regardless of which runtime
+    // created it. To avoid cross-test contamination (one test raising
+    // SIGTERM hitting another test's watcher) we serialize all
+    // SIGTERM tests behind a single `Mutex`.
+    //
+    // **Critical**: when the disabled-path watcher is configured
+    // with `listen_for_sigterm: false`, our spawn_panik_watcher does
+    // NOT install a signal handler for that task. BUT another test
+    // in this binary (or a prior test that left a `Signal` alive)
+    // may already have installed the process-wide disposition. Once
+    // installed, the kernel default of "terminate process on
+    // SIGTERM" is REPLACED. So even with our watcher disabled, a
+    // SIGTERM raised in this test process will NOT kill the
+    // process — it will go to whichever `Signal` instances are
+    // registered. We rely on this property to keep tests safe.
+    //
+    // To be extra safe, every SIGTERM test installs a "guard
+    // `Signal`" via `tokio::signal::unix::signal(SignalKind::terminate())`
+    // before raising, which ensures the process-wide handler is
+    // active (replacing the kernel's "terminate" default) even if
+    // no test has previously installed one.
+    use nix::sys::signal::{Signal, raise};
+    use tokio::sync::Mutex;
+
+    /// Serializes SIGTERM-raising tests so they don't contaminate
+    /// each other's watchers via the process-global signal handler.
+    /// Uses `tokio::sync::Mutex` because the guard is held across
+    /// `.await` (the workspace `clippy::await_holding_lock` lint
+    /// denies `std::sync::MutexGuard` in that position — for good
+    /// reason: `std` guards can deadlock async runtimes when the
+    /// future moves tasks).
+    static SIGTERM_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+
+    /// Install a guard `Signal` to ensure the process-wide SIGTERM
+    /// disposition is "deliver to tokio" rather than "terminate
+    /// process". The handle is kept alive for the duration of the
+    /// test. Returning the handle (rather than using `_ =`) prevents
+    /// premature drop. Returns `None` if install fails (the test
+    /// should then skip or assert separately).
+    fn install_sigterm_guard() -> Option<tokio::signal::unix::Signal> {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok()
+    }
+
+    /// `listen_for_sigterm: true` with empty paths fires the panik
+    /// signal on first SIGTERM with the sentinel path. This is the
+    /// core SIGTERM contract the host-side shutdown-manager relies
+    /// on: a `kill -TERM <inside-pid>` into the secondary container
+    /// triggers the same cascade as a sentinel file appearing on
+    /// disk.
+    #[tokio::test]
+    async fn sigterm_enabled_fires_panik_with_sentinel_path() {
+        let _guard = SIGTERM_TEST_LOCK.lock().await;
+        // Guard Signal: keep SIGTERM disposition pointed at tokio
+        // even if no other test/watcher is installed in this
+        // runtime. Held until the end of the test.
+        let _sigterm_guard = install_sigterm_guard().expect("SIGTERM handler install failed");
+
+        let mut w = spawn_panik_watcher(PanikWatcherConfig {
+            listen_for_sigterm: true,
+            ..Default::default()
+        });
+        let signal_rx = w.take_signal_rx().unwrap();
+        // Yield twice so the watcher task is polled and reaches
+        // its `Signal::recv().await` inside the `select!`. A single
+        // `yield_now` is insufficient on current-thread runtimes
+        // because the spawned task may need more than one yield
+        // point to reach the await; a small sleep is more robust
+        // than counting yields.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        raise(Signal::SIGTERM).expect("raise SIGTERM");
+        let signal = tokio::time::timeout(Duration::from_millis(500), signal_rx)
+            .await
+            .expect("watcher must fire within budget after SIGTERM")
+            .expect("sender must not drop before firing");
+        assert_eq!(signal.matched_path, sigterm_sentinel_path());
+        assert!(is_sigterm_signal(&signal.matched_path));
+    }
+
+    /// SIGTERM-and-file both enabled: SIGTERM arrives first; signal
+    /// carries the SIGTERM sentinel rather than any file path.
+    /// Exercises the `select!` race — first source wins.
+    #[tokio::test]
+    async fn sigterm_and_file_both_enabled_first_wins_sigterm() {
+        let _guard = SIGTERM_TEST_LOCK.lock().await;
+        let _sigterm_guard = install_sigterm_guard().expect("SIGTERM handler install failed");
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("panik");
+        let mut w = spawn_panik_watcher(PanikWatcherConfig {
+            paths: vec![path.clone()],
+            // 5 seconds: long enough that the file-poll arm is parked
+            // in `sleep` when we raise SIGTERM; the SIGTERM arm wins.
+            poll_interval: Duration::from_secs(5),
+            listen_for_sigterm: true,
+        });
+        let signal_rx = w.take_signal_rx().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Raise SIGTERM; do NOT touch the file.
+        raise(Signal::SIGTERM).expect("raise SIGTERM");
+        let signal = tokio::time::timeout(Duration::from_millis(500), signal_rx)
+            .await
+            .expect("watcher must fire within budget after SIGTERM")
+            .expect("sender must not drop before firing");
+        assert_eq!(signal.matched_path, sigterm_sentinel_path());
+    }
+
+    /// SIGTERM-and-file both enabled: file appears first; signal
+    /// carries the file path rather than the SIGTERM sentinel.
+    /// Verifies that enabling SIGTERM doesn't regress file-trigger
+    /// behaviour.
+    #[tokio::test]
+    async fn sigterm_and_file_both_enabled_first_wins_file() {
+        let _guard = SIGTERM_TEST_LOCK.lock().await;
+        let _sigterm_guard = install_sigterm_guard().expect("SIGTERM handler install failed");
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("panik");
+        let mut w = spawn_panik_watcher(PanikWatcherConfig {
+            paths: vec![path.clone()],
+            poll_interval: Duration::from_millis(20),
+            listen_for_sigterm: true,
+        });
+        let signal_rx = w.take_signal_rx().unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Touch the file; do NOT raise SIGTERM.
+        std::fs::write(&path, b"stop").unwrap();
+        let signal = tokio::time::timeout(Duration::from_millis(500), signal_rx)
+            .await
+            .expect("watcher must fire within budget after file create")
+            .expect("sender must not drop before firing");
+        assert_eq!(signal.matched_path, path);
+        assert!(!is_sigterm_signal(&signal.matched_path));
+    }
+
+    /// `listen_for_sigterm: false` does NOT install a tokio
+    /// signal handler from the watcher's perspective. We cannot
+    /// directly observe "no handler installed" from outside the
+    /// module, but we can assert behavioural equivalence to the
+    /// pre-SIGTERM watcher: a watcher with empty paths and
+    /// `listen_for_sigterm: false` is the disabled-watcher path
+    /// (sender drops, receiver errors). This proves the new field
+    /// did not silently turn on SIGTERM listening when the caller
+    /// didn't opt in.
+    ///
+    /// We do NOT raise SIGTERM in this test — if no other test had
+    /// run first, the process-wide disposition would still be the
+    /// kernel default (terminate process), and raising would kill
+    /// the test runner. Instead we cover non-installation
+    /// indirectly: the watcher's task body short-circuits on the
+    /// "no trigger sources" path and drops the sender.
+    #[tokio::test]
+    async fn sigterm_disabled_yields_disabled_watcher_with_empty_paths() {
+        let mut w = spawn_panik_watcher(PanikWatcherConfig {
+            listen_for_sigterm: false,
+            ..Default::default()
+        });
+        let signal_rx = w.take_signal_rx().expect("first take_signal_rx must succeed");
+        let result = tokio::time::timeout(Duration::from_millis(100), signal_rx).await;
+        let result = result.expect("disabled watcher should resolve immediately");
+        assert!(
+            result.is_err(),
+            "watcher with empty paths and listen_for_sigterm=false must \
+             behave like a fully-disabled watcher (sender drops)"
+        );
+    }
+
+    /// Sentinel path is the documented public constant. Locks the
+    /// wire-format so downstream log parsers and
+    /// `ClusterMutation::PanikRequested.reason` consumers can rely
+    /// on the literal across revisions.
+    #[test]
+    fn sigterm_sentinel_path_is_stable_literal() {
+        assert_eq!(SIGTERM_SENTINEL_PATH, "<SIGTERM>");
+        assert_eq!(sigterm_sentinel_path(), PathBuf::from("<SIGTERM>"));
+        assert!(is_sigterm_signal(&PathBuf::from("<SIGTERM>")));
+        assert!(!is_sigterm_signal(&PathBuf::from("/tmp/panik")));
+        // Not a typo target: any other angle-bracket string is NOT
+        // the sentinel.
+        assert!(!is_sigterm_signal(&PathBuf::from("<sigterm>")));
     }
 }

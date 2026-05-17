@@ -459,6 +459,14 @@ impl PyPrimaryCoordinator {
                     dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                         paths: panik_watcher_paths,
                         poll_interval: panik_watcher_poll_interval,
+                        // PRIMARY-role spawner: SIGTERM listening
+                        // OFF. SLURM-driven SIGTERM is forwarded
+                        // by the host shutdown-manager only into
+                        // secondary containers — primaries are
+                        // outside that path. Sentinel-file panik
+                        // and cluster-wide panik broadcast remain
+                        // the primary's emergency-stop sources.
+                        listen_for_sigterm: false,
                     },
                 );
                 if let Some(rx) = panik_watcher.take_signal_rx() {
