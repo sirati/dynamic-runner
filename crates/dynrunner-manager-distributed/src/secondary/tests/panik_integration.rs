@@ -70,6 +70,7 @@ async fn panik_signal_broadcasts_and_returns_panik_shutdown() {
                 log_oom_watcher: false,
                 promoted_primary_quiesce_grace: Duration::from_secs(2),
                 unfulfillable_reinject_max_per_task: None,
+                mem_manager_reserved_bytes: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =

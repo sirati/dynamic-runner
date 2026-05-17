@@ -123,6 +123,16 @@ pub(crate) struct PySecondaryConfig {
     pub(crate) output_dir: PathBuf,
     #[pyo3(get, set)]
     pub(crate) distributed_config: DistributedConfig,
+    /// Bytes withheld from the workers cgroup so the secondary
+    /// process itself has a protected slice of the container's
+    /// `memory.max`. `None` skips the nested workers cgroup
+    /// entirely (legacy flat layout); `Some(n)` materialises the
+    /// subgroup and tightens its cap by `n`. Surfaced to Python so
+    /// the CLI `--mem-manager-reserved` flag plumbs end-to-end.
+    /// See `dynrunner_manager_distributed::SecondaryConfig::mem_manager_reserved_bytes`
+    /// for the full contract.
+    #[pyo3(get, set)]
+    pub(crate) mem_manager_reserved_bytes: Option<u64>,
 }
 
 #[pymethods]
@@ -176,6 +186,7 @@ impl PySecondaryConfig {
         src_tmp = None,
         output_dir = None,
         distributed_config = None,
+        mem_manager_reserved_bytes = None,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -189,6 +200,7 @@ impl PySecondaryConfig {
         src_tmp: Option<PathBuf>,
         output_dir: Option<PathBuf>,
         distributed_config: Option<DistributedConfig>,
+        mem_manager_reserved_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let num_workers = num_workers.unwrap_or_else(detect_num_workers);
         let max_resources = max_resources
@@ -231,6 +243,7 @@ impl PySecondaryConfig {
             src_tmp,
             output_dir,
             distributed_config: distributed_config.unwrap_or_default(),
+            mem_manager_reserved_bytes,
         })
     }
 }
@@ -320,6 +333,7 @@ impl PySecondaryConfig {
             // `PySecondaryConfig` does not currently surface this knob
             // — the live secondary-construction sites set it directly.
             unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: self.mem_manager_reserved_bytes,
         }
     }
 }

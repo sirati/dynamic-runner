@@ -378,6 +378,15 @@ impl PyDistributedManager {
                             // `reinject_task` post-promotion honours the
                             // operator's knob symmetrically.
                             unfulfillable_reinject_max_per_task,
+                            // In-process distributed manager runs primary
+                            // and secondaries in the same process, so
+                            // nesting the workers cgroup would tighten
+                            // the cap on the shared address space.
+                            // Leave unset; only the network-secondary
+                            // path (where the secondary runs in its own
+                            // SLURM container) opts in via
+                            // `--mem-manager-reserved`.
+                            mem_manager_reserved_bytes: None,
                         };
 
                         let estimator = sec_estimator;
@@ -394,6 +403,7 @@ impl PyDistributedManager {
                             manual_start_worker: false,
                             worker_spec: sec_worker_spec.clone(),
                             child_processes: Vec::new(),
+                            workers_cgroup_procs: None,
                         };
 
                         let mut secondary = SecondaryCoordinator::new(

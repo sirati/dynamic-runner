@@ -41,6 +41,10 @@ dynrunner-transport-socket = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Used by `cgroup::tests` to inject a fake `/sys/fs/cgroup` tree at a
+# tempdir root so the orchestrator's predicate helpers + writer can
+# be exercised without touching real cgroup pseudo-files.
+tempfile = "3"
 
 [lints]
 workspace = true

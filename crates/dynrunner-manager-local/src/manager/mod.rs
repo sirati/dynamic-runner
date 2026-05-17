@@ -110,6 +110,22 @@ impl Default for LocalManagerConfig {
 /// The manager is transport-agnostic. The caller provides a factory that
 /// creates new `ManagerEndpoint` connections (e.g. socketpair, channel).
 pub trait WorkerFactory<M: ManagerEndpoint> {
+    /// Receive the workers/ cgroup procs path the pool's nested-cgroup
+    /// setup produced (or `None` to fall back to the flat layout).
+    /// Default impl is a no-op so factories that don't spawn OS
+    /// subprocesses (in-process channel test factories) inherit
+    /// graceful ignore semantics. Real subprocess factories override
+    /// this to stash the path and add a `pre_exec` closure to every
+    /// `Command` that writes the child PID into `cgroup.procs`
+    /// post-fork / pre-exec.
+    ///
+    /// Single concern: hand the cgroup boundary across the
+    /// pool/factory interface. The factory does NOT learn anything
+    /// about cgroup-v2 detection, controller probing, or
+    /// `memory.max` math — those live entirely in the
+    /// [`crate::cgroup`] module.
+    fn set_workers_cgroup(&mut self, _handle: Option<crate::cgroup::NestedCgroupHandle>) {}
+
     /// Create a new transport connection for the given worker.
     /// Called at initial startup and on restart.
     /// Returns (transport, optional_pid) on success.
@@ -514,6 +530,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 &self.scheduler,
                 factory,
                 self.config.print_pid,
+                // LocalManager does not currently surface the nested-
+                // cgroup knob — the in-process / single-host local
+                // path runs workers and the manager in the same
+                // address space's cgroup, so the kernel-OOM
+                // isolation benefit doesn't apply at this scope. The
+                // SecondaryCoordinator path passes the operator-
+                // supplied `mem_manager_reserved_bytes` through; if a
+                // future single-host workload wants the same
+                // isolation it would extend `LocalManagerConfig` and
+                // forward the value here.
+                None,
             )
             .await
     }

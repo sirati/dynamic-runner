@@ -32,6 +32,7 @@ pub(super) fn drive_rust_primary<'py>(
     max_memory_spec: &str,
     forwarded_argv: &[String],
     use_reverse_connection: bool,
+    mem_manager_reserved_bytes: Option<u64>,
     log: &Bound<'py, PyAny>,
 ) -> PyResult<()> {
     let runner_module = py.import("dynamic_runner")?;
@@ -111,6 +112,7 @@ pub(super) fn drive_rust_primary<'py>(
             max_memory_spec,
             forwarded_argv,
             use_reverse_connection,
+            mem_manager_reserved_bytes,
             log,
         )?;
         if let Some((policy, spawner)) = respawn_pyobjs {

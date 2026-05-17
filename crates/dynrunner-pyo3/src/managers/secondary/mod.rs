@@ -125,4 +125,12 @@ pub(crate) struct PySecondaryCoordinator {
     /// receiver converges).
     pub(super) control_plane: crate::managers::control_plane::PrimaryControlPlane,
     pub(super) completed: u32,
+    /// Bytes withheld from the workers cgroup so the secondary process
+    /// itself has a protected slice of the container's `memory.max`.
+    /// `None` skips nesting entirely (legacy flat layout). See
+    /// `dynrunner_manager_distributed::SecondaryConfig::mem_manager_reserved_bytes`
+    /// for the full contract. Plumbed in through the
+    /// `mem_manager_reserved_bytes` kwarg on `__init__`; forwarded
+    /// into the inner `SecondaryConfig` at `run()` entry.
+    pub(super) mem_manager_reserved_bytes: Option<u64>,
 }

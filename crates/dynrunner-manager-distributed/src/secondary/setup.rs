@@ -35,6 +35,12 @@ where
                 &self.scheduler,
                 factory,
                 false,
+                // Operator-supplied via `--mem-manager-reserved` →
+                // SecondaryConfig → here. `None` = skip nesting
+                // (legacy flat layout); `Some(n)` = create the
+                // workers cgroup and reserve n bytes for the
+                // secondary process. See SecondaryConfig docs.
+                self.config.mem_manager_reserved_bytes,
             )
             .await
     }

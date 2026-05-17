@@ -29,6 +29,7 @@ fn cfg_with_shutdown_bin<'a>(
 ) -> WrapperScriptConfig<'a> {
     WrapperScriptConfig {
         shutdown_manager_bin_path: Some(bin_path),
+        mem_manager_reserved_bytes: None,
         ..standard_cfg(slurm_config, &[])
     }
 }

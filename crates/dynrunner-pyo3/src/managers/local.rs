@@ -330,6 +330,7 @@ impl PyLocalManager {
             manual_start_worker: self.manual_start_worker,
             worker_spec: self.worker_spec.clone(),
             child_processes: Vec::new(),
+            workers_cgroup_procs: None,
         };
 
         let phase_deps = self.phase_deps.clone();

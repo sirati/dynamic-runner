@@ -110,6 +110,50 @@ fn standard_mode_script_forwards_max_memory_spec() {
 }
 
 #[test]
+fn standard_mode_script_forwards_mem_manager_reserved_when_set() {
+    // The dispatcher's `--mem-manager-reserved` flow lands at the
+    // wrapper-script generator as `Some(bytes)` on
+    // `WrapperScriptConfig.mem_manager_reserved_bytes`. The
+    // generator MUST render `--mem-manager-reserved=<bytes>` on the
+    // secondary's container_command argv so the secondary's
+    // argparse stores the value on `args.mem_manager_reserved` and
+    // `_dispatch_secondary` passes it through to
+    // `SecondaryConfig(mem_manager_reserved_bytes=...)`.
+    //
+    // Symmetric with `--cores=` / `--max-memory=` forwarding;
+    // SLURM-only because the value reaches the secondary via the
+    // wrapper rather than CLI propagation (the in-process
+    // distributed manager skips the field entirely — its secondaries
+    // share the manager's address space and nesting the workers
+    // cgroup would tighten the shared cap).
+    let config = SlurmConfig::default();
+    let mut cfg = standard_cfg(&config, &[]);
+    cfg.mem_manager_reserved_bytes = Some(500 * 1024 * 1024);
+    let script = generate_wrapper_script(&cfg);
+    assert!(
+        script.contains("--mem-manager-reserved=524288000"),
+        "wrapper script must forward `--mem-manager-reserved=<bytes>` to \
+         secondary; render did not contain it. Script body:\n{script}"
+    );
+}
+
+#[test]
+fn standard_mode_script_omits_mem_manager_reserved_when_none() {
+    // When the field is `None`, the wrapper MUST NOT emit the flag
+    // — the secondary's argparse default takes over. Symmetric with
+    // the `forwarded_argv` empty-collapse behaviour.
+    let config = SlurmConfig::default();
+    let cfg = standard_cfg(&config, &[]);
+    assert!(cfg.mem_manager_reserved_bytes.is_none());
+    let script = generate_wrapper_script(&cfg);
+    assert!(
+        !script.contains("--mem-manager-reserved="),
+        "wrapper must omit `--mem-manager-reserved=` when the config field \
+         is None; render contained it. Script body:\n{script}"
+    );
+}
+
+#[test]
 fn script_forwards_src_network_container_path() {
     // The wrapper bind-mounts the gateway's staged-source drive at
     // `/app/src-network` inside the secondary container (the `-v`

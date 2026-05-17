@@ -48,5 +48,9 @@ pub(super) fn standard_cfg<'a>(
         // unrelated regressions don't trip the new feature's
         // assertions.
         shutdown_manager_bin_path: None,
+        // Default-off so legacy wrapper-script tests assert on the
+        // pre-flag argv shape. The dedicated test for the rendered
+        // `--mem-manager-reserved=` flag flips this to `Some(...)`.
+        mem_manager_reserved_bytes: None,
     }
 }

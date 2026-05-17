@@ -119,6 +119,26 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--mem-manager-reserved",
+        type=str,
+        default="500M",
+        metavar="SIZE",
+        help=(
+            "Bytes withheld from the workers' nested cgroup so the "
+            "secondary process itself has a protected slice of the "
+            "container's cgroup-v2 memory.max. When set (the default "
+            "500M), the secondary nests a `workers/` subgroup under "
+            "its own cgroup and sets `workers/memory.max = "
+            "container_max - SIZE`; a runaway worker then trips "
+            "kernel-OOM on that subgroup, leaving the secondary "
+            "alive so the framework can observe the kill, requeue "
+            "the displaced task, and report cleanly. Empty / unset "
+            "skips the nesting (legacy flat layout — a worker OOM "
+            "reaps the secondary too). Accepts the same M/G suffixes "
+            "as --max-memory."
+        ),
+    )
+    parser.add_argument(
         "--panik-file",
         action="append",
         dest="panik_file_paths",

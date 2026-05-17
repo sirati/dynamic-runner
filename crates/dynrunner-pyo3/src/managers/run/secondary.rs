@@ -68,6 +68,15 @@ pub(crate) fn run_secondary<'py>(
     // src_tmp is non-Optional on PySecondaryConfig (always
     // resolved by `__new__`); pass it through unconditionally.
     kwargs.set_item("src_tmp", config.src_tmp.clone())?;
+    // `--mem-manager-reserved` opt-in for the nested workers
+    // cgroup. None means "skip nesting" so omit the kwarg and let
+    // the constructor pick its default (also None); anything else
+    // forwards explicitly. Mirrors the optional-kwarg shape every
+    // other secondary-side opt-in flag uses (panik watcher paths,
+    // worker_spec, log_dir, …).
+    if let Some(reserved) = config.mem_manager_reserved_bytes {
+        kwargs.set_item("mem_manager_reserved_bytes", reserved)?;
+    }
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }
