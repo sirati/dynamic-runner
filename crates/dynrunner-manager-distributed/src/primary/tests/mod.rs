@@ -19,6 +19,7 @@ mod coordinator_setup;
 mod demoted;
 mod e2e;
 mod initial_assignment;
+mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
 mod retry;
@@ -34,7 +35,7 @@ mod wire;
 #[allow(unused_imports)]
 pub(super) use super::test_helpers::{
     fake_secondary, fake_secondary_with_addrs, make_binary, make_relative_binary, setup_test,
-    FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
+    FakeWorkerFactory, FixedEstimator, NoPeers, SlowFakeWorkerFactory, TestId,
 };
 #[allow(unused_imports)]
 pub(super) use super::*;
@@ -133,6 +134,65 @@ pub(super) fn spawn_real_secondary_with_src_network(
             FixedEstimator(100),
         );
         let mut factory = FakeWorkerFactory;
+        secondary.run(&mut factory).await.unwrap();
+        secondary.completed_count()
+    });
+
+    (pri_to_sec_tx, sec_to_pri_rx, handle)
+}
+
+/// Like [`spawn_real_secondary`] but the worker factory is a
+/// [`SlowFakeWorkerFactory`] driven by per-`relative_path` substring
+/// markers. Used by the phase-lifecycle ordering tests to keep one
+/// item in-flight while a sibling completes so the cascade has a
+/// chance to misfire `on_phase_end`.
+pub(super) fn spawn_real_secondary_slow(
+    secondary_id: String,
+    num_workers: u32,
+    max_resources: dynrunner_core::ResourceMap,
+    slow_markers: Vec<(String, Duration)>,
+) -> (
+    tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    tokio::task::JoinHandle<usize>,
+) {
+    let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+    let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+
+    let handle = tokio::task::spawn_local(async move {
+        let transport = ChannelPrimaryTransportEnd {
+            tx: sec_to_pri_tx,
+            rx: pri_to_sec_rx,
+        };
+        let config = SecondaryConfig {
+            secondary_id,
+            num_workers,
+            max_resources,
+            hostname: "test-host".into(),
+            keepalive_interval: Duration::from_secs(60),
+            src_network: None,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
+            retry_max_passes: 1,
+            primary_link_failure_threshold: 5,
+            primary_link_failure_window: Duration::from_secs(30),
+            setup_deadline: Duration::from_secs(60),
+            is_observer: false,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
+            unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: None,
+        };
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        let mut factory = SlowFakeWorkerFactory::with_markers(slow_markers);
         secondary.run(&mut factory).await.unwrap();
         secondary.completed_count()
     });

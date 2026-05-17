@@ -1315,15 +1315,41 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // and the cascade's next `drain_empty_active_phases` poll
         // would otherwise false-fire `on_phase_end(.., 0, 0)` on the
         // successor phase exactly the way the in-loop bug class did.
+        // Take the command-channel receiver out of `self` for the
+        // duration of every pre-operational-loop step that can fire
+        // `on_phase_end` (via `process_phase_lifecycle`'s in-cascade
+        // dispatch path). Each step is then a pass-through caller
+        // that can hand the receiver into `dispatch_message` so the
+        // cascade's per-iteration drain step picks up callback-queued
+        // `SpawnTasks` / `FailPermanent` / `ReinjectTask` / `Update
+        // PreferredSecondaries` commands inline.
+        //
+        // Required because `operational_loop`'s entry-time exit
+        // check (`completed + failed >= total_tasks && active_workers
+        // == 0`) trips IMMEDIATELY on entry if every pre-loop-dispatched
+        // task happens to finish (and have its on_phase_end fire)
+        // during a pre-loop wait — without inline drain, the
+        // SpawnTasks command sits on the channel until the entry-
+        // time check that exits the loop without ever polling it.
+        // Asm-tokenizer's lazy-spawn consumer pattern
+        // (`FullPipelineTask.on_phase_end → primary_handle.spawn_tasks`)
+        // is the live consumer of this contract.
+        //
+        // Put-back semantics: returned to `self.command_rx` before
+        // `operational_loop` is called so the loop's own
+        // `self.command_rx.take()` re-acquires the same receiver.
+        // The window between take-here and put-back is `Send`-bound
+        // by the same `LocalSet` the rest of the coordinator runs
+        // on; no concurrent producer exists pre-loop.
+        let mut command_rx = self.command_rx.take();
+
         if !self.setup_pending {
             self.pool_mut().drain_empty_active_phases();
-            let mut command_rx = self.command_rx.take();
             self.process_phase_lifecycle(&mut command_rx).await;
-            self.command_rx = command_rx;
         }
 
         // Phase 1+2: Wait for all secondaries to send welcome + cert exchange
-        self.wait_for_connections().await?;
+        self.wait_for_connections(&mut command_rx).await?;
 
         // Phase 2.5: Auto-stage. Run the staging walk on behalf of
         // callers that didn't pre-queue via `queue_stage_file` /
@@ -1399,7 +1425,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // real". Bounded by `config.mesh_ready_timeout` (warning
         // + proceed on straggler, never deadlock — a buggy
         // secondary's silence must not stall the run).
-        self.wait_for_mesh_ready().await?;
+        self.wait_for_mesh_ready(&mut command_rx).await?;
 
         // Promote primary (atomic role-flip). The chosen secondary's
         // role-change is broadcast to every node; each node's
@@ -1411,6 +1437,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `seed_cluster_state` and maintained by ClusterMutation
         // broadcasts) is the only source of truth.
         self.promote_primary().await?;
+
+        // Put the command-channel receiver back on `self` so
+        // `operational_loop`'s own `self.command_rx.take()` picks
+        // it up again. Symmetric with the take at the top of the
+        // pre-loop chain.
+        self.command_rx = command_rx;
 
         // Operational loop (main pass).
         self.operational_loop().await?;
