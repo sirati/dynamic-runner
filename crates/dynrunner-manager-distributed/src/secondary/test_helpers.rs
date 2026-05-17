@@ -196,6 +196,7 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         peer_timeout: Duration::from_secs(120),
         keepalive_miss_threshold: 2,
         retry_max_passes: 1,
+        oom_retry_max_passes: 1,
         // Tight failover threshold so R1 tests don't have to wait
         // 30s of wall-clock. Threshold of 3 is the minimum allowed
         // by the design (single-packet drop margin); the time

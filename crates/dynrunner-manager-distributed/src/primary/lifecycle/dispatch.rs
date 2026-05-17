@@ -39,34 +39,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // to idle and sorts by (busy-workers-on-secondary, worker_id).
         let order = dispatch_order(&self.workers);
         for worker_idx in order {
-            // Skip workers belonging to a secondary that's currently
-            // in backpressure backoff — see
-            // `backpressured_secondaries` doc on `PrimaryCoordinator`.
-            // Without this, the kickstart would re-target the same
-            // unresponsive secondary in a tight loop, which is
-            // exactly the failure storm 07ae301-followup is
-            // designed to break. Re-checked inline (not pre-filtered
-            // in `dispatch_order`) so a backpressure window that
-            // opens mid-tick takes effect immediately.
-            if self.is_backpressured(&self.workers[worker_idx].secondary_id) {
+            // Composed dispatch-shape gate: backpressure backoff +
+            // OOM-bucket single-worker masking. The predicate lives
+            // on `PrimaryCoordinator` so this call site stays
+            // agnostic to either policy. See
+            // `should_skip_worker_for_dispatch` for the per-reason
+            // documentation. Re-checked inline (not pre-filtered in
+            // `dispatch_order`) so a backpressure window or
+            // single-worker-mode flip mid-tick takes effect
+            // immediately.
+            if self.should_skip_worker_for_dispatch(worker_idx) {
                 continue;
             }
-            let global_wid = self.workers[worker_idx].worker_id;
-            // Soft preference tie-break: tasks whose
-            // `preferred_secondaries` lists this worker's secondary
-            // sort first within their priority class. Applied AFTER
-            // `cap_filter_view` so caps remain hard. See
-            // `primary::preferred_secondaries`.
-            let dispatch_secondary_id =
-                self.workers[worker_idx].secondary_id.clone();
-            let preference_predicate =
-                crate::primary::preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
-                    &dispatch_secondary_id,
-                );
-            let view = self.cap_filter_view(
-                self.pool()
-                    .view_for_worker(global_wid, Some(&preference_predicate)),
-            );
+            // Dispatch-shape view pipeline: pool view → soft
+            // preferred-secondaries tie-break → strict
+            // preferred-secondaries gate (OOM bucket only) → cap
+            // filter. The full pipeline lives behind a single
+            // accessor so OOM-bucket policy never leaks here.
+            let view = self.dispatch_view_for_worker(worker_idx);
             if view.is_empty() {
                 continue;
             }
@@ -93,11 +83,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 let binary = self.pool_mut().take_from_view(view, binary_index);
                 self.reserve_type_slot(&binary.type_id);
                 let sec_id = self.workers[worker_idx].secondary_id.clone();
-                let local_worker_id = self.workers[..worker_idx + 1]
-                    .iter()
-                    .filter(|w| w.secondary_id == sec_id)
-                    .count() as u32
-                    - 1;
+                let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
                 self.workers[worker_idx].current_task = Some(binary.clone());
                 self.workers[worker_idx].estimated_resources = estimated_usage.clone();
                 self.workers[worker_idx].is_idle = false;

@@ -626,12 +626,14 @@ where
                     // this is identical to `note_primary_item_completed`
                     // (no entry added to `primary_failed`).
                     self.note_primary_item_failed(&task_hash, &error_type, command_rx).await;
-                    // Drain-check is harmless even when no entry
-                    // was added (no-op when ledger is empty); kept
-                    // for symmetry with the other TaskFailed sites
-                    // so future maintainers don't have to remember
-                    // a per-site filter.
-                    self.primary_drain_check_and_retry(factory).await;
+                    // Kickstart our own idle workers so any
+                    // reinjected items the per-phase retry-bucket
+                    // cascade (inside `note_primary_item_failed`)
+                    // produced reach a worker on this tick. Same
+                    // shape and rationale as the other TaskFailed
+                    // sites — peer workers self-recover on their
+                    // own keepalive tick.
+                    self.repoll_idle_workers(factory).await;
                 }
                 Ok(())
             }

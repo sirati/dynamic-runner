@@ -19,6 +19,7 @@ mod coordinator_setup;
 mod demoted;
 mod e2e;
 mod initial_assignment;
+mod oom_bucket;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
@@ -116,6 +117,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             peer_timeout: Duration::from_secs(120),
                 keepalive_miss_threshold: 3,
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             primary_link_failure_threshold: 5,
             primary_link_failure_window: Duration::from_secs(30),
             setup_deadline: Duration::from_secs(60),
@@ -175,6 +177,7 @@ pub(super) fn spawn_real_secondary_slow(
             peer_timeout: Duration::from_secs(120),
             keepalive_miss_threshold: 3,
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             primary_link_failure_threshold: 5,
             primary_link_failure_window: Duration::from_secs(30),
             setup_deadline: Duration::from_secs(60),
@@ -236,6 +239,11 @@ pub(super) fn spawn_real_secondary_flaky(
             peer_timeout: Duration::from_secs(120),
             keepalive_miss_threshold: 3,
             retry_max_passes,
+            // Mirror Recoverable retries: the existing fixture
+            // callers want one budget value passed in for both
+            // channels; the new `oom_retry_max_passes` knob is
+            // unit-tested in `secondary/tests` separately.
+            oom_retry_max_passes: retry_max_passes,
             primary_link_failure_threshold: 5,
             primary_link_failure_window: Duration::from_secs(30),
             setup_deadline: Duration::from_secs(60),

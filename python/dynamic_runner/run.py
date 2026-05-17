@@ -269,6 +269,26 @@ def _panik_kwargs(args: argparse.Namespace) -> dict:
     return out
 
 
+def _build_distributed_config(args: argparse.Namespace):
+    """Return a `DistributedConfig` carrying any operator-supplied retry
+    knobs (`--retry-max-passes`, `--oom-retry-max-passes`), or `None`
+    when both are unset so the Rust default applies. Both retry buckets
+    run at each phase drain edge — Recoverable first, then OOM — and
+    have independent per-(phase, kind) counters so neither budget bleeds
+    into the other.
+    """
+    import dynamic_runner as _rs
+
+    kwargs = {}
+    if getattr(args, "retry_max_passes", None) is not None:
+        kwargs["retry_max_passes"] = args.retry_max_passes
+    if getattr(args, "oom_retry_max_passes", None) is not None:
+        kwargs["oom_retry_max_passes"] = args.oom_retry_max_passes
+    if not kwargs:
+        return None
+    return _rs.DistributedConfig(**kwargs)
+
+
 def _dispatch_local(task, args, config, logger) -> None:
     """Standard in-process local manager."""
     import dynamic_runner as _rs
@@ -461,12 +481,22 @@ def _dispatch_secondary(task, args, logger) -> None:
     # string (operator opting out) collapses to None so
     # `SecondaryConfig.mem_manager_reserved_bytes` stays unset and
     # the legacy flat layout applies.
+    # `--mem-manager-reserved` arrives in two shapes: a human-readable
+    # spec ("500M" / "1G") from the operator-facing CLI, OR the
+    # already-parsed decimal byte count (`524288000`) rendered by the
+    # SLURM wrapper-script generator that consumed the operator's
+    # spec at dispatch time. The bytes form is the round-trip:
+    # dispatcher parses → wraps into argv → secondary reads it back.
+    # `parse_memory` only accepts the suffix form, so route raw
+    # decimals straight through `int()` and only fall back to the
+    # framework parser when there's an M/G suffix actually present.
     mem_manager_reserved_spec = getattr(args, "mem_manager_reserved", "")
-    mem_manager_reserved_bytes = (
-        _rs.parse_memory(mem_manager_reserved_spec)
-        if mem_manager_reserved_spec
-        else None
-    )
+    if not mem_manager_reserved_spec:
+        mem_manager_reserved_bytes = None
+    elif mem_manager_reserved_spec.isdigit():
+        mem_manager_reserved_bytes = int(mem_manager_reserved_spec)
+    else:
+        mem_manager_reserved_bytes = _rs.parse_memory(mem_manager_reserved_spec)
     logger.info(
         f"resolved per-machine resources: args.cores={args.cores!r} → "
         f"num_workers={num_workers}, args.max_memory={args.max_memory!r} → "
@@ -605,11 +635,7 @@ def _dispatch_single_process(task, args, config, logger) -> None:
     logger.info(f"Workers per secondary: {workers_per_secondary}")
     logger.info(f"RAM per secondary: {ram_per_secondary / (1024**3):.2f}GB")
 
-    distributed_config = None
-    if getattr(args, "retry_max_passes", None) is not None:
-        distributed_config = _rs.DistributedConfig(
-            retry_max_passes=args.retry_max_passes,
-        )
+    distributed_config = _build_distributed_config(args)
     primary_cfg = _rs.PrimaryConfig(
         num_secondaries=num_secondaries,
         distributed_config=distributed_config,
@@ -683,11 +709,7 @@ def _dispatch_multi_computer_local(task, args, deployment: TaskDeploymentSpec, l
 
     spawn_secondary = build_subprocess_spawn(deployment, args)
 
-    distributed_config = None
-    if getattr(args, "retry_max_passes", None) is not None:
-        distributed_config = _rs.DistributedConfig(
-            retry_max_passes=args.retry_max_passes,
-        )
+    distributed_config = _build_distributed_config(args)
     primary_cfg = _rs.PrimaryConfig(
         num_secondaries=num_secondaries,
         distributed_config=distributed_config,

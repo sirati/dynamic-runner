@@ -70,6 +70,38 @@ pub fn apply_preferred_secondaries_predicate<'a, I: Identifier>(
     }
 }
 
+/// Build a `WorkerView::filter`-compatible predicate that DROPS a
+/// task from `secondary_id`'s view when the task has a non-empty
+/// `preferred_secondaries` list that does NOT name `secondary_id`.
+/// Tasks with an empty `preferred_secondaries` are always kept.
+///
+/// Strict counterpart to [`apply_preferred_secondaries_predicate`]:
+/// the soft predicate biases the within-class sort, the strict
+/// filter actually removes ineligible tasks from the view.
+///
+/// Intended call site: the OOM retry-bucket dispatch path applies
+/// this filter via `WorkerView::filter` AFTER `cap_filter_view` and
+/// BEFORE the scheduler's `assign_normal`, so a memory-pressed task
+/// the bucket pinned to a specific (large-memory) secondary cannot
+/// be picked up by a worker on a smaller secondary. Outside the
+/// OOM bucket the strict gate is off and the soft predicate runs
+/// unchanged.
+///
+/// Returns `true` when the worker on `secondary_id` should still
+/// be allowed to consider the task; returns `false` when the task
+/// must be filtered out.
+pub fn filter_strict_preferred_secondaries<'a, I: Identifier>(
+    secondary_id: &'a str,
+) -> impl FnMut(&TaskInfo<I>) -> bool + 'a {
+    move |task| {
+        let prefs = task.preferred_secondaries.as_slice();
+        if prefs.is_empty() {
+            return true;
+        }
+        prefs.iter().any(|s| s.as_str() == secondary_id)
+    }
+}
+
 /// Tracks which "preferred secondary id is not in the known-set"
 /// warnings have already been emitted so repeat validation cycles
 /// don't spam the log.
@@ -184,6 +216,21 @@ mod tests {
             ),
             resolved_path: None,
         }
+    }
+
+    /// Strict filter: empty `preferred_secondaries` → keep; list
+    /// names secondary → keep; list omits secondary → drop.
+    #[test]
+    fn strict_filter_keeps_only_eligible_tasks() {
+        let mut f = filter_strict_preferred_secondaries::<()>("secondary-2");
+        let prefers = task_with_prefs("a", &["secondary-2"]);
+        let other = task_with_prefs("b", &["secondary-7"]);
+        let empty = task_with_prefs("c", &[]);
+        let multi = task_with_prefs("d", &["secondary-7", "secondary-2"]);
+        assert!(f(&prefers));
+        assert!(!f(&other));
+        assert!(f(&empty));
+        assert!(f(&multi));
     }
 
     /// Predicate maps every task whose `preferred_secondaries` lists

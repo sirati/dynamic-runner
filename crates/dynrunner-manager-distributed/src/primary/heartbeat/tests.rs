@@ -62,6 +62,7 @@ fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
                 required_setup_on_promote: false,
         max_concurrent_per_type: std::collections::HashMap::new(),
         retry_max_passes: 1,
+        oom_retry_max_passes: 1,
         fleet_dead_timeout: std::time::Duration::from_secs(30),
         mesh_ready_timeout: std::time::Duration::from_secs(5),
         // Default OFF in legacy heartbeat tests — they assert the
@@ -716,4 +717,135 @@ async fn live_secondary_is_not_falsely_declared_dead() {
     tokio::time::sleep(Duration::from_millis(60)).await;
     let report = primary.collect_heartbeat_report();
     assert_eq!(report.dead.len(), 0);
+}
+
+/// Drain `rx` non-blockingly and return the first `TaskAssignment`
+/// observed, if any. The dispatch kickstart fans `TaskAssignment` to
+/// the survivor's outgoing channel after the dead-secondary requeue;
+/// the test that pins the kickstart contract uses this to assert the
+/// recovered task actually re-targets a survivor (i.e. didn't sit in
+/// the pool until the next external event).
+fn first_task_assignment(
+    rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> Option<DistributedMessage<TestId>> {
+    while let Ok(msg) = rx.try_recv() {
+        if matches!(msg, DistributedMessage::TaskAssignment { .. }) {
+            return Some(msg);
+        }
+    }
+    None
+}
+
+/// Regression for the dispatch-stall after keepalive-driven recovery:
+/// when the primary requeues an in-flight task from a dead secondary,
+/// surviving idle workers do NOT auto-poll. Without an explicit
+/// `dispatch_to_idle_workers` kickstart at the end of the requeue
+/// path the recovered task sits in the pool forever — observed in the
+/// 2026-05-17 cohort run where the primary logged
+/// `recovered_in_flight=1` after a 300 s keepalive timeout but never
+/// re-emitted `task_request` to any idle peer, so the entire dispatch
+/// chain stalled until the SLURM time-limit killed the wrapper.
+///
+/// Mirrors the existing kickstart pattern in
+/// `run_retry_passes` / `handle_task_complete` / `handle_task_failed`:
+/// every other path that re-injects into the pool calls
+/// `dispatch_to_idle_workers().await` before yielding to the
+/// operational loop, because secondaries only send `TaskRequest`
+/// after they finish a task.
+#[tokio::test(flavor = "current_thread")]
+async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
+    let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+        PrimaryCoordinator::new(
+            config(Duration::from_millis(50), 2),
+            transport,
+            dynrunner_transport_quic::NoPeerTransport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator,
+        );
+    install_default_pool(&mut primary);
+
+    // sec-a is the wedged secondary; it owns one in-flight task that
+    // must be recovered into the pool and re-dispatched to sec-b.
+    register_operational_secondary(&mut primary, "sec-a", 0, "victim-a");
+
+    // sec-b is the survivor with an IDLE worker that has a non-zero
+    // memory budget (FixedEstimator requires memory=1, so the budget
+    // must exceed that). Without a budget the scheduler returns NoFit
+    // and the test would falsely pass against a buggy primary.
+    let sec_b_conn = SecondaryConnection::new("sec-b".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_cert_exchange(String::new(), None, None, 0)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "sec-b".into(),
+        SecondaryConnectionState::Operational(sec_b_conn),
+    );
+    primary.seed_keepalive("sec-b");
+    primary.workers.push(RemoteWorkerState {
+        worker_id: 1,
+        secondary_id: "sec-b".into(),
+        resource_budgets: ResourceMap::from([(
+            dynrunner_core::ResourceKind::memory(),
+            1024 * 1024 * 1024u64,
+        )]),
+        current_task: None,
+        estimated_resources: ResourceMap::new(),
+        is_idle: true,
+    });
+
+    // Sleep past the keepalive deadline so sec-a is dead. Refresh
+    // sec-b's keepalive immediately before the tick so only sec-a
+    // ends up in the dead list (we want the legacy single-death
+    // requeue path, not mass-death — mass_death_grace is ZERO via the
+    // default `config` builder, but bumping sec-b is the same shape
+    // the surviving-peer scenario takes in production).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    primary.record_keepalive("sec-b");
+    primary.process_heartbeat_tick().await.unwrap();
+
+    // sec-a is gone, sec-b survives, the recovered task is in the
+    // pool. These three are independent of the kickstart contract —
+    // they assert the requeue itself happened, so a regression in
+    // the requeue path can't masquerade as a kickstart failure.
+    assert!(
+        !primary.secondaries.contains_key("sec-a"),
+        "dead secondary must be removed"
+    );
+    assert!(
+        primary.secondaries.contains_key("sec-b"),
+        "survivor must remain"
+    );
+
+    // The load-bearing assertion: sec-b's outgoing channel saw a
+    // `TaskAssignment` — i.e. the requeue path kickstarted dispatch
+    // to the surviving idle worker, the very signal the production
+    // run was missing.
+    let assignment = first_task_assignment(&mut sec_rxs[1]);
+    assert!(
+        assignment.is_some(),
+        "survivor must receive TaskAssignment after dead-secondary requeue; \
+         without the kickstart the recovered task hangs in the pool until \
+         the next external event (which never came in the cohort run)"
+    );
+    if let Some(DistributedMessage::TaskAssignment { secondary_id, .. }) = assignment {
+        assert_eq!(secondary_id, "sec-b");
+    }
+    // Post-dispatch the survivor's worker is no longer idle and the
+    // recovered task is no longer in the queued bucket — symmetric
+    // to the dispatch-success path elsewhere. `pool().len()` counts
+    // queued + in-flight + blocked, so checking `iter()` (queued-
+    // only) is the right shape: the task moved from queued to
+    // in-flight on the kickstart's dispatch call.
+    assert!(
+        primary.workers.iter().any(|w| w.secondary_id == "sec-b" && !w.is_idle),
+        "survivor's worker must flip to busy after the kickstart"
+    );
+    assert_eq!(
+        primary.pool().iter().count(),
+        0,
+        "recovered task must leave the queued bucket via dispatch kickstart"
+    );
 }

@@ -41,6 +41,7 @@ fn make_coordinator() -> PrimaryCoordinator<
         required_setup_on_promote: false,
         max_concurrent_per_type: HashMap::new(),
         retry_max_passes: 0,
+        oom_retry_max_passes: 1,
         fleet_dead_timeout: Duration::from_secs(1),
         mesh_ready_timeout: Duration::from_secs(1),
         mass_death_grace: Duration::from_secs(1),
@@ -113,6 +114,117 @@ async fn fail_permanent_via_channel() {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }).await;
+}
+
+/// Operator-set `ResourceExhausted(memory)` via `FailPermanent`
+/// funnels into the per-phase OOM retry bucket — the same channel
+/// a worker-originated OOM failure flows through. Pins the
+/// cross-cut: the bucket-partition predicate reads from
+/// `failed_tasks` regardless of who wrote the entry, so the
+/// operator-driven path and the worker-driven path converge on
+/// identical retry semantics.
+///
+/// To pin the partition WITHOUT having the in-cascade OOM bucket
+/// auto-drain the entry (which it WOULD do with a non-zero budget,
+/// because `apply_fail_permanent` calls `note_item_failed` →
+/// `process_phase_lifecycle` → `try_run_phase_retry_bucket`), this
+/// fixture uses `oom_retry_max_passes = 0`. With the cap at zero
+/// the cascade observes the entry, finds the bucket exhausted, and
+/// falls through to `on_phase_end`; the entry stays in
+/// `failed_tasks` and we directly verify the partition.
+#[tokio::test(flavor = "current_thread")]
+async fn fail_permanent_oom_routes_into_per_phase_oom_bucket() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let mut coordinator = make_coordinator();
+        // Disable the OOM bucket so the cascade can't auto-drain the
+        // entry — we want to inspect `failed_tasks` post-apply.
+        coordinator.config.oom_retry_max_passes = 0;
+        let binary = make_binary("doomed-by-operator", 100);
+        let hash = compute_task_hash(&binary);
+        coordinator.cluster_state.apply(
+            ClusterMutation::TaskAdded {
+                hash: hash.clone(),
+                task: binary.clone(),
+            },
+        );
+        let mut phase_set = std::collections::HashSet::new();
+        phase_set.insert(binary.phase_id.clone());
+        coordinator.pending = Some(
+            dynrunner_scheduler_api::PendingPool::new(phase_set, HashMap::new())
+                .expect("pool init"),
+        );
+        for p in coordinator.pool().active_phases() {
+            coordinator.phase_completed.insert(p.clone(), 0);
+            coordinator.phase_failed.insert(p.clone(), 0);
+        }
+        // `all_binaries` is the binary-lookup table the retry-bucket
+        // primitive reads to map `failed_tasks` hashes back to
+        // dispatchable `TaskInfo`s. In production this is populated
+        // by `run()`'s seed step; here we set it explicitly.
+        coordinator.all_binaries = vec![binary.clone()];
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        super::handle_primary_command(
+            &mut coordinator,
+            PrimaryCommand::FailPermanent {
+                hash: hash.clone(),
+                error: ErrorType::ResourceExhausted(
+                    dynrunner_core::ResourceKind::memory(),
+                ),
+                reason: "over budget".into(),
+                reply: reply_tx,
+            },
+            &mut None,
+        )
+        .await;
+        assert!(
+            reply_rx.await.unwrap().is_ok(),
+            "fail_permanent should accept ResourceExhausted(memory)"
+        );
+
+        // Bucket exhausted (cap=0), entry stays in `failed_tasks`
+        // with the OOM kind — the partition predicate the OOM
+        // bucket would have used.
+        match coordinator.failed_tasks.get(&hash) {
+            Some(ErrorType::ResourceExhausted(kind)) => {
+                assert_eq!(kind.as_str(), "memory");
+            }
+            other => panic!(
+                "operator-set OOM should land in failed_tasks as \
+                 ResourceExhausted(memory); got {other:?}"
+            ),
+        }
+
+        // Now flip cap to 1 and drive the OOM bucket directly. It
+        // must pick the entry up because the partition predicate
+        // matches `ResourceExhausted(memory)`, regardless of
+        // whether the failure came from a worker or an operator
+        // command.
+        coordinator.config.oom_retry_max_passes = 1;
+        // Reset the per-phase counter so the new cap takes effect
+        // for this bucket pass.
+        coordinator.retry_passes_used.clear();
+        let phase = binary.phase_id.clone();
+        let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> =
+            None;
+        let reinjected = coordinator
+            .try_run_phase_retry_bucket(
+                &phase,
+                crate::primary::retry_bucket::BucketKind::Oom,
+                &mut no_cmd_rx,
+            )
+            .await
+            .expect("OOM bucket runs cleanly");
+        assert!(
+            reinjected,
+            "operator-set OOM must funnel into the per-phase OOM bucket"
+        );
+        assert!(
+            !coordinator.failed_tasks.contains_key(&hash),
+            "OOM bucket should drain the entry from failed_tasks"
+        );
     }).await;
 }
 

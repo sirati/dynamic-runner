@@ -7,9 +7,9 @@
 //!   CRDT state at promotion time.
 //! - [`ledger_ops`] — `primary_pending_len`,
 //!   `note_primary_item_completed`, `note_primary_item_failed`,
-//!   `primary_drain_check_and_retry`, `primary_pending_is_empty`:
-//!   maintain the in-flight ledger as items complete or fail and
-//!   drive Recoverable-retry re-injection.
+//!   `primary_pending_is_empty`: maintain the in-flight ledger as
+//!   items complete or fail. Retry-bucket re-injection is owned by
+//!   `lifecycle`'s phase-drain cascade, not by this module.
 //! - [`task_request`] — `handle_primary_task_request`: respond to a
 //!   peer's `TaskRequest` by picking from the pool and sending a
 //!   `TaskAssignment`.

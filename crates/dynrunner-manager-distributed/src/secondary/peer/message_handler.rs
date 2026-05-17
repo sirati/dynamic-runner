@@ -189,19 +189,17 @@ where
                     // `primary_failed` for the retry pass,
                     // others just decrement in-flight as before.
                     self.note_primary_item_failed(&task_hash, &error_type, command_rx).await;
-                    // Synchronous drain-check: if THIS failure was
-                    // the last in-flight item AND the pool is
-                    // empty, immediately re-inject the failed-task
-                    // ledger and re-poll our own workers. Without
-                    // this synchronous trigger the retry waits
-                    // until the next keepalive tick (up to the
-                    // keepalive interval), which races the live
-                    // primary's `operational_loop` exit (which
-                    // fires on `completed + failed >= total` and
-                    // doesn't wait). No-op when there's still
-                    // pending work or no Recoverable failures
-                    // logged.
-                    self.primary_drain_check_and_retry(factory).await;
+                    // Synchronous kickstart: `note_primary_item_failed`
+                    // ran the per-phase retry-bucket cascade inline
+                    // (see `secondary/primary/lifecycle.rs`); the
+                    // bucket may have reinjected the failed task
+                    // into the pool. Re-poll OUR own idle workers
+                    // so the reinjected item reaches a worker on
+                    // this tick instead of waiting up to one
+                    // keepalive interval. Peer workers self-recover
+                    // on their own keepalive tick. No-op when no
+                    // worker is idle.
+                    self.repoll_idle_workers(factory).await;
                     tracing::debug!(
                         peer = %secondary_id,
                         task_hash,

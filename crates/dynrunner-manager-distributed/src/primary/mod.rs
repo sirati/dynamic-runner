@@ -35,6 +35,7 @@ mod lifecycle;
 mod peer_setup;
 pub mod preferred_secondaries;
 pub mod respawn;
+pub(crate) mod retry_bucket;
 pub mod staging;
 mod task;
 pub mod wire;

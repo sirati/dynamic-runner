@@ -1,14 +1,13 @@
-//! Primary-side in-flight ledger queries and retry orchestration.
+//! Primary-side in-flight ledger queries for the promoted secondary.
 //!
 //! Single concern: maintain `primary_in_flight` / `primary_pending`
-//! invariants as items complete or fail, and drive the
-//! drain-check-and-retry sweep that re-injects Recoverable failures
-//! into the pool when no live work remains. Pool retries are gated
-//! by the ledger here (callers say "an item finished" / "an item
-//! failed"; this module owns the bookkeeping side effects).
+//! invariants as items complete or fail. Pool retries are driven
+//! at the phase-drain edge by `process_primary_phase_lifecycle`
+//! (see `secondary/primary/lifecycle.rs`), which calls the shared
+//! retry-bucket core; this module just records the failure into
+//! `primary_failed` and hands control to the cascade.
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender, TaskInfo};
-use dynrunner_manager_local::WorkerFactory;
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -93,14 +92,16 @@ where
     /// Sibling to `note_primary_item_completed` for the failure path.
     /// Decrements the pool's in-flight counter for the item's phase
     /// (same as completion — phase machine doesn't distinguish
-    /// success vs failure for in-flight bookkeeping). For Recoverable
-    /// failures of tasks THIS secondary dispatched as primary
-    /// via `handle_primary_task_request`, also stash the binary in
-    /// `primary_failed` so `primary_drain_check_and_retry`
-    /// can re-inject it after the main pass drains. Non-Recoverable
-    /// / OutOfMemory / Unknown failures bypass the ledger — they're
-    /// terminal at the worker level and retry would likely fail
-    /// again the same way.
+    /// success vs failure for in-flight bookkeeping). Stash the
+    /// binary + error in `primary_failed` regardless of error
+    /// class — mirrors the live primary's `failed_tasks.insert(...)`
+    /// step in `task/failed.rs`. The per-phase retry-bucket cascade
+    /// fired by `process_primary_phase_lifecycle` partitions the
+    /// ledger by bucket kind (Recoverable / OOM); error types not
+    /// matched by any bucket (`NonRecoverable`, `Unfulfillable`,
+    /// non-memory `ResourceExhausted`) survive in the ledger
+    /// permanently and surface through the run's outcome summary
+    /// as `fail_final`. Same partition the live primary applies.
     ///
     /// Tasks not in `primary_in_flight` (i.e. not dispatched by this
     /// secondary as primary — e.g. peer-completion forwards
@@ -113,9 +114,9 @@ where
     /// Called from every wire-arrival site that observes a TaskFailed
     /// for a primary-dispatched task: peer.rs (peer transport),
     /// processing.rs (own worker event), dispatch.rs (live-primary
-    /// forward, no-op for Recoverable). The Recoverable filter is
-    /// inside this function so the callers don't have to special-case
-    /// the retry path.
+    /// forward path). The retry-bucket partition is applied at the
+    /// drain edge inside `process_primary_phase_lifecycle`; callers
+    /// don't have to know which classes are retriable.
     pub(in crate::secondary) async fn note_primary_item_failed(
         &mut self,
         file_hash: &str,
@@ -128,23 +129,18 @@ where
         };
         let phase_id = item.phase_id.clone();
         let task_id = item.binary.task_id.clone();
-        if matches!(error_type, dynrunner_core::ErrorType::Recoverable) {
-            // Stash for the retry pass. Idempotent — the same hash
-            // appearing twice (e.g. after re-injection fails again)
-            // overwrites with the same binary and the latest
-            // ErrorType, which is harmless. The entry carries
-            // `error_type` so the outcome-summary breakdown can
-            // partition the ledger by class; today only Recoverable
-            // lands here (retry-pass scope), but the structure is
-            // ready when non-Recoverable accounting joins.
-            self.primary_failed.insert(
-                file_hash.to_string(),
-                crate::secondary::FailedTaskEntry {
-                    binary: item.binary,
-                    error_type: error_type.clone(),
-                },
-            );
-        }
+        // Mirror the live-primary's `failed_tasks.insert` step:
+        // every error class lands in the ledger; the retry-bucket
+        // cascade in `process_primary_phase_lifecycle` decides
+        // which classes get a second-chance dispatch. Idempotent
+        // — re-arrival overwrites with the latest ErrorType.
+        self.primary_failed.insert(
+            file_hash.to_string(),
+            crate::secondary::FailedTaskEntry {
+                binary: item.binary,
+                error_type: error_type.clone(),
+            },
+        );
         // Per-phase counter bump BEFORE the drain cascade so the
         // `on_phase_end(phase, completed, failed)` callback observes
         // the failure when this failure is the one that takes the
@@ -158,117 +154,6 @@ where
             pool.on_item_finished(&phase_id, task_id.as_deref());
         }
         self.process_primary_phase_lifecycle(command_rx).await;
-    }
-
-    /// Primary-side equivalent of the local primary's
-    /// `run_retry_passes`. Called once per keepalive tick from
-    /// `process_tasks`. When the main pass has drained for THIS
-    /// primary's view (pool empty, no items in flight, no local
-    /// active tasks) AND there are Recoverable failures pending in
-    /// `primary_failed` AND the retry budget hasn't been
-    /// exhausted, take a snapshot of the failed binaries, clear the
-    /// ledger, re-inject each into `primary_pending` via
-    /// `pool.reinject`, bump the pass counter, and kick our own idle
-    /// workers via `repoll_idle_workers` so the operational loop
-    /// re-engages with the just-injected items.
-    ///
-    /// Why "drain-check" rather than a phase-explicit "main pass" /
-    /// "retry pass" boundary: the primary's `process_tasks` loop
-    /// has no notion of pass boundaries — it's a single select! that
-    /// runs until shutdown. The drain-check fires whenever the loop
-    /// is observably idle and there's leftover retry work, which is
-    /// the same trigger condition the local primary's two-phase
-    /// `operational_loop` → `run_retry_passes` design used (drain →
-    /// re-inject → re-run). Repeated firing is gated by the budget
-    /// counter: once `retry_passes_used == retry_max_passes`, the
-    /// next drain-check leaves `primary_failed` populated and
-    /// the run wraps up via the normal exit conditions.
-    ///
-    /// Peer secondaries' workers don't need a kickstart from here:
-    /// they re-poll on their own keepalive tick via
-    /// `repoll_idle_workers` (with backoff) so any peer worker that
-    /// got "no work" before the re-injection will see new work on its
-    /// next request. Only the primary's own workers need an
-    /// immediate kick — they're the ones whose `request_task_for_worker`
-    /// short-circuits through `handle_primary_task_request` directly.
-    pub(in crate::secondary) async fn primary_drain_check_and_retry(
-        &mut self,
-        factory: &mut impl WorkerFactory<M>,
-    ) {
-        if !self.is_primary {
-            return;
-        }
-        if self.primary_failed.is_empty() {
-            return;
-        }
-        if !self.primary_pending_is_empty()
-            || !self.primary_in_flight.is_empty()
-            || !self.active_tasks.is_empty()
-        {
-            return;
-        }
-        if !self.primary_retry_budget.should_retry() {
-            // Budget exhausted on either axis (attempt-count cap OR
-            // SLURM-wallclock deadline minus safety margin): the
-            // residual entries are permanent failures. Keep them in
-            // the ledger so test fixtures (and future operator-
-            // visible probes) can count permanent failures from the
-            // primary's perspective; the log-spam guard is
-            // `exhaustion_warning_emitted` so we emit the warning
-            // once per run rather than every drain check.
-            if !self.exhaustion_warning_emitted {
-                // Tasks in `primary_failed` at retry-exhaustion time
-                // are now terminal (no further passes). Surface them
-                // as `fail_final` so the operator's log-side
-                // breakdown matches the actual disposition; the
-                // class-of-error these tasks hit was Recoverable
-                // (only Recoverable lands in primary_failed today),
-                // but the run-level outcome class is "final" because
-                // the retry policy gave up.
-                //
-                // `passes` reflects the legacy attempt-count cap; if
-                // the cliff was the SLURM-wallclock side, the actual
-                // attempts-used will be < retry_max_passes — operators
-                // chasing "why didn't I get all my retries?" should
-                // cross-reference `$SLURM_JOB_END_TIME` and the run
-                // duration. Single log shape kept stable for
-                // back-compat with the existing operator dashboards.
-                tracing::warn!(
-                    fail_final = self.primary_failed.len(),
-                    passes = self.config.retry_max_passes,
-                    "primary retry budget exhausted; failed tasks are permanent"
-                );
-                self.exhaustion_warning_emitted = true;
-            }
-            return;
-        }
-
-        // Drain the failed-ledger: each entry yields its `binary`
-        // for re-injection into `primary_pending`. The `error_type`
-        // recorded on the entry is intentionally discarded here —
-        // the next pass will overwrite with whatever outcome the
-        // retry produces.
-        let to_retry: Vec<TaskInfo<I>> =
-            std::mem::take(&mut self.primary_failed)
-                .into_values()
-                .map(|entry| entry.binary)
-                .collect();
-        let pass = self.primary_retry_budget.attempts_used() + 1;
-        tracing::info!(
-            pass,
-            count = to_retry.len(),
-            "primary retry pass: re-injecting failed tasks"
-        );
-        if let Some(pool) = self.primary_pending.as_mut() {
-            for binary in to_retry {
-                pool.reinject(binary);
-            }
-        }
-        self.primary_retry_budget.record_attempt();
-
-        // Kick our own idle workers — see method-level doc. Peer
-        // workers self-recover on their next keepalive-driven repoll.
-        self.repoll_idle_workers(factory).await;
     }
 
     /// Test/inspection helper: whether the pool has zero queued items.

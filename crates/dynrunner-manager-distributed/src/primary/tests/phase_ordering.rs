@@ -281,6 +281,7 @@ async fn run_phase_ordering_scenario(
         required_setup_on_promote: false,
         max_concurrent_per_type: std::collections::HashMap::new(),
         retry_max_passes: 1,
+        oom_retry_max_passes: 1,
         fleet_dead_timeout: Duration::from_secs(30),
         mesh_ready_timeout: Duration::from_secs(5),
         mass_death_grace: Duration::ZERO,

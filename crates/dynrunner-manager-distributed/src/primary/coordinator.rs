@@ -145,6 +145,15 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// `failed_tasks`.
     pub(super) phase_completed: HashMap<PhaseId, u32>,
     pub(super) phase_failed: HashMap<PhaseId, u32>,
+    /// Per-(phase, retry-bucket) pass counter, owned by
+    /// `primary::retry_bucket`. Each entry tracks how many passes
+    /// have been consumed by the matching bucket for that phase;
+    /// caps are read from `config.retry_max_passes` /
+    /// `config.oom_retry_max_passes`. See
+    /// [`crate::primary::retry_bucket`] for the surface this is
+    /// keyed against.
+    pub(super) retry_passes_used:
+        crate::primary::retry_bucket::RetryPassesUsed,
     /// Currently in-flight count per `TypeId`, against
     /// `config.max_concurrent_per_type`. Incremented on dispatch
     /// (in both `assign_initial` and `assign_normal` paths),
@@ -527,6 +536,33 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// arm WRITES, the outer wrapper READS. Avoids touching the
     /// `Result<(), String>` signature of the inner loop.
     pub(super) setup_deadline_outcome: Option<std::time::Duration>,
+
+    /// OOM-bucket dispatch-shape gate. `true` only while a per-phase
+    /// OOM retry bucket is actively reinjecting and draining; `false`
+    /// otherwise. The retry-bucket primitive
+    /// ([`crate::primary::retry_bucket`]) is the sole writer:
+    /// it flips this `true` on `BucketKind::Oom` entry, and back to
+    /// `false` on every `Ok(false)` return of the OOM bucket (no
+    /// candidates left OR budget exhausted).
+    ///
+    /// Read by dispatch-shape sites (`dispatch_to_idle_workers`,
+    /// `handle_task_request`, the operational-loop 5-min timeout arm)
+    /// through the accessor [`Self::single_worker_mode`] / the
+    /// composed predicate [`Self::should_skip_worker_for_dispatch`].
+    /// Call sites never branch on this directly — the masking + the
+    /// strict-preferred-secondaries filter live behind a single
+    /// dispatch-shape pipeline so the rest of the coordinator stays
+    /// agnostic to OOM-bucket semantics.
+    ///
+    /// User spec (2026-05-17): during the OOM bucket the retries
+    /// should run with 1 worker per secondary and tasks ordered by
+    /// node memory DESC so memory-pressed work gets a fresh shot
+    /// against maximum RAM headroom. Concurrent normal-pass workers
+    /// share the masking for the duration of the OOM bucket; this
+    /// is documented as acceptable throughput tax (concurrent normal
+    /// dispatch tends to share secondaries with the OOM-bucket
+    /// retries anyway).
+    pub(super) single_worker_mode: bool,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -586,6 +622,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             failed_tasks: HashMap::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
+            retry_passes_used: HashMap::new(),
             in_flight_per_type: HashMap::new(),
             on_phase_start: None,
             on_phase_end: None,
@@ -626,6 +663,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             panik_signal_rx: None,
             panik_outcome: None,
             setup_deadline_outcome: None,
+            single_worker_mode: false,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -906,6 +944,98 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             .is_some_and(|t| Instant::now() < *t)
     }
 
+    /// True while the per-phase OOM retry bucket is actively
+    /// reinjecting + draining. Sole writer: `try_run_phase_retry_bucket`
+    /// (set true on `BucketKind::Oom` entry, reset on its `Ok(false)`
+    /// returns). Read by the dispatch-shape pipeline and the
+    /// operational-loop 5-min timeout arm. See the field doc on
+    /// `single_worker_mode` for the user-spec rationale.
+    pub(super) fn single_worker_mode(&self) -> bool {
+        self.single_worker_mode
+    }
+
+    /// Secondary-local worker id (0-based) for the worker at index
+    /// `worker_idx` in `self.workers`. Workers are stored grouped by
+    /// secondary in `self.workers` (initial-assignment populated
+    /// order); the local id is "position among same-secondary
+    /// predecessors in the Vec".
+    ///
+    /// Single concern: index translation. Used by the dispatch-shape
+    /// pipeline so OOM-bucket single-worker masking can read the
+    /// secondary-local id without each call site re-doing the linear
+    /// scan. The two existing call sites — `dispatch_to_idle_workers`
+    /// and `handle_task_request` — already computed the same value
+    /// inline; centralising keeps the masking site and the wire-
+    /// emitted `local_worker_id` in lockstep.
+    pub(super) fn local_worker_id_in_secondary(&self, worker_idx: usize) -> u32 {
+        let sec_id = self.workers[worker_idx].secondary_id.as_str();
+        self.workers[..worker_idx + 1]
+            .iter()
+            .filter(|w| w.secondary_id == sec_id)
+            .count() as u32
+            - 1
+    }
+
+    /// True iff the worker at `worker_idx` must be skipped this
+    /// dispatch tick. Composes the two reasons-to-skip the dispatch
+    /// pipeline knows about today:
+    ///
+    ///   * The worker's secondary is in backpressure backoff
+    ///     ([`Self::is_backpressured`]).
+    ///   * OOM-bucket single-worker mode is active and this is not
+    ///     worker 0 of its secondary ([`Self::single_worker_mode`]).
+    ///
+    /// Single concern: the dispatch-pipeline's "skip this worker"
+    /// decision. Adding another reason-to-skip lands here, not as a
+    /// parallel `if` at every call site. The two call sites
+    /// (`dispatch_to_idle_workers` + `handle_task_request`) stay
+    /// agnostic to either policy.
+    pub(super) fn should_skip_worker_for_dispatch(&self, worker_idx: usize) -> bool {
+        let sec_id = self.workers[worker_idx].secondary_id.as_str();
+        if self.is_backpressured(sec_id) {
+            return true;
+        }
+        if self.single_worker_mode && self.local_worker_id_in_secondary(worker_idx) != 0 {
+            return true;
+        }
+        false
+    }
+
+    /// Secondary ids ordered by total advertised memory descending.
+    /// Ties broken stably by id (lexicographic) so the OOM-bucket
+    /// per-task `preferred_secondaries` assignment is reproducible
+    /// across re-entries. Secondaries with no `memory` resource
+    /// advertised sort last (treated as zero).
+    ///
+    /// Single concern: snapshot the cluster's per-node memory
+    /// ranking at OOM-bucket entry. Re-sorting per iteration is
+    /// explicitly NOT done — a secondary that dies mid-bucket will
+    /// naturally fail dispatch, and the next bucket entry re-samples.
+    /// Returns owned `String`s so callers can carry the snapshot
+    /// across `&mut self` reinject/dispatch calls without lifetime
+    /// surgery.
+    pub(super) fn secondaries_sorted_by_memory_desc(&self) -> Vec<String> {
+        let mem_kind = dynrunner_core::ResourceKind::memory();
+        let mut entries: Vec<(String, u64)> = self
+            .secondaries
+            .iter()
+            .map(|(id, state)| {
+                let mem = state
+                    .resources()
+                    .iter()
+                    .find(|r| r.kind == mem_kind)
+                    .map(|r| r.amount)
+                    .unwrap_or(0);
+                (id.clone(), mem)
+            })
+            .collect();
+        // Sort by (memory DESC, id ASC). Stable on id so a fleet with
+        // multiple equal-memory nodes assigns retries deterministically
+        // across re-runs.
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries.into_iter().map(|(id, _)| id).collect()
+    }
+
     /// Borrow the pending pool. Panics if called before `run()` has
     /// initialised it — every internal call site is inside the run
     /// pipeline so this is a contract violation, not a runtime path.
@@ -920,6 +1050,59 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.pending
             .as_mut()
             .expect("PendingPool initialised at run() start")
+    }
+
+    /// Build the dispatch-shape worker view for the worker at
+    /// `worker_idx`. The pipeline is:
+    ///
+    ///   1. `pool.view_for_worker(global_wid, Some(&soft_pred))` —
+    ///      priority-ordered eligible items with soft
+    ///      `preferred_secondaries` tie-break.
+    ///   2. Strict `preferred_secondaries` filter — ACTIVE iff
+    ///      `single_worker_mode()` is true. Drops items whose
+    ///      non-empty `preferred_secondaries` list omits this
+    ///      worker's secondary.
+    ///   3. `cap_filter_view` — drops items over a per-type cap.
+    ///
+    /// Single concern: the dispatch-pipeline's view-construction
+    /// shape. Outside the OOM bucket step (2) is a no-op; inside
+    /// it is load-bearing. Both call sites
+    /// (`dispatch_to_idle_workers` and `handle_task_request`) call
+    /// this once and consume the returned view directly.
+    pub(super) fn dispatch_view_for_worker(
+        &self,
+        worker_idx: usize,
+    ) -> dynrunner_scheduler_api::WorkerView<I> {
+        let global_wid = self.workers[worker_idx].worker_id;
+        let secondary_id = self.workers[worker_idx].secondary_id.as_str();
+        let soft_predicate = preferred_secondaries::apply_preferred_secondaries_predicate::<I>(
+            secondary_id,
+        );
+        let view = self
+            .pool()
+            .view_for_worker(global_wid, Some(&soft_predicate));
+        let view = self.apply_strict_preferred_secondaries(view, secondary_id);
+        self.cap_filter_view(view)
+    }
+
+    /// Apply the strict-preferred-secondaries filter to `view` iff
+    /// the coordinator is in OOM-bucket single-worker mode; otherwise
+    /// return `view` unchanged.
+    ///
+    /// Kept as a tiny standalone helper so the active-vs-inactive
+    /// gating lives in exactly one place and the dispatch-pipeline
+    /// helper above reads as a flat sequence of steps.
+    fn apply_strict_preferred_secondaries(
+        &self,
+        view: dynrunner_scheduler_api::WorkerView<I>,
+        secondary_id: &str,
+    ) -> dynrunner_scheduler_api::WorkerView<I> {
+        if !self.single_worker_mode() {
+            return view;
+        }
+        view.filter(
+            preferred_secondaries::filter_strict_preferred_secondaries::<I>(secondary_id),
+        )
     }
 
     /// Drop the worker view down to the per-type-cap-eligible items.
@@ -1242,6 +1425,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.phase_completed.clear();
         self.phase_failed.clear();
         self.phase_started_emitted.clear();
+        // Per-(phase, bucket) retry counters: cleared at run-start
+        // so a coordinator reused across runs (no production path
+        // does this today, but the single-shot contract should not
+        // implicitly depend on `new()`-only init) starts every
+        // bucket from zero.
+        self.retry_passes_used.clear();
         for p in &phase_set {
             self.phase_completed.insert(p.clone(), 0);
             self.phase_failed.insert(p.clone(), 0);
@@ -1670,6 +1859,50 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 break;
             }
             for p in &drained {
+                // Per-phase retry-bucket cascade — runs BEFORE
+                // `on_phase_end` so phase B (which depends on A)
+                // doesn't activate until phase A's retry buckets
+                // are exhausted. See `crate::primary::retry_bucket`
+                // for the partition and counter semantics.
+                //
+                // Recoverable bucket first: a Recoverable failure
+                // that succeeds on retry leaves no entry in
+                // `failed_tasks`, so the subsequent OOM-bucket
+                // probe finds nothing and falls through cleanly.
+                // OOM bucket second: the dispatch modifiers (when
+                // wired) constrain memory-heavy work to a single
+                // worker per secondary in memory-DESC order, so
+                // running it AFTER the Recoverable bucket has
+                // settled keeps the constraint scoped to actually-
+                // over-budget tasks.
+                //
+                // On `Ok(true)`: the bucket reinjected at least one
+                // task; the phase has flipped Drained → Active and
+                // `drained_pending` no longer contains it. Skip
+                // `on_phase_end` and `mark_phase_done` for this
+                // phase; the next drain edge will revisit it.
+                if self
+                    .try_run_phase_retry_bucket(
+                        p,
+                        crate::primary::retry_bucket::BucketKind::Recoverable,
+                        command_rx,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if self
+                    .try_run_phase_retry_bucket(
+                        p,
+                        crate::primary::retry_bucket::BucketKind::Oom,
+                        command_rx,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let completed = self.phase_completed.get(p).copied().unwrap_or(0);
                 let failed = self.phase_failed.get(p).copied().unwrap_or(0);
                 if let Some(cb) = self.on_phase_end.as_mut() {

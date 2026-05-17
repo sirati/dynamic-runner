@@ -133,10 +133,21 @@ async fn note_primary_item_completed_fires_on_phase_end_on_pool_drain() {
 
 /// (2) Mixed-class drain: 1 completion + 1 failure in the same phase
 /// drain the pool; the final cascade-fire reports both counts.
+///
+/// Configured with `retry_max_passes = 0` so the per-phase
+/// Recoverable retry bucket (which post-2026-05-17 runs at the
+/// drain edge BEFORE `on_phase_end`) does not reinject the failed
+/// task; this test's contract is the per-phase counter
+/// bookkeeping for the failure path, NOT the retry-bucket
+/// semantics (which are pinned separately in
+/// `retry_bucket_cascade.rs`).
 #[tokio::test(flavor = "current_thread")]
 async fn note_primary_item_failed_contributes_to_phase_end_counters() {
     let phase = PhaseId::from("phase-a");
-    let mut sec = make_secondary(election_config("sec-0"));
+    let mut cfg = election_config("sec-0");
+    cfg.retry_max_passes = 0;
+    cfg.oom_retry_max_passes = 0;
+    let mut sec = make_secondary(cfg);
     // Two-item phase: the pool needs two in-flight markers so the
     // first finish leaves the phase still Active (1 in_flight remaining).
     let mut phase_ids = HashSet::new();

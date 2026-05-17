@@ -1,33 +1,43 @@
 //! Phase-lifecycle bookkeeping for the promoted-secondary's primary
 //! pool.
 //!
-//! Single concern: drive `Drained` phases through `on_phase_end` →
-//! `mark_phase_done` → newly-Active phases through `on_phase_start`,
-//! mirroring `PrimaryCoordinator::process_phase_lifecycle` so a
-//! setup-promoted secondary that owns the live pool fires the same
-//! lifecycle hooks the demoted primary would have. The fire-site is
-//! the only addition; the cascade-drain primitive itself stays the
-//! free-function `cascade_drain_done` (callback-silent, used by
-//! `populate_primary_from_cluster_state` whose semantics must NOT
-//! refire `on_phase_end` for items that completed pre-promotion).
+//! Single concern: drive `Drained` phases through the per-phase
+//! retry-bucket cascade → `on_phase_end` → `mark_phase_done` →
+//! newly-Active phases through `on_phase_start`, mirroring
+//! `PrimaryCoordinator::process_phase_lifecycle` so a setup-promoted
+//! secondary that owns the live pool fires the same retry semantics
+//! and lifecycle hooks the demoted primary would have. The
+//! fire-site is the only addition; the cascade-drain primitive
+//! itself stays the free-function `cascade_drain_done`
+//! (callback-silent, used by `populate_primary_from_cluster_state`
+//! whose semantics must NOT refire `on_phase_end` for items that
+//! completed pre-promotion).
 //!
 //! Module boundary:
 //!   * Owns: the `Option<OnPhaseStart>` / `Option<OnPhaseEnd>`
-//!     invocation semantics on `SecondaryCoordinator` and the
+//!     invocation semantics on `SecondaryCoordinator`, the
 //!     per-phase counter bookkeeping (`primary_phase_completed`,
-//!     `primary_phase_failed`, `primary_phase_started_emitted`).
+//!     `primary_phase_failed`, `primary_phase_started_emitted`),
+//!     and the per-side candidate-build + kickstart steps that
+//!     wrap the shared retry-bucket core.
 //!   * Does NOT own: the pool primitives themselves
 //!     (`poll_drain_transitions` / `mark_phase_done` /
 //!     `drain_empty_active_phases` / `active_phases`) — those live in
 //!     `dynrunner-scheduler-api`'s `PendingPool` and are invoked
-//!     verbatim here.
+//!     verbatim here. The retry-bucket core
+//!     (`try_phase_retry_bucket_core`) lives in
+//!     `primary/retry_bucket.rs` and is reused 1:1 with the live
+//!     primary path.
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender, PhaseId};
+use dynrunner_core::{Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
+use crate::primary::retry_bucket::{
+    try_phase_retry_bucket_core, BucketKind,
+};
 use crate::primary::PrimaryCommand;
 
 use super::super::SecondaryCoordinator;
@@ -116,6 +126,79 @@ where
     /// with `cluster_state` already populated from the live primary's
     /// broadcasts, so the same invariant holds — no transient
     /// empty-phase window exists for the secondary to gate against.
+    /// Per-(phase, bucket) retry-bucket primitive for the
+    /// promoted-secondary's primary path. Mirrors
+    /// `PrimaryCoordinator::try_run_phase_retry_bucket` 1:1 by
+    /// delegating to the shared core in
+    /// `primary/retry_bucket.rs`. The two paths differ only in:
+    ///
+    ///   1. Candidate-build source — the secondary's
+    ///      `primary_failed` ledger keys hashes to
+    ///      `FailedTaskEntry { binary, error_type }` so each
+    ///      entry already carries the `TaskInfo` needed for
+    ///      reinjection. The live primary cross-references its
+    ///      `all_binaries` snapshot against `failed_tasks` (which
+    ///      stores `ErrorType` only).
+    ///   2. Kickstart — the secondary calls `repoll_idle_workers`
+    ///      against its OWN worker pool; peer secondaries
+    ///      self-recover on their own keepalive tick via the same
+    ///      method.
+    ///
+    /// Returns `true` iff at least one task was reinjected. On
+    /// `true` the caller (`process_primary_phase_lifecycle`)
+    /// skips `on_phase_end` + `mark_phase_done` for this phase
+    /// because the pool has flipped `Drained → Active` again via
+    /// `PendingPool::reinject`; the next `poll_drain_transitions`
+    /// will revisit the phase only after the freshly-reinjected
+    /// items terminate.
+    ///
+    /// `command_rx` is threaded for symmetry with the live-primary
+    /// path; the current call path does not consume commands
+    /// inside the bucket (no callback fires from inside the
+    /// budget+reinject step), but the parameter keeps the
+    /// signature aligned with future cross-cut paths (e.g. a
+    /// `FailPermanent` re-entering via `apply_fail_permanent`
+    /// would need the same dispatch chokepoint).
+    async fn try_run_primary_phase_retry_bucket(
+        &mut self,
+        phase: &PhaseId,
+        kind: BucketKind,
+        _command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+    ) -> bool {
+        let Some(pool) = self.primary_pending.as_mut() else {
+            return false;
+        };
+        // Walk `primary_failed` directly: each entry already
+        // carries the `TaskInfo` (the secondary's mirror keeps the
+        // binary on-entry; the live primary keeps a separate
+        // snapshot). Filter by `(phase, kind)` exactly the way the
+        // live primary does. The ledger key here is the wire
+        // `file_hash` — identical to `compute_task_hash(binary)`
+        // in production (the worker and primary share the same
+        // recipe; see `primary/wire.rs::compute_task_hash` and
+        // `secondary/primary/mod.rs::task_file_hash`).
+        let candidates: Vec<TaskInfo<I>> = self
+            .primary_failed
+            .iter()
+            .filter(|(_, e)| e.binary.phase_id == *phase)
+            .filter(|(_, e)| kind.matches(&e.error_type))
+            .map(|(_, e)| e.binary.clone())
+            .collect();
+        let cap = kind.max_passes_secondary(&self.config);
+        let primary_failed = &mut self.primary_failed;
+        try_phase_retry_bucket_core(
+            phase,
+            kind,
+            candidates,
+            pool,
+            &mut self.primary_retry_passes_used,
+            cap,
+            |h| {
+                primary_failed.remove(h);
+            },
+        )
+    }
+
     pub(in crate::secondary) async fn process_primary_phase_lifecycle(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
@@ -129,6 +212,48 @@ where
                 break;
             }
             for p in &drained {
+                // Per-phase retry-bucket cascade — runs BEFORE
+                // `on_phase_end` so phase B (which depends on A)
+                // doesn't activate until phase A's retry buckets
+                // are exhausted. Mirrors the live-primary's
+                // `process_phase_lifecycle` 1:1 — see
+                // `crate::primary::retry_bucket` for the partition
+                // and counter semantics.
+                //
+                // Recoverable bucket first; OOM bucket second.
+                // Same ordering rationale as the live primary:
+                // Recoverable retries that succeed leave nothing
+                // for the OOM bucket to find; OOM running after
+                // Recoverable settles keeps any future
+                // single-worker / memory-DESC dispatch modifier
+                // scoped to actually-over-budget tasks.
+                //
+                // On `true`: the bucket reinjected at least one
+                // task; the phase has flipped Drained → Active
+                // and the next iteration's `poll_drain_transitions`
+                // will not return it until the new items terminate.
+                // Skip `on_phase_end` and `mark_phase_done` for
+                // this phase on this iteration.
+                if self
+                    .try_run_primary_phase_retry_bucket(
+                        p,
+                        BucketKind::Recoverable,
+                        command_rx,
+                    )
+                    .await
+                {
+                    continue;
+                }
+                if self
+                    .try_run_primary_phase_retry_bucket(
+                        p,
+                        BucketKind::Oom,
+                        command_rx,
+                    )
+                    .await
+                {
+                    continue;
+                }
                 let completed = self
                     .primary_phase_completed
                     .get(p)

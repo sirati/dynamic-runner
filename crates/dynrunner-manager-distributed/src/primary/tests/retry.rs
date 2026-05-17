@@ -87,6 +87,7 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -211,6 +212,7 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -300,6 +302,7 @@ async fn recoverable_failure_twice_becomes_permanent() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -412,6 +415,7 @@ async fn retry_max_passes_zero_disables_retry() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 0,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -497,5 +501,453 @@ async fn retry_max_passes_zero_disables_retry() {
         // because budget is 0 → permanent failure with no retry.
         assert_eq!(primary.completed_count(), 0);
         assert_eq!(primary.failed_count(), 1);
+    }).await;
+}
+
+/// LMU-regression target: the OOM-bucket budget is independent of
+/// the Recoverable-bucket budget, and a phase whose only outstanding
+/// failures are `ResourceExhausted(memory)` must reach `Done` once
+/// the OOM bucket is exhausted (here disabled with
+/// `oom_retry_max_passes = 0`). Pre-redesign the post-pipeline
+/// retry pass + binary "Unfulfillable vs everything else" partition
+/// would have wedged the phase: `on_phase_end` had already fired
+/// against a stale view, retry would reinject and re-fail, then the
+/// surviving fail_oom set stayed in `failed_tasks` while the
+/// counter exit kept `total - completed - failed = 0` but the
+/// phase-state machine drifted out of sync.
+///
+/// Asserts BOTH (a) the per-class outcome partition is exactly
+/// `0 completed / 1 fail_oom / 0 fail_retry / 0 fail_final`, AND
+/// (b) `on_phase_end` fires for the phase with the right counts.
+#[tokio::test(flavor = "current_thread")]
+async fn oom_failure_with_zero_retries_still_advances_phase() {
+    use std::sync::{Arc, Mutex};
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_secs(5),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            oom_retry_max_passes: 0,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_millis(500),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_binary("doomed", 50)];
+
+        let (id, rx, tx) = secondary_ends.remove(0);
+        tokio::task::spawn_local(async move {
+            let mut rx = rx;
+            tx.send(DistributedMessage::SecondaryWelcome {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 1024 * 1024 * 1024,
+                }],
+                worker_count: 1,
+                hostname: "test".into(),
+                is_observer: false,
+            }).unwrap();
+            tx.send(DistributedMessage::CertExchange {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: "FAKE".into(),
+                ipv4_address: Some("127.0.0.1".into()),
+                ipv6_address: None,
+                quic_port: 5000,
+            }).unwrap();
+            while let Some(msg) = rx.recv().await {
+                let hash_opt = match &msg {
+                    DistributedMessage::InitialAssignment { zip_files, .. } => zip_files
+                        .first()
+                        .and_then(|z| z.binaries.first())
+                        .map(|e| e.hash.clone()),
+                    DistributedMessage::TaskAssignment { file_hash, .. } => {
+                        Some(file_hash.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(h) = hash_opt {
+                    tx.send(DistributedMessage::TaskFailed {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        task_hash: h,
+                        error_type: dynrunner_core::ErrorType::ResourceExhausted(
+                            dynrunner_core::ResourceKind::memory(),
+                        ),
+                        error_message: "over budget".into(),
+                    }).unwrap();
+                    tx.send(DistributedMessage::TaskRequest {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: 1024 * 1024 * 1024,
+                        }],
+                    }).unwrap();
+                }
+            }
+        });
+
+        let recorded_ends: Arc<Mutex<Vec<(String, u32, u32)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let ends_cb = recorded_ends.clone();
+        let on_end: crate::primary::OnPhaseEnd = Box::new(
+            move |p: &dynrunner_core::PhaseId, c: u32, f: u32| {
+                ends_cb.lock().unwrap().push((p.to_string(), c, f));
+            },
+        );
+        let on_start: crate::primary::OnPhaseStart =
+            Box::new(|_| {});
+
+        // Bound the test so a wedged phase surfaces as a timeout, not
+        // a hang. Mesh-ready collapses fast (500ms above);
+        // post-promotion the secondary's quiesce grace contributes
+        // ~2s, hence the 10s budget.
+        let run_fut = primary.run(binaries, HashMap::new(), on_start, on_end);
+        match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
+            Ok(res) => res.unwrap(),
+            Err(_) => panic!(
+                "LMU regression: run() did not return within 10s with \
+                 oom_retry_max_passes=0; phase wedged on ResourceExhausted(memory) \
+                 failure"
+            ),
+        }
+
+        // Per-class outcome partition: 1 fail_oom; everything else 0.
+        assert_eq!(primary.completed_count(), 0);
+        assert_eq!(primary.failed_count(), 1);
+        let outcome = primary.outcome_summary();
+        assert_eq!(outcome.fail_oom, 1, "OOM failure must classify as fail_oom");
+        assert_eq!(outcome.fail_retry, 0);
+        assert_eq!(outcome.fail_final, 0);
+
+        // on_phase_end fired exactly once for the default phase
+        // with the right counts.
+        let ends = recorded_ends.lock().unwrap().clone();
+        assert_eq!(
+            ends.len(),
+            1,
+            "on_phase_end must fire exactly once even with OOM failure; got {ends:?}"
+        );
+        let (phase, completed, failed) = &ends[0];
+        assert_eq!(phase, "default");
+        assert_eq!(*completed, 0);
+        assert_eq!(*failed, 1);
+    }).await;
+}
+
+/// Per-phase Recoverable bucket runs the retry pass at the
+/// phase-drain edge BEFORE `on_phase_end` fires. Setup: one task
+/// fails Recoverably once, then succeeds. End state: cluster
+/// reports 1 completion, 0 failures — the bucket reinjected at the
+/// drain edge, the retry succeeded, the per-phase counter cleared
+/// `failed_tasks`.
+///
+/// Counterpart to `recoverable_failure_succeeds_on_retry_pass`,
+/// which exercises the same shape from the secondary's primary-
+/// path retry. This test pins the EXIT contract — `completed_count`
+/// and `failed_count` reflect the post-retry state by the time
+/// `run()` returns — so a regression that loses the retry-success
+/// observation between the operational-loop exit and the run-level
+/// accounting surfaces here.
+#[tokio::test(flavor = "current_thread")]
+async fn recoverable_bucket_runs_within_phase_drain_edge() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let max_res = dynrunner_core::ResourceMap::from(
+            [(dynrunner_core::ResourceKind::memory(), 1024 * 1024 * 1024u64)]
+        );
+        let mut quotas = HashMap::new();
+        quotas.insert("/tmp/flaky".to_string(), 1u32);
+        let flaky = super::test_helpers::FlakyWorkerFactory::with_quotas(quotas);
+
+        let (pri_to_sec_tx, sec_to_pri_rx, sec_handle) =
+            spawn_real_secondary_flaky(
+                "sec-0".into(),
+                1,
+                max_res,
+                flaky,
+                /* retry_max_passes = */ 1,
+            );
+
+        let (incoming_tx, incoming_rx) = tokio_mpsc::unbounded_channel();
+        let mut outgoing = HashMap::new();
+        outgoing.insert("sec-0".to_string(), pri_to_sec_tx);
+        tokio::task::spawn_local(async move {
+            let mut rx = sec_to_pri_rx;
+            while let Some(msg) = rx.recv().await {
+                if incoming_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(10),
+            peer_timeout: Duration::from_secs(10),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            oom_retry_max_passes: 1,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_millis(500),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        let binaries = vec![make_binary("flaky", 50)];
+        let (deps, ops, ope) = noop_phase_args();
+        primary.run(binaries, deps, ops, ope).await.unwrap();
+
+        // 1 completion, 0 residual failures: the per-phase bucket
+        // reinjected the Recoverable failure inside the same `run()`
+        // and the retry succeeded.
+        assert_eq!(primary.completed_count(), 1);
+        assert_eq!(primary.failed_count(), 0);
+
+        drop(primary);
+        let _ = sec_handle.await;
+    }).await;
+}
+
+/// Sequential phase advance: phase B (depends on A) does NOT become
+/// Active until A's retry buckets exhaust. A's only task fails
+/// `ResourceExhausted(memory)` with `oom_retry_max_passes = 0`, so
+/// the OOM bucket immediately exhausts and `on_phase_end(A)` fires;
+/// `on_phase_start(B)` must NOT precede `on_phase_end(A)`.
+///
+/// Pins the "next phase depends on previous phase being done"
+/// invariant from the 2026-05-17 user spec.
+#[tokio::test(flavor = "current_thread")]
+async fn sequential_phase_advance_after_oom_bucket_exhausts() {
+    use std::sync::{Arc, Mutex};
+    use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TypeId};
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+
+        let mut phase_deps: HashMap<PhaseId, Vec<PhaseId>> = HashMap::new();
+        phase_deps.insert(PhaseId::from("B"), vec![PhaseId::from("A")]);
+
+        let config = PrimaryConfig {
+            node_id: "primary".into(),
+            num_secondaries: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_timeout: Duration::from_secs(5),
+            keepalive_interval: Duration::from_millis(50),
+            keepalive_miss_threshold: 3,
+            source_pre_staged_root: None,
+            uses_file_based_items: true,
+            required_setup_on_promote: false,
+            max_concurrent_per_type: std::collections::HashMap::new(),
+            retry_max_passes: 1,
+            oom_retry_max_passes: 0,
+            fleet_dead_timeout: std::time::Duration::from_secs(30),
+            mesh_ready_timeout: std::time::Duration::from_millis(500),
+            mass_death_grace: std::time::Duration::ZERO,
+            mass_death_min_count: 2,
+            source_dir: None,
+            unfulfillable_reinject_max_per_task: None,
+            setup_promote_deadline: std::time::Duration::from_secs(600),
+        };
+
+        let mut primary = PrimaryCoordinator::new(
+            config,
+            transport,
+            NoPeers,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+
+        // Phase A: one task that fails OOM. Phase B: one task that
+        // succeeds. The fake secondary fails phase-A tasks with OOM
+        // and accepts phase-B tasks.
+        fn phased(name: &str, phase: &str) -> TaskInfo<TestId> {
+            TaskInfo {
+                path: std::path::PathBuf::from(format!("/tmp/{name}")),
+                size: 50,
+                identifier: TestId(name.into()),
+                phase_id: PhaseId::from(phase),
+                type_id: TypeId::from("default"),
+                affinity_id: None,
+                payload: serde_json::Value::Null,
+                task_id: Some(name.into()),
+                task_depends_on: vec![],
+                preferred_secondaries: SoftPreferredSecondaries::default(),
+                resolved_path: None,
+            }
+        }
+        let binaries = vec![phased("a_task", "A"), phased("b_task", "B")];
+
+        // Fake secondary: fail "a_task" (OOM), succeed "b_task".
+        let (id, rx, tx) = secondary_ends.remove(0);
+        tokio::task::spawn_local(async move {
+            let mut rx = rx;
+            tx.send(DistributedMessage::SecondaryWelcome {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                resources: vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 1024 * 1024 * 1024,
+                }],
+                worker_count: 1,
+                hostname: "test".into(),
+                is_observer: false,
+            }).unwrap();
+            tx.send(DistributedMessage::CertExchange {
+                sender_id: id.clone(), timestamp: 0.0,
+                secondary_id: id.clone(),
+                public_cert_pem: "FAKE".into(),
+                ipv4_address: Some("127.0.0.1".into()),
+                ipv6_address: None,
+                quic_port: 5000,
+            }).unwrap();
+            // For each assignment: send a `TaskFailed` with OOM if
+            // path contains "a_task", or a `TaskComplete` for
+            // "b_task". Then ask for the next task.
+            while let Some(msg) = rx.recv().await {
+                let assignment = match &msg {
+                    DistributedMessage::InitialAssignment { zip_files, .. } => {
+                        zip_files
+                            .first()
+                            .and_then(|z| z.binaries.first())
+                            .map(|e| (e.hash.clone(), e.binary_info.task_id.clone()))
+                    }
+                    DistributedMessage::TaskAssignment { file_hash, binary_info, .. } => {
+                        Some((file_hash.clone(), binary_info.task_id.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((h, task_id)) = assignment {
+                    let task_id = task_id.unwrap_or_default();
+                    if task_id == "a_task" {
+                        tx.send(DistributedMessage::TaskFailed {
+                            sender_id: id.clone(), timestamp: 0.0,
+                            secondary_id: id.clone(),
+                            worker_id: 0,
+                            task_hash: h,
+                            error_type: dynrunner_core::ErrorType::ResourceExhausted(
+                                dynrunner_core::ResourceKind::memory(),
+                            ),
+                            error_message: "over budget".into(),
+                        }).unwrap();
+                    } else {
+                        tx.send(DistributedMessage::TaskComplete {
+                            sender_id: id.clone(), timestamp: 0.0,
+                            secondary_id: id.clone(),
+                            worker_id: 0,
+                            task_hash: h,
+                            result_data: None,
+                        }).unwrap();
+                    }
+                    tx.send(DistributedMessage::TaskRequest {
+                        sender_id: id.clone(), timestamp: 0.0,
+                        secondary_id: id.clone(),
+                        worker_id: 0,
+                        available_resources: vec![dynrunner_core::ResourceAmount {
+                            kind: dynrunner_core::ResourceKind::memory(),
+                            amount: 1024 * 1024 * 1024,
+                        }],
+                    }).unwrap();
+                }
+            }
+        });
+
+        // Record ordered phase events.
+        #[derive(Clone, Debug)]
+        enum Ev { Start(String), End(String) }
+        let log: Arc<Mutex<Vec<Ev>>> = Arc::new(Mutex::new(Vec::new()));
+        let log_starts = log.clone();
+        let on_start: crate::primary::OnPhaseStart =
+            Box::new(move |p: &PhaseId| {
+                log_starts.lock().unwrap().push(Ev::Start(p.to_string()));
+            });
+        let log_ends = log.clone();
+        let on_end: crate::primary::OnPhaseEnd =
+            Box::new(move |p: &PhaseId, _, _| {
+                log_ends.lock().unwrap().push(Ev::End(p.to_string()));
+            });
+
+        let run_fut = primary.run(binaries, phase_deps, on_start, on_end);
+        match tokio::time::timeout(Duration::from_secs(10), run_fut).await {
+            Ok(res) => res.unwrap(),
+            Err(_) => panic!(
+                "sequential-phase-advance: run() did not return within 10s; \
+                 phase A may have wedged"
+            ),
+        }
+
+        let events = log.lock().unwrap().clone();
+        // Find indices of Start(B) and End(A). Start(B) must come
+        // AFTER End(A).
+        let mut start_b: Option<usize> = None;
+        let mut end_a: Option<usize> = None;
+        for (i, ev) in events.iter().enumerate() {
+            match ev {
+                Ev::Start(p) if p == "B" => start_b = Some(i),
+                Ev::End(p) if p == "A" => end_a = Some(i),
+                _ => {}
+            }
+        }
+        let end_a = end_a.expect(
+            "on_phase_end(A) must fire even after OOM failure; events: see log",
+        );
+        let start_b = start_b.expect(
+            "on_phase_start(B) must fire after A is Done; events: see log",
+        );
+        assert!(
+            end_a < start_b,
+            "on_phase_start(B) must NOT precede on_phase_end(A); \
+             end_a={end_a} start_b={start_b} events={events:?}"
+        );
     }).await;
 }

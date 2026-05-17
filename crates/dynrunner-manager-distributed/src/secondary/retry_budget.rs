@@ -143,19 +143,27 @@ impl RetryBudget {
         }
     }
 
-    /// Bump the attempt counter. Called by the re-injection site
-    /// once per completed re-inject-and-bump cycle, NOT per
-    /// individual failed-task entry.
+    /// Bump the attempt counter. Once a load-bearing piece of the
+    /// secondary's primary retry path; post-2026-05-17 the per-
+    /// (phase, bucket) counter on
+    /// `SecondaryCoordinator::primary_retry_passes_used` owns the
+    /// attempt-count axis, and `should_retry()` is consulted only
+    /// for its SLURM-wallclock half. Kept on the type so the dual-
+    /// axis design stays intact for any future caller that does
+    /// want to bump (and so the internal unit tests in this file
+    /// retain the API they exercise).
+    #[allow(dead_code)]
     pub(crate) fn record_attempt(&mut self) {
         self.attempts_used = self.attempts_used.saturating_add(1);
     }
 
     /// Test/inspection accessor for the consumed-attempts count.
     /// Production code never reads this — it consults
-    /// [`Self::should_retry`] instead. Kept here (not `cfg(test)`)
-    /// because the secondary's existing
-    /// `primary_retry_passes_used_for_test` is test-gated at its
-    /// own boundary and needs to forward to this getter.
+    /// [`Self::should_retry`] instead. Kept on the type alongside
+    /// `record_attempt` for the same dual-axis preservation
+    /// rationale; live callers exist in this file's unit tests
+    /// and (potentially) future re-injection sites.
+    #[allow(dead_code)]
     pub(crate) fn attempts_used(&self) -> u32 {
         self.attempts_used
     }

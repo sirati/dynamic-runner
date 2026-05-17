@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     PeerTransport,
     SecondaryTransport,
@@ -665,7 +664,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         break;
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                _ = tokio::time::sleep(Duration::from_secs(300)),
+                    if !self.single_worker_mode() => {
+                    // 5-min stuck-worker watchdog. Disabled while
+                    // the OOM retry bucket is active: a single-
+                    // worker-per-secondary pass on a memory-pressed
+                    // workload can legitimately exceed 5 minutes,
+                    // and the blanket Recoverable re-tag here would
+                    // poison the bucket's hand-tuned dispatch shape
+                    // mid-flight (every in-flight task gets re-
+                    // classified Recoverable, the OOM-bucket
+                    // accounting goes off the rails). The flag
+                    // [`single_worker_mode`] is the gate;
+                    // `try_run_phase_retry_bucket` is its sole
+                    // writer. Outside the OOM bucket the arm runs
+                    // unchanged.
                     let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
                     if active > 0 {
                         let outcome = self.outcome_summary();
@@ -781,135 +794,30 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         Ok(())
     }
 
-    /// After the main operational loop drains, run up to
-    /// `config.retry_max_passes` retry passes. Each pass drains the
-    /// retriable subset of `failed_tasks` (everything except
-    /// `ErrorType::Unfulfillable`) into the pool, kicks dispatch to
-    /// all currently-idle workers, then runs the operational loop
-    /// again. Tasks that fail on the retry pass land back in
-    /// `failed_tasks` for the next iteration — or stay there
-    /// permanently if the retry budget is exhausted. No-op when
-    /// `failed_tasks` is empty or contains only Unfulfillable entries.
+    /// Post-pipeline retry pass — now a no-op.
     ///
-    /// `ErrorType::Unfulfillable` is the operator-resolvable failure
-    /// class (CRDT terminal state `TaskState::Unfulfillable`) and is
-    /// reinjected exclusively via `PrimaryCommand::ReinjectTask` —
-    /// the auto-retry pass deliberately leaves those entries in
-    /// `failed_tasks` so the run-done counter check still trips and
-    /// the operator's reinject command remains the sole path back to
-    /// `Pending`. Worker-reported Unfulfillable failures and
-    /// `apply_fail_permanent`-broadcast Unfulfillable cascades both
-    /// land in `failed_tasks` with this kind; the filter here is the
-    /// single chokepoint that keeps them isolated from the pass-
-    /// counter retry channel.
+    /// Pre-redesign this drove ONE lumped retry pass after the main
+    /// operational loop drained every phase. The 2026-05-17 user-
+    /// spec'd redesign moved retry semantics INTO the per-phase
+    /// lifecycle cascade so phase B never advances while phase A
+    /// still has retriable failures — see
+    /// [`crate::primary::retry_bucket`] and the
+    /// `try_run_phase_retry_bucket` call sites inside
+    /// [`crate::primary::PrimaryCoordinator::process_phase_lifecycle`].
     ///
-    /// The proactive idle-worker dispatch step is required because
-    /// secondaries only send `TaskRequest` after they finish a task;
-    /// after the main pass drains every worker is idle but already
-    /// sent its last TaskRequest (which got `nothing-to-do` because
-    /// the failed task wasn't in the pool yet). Without the
-    /// kickstart the re-injected binaries would sit in the pool
-    /// forever waiting for a TaskRequest that never comes.
+    /// The function body is kept as a no-op (rather than removed)
+    /// so the existing call site in `run_pipeline` stays compiling
+    /// without a churning structural edit; cleanup of the call
+    /// site is a follow-up. Panik / demoted short-circuits stay so
+    /// a future re-introduction of post-pipeline behaviour doesn't
+    /// silently re-arm them.
     pub(crate) async fn run_retry_passes(&mut self) -> Result<(), String> {
-        // Panik shortcut: if the operational loop exited via the
-        // panik arm, every worker is being / has been killed and
-        // the cluster's shutting down. Re-injecting failed tasks
-        // and entering another operational loop would dispatch
-        // them to dead transports (the SLURM wrapper is about to
-        // reap the container on exit 137). Bail immediately so
-        // the outer `run_pipeline` can translate `panik_outcome`
-        // into `RunError::PanikShutdown`.
         if self.panik_outcome.is_some() {
             return Ok(());
         }
-        // Demoted observer mode: the promoted primary owns
-        // retry orchestration. The local primary's `failed_tasks`
-        // set still receives forwarded outcomes (so the run-done
-        // counter check trips when everything is accounted for),
-        // but re-injecting tasks into the local pool and
-        // dispatching them would create the very parallel-dispatch
-        // race demotion is meant to eliminate. See `demoted` doc
-        // on `PrimaryCoordinator`.
         if self.demoted {
             return Ok(());
         }
-        for pass_idx in 0..self.config.retry_max_passes {
-            // Partition `failed_tasks` into retriable vs operator-
-            // only buckets. Unfulfillable entries (operator-resolvable
-            // failures) stay in `failed_tasks` so end-of-run
-            // accounting and the loop-exit counter check still see
-            // them; only the retriable subset (Recoverable,
-            // ResourceExhausted, NonRecoverable) feeds the pool
-            // reinjection step. Walking the HashMap with `drain` keeps
-            // the partition atomic with respect to the operational
-            // loop (no concurrent producer modifies `failed_tasks`
-            // between the partition and the operational_loop call —
-            // the loop's `select!` is the only producer and it hasn't
-            // started yet for this pass).
-            //
-            // ErrorType from the previous pass is discarded for
-            // retriable entries; a task's terminal classification is
-            // the one from its last observed failure. Unfulfillable
-            // entries retain their ErrorType because they're skipped
-            // entirely.
-            let mut retriable: HashMap<String, ErrorType> = HashMap::new();
-            let mut unfulfillable: HashMap<String, ErrorType> = HashMap::new();
-            for (hash, kind) in self.failed_tasks.drain() {
-                if matches!(kind, ErrorType::Unfulfillable { .. }) {
-                    unfulfillable.insert(hash, kind);
-                } else {
-                    retriable.insert(hash, kind);
-                }
-            }
-            // Restore the operator-only entries before any early-exit
-            // path so end-of-run accounting still observes them.
-            self.failed_tasks = unfulfillable;
-
-            if retriable.is_empty() {
-                break;
-            }
-
-            let to_retry: Vec<TaskInfo<I>> = self
-                .all_binaries
-                .iter()
-                .filter(|b| retriable.contains_key(&compute_task_hash(b)))
-                .cloned()
-                .collect();
-
-            tracing::info!(
-                pass = pass_idx + 1,
-                count = to_retry.len(),
-                "retry pass: re-injecting failed tasks"
-            );
-
-            for binary in to_retry {
-                // Re-inject preserves phase state (flips Drained/Done
-                // back to Active for this phase) so the operational
-                // loop re-engages with the items.
-                self.pool_mut().reinject(binary);
-            }
-
-            // Proactively dispatch to every idle worker before
-            // entering the operational loop — see method-level
-            // comment for the rationale.
-            self.dispatch_to_idle_workers().await?;
-
-            // The operational loop will dispatch the re-injected
-            // tasks, observe their TaskComplete / TaskFailed
-            // outcomes, and exit when the pool drains again. Tasks
-            // that fail in this pass land in `failed_tasks` for the
-            // next iteration of THIS for-loop.
-            self.operational_loop().await?;
-        }
-
-        if !self.failed_tasks.is_empty() {
-            tracing::warn!(
-                permanent_failures = self.failed_tasks.len(),
-                passes = self.config.retry_max_passes,
-                "retry budget exhausted; tasks permanently failed"
-            );
-        }
-
         Ok(())
     }
 
