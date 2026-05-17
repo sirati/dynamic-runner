@@ -29,5 +29,5 @@ mod shutdown_binary;
 mod tests;
 mod types;
 
-pub use shutdown_binary::{SHUTDOWN_BIN_REMOTE_BASENAME, SHUTDOWN_BIN_SOURCE_ENV};
+pub use shutdown_binary::SHUTDOWN_BIN_REMOTE_BASENAME;
 pub use types::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};

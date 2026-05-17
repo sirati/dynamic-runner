@@ -97,35 +97,40 @@ class SlurmJobManager:
         self._rust.prepare_directories()
         logger.info("Directories created successfully")
 
-    def upload_shutdown_manager_binary(self) -> str | None:
-        """Stage the ``dynrunner-slurm-shutdown`` binary on the gateway.
+    def upload_shutdown_manager_binary(self) -> str:
+        """Stage the bundled ``dynrunner-slurm-shutdown`` binary on the gateway.
 
-        Pure delegation to Rust for the upload mechanics. The Rust
-        side reads ``DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE`` (set by
-        the consumer's nix flake to
-        ``result/bin/dynrunner-slurm-shutdown``), uploads the binary
-        to ``<root_folder>/dynrunner-slurm-shutdown`` on the gateway,
-        ``chmod 755``s it, and records the (raw, possibly
-        tilde-prefixed) remote path on the manager.
+        Resolves the local source path via
+        :func:`dynamic_runner._shutdown_manager.bundled_binary_path`
+        (env-var override > nix-bundled artifact) and hands the
+        resolved path to the Rust upload primitive. Hard error when
+        neither source is available — the SLURM dispatch path
+        requires the binary for correct rootless-podman container
+        teardown on ``scancel`` / TIMEOUT, and the previous opt-in
+        ``DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE``-only model silently
+        disabled cleanup when consumer flakes did not set the env
+        var (the exact failure mode the shutdown-manager was built
+        to prevent).
 
-        Returns the tilde-expanded remote path for the caller's use
-        (the wrapper-script template ``bash_quote``s the path, which
-        wraps tilde-bearing paths in single quotes and DEFEATS bash's
-        tilde expansion at script runtime). Resolving the tilde here
-        — at the Python bridge boundary — mirrors :meth:`submit_job`'s
-        ``run_log_dir`` expansion: tilde resolution needs the
-        gateway's ``remote_home`` attribute, which the Rust core
-        can't see through ``PyGatewayAdapter``. The Rust manager
-        retains the raw path verbatim; the expansion is a one-way
-        Python-side concern.
-
-        Returns ``None`` when the env var was unset (orphan-container
-        cleanup disabled — Rust side emits a tracing warning so the
-        missing integration is operator-visible).
+        Returns the tilde-expanded remote path the gateway-side
+        binary lives at. Tilde expansion happens here (mirrors
+        :meth:`submit_job`'s ``run_log_dir`` expansion — see that
+        method's docstring for the rationale: tilde resolution needs
+        the Python gateway's ``remote_home`` attribute, which the
+        Rust core can't see through ``PyGatewayAdapter``).
         """
-        raw = self._rust.upload_shutdown_manager_binary()
-        if raw is None:
-            return None
+        from .._shutdown_manager import bundled_binary_path, ENV_VAR
+
+        local = bundled_binary_path()
+        if local is None:
+            raise RuntimeError(
+                f"shutdown-manager binary not found. Either the framework "
+                f"wheel was built without the bundled binary (non-nix "
+                f"install) or {ENV_VAR} points at a missing path. "
+                f"SLURM dispatch requires this binary for rootless-podman "
+                f"orphan-container teardown on scancel / TIMEOUT."
+            )
+        raw = self._rust.upload_shutdown_manager_binary_from(str(local))
         return self._expand_path(raw)
 
     @property
@@ -134,11 +139,14 @@ class SlurmJobManager:
 
         Tilde-expanded (mirrors the
         :meth:`upload_shutdown_manager_binary` return shape — see
-        that method's docstring for the rationale). ``None`` when
-        the upload was skipped (env var unset) or hasn't been called
-        yet. Read by the Rust preparation step when threading the
-        value into per-secondary ``generate_wrapper_script`` kwargs
-        (initial cohort + respawn paths).
+        that method's docstring for the rationale). ``None`` only
+        when :meth:`upload_shutdown_manager_binary` has not yet been
+        called on this manager — a successful upload always records
+        a path (the upload step itself raises on missing binary
+        rather than skipping silently). Read by the Rust preparation
+        step when threading the value into per-secondary
+        ``generate_wrapper_script`` kwargs (initial cohort + respawn
+        paths).
         """
         raw = self._rust.shutdown_manager_remote_path
         if raw is None:
@@ -297,11 +305,11 @@ class SlurmJobManager:
         :meth:`upload_shutdown_manager_binary`). When set, the rendered
         wrapper spawns the shutdown manager under
         ``systemd-run --user --scope`` so it survives slurmd cgroup
-        teardown. When ``None`` the wrapper omits the spawn block and
-        the cleanup trap is a minimal CMD_RELAY-only teardown (no
-        ``/tmp`` cleanup on SLURM-induced termination — Rust side
-        emits a warning at upload time so the missing integration is
-        operator-visible).
+        teardown. The ``None`` branch exists for renderer-internal
+        unit tests and back-compat; in production
+        :meth:`upload_shutdown_manager_binary` always populates the
+        path (or raises on missing source), so the spawn block is
+        always emitted on the SLURM dispatch path.
         """
         connection_info_dir = (
             self._expand_path(f"{run_log_dir or self.slurm_config.get_log_dir()}/connection_info")

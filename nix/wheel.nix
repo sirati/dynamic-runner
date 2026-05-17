@@ -1,9 +1,11 @@
 {
   lib,
   buildPythonPackage,
+  python,
   rustPlatform,
   openssl,
   pkg-config,
+  shutdownManagerBin,
 }:
 
 # Wheel/Python-package derivation for dynamic_runner.
@@ -41,6 +43,22 @@ buildPythonPackage {
   buildInputs = [ openssl ];
 
   doCheck = false;
+
+  # Drop the musl-static shutdown-manager binary into the installed
+  # package tree so `dynamic_runner._shutdown_manager.bundled_binary_path()`
+  # resolves to it. Runs after maturin's install step (which writes
+  # `_native.<ext>.so` + the python source tree under `${out}/${python.sitePackages}/dynamic_runner/`),
+  # so we just need to land the file at the right path with the
+  # right mode. Bypassing the wheel manifest is intentional: this is
+  # a nix-derivation install, not a `pip install`, so the file just
+  # needs to live on disk under the import-path; no `RECORD` entry
+  # required for the framework's import-time resolution path to find
+  # it via `importlib.resources.files`.
+  postInstall = ''
+    install -Dm755 \
+      ${shutdownManagerBin}/bin/dynrunner-slurm-shutdown \
+      $out/${python.sitePackages}/dynamic_runner/_shutdown_manager/dynrunner-slurm-shutdown
+  '';
 
   meta = with lib; {
     description = "Multi-process / multi-host Python task runner backed by a Rust workspace.";
