@@ -99,7 +99,31 @@ pub struct PrimaryConfig {
     /// (handled in `requeue_dead_secondary`) does NOT count as a
     /// failure — those tasks were never actually failed, just lost
     /// their worker.
+    ///
+    /// Scope: per-phase, per-bucket. Each phase's Recoverable bucket
+    /// has its own pass counter; OOM bucket has a SEPARATE counter
+    /// (`oom_retry_max_passes`) for the same phase.
     pub retry_max_passes: u32,
+
+    /// Number of retry passes for the per-phase OOM-retry bucket.
+    /// Default mirrors `retry_max_passes` (=1) so existing configs
+    /// keep the legacy "one retry across all classes" budget; setting
+    /// the two independently lets a workload that wants fail-fast
+    /// memory-pressure response (`oom_retry_max_passes = 0`) keep
+    /// transient-error retries (`retry_max_passes >= 1`), or vice
+    /// versa.
+    ///
+    /// Each phase has its own counter under this cap. The bucket runs
+    /// AT the phase-drain edge, BEFORE `on_phase_end` fires. When the
+    /// counter reaches the cap, the surviving OOM-failed tasks become
+    /// terminal for that phase: `on_phase_end` fires with the per-class
+    /// counts unchanged, `mark_phase_done` advances dependents.
+    /// `oom_retry_max_passes = 0` disables the OOM bucket entirely
+    /// (failures still land in `failed_tasks` with the
+    /// `ResourceExhausted(memory)` classification — the run's outcome
+    /// summary still reports them — but no second-chance dispatch is
+    /// attempted before the phase advances).
+    pub oom_retry_max_passes: u32,
 
     /// Grace period after every secondary in the fleet has been
     /// declared dead (via `requeue_dead_secondary`) before the
@@ -268,6 +292,10 @@ impl Default for PrimaryConfig {
             required_setup_on_promote: false,
             max_concurrent_per_type: HashMap::new(),
             retry_max_passes: 1,
+            // Mirrors `retry_max_passes` so OOM tasks keep their
+            // historical "one retry then permanent" budget unless the
+            // operator opts out (`--oom-retry-max-passes 0`).
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: Duration::from_secs(30),
             mesh_ready_timeout: Duration::from_secs(60),
             mass_death_grace: Duration::from_secs(60),

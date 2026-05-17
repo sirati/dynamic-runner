@@ -30,6 +30,7 @@ async fn stranded_count_is_zero_on_clean_run() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -221,6 +222,7 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             // Long fleet_dead so the operational loop's exit happens
             // via "transport closed" (recv → None), not via the
             // fleet-dead timer push-to-failed path. Keeps this test
@@ -341,6 +343,7 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 0,
+            oom_retry_max_passes: 1,
             // Zero timeout so the very first loop iteration's
             // `elapsed >= fleet_dead_timeout` predicate trips, no
             // wall-clock wait needed in the test.
@@ -461,6 +464,7 @@ async fn drain_pending_messages_updates_completed_set() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,
@@ -565,6 +569,7 @@ async fn clean_run_does_not_false_positive_stranded() {
             required_setup_on_promote: false,
             max_concurrent_per_type: std::collections::HashMap::new(),
             retry_max_passes: 1,
+            oom_retry_max_passes: 1,
             fleet_dead_timeout: std::time::Duration::from_secs(30),
             mesh_ready_timeout: std::time::Duration::from_secs(5),
             mass_death_grace: std::time::Duration::ZERO,

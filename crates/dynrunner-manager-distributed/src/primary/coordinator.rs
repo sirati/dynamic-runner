@@ -145,6 +145,15 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// `failed_tasks`.
     pub(super) phase_completed: HashMap<PhaseId, u32>,
     pub(super) phase_failed: HashMap<PhaseId, u32>,
+    /// Per-(phase, retry-bucket) pass counter, owned by
+    /// `primary::retry_bucket`. Each entry tracks how many passes
+    /// have been consumed by the matching bucket for that phase;
+    /// caps are read from `config.retry_max_passes` /
+    /// `config.oom_retry_max_passes`. See
+    /// [`crate::primary::retry_bucket`] for the surface this is
+    /// keyed against.
+    pub(super) retry_passes_used:
+        crate::primary::retry_bucket::RetryPassesUsed,
     /// Currently in-flight count per `TypeId`, against
     /// `config.max_concurrent_per_type`. Incremented on dispatch
     /// (in both `assign_initial` and `assign_normal` paths),
@@ -586,6 +595,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             failed_tasks: HashMap::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
+            retry_passes_used: HashMap::new(),
             in_flight_per_type: HashMap::new(),
             on_phase_start: None,
             on_phase_end: None,
@@ -1242,6 +1252,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.phase_completed.clear();
         self.phase_failed.clear();
         self.phase_started_emitted.clear();
+        // Per-(phase, bucket) retry counters: cleared at run-start
+        // so a coordinator reused across runs (no production path
+        // does this today, but the single-shot contract should not
+        // implicitly depend on `new()`-only init) starts every
+        // bucket from zero.
+        self.retry_passes_used.clear();
         for p in &phase_set {
             self.phase_completed.insert(p.clone(), 0);
             self.phase_failed.insert(p.clone(), 0);
@@ -1670,6 +1686,50 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 break;
             }
             for p in &drained {
+                // Per-phase retry-bucket cascade — runs BEFORE
+                // `on_phase_end` so phase B (which depends on A)
+                // doesn't activate until phase A's retry buckets
+                // are exhausted. See `crate::primary::retry_bucket`
+                // for the partition and counter semantics.
+                //
+                // Recoverable bucket first: a Recoverable failure
+                // that succeeds on retry leaves no entry in
+                // `failed_tasks`, so the subsequent OOM-bucket
+                // probe finds nothing and falls through cleanly.
+                // OOM bucket second: the dispatch modifiers (when
+                // wired) constrain memory-heavy work to a single
+                // worker per secondary in memory-DESC order, so
+                // running it AFTER the Recoverable bucket has
+                // settled keeps the constraint scoped to actually-
+                // over-budget tasks.
+                //
+                // On `Ok(true)`: the bucket reinjected at least one
+                // task; the phase has flipped Drained → Active and
+                // `drained_pending` no longer contains it. Skip
+                // `on_phase_end` and `mark_phase_done` for this
+                // phase; the next drain edge will revisit it.
+                if self
+                    .try_run_phase_retry_bucket(
+                        p,
+                        crate::primary::retry_bucket::BucketKind::Recoverable,
+                        command_rx,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if self
+                    .try_run_phase_retry_bucket(
+                        p,
+                        crate::primary::retry_bucket::BucketKind::Oom,
+                        command_rx,
+                    )
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let completed = self.phase_completed.get(p).copied().unwrap_or(0);
                 let failed = self.phase_failed.get(p).copied().unwrap_or(0);
                 if let Some(cb) = self.on_phase_end.as_mut() {

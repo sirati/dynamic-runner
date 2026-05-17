@@ -41,6 +41,7 @@ fn make_coordinator() -> PrimaryCoordinator<
         required_setup_on_promote: false,
         max_concurrent_per_type: HashMap::new(),
         retry_max_passes: 0,
+        oom_retry_max_passes: 1,
         fleet_dead_timeout: Duration::from_secs(1),
         mesh_ready_timeout: Duration::from_secs(1),
         mass_death_grace: Duration::from_secs(1),

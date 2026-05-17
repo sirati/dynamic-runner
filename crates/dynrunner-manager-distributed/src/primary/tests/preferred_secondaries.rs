@@ -18,6 +18,7 @@ fn preferred_secondaries_test_config() -> PrimaryConfig {
         required_setup_on_promote: false,
         max_concurrent_per_type: std::collections::HashMap::new(),
         retry_max_passes: 1,
+        oom_retry_max_passes: 1,
         fleet_dead_timeout: std::time::Duration::from_secs(30),
         mesh_ready_timeout: std::time::Duration::from_secs(5),
         mass_death_grace: std::time::Duration::ZERO,
