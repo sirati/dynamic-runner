@@ -10,9 +10,12 @@
 //! `TaskPreferredSecondariesUpdated`) live inline here.
 //!
 //! Two entry points: the receiver-side `apply` convenience wrapper
-//! that discards the auto-resumed list, and the originator-side
-//! `apply_with_resumed_blocked` that surfaces auto-resumed `TaskInfo`s
-//! for re-injection into the live `PendingPool`.
+//! that discards the auto-resumed list AND the freshly-Pending
+//! TasksSpawned surface, and the originator-/receiver-side
+//! `apply_with_resumed_blocked` that surfaces (a) auto-resumed
+//! `TaskInfo`s for re-injection into the live `PendingPool` and (b)
+//! freshly-Pending entries from a `TasksSpawned` batch so a receive-
+//! side caller that locally owns a dispatch pool can grow it.
 
 use dynrunner_core::{ErrorType, Identifier, SoftPreferredSecondaries, TaskInfo};
 use dynrunner_protocol_primary_secondary::ClusterMutation;
@@ -23,36 +26,59 @@ use crate::task_completed::TaskCompletedEvent;
 impl<I: Identifier> ClusterState<I> {
     /// Convenience wrapper around [`Self::apply_with_resumed_blocked`]
     /// for callers that don't care which `Blocked` dependents the
-    /// apply unblocked (the receiver side: any peer secondary or
-    /// observer applying a mutation observed on the wire).
+    /// apply unblocked OR which freshly-Pending tasks rode in on a
+    /// `TasksSpawned` batch.
     ///
-    /// Originator-side callers — i.e. the live primary's
-    /// `apply_and_broadcast_cluster_mutations` and the promoted
-    /// secondary's `apply_and_broadcast_mutations` — must use
-    /// `apply_with_resumed_blocked` so the resumed `TaskInfo`s can
-    /// be re-injected into the live `PendingPool` (their original
-    /// pool entries were dropped by the cascade-fail in
-    /// `pool.on_item_failed_permanent` and only the CRDT side has
-    /// kept them addressable since).
+    /// Pool-owning callers (live primary's
+    /// `apply_and_broadcast_cluster_mutations`, the promoted
+    /// secondary's `apply_and_broadcast_mutations`, AND the wire-
+    /// receive paths that locally own a dispatch pool) must use
+    /// `apply_with_resumed_blocked` so the resumed `TaskInfo`s can be
+    /// re-injected into the live `PendingPool` AND so wire-received
+    /// `TasksSpawned` mutations grow the pool to match the ledger.
+    /// Their original pool entries were dropped by the cascade-fail
+    /// in `pool.on_item_failed_permanent` (resumed) or never existed
+    /// on this node (wire-received TasksSpawned), and only the CRDT
+    /// side has kept them addressable since.
     pub fn apply(&mut self, m: ClusterMutation<I>) -> ApplyOutcome {
-        let mut _scratch: Vec<TaskInfo<I>> = Vec::new();
-        self.apply_with_resumed_blocked(m, &mut _scratch)
+        let mut _resumed_scratch: Vec<TaskInfo<I>> = Vec::new();
+        let mut _newly_pending_scratch: Vec<TaskInfo<I>> = Vec::new();
+        self.apply_with_resumed_blocked(
+            m,
+            &mut _resumed_scratch,
+            &mut _newly_pending_scratch,
+        )
     }
 
     /// Apply a single `ClusterMutation<I>` and, in addition to the
-    /// usual [`ApplyOutcome`], append any `TaskInfo<I>`s that were
-    /// just auto-resumed from `Blocked → Pending` (see
-    /// [`Self::resume_blocked_on`]) to `resumed`.
+    /// usual [`ApplyOutcome`], surface two derived-view buffers:
     ///
-    /// `resumed` is intentionally an out-parameter rather than part
-    /// of the return type: most apply variants append zero items, and
-    /// originator-side callers (which are the only ones that read
-    /// the list) prefer to accumulate across a whole mutation batch
-    /// into a single buffer before deciding what to do with it.
+    /// * `resumed` — clones of every `TaskInfo<I>` auto-resumed from
+    ///   `Blocked → Pending` by a `TaskCompleted` arm (see
+    ///   [`Self::resume_blocked_on`]). Pre-fix the cascade-pause
+    ///   primitive dropped the dependent's pool entry; the resumed
+    ///   surface lets originator-side callers re-introduce it for
+    ///   dispatch.
+    /// * `newly_pending_from_spawn` — clones of every `TaskInfo<I>`
+    ///   inside a `TasksSpawned` batch whose post-classify state is
+    ///   `Pending` (no deps, or all deps already `Completed`).
+    ///   Receive-side callers that locally own a dispatch pool use
+    ///   this surface to grow the pool so it stays coherent with
+    ///   the CRDT ledger. Duplicate-hash entries that NoOp on the
+    ///   ledger are NOT surfaced (pool growth is idempotent under
+    ///   snapshot retransmission). Cascade-Failed and Blocked entries
+    ///   are not surfaced because they don't enter the pool.
+    ///
+    /// Both buffers are out-parameters rather than part of the return
+    /// type: most apply variants append zero items, and the receive-
+    /// side callers (which are the only ones that read the list)
+    /// prefer to accumulate across a whole mutation batch into a
+    /// single buffer before deciding what to do with it.
     pub fn apply_with_resumed_blocked(
         &mut self,
         m: ClusterMutation<I>,
         resumed: &mut Vec<TaskInfo<I>>,
+        newly_pending_from_spawn: &mut Vec<TaskInfo<I>>,
     ) -> ApplyOutcome {
         match m {
             ClusterMutation::TaskAdded { hash, task } => {
@@ -386,7 +412,9 @@ impl<I: Identifier> ClusterState<I> {
                 holdings,
                 epoch,
             } => self.apply_peer_resource_holdings_updated(peer_id, holdings, epoch),
-            ClusterMutation::TasksSpawned { tasks } => self.apply_tasks_spawned(tasks),
+            ClusterMutation::TasksSpawned { tasks } => {
+                self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
+            }
             ClusterMutation::PanikRequested {
                 source_peer,
                 reason,

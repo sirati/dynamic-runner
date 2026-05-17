@@ -720,3 +720,255 @@ async fn cascade_drains_callback_queued_spawn_tasks_inline() {
         "apply_spawn_tasks succeeded with no per-index errors: {result:?}"
     );
 }
+
+/// Regression: wire-received `ClusterMutation::TasksSpawned` MUST
+/// grow `primary_pending` on a promoted secondary so the pool stays
+/// coherent with the CRDT ledger.
+///
+/// Pre-fix the in-process distributed bug: phase-end Python callback
+/// calls `primary_handle.spawn_tasks(...)` which routes through the
+/// DEMOTED primary's command channel; demoted primary applies +
+/// broadcasts `TasksSpawned`; promoted secondary receives the wire
+/// mutation and applies it to `cluster_state` (the ledger grows), but
+/// `apply_cluster_mutations` never extended `primary_pending` with
+/// the new task — the pool stayed empty and the next dispatch tick
+/// had nothing to assign. The whole run hung at "drained=1 pending
+/// wire message" at teardown.
+///
+/// This test pins the property that `apply_cluster_mutations`
+/// (invoked from every wire-receive path in `dispatch_message` and
+/// `wait_for_setup`) extends `primary_pending` with every freshly-
+/// Pending entry surfaced by the apply rule.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_cluster_mutations_grows_primary_pending_on_wire_received_tasks_spawned() {
+    let phase_a = PhaseId::from("phase-a");
+    let mut sec = make_secondary(election_config("sec-0"));
+    // Promoted-secondary scenario: the pool-extension step lands the
+    // freshly-Pending entry into `primary_pending` only when the
+    // field is `Some`. Flip the promoted flag + seed the pool.
+    sec.is_primary = true;
+    let mut phase_set = HashSet::new();
+    phase_set.insert(phase_a.clone());
+    let pool = PendingPool::<TestId>::new(phase_set, HashMap::new())
+        .expect("pool graph valid");
+    sec.primary_pending = Some(pool);
+
+    let initial_pool_len = sec
+        .primary_pending
+        .as_ref()
+        .expect("pool present")
+        .len();
+    let initial_task_count = sec.cluster_state.task_count();
+
+    // Build a brand-new task that did NOT originate via any local
+    // pool action. This mirrors the wire-receive case: a peer
+    // broadcasts a `TasksSpawned` carrying tasks this node has never
+    // seen before. No `task_depends_on` → the apply rule classifies
+    // the entry as freshly `Pending` (the surface this fix targets).
+    let task = TaskInfo {
+        path: PathBuf::from("/tmp/wire-spawned"),
+        size: 100,
+        identifier: TestId("wire-spawned".into()),
+        phase_id: phase_a.clone(),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: Some("task-wire".into()),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    let task_hash = crate::primary::wire::compute_task_hash(&task);
+
+    let mutations = vec![
+        dynrunner_protocol_primary_secondary::ClusterMutation::TasksSpawned {
+            tasks: vec![task.clone()],
+        },
+    ];
+
+    // Drive the wire-receive entry-point directly. This is the
+    // primitive `dispatch_message`'s `ClusterMutation` arm calls per
+    // batch (and `wait_for_setup`'s receive loop calls in setup-time).
+    sec.apply_cluster_mutations(mutations);
+
+    // (1) cluster_state grew by 1 — the apply landed the entry.
+    assert_eq!(
+        sec.cluster_state.task_count(),
+        initial_task_count + 1,
+        "task_count grows by 1: wire-received TasksSpawned applied to ledger"
+    );
+
+    // (2) The new entry is Pending in the CRDT (no deps, no prereqs
+    // in flight) — the precondition for pool extension.
+    use crate::cluster_state::TaskState;
+    let state = sec
+        .cluster_state
+        .task_state(&task_hash)
+        .expect("spawned task in ledger");
+    assert!(
+        matches!(state, TaskState::Pending { .. }),
+        "wire-spawned task classified Pending: got {state:?}"
+    );
+
+    // (3) The pool grew by 1 — `apply_cluster_mutations` reinjected
+    // the freshly-Pending task into `primary_pending`. This is THE
+    // regression-pin: pre-fix the pool stayed at `initial_pool_len`
+    // and the wire-received task was lost to dispatch.
+    let final_pool_len = sec
+        .primary_pending
+        .as_ref()
+        .expect("pool present")
+        .len();
+    assert_eq!(
+        final_pool_len,
+        initial_pool_len + 1,
+        "primary_pending grew by 1: wire-received TasksSpawned \
+         reinjected freshly-Pending task into the pool"
+    );
+
+    // (4) The reinjected entry is the same task we wired in
+    // (same hash). Read it back via `take_first_match` — destructive,
+    // but the test is done.
+    let popped = sec
+        .primary_pending
+        .as_mut()
+        .expect("pool present")
+        .take_first_match(|t| {
+            crate::primary::wire::compute_task_hash(t) == task_hash
+        });
+    assert!(
+        popped.is_some(),
+        "the reinjected pool entry matches the wire-spawned task's hash"
+    );
+}
+
+/// Regression: re-applying the SAME wire-received `TasksSpawned`
+/// mutation is idempotent on the pool — the second apply NoOps on
+/// cluster_state (duplicate-hash) and does NOT re-grow the pool. This
+/// pins the snapshot-retransmission safety of the fix: a peer that
+/// re-broadcasts a TasksSpawned (intentional snapshot replay, or a
+/// late-joiner state-sync) must not double-inject tasks.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_cluster_mutations_idempotent_on_repeat_wire_received_tasks_spawned() {
+    let phase_a = PhaseId::from("phase-a");
+    let mut sec = make_secondary(election_config("sec-0"));
+    sec.is_primary = true;
+    let mut phase_set = HashSet::new();
+    phase_set.insert(phase_a.clone());
+    let pool = PendingPool::<TestId>::new(phase_set, HashMap::new())
+        .expect("pool graph valid");
+    sec.primary_pending = Some(pool);
+
+    let task = TaskInfo {
+        path: PathBuf::from("/tmp/wire-spawned"),
+        size: 100,
+        identifier: TestId("wire-spawned".into()),
+        phase_id: phase_a.clone(),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: Some("task-wire".into()),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+
+    let make_batch = || {
+        vec![
+            dynrunner_protocol_primary_secondary::ClusterMutation::TasksSpawned {
+                tasks: vec![task.clone()],
+            },
+        ]
+    };
+
+    // First apply: ledger grows + pool grows.
+    sec.apply_cluster_mutations(make_batch());
+    let pool_len_after_first = sec
+        .primary_pending
+        .as_ref()
+        .expect("pool present")
+        .len();
+    let task_count_after_first = sec.cluster_state.task_count();
+    assert_eq!(pool_len_after_first, 1, "pool grew on first apply");
+
+    // Second apply with the SAME batch: cluster_state NoOps the
+    // duplicate-hash entry (the apply rule's idempotency contract),
+    // and the surface is empty so the pool is not re-grown.
+    sec.apply_cluster_mutations(make_batch());
+    assert_eq!(
+        sec.cluster_state.task_count(),
+        task_count_after_first,
+        "task_count unchanged on duplicate-hash re-apply"
+    );
+    assert_eq!(
+        sec.primary_pending
+            .as_ref()
+            .expect("pool present")
+            .len(),
+        pool_len_after_first,
+        "pool unchanged on duplicate-hash re-apply — idempotent under \
+         TasksSpawned retransmission / snapshot replay"
+    );
+}
+
+/// Regression: a non-promoted secondary (no `primary_pending`)
+/// applies wire-received TasksSpawned to the CRDT ledger but silently
+/// skips the pool-extension step. The field is the boundary — no
+/// `if is_primary` special-case; the absence of the pool itself
+/// gates the reinject.
+#[tokio::test(flavor = "current_thread")]
+async fn apply_cluster_mutations_skips_pool_extension_on_non_promoted_secondary() {
+    let phase_a = PhaseId::from("phase-a");
+    let mut sec = make_secondary(election_config("sec-0"));
+    // Non-promoted: is_primary stays false; primary_pending stays None.
+    assert!(
+        sec.primary_pending.is_none(),
+        "fixture starts with primary_pending = None"
+    );
+
+    let task = TaskInfo {
+        path: PathBuf::from("/tmp/wire-spawned"),
+        size: 100,
+        identifier: TestId("wire-spawned".into()),
+        phase_id: phase_a.clone(),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: Some("task-wire".into()),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    let task_hash = crate::primary::wire::compute_task_hash(&task);
+    let initial_task_count = sec.cluster_state.task_count();
+
+    sec.apply_cluster_mutations(vec![
+        dynrunner_protocol_primary_secondary::ClusterMutation::TasksSpawned {
+            tasks: vec![task.clone()],
+        },
+    ]);
+
+    // Ledger grew — the apply rule still ran.
+    assert_eq!(
+        sec.cluster_state.task_count(),
+        initial_task_count + 1,
+        "task_count grows even on non-promoted secondary; the CRDT \
+         applies regardless of pool ownership"
+    );
+    use crate::cluster_state::TaskState;
+    let state = sec
+        .cluster_state
+        .task_state(&task_hash)
+        .expect("spawned task in ledger");
+    assert!(
+        matches!(state, TaskState::Pending { .. }),
+        "wire-spawned task classified Pending in the ledger"
+    );
+
+    // Pool absence persists — no panic, no implicit pool creation.
+    assert!(
+        sec.primary_pending.is_none(),
+        "primary_pending stays None on a non-promoted secondary; the \
+         reinject step is silently skipped, not panic-on-Unwrap"
+    );
+}
