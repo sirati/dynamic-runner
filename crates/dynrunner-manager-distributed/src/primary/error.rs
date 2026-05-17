@@ -35,6 +35,32 @@ pub enum RunError {
         stranded: usize,
         outcome: OutcomeSummary,
     },
+    /// Operator-initiated emergency stop via the panik-watcher.
+    /// The primary observed its panik file (any of the configured
+    /// `--panik-file` paths), broadcast
+    /// `ClusterMutation::PanikRequested` to every secondary on
+    /// the peer mesh, and is returning so the PyO3 wrapper can
+    /// call `std::process::exit(137)`. The SLURM wrapper sees
+    /// exit 137 and reaps the podman container; secondaries on
+    /// other nodes have either already observed their own panik
+    /// file or learn about the cluster-wide stop through the
+    /// broadcast and follow suit.
+    ///
+    /// `matched_path` is the first panik file that existed on
+    /// this node (input-order priority — see
+    /// `PanikWatcherConfig.paths` doc). `reason` is the shape
+    /// `"panik file: <path>"` carried in the broadcast
+    /// `ClusterMutation::PanikRequested.reason` so terminal logs
+    /// across the cluster all surface the same sentinel.
+    ///
+    /// Why a separate variant rather than `Other(String)`: the
+    /// PyO3 boundary needs to translate panik into
+    /// `exit(137)` specifically (vs. `exit(1)` for other
+    /// errors); a string-matched discriminator would be fragile.
+    PanikShutdown {
+        matched_path: std::path::PathBuf,
+        reason: String,
+    },
     /// Any other run-time failure — transport setup, pool
     /// construction, broadcast deliveries that exhausted retries, etc.
     Other(String),
@@ -51,6 +77,14 @@ impl fmt::Display for RunError {
                 r = outcome.fail_retry,
                 o = outcome.fail_oom,
                 fi = outcome.fail_final,
+            ),
+            Self::PanikShutdown {
+                matched_path,
+                reason,
+            } => write!(
+                f,
+                "primary panik shutdown: {reason} (matched_path={})",
+                matched_path.display()
             ),
             Self::Other(msg) => f.write_str(msg),
         }

@@ -27,6 +27,7 @@ mod cascade;
 mod late_joiner_accept_emits_peer_joined;
 mod late_joiner_observer;
 mod observer_announcer_wireup;
+mod panik_integration;
 mod peer_mesh_watchdog;
 mod processing;
 mod promoted_primary_quiesce_gate;

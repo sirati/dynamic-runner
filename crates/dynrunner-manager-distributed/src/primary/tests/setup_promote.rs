@@ -136,6 +136,12 @@ async fn setup_promote_run_with_retry_success_completes_via_runcomplete() {
             loop {
                 match secondary.run_until_setup_or_done(&mut factory).await {
                     Ok(RunOutcome::Done) => break,
+                    Ok(RunOutcome::PanikShutdown { matched_path, .. }) => {
+                        panic!(
+                            "secondary unexpectedly panik-shutdown on test path: {}",
+                            matched_path.display()
+                        )
+                    }
                     Ok(RunOutcome::SetupPending) => {
                         secondary
                             .ingest_setup_discovery(
@@ -464,7 +470,13 @@ async fn setup_promote_multi_secondary_natural_quiesce_completes_via_runcomplete
                 loop {
                     match secondary.run_until_setup_or_done(&mut factory).await {
                         Ok(RunOutcome::Done) => break,
-                        Ok(RunOutcome::SetupPending) => {
+                        Ok(RunOutcome::PanikShutdown { matched_path, .. }) => {
+                        panic!(
+                            "secondary unexpectedly panik-shutdown on test path: {}",
+                            matched_path.display()
+                        )
+                    }
+                    Ok(RunOutcome::SetupPending) => {
                             secondary
                                 .ingest_setup_discovery(
                                     discovered_local.clone(),
@@ -845,7 +857,13 @@ async fn promoted_secondary_flushes_primary_transport_before_natural_quiesce_exi
                 loop {
                     match secondary.run_until_setup_or_done(&mut factory).await {
                         Ok(RunOutcome::Done) => break,
-                        Ok(RunOutcome::SetupPending) => {
+                        Ok(RunOutcome::PanikShutdown { matched_path, .. }) => {
+                        panic!(
+                            "secondary unexpectedly panik-shutdown on test path: {}",
+                            matched_path.display()
+                        )
+                    }
+                    Ok(RunOutcome::SetupPending) => {
                             secondary
                                 .ingest_setup_discovery(
                                     discovered_local.clone(),
@@ -1089,7 +1107,13 @@ async fn setup_promote_multi_secondary_distributes_to_idle_peers_on_promote() {
                 loop {
                     match secondary.run_until_setup_or_done(&mut factory).await {
                         Ok(RunOutcome::Done) => break,
-                        Ok(RunOutcome::SetupPending) => {
+                        Ok(RunOutcome::PanikShutdown { matched_path, .. }) => {
+                        panic!(
+                            "secondary unexpectedly panik-shutdown on test path: {}",
+                            matched_path.display()
+                        )
+                    }
+                    Ok(RunOutcome::SetupPending) => {
                             secondary
                                 .ingest_setup_discovery(
                                     discovered_local.clone(),

@@ -119,6 +119,7 @@ where
             task_completed_dispatcher_handle: None,
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
+            panik_signal_rx: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -177,6 +178,26 @@ where
             handle.abort();
             let _ = handle.await;
         }
+    }
+
+    /// Register the panik-watcher signal receiver. Must be called
+    /// BEFORE `run_until_setup_or_done` enters; calls afterwards have
+    /// no effect on the active loop (the field is `Option::take`-n
+    /// into the loop's local state on first entry).
+    ///
+    /// Single concern: the coordinator owns the panik-react logic
+    /// (broadcast `ClusterMutation::PanikRequested`, kill all worker
+    /// process trees, return `RunOutcome::PanikShutdown`). The PyO3
+    /// wrapper owns spawning [`crate::panik_watcher::spawn_panik_watcher`]
+    /// and threading its `take_signal_rx()` here; that separation is
+    /// what lets each Rust-only caller (tests, the existing `run`
+    /// wrapper) skip the watcher entirely without conditional
+    /// branches in the operational loop.
+    pub fn register_panik_signal_rx(
+        &mut self,
+        rx: tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>,
+    ) {
+        self.panik_signal_rx = Some(rx);
     }
 
     /// Register a [`crate::task_completed::TaskCompletedListener`].
@@ -476,6 +497,22 @@ where
                  may be promoted with required_setup=true)"
                     .to_string(),
             ),
+            // Surface PanikShutdown as a String error on the legacy
+            // `run()` path. The PyO3 wrapper takes the structured
+            // `RunOutcome` directly and calls `std::process::exit(137)`;
+            // the legacy wrapper has no such side-effect channel, so
+            // operators using the Rust-only API observe panik as a
+            // normal error return with the matched path in the
+            // message. (Tests using the legacy `run()` don't trigger
+            // the watcher — no panik file is ever created — so this
+            // arm is structurally cold in production Rust-only usage.)
+            RunOutcome::PanikShutdown {
+                matched_path,
+                reason,
+            } => Err(format!(
+                "secondary panik shutdown: {reason} (matched_path={})",
+                matched_path.display()
+            )),
         }
     }
 
@@ -666,7 +703,7 @@ where
         // run to completion.
         let outcome = self.process_tasks(factory).await?;
 
-        match outcome {
+        match &outcome {
             RunOutcome::Done => {
                 // Normal termination — stop workers and log finish.
                 self.stop_all_workers().await;
@@ -683,6 +720,24 @@ where
                 tracing::info!(
                     secondary = %self.config.secondary_id,
                     "secondary yielding for setup discovery"
+                );
+            }
+            RunOutcome::PanikShutdown {
+                matched_path,
+                reason,
+            } => {
+                // Workers have already been taken down via the
+                // panik-react path's `kill_all_workers_with_grace`;
+                // skip the clean `stop_all_workers` ladder (it would
+                // try to send a protocol Stop on a dead transport
+                // and waste teardown time). The PyO3 wrapper will
+                // call `std::process::exit(137)` as soon as it sees
+                // this variant.
+                tracing::warn!(
+                    secondary = %self.config.secondary_id,
+                    matched_path = %matched_path.display(),
+                    reason = %reason,
+                    "secondary panik shutdown"
                 );
             }
         }

@@ -249,6 +249,10 @@
                          PromotePrimary{{required_setup=true}} causes it, \
                          which an observer rejects"
                     ),
+                    Ok(Ok(RunOutcome::PanikShutdown { matched_path, .. })) => panic!(
+                        "observer unexpectedly panik-shutdown on test path: {}",
+                        matched_path.display()
+                    ),
                 }
             })
             .await;

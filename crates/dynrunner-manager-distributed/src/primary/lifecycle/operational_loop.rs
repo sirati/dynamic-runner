@@ -75,6 +75,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // case, matching the command-channel disabled-arm shape.
         let mut respawn_request_rx = self.respawn_request_rx.take();
 
+        // Panik-watcher signal receiver. Same shape as the closed-
+        // channel arms above: taken out for the loop's duration so
+        // the awaiting arm owns the receiver across `select!`
+        // iterations, parked on `pending().await` when None
+        // (operator passed no `--panik-file` paths) or once the
+        // signal has already fired+consumed.
+        //
+        // Unlike `command_rx` / `matcher_trigger_rx`, this is a
+        // ONESHOT receiver — the watcher resolves exactly once
+        // (matched-file detection OR sender drop on abort). After
+        // resolution we set the local to None so subsequent
+        // iterations re-park on `pending().await`, mirroring the
+        // secondary's panik arm.
+        let mut panik_signal_rx = self.panik_signal_rx.take();
+
         loop {
             // Check termination: all tasks accounted for AND no
             // worker is mid-dispatch. Both halves of the check are
@@ -535,6 +550,48 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 } => {
                     self.handle_respawn_join(outcome);
                 }
+                // Panik (operator-initiated emergency stop) arm. The
+                // watcher's `oneshot::Receiver<PanikSignal>` resolves
+                // exactly once: with `Ok(signal)` on first-matching
+                // panik file, or with `Err(_)` if the watcher's
+                // sender was dropped (empty paths config or task
+                // abort on coordinator drop). On `Ok` we broadcast
+                // `ClusterMutation::PanikRequested` and stash the
+                // (matched_path, reason) on `self.panik_outcome` so
+                // the outer `run_pipeline` can translate it into
+                // `RunError::PanikShutdown`. Breaking out of the
+                // loop here mirrors the `transport_closed` /
+                // `peer_transport_closed` exit shape: the operational
+                // loop's `Result<(), String>` signature does not need
+                // to change.
+                //
+                // `Err(_)` is treated as a no-op (watcher disabled or
+                // gracefully stopped); the loop continues. Setting
+                // the local to None on either branch prevents the
+                // resolved-already future from hot-looping the
+                // select.
+                panik = async {
+                    match panik_signal_rx.as_mut() {
+                        Some(rx) => rx.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    panik_signal_rx = None;
+                    if let Ok(signal) = panik {
+                        let outcome = self
+                            .handle_panik_signal(signal.matched_path)
+                            .await;
+                        self.panik_outcome = Some(outcome);
+                        // Break the operational loop. The outer
+                        // `run_pipeline` consumes `panik_outcome`
+                        // after the loop returns Ok and surfaces
+                        // `RunError::PanikShutdown` to the caller.
+                        tracing::warn!(
+                            "primary operational loop exiting via panik path"
+                        );
+                        break;
+                    }
+                }
                 _ = tokio::time::sleep(Duration::from_secs(300)) => {
                     let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
                     if active > 0 {
@@ -585,6 +642,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // passes re-enter the operational loop and a death observed
         // during a retry pass should still drive the dispatcher.
         self.respawn_request_rx = respawn_request_rx;
+        // Same rationale for the panik-signal receiver: a retry
+        // pass that re-enters the operational loop must keep its
+        // panik arm wired up. The receiver is `Some` only while the
+        // watcher hasn't fired yet — once the panik arm consumed
+        // it, the local was set to None and we round-trip None
+        // through `self` (a benign noop). The outer `run_pipeline`
+        // owns "did panik fire?" via `self.panik_outcome`, which
+        // an entry into `run_retry_passes` checks BEFORE re-entering
+        // the loop so the retry pass is bypassed on panik.
+        self.panik_signal_rx = panik_signal_rx;
 
         // Drain any in-flight respawn tasks so the operational loop
         // never exits with a tokio task quietly outliving the
@@ -671,6 +738,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// kickstart the re-injected binaries would sit in the pool
     /// forever waiting for a TaskRequest that never comes.
     pub(crate) async fn run_retry_passes(&mut self) -> Result<(), String> {
+        // Panik shortcut: if the operational loop exited via the
+        // panik arm, every worker is being / has been killed and
+        // the cluster's shutting down. Re-injecting failed tasks
+        // and entering another operational loop would dispatch
+        // them to dead transports (the SLURM wrapper is about to
+        // reap the container on exit 137). Bail immediately so
+        // the outer `run_pipeline` can translate `panik_outcome`
+        // into `RunError::PanikShutdown`.
+        if self.panik_outcome.is_some() {
+            return Ok(());
+        }
         // Demoted observer mode: the promoted primary owns
         // retry orchestration. The local primary's `failed_tasks`
         // set still receives forwarded outcomes (so the run-done

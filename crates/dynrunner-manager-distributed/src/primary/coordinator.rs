@@ -479,6 +479,42 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// [`preferred_secondaries::PreferredSecondariesValidator`].
     pub(super) preferred_secondaries_validator:
         preferred_secondaries::PreferredSecondariesValidator,
+
+    /// Panik-watcher signal receiver. Installed via
+    /// [`Self::register_panik_signal_rx`] before `run()`; `None`
+    /// when the operator did not pass any `--panik-file` paths. The
+    /// operational `select!` arm in
+    /// `lifecycle/operational_loop.rs` reads this slot, parks on
+    /// `pending().await` when None, and on `Ok(signal)` broadcasts
+    /// `ClusterMutation::PanikRequested` then returns
+    /// `RunError::PanikShutdown` for the PyO3 wrapper to translate
+    /// into `std::process::exit(137)`.
+    ///
+    /// Unlike the secondary, the primary owns no local worker pool
+    /// (workers run on secondaries, accessed remotely via the
+    /// `RemoteWorkerState` ledger), so the primary's panik-react
+    /// path has no `kill_all_workers_with_grace` step — just the
+    /// broadcast + exit. Worker teardown is each secondary's
+    /// concern; the broadcast is what tells every other node to
+    /// run its own teardown.
+    pub(super) panik_signal_rx:
+        Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
+
+    /// Set by the panik arm in the operational `select!` loop when
+    /// the watcher signal fires. Carries the (matched_path, reason)
+    /// pair the panik handler produced.
+    ///
+    /// One-concern wiring identical to the secondary's `fatal_exit`
+    /// pattern: the arm only WRITES this; the outer `run_pipeline`
+    /// only READS. Avoids changing the inner loop's `Result<(),
+    /// String>` signature into `Result<(), RunError>` (which would
+    /// ripple through every `?` site, every `From<String>`
+    /// conversion, and several helper methods). The outer wrapper
+    /// observes a Some here after the operational loop returns Ok
+    /// and translates it into `Err(RunError::PanikShutdown { … })`
+    /// so the PyO3 boundary can match the structured variant and
+    /// call `exit(137)`.
+    pub(super) panik_outcome: Option<(std::path::PathBuf, String)>,
 }
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -575,6 +611,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             respawn_primary_pubkey_pem: String::new(),
             preferred_secondaries_validator:
                 preferred_secondaries::PreferredSecondariesValidator::new(),
+            panik_signal_rx: None,
+            panik_outcome: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -627,6 +665,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         listener: Box<dyn crate::peer_lifecycle::LifecycleListener>,
     ) {
         self.peer_lifecycle_listeners.push(listener);
+    }
+
+    /// Register the panik-watcher signal receiver. Must be called
+    /// BEFORE `run()` enters; calls afterwards have no effect on
+    /// the active loop (the field is `Option::take`-n into the
+    /// operational loop's local state on first entry).
+    ///
+    /// Mirrors `SecondaryCoordinator::register_panik_signal_rx`.
+    /// The PyO3 wrapper owns spawning
+    /// [`crate::panik_watcher::spawn_panik_watcher`] and threading
+    /// its `take_signal_rx()` here.
+    pub fn register_panik_signal_rx(
+        &mut self,
+        rx: tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>,
+    ) {
+        self.panik_signal_rx = Some(rx);
     }
 
     /// Tear down the peer-lifecycle dispatcher task spawned at
@@ -1296,6 +1350,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // Operational loop (main pass).
         self.operational_loop().await?;
 
+        // Panik check: if the operational loop's panik arm fired,
+        // the cluster has already been instructed (via the broadcast)
+        // to shut down. Surface as `RunError::PanikShutdown` and
+        // skip every remaining phase (retry passes, drain, accounting,
+        // RunComplete settle window). The PyO3 wrapper translates
+        // PanikShutdown into `std::process::exit(137)` so the SLURM
+        // wrapper reaps the container.
+        if let Some((matched_path, reason)) = self.panik_outcome.take() {
+            tracing::warn!(
+                matched_path = %matched_path.display(),
+                reason = %reason,
+                "primary run aborted by panik signal; surfacing PanikShutdown"
+            );
+            return Err(RunError::PanikShutdown {
+                matched_path,
+                reason,
+            });
+        }
+
         // Phase 10: Retry pass(es). Each Recoverable / NonRecoverable
         // failure in the main pass terminated its dispatch slot and
         // landed the task hash in `failed_tasks`. Re-inject those
@@ -1307,6 +1380,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // retries at all; the pass-based shape gives task-level
         // retry that matches the local manager's behaviour.
         self.run_retry_passes().await?;
+
+        // Same panik check, post-retry-passes. If panik fired during
+        // a retry pass's operational-loop re-entry, `panik_outcome`
+        // is Some and `run_retry_passes` bailed at the top of its
+        // next iteration. Pick it up here.
+        if let Some((matched_path, reason)) = self.panik_outcome.take() {
+            tracing::warn!(
+                matched_path = %matched_path.display(),
+                reason = %reason,
+                "primary run aborted by panik signal during retry passes; \
+                 surfacing PanikShutdown"
+            );
+            return Err(RunError::PanikShutdown {
+                matched_path,
+                reason,
+            });
+        }
 
         // Drain any TaskComplete / TaskFailed messages that crossed the
         // wire while the operational loop was winding down but hadn't
