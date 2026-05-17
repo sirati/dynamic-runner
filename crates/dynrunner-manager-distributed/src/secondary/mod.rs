@@ -553,4 +553,46 @@ where
     /// would race the take/put with cancel-on-arm-fire semantics).
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
+
+    /// Lifecycle hook invoked when this secondary owns the primary
+    /// pool (post-promotion) and a phase reaches `Drained`. Mirrors
+    /// `PrimaryCoordinator::on_phase_end` exactly; the PyO3 wrapper
+    /// installs a GIL-reacquiring closure that calls Python's
+    /// `task.on_phase_end(phase_id, completed, failed)`. `None` when
+    /// the caller did not supply a hook OR when this secondary never
+    /// gets promoted — in both cases the fire-site silently no-ops, so
+    /// non-promoted secondaries are unaffected by the field's
+    /// existence.
+    pub(super) on_phase_end:
+        Option<crate::primary::OnPhaseEnd>,
+
+    /// Per-phase completion counters fed to `on_phase_end`. Incremented
+    /// inside `note_primary_item_completed` (the single chokepoint
+    /// where a primary-dispatched item terminates successfully on this
+    /// secondary's pool); mirrors the same field on
+    /// `PrimaryCoordinator`. Stays empty when this secondary is never
+    /// promoted (the increment site is also the only writer).
+    pub(super) primary_phase_completed:
+        std::collections::HashMap<dynrunner_core::PhaseId, u32>,
+
+    /// Per-phase failure counters fed to `on_phase_end`. Sibling of
+    /// `primary_phase_completed` for the failure path.
+    pub(super) primary_phase_failed:
+        std::collections::HashMap<dynrunner_core::PhaseId, u32>,
+
+    /// Phases that have already had `on_phase_start` fired through this
+    /// secondary's lifecycle bridge. Mirrors
+    /// `PrimaryCoordinator::phase_started_emitted` — the pool's state
+    /// machine doesn't track "did we observe this transition", so the
+    /// coordinator does the bookkeeping. Stays empty when no lifecycle
+    /// callback is installed.
+    pub(super) primary_phase_started_emitted:
+        std::collections::HashSet<dynrunner_core::PhaseId>,
+
+    /// Lifecycle hook invoked when this secondary owns the primary
+    /// pool (post-promotion) and a phase flips Blocked → Active.
+    /// Mirrors `PrimaryCoordinator::on_phase_start`. Same `None`
+    /// semantics as `on_phase_end`.
+    pub(super) on_phase_start:
+        Option<crate::primary::OnPhaseStart>,
 }

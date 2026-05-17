@@ -120,6 +120,11 @@ where
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
+            on_phase_end: None,
+            on_phase_start: None,
+            primary_phase_completed: HashMap::new(),
+            primary_phase_failed: HashMap::new(),
+            primary_phase_started_emitted: HashSet::new(),
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -208,6 +213,31 @@ where
         listener: Box<dyn crate::task_completed::TaskCompletedListener>,
     ) {
         self.task_completed_listeners.push(listener);
+    }
+
+    /// Install per-phase lifecycle hooks fired on this secondary when
+    /// it owns the primary pool (post-promotion). Mirrors the same
+    /// shape `PrimaryCoordinator::run_pipeline` accepts:
+    /// `on_phase_start(&PhaseId)` fires when a phase flips Blocked →
+    /// Active; `on_phase_end(&PhaseId, completed, failed)` fires when
+    /// the phase reaches `Drained`.
+    ///
+    /// Must be called before `run_until_setup_or_done` enters.
+    /// Secondaries that never get promoted never invoke either hook,
+    /// so the absence of a registration is the no-op case (the
+    /// fire-sites guard on the `Option`).
+    ///
+    /// Single concern: ownership transfer of the boxed closures from
+    /// the PyO3 wrapper (which constructs the GIL-reacquiring
+    /// closures) onto the coordinator that will fire them. The
+    /// invocation semantics live in `secondary/primary/lifecycle.rs`.
+    pub fn register_phase_lifecycle_callbacks(
+        &mut self,
+        on_phase_start: crate::primary::OnPhaseStart,
+        on_phase_end: crate::primary::OnPhaseEnd,
+    ) {
+        self.on_phase_start = Some(on_phase_start);
+        self.on_phase_end = Some(on_phase_end);
     }
 
     /// Tear down the task-completion dispatcher task. Mirrors

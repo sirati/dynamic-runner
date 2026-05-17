@@ -22,6 +22,19 @@
 //!   `apply_locally_for_broadcast` + dual fan-out for batches this
 //!   node produces, plus the wrapper entry-point for setup-time
 //!   discovery results.
+//! - [`lifecycle`] — `process_primary_phase_lifecycle`,
+//!   `fire_primary_phase_starts`: phase-lifecycle cascade and
+//!   `on_phase_start`/`on_phase_end` fire-sites for the
+//!   promoted-secondary path. Mirrors
+//!   `PrimaryCoordinator::process_phase_lifecycle` so a setup-promoted
+//!   secondary that owns the live pool fires the same hooks the
+//!   demoted primary would have.
+//! - [`spawn_tasks`] — `apply_spawn_tasks`: promoted-secondary's
+//!   analog of `PrimaryCoordinator::apply_spawn_tasks`. Shares the
+//!   pre-apply validator with the primary so the duplicate-hash +
+//!   unknown-dep rules cannot drift; routes the post-apply state into
+//!   `primary_pending` / `primary_failed` so a runtime-injected batch
+//!   reaches the live pool on the promoted-secondary path too.
 //!
 //! Free helpers `task_file_hash` and `cascade_drain_done` live in
 //! this `mod.rs` because every submodule references them — pulling
@@ -34,7 +47,9 @@ use dynrunner_scheduler_api::PendingPool;
 mod broadcast;
 mod hydrate;
 mod ledger_ops;
+mod lifecycle;
 mod recovery;
+mod spawn_tasks;
 mod task_request;
 
 /// Stable hash of a `TaskInfo`'s path+identifier, matching the wire

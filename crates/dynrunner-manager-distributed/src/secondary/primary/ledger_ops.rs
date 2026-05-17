@@ -13,7 +13,6 @@ use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
-use super::cascade_drain_done;
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
@@ -63,10 +62,23 @@ where
         // trigger a pointless retry pass. Mirrors the live primary's
         // `failed_tasks.remove` in `handle_task_complete`.
         self.primary_failed.remove(file_hash);
+        // Per-phase counter bump BEFORE the drain cascade so the
+        // `on_phase_end(phase, completed, failed)` callback sees the
+        // up-to-date count when this completion is the one that takes
+        // the phase to `Drained`. Mirrors
+        // `PrimaryCoordinator::note_item_completed`.
+        *self
+            .primary_phase_completed
+            .entry(phase_id.clone())
+            .or_insert(0) += 1;
         if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id, task_id.as_deref());
-            cascade_drain_done(pool);
         }
+        // Cascade drain + fire the registered `on_phase_end` /
+        // `on_phase_start` callbacks (no-ops when no callback is
+        // registered or `primary_pending` is `None`). See
+        // `secondary/primary/lifecycle.rs` for the cascade semantics.
+        self.process_primary_phase_lifecycle();
     }
 
     /// Sibling to `note_primary_item_completed` for the failure path.
@@ -123,10 +135,19 @@ where
                 },
             );
         }
+        // Per-phase counter bump BEFORE the drain cascade so the
+        // `on_phase_end(phase, completed, failed)` callback observes
+        // the failure when this failure is the one that takes the
+        // phase to `Drained`. Mirrors
+        // `PrimaryCoordinator::note_item_failed`.
+        *self
+            .primary_phase_failed
+            .entry(phase_id.clone())
+            .or_insert(0) += 1;
         if let Some(pool) = self.primary_pending.as_mut() {
             pool.on_item_finished(&phase_id, task_id.as_deref());
-            cascade_drain_done(pool);
         }
+        self.process_primary_phase_lifecycle();
     }
 
     /// Primary-side equivalent of the local primary's

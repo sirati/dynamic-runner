@@ -20,6 +20,11 @@
 //!   PeerJoined emission contract for the late-joiner accept path.
 //! - [`observer_announcer_wireup`] — observer announcer production
 //!   wiring contract.
+//! - [`phase_lifecycle_callback`] — promoted-secondary fires
+//!   `on_phase_end` through `note_primary_item_completed` /
+//!   `note_primary_item_failed`'s drain cascade (Pins the
+//!   single-process / SLURM gap reported by consumer:
+//!   `on_phase_end` was silent on the post-promotion path).
 
 #![cfg(test)]
 
@@ -29,6 +34,7 @@ mod late_joiner_observer;
 mod observer_announcer_wireup;
 mod panik_integration;
 mod peer_mesh_watchdog;
+mod phase_lifecycle_callback;
 mod processing;
 mod promoted_primary_quiesce_gate;
 mod r1;

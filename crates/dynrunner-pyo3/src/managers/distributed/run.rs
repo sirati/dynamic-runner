@@ -140,6 +140,37 @@ impl PyDistributedManager {
             ),
         );
 
+        // Clone the task_definition once per secondary so the in-process
+        // setup-promote path can fire `on_phase_end` through the
+        // promoted-secondary's pool-drain transitions on the SAME
+        // Python `TaskDefinition` instance the primary's callback
+        // already targets. Pre-fix the promoted secondary's
+        // `note_primary_item_completed` walked the cascade silently
+        // (see `manager-distributed/src/secondary/primary/lifecycle.rs`),
+        // so a multi-phase Python task hosting `on_phase_end` in
+        // single-process mode never observed the phase boundary on the
+        // post-promotion path. Each per-secondary closure pair is
+        // pushed in the order the secondaries are spawned below; the
+        // spawn loop pops one pair off this vec per iteration so each
+        // closure captures its own `Py<PyAny>` ref-bump.
+        let mut sec_phase_lifecycle_callbacks: Vec<(
+            crate::managers::lifecycle::OnPhaseStart,
+            crate::managers::lifecycle::OnPhaseEnd,
+        )> = Vec::with_capacity(num_secondaries as usize);
+        for _ in 0..num_secondaries {
+            let on_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
+                crate::managers::lifecycle::make_on_phase_start(
+                    self.task_definition.clone_ref(py),
+                ),
+            );
+            let on_end: crate::managers::lifecycle::OnPhaseEnd = Box::new(
+                crate::managers::lifecycle::make_on_phase_end(
+                    self.task_definition.clone_ref(py),
+                ),
+            );
+            sec_phase_lifecycle_callbacks.push((on_start, on_end));
+        }
+
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
         // Wrapped through `PyPeerLifecycleListener::new` into a
@@ -213,7 +244,9 @@ impl PyDistributedManager {
                         RunnerIdentifier,
                     >::new("primary".into());
 
-                for (secondary_id, sec_log) in sec_log_dirs.into_iter() {
+                for ((secondary_id, sec_log), (sec_on_phase_start, sec_on_phase_end)) in
+                    sec_log_dirs.into_iter().zip(sec_phase_lifecycle_callbacks)
+                {
                     // primary→secondary channel
                     let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
                     // secondary→primary channel
@@ -375,6 +408,30 @@ impl PyDistributedManager {
                         if let Some(rx) = panik_watcher.take_signal_rx() {
                             secondary.register_panik_signal_rx(rx);
                         }
+
+                        // Install the per-secondary phase-lifecycle
+                        // callbacks BEFORE `run()` enters — the
+                        // coordinator's `register_phase_lifecycle_callbacks`
+                        // contract requires pre-run registration, same
+                        // shape as `register_lifecycle_listener` /
+                        // `register_panik_signal_rx`. The callbacks fire
+                        // ONLY when this secondary is promoted into the
+                        // primary role and observes a phase-drain
+                        // transition through `note_primary_item_completed`
+                        // / `note_primary_item_failed` (see
+                        // `manager-distributed/src/secondary/primary/lifecycle.rs`).
+                        // Non-promoted secondaries hold the registration
+                        // dormant and never invoke either closure; the
+                        // closures themselves are GIL-reacquiring and
+                        // call into the SAME Python `TaskDefinition`
+                        // instance the primary's `on_phase_*` callbacks
+                        // target — there's one `task_definition` in the
+                        // process and a multi-phase task hosts its hook
+                        // logic on that single instance.
+                        secondary.register_phase_lifecycle_callbacks(
+                            sec_on_phase_start,
+                            sec_on_phase_end,
+                        );
 
                         let result = secondary.run(&mut factory).await;
                         if let Err(e) = &result {
