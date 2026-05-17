@@ -404,11 +404,24 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Number of retry passes after the main operational loop drains. "
-            "Default 1: tasks that fail Recoverable in the main pass get one "
-            "more attempt in a retry pass; tasks that fail twice are permanent. "
-            "Set 0 to disable retry (Recoverable failures become terminal "
-            "immediately)."
+            "Number of Recoverable-retry passes at each phase drain edge. "
+            "Default 1: tasks that fail Recoverable get one more attempt in the "
+            "Recoverable retry bucket before the phase advances; tasks that "
+            "fail twice are permanent. Set 0 to disable retry (Recoverable "
+            "failures become terminal immediately)."
+        ),
+    )
+    parser.add_argument(
+        "--oom-retry-max-passes",
+        type=int,
+        default=None,
+        help=(
+            "Number of OOM-retry passes at each phase drain edge for tasks "
+            "failed with ErrorType::ResourceExhausted(memory). Runs AFTER the "
+            "Recoverable bucket exhausts for that phase. Default 1. Set 0 to "
+            "disable (OOM failures become terminal after the first attempt). "
+            "Separate from --retry-max-passes so Recoverable retries don't "
+            "consume the OOM-retry budget and vice versa."
         ),
     )
     parser.add_argument(
