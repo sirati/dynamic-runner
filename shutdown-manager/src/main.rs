@@ -109,7 +109,11 @@ fn run_with_config(cfg: Config) -> ExitCode {
         log(&format!("fatal: signal install failed: {}", e));
         return ExitCode::from(3);
     }
-    let backend = RealPodman::new(cfg.storage_root.clone(), cfg.runroot.clone());
+    let backend = RealPodman::new(
+        cfg.podman_path.clone(),
+        cfg.storage_root.clone(),
+        cfg.runroot.clone(),
+    );
     let clock = RealClock;
     let probe = KillProbe;
     let poll_cfg = PollConfig {
