@@ -122,6 +122,7 @@ if command -v systemd-run >/dev/null 2>&1; then
             --runroot "$PODMAN_RUN" \
             --tmp-prefix "$RNDTMP" \
             --pid-file "$RNDTMP/shutdown-manager.pid" \
+            --wrapper-pid "$$" \
             </dev/null >>"$RNDTMP/shutdown-manager.log" 2>&1 &
     SHUTDOWN_SPAWN_PID=$!
     # `systemd-run --user --scope` is foreground-by-default; the

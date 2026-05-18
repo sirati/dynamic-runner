@@ -67,12 +67,20 @@ fn renders_shutdown_manager_spawn_when_path_set() {
     // All five required CLI args present (the secondary subagent
     // owns the binary's CLI contract — we just assert we render
     // every one of the documented mandatory args).
+    //
+    // `--wrapper-pid "$$"` is the wrapper-monitor opt-in: the
+    // shutdown manager polls the wrapper PID each tick and falls
+    // through to SIGNAL_SHUTDOWN when the wrapper disappears
+    // (closing the SLURM-TIMEOUT proctrack-reap race). `$$` is
+    // bash's PID-of-the-current-script — evaluated in the wrapper's
+    // bash context at spawn time, NOT inside systemd-run.
     for arg in [
         "--container-name \"$CONTAINER_NAME\"",
         "--storage-root \"$PODMAN_STORAGE\"",
         "--runroot \"$PODMAN_RUN\"",
         "--tmp-prefix \"$RNDTMP\"",
         "--pid-file \"$RNDTMP/shutdown-manager.pid\"",
+        "--wrapper-pid \"$$\"",
     ] {
         assert!(
             script.contains(arg),
@@ -93,6 +101,28 @@ fn renders_shutdown_manager_spawn_when_path_set() {
     // a quoting/brace regression in the spawn block would slip
     // through otherwise.
     assert_bash_syntax_ok(&script);
+}
+
+/// The `--wrapper-pid` value must be the literal bash sigil `$$`
+/// (in double quotes), not a Rust-side-substituted constant. The
+/// wrapper script's PID is unknowable at render time; bash
+/// evaluates `$$` to the running script's PID at spawn. A renderer
+/// regression that inserted, say, an env var or a hard-coded
+/// number would break the manager's wrapper-monitor.
+#[test]
+fn wrapper_pid_renders_as_literal_bash_dollar_dollar() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+    // The substring must be present exactly — and ONLY inside the
+    // spawn block. (No other place in the wrapper uses `--wrapper-pid`.)
+    let count = script.matches("--wrapper-pid \"$$\"").count();
+    assert_eq!(
+        count, 1,
+        "expected exactly one occurrence of `--wrapper-pid \"$$\"` (the \
+         shutdown-manager spawn argv); render contained {count}. \
+         Full script:\n{script}"
+    );
 }
 
 /// Shell out to `bash -n` to confirm the rendered script parses.
