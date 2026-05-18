@@ -566,6 +566,17 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // `active_tasks` to prove the dispatch actually happened.
             let binary = make_binary("post-promotion-task", 50);
             let file_hash = format!("hash_{}", binary.identifier.0);
+            // Pre-bind the worker's `loaded_type_id` to the task's
+            // type so the dispatch path hits the same-type fast path
+            // (`AlreadyLoaded`) inside `ensure_worker_for_type_async`
+            // rather than stashing the binary in `pending_first_bind`.
+            // This isolates the test's concern (peer-routed
+            // TaskAssignment reaches the worker via `dispatch_message`)
+            // from the first-bind respawn flow (covered by the
+            // `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
+            // and `singleton_typed_phase_chain_completes_on_secondary`
+            // tests).
+            secondary.pool.workers[0].loaded_type_id = Some(binary.type_id.clone());
             let assignment = DistributedMessage::TaskAssignment {
                 sender_id: "sec-0".into(),       // promoted peer-primary
                 timestamp: 0.0,

@@ -171,43 +171,61 @@ where
                 let estimated = self.estimator.estimate(&actual_binary);
                 let wid = worker_id.min(self.pool.workers.len() as u32 - 1);
                 if self.pool.workers[wid as usize].is_idle_state() {
-                    // Per-type subprocess dispatch with the same
-                    // first-bind / type-shift discrimination as
-                    // dispatch.rs. First-bind (None →
-                    // required_type) uses the synchronous variant
-                    // to preserve the pre-fix observable behaviour
-                    // tests rely on; true type-shifts (Some(T1) →
-                    // Some(T2)) route through the async-event flow
-                    // and re-queue the binary to the local pool so
-                    // the worker's eventual Ready event picks it
-                    // up on the next request_task_for_worker tick.
-                    let prior_type = self.pool.loaded_type_id(wid).cloned();
-                    let is_true_type_shift = prior_type
-                        .as_ref()
-                        .is_some_and(|t| t != &actual_binary.type_id);
-                    let ensure_result: Result<(), String> = if is_true_type_shift {
-                        match self
-                            .pool
-                            .ensure_worker_for_type_async(wid, &actual_binary.type_id, factory, false)
-                            .await
-                        {
-                            Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
-                            Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
-                                tracing::info!(
-                                    worker_id = wid,
-                                    type_id = %actual_binary.type_id,
-                                    "primary self-assign: type-shift respawn issued; \
-                                     re-queuing binary so the eventual Ready event picks it up"
-                                );
-                                self.recover_in_flight_to_pool(&file_hash);
-                                return Ok(());
-                            }
-                            Err(e) => Err(e),
+                    // Per-type subprocess dispatch via the async-event
+                    // flow for both first-bind AND true type-shift.
+                    // Same wedge prevention as `dispatch/router.rs`'s
+                    // TaskAssignment arm; see that arm for the
+                    // full rationale. The pre-fix `is_true_type_shift`
+                    // discriminator left first-bind on the sync
+                    // `ensure_worker_for_type` path, which blocked
+                    // the secondary's `select!` for the full Python
+                    // worker import time on the asm-tokenizer LMU
+                    // dispatch.
+                    //
+                    // Pending-binary stash: keeping the binary on
+                    // this secondary's `pending_first_bind` map
+                    // (rather than bouncing as backpressure via
+                    // `recover_in_flight_to_pool`) preserves
+                    // distribution fairness on the promote-and-
+                    // distribute workloads — peer secondaries pay
+                    // one wire round-trip per first-bind, the
+                    // promoted-primary's self-assigns would reach
+                    // the same-type fast path sub-ms after Ready,
+                    // and the gap let the promoted node burn
+                    // through the entire pool. Stashing keeps the
+                    // binary pinned to the worker the dispatch arm
+                    // chose; the Disconnected handler recovers via
+                    // `recover_in_flight_to_pool` if the worker
+                    // dies before Ready (the `primary_in_flight`
+                    // entry was inserted upstream of this match,
+                    // outside this if-else, so it stays alive
+                    // across the pending stash).
+                    let ensure_result: Result<(), String> = match self
+                        .pool
+                        .ensure_worker_for_type_async(wid, &actual_binary.type_id, factory, false)
+                        .await
+                    {
+                        Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
+                        Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
+                            tracing::debug!(
+                                worker_id = wid,
+                                type_id = %actual_binary.type_id,
+                                file_hash = %file_hash,
+                                "primary self-assign: type-bind respawn issued; \
+                                 stashing binary in pending_first_bind until Ready arrives"
+                            );
+                            self.pending_first_bind.insert(
+                                wid,
+                                super::super::PendingFirstBind {
+                                    binary: actual_binary,
+                                    file_hash,
+                                    estimated,
+                                    source: super::super::BindSource::PrimarySelfAssign,
+                                },
+                            );
+                            return Ok(());
                         }
-                    } else {
-                        self.pool
-                            .ensure_worker_for_type(wid, &actual_binary.type_id, factory, false)
-                            .await
+                        Err(e) => Err(e),
                     };
                     if let Err(e) = ensure_result {
                         tracing::warn!(

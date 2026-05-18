@@ -221,6 +221,27 @@ where
                     "worker disconnected"
                 );
 
+                // Recover any pending first-bind binary first: the
+                // worker died between `RespawnInProgress` and the
+                // expected `Ready`, so the binary stashed in
+                // `pending_first_bind` is orphaned. Route it back
+                // to the right ledger per its `BindSource`
+                // discriminator before the standard disconnect
+                // path proceeds. Two-step here (take + recover)
+                // because `recover_pending_first_bind` takes
+                // `&mut self` and the `pending` value extracted
+                // from the map would otherwise conflict.
+                if let Some(pending) = self.pending_first_bind.remove(&worker_id) {
+                    let pending_hash = pending.file_hash.clone();
+                    let source = pending.source.clone();
+                    tracing::warn!(
+                        worker_id,
+                        task_hash = %pending_hash,
+                        "pending first-bind worker disconnected before Ready; recovering binary"
+                    );
+                    self.recover_pending_first_bind(worker_id, &pending_hash, &source).await?;
+                }
+
                 // Find and report the task as failed
                 let file_hash = self
                     .active_tasks
@@ -374,6 +395,81 @@ where
                 // observable transition that revives the slot's
                 // pull semantic resets the rate-limiter".
                 self.primary_link.reset_backoff(worker_id);
+                // Pending first-bind binary (if any): the dispatch
+                // arm in `dispatch/router.rs` (peer-assigned) or
+                // `primary/task_request.rs` (self-assigned)
+                // stashed the binary in `pending_first_bind` when
+                // it hit `EnsureWorkerOutcome::RespawnInProgress`.
+                // The slot is now Idle with the correct
+                // `loaded_type_id`; the same-type fast path inside
+                // `ensure_worker_for_type_async` would be a no-op,
+                // so we go straight to `assign_task`. Stashing-then-
+                // assign avoids the bounce-as-backpressure wire
+                // round-trip that the original type-shift fix used
+                // and preserves the dispatch-arm's worker-target
+                // choice (matters for the
+                // `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
+                // distribution-fairness contract).
+                if let Some(pending) = self.pending_first_bind.remove(&worker_id) {
+                    let super::super::PendingFirstBind {
+                        binary,
+                        file_hash,
+                        estimated,
+                        source,
+                    } = pending;
+                    let log_task_hash = file_hash.clone();
+                    let task_id_log = binary.task_id.clone();
+                    let phase_log = binary.phase_id.clone();
+                    let type_log = binary.type_id.clone();
+                    let estimated_mb =
+                        estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
+                    match self.pool.workers[worker_id as usize]
+                        .assign_task(binary, estimated, false)
+                        .await
+                    {
+                        Ok(()) => {
+                            self.active_tasks.insert(file_hash, worker_id);
+                            tracing::info!(
+                                worker_id,
+                                task_id = ?task_id_log,
+                                phase = %phase_log,
+                                task_type = %type_log,
+                                task_hash = %log_task_hash,
+                                estimated_mb,
+                                "pending first-bind assigned post-Ready"
+                            );
+                        }
+                        Err(e) => {
+                            // The freshly-spawned worker died
+                            // between Ready and the assign_task
+                            // write. Reap so the log shows the
+                            // actual signal/code rather than the
+                            // pipe-level error string. Recovery
+                            // shape mirrors the same-arm
+                            // [Disconnected] path: the binary
+                            // path takes the source-discriminated
+                            // recovery branch so the in-flight
+                            // ledger ends up consistent.
+                            let exit_status =
+                                self.pool.workers[worker_id as usize].try_reap_exit();
+                            tracing::warn!(
+                                worker_id,
+                                error = %e,
+                                exit_status = exit_status.as_ref().map(|s| s.to_string()),
+                                task_hash = %log_task_hash,
+                                "pending first-bind assign_task failed; recovering binary"
+                            );
+                            self.pending_worker_restarts.insert(worker_id);
+                            self.recover_pending_first_bind(
+                                worker_id,
+                                &log_task_hash,
+                                &source,
+                            )
+                            .await?;
+                        }
+                    }
+                    return Ok(None);
+                }
                 // Repoll for a task now that the slot is Idle
                 // again. Mirrors the post-TaskCompleted repoll
                 // (line 165 above) so the type-shift respawn

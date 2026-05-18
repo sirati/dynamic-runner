@@ -203,8 +203,25 @@ impl<I: Identifier> Scheduler<I> for ResourceStealingScheduler {
         &self,
         workers: &[WorkerBudgetInfo<I>],
         max_resources: &ResourceMap,
-        _in_pressure_phase: bool,
+        in_pressure_phase: bool,
     ) -> ResourcePressureDecision {
+        // The pressure-phase flag is the manager-side authority on
+        // "the cluster has crossed an OOM-pressure boundary and active
+        // preempt is now warranted". Outside that phase no kill should
+        // fire — opportunistic-victim selection and smallest-active
+        // selection are both pressure-phase concerns. Pre-fix the flag
+        // was unused (underscore-prefixed dead parameter), so the
+        // descending-budget smallest-active branch fired
+        // unconditionally as soon as one worker's actual_usage
+        // overshot `effective_max`, producing the observed 100–400 ms
+        // `NoFaultUnderBudget` kill cadence on secondaries that never
+        // enter a pressure phase. The gate here restores the
+        // architectural intent: the SCHEDULER decides whether the
+        // system is in pressure; outside of pressure, return NoAction
+        // unconditionally.
+        if !in_pressure_phase {
+            return ResourcePressureDecision::NoAction;
+        }
         let max = self.get(max_resources);
         let actual_usage: u64 = workers.iter().map(|w| self.get(&w.actual_usage)).sum();
         let num_workers = workers.len() as u64;

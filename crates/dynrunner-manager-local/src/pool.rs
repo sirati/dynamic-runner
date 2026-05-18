@@ -237,6 +237,18 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         if !old.is_stopped() {
             old.stop().await;
         }
+        // Abort the orphan poll task (if any) BEFORE the slot is
+        // replaced. `stop()` only handles the Idle case; a
+        // Transitioning slot (poll_loop running) leaves the spawned
+        // task detached on handle drop, which can later emit a
+        // buffered `Response::Completed` (or pipe-EOF `Disconnected`)
+        // on the pool's shared event channel for this worker_id. The
+        // secondary's `handle_worker_event` has already cleaned
+        // `active_tasks` for the killed task, so the stale event
+        // surfaces as `task done task_hash=None` and the dispatcher's
+        // accounting silently stalls. See `WorkerHandle::abort_poll_task`
+        // for the full rationale.
+        old.abort_poll_task();
 
         let preserved_type = self.workers[worker_id as usize].loaded_type_id.clone();
         let (transport, pid) = match &preserved_type {
@@ -340,6 +352,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         if !old.is_stopped() {
             old.stop().await;
         }
+        // Abort the orphan poll task before SIGKILL + replace. See
+        // `restart_worker` for the full rationale; same single-concern
+        // boundary applies to every worker-replacement lifecycle path
+        // on the pool.
+        old.abort_poll_task();
         old.kill_subprocess();
 
         let (transport, pid) = factory
@@ -462,6 +479,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         if !old.is_stopped() {
             old.stop().await;
         }
+        // Abort the orphan poll task before SIGKILL + replace. See
+        // `restart_worker` for the full rationale; same single-concern
+        // boundary applies to every worker-replacement lifecycle path
+        // on the pool.
+        old.abort_poll_task();
         // Eagerly SIGKILL the prior subprocess so the type-shift
         // respawn does not race against a still-running worker
         // continuing to load the previous type's worker_module. The
@@ -656,6 +678,363 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
                  SIGTERM within the grace window"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod orphan_poll_task_tests {
+    use super::*;
+    use crate::manager::WorkerFactory;
+    use crate::worker::WorkerEvent;
+    use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, ResourceKind, TaskInfo, WorkerId};
+    use dynrunner_protocol_manager_worker::{Command, Response};
+    use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    struct TestId(String);
+
+    fn make_binary(name: &str) -> TaskInfo<TestId> {
+        TaskInfo {
+            path: std::path::PathBuf::from(name),
+            size: 100,
+            identifier: TestId(name.into()),
+            phase_id: dynrunner_core::PhaseId::from("default"),
+            type_id: dynrunner_core::TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: None,
+            task_depends_on: Vec::new(),
+            preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
+            resolved_path: None,
+        }
+    }
+
+    /// Fake worker that emits exactly one `Response::Done` per
+    /// received `ProcessTask` after an artificial delay, then loops.
+    ///
+    /// The delay (200ms) is the window the test exploits: a
+    /// `restart_worker` call landing during that window must abort
+    /// the orphan poll_task BEFORE the buffered Done lands on the
+    /// pool's event channel. If `abort_poll_task` is not invoked the
+    /// orphan event surfaces and the test fails.
+    fn spawn_delayed_done_worker(
+        spawn_count: Arc<AtomicU32>,
+    ) -> impl FnMut(WorkerId) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+        move |_worker_id| {
+            spawn_count.fetch_add(1, Ordering::SeqCst);
+            let (manager_end, runner_end) = channel_pair();
+            tokio::task::spawn_local(async move {
+                let mut runner: ChannelRunnerEnd = runner_end;
+                let _ = runner.send(Response::Ready).await;
+                loop {
+                    match MessageReceiver::<Command>::recv(&mut runner).await {
+                        Some(Command::Stop) => break,
+                        Some(Command::ProcessTask { .. }) => {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            let _ = runner
+                                .send(Response::Done { result_data: None })
+                                .await;
+                        }
+                        None => break,
+                    }
+                }
+            });
+            Ok((manager_end, None))
+        }
+    }
+
+    struct DelayedDoneFactory {
+        spawn_count: Arc<AtomicU32>,
+    }
+
+    impl WorkerFactory<ChannelManagerEnd> for DelayedDoneFactory {
+        fn spawn_worker(
+            &mut self,
+            worker_id: WorkerId,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            spawn_delayed_done_worker(self.spawn_count.clone())(worker_id)
+        }
+    }
+
+    /// Regression pin: `WorkerPool::restart_worker` MUST abort the
+    /// orphan `poll_task` of the slot it is replacing. Without the
+    /// abort, the spawned poll_loop continues reading from the
+    /// (now-doomed) transport and can land a buffered
+    /// `WorkerEvent::TaskCompleted` on the pool's shared event
+    /// channel after the slot has been cleared — the secondary's
+    /// `handle_worker_event` looks up `active_tasks` (already empty
+    /// for the killed task) and the event surfaces as `task done
+    /// task_hash=None`, exactly the wedge symptom the asm-tokenizer
+    /// 80-task repro produced after the first OOM-last-resort kill.
+    ///
+    /// Setup: assign one task to a worker whose `Response::Done`
+    /// is delayed 200ms. Call `restart_worker` during the delay.
+    /// Drain the event channel for 400ms after restart — if the
+    /// orphan was aborted, NO TaskCompleted from the original
+    /// poll_loop arrives. If `abort_poll_task` is missing, the
+    /// original Done lands AFTER restart and the channel produces
+    /// a stale TaskCompleted that violates the assertion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_worker_aborts_orphan_poll_task() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let mut factory = DelayedDoneFactory {
+                spawn_count: spawn_count.clone(),
+            };
+            let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+            let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+
+            let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+            pool.initialize(1, &max, &scheduler, &mut factory, false, None)
+                .await
+                .expect("pool init");
+
+            // `wait_for_all_ready` (inside `initialize`) drives
+            // `poll_ready` inline and does NOT push Ready to the
+            // event channel; nothing to drain here.
+
+// Assign a task that the worker takes 200ms to complete.
+            let binary = make_binary("delayed");
+            let est = ResourceMap::from([(ResourceKind::memory(), 100)]);
+            pool.workers[0]
+                .assign_task(binary, est, false)
+                .await
+                .expect("assign");
+
+            // Immediately restart the worker — the in-flight poll_loop
+            // is the orphan we expect to be aborted before it can
+            // emit its TaskCompleted event.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            pool.restart_worker(0, &mut factory, false)
+                .await
+                .expect("restart");
+
+            // Window long enough for both (a) the orphan's buffered
+            // Response::Done (200ms post-assign) AND (b) any
+            // post-restart event from the fresh worker (which has
+            // no task assigned).
+            let drained = tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                pool.recv_event(),
+            )
+            .await;
+
+            match drained {
+                Ok(Some(event)) => panic!(
+                    "expected no stale event from the orphan poll_task; \
+                     got {event:?}. abort_poll_task is missing from \
+                     restart_worker."
+                ),
+                Ok(None) => panic!("event channel closed unexpectedly"),
+                Err(_elapsed) => {
+                    // Timeout: nothing arrived in the window. The
+                    // orphan was aborted as required.
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Regression pin: same orphan-abort contract for
+    /// `WorkerPool::ensure_worker_for_type` (sync type-shift
+    /// respawn). The pool's three worker-replacement lifecycle
+    /// paths (`restart_worker`, `ensure_worker_for_type`,
+    /// `ensure_worker_for_type_async`) share the orphan-abort
+    /// concern; pinning all three independently catches a future
+    /// refactor that wires the abort into one but forgets the
+    /// others.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_worker_for_type_aborts_orphan_poll_task() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+            let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+
+            // Factory with `spawn_worker_for_type` overridden to
+            // record the requested TypeId so the sync respawn path
+            // observes a "true type-shift" against the slot's
+            // initial `loaded_type_id = None` and engages the
+            // kill+respawn arm of `ensure_worker_for_type`.
+            struct TypeShiftFactory {
+                spawn_count: Arc<AtomicU32>,
+            }
+
+            impl WorkerFactory<ChannelManagerEnd> for TypeShiftFactory {
+                fn spawn_worker(
+                    &mut self,
+                    worker_id: WorkerId,
+                ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+                    spawn_delayed_done_worker(self.spawn_count.clone())(worker_id)
+                }
+                fn spawn_worker_for_type(
+                    &mut self,
+                    worker_id: WorkerId,
+                    _type_id: &dynrunner_core::TypeId,
+                ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+                    self.spawn_worker(worker_id)
+                }
+            }
+
+            let mut factory = TypeShiftFactory {
+                spawn_count: spawn_count.clone(),
+            };
+
+            let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+            pool.initialize(1, &max, &scheduler, &mut factory, false, None)
+                .await
+                .expect("pool init");
+
+            // `wait_for_all_ready` (inside `initialize`) drives
+            // `poll_ready` inline and does NOT push Ready to the
+            // event channel; nothing to drain here.
+
+// Assign a task so poll_loop is spawned (the orphan
+            // we test the abort against).
+            let binary = make_binary("delayed");
+            let est = ResourceMap::from([(ResourceKind::memory(), 100)]);
+            pool.workers[0]
+                .assign_task(binary, est, false)
+                .await
+                .expect("assign");
+
+            // Trigger the sync type-shift respawn arm. The slot's
+            // `loaded_type_id` is None at this point so the arm
+            // engages (None != Some("shift")).
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let required = dynrunner_core::TypeId::from("shift");
+            pool.ensure_worker_for_type(0, &required, &mut factory, false)
+                .await
+                .expect("ensure_worker_for_type");
+
+            let drained = tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                pool.recv_event(),
+            )
+            .await;
+
+            match drained {
+                Ok(Some(event)) => panic!(
+                    "expected no stale event from the orphan poll_task; \
+                     got {event:?}. abort_poll_task is missing from \
+                     ensure_worker_for_type."
+                ),
+                Ok(None) => panic!("event channel closed unexpectedly"),
+                Err(_elapsed) => {
+                    // Timeout: nothing arrived. Orphan was aborted.
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Regression pin: same orphan-abort contract for
+    /// `WorkerPool::ensure_worker_for_type_async`. The async variant
+    /// emits a Ready event on the channel when the fresh worker
+    /// reaches Ready; the test must therefore distinguish "Ready
+    /// from the fresh worker" (allowed) from "stale TaskCompleted
+    /// from the orphan" (forbidden).
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_worker_for_type_async_aborts_orphan_poll_task() {
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+            let max = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]);
+
+            struct TypeShiftFactory {
+                spawn_count: Arc<AtomicU32>,
+            }
+
+            impl WorkerFactory<ChannelManagerEnd> for TypeShiftFactory {
+                fn spawn_worker(
+                    &mut self,
+                    worker_id: WorkerId,
+                ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+                    spawn_delayed_done_worker(self.spawn_count.clone())(worker_id)
+                }
+                fn spawn_worker_for_type(
+                    &mut self,
+                    worker_id: WorkerId,
+                    _type_id: &dynrunner_core::TypeId,
+                ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+                    self.spawn_worker(worker_id)
+                }
+            }
+
+            let mut factory = TypeShiftFactory {
+                spawn_count: spawn_count.clone(),
+            };
+
+            let mut pool: WorkerPool<ChannelManagerEnd, TestId> = WorkerPool::new();
+            pool.initialize(1, &max, &scheduler, &mut factory, false, None)
+                .await
+                .expect("pool init");
+
+            // `wait_for_all_ready` (inside `initialize`) drives
+            // `poll_ready` inline and does NOT push Ready to the
+            // event channel; nothing to drain here.
+
+let binary = make_binary("delayed");
+            let est = ResourceMap::from([(ResourceKind::memory(), 100)]);
+            pool.workers[0]
+                .assign_task(binary, est, false)
+                .await
+                .expect("assign");
+
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let required = dynrunner_core::TypeId::from("shift");
+            let outcome = pool
+                .ensure_worker_for_type_async(0, &required, &mut factory, false)
+                .await
+                .expect("ensure async");
+            // The async variant kills the slot and returns
+            // RespawnInProgress without waiting for Ready.
+            assert!(matches!(outcome, EnsureWorkerOutcome::RespawnInProgress));
+
+            // Drain events for 400ms — long enough for both the
+            // orphan's buffered TaskCompleted (forbidden) AND the
+            // fresh worker's Ready (allowed). Assert only the
+            // allowed shape lands.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+            let mut saw_orphan = false;
+            while std::time::Instant::now() < deadline {
+                let next = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    pool.recv_event(),
+                )
+                .await;
+                match next {
+                    Ok(Some(WorkerEvent::Ready { .. })) => {
+                        // Fresh worker reached Ready — expected.
+                    }
+                    Ok(Some(other)) => {
+                        // Any other event (TaskCompleted /
+                        // Disconnected / PhaseUpdate / Keepalive)
+                        // arriving with worker_id=0 right after the
+                        // respawn is an orphan event.
+                        saw_orphan = true;
+                        eprintln!("unexpected orphan event: {other:?}");
+                    }
+                    Ok(None) => panic!("event channel closed unexpectedly"),
+                    Err(_) => continue,
+                }
+            }
+            assert!(
+                !saw_orphan,
+                "saw stale event(s) from the orphan poll_task; \
+                 abort_poll_task is missing from ensure_worker_for_type_async."
+            );
+
+            // Avoid an unused-import warning in case the only
+            // ErrorType ref above is conditional.
+            let _ = ErrorType::Recoverable;
+        })
+        .await;
     }
 }
 

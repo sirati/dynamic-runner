@@ -267,7 +267,9 @@ fn check_pressure_no_action_below_threshold() {
     // here so the test exercises ONLY the threshold-driven NoAction
     // branch — the safety-margin behaviour has dedicated tests
     // (`active_kill_fires_at_margin_not_at_cgroup_cap`,
-    // `safety_margin_zero_restores_pre_fix_behavior`).
+    // `safety_margin_zero_restores_pre_fix_behavior`). Runs under
+    // `in_pressure_phase=true` so the in_pressure_phase gate
+    // (pinned separately) doesn't mask the threshold check.
     let s = ResourceStealingScheduler {
         cgroup_safety_margin: 0,
         ..sched()
@@ -283,7 +285,7 @@ fn check_pressure_no_action_below_threshold() {
         estimated_usage: mem(100),
     }];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(10000), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(10000), true);
     assert!(matches!(decision, ResourcePressureDecision::NoAction));
 }
 
@@ -319,7 +321,7 @@ fn check_pressure_kills_opportunistic_first() {
         },
     ];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
         _ => panic!("expected Kill"),
@@ -358,7 +360,7 @@ fn check_pressure_kills_smallest_active_when_no_opportunistic() {
         },
     ];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
         _ => panic!("expected Kill"),
@@ -366,10 +368,10 @@ fn check_pressure_kills_smallest_active_when_no_opportunistic() {
 }
 
 #[test]
-fn check_pressure_still_runs_during_pressure_phase() {
-    // Proxy-byte numbers: explicit zero margin so the test exercises
-    // the documented behaviour (pressure_phase=true does not gate
-    // pressure checks) rather than the margin-saturation path.
+fn check_pressure_kills_during_pressure_phase() {
+    // Pins that pressure_phase=true is the precondition for any kill
+    // branch to fire. With usage 99999 vs cap 100 the kill is obvious;
+    // the assertion is shape-only (Kill vs NoAction).
     let s = ResourceStealingScheduler {
         cgroup_safety_margin: 0,
         ..sched()
@@ -387,6 +389,61 @@ fn check_pressure_still_runs_during_pressure_phase() {
     let decision =
         Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     assert!(matches!(decision, ResourcePressureDecision::Kill { .. }));
+}
+
+#[test]
+fn check_pressure_no_action_outside_pressure_phase_even_when_over_budget() {
+    // Gate test: even when actual_usage massively exceeds effective_max
+    // (the scenario that would otherwise hit the smallest-active kill
+    // branch), `in_pressure_phase=false` short-circuits to NoAction.
+    // This pins the architectural intent that the SCHEDULER decides
+    // whether the system is in pressure; the kill path is reserved
+    // for explicit pressure-phase entry by the manager.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
+    let workers = vec![WorkerBudgetInfo {
+        worker_id: 0,
+        reserved_budgets: mem(500),
+        actual_usage: mem(99999),
+        is_idle: false,
+        is_opportunistic: true,
+        has_initial_assignment: true,
+        current_task: Some(make_binary("a", 10)),
+        estimated_usage: mem(99999),
+    }];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+    assert!(
+        matches!(decision, ResourcePressureDecision::NoAction),
+        "expected NoAction with in_pressure_phase=false regardless of usage, got {decision:?}"
+    );
+}
+
+#[test]
+fn check_pressure_no_action_outside_pressure_phase_with_opportunistic_overshoot() {
+    // Gate test, opportunistic-branch variant: even when the
+    // opportunistic-victim selection would otherwise trigger
+    // (`actual_usage > effective_max − threshold` with a live
+    // opportunistic worker), `in_pressure_phase=false` short-circuits
+    // to NoAction. Pin both branches independently so a future
+    // re-arrangement that only gates one of them is caught.
+    let s = ResourceStealingScheduler {
+        cgroup_safety_margin: 0,
+        ..sched()
+    };
+    let max = 1000u64;
+    let workers = vec![
+        worker_active(0, 500, 400, false),
+        worker_active(1, 500, 400, true),
+    ];
+    let decision =
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(max), false);
+    assert!(
+        matches!(decision, ResourcePressureDecision::NoAction),
+        "expected NoAction with in_pressure_phase=false regardless of opportunistic-victim selection, got {decision:?}"
+    );
 }
 
 #[test]
@@ -442,7 +499,7 @@ fn pressure_kill_fires_before_cgroup_oom() {
     ];
     // Sum of actual_usage = 92.
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 1),
         _ => panic!("expected Kill of opportunistic worker, got {decision:?}"),
@@ -474,7 +531,7 @@ fn active_kill_fires_at_margin_not_at_cgroup_cap() {
         estimated_usage: mem(95),
     }];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, .. } => assert_eq!(worker_id, 7),
         _ => panic!("expected Kill of smallest active worker, got {decision:?}"),
@@ -488,7 +545,10 @@ fn safety_margin_zero_restores_pre_fix_behavior() {
     // kernel-OOM"). Same workers/usage as
     // `active_kill_fires_at_margin_not_at_cgroup_cap` but with the
     // margin disabled must return NoAction. If a future default-zero
-    // mistake re-emerges this test catches it.
+    // mistake re-emerges this test catches it. Runs under
+    // `in_pressure_phase=true` to exercise the safety-margin branch
+    // — the in_pressure_phase gate itself is pinned separately by
+    // `check_pressure_no_action_outside_pressure_phase_*`.
     let s = ResourceStealingScheduler {
         cgroup_safety_margin: 0,
         pressure_threshold: 5,
@@ -505,7 +565,7 @@ fn safety_margin_zero_restores_pre_fix_behavior() {
         estimated_usage: mem(95),
     }];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     assert!(
         matches!(decision, ResourcePressureDecision::NoAction),
         "expected NoAction with margin=0 and usage<cap, got {decision:?}"
@@ -565,7 +625,7 @@ fn kill_reason_no_fault_memory_stealing_when_opportunistic_picked() {
         worker_active(1, 500, 400, true),
     ];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 1);
@@ -602,7 +662,7 @@ fn kill_reason_no_fault_under_budget_when_smallest_active_is_below_reserved() {
         },
     ];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 1);
@@ -644,7 +704,7 @@ fn kill_reason_oom_over_budget_when_smallest_active_is_over_reserved() {
         },
     ];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(1000), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 1);
@@ -673,7 +733,7 @@ fn kill_reason_oom_last_resort_when_single_active_over_budget() {
         estimated_usage: mem(200),
     }];
     let decision =
-        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), false);
+        Scheduler::<TestId>::check_resource_pressure(&s, &workers, &mem(100), true);
     match decision {
         ResourcePressureDecision::Kill { worker_id, reason } => {
             assert_eq!(worker_id, 7);
