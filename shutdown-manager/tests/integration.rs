@@ -41,7 +41,7 @@ fn pid_file_lifecycle_roundtrip() {
     write_pid_file(&pid_path).unwrap();
     assert!(pid_path.exists(), "pid file should exist after write");
     let backend = MockBackend::new();
-    backend.script_unshare(vec![true]);
+    backend.script_remove(vec![true]);
     final_cleanup(&backend, &dir.path().join("tmp-nope"), &pid_path, |_| {});
     assert!(!pid_path.exists(), "pid file must be removed after cleanup");
 }
@@ -173,7 +173,7 @@ fn final_cleanup_runs_after_idle_path() {
 
     let backend = MockBackend::new();
     backend.script_exists(vec![true, false, false]);
-    backend.script_unshare(vec![true]);
+    backend.script_remove(vec![true]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
     let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
@@ -182,8 +182,8 @@ fn final_cleanup_runs_after_idle_path() {
     assert!(!pid_path.exists(), "pid file should be removed");
     let calls = backend.calls();
     assert!(
-        calls.iter().any(|c| c.starts_with("unshare_remove(")),
-        "unshare must run; calls: {:?}",
+        calls.iter().any(|c| c.starts_with("remove_tmp_tree(")),
+        "remove_tmp_tree must run; calls: {:?}",
         calls
     );
 }
@@ -198,7 +198,7 @@ fn final_cleanup_runs_after_signal_path() {
 
     let backend = MockBackend::new();
     backend.script_exists(vec![false]); // gone at entry
-    backend.script_unshare(vec![true]);
+    backend.script_remove(vec![true]);
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
@@ -447,8 +447,8 @@ fn podman_path_flag_threads_into_backend() {
 /// that exists on the filesystem but is NOT `rm` (`/usr/bin/false`);
 /// the manager's bootstrap (parse → log-file open → pid-file write
 /// → signal install → poll-loop entry) must succeed even though the
-/// final `podman unshare <rm_path> <tmp> -rf` call will fail at exec
-/// inside the userns. The proof point: the bootstrap log lines reach
+/// final `<rm_path> <tmp> -rf` call will fail at exec. The proof
+/// point: the bootstrap log lines reach
 /// `--log-file` exactly like the canonical case — confirming the
 /// flag is wired through and that the manager's "podman failures
 /// are best-effort" contract survives a hostile `--rm-path`. If the

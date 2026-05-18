@@ -65,9 +65,9 @@ IDLE_SHUTDOWN:
   podman rm -af
 
 FINAL_CLEANUP (both paths):
-  # Single `rm -rf` gated by validate_safe_tmp_path. NO host-side fallback.
+  # Single host `rm -rf` gated by validate_safe_tmp_path. NO fallback.
   validate_safe_tmp_path(<tmp_prefix>)    # canonicalize + checks (see below)
-  podman unshare <rm> <canonical_path> -rf
+  <rm> <canonical_path> -rf
   unlink <pid_file>                       # missing is OK
 ```
 
@@ -168,7 +168,7 @@ hand-rolled.
 - Signal shutdown via both `pgrep -P 1 -o → Some` and `→ None` paths.
 - Belt-and-suspenders `podman kill` always fires after the in-container kill.
 - Graceful exit within grace skips `podman stop`; surviving the grace triggers it.
-- `final_cleanup` runs on both paths, prefers `podman unshare`, falls back to host rm.
+- `final_cleanup` runs on both paths via host `rm -rf` gated by `validate_safe_tmp_path`.
 - Config parsing rejects missing required flags, unknown flags, zero/non-numeric values.
 
 Tests use the in-process `testing::MockBackend` and `testing::FakeClock`;

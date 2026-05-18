@@ -1,24 +1,27 @@
 //! Single concern: filesystem cleanup at the end of the shutdown
 //! sequence — `/tmp/asm-XXX` directory and the PID file.
 //!
-//! The `/tmp` removal is non-trivial: rootless podman places its
-//! layer/storage directories under `<tmp_prefix>/storage` with
-//! subuid-owned files that the host UID cannot unlink directly. The
-//! correct primitive is `podman unshare <rm> <validated-abs-path>
-//! -rf`, which re-enters the user namespace where those subuids are
-//! local; the path argument is canonicalized AND validated by
+//! The tmp-prefix is removed via host `<rm> <validated-abs-path>
+//! -rf`. The path is canonicalized AND validated by
 //! [`crate::podman::validate_safe_tmp_path`] before any exec runs
 //! (strictly under `/tmp/`, no `/home/`, character whitelist, no
-//! symlink escape).
+//! symlink escape). Validation is the safety; no `podman unshare`
+//! wrapping is involved.
 //!
-//! No host-side fallback exists. The previous fallback could only
-//! succeed for the no-subuid case (i.e. when the container never
-//! started, so nothing needed unshare anyway); for the real failure
-//! mode (subuid-owned overlay storage) it always EACCES'd. More
-//! importantly, a recursive-remove on the host UID can never be
-//! safer than a validated-path `rm -rf` inside the userns. If the
-//! podman unshare fails the manager logs the captured stderr and
-//! leaves the tree on disk for an operator to inspect — losing
+//! The previous `podman unshare`-wrapped invocation failed with
+//! `EBUSY` on `<prefix>/storage/overlay` because the unshare's
+//! storage driver (initialized via `--root=<prefix>/storage`) held
+//! an internal lock on its own root dir — a podman-internal busy
+//! state, not a kernel mount. Empirically (asm-tokenizer
+//! 2026-05-18 12:20): `findmnt` shows zero kernel mounts under
+//! the cleanup target; `ls -la` shows only kruppb-owned regular
+//! dirs that the rootless-podman storage driver pre-creates as
+//! metadata. Host rm clears the tree instantly. The argv-shape
+//! validation gate is what protects against catastrophic path
+//! bugs, not the absent unshare wrapping.
+//!
+//! On rm failure the manager logs the captured stderr and leaves
+//! the tree on disk for operator inspection. No fallback — losing
 //! `/tmp/asm-*` debris is strictly less bad than a recursive
 //! removal whose target the validation could not vet.
 
@@ -43,14 +46,11 @@ pub fn final_cleanup<B: PodmanBackend, L: FnMut(&str)>(
     remove_pid_file(pid_file, &mut log);
 }
 
-/// `podman unshare <rm> <validated-abs-path> -rf`. On failure the
-/// captured stderr (including argv and exit status) is logged and
-/// the tree is left on disk for operator inspection. Intentionally
-/// NO host-side fallback — the only path that gets touched is the
-/// one [`crate::podman::validate_safe_tmp_path`] approved, and a
-/// host-UID recursive remove cannot improve on the userns-aware
-/// invocation (host UID can't see subuid-owned overlay storage
-/// anyway).
+/// Host `<rm> <validated-abs-path> -rf`. On failure the captured
+/// stderr (including argv and exit status) is logged and the tree
+/// is left on disk for operator inspection. Intentionally NO
+/// fallback — the only path that gets touched is the one
+/// [`crate::podman::validate_safe_tmp_path`] approved.
 fn remove_tmp_prefix<B: PodmanBackend, L: FnMut(&str)>(
     backend: &B,
     tmp_prefix: &Path,
@@ -65,13 +65,13 @@ fn remove_tmp_prefix<B: PodmanBackend, L: FnMut(&str)>(
         }
         true => {
             log(&format!(
-                "removing tmp-prefix via podman unshare: {}",
+                "removing tmp-prefix: {}",
                 tmp_prefix.display()
             ));
-            match backend.unshare_remove(tmp_prefix) {
-                Ok(()) => log("tmp-prefix removed via unshare"),
+            match backend.remove_tmp_tree(tmp_prefix) {
+                Ok(()) => log("tmp-prefix removed"),
                 Err(stderr) => log(&format!(
-                    "podman unshare rm failed; tmp-prefix left on disk for operator inspection. stderr: {}",
+                    "rm failed; tmp-prefix left on disk for operator inspection. stderr: {}",
                     stderr
                 )),
             }
@@ -108,14 +108,14 @@ mod tests {
     use std::cell::RefCell;
 
     struct FakeBackend {
-        unshare_result: Result<(), String>,
+        remove_result: Result<(), String>,
         calls: RefCell<Vec<String>>,
     }
 
     impl FakeBackend {
-        fn new(unshare_ok: bool) -> Self {
+        fn new(remove_ok: bool) -> Self {
             Self {
-                unshare_result: match unshare_ok {
+                remove_result: match remove_ok {
                     true => Ok(()),
                     false => Err("mock-failure".to_string()),
                 },
@@ -125,7 +125,7 @@ mod tests {
 
         fn with_stderr(stderr: &str) -> Self {
             Self {
-                unshare_result: Err(stderr.to_string()),
+                remove_result: Err(stderr.to_string()),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -150,11 +150,11 @@ mod tests {
         fn rm_all(&self) -> bool {
             unreachable!()
         }
-        fn unshare_remove(&self, p: &Path) -> Result<(), String> {
+        fn remove_tmp_tree(&self, p: &Path) -> Result<(), String> {
             self.calls
                 .borrow_mut()
-                .push(format!("unshare_remove({})", p.display()));
-            self.unshare_result.clone()
+                .push(format!("remove_tmp_tree({})", p.display()));
+            self.remove_result.clone()
         }
     }
 
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn tmp_prefix_present_invokes_unshare() {
+    fn tmp_prefix_present_invokes_remove() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("asm-xxx");
         fs::create_dir(&tmp).unwrap();
@@ -216,23 +216,23 @@ mod tests {
         assert_eq!(
             backend.calls.borrow().len(),
             1,
-            "expected one unshare call, got {:?}",
+            "expected one remove_tmp_tree call, got {:?}",
             backend.calls.borrow()
         );
         assert!(
-            backend.calls.borrow()[0].contains("unshare_remove"),
+            backend.calls.borrow()[0].contains("remove_tmp_tree"),
             "calls: {:?}",
             backend.calls.borrow()
         );
         assert!(
-            logs.iter().any(|l| l.contains("removed via unshare")),
+            logs.iter().any(|l| l.contains("tmp-prefix removed")),
             "logs: {:?}",
             logs
         );
     }
 
     #[test]
-    fn unshare_failure_logs_stderr_in_message() {
+    fn remove_failure_logs_stderr_in_message() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("asm-xxx");
         fs::create_dir(&tmp).unwrap();
@@ -247,18 +247,18 @@ mod tests {
         );
     }
 
-    /// On `unshare_remove` failure the tree is intentionally left
+    /// On `remove_tmp_tree` failure the tree is intentionally left
     /// on disk — no host-side fallback. The log line captures the
     /// stderr AND states that the tree was left in place, so the
     /// operator knows where to look.
     #[test]
-    fn unshare_failure_leaves_tree_in_place() {
+    fn remove_failure_leaves_tree_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let tmp = dir.path().join("asm-xxx");
         fs::create_dir(&tmp).unwrap();
         let inner = tmp.join("file");
         fs::write(&inner, b"x").unwrap();
-        let backend = FakeBackend::new(false); // unshare returns Err
+        let backend = FakeBackend::new(false); // remove_tmp_tree returns Err
         let mut logs: Vec<String> = Vec::new();
         remove_tmp_prefix(&backend, &tmp, &mut |m| logs.push(m.to_string()));
         // Tree must STILL be on disk: the load-bearing safety
@@ -267,7 +267,7 @@ mod tests {
         // invocation; leaving debris is strictly safer.
         assert!(
             tmp.exists(),
-            "tmp-prefix must remain on disk when unshare fails; no host fallback"
+            "tmp-prefix must remain on disk when rm fails; no fallback"
         );
         assert!(
             inner.exists(),

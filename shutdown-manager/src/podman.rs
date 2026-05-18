@@ -9,11 +9,13 @@
 //! Errors are intentionally collapsed to `bool` at the trait surface
 //! for the *signalling* methods (`kill_pid1`, `stop`, `rm_all`, ...):
 //! every caller in this binary treats those failures as "best effort,
-//! move on". The exception is [`PodmanBackend::unshare_remove`], whose
+//! move on". The exception is [`PodmanBackend::remove_tmp_tree`], whose
 //! caller (`cleanup::remove_tmp_prefix`) needs the captured stderr in
 //! the manager's log to diagnose why `/tmp/asm-*` cleanup fails — it
 //! therefore returns `Result<(), String>` with stderr/argv/exit packed
-//! into the error string.
+//! into the error string. Despite living on the same trait,
+//! `remove_tmp_tree` is a host-side `rm -rf` and does NOT shell out
+//! through podman at all (see its method doc for the why).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -48,13 +50,28 @@ pub trait PodmanBackend {
     /// root, releasing layer references. Idempotent.
     fn rm_all(&self) -> bool;
 
-    /// `podman unshare <rm-path> <abs-path> -rf` — drop into the
-    /// user-namespace where the storage subuids are owned and remove
-    /// a directory tree. Required because subuid-owned files under
-    /// `<tmp>/storage` are not unlinkable by the host UID alone.
+    /// `<rm-path> <abs-path> -rf` — host-side recursive remove of
+    /// the tmp tree. Despite the surrounding podman primitives,
+    /// this one does NOT use `podman unshare`: the cleanup target
+    /// is a host-UID-owned tree (rootless podman never writes
+    /// subuid-owned content under the SLURM-TIMEOUT shape the
+    /// shutdown manager handles — empirically confirmed by peer
+    /// asm-tokenizer 2026-05-18 12:20 with `findmnt` showing zero
+    /// kernel mounts and `ls -la` showing only the kruppb-owned
+    /// regular dirs the storage driver pre-creates as metadata).
+    ///
+    /// The previous `podman --root=X unshare rm X -rf` shape
+    /// failed with `EBUSY: Device or resource busy` on `X/storage/
+    /// overlay` because the unshare's storage driver (initialized
+    /// via `--root=X`) holds an internal lock on its own root
+    /// directory — a podman-internal busy state, not a kernel
+    /// mount. Dropping the unshare drops the lock; host rm
+    /// proceeds and the tree clears.
     ///
     /// HARD SAFETY CONTRACT (enforced by [`validate_safe_tmp_path`]
-    /// inside [`RealPodman::unshare_remove`], invoked before exec):
+    /// inside [`RealPodman::remove_tmp_tree`], invoked before exec).
+    /// The argv-shape validation is what protects against
+    /// catastrophic path bugs, not the absent unshare wrapping:
     ///
     ///   - path canonicalizes (symlinks resolved, `..` collapsed) —
     ///     also proves the path exists;
@@ -75,11 +92,10 @@ pub trait PodmanBackend {
     /// dynamically.
     ///
     /// On failure returns `Err(stderr)` where the string carries the
-    /// captured stderr plus the argv and exit status — this is the
-    /// only podman call whose failure we actively diagnose, since
-    /// `/tmp/asm-*` directories silently piling up on workers is a
-    /// real recurring symptom and the next repro must tell us why.
-    fn unshare_remove(&self, path: &Path) -> Result<(), String>;
+    /// captured stderr plus the argv and exit status — `/tmp/asm-*`
+    /// directories silently piling up on workers is a real recurring
+    /// symptom and the next repro must tell us why.
+    fn remove_tmp_tree(&self, path: &Path) -> Result<(), String>;
 }
 
 /// Production backend. Holds the podman binary path, the `rm`
@@ -88,18 +104,23 @@ pub trait PodmanBackend {
 ///
 /// Both binary paths are resolved ONCE upstream — by the wrapper
 /// script's `command -v podman` / `command -v rm` at render time —
-/// and stored here as absolute `PathBuf`s. Every podman/rm
-/// invocation reuses the stored absolute path verbatim; there is
-/// no exec-time PATH lookup ever, because the absolute path
-/// travels straight through to `execve(2)`. This design exists
-/// because the manager runs under a systemd-user-service unit
-/// whose PATH does NOT inherit the wrapper's shell PATH — on
-/// NixOS workers `podman` and `rm` live under
-/// `/run/current-system/sw/bin/`, which is not on the default
-/// user-systemd PATH, and any path-lookup inside the manager
-/// (or inside the podman-unshare userns) would ENOENT
-/// (asm-tokenizer 2026-05-18 at 17481c4 for rm; earlier for
-/// podman).
+/// and stored here as absolute `PathBuf`s. Every invocation reuses
+/// the stored absolute path verbatim; there is no exec-time PATH
+/// lookup ever, because the absolute path travels straight through
+/// to `execve(2)`. This design exists because the manager runs
+/// under a systemd-user-service unit whose PATH does NOT inherit
+/// the wrapper's shell PATH — on NixOS workers `podman` and `rm`
+/// live under `/run/current-system/sw/bin/`, which is not on the
+/// default user-systemd PATH; any path-lookup inside the manager
+/// would ENOENT (asm-tokenizer 2026-05-18 at 17481c4 for rm;
+/// earlier for podman).
+///
+/// `rm_path` is invoked DIRECTLY (`Command::new(&self.rm_path)`),
+/// not through `podman unshare`. The unshare-wrapped invocation
+/// failed with `EBUSY` because the unshare's storage driver
+/// (initialized via `--root=<prefix>/storage`) holds an internal
+/// lock on its own root directory. See [`PodmanBackend::remove_tmp_tree`]
+/// doc for the full evidence trail.
 #[derive(Debug, Clone)]
 pub struct RealPodman {
     podman_path: PathBuf,
@@ -227,14 +248,14 @@ impl PodmanBackend for RealPodman {
         Self::run_silent(c)
     }
 
-    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
+    fn remove_tmp_tree(&self, path: &Path) -> Result<(), String> {
         // Validation is BEFORE any exec — if the path is malformed,
         // off-prefix, or contains forbidden characters, no rm runs.
         // The validated canonical form is what we hand to rm: any
         // symlink chain in the input has been collapsed, so the
         // recursion target is the actual on-disk tree.
         let canonical = validate_safe_tmp_path(path)?;
-        let mut c = self.cmd();
+        // Direct host `rm`, NOT routed through `podman unshare`.
         // `self.rm_path` is the absolute path resolved once by the
         // wrapper at startup (see RealPodman doc). Reused verbatim
         // every call — no exec-time PATH lookup.
@@ -244,15 +265,13 @@ impl PodmanBackend for RealPodman {
         // leaves `rm -rf` with no operand (safe failure) rather than
         // letting `-rf` survive into a position that could attach to
         // a different operand if argv composition ever changes.
-        c.arg("unshare")
-            .arg(&self.rm_path)
-            .arg(&canonical)
-            .arg("-rf");
+        let mut c = Command::new(&self.rm_path);
+        c.arg(&canonical).arg("-rf");
         Self::run_capture_stderr(c)
     }
 }
 
-/// Pre-flight safety gate for [`PodmanBackend::unshare_remove`]. On
+/// Pre-flight safety gate for [`PodmanBackend::remove_tmp_tree`]. On
 /// success returns the canonical (symlink-resolved, `..`-collapsed)
 /// path that the caller hands to `rm -rf`; on failure returns a
 /// diagnostic suitable for the operator log.
