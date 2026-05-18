@@ -9,20 +9,11 @@
 //! Errors are intentionally collapsed to `bool` at the trait surface
 //! for the *signalling* methods (`kill_pid1`, `stop`, `rm_all`, ...):
 //! every caller in this binary treats those failures as "best effort,
-//! move on". The cleanup-walk primitives — `unshare_find_files`,
-//! `unshare_find_dirs`, `unshare_unlink`, `unshare_rmdir` — are the
-//! exception and return `Result<_, String>` with captured stderr so
-//! `cleanup::remove_tmp_prefix` can log the specific failure for each
-//! entry without aborting the whole walk.
-//!
-//! The walk-primitives DELIBERATELY do not expose any recursive flag
-//! (no `-r`, no `-rf`, no `-depth -delete`). Recursion is owned by
-//! `cleanup` — listing first, removing one entry per call — so a
-//! caller-side bug in the path computation can never cascade into a
-//! `rm -rf` of an unintended subtree. There is no host-side fallback;
-//! if `podman unshare` cannot enter the userns the cleanup logs the
-//! failure and exits leaving the tree in place for an operator to
-//! diagnose.
+//! move on". The exception is [`PodmanBackend::unshare_remove`], whose
+//! caller (`cleanup::remove_tmp_prefix`) needs the captured stderr in
+//! the manager's log to diagnose why `/tmp/asm-*` cleanup fails — it
+//! therefore returns `Result<(), String>` with stderr/argv/exit packed
+//! into the error string.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -57,75 +48,62 @@ pub trait PodmanBackend {
     /// root, releasing layer references. Idempotent.
     fn rm_all(&self) -> bool;
 
-    /// `podman unshare <find-path> <root> -mindepth 1 -type f
-    /// -print0` — list every FILE under `root` (one entry per
-    /// returned `PathBuf`). The cleanup walk's stage-1 plans
-    /// per-file unlink from this list.
+    /// `podman unshare <rm-path> <abs-path> -rf` — drop into the
+    /// user-namespace where the storage subuids are owned and remove
+    /// a directory tree. Required because subuid-owned files under
+    /// `<tmp>/storage` are not unlinkable by the host UID alone.
     ///
-    /// `-mindepth 1` excludes `root` itself (which is a directory and
-    /// belongs to the stage-3 dir list). `-print0` emits NUL-separated
-    /// output so paths containing newlines (rare under `/tmp/asm-*`
-    /// but possible) parse unambiguously.
+    /// HARD SAFETY CONTRACT (enforced by [`validate_safe_tmp_path`]
+    /// inside [`RealPodman::unshare_remove`], invoked before exec):
     ///
-    /// On non-zero exit returns `Err(diag)` where `diag` packs the
-    /// argv, exit status, and captured stderr — the cleanup-walk
-    /// caller logs this and aborts cleanup (rather than fall back
-    /// to a recursive host-side `remove_dir_all`, which would
-    /// defeat the entire single-entry-per-op design).
-    fn unshare_find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String>;
-
-    /// `podman unshare <find-path> <root> -depth -type d -print0` —
-    /// list every DIRECTORY under `root` (INCLUDING `root` itself),
-    /// leaf-first.
+    ///   - path canonicalizes (symlinks resolved, `..` collapsed) —
+    ///     also proves the path exists;
+    ///   - canonical path is absolute;
+    ///   - canonical path is strictly under `/tmp/` (and not `/tmp/`
+    ///     itself) — a symlink whose target leaves `/tmp/` is
+    ///     rejected by this check after canonicalize;
+    ///   - canonical path does NOT traverse `/home/`;
+    ///   - canonical path matches a strict character whitelist
+    ///     `[a-zA-Z0-9./_-]` — rejects `*`, `'`, shell metas, NUL,
+    ///     whitespace.
     ///
-    /// `-depth` is load-bearing: rmdir requires emptiness, so the
-    /// walk's stage-4 must process children before their parents.
-    /// `-print0` for the same NUL-safety reason as `unshare_find_files`.
+    /// Argv is `rm <abs-path> -rf` (path BEFORE flags). Reason: if
+    /// any future arg-construction bug drops the path slot, `rm -rf`
+    /// alone has no operand and is a safe no-op exit-error; the
+    /// reversed shape `rm -rf <abs-path>` would let a dropped path
+    /// expose `-rf` to a subsequent arg if argv ever gets composed
+    /// dynamically.
     ///
-    /// `Err` on non-zero exit, same diagnostic shape as
-    /// `unshare_find_files`.
-    fn unshare_find_dirs(&self, root: &Path) -> Result<Vec<PathBuf>, String>;
-
-    /// `podman unshare <rm-path> -- <file>` — unlink ONE file. No
-    /// `-r`, no `-f`. Single-entry.
-    ///
-    /// `Err(stderr-diag)` on non-zero exit. The walk continues past
-    /// per-file failures (so a single stuck inode doesn't block the
-    /// rest of the prefix from being torn down); the per-file
-    /// diagnostic is logged.
-    fn unshare_unlink(&self, file: &Path) -> Result<(), String>;
-
-    /// `podman unshare <rmdir-path> -- <dir>` — remove ONE empty
-    /// directory. Single-entry.
-    ///
-    /// `Err` typically signals `ENOTEMPTY`/`EBUSY` (the walk's
-    /// planner left children, or another process re-populated the
-    /// dir between list-time and rmdir-time). The walk continues
-    /// past per-dir failures with the failure count summarised at
-    /// end-of-walk.
-    fn unshare_rmdir(&self, dir: &Path) -> Result<(), String>;
+    /// On failure returns `Err(stderr)` where the string carries the
+    /// captured stderr plus the argv and exit status — this is the
+    /// only podman call whose failure we actively diagnose, since
+    /// `/tmp/asm-*` directories silently piling up on workers is a
+    /// real recurring symptom and the next repro must tell us why.
+    fn unshare_remove(&self, path: &Path) -> Result<(), String>;
 }
 
-/// Production backend. Holds the podman binary path AND the
-/// storage/runroot prefix so callers do not have to know about
-/// either.
+/// Production backend. Holds the podman binary path, the `rm`
+/// binary path, AND the storage/runroot prefix so callers do not
+/// have to know about any of them.
 ///
-/// `podman_path` is an explicit input (not a hard-coded `"podman"`)
-/// because the manager runs inside a systemd-user-service unit whose
-/// `PATH` does NOT inherit the parent shell's PATH — on NixOS workers
-/// `podman` lives at `/run/current-system/sw/bin/podman`, which is
-/// not on the default user-systemd PATH and would ENOENT under
-/// `Command::new("podman").spawn()`. `rm_path`, `rmdir_path`, and
-/// `find_path` follow the same convention — the wrapper resolves
-/// `command -v rm|rmdir|find` once at render time so the per-entry
-/// cleanup primitives have absolute paths to invoke under `podman
-/// unshare`.
+/// Both binary paths are resolved ONCE upstream — by the wrapper
+/// script's `command -v podman` / `command -v rm` at render time —
+/// and stored here as absolute `PathBuf`s. Every podman/rm
+/// invocation reuses the stored absolute path verbatim; there is
+/// no exec-time PATH lookup ever, because the absolute path
+/// travels straight through to `execve(2)`. This design exists
+/// because the manager runs under a systemd-user-service unit
+/// whose PATH does NOT inherit the wrapper's shell PATH — on
+/// NixOS workers `podman` and `rm` live under
+/// `/run/current-system/sw/bin/`, which is not on the default
+/// user-systemd PATH, and any path-lookup inside the manager
+/// (or inside the podman-unshare userns) would ENOENT
+/// (asm-tokenizer 2026-05-18 at 17481c4 for rm; earlier for
+/// podman).
 #[derive(Debug, Clone)]
 pub struct RealPodman {
     podman_path: PathBuf,
     rm_path: PathBuf,
-    rmdir_path: PathBuf,
-    find_path: PathBuf,
     storage_root: PathBuf,
     runroot: PathBuf,
 }
@@ -134,16 +112,12 @@ impl RealPodman {
     pub fn new(
         podman_path: PathBuf,
         rm_path: PathBuf,
-        rmdir_path: PathBuf,
-        find_path: PathBuf,
         storage_root: PathBuf,
         runroot: PathBuf,
     ) -> Self {
         Self {
             podman_path,
             rm_path,
-            rmdir_path,
-            find_path,
             storage_root,
             runroot,
         }
@@ -193,44 +167,6 @@ impl RealPodman {
             Err(e) => Err(format!("argv: {}; spawn-error: {}", argv, e)),
         }
     }
-
-    /// Run a command capturing stdout AND stderr. `Ok(stdout-bytes)`
-    /// on exit-0; `Err(stderr-diag)` otherwise. Used by the
-    /// `unshare_find_*` primitives, which need the NUL-separated
-    /// stdout payload while still surfacing exit-code+stderr on
-    /// failure.
-    fn run_capture_stdout(mut cmd: Command) -> Result<Vec<u8>, String> {
-        cmd.stdin(Stdio::null());
-        let argv = format!("{:?}", cmd);
-        match cmd.output() {
-            Ok(out) => match out.status.success() {
-                true => Ok(out.stdout),
-                false => Err(format!(
-                    "argv: {}; exit={}; stderr: {}",
-                    argv,
-                    out.status,
-                    String::from_utf8_lossy(&out.stderr).trim_end()
-                )),
-            },
-            Err(e) => Err(format!("argv: {}; spawn-error: {}", argv, e)),
-        }
-    }
-}
-
-/// Parse a `-print0` payload (NUL-separated paths, trailing NUL
-/// included for non-empty output) into a `Vec<PathBuf>`. Empty
-/// elements (between adjacent NULs, or the trailing-NUL terminator)
-/// are filtered. UTF-8 decoded best-effort via `String::from_utf8_lossy`
-/// — paths under `/tmp/asm-*` are ASCII-safe by construction (random
-/// suffix + container-runtime-generated subdirs); a stray non-UTF-8
-/// byte would corrupt that one path to `U+FFFD` rather than failing
-/// the walk.
-fn split_print0(bytes: &[u8]) -> Vec<PathBuf> {
-    bytes
-        .split(|&b| b == 0)
-        .filter(|slice| !slice.is_empty())
-        .map(|slice| PathBuf::from(String::from_utf8_lossy(slice).into_owned()))
-        .collect()
 }
 
 impl PodmanBackend for RealPodman {
@@ -291,98 +227,287 @@ impl PodmanBackend for RealPodman {
         Self::run_silent(c)
     }
 
-    fn unshare_find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
+        // Validation is BEFORE any exec — if the path is malformed,
+        // off-prefix, or contains forbidden characters, no rm runs.
+        // The validated canonical form is what we hand to rm: any
+        // symlink chain in the input has been collapsed, so the
+        // recursion target is the actual on-disk tree.
+        let canonical = validate_safe_tmp_path(path)?;
         let mut c = self.cmd();
+        // `self.rm_path` is the absolute path resolved once by the
+        // wrapper at startup (see RealPodman doc). Reused verbatim
+        // every call — no exec-time PATH lookup.
+        //
+        // Argv shape: `<rm-path> <canonical> -rf`. Path BEFORE flags
+        // per the trait-doc safety contract: a dropped path slot
+        // leaves `rm -rf` with no operand (safe failure) rather than
+        // letting `-rf` survive into a position that could attach to
+        // a different operand if argv composition ever changes.
         c.arg("unshare")
-            .arg(&self.find_path)
-            .arg(root)
-            .arg("-mindepth")
-            .arg("1")
-            .arg("-type")
-            .arg("f")
-            .arg("-print0");
-        Self::run_capture_stdout(c).map(|bytes| split_print0(&bytes))
-    }
-
-    fn unshare_find_dirs(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
-        let mut c = self.cmd();
-        c.arg("unshare")
-            .arg(&self.find_path)
-            .arg(root)
-            .arg("-depth")
-            .arg("-type")
-            .arg("d")
-            .arg("-print0");
-        Self::run_capture_stdout(c).map(|bytes| split_print0(&bytes))
-    }
-
-    fn unshare_unlink(&self, file: &Path) -> Result<(), String> {
-        let mut c = self.cmd();
-        c.arg("unshare").arg(&self.rm_path).arg("--").arg(file);
+            .arg(&self.rm_path)
+            .arg(&canonical)
+            .arg("-rf");
         Self::run_capture_stderr(c)
     }
+}
 
-    fn unshare_rmdir(&self, dir: &Path) -> Result<(), String> {
-        let mut c = self.cmd();
-        c.arg("unshare").arg(&self.rmdir_path).arg("--").arg(dir);
-        Self::run_capture_stderr(c)
+/// Pre-flight safety gate for [`PodmanBackend::unshare_remove`]. On
+/// success returns the canonical (symlink-resolved, `..`-collapsed)
+/// path that the caller hands to `rm -rf`; on failure returns a
+/// diagnostic suitable for the operator log.
+///
+/// Six checks, listed in order of execution; each one fails closed:
+///
+///   1. **canonicalize** — resolves all symlinks in the input path
+///      and collapses `..` segments. Also requires the path to
+///      exist (returns `ENOENT` otherwise) — there is no value in
+///      `rm -rf`-ing a nonexistent path, so we let canonicalize be
+///      the existence probe at the same time.
+///   2. **absolute** — canonicalize is documented to return absolute
+///      paths on Unix, but we re-assert as a defense against the
+///      contract changing or unusual mount setups.
+///   3. **UTF-8** — `/tmp/asm-*` is ASCII by construction (the
+///      wrapper generates hex-suffix names). A non-UTF-8 canonical
+///      path indicates the input was constructed wrongly; refuse.
+///   4. **strictly under `/tmp/`** — canonical path starts with
+///      `/tmp/` AND is longer than `/tmp/` itself. A symlink whose
+///      target leaves `/tmp/` fails here because canonicalize
+///      already followed it: the symlink might live under `/tmp/`
+///      but the canonical resolved path is what we check.
+///   5. **no `/home/` substring** — defense against a canonical
+///      path that traverses a user home dir (e.g. a `/tmp/asm-*`
+///      that ended up resolving to `/home/user/tmp/asm-*` via a
+///      mount or symlink quirk we missed). Cheap; fail closed.
+///   6. **character whitelist** — `[a-zA-Z0-9./_-]` is the full set
+///      of characters that appear in a well-formed
+///      `/tmp/asm-{8hex}/<podman-overlay-tree>` path. Anything else
+///      (`*`, `'`, `"`, `` ` ``, `$`, `;`, `&`, `|`, `<`, `>`, `\n`,
+///      `\0`, whitespace, etc.) is rejected. The check is on the
+///      canonical path (post-resolution), so it catches a symlink
+///      whose target contains shell metas as well.
+fn validate_safe_tmp_path(input: &Path) -> Result<PathBuf, String> {
+    // Canonicalize FIRST — every subsequent check operates on the
+    // resolved on-disk identity, not the user-supplied string. This
+    // is the load-bearing safety step: a symlink under /tmp/ whose
+    // target leaves /tmp/ resolves here and fails the /tmp/ prefix
+    // check below; a `..`-laced input collapses; a non-existent
+    // input fails at this step (canonicalize errors on ENOENT,
+    // which we treat as "nothing to remove anyway, refuse").
+    let canonical = input.canonicalize().map_err(|e| {
+        format!(
+            "validate_safe_tmp_path: canonicalize {} failed: {}",
+            input.display(),
+            e
+        )
+    })?;
+
+    // canonicalize returns absolute on Unix; re-assert as a defense
+    // against the contract changing or an unusual mount setup.
+    if !canonical.is_absolute() {
+        return Err(format!(
+            "validate_safe_tmp_path: canonical path not absolute: {}",
+            canonical.display()
+        ));
     }
+
+    // /tmp/asm-* paths are ASCII by construction; non-UTF-8 here
+    // means the input was malformed.
+    let s = canonical.to_str().ok_or_else(|| {
+        format!(
+            "validate_safe_tmp_path: canonical path not UTF-8: {:?}",
+            canonical
+        )
+    })?;
+
+    // Strictly under /tmp/ — refuses bare `/tmp/` itself so we can
+    // never rm -rf the whole tmpfs.
+    if !s.starts_with("/tmp/") || s.len() <= "/tmp/".len() {
+        return Err(format!(
+            "validate_safe_tmp_path: path not strictly under /tmp/: {}",
+            s
+        ));
+    }
+
+    // /home/ substring check — defense against canonical paths that
+    // somehow traverse a user home directory via a mount or symlink
+    // quirk we missed.
+    if s.contains("/home/") {
+        return Err(format!(
+            "validate_safe_tmp_path: path traverses /home/: {}",
+            s
+        ));
+    }
+
+    // Character whitelist on the canonical (post-resolution) path —
+    // catches `*`, `'`, `"`, `` ` ``, `$`, `;`, `&`, `|`, `<`, `>`,
+    // `\n`, `\0`, whitespace, etc. The `/tmp/asm-{8hex}/<podman
+    // overlay tree>` shape only ever produces `[a-zA-Z0-9./_-]`.
+    if let Some(bad) = s
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(*c, '/' | '.' | '-' | '_')))
+    {
+        return Err(format!(
+            "validate_safe_tmp_path: path contains non-whitelisted char {:?}: {}",
+            bad, s
+        ));
+    }
+
+    Ok(canonical)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
-    /// Smoke: builder records every CLI-path field on the struct (we
-    /// can't easily inspect a `Command` post-hoc without spawning, so
-    /// this is more a constructor sanity-check than a behaviour test
-    /// — behaviour is exercised via the mock in `tests/common`).
+    /// Smoke: builder records podman_path/rm_path/storage/runroot
+    /// in the command vector (we can't easily inspect a `Command`
+    /// post-hoc without spawning, so this is more a constructor
+    /// sanity-check than a behaviour test — behaviour is exercised
+    /// via the mock in `tests/common`).
     #[test]
     fn real_backend_constructs() {
         let b = RealPodman::new(
             PathBuf::from("/nix/store/x/bin/podman"),
-            PathBuf::from("/nix/store/x/bin/rm"),
-            PathBuf::from("/nix/store/x/bin/rmdir"),
-            PathBuf::from("/nix/store/x/bin/find"),
+            PathBuf::from("/nix/store/y/bin/rm"),
             PathBuf::from("/r"),
             PathBuf::from("/rr"),
         );
         assert_eq!(b.podman_path, Path::new("/nix/store/x/bin/podman"));
-        assert_eq!(b.rm_path, Path::new("/nix/store/x/bin/rm"));
-        assert_eq!(b.rmdir_path, Path::new("/nix/store/x/bin/rmdir"));
-        assert_eq!(b.find_path, Path::new("/nix/store/x/bin/find"));
+        assert_eq!(b.rm_path, Path::new("/nix/store/y/bin/rm"));
         assert_eq!(b.storage_root, Path::new("/r"));
         assert_eq!(b.runroot, Path::new("/rr"));
     }
 
-    /// `split_print0` consumes the canonical `find -print0` payload
-    /// shape: each entry terminated by NUL, including the final entry.
-    /// Empty slices between adjacent NULs (or after the trailing NUL)
-    /// must be filtered — `find -print0` never emits an empty path
-    /// itself, but the trailing NUL produces an empty trailing slice
-    /// from `split`.
+    /// Positive path: a real tempdir created under `/tmp/`
+    /// canonicalizes to a path that satisfies every check. Returns
+    /// Ok(canonical) and the canonical path is what we'd hand to
+    /// `rm -rf`.
     #[test]
-    fn split_print0_parses_canonical_payload() {
-        let payload = b"/tmp/asm-XXX/a\0/tmp/asm-XXX/b\0/tmp/asm-XXX/c\0";
-        let parsed = split_print0(payload);
-        assert_eq!(
-            parsed,
-            vec![
-                PathBuf::from("/tmp/asm-XXX/a"),
-                PathBuf::from("/tmp/asm-XXX/b"),
-                PathBuf::from("/tmp/asm-XXX/c"),
-            ]
+    fn validate_safe_tmp_path_accepts_real_tmp_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        assert!(
+            path.starts_with("/tmp/"),
+            "tempfile not under /tmp/ — test env unusual: {:?}",
+            path
+        );
+        let canonical = validate_safe_tmp_path(path).expect("valid path must pass");
+        assert!(canonical.is_absolute());
+        assert!(canonical.starts_with("/tmp/"));
+    }
+
+    /// Missing path fails at canonicalize before any other check
+    /// runs. Diagnostic names canonicalize so the operator knows
+    /// the failure mode.
+    #[test]
+    fn validate_safe_tmp_path_rejects_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = validate_safe_tmp_path(&missing).expect_err("missing path must fail");
+        assert!(
+            err.contains("canonicalize"),
+            "diagnostic should name canonicalize, got: {}",
+            err
         );
     }
 
-    /// Empty `find` output (no matching entries under the root) parses
-    /// to an empty Vec. The cleanup walk relies on this — an empty
-    /// stage-1 list yields zero unlink calls and proceeds straight to
-    /// stage-3.
+    /// An existing path that is NOT under /tmp/ — `/etc` is the
+    /// portable choice (exists on every Linux host, canonicalizes
+    /// cleanly, not under /tmp/).
     #[test]
-    fn split_print0_handles_empty_payload() {
-        assert!(split_print0(b"").is_empty());
-        assert!(split_print0(b"\0").is_empty());
-        assert!(split_print0(b"\0\0\0").is_empty());
+    fn validate_safe_tmp_path_rejects_off_tmp_path() {
+        let err = validate_safe_tmp_path(Path::new("/etc"))
+            .expect_err("/etc must reject");
+        assert!(
+            err.contains("not strictly under /tmp/"),
+            "diagnostic mismatch: {}",
+            err
+        );
+    }
+
+    /// Load-bearing safety: a symlink that lives under /tmp/ but
+    /// whose target leaves /tmp/ is rejected, because canonicalize
+    /// follows the link and the resolved /etc fails the /tmp/
+    /// prefix check. A hostile or accidental symlink cannot
+    /// redirect the rm -rf out of /tmp/.
+    #[test]
+    fn validate_safe_tmp_path_rejects_symlink_escaping_tmp() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("escape");
+        symlink("/etc", &link).expect("symlink create must work in tempdir");
+        let err = validate_safe_tmp_path(&link)
+            .expect_err("symlink leaving /tmp/ must reject");
+        assert!(
+            err.contains("not strictly under /tmp/"),
+            "diagnostic mismatch: {}",
+            err
+        );
+    }
+
+    /// A real path under /tmp/ that contains the literal segment
+    /// `/home/` — e.g. `/tmp/asm-XXX/home/leak` — is rejected.
+    /// Defense against canonical paths that traverse a home dir
+    /// via any quirk; check is `contains`, not `starts_with`.
+    #[test]
+    fn validate_safe_tmp_path_rejects_home_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        let home_sub = dir.path().join("home").join("leak");
+        fs::create_dir_all(&home_sub).expect("nested mkdir must work");
+        let err = validate_safe_tmp_path(&home_sub)
+            .expect_err("/home/ substring path must reject");
+        assert!(
+            err.contains("traverses /home/"),
+            "diagnostic mismatch: {}",
+            err
+        );
+    }
+
+    /// Character whitelist enforced on real filesystem entries.
+    /// Linux filenames accept `*`, `'`, etc. — we create them, then
+    /// confirm canonicalize succeeds (the entry exists) but the
+    /// whitelist check rejects.
+    ///
+    /// One file per forbidden char, asserted independently so a
+    /// future whitelist relaxation has to deliberately delete the
+    /// specific case, not "fix" one catch-all assertion.
+    #[test]
+    fn validate_safe_tmp_path_rejects_forbidden_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("star", "a*b", '*'),
+            ("squote", "a'b", '\''),
+            ("dquote", "a\"b", '"'),
+            ("semi", "a;b", ';'),
+            ("amp", "a&b", '&'),
+            ("pipe", "a|b", '|'),
+            ("lt", "a<b", '<'),
+            ("gt", "a>b", '>'),
+            ("space", "a b", ' '),
+            ("dollar", "a$b", '$'),
+            ("backtick", "a`b", '`'),
+            ("newline", "a\nb", '\n'),
+            ("backslash", "a\\b", '\\'),
+        ];
+        for (slug, name, ch) in cases {
+            let bucket = dir.path().join(slug);
+            fs::create_dir(&bucket).unwrap();
+            let path = bucket.join(name);
+            fs::write(&path, b"").unwrap_or_else(|e| {
+                panic!("create file {:?}: {}", path, e);
+            });
+            let err = match validate_safe_tmp_path(&path) {
+                Ok(_) => panic!("must reject {:?}", ch),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("non-whitelisted char"),
+                "{:?}: diagnostic mismatch: {}",
+                ch,
+                err
+            );
+        }
     }
 }

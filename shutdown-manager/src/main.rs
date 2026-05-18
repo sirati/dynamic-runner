@@ -112,8 +112,6 @@ fn run_with_config(cfg: Config) -> ExitCode {
     let backend = RealPodman::new(
         cfg.podman_path.clone(),
         cfg.rm_path.clone(),
-        cfg.rmdir_path.clone(),
-        cfg.find_path.clone(),
         cfg.storage_root.clone(),
         cfg.runroot.clone(),
     );

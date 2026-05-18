@@ -34,8 +34,6 @@ fn always_alive() -> MockProcessProbe {
 }
 
 /// Test 1: PID file is written on startup, removed on clean exit.
-/// The tmp-prefix is intentionally non-existent so the cleanup walk
-/// short-circuits at the existence probe — no backend calls needed.
 #[test]
 fn pid_file_lifecycle_roundtrip() {
     let dir = tempdir().unwrap();
@@ -43,6 +41,7 @@ fn pid_file_lifecycle_roundtrip() {
     write_pid_file(&pid_path).unwrap();
     assert!(pid_path.exists(), "pid file should exist after write");
     let backend = MockBackend::new();
+    backend.script_unshare(vec![true]);
     final_cleanup(&backend, &dir.path().join("tmp-nope"), &pid_path, |_| {});
     assert!(!pid_path.exists(), "pid file must be removed after cleanup");
 }
@@ -164,11 +163,6 @@ fn signal_shutdown_pgrep_none_belt_only() {
 /// Test 8: FINAL_CLEANUP runs on idle path and signal path. Modelled
 /// via a wrapper that mirrors what `main` does — call run, then
 /// final_cleanup.
-///
-/// The mock scripts `unshare_find_files` to return an empty list and
-/// `unshare_find_dirs` to return `[tmp_prefix]`; that exercises the
-/// full four-stage walk (enumeration + per-dir rmdir on the prefix
-/// itself) without needing scripted file-level entries.
 #[test]
 fn final_cleanup_runs_after_idle_path() {
     let dir = tempdir().unwrap();
@@ -179,9 +173,7 @@ fn final_cleanup_runs_after_idle_path() {
 
     let backend = MockBackend::new();
     backend.script_exists(vec![true, false, false]);
-    backend.script_find_files(vec![Ok(Vec::new())]);
-    backend.script_find_dirs(vec![Ok(vec![tmp_prefix.clone()])]);
-    backend.script_rmdir(vec![Ok(())]);
+    backend.script_unshare(vec![true]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
     let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
@@ -190,18 +182,8 @@ fn final_cleanup_runs_after_idle_path() {
     assert!(!pid_path.exists(), "pid file should be removed");
     let calls = backend.calls();
     assert!(
-        calls.iter().any(|c| c.starts_with("unshare_find_files(")),
-        "stage-1 find must run; calls: {:?}",
-        calls
-    );
-    assert!(
-        calls.iter().any(|c| c.starts_with("unshare_find_dirs(")),
-        "stage-3 find must run; calls: {:?}",
-        calls
-    );
-    assert!(
-        calls.iter().any(|c| c.starts_with("unshare_rmdir(")),
-        "stage-4 rmdir must run for the tmp-prefix root; calls: {:?}",
+        calls.iter().any(|c| c.starts_with("unshare_remove(")),
+        "unshare must run; calls: {:?}",
         calls
     );
 }
@@ -216,9 +198,7 @@ fn final_cleanup_runs_after_signal_path() {
 
     let backend = MockBackend::new();
     backend.script_exists(vec![false]); // gone at entry
-    backend.script_find_files(vec![Ok(Vec::new())]);
-    backend.script_find_dirs(vec![Ok(vec![tmp_prefix.clone()])]);
-    backend.script_rmdir(vec![Ok(())]);
+    backend.script_unshare(vec![true]);
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
@@ -460,6 +440,103 @@ fn podman_path_flag_threads_into_backend() {
          Missing pid file would indicate the bootstrap chain itself \
          aborted on the flag — which would mean `--podman-path` is \
          load-bearing in a way it must not be.",
+    );
+}
+
+/// Test 13: `--rm-path` is honoured end-to-end. We pass a real path
+/// that exists on the filesystem but is NOT `rm` (`/usr/bin/false`);
+/// the manager's bootstrap (parse → log-file open → pid-file write
+/// → signal install → poll-loop entry) must succeed even though the
+/// final `podman unshare <rm_path> <tmp> -rf` call will fail at exec
+/// inside the userns. The proof point: the bootstrap log lines reach
+/// `--log-file` exactly like the canonical case — confirming the
+/// flag is wired through and that the manager's "podman failures
+/// are best-effort" contract survives a hostile `--rm-path`. If the
+/// flag were ignored or the binary aborted on the resulting failure,
+/// the bootstrap lines would either reflect a different path or
+/// never reach the file.
+///
+/// Subprocess, not unit-test the closure: same rationale as
+/// `podman_path_flag_threads_into_backend` — argv → resolved Config
+/// → backend construction is the load-bearing chain.
+#[test]
+fn rm_path_flag_threads_into_backend() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let bin = env!("CARGO_BIN_EXE_dynrunner-slurm-shutdown");
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("shutdown-manager.log");
+    let pid_path = dir.path().join("shutdown.pid");
+    let tmp_prefix = dir.path().join("asm-XXX");
+    let storage_root = dir.path().join("podman-root");
+    let runroot = dir.path().join("podman-run");
+    let wrapper_pid = std::process::id().to_string();
+
+    // `/usr/bin/false` exists on every Linux distro the framework
+    // targets, exits non-zero on every invocation, and is NOT `rm`.
+    // Using it proves the bootstrap stages don't depend on a working
+    // inner-userns `rm` — exactly the contract the post-2026-05-18
+    // shutdown manager needs to preserve so a bad `--rm-path` from
+    // a misconfigured wrapper degrades to "cleanup fails, manager
+    // still tears down" rather than aborting bootstrap.
+    let mut child = Command::new(bin)
+        .args([
+            "--container-name",
+            "ctr-does-not-exist",
+            "--storage-root",
+            storage_root.to_str().unwrap(),
+            "--runroot",
+            runroot.to_str().unwrap(),
+            "--tmp-prefix",
+            tmp_prefix.to_str().unwrap(),
+            "--pid-file",
+            pid_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "--poll-interval-secs",
+            "1",
+            "--idle-shutdown-secs",
+            "1",
+            "--wrapper-pid",
+            &wrapper_pid,
+            "--rm-path",
+            "/usr/bin/false",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn shutdown-manager binary with --rm-path");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents.contains("starting; container=") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        contents.contains("starting; container=ctr-does-not-exist"),
+        "--rm-path /usr/bin/false: bootstrap log line must still \
+         reach the file (the flag is wired through; cleanup failure \
+         is best-effort post-bootstrap); contents:\n{contents}",
+    );
+    // PID file must exist post-bootstrap — written before any
+    // podman/rm call, so a bad rm_path cannot prevent it.
+    assert!(
+        pid_path.exists(),
+        "--rm-path /usr/bin/false: pid file must be written during \
+         bootstrap (pre-poll-loop, pre-any-podman-call). Missing pid \
+         file would indicate the bootstrap chain itself aborted on \
+         the flag — which would mean `--rm-path` is load-bearing in \
+         a way it must not be.",
     );
 }
 

@@ -65,13 +65,34 @@ IDLE_SHUTDOWN:
   podman rm -af
 
 FINAL_CLEANUP (both paths):
-  # Per-entry walk: NO recursive primitive, NO host-side fallback.
-  podman unshare find <tmp_prefix> -mindepth 1 -type f -print0
-  for each file: podman unshare rm -- <file>
-  podman unshare find <tmp_prefix> -depth -type d -print0   # leaf-first
-  for each dir : podman unshare rmdir -- <dir>
-  unlink <pid_file>                                          # missing is OK
+  # Single `rm -rf` gated by validate_safe_tmp_path. NO host-side fallback.
+  validate_safe_tmp_path(<tmp_prefix>)    # canonicalize + checks (see below)
+  podman unshare <rm> <canonical_path> -rf
+  unlink <pid_file>                       # missing is OK
 ```
+
+The `validate_safe_tmp_path` gate is the load-bearing safety
+property; it runs BEFORE any exec and fails closed:
+
+1. `canonicalize` resolves symlinks, collapses `..`, and requires
+   the path to exist;
+2. canonical path is absolute (Unix canonicalize already guarantees
+   this; re-asserted defensively);
+3. canonical path is valid UTF-8 (`/tmp/asm-*` is ASCII by
+   construction);
+4. canonical path is strictly under `/tmp/` (refuses bare `/tmp/`
+   itself; a symlink whose target leaves `/tmp/` fails here because
+   canonicalize already followed it);
+5. canonical path does not contain the substring `/home/`;
+6. canonical path matches the strict character whitelist
+   `[a-zA-Z0-9./_-]` — rejects `*`, `'`, `"`, `` ` ``, `$`, `;`,
+   `&`, `|`, `<`, `>`, NUL, whitespace, etc.
+
+Argv order is `<rm-path> <canonical-path> -rf` (path BEFORE flags):
+if an argv-construction bug ever drops the path slot, `rm -rf`
+alone has no operand and is a safe no-op exit-error, rather than
+`-rf` surviving into a position that could attach to a subsequent
+operand.
 
 The shutdown flag is set by SIGTERM **or** SIGCONT handlers
 (`signal_hook::low_level::register`, atomic store, async-signal-safe).

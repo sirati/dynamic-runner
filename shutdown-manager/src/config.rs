@@ -59,41 +59,25 @@ pub struct Config {
     /// callers that haven't been updated.
     pub podman_path: PathBuf,
     /// Absolute path to the `rm` binary the manager invokes via
-    /// `podman unshare <rm> -- <file>` to unlink a single file in
-    /// the cleanup walk. Threaded through argv for the same reason
+    /// `podman unshare <rm> <validated-abs-path> -rf` to remove the
+    /// tmp-prefix tree. Threaded through argv for the same reason
     /// `podman_path` is: the systemd-user-service unit's PATH does
     /// not inherit the wrapper's PATH, and `rm` inside the
     /// userns-rewritten exec must be addressable by absolute path.
     ///
-    /// No `-r`, no `-f` is ever passed — the walk lists entries
-    /// individually and unlinks each one. The flag exists so an
-    /// operator can pin the coreutils provider (busybox vs GNU)
-    /// without recompiling, and so a missing PATH lookup degrades
-    /// to a clear ENOENT instead of silent failure.
+    /// The `-rf` is safe ONLY because the operand is canonicalize-
+    /// resolved and gated by [`crate::podman::validate_safe_tmp_path`]
+    /// (strictly under `/tmp/`, no `/home/` traversal, character
+    /// whitelist, no symlink escape). The argv order is `<rm>
+    /// <path> -rf` (path BEFORE flags): if an argv-composition bug
+    /// ever drops the path slot, `rm -rf` alone has no operand and
+    /// is a safe no-op, rather than `-rf` surviving into a
+    /// position that could attach to a subsequent operand.
     ///
     /// Defaulted to the literal `"rm"` for callers that haven't
     /// been updated; the wrapper-script renderer resolves
     /// `command -v rm` and threads the absolute path explicitly.
     pub rm_path: PathBuf,
-    /// Absolute path to the `rmdir` binary the manager invokes via
-    /// `podman unshare <rmdir> -- <dir>` to remove one empty
-    /// directory at a time. Mirror of `rm_path` for directory
-    /// teardown — see that field for design rationale.
-    pub rmdir_path: PathBuf,
-    /// Absolute path to the `find` binary the manager invokes via
-    /// `podman unshare <find> <root> ...` to enumerate files and
-    /// directories under the tmp-prefix. `find` is required because
-    /// the manager runs as the host UID; the subuid-owned
-    /// `storage/overlay-containers/...` subdirs are unreadable to
-    /// the host UID, so plain `std::fs::read_dir` walks would
-    /// EACCES well before reaching every leaf. Doing the walk
-    /// inside `podman unshare` re-enters the userns where those
-    /// subuids are local and readable.
-    ///
-    /// Defaulted to the literal `"find"`; the wrapper-script
-    /// renderer resolves `command -v find` and threads the
-    /// absolute path explicitly.
-    pub find_path: PathBuf,
 }
 
 /// Default per the CLI contract.
@@ -119,8 +103,6 @@ struct Builder {
     log_file: Option<PathBuf>,
     podman_path: Option<PathBuf>,
     rm_path: Option<PathBuf>,
-    rmdir_path: Option<PathBuf>,
-    find_path: Option<PathBuf>,
 }
 
 impl Builder {
@@ -159,10 +141,6 @@ impl Builder {
                 .podman_path
                 .unwrap_or_else(|| PathBuf::from("podman")),
             rm_path: self.rm_path.unwrap_or_else(|| PathBuf::from("rm")),
-            rmdir_path: self
-                .rmdir_path
-                .unwrap_or_else(|| PathBuf::from("rmdir")),
-            find_path: self.find_path.unwrap_or_else(|| PathBuf::from("find")),
         })
     }
 }
@@ -221,8 +199,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
             "--log-file" => b.log_file = Some(PathBuf::from(take_str(&mut iter)?)),
             "--podman-path" => b.podman_path = Some(PathBuf::from(take_str(&mut iter)?)),
             "--rm-path" => b.rm_path = Some(PathBuf::from(take_str(&mut iter)?)),
-            "--rmdir-path" => b.rmdir_path = Some(PathBuf::from(take_str(&mut iter)?)),
-            "--find-path" => b.find_path = Some(PathBuf::from(take_str(&mut iter)?)),
             other => return Err(format!("unknown flag: {}", other)),
         }
     }
@@ -271,12 +247,10 @@ mod tests {
             cfg.container_stop_grace.as_secs(),
             DEFAULT_CONTAINER_STOP_GRACE_SECS
         );
-        // Coreutils-path defaults preserve PATH-lookup behaviour for
+        // Coreutils-path default preserves PATH-lookup behaviour for
         // callers that haven't been updated; the wrapper renderer
         // resolves absolute paths and threads them explicitly.
         assert_eq!(cfg.rm_path, PathBuf::from("rm"));
-        assert_eq!(cfg.rmdir_path, PathBuf::from("rmdir"));
-        assert_eq!(cfg.find_path, PathBuf::from("find"));
     }
 
     #[test]
@@ -486,49 +460,4 @@ mod tests {
         );
     }
 
-    /// `--rmdir-path /abs/rmdir` mirrors `--rm-path`. The cleanup
-    /// walk's stage-4 calls `podman unshare <rmdir> -- <dir>` once
-    /// per directory, leaf-first.
-    #[test]
-    fn parses_rmdir_path_optional() {
-        let mut args = minimal_required();
-        args.extend(argv(&["--rmdir-path", "/usr/bin/rmdir"]));
-        let cfg = parse(args).expect("must parse");
-        assert_eq!(cfg.rmdir_path, PathBuf::from("/usr/bin/rmdir"));
-    }
-
-    #[test]
-    fn rmdir_path_equals_form() {
-        let mut args = minimal_required();
-        args.extend(argv(&["--rmdir-path=/run/current-system/sw/bin/rmdir"]));
-        let cfg = parse(args).expect("must parse");
-        assert_eq!(
-            cfg.rmdir_path,
-            PathBuf::from("/run/current-system/sw/bin/rmdir"),
-        );
-    }
-
-    /// `--find-path /abs/find` threads the enumeration binary. The
-    /// walk's stages 1 and 3 invoke `podman unshare <find> <root>
-    /// -mindepth 1 -type f -print0` and `... -depth -type d -print0`
-    /// respectively; both need an absolute path under the
-    /// systemd-user-service unit, identical motivation to `--rm-path`.
-    #[test]
-    fn parses_find_path_optional() {
-        let mut args = minimal_required();
-        args.extend(argv(&["--find-path", "/usr/bin/find"]));
-        let cfg = parse(args).expect("must parse");
-        assert_eq!(cfg.find_path, PathBuf::from("/usr/bin/find"));
-    }
-
-    #[test]
-    fn find_path_equals_form() {
-        let mut args = minimal_required();
-        args.extend(argv(&["--find-path=/run/current-system/sw/bin/find"]));
-        let cfg = parse(args).expect("must parse");
-        assert_eq!(
-            cfg.find_path,
-            PathBuf::from("/run/current-system/sw/bin/find"),
-        );
-    }
 }
