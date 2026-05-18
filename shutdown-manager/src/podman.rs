@@ -9,11 +9,20 @@
 //! Errors are intentionally collapsed to `bool` at the trait surface
 //! for the *signalling* methods (`kill_pid1`, `stop`, `rm_all`, ...):
 //! every caller in this binary treats those failures as "best effort,
-//! move on". The exception is [`PodmanBackend::unshare_remove`], whose
-//! caller (`cleanup::remove_tmp_prefix`) needs the captured stderr in
-//! the manager's log to diagnose why `/tmp/asm-*` cleanup fails — it
-//! therefore returns `Result<(), String>` with stderr/argv/exit packed
-//! into the error string.
+//! move on". The cleanup-walk primitives — `unshare_find_files`,
+//! `unshare_find_dirs`, `unshare_unlink`, `unshare_rmdir` — are the
+//! exception and return `Result<_, String>` with captured stderr so
+//! `cleanup::remove_tmp_prefix` can log the specific failure for each
+//! entry without aborting the whole walk.
+//!
+//! The walk-primitives DELIBERATELY do not expose any recursive flag
+//! (no `-r`, no `-rf`, no `-depth -delete`). Recursion is owned by
+//! `cleanup` — listing first, removing one entry per call — so a
+//! caller-side bug in the path computation can never cascade into a
+//! `rm -rf` of an unintended subtree. There is no host-side fallback;
+//! if `podman unshare` cannot enter the userns the cleanup logs the
+//! failure and exits leaving the tree in place for an operator to
+//! diagnose.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -48,17 +57,53 @@ pub trait PodmanBackend {
     /// root, releasing layer references. Idempotent.
     fn rm_all(&self) -> bool;
 
-    /// `podman unshare rm -rf <path>` — drop into the user-namespace
-    /// where the storage subuids are owned and remove a directory
-    /// tree. Required because subuid-owned files under `<tmp>/storage`
-    /// are not unlinkable by the host UID alone.
+    /// `podman unshare <find-path> <root> -mindepth 1 -type f
+    /// -print0` — list every FILE under `root` (one entry per
+    /// returned `PathBuf`). The cleanup walk's stage-1 plans
+    /// per-file unlink from this list.
     ///
-    /// On failure returns `Err(stderr)` where the string carries the
-    /// captured stderr plus the argv and exit status — this is the
-    /// only podman call whose failure we actively diagnose, since
-    /// `/tmp/asm-*` directories silently piling up on workers is a
-    /// real recurring symptom and the next repro must tell us why.
-    fn unshare_remove(&self, path: &Path) -> Result<(), String>;
+    /// `-mindepth 1` excludes `root` itself (which is a directory and
+    /// belongs to the stage-3 dir list). `-print0` emits NUL-separated
+    /// output so paths containing newlines (rare under `/tmp/asm-*`
+    /// but possible) parse unambiguously.
+    ///
+    /// On non-zero exit returns `Err(diag)` where `diag` packs the
+    /// argv, exit status, and captured stderr — the cleanup-walk
+    /// caller logs this and aborts cleanup (rather than fall back
+    /// to a recursive host-side `remove_dir_all`, which would
+    /// defeat the entire single-entry-per-op design).
+    fn unshare_find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String>;
+
+    /// `podman unshare <find-path> <root> -depth -type d -print0` —
+    /// list every DIRECTORY under `root` (INCLUDING `root` itself),
+    /// leaf-first.
+    ///
+    /// `-depth` is load-bearing: rmdir requires emptiness, so the
+    /// walk's stage-4 must process children before their parents.
+    /// `-print0` for the same NUL-safety reason as `unshare_find_files`.
+    ///
+    /// `Err` on non-zero exit, same diagnostic shape as
+    /// `unshare_find_files`.
+    fn unshare_find_dirs(&self, root: &Path) -> Result<Vec<PathBuf>, String>;
+
+    /// `podman unshare <rm-path> -- <file>` — unlink ONE file. No
+    /// `-r`, no `-f`. Single-entry.
+    ///
+    /// `Err(stderr-diag)` on non-zero exit. The walk continues past
+    /// per-file failures (so a single stuck inode doesn't block the
+    /// rest of the prefix from being torn down); the per-file
+    /// diagnostic is logged.
+    fn unshare_unlink(&self, file: &Path) -> Result<(), String>;
+
+    /// `podman unshare <rmdir-path> -- <dir>` — remove ONE empty
+    /// directory. Single-entry.
+    ///
+    /// `Err` typically signals `ENOTEMPTY`/`EBUSY` (the walk's
+    /// planner left children, or another process re-populated the
+    /// dir between list-time and rmdir-time). The walk continues
+    /// past per-dir failures with the failure count summarised at
+    /// end-of-walk.
+    fn unshare_rmdir(&self, dir: &Path) -> Result<(), String>;
 }
 
 /// Production backend. Holds the podman binary path AND the
@@ -70,20 +115,35 @@ pub trait PodmanBackend {
 /// `PATH` does NOT inherit the parent shell's PATH — on NixOS workers
 /// `podman` lives at `/run/current-system/sw/bin/podman`, which is
 /// not on the default user-systemd PATH and would ENOENT under
-/// `Command::new("podman").spawn()` (asm-tokenizer 2026-05-18). The
-/// wrapper script resolves `command -v podman` once at render time
-/// and passes the absolute path via `--podman-path`.
+/// `Command::new("podman").spawn()`. `rm_path`, `rmdir_path`, and
+/// `find_path` follow the same convention — the wrapper resolves
+/// `command -v rm|rmdir|find` once at render time so the per-entry
+/// cleanup primitives have absolute paths to invoke under `podman
+/// unshare`.
 #[derive(Debug, Clone)]
 pub struct RealPodman {
     podman_path: PathBuf,
+    rm_path: PathBuf,
+    rmdir_path: PathBuf,
+    find_path: PathBuf,
     storage_root: PathBuf,
     runroot: PathBuf,
 }
 
 impl RealPodman {
-    pub fn new(podman_path: PathBuf, storage_root: PathBuf, runroot: PathBuf) -> Self {
+    pub fn new(
+        podman_path: PathBuf,
+        rm_path: PathBuf,
+        rmdir_path: PathBuf,
+        find_path: PathBuf,
+        storage_root: PathBuf,
+        runroot: PathBuf,
+    ) -> Self {
         Self {
             podman_path,
+            rm_path,
+            rmdir_path,
+            find_path,
             storage_root,
             runroot,
         }
@@ -133,6 +193,44 @@ impl RealPodman {
             Err(e) => Err(format!("argv: {}; spawn-error: {}", argv, e)),
         }
     }
+
+    /// Run a command capturing stdout AND stderr. `Ok(stdout-bytes)`
+    /// on exit-0; `Err(stderr-diag)` otherwise. Used by the
+    /// `unshare_find_*` primitives, which need the NUL-separated
+    /// stdout payload while still surfacing exit-code+stderr on
+    /// failure.
+    fn run_capture_stdout(mut cmd: Command) -> Result<Vec<u8>, String> {
+        cmd.stdin(Stdio::null());
+        let argv = format!("{:?}", cmd);
+        match cmd.output() {
+            Ok(out) => match out.status.success() {
+                true => Ok(out.stdout),
+                false => Err(format!(
+                    "argv: {}; exit={}; stderr: {}",
+                    argv,
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim_end()
+                )),
+            },
+            Err(e) => Err(format!("argv: {}; spawn-error: {}", argv, e)),
+        }
+    }
+}
+
+/// Parse a `-print0` payload (NUL-separated paths, trailing NUL
+/// included for non-empty output) into a `Vec<PathBuf>`. Empty
+/// elements (between adjacent NULs, or the trailing-NUL terminator)
+/// are filtered. UTF-8 decoded best-effort via `String::from_utf8_lossy`
+/// — paths under `/tmp/asm-*` are ASCII-safe by construction (random
+/// suffix + container-runtime-generated subdirs); a stray non-UTF-8
+/// byte would corrupt that one path to `U+FFFD` rather than failing
+/// the walk.
+fn split_print0(bytes: &[u8]) -> Vec<PathBuf> {
+    bytes
+        .split(|&b| b == 0)
+        .filter(|slice| !slice.is_empty())
+        .map(|slice| PathBuf::from(String::from_utf8_lossy(slice).into_owned()))
+        .collect()
 }
 
 impl PodmanBackend for RealPodman {
@@ -193,9 +291,40 @@ impl PodmanBackend for RealPodman {
         Self::run_silent(c)
     }
 
-    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
+    fn unshare_find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
         let mut c = self.cmd();
-        c.arg("unshare").arg("rm").arg("-rf").arg(path);
+        c.arg("unshare")
+            .arg(&self.find_path)
+            .arg(root)
+            .arg("-mindepth")
+            .arg("1")
+            .arg("-type")
+            .arg("f")
+            .arg("-print0");
+        Self::run_capture_stdout(c).map(|bytes| split_print0(&bytes))
+    }
+
+    fn unshare_find_dirs(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+        let mut c = self.cmd();
+        c.arg("unshare")
+            .arg(&self.find_path)
+            .arg(root)
+            .arg("-depth")
+            .arg("-type")
+            .arg("d")
+            .arg("-print0");
+        Self::run_capture_stdout(c).map(|bytes| split_print0(&bytes))
+    }
+
+    fn unshare_unlink(&self, file: &Path) -> Result<(), String> {
+        let mut c = self.cmd();
+        c.arg("unshare").arg(&self.rm_path).arg("--").arg(file);
+        Self::run_capture_stderr(c)
+    }
+
+    fn unshare_rmdir(&self, dir: &Path) -> Result<(), String> {
+        let mut c = self.cmd();
+        c.arg("unshare").arg(&self.rmdir_path).arg("--").arg(dir);
         Self::run_capture_stderr(c)
     }
 }
@@ -204,20 +333,56 @@ impl PodmanBackend for RealPodman {
 mod tests {
     use super::*;
 
-    /// Smoke: builder records podman_path/storage/runroot in the
-    /// command vector (we can't easily inspect a `Command` post-hoc
-    /// without spawning, so this is more a constructor sanity-check
-    /// than a behaviour test — behaviour is exercised via the mock
-    /// in `tests/common`).
+    /// Smoke: builder records every CLI-path field on the struct (we
+    /// can't easily inspect a `Command` post-hoc without spawning, so
+    /// this is more a constructor sanity-check than a behaviour test
+    /// — behaviour is exercised via the mock in `tests/common`).
     #[test]
     fn real_backend_constructs() {
         let b = RealPodman::new(
             PathBuf::from("/nix/store/x/bin/podman"),
+            PathBuf::from("/nix/store/x/bin/rm"),
+            PathBuf::from("/nix/store/x/bin/rmdir"),
+            PathBuf::from("/nix/store/x/bin/find"),
             PathBuf::from("/r"),
             PathBuf::from("/rr"),
         );
         assert_eq!(b.podman_path, Path::new("/nix/store/x/bin/podman"));
+        assert_eq!(b.rm_path, Path::new("/nix/store/x/bin/rm"));
+        assert_eq!(b.rmdir_path, Path::new("/nix/store/x/bin/rmdir"));
+        assert_eq!(b.find_path, Path::new("/nix/store/x/bin/find"));
         assert_eq!(b.storage_root, Path::new("/r"));
         assert_eq!(b.runroot, Path::new("/rr"));
+    }
+
+    /// `split_print0` consumes the canonical `find -print0` payload
+    /// shape: each entry terminated by NUL, including the final entry.
+    /// Empty slices between adjacent NULs (or after the trailing NUL)
+    /// must be filtered — `find -print0` never emits an empty path
+    /// itself, but the trailing NUL produces an empty trailing slice
+    /// from `split`.
+    #[test]
+    fn split_print0_parses_canonical_payload() {
+        let payload = b"/tmp/asm-XXX/a\0/tmp/asm-XXX/b\0/tmp/asm-XXX/c\0";
+        let parsed = split_print0(payload);
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("/tmp/asm-XXX/a"),
+                PathBuf::from("/tmp/asm-XXX/b"),
+                PathBuf::from("/tmp/asm-XXX/c"),
+            ]
+        );
+    }
+
+    /// Empty `find` output (no matching entries under the root) parses
+    /// to an empty Vec. The cleanup walk relies on this — an empty
+    /// stage-1 list yields zero unlink calls and proceeds straight to
+    /// stage-3.
+    #[test]
+    fn split_print0_handles_empty_payload() {
+        assert!(split_print0(b"").is_empty());
+        assert!(split_print0(b"\0").is_empty());
+        assert!(split_print0(b"\0\0\0").is_empty());
     }
 }

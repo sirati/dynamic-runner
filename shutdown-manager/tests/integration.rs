@@ -34,6 +34,8 @@ fn always_alive() -> MockProcessProbe {
 }
 
 /// Test 1: PID file is written on startup, removed on clean exit.
+/// The tmp-prefix is intentionally non-existent so the cleanup walk
+/// short-circuits at the existence probe — no backend calls needed.
 #[test]
 fn pid_file_lifecycle_roundtrip() {
     let dir = tempdir().unwrap();
@@ -41,7 +43,6 @@ fn pid_file_lifecycle_roundtrip() {
     write_pid_file(&pid_path).unwrap();
     assert!(pid_path.exists(), "pid file should exist after write");
     let backend = MockBackend::new();
-    backend.script_unshare(vec![true]);
     final_cleanup(&backend, &dir.path().join("tmp-nope"), &pid_path, |_| {});
     assert!(!pid_path.exists(), "pid file must be removed after cleanup");
 }
@@ -163,6 +164,11 @@ fn signal_shutdown_pgrep_none_belt_only() {
 /// Test 8: FINAL_CLEANUP runs on idle path and signal path. Modelled
 /// via a wrapper that mirrors what `main` does — call run, then
 /// final_cleanup.
+///
+/// The mock scripts `unshare_find_files` to return an empty list and
+/// `unshare_find_dirs` to return `[tmp_prefix]`; that exercises the
+/// full four-stage walk (enumeration + per-dir rmdir on the prefix
+/// itself) without needing scripted file-level entries.
 #[test]
 fn final_cleanup_runs_after_idle_path() {
     let dir = tempdir().unwrap();
@@ -173,7 +179,9 @@ fn final_cleanup_runs_after_idle_path() {
 
     let backend = MockBackend::new();
     backend.script_exists(vec![true, false, false]);
-    backend.script_unshare(vec![true]);
+    backend.script_find_files(vec![Ok(Vec::new())]);
+    backend.script_find_dirs(vec![Ok(vec![tmp_prefix.clone()])]);
+    backend.script_rmdir(vec![Ok(())]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
     let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
@@ -182,8 +190,18 @@ fn final_cleanup_runs_after_idle_path() {
     assert!(!pid_path.exists(), "pid file should be removed");
     let calls = backend.calls();
     assert!(
-        calls.iter().any(|c| c.starts_with("unshare_remove(")),
-        "unshare must run; calls: {:?}",
+        calls.iter().any(|c| c.starts_with("unshare_find_files(")),
+        "stage-1 find must run; calls: {:?}",
+        calls
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("unshare_find_dirs(")),
+        "stage-3 find must run; calls: {:?}",
+        calls
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("unshare_rmdir(")),
+        "stage-4 rmdir must run for the tmp-prefix root; calls: {:?}",
         calls
     );
 }
@@ -198,7 +216,9 @@ fn final_cleanup_runs_after_signal_path() {
 
     let backend = MockBackend::new();
     backend.script_exists(vec![false]); // gone at entry
-    backend.script_unshare(vec![true]);
+    backend.script_find_files(vec![Ok(Vec::new())]);
+    backend.script_find_dirs(vec![Ok(vec![tmp_prefix.clone()])]);
+    backend.script_rmdir(vec![Ok(())]);
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
