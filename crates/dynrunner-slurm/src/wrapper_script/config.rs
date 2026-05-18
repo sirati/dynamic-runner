@@ -118,9 +118,9 @@ pub struct WrapperScriptConfig<'a> {
     pub is_observer: bool,
     /// Absolute path to the `dynrunner-slurm-shutdown` binary on the
     /// compute-node filesystem. When `Some`, the rendered wrapper
-    /// spawns the shutdown manager via `systemd-run --user --scope`
-    /// right after scratch-dir creation; the wrapper's signal trap
-    /// forwards SIGTERM/SIGCONT/etc. to the scope via
+    /// spawns the shutdown manager via `systemd-run --user --unit`
+    /// (service mode) right after scratch-dir creation; the wrapper's
+    /// signal trap forwards SIGTERM/SIGCONT/etc. to the unit via
     /// `systemctl --user kill`. When `None`, the wrapper emits no
     /// shutdown-manager spawn block and the cleanup trap is a
     /// minimal CMD_RELAY-only teardown (legacy behavior, NO /tmp

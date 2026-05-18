@@ -286,8 +286,8 @@ fn standard_mode_script_contains_gateway() {
     // The pre-2026-05 inline `setsid -f bash` watchdog has been
     // removed; teardown is now owned by the out-of-cgroup
     // `dynrunner-slurm-shutdown` binary spawned via
-    // `systemd-run --user --scope` when the caller plumbs
-    // `WrapperScriptConfig::shutdown_manager_bin_path`. See
+    // `systemd-run --user --unit` (service mode) when the caller
+    // plumbs `WrapperScriptConfig::shutdown_manager_bin_path`. See
     // `wrapper_script::tests::shutdown_manager` for the
     // positive assertions on the new shape; the negative
     // assertions (watchdog must not reappear) live in

@@ -2,7 +2,8 @@
 //!
 //! Single concern: stage the musl-static shutdown-manager binary on
 //! the SLURM gateway so per-job wrapper scripts can spawn it via
-//! `systemd-run --user --scope` and have it survive cgroup teardown.
+//! `systemd-run --user --unit` (service mode) and have it survive
+//! cgroup teardown.
 //! Same deployment pattern as the per-job wrapper script
 //! (`job_<name>.sh`) and the source-binary upload — write to
 //! `root_folder`, `chmod` the remote, remember the resolved path.
