@@ -1,24 +1,39 @@
 //! Single concern: filesystem cleanup at the end of the shutdown
 //! sequence — `/tmp/asm-XXX` directory and the PID file.
 //!
-//! The tmp-prefix is removed via host `<rm> <validated-abs-path>
-//! -rf`. The path is canonicalized AND validated by
+//! The tmp-prefix is removed via `podman unshare <rm>
+//! <validated-abs-path> -rf` (no `--root`/`--runroot`). The path
+//! is canonicalized AND validated by
 //! [`crate::podman::validate_safe_tmp_path`] before any exec runs
 //! (strictly under `/tmp/`, no `/home/`, character whitelist, no
-//! symlink escape). Validation is the safety; no `podman unshare`
-//! wrapping is involved.
+//! symlink escape). Validation is the safety; the `podman unshare`
+//! wrap is for permission.
 //!
-//! The previous `podman unshare`-wrapped invocation failed with
-//! `EBUSY` on `<prefix>/storage/overlay` because the unshare's
-//! storage driver (initialized via `--root=<prefix>/storage`) held
-//! an internal lock on its own root dir — a podman-internal busy
-//! state, not a kernel mount. Empirically (asm-tokenizer
-//! 2026-05-18 12:20): `findmnt` shows zero kernel mounts under
-//! the cleanup target; `ls -la` shows only kruppb-owned regular
-//! dirs that the rootless-podman storage driver pre-creates as
-//! metadata. Host rm clears the tree instantly. The argv-shape
-//! validation gate is what protects against catastrophic path
-//! bugs, not the absent unshare wrapping.
+//! Two orthogonal failure modes shaped the current design:
+//!
+//!   1. `podman --root=X --runroot=Y unshare rm X -rf` (a70d3bf,
+//!      62f3ffb) failed with `EBUSY: Device or resource busy` on
+//!      `X/storage/overlay`. The unshare's storage driver,
+//!      initialized via `--root=X`, holds an internal lock on its
+//!      own root directory — a podman-internal busy state, not a
+//!      kernel mount (asm-tokenizer 2026-05-18 12:20: `findmnt`
+//!      showed zero kernel mounts).
+//!
+//!   2. Plain host `rm <path> -rf` (def6d7a) failed with EACCES
+//!      on rootless-podman overlay content. The files themselves
+//!      are kruppb-owned, but their parent directories follow the
+//!      nix-store immutable pattern — mode `r-xr-xr-x`, no write
+//!      bit. POSIX `unlinkat(2)` needs write permission on the
+//!      *parent*, which host kruppb lacks. (asm-tokenizer
+//!      2026-05-18 12:37: directly observed on libtsan.so under
+//!      `<prefix>/storage/overlay/.../diff/nix/store/.../lib/`.)
+//!
+//! The current shape resolves both: `podman unshare` (without
+//! `--root`/`--runroot`) gives kruppb uid-0 inside the user
+//! namespace, which bypasses the dir-write-bit via
+//! `CAP_DAC_OVERRIDE`; the absence of `--root`/`--runroot` means
+//! no storage driver is initialized on the path being deleted,
+//! so no busy-lock.
 //!
 //! On rm failure the manager logs the captured stderr and leaves
 //! the tree on disk for operator inspection. No fallback — losing
@@ -46,10 +61,11 @@ pub fn final_cleanup<B: PodmanBackend, L: FnMut(&str)>(
     remove_pid_file(pid_file, &mut log);
 }
 
-/// Host `<rm> <validated-abs-path> -rf`. On failure the captured
-/// stderr (including argv and exit status) is logged and the tree
-/// is left on disk for operator inspection. Intentionally NO
-/// fallback — the only path that gets touched is the one
+/// `podman unshare <rm> <validated-abs-path> -rf` (no `--root`,
+/// no `--runroot`). On failure the captured stderr (including
+/// argv and exit status) is logged and the tree is left on disk
+/// for operator inspection. Intentionally NO fallback — the only
+/// path that gets touched is the one
 /// [`crate::podman::validate_safe_tmp_path`] approved.
 fn remove_tmp_prefix<B: PodmanBackend, L: FnMut(&str)>(
     backend: &B,
