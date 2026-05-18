@@ -160,6 +160,19 @@ pub trait Scheduler<I: Identifier> {
     ) -> AssignmentDecision;
 
     /// Check resource pressure and decide whether to kill a worker.
+    ///
+    /// `in_pressure_phase` is the manager-side authority on "the
+    /// cluster has crossed an OOM-pressure boundary and active
+    /// preempt is now warranted". Implementations MUST short-circuit
+    /// to `ResourcePressureDecision::NoAction` when the flag is
+    /// `false` — outside an explicit pressure phase, no kill should
+    /// fire even if `actual_usage` overshoots `effective_max` (an
+    /// overshoot without a pressure-phase entry is the manager's
+    /// concern, not the scheduler's). The flag is set by the
+    /// manager-side phase machine (see
+    /// `dynrunner-manager-local::manager::phases`) when the
+    /// pre-existing in-flight backlog should be drained before any
+    /// new task is dispatched.
     fn check_resource_pressure(
         &self,
         workers: &[WorkerBudgetInfo<I>],
