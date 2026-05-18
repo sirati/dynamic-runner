@@ -118,6 +118,7 @@ where
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
             pending_worker_restarts: HashSet::new(),
+            pending_first_bind: HashMap::new(),
             setup_pending: false,
             setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),

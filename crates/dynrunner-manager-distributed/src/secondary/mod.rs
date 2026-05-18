@@ -66,6 +66,51 @@ pub(super) struct PrimaryInFlightItem<I: Identifier> {
     pub(super) binary: TaskInfo<I>,
 }
 
+/// Source of a task that's currently waiting on a worker's first-bind
+/// (or true type-shift) respawn to reach `Response::Ready`. Drives the
+/// `WorkerEvent::Disconnected` recovery path: which ledger the binary
+/// needs to be returned to if the worker dies before Ready arrives.
+///
+/// See [`PendingFirstBind`] and `SecondaryCoordinator.pending_first_bind`.
+#[derive(Debug, Clone)]
+pub(super) enum BindSource {
+    /// Inbound TaskAssignment from a peer (or the original primary).
+    /// Disconnect recovery: send TaskFailed-as-backpressure
+    /// (`"worker pipe broken; respawning"`) to the current primary so
+    /// the primary's `handle_primary_peer_rejection` requeues the
+    /// binary for re-dispatch.
+    PeerAssigned,
+    /// Local self-assign from `handle_primary_task_request` while this
+    /// secondary holds primary authority. Disconnect recovery:
+    /// `recover_in_flight_to_pool` (the binary is already tracked in
+    /// `primary_in_flight` because the self-assign path inserts there
+    /// BEFORE attempting the respawn).
+    PrimarySelfAssign,
+}
+
+/// One pending first-bind entry: the inbound binary the dispatch arm
+/// could not assign immediately because the target worker's
+/// `loaded_type_id` did not match the task's `type_id` (first-bind
+/// `None → Some(T)` OR true type-shift `Some(T1) → Some(T2)`). The
+/// pool's [`crate::pool::WorkerPool::ensure_worker_for_type_async`]
+/// kicked off the kill+spawn on a background `wait_ready` task; this
+/// entry is the dispatch-arm side, keyed by the `WorkerId` so the
+/// `WorkerEvent::Ready` handler can pick it up and call `assign_task`
+/// once the slot is observably Idle with the new type bound.
+///
+/// Carries everything `assign_task` + cleanup needs: the resolved
+/// `TaskInfo`, the wire-side `file_hash` (used by `active_tasks` and
+/// the disconnect-recovery wire messages), the scheduler's estimated
+/// resource usage, and the [`BindSource`] discriminator that drives
+/// the disconnect-recovery branch.
+#[derive(Debug, Clone)]
+pub(super) struct PendingFirstBind<I: Identifier> {
+    pub(super) binary: TaskInfo<I>,
+    pub(super) file_hash: String,
+    pub(super) estimated: dynrunner_core::ResourceMap,
+    pub(super) source: BindSource,
+}
+
 /// One entry in the secondary's `primary_failed` ledger. Carries
 /// both the original `TaskInfo` (so the secondary can re-inject the
 /// binary on a retry pass without re-fetching it from the cluster
@@ -425,6 +470,75 @@ where
     /// last drain (set was emptied) or is still queued (no-op
     /// already in flight).
     pub(super) pending_worker_restarts: HashSet<WorkerId>,
+
+    /// Pending task assignments waiting on a freshly-spawned worker
+    /// to reach `Response::Ready`. Keyed by `WorkerId`; consumed by
+    /// the `WorkerEvent::Ready` arm in
+    /// [`crate::secondary::processing::worker_event`].
+    ///
+    /// # Single concern
+    ///
+    /// The select!-arm bodies in `dispatch/router.rs` (TaskAssignment
+    /// from primary) and `primary/task_request.rs`
+    /// (`handle_primary_task_request`) historically held an inline
+    /// `ensure_worker_for_type(...).await` on the FIRST-BIND path
+    /// (`loaded_type_id == None`). The await drove
+    /// [`crate::worker::WorkerHandle::poll_ready`] in a loop until
+    /// the freshly-spawned worker subprocess sent `Response::Ready`
+    /// — and BLOCKED the select! for the full duration. Production
+    /// observed 300+s of tokio-runtime silence on the asm-tokenizer
+    /// LMU dispatch when the worker took longer than the keepalive
+    /// interval to import its Python task module.
+    ///
+    /// The async-event fix routes type-bind through
+    /// [`crate::pool::WorkerPool::ensure_worker_for_type_async`]
+    /// (returns `RespawnInProgress` immediately, drives
+    /// `wait_ready` on a background `spawn_local` task that emits
+    /// `WorkerEvent::Ready` on the pool's channel when done). The
+    /// caller stores the inbound binary HERE keyed by the worker
+    /// it dispatched to, returns from the select! arm, and the
+    /// Ready handler picks the binary back up and calls
+    /// `assign_task` once the slot is observably Idle with the
+    /// correct `loaded_type_id`.
+    ///
+    /// # Why HERE rather than bouncing as backpressure
+    ///
+    /// The first cut of this fix bounced the binary back to the
+    /// primary as a `TaskFailed` carrying the
+    /// `"worker pipe broken; respawning"` marker, mirroring the
+    /// existing type-shift respawn path. That path works
+    /// architecturally — the primary's
+    /// `handle_primary_peer_rejection` requeues and re-dispatches
+    /// — but introduces distribution bias: the promoted-primary's
+    /// own self-assigns reach the same-type fast path within
+    /// sub-millisecond after the Ready event fires (no wire
+    /// round-trip), while peer secondaries pay one full primary
+    /// round-trip per first-bind. On small workloads (e.g. the
+    /// 20-binary asm-tokenizer Tier-2 recipe) the promoted-primary
+    /// burns through every task before the peer cycle catches up,
+    /// regressing the
+    /// `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
+    /// test which pins per-secondary distribution fairness.
+    ///
+    /// Storing the binary on the secondary preserves fairness:
+    /// each worker stays bound to its initial assignment for the
+    /// duration of the respawn, no round-trip needed.
+    ///
+    /// # Loss handling
+    ///
+    /// If the worker dies before reaching Ready, the
+    /// `WorkerEvent::Disconnected` arm drains the entry and
+    /// recovers it per `source`:
+    ///
+    ///   * `BindSource::PrimarySelfAssign` →
+    ///     [`Self::recover_in_flight_to_pool`] (the binary is
+    ///     already in `primary_in_flight`; pushes it back to the
+    ///     pool front).
+    ///   * `BindSource::PeerAssigned` → send TaskFailed-as-
+    ///     backpressure to the current primary so the primary's
+    ///     `handle_primary_peer_rejection` requeues it for
+    ///     another peer (or self-assign).
+    pub(super) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
 
     /// Set true by the `PromotePrimary { required_setup: true }` arm
     /// in `dispatch.rs` when this secondary is promoted into the

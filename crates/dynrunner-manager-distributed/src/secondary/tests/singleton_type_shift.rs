@@ -521,6 +521,85 @@ async fn singleton_typed_phase_chain_completes_on_secondary() {
 ///      jitter (200–400ms gap) and the pre-fix wedge (≥1500ms),
 ///      yielding a discriminator that fires deterministically on
 ///      the bug.
+/// Regression (load-bearing) — first-bind variant of the
+/// keepalive-liveness contract. Pre-fix BOTH first-bind (`None →
+/// Some(T)`) AND true type-shift (`Some(T1) → Some(T2)`) routed
+/// through the synchronous `ensure_worker_for_type`; the prior
+/// Bug A fix (commit 7862339) only switched true-type-shift to the
+/// async-event flow. The first-bind path retained the inline
+/// `poll_ready` loop and wedged the secondary's `select!` for the
+/// full slow-Ready window every time a worker was bound to its
+/// initial type. Production observed this on the asm-tokenizer
+/// 80-task wedge where secondaries 2 & 3 processed exactly one
+/// task each then went silent — the initial first-bind respawn
+/// blocked the operational loop long enough that the primary
+/// keepalive_timeout fired and recovery routed work elsewhere.
+///
+/// This test pins the keepalive-liveness contract for the
+/// first-bind path by configuring the factory to slow Ready
+/// specifically on `type_a` (the first task's type), so the
+/// first-bind respawn engages the slow-Ready window AND the test
+/// asserts keepalives keep firing through it. Same discriminator
+/// shape as the type-shift variant above.
+#[tokio::test(flavor = "current_thread")]
+async fn keepalives_keep_firing_during_slow_ready_on_first_bind() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // Slow type_a's Ready by 1.5 s. The first task in
+            // the chain is `task_a` with `type_a`, so the
+            // initial first-bind respawn engages the slow-Ready
+            // window. Subsequent type-shifts use type_b/type_c
+            // which respond instantly — keeps the test focused on
+            // the first-bind window.
+            let factory = TypedFakeWorkerFactory::new()
+                .with_slow_ready("type_a", Duration::from_millis(1500));
+
+            let (completed, type_shifts, arrivals) =
+                run_singleton_chain_with_factory(
+                    factory,
+                    Duration::from_secs(10),
+                    Duration::from_millis(200),
+                )
+                .await;
+
+            assert_eq!(
+                completed, 3,
+                "all 3 tasks complete even with slow Ready on type_a's first bind"
+            );
+            assert!(
+                type_shifts >= 2,
+                "type-shift respawn must have fired ≥2 times \
+                 (A→B, B→C); observed {type_shifts}"
+            );
+            let liveness_window = Duration::from_millis(1000);
+            let early_keepalives: usize = arrivals
+                .iter()
+                .filter(|t| **t < liveness_window)
+                .count();
+            assert!(
+                early_keepalives >= 2,
+                "only {early_keepalives} keepalive(s) arrived in \
+                 the first {liveness_window:?} of the run — the \
+                 secondary's tokio `select!` was wedged during the \
+                 slow-Ready first-bind window. Pre-fix the \
+                 synchronous wait inside `ensure_worker_for_type` \
+                 blocks the operational loop for the entire \
+                 slow_ready_delay (1500ms here) on the FIRST-BIND \
+                 path (`loaded_type_id == None`), and the missed-tick \
+                 burst on resume collapses into a single \
+                 microsecond-spaced cluster at t≈1500ms. Post-fix \
+                 the first-bind binary is stashed in \
+                 `pending_first_bind` and the operational loop \
+                 keeps firing keepalives during the wait — at \
+                 least 4 should land before {liveness_window:?}. \
+                 Arrivals (relative to run start): {arrivals:?}"
+            );
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn keepalives_keep_firing_during_slow_ready_on_type_shift() {
     let _ = tracing_subscriber::fmt::try_init();
