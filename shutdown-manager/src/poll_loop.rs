@@ -28,10 +28,29 @@
 //!     podman kill --signal TERM <name> (belt-and-suspenders)
 //!     wait up to secondary_grace; if alive: stop -t container_stop_grace
 //!   podman rm -af
+//!   podman unmount --all   # drop lingering storage-driver mounts
 //!
 //! IDLE_SHUTDOWN:
 //!   podman rm -af
+//!   podman unmount --all
 //! ```
+//!
+//! `unmount --all` runs AFTER `rm -af` and BEFORE the cleanup walk
+//! to flush residual fuse-overlayfs mountpoints that `rm -af`'s
+//! unmount path did not reach. Under SLURM TIMEOUT the wrapper's
+//! process tree is SIGKILL'd as a unit, killing the fuse-overlayfs
+//! daemon that backs the container's storage mount as a sibling
+//! process; the kernel mount table then references a dead FUSE
+//! backend. By the time the shutdown manager runs `rm -af`, podman
+//! often has nothing to remove (auto-rm fired on the container's
+//! Exited transition), so the unmount step that would have
+//! fired inside rm -af is bypassed. The dead-FUSE mountpoint
+//! survives — `rm -rf` of the tmp-prefix then EBUSY's on
+//! `storage/overlay` leaving ~40K of mountpoint-stub residue per
+//! prefix (asm-tokenizer 2026-05-18 12:05 on a70d3bf).
+//! `unmount --all` issues an explicit `umount(2)` on the residual
+//! mountpoint which the kernel processes cleanly even with a
+//! dead FUSE daemon.
 
 use crate::clock::Clock;
 use crate::podman::PodmanBackend;
@@ -170,12 +189,16 @@ pub fn signal_shutdown<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
     }
     let _ = backend.rm_all();
     log("podman rm -af invoked");
+    let _ = backend.unmount_all();
+    log("podman unmount --all invoked");
 }
 
 /// IDLE_SHUTDOWN branch.
 pub fn idle_shutdown<B: PodmanBackend, L: FnMut(&str)>(backend: &B, log: &mut L) {
     let _ = backend.rm_all();
     log("podman rm -af invoked (idle path)");
+    let _ = backend.unmount_all();
+    log("podman unmount --all invoked (idle path)");
 }
 
 /// Send SIGTERM to the in-container PID returned by pgrep, if any.
@@ -302,6 +325,11 @@ mod tests {
         let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::IdleShutdown);
         assert!(backend.rm_all_called());
+        // The post-rm unmount step is load-bearing for the cleanup
+        // walk under SLURM TIMEOUT (peer asm-tokenizer 2026-05-18
+        // 12:05 on a70d3bf: 40K residue per prefix from a dead
+        // FUSE mountpoint that rm -af did not flush).
+        assert!(backend.unmount_all_called());
     }
 
     #[test]

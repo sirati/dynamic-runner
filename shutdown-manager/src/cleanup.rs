@@ -150,6 +150,9 @@ mod tests {
         fn rm_all(&self) -> bool {
             unreachable!()
         }
+        fn unmount_all(&self) -> bool {
+            unreachable!()
+        }
         fn unshare_remove(&self, p: &Path) -> Result<(), String> {
             self.calls
                 .borrow_mut()

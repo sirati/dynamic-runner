@@ -27,6 +27,7 @@ pub struct MockBackend {
     pgrep_script: RefCell<Vec<Option<u32>>>,
     unshare_script: RefCell<Vec<bool>>,
     rm_all_called: RefCell<bool>,
+    unmount_all_called: RefCell<bool>,
 }
 
 impl MockBackend {
@@ -49,6 +50,9 @@ impl MockBackend {
     }
     pub fn rm_all_called(&self) -> bool {
         *self.rm_all_called.borrow()
+    }
+    pub fn unmount_all_called(&self) -> bool {
+        *self.unmount_all_called.borrow()
     }
 
     fn record(&self, s: impl Into<String>) {
@@ -96,6 +100,11 @@ impl PodmanBackend for MockBackend {
     fn rm_all(&self) -> bool {
         *self.rm_all_called.borrow_mut() = true;
         self.record("rm_all".to_string());
+        true
+    }
+    fn unmount_all(&self) -> bool {
+        *self.unmount_all_called.borrow_mut() = true;
+        self.record("unmount_all".to_string());
         true
     }
     fn unshare_remove(&self, path: &Path) -> Result<(), String> {
