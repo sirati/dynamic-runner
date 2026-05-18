@@ -35,6 +35,7 @@
 
 use crate::clock::Clock;
 use crate::podman::PodmanBackend;
+use crate::process_probe::ProcessProbe;
 use crate::shutdown_flag::ShutdownFlag;
 use std::time::Duration;
 
@@ -47,6 +48,12 @@ pub struct PollConfig {
     pub idle_shutdown: Duration,
     pub secondary_grace: Duration,
     pub container_stop_grace: Duration,
+    /// Optional PID of the wrapper script that spawned the manager.
+    /// When `Some`, the poll loop treats wrapper disappearance as a
+    /// third wake input (collapsed into the existing SIGNAL_SHUTDOWN
+    /// branch). `None` disables the check; loop behaviour is then
+    /// identical to the pre-monitor design.
+    pub wrapper_pid: Option<u32>,
 }
 
 /// Which branch of the state machine fired. Returned by `run` so the
@@ -63,10 +70,15 @@ pub enum Outcome {
 /// Drive the state machine to completion. Returns when one of the two
 /// branches has run to its end (signals issued, `rm -af` invoked).
 /// Filesystem cleanup (PID-file, /tmp prefix) happens in the caller.
-pub fn run<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
+///
+/// `probe` observes wrapper-script liveness. When `cfg.wrapper_pid`
+/// is `None`, the probe is never consulted and the loop's wake-set
+/// reduces to the original (flag, container-idle) pair.
+pub fn run<B: PodmanBackend, C: Clock, P: ProcessProbe, L: FnMut(&str)>(
     backend: &B,
     flag: &ShutdownFlag,
     clock: &C,
+    probe: &P,
     cfg: &PollConfig,
     mut log: L,
 ) -> Outcome {
@@ -76,6 +88,11 @@ pub fn run<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
     loop {
         if flag.is_set() {
             log("signal observed; entering SIGNAL_SHUTDOWN");
+            signal_shutdown(backend, clock, cfg, &mut log);
+            return Outcome::SignalShutdown;
+        }
+        if wrapper_gone(probe, cfg.wrapper_pid) {
+            log("wrapper PID gone; entering SIGNAL_SHUTDOWN (wrapper-monitor)");
             signal_shutdown(backend, clock, cfg, &mut log);
             return Outcome::SignalShutdown;
         }
@@ -101,6 +118,17 @@ pub fn run<B: PodmanBackend, C: Clock, L: FnMut(&str)>(
             }
         }
         clock.sleep(cfg.poll_interval);
+    }
+}
+
+/// Reduce "optional wrapper PID + probe" to a single boolean wake-input
+/// for the poll loop. Returns `false` when no PID was configured so
+/// the loop's decision table stays the same shape with and without
+/// the wrapper-monitor enabled.
+fn wrapper_gone<P: ProcessProbe>(probe: &P, pid: Option<u32>) -> bool {
+    match pid {
+        None => false,
+        Some(p) => !probe.is_alive(p),
     }
 }
 
@@ -202,7 +230,7 @@ fn ceil_ticks(idle: Duration, poll: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{FakeClock, MockBackend};
+    use crate::testing::{FakeClock, MockBackend, MockProcessProbe};
 
     fn cfg(poll_secs: u64, idle_secs: u64) -> PollConfig {
         PollConfig {
@@ -211,7 +239,22 @@ mod tests {
             idle_shutdown: Duration::from_secs(idle_secs),
             secondary_grace: Duration::from_secs(5),
             container_stop_grace: Duration::from_secs(10),
+            wrapper_pid: None,
         }
+    }
+
+    fn cfg_with_wrapper(poll_secs: u64, idle_secs: u64, pid: u32) -> PollConfig {
+        PollConfig {
+            wrapper_pid: Some(pid),
+            ..cfg(poll_secs, idle_secs)
+        }
+    }
+
+    /// Default probe used by tests that don't exercise the wrapper-
+    /// monitor branch — always reports alive so the probe path is a
+    /// no-op.
+    fn always_alive() -> MockProcessProbe {
+        MockProcessProbe::always_alive()
     }
 
     #[test]
@@ -244,7 +287,7 @@ mod tests {
         let clock = FakeClock::new();
         // Inject a side-effect on the 5th sleep to set the flag.
         clock.set_on_sleep(5, flag.clone());
-        let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+        let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::SignalShutdown);
     }
 
@@ -256,7 +299,7 @@ mod tests {
         backend.script_exists(vec![true, false, false, false]);
         let flag = ShutdownFlag::new();
         let clock = FakeClock::new();
-        let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+        let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::IdleShutdown);
         assert!(backend.rm_all_called());
     }
@@ -271,7 +314,7 @@ mod tests {
         let flag = ShutdownFlag::new();
         flag.set_for_test();
         let clock = FakeClock::new();
-        let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+        let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::SignalShutdown);
         let calls = backend.calls();
         assert!(
@@ -299,7 +342,7 @@ mod tests {
         let flag = ShutdownFlag::new();
         flag.set_for_test();
         let clock = FakeClock::new();
-        let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+        let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::SignalShutdown);
         let calls = backend.calls();
         assert!(
@@ -326,7 +369,7 @@ mod tests {
         let flag = ShutdownFlag::new();
         flag.set_for_test();
         let clock = FakeClock::new();
-        let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+        let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::SignalShutdown);
         let calls = backend.calls();
         assert!(
@@ -343,7 +386,7 @@ mod tests {
         let flag = ShutdownFlag::new();
         flag.set_for_test();
         let clock = FakeClock::new();
-        let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+        let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
         assert_eq!(outcome, Outcome::SignalShutdown);
         let calls = backend.calls();
         assert!(
@@ -360,6 +403,116 @@ mod tests {
             calls.contains(&"rm_all".to_string()),
             "rm_all still runs; calls: {:?}",
             calls
+        );
+    }
+
+    // ----------- wrapper-monitor (third wake input) ----------------
+
+    /// When `wrapper_pid` is `None`, the probe is never consulted —
+    /// even a probe that would lie about the world has no effect.
+    /// Encodes the backward-compat contract for callers that haven't
+    /// opted in.
+    #[test]
+    fn wrapper_monitor_inert_when_pid_none() {
+        let backend = MockBackend::new();
+        // Sighting on tick 1, then absent forever → fall through to
+        // IDLE_SHUTDOWN exactly as today.
+        backend.script_exists(vec![true, false, false, false]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        // Probe says "always dead" — must be IGNORED when pid is None.
+        let probe = MockProcessProbe::always_dead();
+        let outcome = run(&backend, &flag, &clock, &probe, &cfg(2, 4), |_| {});
+        assert_eq!(
+            outcome,
+            Outcome::IdleShutdown,
+            "wrapper_pid=None ⇒ probe must not affect loop outcome"
+        );
+    }
+
+    /// Wrapper alive for the first few ticks, then dead ⇒ the loop
+    /// must enter SIGNAL_SHUTDOWN on the tick the probe flips, NOT
+    /// wait for IDLE_SHUTDOWN's grace. Container is "present" the
+    /// whole time (mimicking orphan-conmon survival post-SLURM-TERM)
+    /// so the idle path can never trigger.
+    #[test]
+    fn wrapper_death_triggers_signal_shutdown() {
+        let backend = MockBackend::new();
+        // Container present for as long as the loop runs (>= 5 ticks).
+        backend.script_exists(vec![true; 32]);
+        // After SIGNAL_SHUTDOWN enters, the branch calls
+        // `exec_pgrep_first_child` — script one return so the
+        // in-container kill path is exercised.
+        backend.script_pgrep(vec![Some(7)]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        // Alive on ticks 1..=3, dead from tick 4 onwards.
+        let probe = MockProcessProbe::script(vec![true, true, true, false]);
+        let outcome = run(&backend, &flag, &clock, &probe, &cfg_with_wrapper(2, 30, 4242), |_| {});
+        assert_eq!(outcome, Outcome::SignalShutdown);
+        let calls = backend.calls();
+        // Signal-shutdown body must have run: rm_all is its terminal step.
+        assert!(
+            calls.contains(&"rm_all".to_string()),
+            "SIGNAL_SHUTDOWN cleanup must run on wrapper-gone; calls: {:?}",
+            calls
+        );
+        // The flag was NEVER set in this scenario — proves the wake
+        // came from the probe, not from signals.
+        assert!(!flag.is_set(), "flag must remain clear in wrapper-monitor wake path");
+    }
+
+    /// If the wrapper is already gone at the very first tick — e.g.
+    /// the wrapper died between spawn and the manager's first poll —
+    /// SIGNAL_SHUTDOWN must still fire (no "saw_once" gating, no
+    /// extra grace).
+    #[test]
+    fn wrapper_already_dead_at_entry_triggers_signal_shutdown() {
+        let backend = MockBackend::new();
+        backend.script_exists(vec![true; 8]);
+        backend.script_pgrep(vec![None]);
+        let flag = ShutdownFlag::new();
+        let clock = FakeClock::new();
+        let probe = MockProcessProbe::always_dead();
+        let outcome = run(&backend, &flag, &clock, &probe, &cfg_with_wrapper(2, 30, 4242), |_| {});
+        assert_eq!(outcome, Outcome::SignalShutdown);
+        assert!(backend.calls().contains(&"rm_all".to_string()));
+    }
+
+    /// The shutdown-flag path must STILL win when both flag and
+    /// wrapper-gone fire on the same tick. (Both end at the same
+    /// cleanup body, so this is mostly a log-ordering assertion —
+    /// but the flag check sits first deliberately to preserve the
+    /// "operator-initiated" log line over the "wrapper-monitor" one
+    /// when an operator triggered shutdown.)
+    #[test]
+    fn flag_check_precedes_wrapper_check_when_both_fire() {
+        let backend = MockBackend::new();
+        backend.script_exists(vec![true; 4]);
+        backend.script_pgrep(vec![Some(1)]);
+        let flag = ShutdownFlag::new();
+        flag.set_for_test();
+        let clock = FakeClock::new();
+        let probe = MockProcessProbe::always_dead();
+        // Capture log lines to confirm which branch fired first.
+        let mut lines: Vec<String> = Vec::new();
+        let outcome = run(
+            &backend,
+            &flag,
+            &clock,
+            &probe,
+            &cfg_with_wrapper(2, 30, 4242),
+            |m| lines.push(m.to_string()),
+        );
+        assert_eq!(outcome, Outcome::SignalShutdown);
+        let first_branch_line = lines
+            .iter()
+            .find(|l| l.contains("SIGNAL_SHUTDOWN"))
+            .expect("a SIGNAL_SHUTDOWN log must appear");
+        assert!(
+            first_branch_line.contains("signal observed"),
+            "flag check must be evaluated before wrapper-monitor; got: {:?}",
+            lines
         );
     }
 }

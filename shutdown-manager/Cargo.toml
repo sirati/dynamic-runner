@@ -24,6 +24,11 @@ path = "src/lib.rs"
 # avoid pulling in optional integrations (channel, iterator, extended-siginfo).
 # We only need low_level::register.
 signal-hook = { version = "0.3", default-features = false }
+# libc is used by `process_probe::KillProbe` for `kill(pid, 0)` and
+# `__errno_location`. Already pulled in transitively by signal-hook;
+# declared explicitly here so the dependency edge is visible at the
+# crate boundary.
+libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 # Cross-platform temp dir for filesystem cleanup tests. Tiny crate, no proc-macros.

@@ -23,6 +23,13 @@ pub struct Config {
     pub idle_shutdown: Duration,
     pub secondary_grace: Duration,
     pub container_stop_grace: Duration,
+    /// Optional PID of the wrapper script that spawned this manager.
+    /// When set, the poll loop probes the PID each tick and triggers
+    /// SIGNAL_SHUTDOWN unconditionally on its disappearance — closing
+    /// the SLURM-TIMEOUT race where proctrack reaps the wrapper
+    /// before its signal trap can forward `systemctl --user kill`.
+    /// `None` (the default) preserves pre-monitor behaviour.
+    pub wrapper_pid: Option<u32>,
 }
 
 /// Default per the CLI contract.
@@ -44,6 +51,7 @@ struct Builder {
     idle_shutdown_secs: Option<u64>,
     secondary_grace_secs: Option<u64>,
     container_stop_grace_secs: Option<u64>,
+    wrapper_pid: Option<u32>,
 }
 
 impl Builder {
@@ -76,6 +84,7 @@ impl Builder {
                 self.container_stop_grace_secs
                     .unwrap_or(DEFAULT_CONTAINER_STOP_GRACE_SECS),
             ),
+            wrapper_pid: self.wrapper_pid,
         })
     }
 }
@@ -119,6 +128,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
             "--secondary-grace-secs" => b.secondary_grace_secs = Some(take_u64(&mut iter)?),
             "--container-stop-grace-secs" => {
                 b.container_stop_grace_secs = Some(take_u64(&mut iter)?)
+            }
+            "--wrapper-pid" => {
+                // PIDs are 1..pid_max on Linux; reuse take_u64 (which
+                // already rejects 0) and narrow to u32. Cast bounds:
+                // pid_max never exceeds 2^22; explicit overflow check
+                // keeps the contract honest if a caller passes garbage.
+                let n = take_u64(&mut iter)?;
+                let pid: u32 = n
+                    .try_into()
+                    .map_err(|_| format!("--wrapper-pid out of range: {}", n))?;
+                b.wrapper_pid = Some(pid);
             }
             other => return Err(format!("unknown flag: {}", other)),
         }
@@ -239,5 +259,47 @@ mod tests {
     fn flag_without_value_is_error() {
         let err = parse(argv(&["--container-name"])).unwrap_err();
         assert!(err.contains("requires a value"), "got: {}", err);
+    }
+
+    #[test]
+    fn wrapper_pid_defaults_to_none() {
+        let cfg = parse(minimal_required()).expect("must parse");
+        assert!(
+            cfg.wrapper_pid.is_none(),
+            "--wrapper-pid omitted ⇒ None (preserves pre-monitor behaviour)"
+        );
+    }
+
+    #[test]
+    fn wrapper_pid_parses_when_set() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--wrapper-pid", "12345"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(cfg.wrapper_pid, Some(12345));
+    }
+
+    #[test]
+    fn wrapper_pid_accepts_equals_form() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--wrapper-pid=99"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(cfg.wrapper_pid, Some(99));
+    }
+
+    #[test]
+    fn wrapper_pid_zero_rejected() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--wrapper-pid", "0"]));
+        let err = parse(args).unwrap_err();
+        assert!(err.contains("> 0"), "got: {}", err);
+    }
+
+    #[test]
+    fn wrapper_pid_overflow_rejected() {
+        // 2^32 = 4_294_967_296 is one past u32::MAX.
+        let mut args = minimal_required();
+        args.extend(argv(&["--wrapper-pid", "4294967296"]));
+        let err = parse(args).unwrap_err();
+        assert!(err.contains("out of range"), "got: {}", err);
     }
 }

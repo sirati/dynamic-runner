@@ -10,6 +10,7 @@
 
 use crate::clock::Clock;
 use crate::podman::PodmanBackend;
+use crate::process_probe::ProcessProbe;
 use crate::shutdown_flag::ShutdownFlag;
 use std::cell::RefCell;
 use std::path::Path;
@@ -139,6 +140,77 @@ impl Clock for FakeClock {
         match trigger {
             Some((target, flag)) if target == *n => flag.set_for_test(),
             _ => {}
+        }
+    }
+}
+
+/// Programmable [`ProcessProbe`]. Each `is_alive` call consumes one
+/// scripted boolean; past the end of the script the probe sticks at
+/// the final value (saturating) — this matches realistic semantics
+/// (once the wrapper has died, it stays dead).
+#[derive(Default)]
+pub struct MockProcessProbe {
+    script: RefCell<Vec<bool>>,
+    /// Saturating value once `script` is drained. Defaults to the
+    /// last popped value, falling back to `false` when nothing was
+    /// ever scripted.
+    last: RefCell<bool>,
+    calls: RefCell<u32>,
+}
+
+impl MockProcessProbe {
+    /// Construct a probe with a scripted sequence of `is_alive`
+    /// returns. After the script is drained the most recent value
+    /// is returned on every subsequent call.
+    pub fn script(values: Vec<bool>) -> Self {
+        let saturating = values.last().copied().unwrap_or(false);
+        Self {
+            script: RefCell::new(values),
+            last: RefCell::new(saturating),
+            calls: RefCell::new(0),
+        }
+    }
+
+    /// Probe that always reports the wrapper as alive — the test
+    /// default for paths that do not exercise the wrapper-monitor
+    /// branch.
+    pub fn always_alive() -> Self {
+        Self {
+            script: RefCell::new(Vec::new()),
+            last: RefCell::new(true),
+            calls: RefCell::new(0),
+        }
+    }
+
+    /// Probe that always reports the wrapper as dead — used to
+    /// drive the SIGNAL_SHUTDOWN branch from the wrapper-monitor.
+    pub fn always_dead() -> Self {
+        Self {
+            script: RefCell::new(Vec::new()),
+            last: RefCell::new(false),
+            calls: RefCell::new(0),
+        }
+    }
+
+    /// Number of times the loop has asked us — useful for asserting
+    /// the probe was consulted (or NOT consulted, in the `pid=None`
+    /// inertness test).
+    pub fn calls(&self) -> u32 {
+        *self.calls.borrow()
+    }
+}
+
+impl ProcessProbe for MockProcessProbe {
+    fn is_alive(&self, _pid: u32) -> bool {
+        *self.calls.borrow_mut() += 1;
+        let mut script = self.script.borrow_mut();
+        match script.is_empty() {
+            true => *self.last.borrow(),
+            false => {
+                let v = script.remove(0);
+                *self.last.borrow_mut() = v;
+                v
+            }
         }
     }
 }
