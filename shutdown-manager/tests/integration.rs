@@ -86,6 +86,13 @@ fn idle_shutdown_after_grace_following_sighting() {
     let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(outcome, Outcome::IdleShutdown);
     assert!(backend.rm_all_called());
+    assert!(
+        backend.unmount_all_called(),
+        "SIGNAL_SHUTDOWN must invoke unmount --all after rm -af to flush \
+         residual fuse-overlayfs mountpoints (asm-tokenizer 2026-05-18 \
+         12:05 on a70d3bf — 40K residue per prefix from dead FUSE \
+         mount that rm -af did not flush)"
+    );
 }
 
 /// Test 5: idle-shutdown does NOT fire if the container never appeared.
@@ -234,6 +241,11 @@ fn mock_records_call_order() {
         // deciding whether to call `stop`.
         "container_exists(ctr) -> false".to_string(),
         "rm_all".to_string(),
+        // unmount --all immediately after rm -af, BEFORE the
+        // cleanup walk would run. Flushes residual fuse-overlayfs
+        // mountpoints under SLURM TIMEOUT (peer asm-tokenizer
+        // 2026-05-18 12:05).
+        "unmount_all".to_string(),
     ];
     assert_eq!(calls, want, "exact call order mismatch");
 }
