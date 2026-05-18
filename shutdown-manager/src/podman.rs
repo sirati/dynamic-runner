@@ -50,23 +50,38 @@ pub trait PodmanBackend {
     /// root, releasing layer references. Idempotent.
     fn rm_all(&self) -> bool;
 
-    /// `<rm-path> <abs-path> -rf` — host-side recursive remove of
-    /// the tmp tree. Despite the surrounding podman primitives,
-    /// this one does NOT use `podman unshare`: the cleanup target
-    /// is a host-UID-owned tree (rootless podman never writes
-    /// subuid-owned content under the SLURM-TIMEOUT shape the
-    /// shutdown manager handles — empirically confirmed by peer
-    /// asm-tokenizer 2026-05-18 12:20 with `findmnt` showing zero
-    /// kernel mounts and `ls -la` showing only the kruppb-owned
-    /// regular dirs the storage driver pre-creates as metadata).
+    /// `podman unshare <rm-path> <abs-path> -rf` — recursive
+    /// remove of the tmp tree via a rootless-podman user-namespace
+    /// where kruppb maps to uid 0. The unshare invocation is
+    /// **without** `--root`/`--runroot`: the userns entry is what
+    /// we need; the storage-driver context is not.
     ///
-    /// The previous `podman --root=X unshare rm X -rf` shape
-    /// failed with `EBUSY: Device or resource busy` on `X/storage/
-    /// overlay` because the unshare's storage driver (initialized
-    /// via `--root=X`) holds an internal lock on its own root
-    /// directory — a podman-internal busy state, not a kernel
-    /// mount. Dropping the unshare drops the lock; host rm
-    /// proceeds and the tree clears.
+    /// Why not plain host `rm`: rootless-podman overlay storage
+    /// contains nix-store-pattern read-only directories (mode
+    /// `r-xr-xr-x` even on dirs owned by kruppb). `unlinkat(2)`
+    /// requires write permission on the *parent directory* of the
+    /// entry being removed; host kruppb lacks that write bit and
+    /// gets EACCES. Inside `podman unshare`, kruppb maps to uid 0,
+    /// which bypasses the dir-write-bit via `CAP_DAC_OVERRIDE`
+    /// (empirically confirmed by peer asm-tokenizer 2026-05-18
+    /// 12:37 — bare `rm /tmp/asm-XXX -rf` EACCES'd on
+    /// `nix/store/.../libtsan.so.2.0.0`; `podman unshare rm
+    /// /tmp/asm-XXX -rf` cleared the same residue cleanly).
+    ///
+    /// Why no `--root`/`--runroot`: the earlier shape
+    /// `podman --root=X --runroot=Y unshare rm X -rf` failed with
+    /// `EBUSY: Device or resource busy` on `X/storage/overlay`
+    /// because the unshare's storage driver — initialized exactly
+    /// because we passed `--root=X` — holds an internal lock on
+    /// its own root directory. Dropping those flags eliminates the
+    /// busy-lock without losing the userns entry: the userns
+    /// mapping comes from `containers.conf` defaults and rootless-
+    /// podman state, not from `--root`.
+    ///
+    /// Net argv: `podman unshare <rm-path> <abs-path> -rf`. Built
+    /// from a fresh `Command::new(&self.podman_path)` — NOT the
+    /// `self.cmd()` helper that prepends `--root`/`--runroot`/
+    /// `--cgroup-manager`, because we explicitly do NOT want those.
     ///
     /// HARD SAFETY CONTRACT (enforced by [`validate_safe_tmp_path`]
     /// inside [`RealPodman::remove_tmp_tree`], invoked before exec).
@@ -115,12 +130,15 @@ pub trait PodmanBackend {
 /// would ENOENT (asm-tokenizer 2026-05-18 at 17481c4 for rm;
 /// earlier for podman).
 ///
-/// `rm_path` is invoked DIRECTLY (`Command::new(&self.rm_path)`),
-/// not through `podman unshare`. The unshare-wrapped invocation
-/// failed with `EBUSY` because the unshare's storage driver
-/// (initialized via `--root=<prefix>/storage`) holds an internal
-/// lock on its own root directory. See [`PodmanBackend::remove_tmp_tree`]
-/// doc for the full evidence trail.
+/// `rm_path` is invoked THROUGH `podman unshare` (no
+/// `--root`/`--runroot`) — the user-namespace gives kruppb uid-0
+/// inside which is what lets `unlinkat(2)` clear the rootless-
+/// podman overlay tree (nix-store-pattern `r-xr-xr-x` parent dirs
+/// block plain host rm via EACCES; uid-0-via-`CAP_DAC_OVERRIDE`
+/// bypasses the dir-write-bit). Dropping `--root`/`--runroot` is
+/// what fixes the prior storage-driver-busy lock; see
+/// [`PodmanBackend::remove_tmp_tree`] doc for the full evidence
+/// trail.
 #[derive(Debug, Clone)]
 pub struct RealPodman {
     podman_path: PathBuf,
@@ -255,18 +273,28 @@ impl PodmanBackend for RealPodman {
         // symlink chain in the input has been collapsed, so the
         // recursion target is the actual on-disk tree.
         let canonical = validate_safe_tmp_path(path)?;
-        // Direct host `rm`, NOT routed through `podman unshare`.
-        // `self.rm_path` is the absolute path resolved once by the
-        // wrapper at startup (see RealPodman doc). Reused verbatim
-        // every call — no exec-time PATH lookup.
+        // `podman unshare <rm> <path> -rf` WITHOUT `--root`/
+        // `--runroot`. Both binary paths are absolute (resolved by
+        // the wrapper at startup; see RealPodman doc). The
+        // `self.cmd()` helper deliberately is NOT used here: that
+        // helper prepends `--root=<storage>`/`--runroot=<run>`/
+        // `--cgroup-manager=cgroupfs`, and those are what caused
+        // the storage-driver-busy lock on `<prefix>/storage/overlay`
+        // in the earlier shape (a70d3bf/62f3ffb). The userns entry
+        // we need comes from rootless-podman defaults, not from
+        // those flags.
         //
-        // Argv shape: `<rm-path> <canonical> -rf`. Path BEFORE flags
-        // per the trait-doc safety contract: a dropped path slot
-        // leaves `rm -rf` with no operand (safe failure) rather than
-        // letting `-rf` survive into a position that could attach to
-        // a different operand if argv composition ever changes.
-        let mut c = Command::new(&self.rm_path);
-        c.arg(&canonical).arg("-rf");
+        // Argv shape: `unshare <rm-path> <canonical> -rf`. Path
+        // BEFORE flags per the trait-doc safety contract: a
+        // dropped path slot leaves `rm -rf` with no operand (safe
+        // failure) rather than letting `-rf` survive into a
+        // position that could attach to a different operand if
+        // argv composition ever changes.
+        let mut c = Command::new(&self.podman_path);
+        c.arg("unshare")
+            .arg(&self.rm_path)
+            .arg(&canonical)
+            .arg("-rf");
         Self::run_capture_stderr(c)
     }
 }
