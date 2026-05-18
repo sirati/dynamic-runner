@@ -6,10 +6,14 @@
 //! Tests use [`MockBackend`] in `tests/common`, never spawning real
 //! podman processes.
 //!
-//! Errors are intentionally collapsed to `bool` at the trait surface:
-//! every caller in this binary treats podman failure as "best effort,
-//! move on" — surfacing typed error info upward would only be ignored
-//! and inflate the binary.
+//! Errors are intentionally collapsed to `bool` at the trait surface
+//! for the *signalling* methods (`kill_pid1`, `stop`, `rm_all`, ...):
+//! every caller in this binary treats those failures as "best effort,
+//! move on". The exception is [`PodmanBackend::unshare_remove`], whose
+//! caller (`cleanup::remove_tmp_prefix`) needs the captured stderr in
+//! the manager's log to diagnose why `/tmp/asm-*` cleanup fails — it
+//! therefore returns `Result<(), String>` with stderr/argv/exit packed
+//! into the error string.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -48,7 +52,13 @@ pub trait PodmanBackend {
     /// where the storage subuids are owned and remove a directory
     /// tree. Required because subuid-owned files under `<tmp>/storage`
     /// are not unlinkable by the host UID alone.
-    fn unshare_remove(&self, path: &Path) -> bool;
+    ///
+    /// On failure returns `Err(stderr)` where the string carries the
+    /// captured stderr plus the argv and exit status — this is the
+    /// only podman call whose failure we actively diagnose, since
+    /// `/tmp/asm-*` directories silently piling up on workers is a
+    /// real recurring symptom and the next repro must tell us why.
+    fn unshare_remove(&self, path: &Path) -> Result<(), String>;
 }
 
 /// Production backend. Holds the storage/runroot prefix so callers do
@@ -87,6 +97,29 @@ impl RealPodman {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         matches!(cmd.status(), Ok(s) if s.success())
+    }
+
+    /// Run a command capturing stderr (stdout/stdin still nulled).
+    /// `Ok(())` on exit-0; `Err(diag)` otherwise, where `diag` packs
+    /// argv (debug-formatted — may include shell-unsafe chars, fine
+    /// for a log line but not for replay), exit status, and the
+    /// captured stderr decoded best-effort as UTF-8 via
+    /// `String::from_utf8_lossy`.
+    fn run_capture_stderr(mut cmd: Command) -> Result<(), String> {
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        let argv = format!("{:?}", cmd);
+        match cmd.output() {
+            Ok(out) => match out.status.success() {
+                true => Ok(()),
+                false => Err(format!(
+                    "argv: {}; exit={}; stderr: {}",
+                    argv,
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim_end()
+                )),
+            },
+            Err(e) => Err(format!("argv: {}; spawn-error: {}", argv, e)),
+        }
     }
 }
 
@@ -148,10 +181,10 @@ impl PodmanBackend for RealPodman {
         Self::run_silent(c)
     }
 
-    fn unshare_remove(&self, path: &Path) -> bool {
+    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
         let mut c = self.cmd();
         c.arg("unshare").arg("rm").arg("-rf").arg(path);
-        Self::run_silent(c)
+        Self::run_capture_stderr(c)
     }
 }
 
