@@ -25,9 +25,8 @@ pub struct MockBackend {
     calls: RefCell<Vec<String>>,
     exists_script: RefCell<Vec<bool>>,
     pgrep_script: RefCell<Vec<Option<u32>>>,
-    unshare_script: RefCell<Vec<bool>>,
+    remove_script: RefCell<Vec<bool>>,
     rm_all_called: RefCell<bool>,
-    unmount_all_called: RefCell<bool>,
 }
 
 impl MockBackend {
@@ -41,8 +40,8 @@ impl MockBackend {
     pub fn script_pgrep(&self, results: Vec<Option<u32>>) {
         *self.pgrep_script.borrow_mut() = results;
     }
-    pub fn script_unshare(&self, results: Vec<bool>) {
-        *self.unshare_script.borrow_mut() = results;
+    pub fn script_remove(&self, results: Vec<bool>) {
+        *self.remove_script.borrow_mut() = results;
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -50,9 +49,6 @@ impl MockBackend {
     }
     pub fn rm_all_called(&self) -> bool {
         *self.rm_all_called.borrow()
-    }
-    pub fn unmount_all_called(&self) -> bool {
-        *self.unmount_all_called.borrow()
     }
 
     fn record(&self, s: impl Into<String>) {
@@ -102,14 +98,9 @@ impl PodmanBackend for MockBackend {
         self.record("rm_all".to_string());
         true
     }
-    fn unmount_all(&self) -> bool {
-        *self.unmount_all_called.borrow_mut() = true;
-        self.record("unmount_all".to_string());
-        true
-    }
-    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
-        let r = Self::pop_bool(&self.unshare_script);
-        self.record(format!("unshare_remove({}) -> {}", path.display(), r));
+    fn remove_tmp_tree(&self, path: &Path) -> Result<(), String> {
+        let r = Self::pop_bool(&self.remove_script);
+        self.record(format!("remove_tmp_tree({}) -> {}", path.display(), r));
         match r {
             true => Ok(()),
             false => Err("mock-failure".to_string()),
