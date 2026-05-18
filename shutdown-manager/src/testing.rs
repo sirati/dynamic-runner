@@ -98,10 +98,13 @@ impl PodmanBackend for MockBackend {
         self.record("rm_all".to_string());
         true
     }
-    fn unshare_remove(&self, path: &Path) -> bool {
+    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
         let r = Self::pop_bool(&self.unshare_script);
         self.record(format!("unshare_remove({}) -> {}", path.display(), r));
-        r
+        match r {
+            true => Ok(()),
+            false => Err("mock-failure".to_string()),
+        }
     }
 }
 

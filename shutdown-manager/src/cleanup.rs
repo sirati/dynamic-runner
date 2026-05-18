@@ -55,9 +55,12 @@ fn remove_tmp_prefix<B: PodmanBackend, L: FnMut(&str)>(
                 tmp_prefix.display()
             ));
             match backend.unshare_remove(tmp_prefix) {
-                true => log("tmp-prefix removed via unshare"),
-                false => {
-                    log("podman unshare rm failed; falling back to host rm -rf");
+                Ok(()) => log("tmp-prefix removed via unshare"),
+                Err(stderr) => {
+                    log(&format!(
+                        "podman unshare rm failed; falling back to host rm -rf. stderr: {}",
+                        stderr
+                    ));
                     fallback_remove(tmp_prefix, log);
                 }
             }
@@ -111,14 +114,24 @@ mod tests {
     use std::cell::RefCell;
 
     struct FakeBackend {
-        unshare_ok: bool,
+        unshare_result: Result<(), String>,
         calls: RefCell<Vec<String>>,
     }
 
     impl FakeBackend {
         fn new(unshare_ok: bool) -> Self {
             Self {
-                unshare_ok,
+                unshare_result: match unshare_ok {
+                    true => Ok(()),
+                    false => Err("mock-failure".to_string()),
+                },
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_stderr(stderr: &str) -> Self {
+            Self {
+                unshare_result: Err(stderr.to_string()),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -143,11 +156,11 @@ mod tests {
         fn rm_all(&self) -> bool {
             unreachable!()
         }
-        fn unshare_remove(&self, p: &Path) -> bool {
+        fn unshare_remove(&self, p: &Path) -> Result<(), String> {
             self.calls
                 .borrow_mut()
                 .push(format!("unshare_remove({})", p.display()));
-            self.unshare_ok
+            self.unshare_result.clone()
         }
     }
 
@@ -219,6 +232,22 @@ mod tests {
         );
         assert!(
             logs.iter().any(|l| l.contains("removed via unshare")),
+            "logs: {:?}",
+            logs
+        );
+    }
+
+    #[test]
+    fn unshare_failure_logs_stderr_in_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("asm-xxx");
+        fs::create_dir(&tmp).unwrap();
+        let backend = FakeBackend::with_stderr("subuid mapping not found");
+        let mut logs: Vec<String> = Vec::new();
+        remove_tmp_prefix(&backend, &tmp, &mut |m| logs.push(m.to_string()));
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("stderr: subuid mapping not found")),
             "logs: {:?}",
             logs
         );
