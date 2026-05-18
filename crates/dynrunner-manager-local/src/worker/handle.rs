@@ -627,6 +627,42 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
         }
     }
 
+    /// Abort the background poll task (if any) so it cannot emit
+    /// further [`WorkerEvent`]s on the pool's shared event channel.
+    ///
+    /// # Single concern
+    ///
+    /// The slot is about to be replaced (OOM-restart, type-shift
+    /// respawn): the manager is moving on, the prior subprocess is
+    /// dead or being killed, and any event the orphan `poll_task`
+    /// might still emit (a buffered `Response::Completed` read from
+    /// the closing pipe, a `Disconnected` synthesised from pipe-EOF
+    /// after `kill_subprocess`) would land on the pool's `event_tx`
+    /// with the original `worker_id` and be processed by the
+    /// secondary's `handle_worker_event` AS IF it came from the
+    /// fresh subprocess — but the secondary has already removed the
+    /// killed task from `active_tasks`, so the lookup misses and
+    /// the event surfaces as `task done task_hash=None` (the
+    /// observed wedge symptom).
+    ///
+    /// `JoinHandle::abort` cancels the spawned task at its next
+    /// await point; the protocol state it was driving is forfeited
+    /// (the slot is being replaced anyway, so the prior protocol
+    /// state is no longer needed). The `tx` clone the task held
+    /// drops with the task, so no further events can be sent. The
+    /// `WorkerHandle` itself is unchanged from the caller's
+    /// perspective; the pool's replacement code follows with the
+    /// usual `kill_subprocess` + new-handle assignment.
+    ///
+    /// Idempotent: no-op when `poll_task` is `None` (the slot was
+    /// not in a Transitioning state, or `reclaim_protocol` already
+    /// took the handle).
+    pub fn abort_poll_task(&mut self) {
+        if let Some(handle) = self.poll_task.take() {
+            handle.abort();
+        }
+    }
+
     /// Clear current task metadata (after completion or OOM kill).
     pub fn clear_task(&mut self) {
         self.current_binary = None;
