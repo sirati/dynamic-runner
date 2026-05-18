@@ -9,13 +9,20 @@
 //! here is to spawn it under one of two cgroup-escape primitives,
 //! picked at runtime by the rendered bash:
 //!
-//!   1. `systemd-run --user --scope` (preferred) — manager inherits
-//!      the user's `user@<uid>.service` cgroup, NOT the slurmd job
-//!      cgroup. Requires a reachable user-systemd bus socket.
+//!   1. `systemd-run --user --unit=<name>` (preferred, service mode)
+//!      — manager inherits the user's `user@<uid>.service` cgroup,
+//!      NOT the slurmd job cgroup. Requires a reachable user-systemd
+//!      bus socket. Service mode (no `--scope`) is used because
+//!      systemd-run blocks until registration completes and returns
+//!      the actual exit code synchronously; the prior scope-mode +
+//!      `&` pattern was racy under SLURM TIMEOUT (could reap a
+//!      still-handshaking systemd-run before the scope was ever
+//!      registered — silent no-op, asm-tokenizer 2026-05-18).
 //!   2. `setsid -f` (fallback) — manager runs in a new session
-//!      inside the slurmd job cgroup. Used when the user-bus probe
-//!      fails (no `loginctl enable-linger`, stripped
-//!      XDG_RUNTIME_DIR). Cgroup escape is lost but the manager
+//!      inside the slurmd job cgroup. Used when (a) the user-bus
+//!      probe fails (no `loginctl enable-linger`, stripped
+//!      XDG_RUNTIME_DIR) OR (b) the bus is present but service
+//!      registration fails. Cgroup escape is lost but the manager
 //!      binary at least starts and reacts to graceful exits.
 //!
 //! The replaced pre-2026-05 `setsid -f bash` inline watchdog is
@@ -60,16 +67,29 @@ fn renders_shutdown_manager_spawn_when_path_set() {
     let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
 
     assert!(
-        script.contains("systemd-run --user --scope"),
-        "spawn block must use `systemd-run --user --scope` so the \
-         manager inherits the user's `user@<uid>.service` cgroup \
-         (NOT the slurmd job cgroup); render did not contain it"
+        script.contains("systemd-run --user --quiet"),
+        "spawn block must use `systemd-run --user --quiet` (service \
+         mode, no `--scope`) so the manager inherits the user's \
+         `user@<uid>.service` cgroup AND so the invocation blocks \
+         synchronously until registration completes (no `&`-race \
+         vs. SLURM TIMEOUT); render did not contain it"
+    );
+    // Regression guard: --scope must NOT appear. Scope mode is the
+    // racy pattern we're moving away from.
+    assert!(
+        !script.contains("systemd-run --user --scope"),
+        "spawn block must NOT use `systemd-run --user --scope`: scope \
+         mode forces a foreground wait that requires `&` to background, \
+         and the bus-registration handshake is racy w.r.t. SLURM TIMEOUT \
+         (asm-tokenizer 2026-05-18: 2/4 workers silent no-op under \
+         forced timeout). Service mode (--unit only) blocks until \
+         registered."
     );
     // The unit name is the rnd_suffix-based scope; the prefix
     // alone is a reliable substring.
     assert!(
         script.contains("--unit=\"$SHUTDOWN_SCOPE\""),
-        "spawn block must address the scope by `--unit=$SHUTDOWN_SCOPE` so \
+        "spawn block must address the unit by `--unit=$SHUTDOWN_SCOPE` so \
          `systemctl --user kill` can later target it; render did not contain it"
     );
     // Bin path appears verbatim (bash_quote keeps safe ASCII paths
@@ -120,16 +140,23 @@ fn renders_shutdown_manager_spawn_when_path_set() {
          choosing the systemd-run path; render did not contain the -S probe"
     );
     assert!(
-        script.contains("XDG_RUNTIME_DIR=\"$SYSTEMD_USER_RUNTIME_DIR\" systemd-run --user --scope"),
+        script.contains(
+            "XDG_RUNTIME_DIR=\"$SYSTEMD_USER_RUNTIME_DIR\" systemd-run --user --quiet"
+        ),
         "systemd-run invocation must be prefixed with \
          `XDG_RUNTIME_DIR=$SYSTEMD_USER_RUNTIME_DIR` so the bus client \
          reads the captured user-runtime dir, not podman's override; \
          render did not contain the prefix"
     );
+    // The setsid fallback is now reached via the post-systemd-run
+    // `if [ -z "$SHUTDOWN_MODE" ]` guard (so it also catches a
+    // registration-failure return-non-zero from systemd-run, not
+    // only a missing bus). Prior shape was an `elif`.
     assert!(
-        script.contains("elif command -v setsid >/dev/null 2>&1; then"),
-        "spawn block must fall back to `setsid -f` when the user-bus is \
-         unreachable; render did not contain the setsid elif"
+        script.contains("if [ -z \"$SHUTDOWN_MODE\" ] && command -v setsid >/dev/null 2>&1; then"),
+        "spawn block must fall back to `setsid -f` when systemd-run is \
+         not chosen OR fails registration (via `[ -z $SHUTDOWN_MODE ]` \
+         re-entry); render did not contain the fallback guard"
     );
     assert!(
         script.contains("setsid -f"),
@@ -150,10 +177,10 @@ fn renders_shutdown_manager_spawn_when_path_set() {
         "setsid fallback must read the manager pid from its pid-file; \
          render did not contain the read"
     );
-    // Bus-absent warning is rendered (the operator-facing diagnostic
-    // when the cgroup-escape downgrade kicks in).
+    // Cgroup-escape-downgrade warning is rendered (the operator-
+    // facing diagnostic when the fallback kicks in).
     assert!(
-        script.contains("WARNING: no user-systemd bus"),
+        script.contains("WARNING: shutdown manager running under setsid"),
         "setsid fallback must emit a stderr warning explaining the \
          cgroup-escape downgrade; render did not contain it"
     );
@@ -165,7 +192,98 @@ fn renders_shutdown_manager_spawn_when_path_set() {
     assert_bash_syntax_ok(&script);
 }
 
-/// The dispatch is RUNTIME (bash if/elif), not render-time. Both
+/// Service-mode requires three `--property=` overrides:
+///   - `Restart=no` so systemd doesn't auto-restart the manager
+///     after it intentionally exits at cleanup completion.
+///   - `StandardOutput=append:<LOG>` and `StandardError=append:<LOG>`
+///     so the spawned binary's stdio (now owned by systemd, not the
+///     wrapper shell) lands in the same per-job log file the
+///     cleanup-trap diagnostics expect.
+///
+/// AND: no `&` follows the systemd-run invocation — regression
+/// guard against re-introducing the scope-mode race (systemd-run in
+/// scope mode is foreground-blocking on CMD's lifetime; backgrounding
+/// with `&` puts the bus-registration handshake into a race with
+/// SLURM TIMEOUT proctrack reaping).
+#[test]
+fn service_mode_renders_with_required_properties() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+
+    assert!(
+        script.contains("--property=Restart=no"),
+        "service-mode unit must set Restart=no so systemd does not \
+         auto-restart the manager after its intentional post-cleanup \
+         exit; render did not contain the property"
+    );
+    assert!(
+        script.contains("--property=\"StandardOutput=append:$SHUTDOWN_LOG_PATH\""),
+        "service-mode unit must route stdout to the manager log via \
+         StandardOutput=append (systemd owns the spawned binary's fds \
+         in service mode; the wrapper shell's `>>LOG` no longer applies); \
+         render did not contain it"
+    );
+    assert!(
+        script.contains("--property=\"StandardError=append:$SHUTDOWN_LOG_PATH\""),
+        "service-mode unit must route stderr to the manager log via \
+         StandardError=append; render did not contain it"
+    );
+    // No `&` after the systemd-run invocation. Service mode is
+    // synchronous; backgrounding would re-introduce the race that
+    // this whole change exists to fix. The substring we look for
+    // is the closing of the systemd-run continuation block (right
+    // before the bash `; then`) — if a `&` snuck in there it
+    // would appear immediately before `; then`.
+    assert!(
+        !script.contains("--wrapper-pid \"$$\" &"),
+        "systemd-run must NOT be backgrounded with `&` in service \
+         mode — that would re-introduce the scope-mode race the \
+         service-mode switch was meant to fix; render contained the `&`"
+    );
+}
+
+/// The setsid fallback must remain reachable when systemd-run
+/// REGISTRATION fails (non-zero exit from the synchronous
+/// systemd-run invocation), not only when the bus probe fails.
+/// This is the structural reason for moving from `if/elif` to
+/// `if + if [ -z "$SHUTDOWN_MODE" ]` — the elif could only catch
+/// the bus-absent case; the post-guarded second `if` also catches
+/// systemd-run registration-failure (bus reachable, but unit-name
+/// collision / property rejected / transient PID1 issue).
+#[test]
+fn setsid_fallback_reachable_on_systemd_run_failure() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+
+    // The systemd-run invocation is wrapped in `if … ; then SHUTDOWN_MODE=systemd; else ...`.
+    // On the failure branch we must clear SHUTDOWN_SCOPE so the
+    // cleanup forward's `[ -n "$SHUTDOWN_SCOPE" ]` guard skips a
+    // dangling unit name, and we must NOT set SHUTDOWN_MODE so the
+    // subsequent `[ -z $SHUTDOWN_MODE ]` re-entry into setsid fires.
+    assert!(
+        script.contains("SYSTEMD_RUN_RC=$?"),
+        "systemd-run failure branch must capture the exit code into \
+         SYSTEMD_RUN_RC for the operator-facing warning; render did \
+         not contain the capture"
+    );
+    assert!(
+        script.contains("WARNING: systemd-run --user --unit failed"),
+        "systemd-run failure branch must emit a stderr WARNING with \
+         the exit code; render did not contain it"
+    );
+    assert!(
+        script.contains("if [ -z \"$SHUTDOWN_MODE\" ] && command -v setsid >/dev/null 2>&1; then"),
+        "spawn block must re-enter the setsid fallback via \
+         `if [ -z $SHUTDOWN_MODE ]` AFTER the systemd-run if/else \
+         (so registration failure — not only bus-absent — falls \
+         through); render did not contain the re-entry guard"
+    );
+}
+
+/// The dispatch is RUNTIME (two sequential bash `if`s linked by an
+/// `[ -z $SHUTDOWN_MODE ]` re-entry guard), not render-time. Both
 /// branches must appear in every render with the bin path set, so
 /// the runtime probe has a target to dispatch into.
 #[test]
@@ -175,19 +293,18 @@ fn setsid_fallback_branch_renders_when_systemd_bus_missing() {
     let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
 
     // Both the systemd-run and the setsid -f primitives are rendered
-    // once each; the bash if/elif at runtime picks one. A render-time
+    // once each; the bash if/if at runtime picks one. A render-time
     // collapse to a single primitive would be a regression. Match on
     // a substring that's unique to the actual invocation (NOT the
     // narrative comments/echoes that also mention each primitive).
-    let systemd_count = script
-        .matches("systemd-run --user --scope --quiet --collect --unit=")
-        .count();
+    let systemd_count = script.matches("systemd-run --user --quiet \\").count();
     let setsid_count = script.matches("setsid -f /").count();
     assert_eq!(
         systemd_count, 1,
-        "expected exactly one rendered `systemd-run --user --scope \
-         --quiet --collect --unit=...` invocation in the spawn block; \
-         got {systemd_count}. Full script:\n{script}"
+        "expected exactly one rendered `systemd-run --user --quiet \\` \
+         invocation in the spawn block (service mode, line-continuation \
+         to the --unit/--property/-- block below); got {systemd_count}. \
+         Full script:\n{script}"
     );
     assert_eq!(
         setsid_count, 1,
@@ -195,12 +312,24 @@ fn setsid_fallback_branch_renders_when_systemd_bus_missing() {
          invocation in the spawn block; got {setsid_count}. \
          Full script:\n{script}"
     );
-    // The two branches are joined by `elif`, not `else if`. (sanity
-    // check on the bash shape — bash uses `elif`.)
+    // The two branches are NO LONGER joined by `elif` — the post-
+    // 2026-05-18 restructure uses two sequential `if`s linked by an
+    // `[ -z $SHUTDOWN_MODE ]` guard so the setsid fallback is reachable
+    // BOTH when the bus probe fails AND when systemd-run registration
+    // returns non-zero. The legacy `elif` shape would only catch the
+    // former.
     assert!(
-        script.contains("elif command -v setsid"),
-        "branches must be joined by bash `elif`, not separate `if`; \
-         render did not contain the elif"
+        !script.contains("elif command -v setsid"),
+        "branches must NOT be joined by `elif` (legacy shape — only \
+         catches bus-absent, not registration-failure); render still \
+         contained the elif"
+    );
+    assert!(
+        script.contains("if [ -z \"$SHUTDOWN_MODE\" ] && command -v setsid"),
+        "setsid branch must be guarded by the post-systemd-run \
+         `[ -z $SHUTDOWN_MODE ]` re-entry so it catches both \
+         bus-absent and registration-failure cases; render did not \
+         contain the guard"
     );
 }
 
@@ -272,7 +401,7 @@ fn assert_bash_syntax_ok(script: &str) {
 }
 
 /// `shutdown_manager_bin_path = None` collapses the spawn block to
-/// empty: no `systemd-run --user --scope`, no watchdog content.
+/// empty: no `systemd-run --user`, no watchdog content.
 #[test]
 fn renders_no_shutdown_manager_when_path_none() {
     let config = SlurmConfig::default();
@@ -280,9 +409,9 @@ fn renders_no_shutdown_manager_when_path_none() {
     let script = generate_wrapper_script(&standard_cfg(&config, &[]));
 
     assert!(
-        !script.contains("systemd-run --user --scope"),
+        !script.contains("systemd-run --user"),
         "with shutdown_manager_bin_path=None the script must NOT \
-         contain the systemd-run spawn invocation"
+         contain any systemd-run spawn invocation"
     );
     assert!(
         !script.contains("WATCHDOG:"),

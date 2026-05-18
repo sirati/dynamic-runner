@@ -1,13 +1,13 @@
 //! [`generate_wrapper_script`]: the canonical secondary-mode wrapper
 //! generator. Sequentially-built bash heredocs span scratch-dir
 //! setup, podman storage, FIFO command-relay, optional shutdown-
-//! manager spawn (out-of-cgroup, via `systemd-run --user --scope`),
-//! image load, container run, and cleanup traps. Splitting further
-//! would fracture the linearly-constructed bash payload (each
-//! section depends on shell variables defined upstream); the file
-//! sits above the 300-line target because the script body it emits
-//! is itself one cohesive bash program. See [`super`] for the
-//! higher-level rationale.
+//! manager spawn (out-of-cgroup, via `systemd-run --user --unit`
+//! service mode), image load, container run, and cleanup traps.
+//! Splitting further would fracture the linearly-constructed bash
+//! payload (each section depends on shell variables defined
+//! upstream); the file sits above the 300-line target because the
+//! script body it emits is itself one cohesive bash program. See
+//! [`super`] for the higher-level rationale.
 //!
 //! The pre-2026-05 inline watchdog (a `setsid -f bash -c '...'`
 //! subshell that polled `squeue %T` and signalled the container)
@@ -17,9 +17,9 @@
 //! watchdog died alongside everything else, defeating its
 //! "survives wrapper exit" purpose. The replacement is an
 //! out-of-cgroup shutdown-manager process spawned via
-//! `systemd-run --user --scope`, addressed by name via
-//! `systemctl --user kill` from the wrapper's signal trap. See
-//! [`WrapperScriptConfig::shutdown_manager_bin_path`].
+//! `systemd-run --user --unit=<name>` as a transient service unit,
+//! addressed by name via `systemctl --user kill` from the wrapper's
+//! signal trap. See [`WrapperScriptConfig::shutdown_manager_bin_path`].
 
 use super::config::{ConnectionMode, WrapperScriptConfig, WRAPPER_SRC_NETWORK_CONTAINER_PATH};
 use super::quote::{bash_quote, rand_hex8};
@@ -85,30 +85,55 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // Out-of-cgroup shutdown-manager spawn block. When the caller
     // supplies `shutdown_manager_bin_path`, the wrapper picks one of
     // two cgroup-escape primitives at RUNTIME based on whether the
-    // user-systemd bus is reachable:
+    // user-systemd bus is reachable AND whether the user-systemd
+    // service registration succeeds:
     //
-    //   1. `systemd-run --user --scope` (preferred): manager lives in
-    //      the user's `user@<uid>.service` cgroup, NOT the slurmd job
-    //      cgroup. SLURM cgroup-v2 teardown of the job pidtree
-    //      therefore does not reap the manager.
+    //   1. `systemd-run --user --unit=<name>` (preferred, service
+    //      mode): manager lives in the user's `user@<uid>.service`
+    //      cgroup, NOT the slurmd job cgroup. SLURM cgroup-v2 teardown
+    //      of the job pidtree therefore does not reap the manager.
+    //
+    //      Why service-mode (not `--scope`): scope mode keeps
+    //      systemd-run as the wait-parent of the spawned binary
+    //      (foreground-blocking until the binary exits), forcing a
+    //      shell `&` to background the waiter. The `&` introduces a
+    //      RACE: systemd-run's bus handshake with user-systemd to
+    //      register the scope is asynchronous w.r.t. the wrapper's
+    //      continuation. If SLURM TIMEOUT fires before the handshake
+    //      completes, proctrack reaps the still-handshaking
+    //      systemd-run subprocess in the wrapper's cgroup tree and
+    //      the scope is never registered — silent no-op, no journal
+    //      entry, no log file (asm-tokenizer 2026-05-18: 2/4 workers
+    //      under forced --slurm-time-limit 1). Service mode (no
+    //      `--scope`) makes systemd the parent of the spawned binary
+    //      directly; systemd-run blocks UNTIL registration completes
+    //      and returns its exit code synchronously. No `&` needed,
+    //      no race. Restart=no preserves the previous "manager exits
+    //      after cleanup" semantics.
     //   2. `setsid -f` (fallback): manager runs in a new session in
     //      the slurmd job cgroup. SLURM TIMEOUT will reap it before
     //      cleanup runs; the manager still gets a chance to react to
     //      wrapper-exit on graceful terminations, but cgroup-induced
     //      kills (SLURM TIMEOUT, scancel-after-grace, node reboot)
-    //      defeat it. The fallback exists because rootless-podman
-    //      compute hosts without `loginctl enable-linger <user>` and
-    //      hosts where slurmd strips XDG_RUNTIME_DIR have no user-bus
-    //      socket reachable — `systemd-run --user --scope` would
-    //      otherwise fail outright (asm-tokenizer 2026-05-18: log
-    //      content "Failed to connect to user scope bus via local
-    //      transport" — the binary never started).
+    //      defeat it. The fallback exists for two reasons:
+    //      (a) rootless-podman compute hosts without `loginctl
+    //      enable-linger <user>` and hosts where slurmd strips
+    //      XDG_RUNTIME_DIR have no user-bus socket reachable — the
+    //      `[ -S … ]` probe returns false and we skip the
+    //      service-mode invocation outright;
+    //      (b) the bus is reachable but registration fails at runtime
+    //      (e.g. unit-name collision, transient PID1 unresponsiveness,
+    //      `--property=` rejected by an old systemd). systemd-run
+    //      returns non-zero; we fall through to setsid.
     //
-    // Cleanup-forward picks the same primitive symmetrically: SCOPE
-    // is signalled via `systemctl --user kill`; PID is signalled via
-    // `kill -SIGCONT` directly. SIGCONT cannot be blocked/ignored
-    // and doesn't terminate; it wakes the manager's poll loop so it
-    // observes "wrapper gone, container gone, time to clean up".
+    // Cleanup-forward picks the same primitive symmetrically: a
+    // registered systemd unit (be it scope or service — `systemctl
+    // --user kill` targets by unit name regardless of suffix) is
+    // signalled via `systemctl --user kill`; setsid-PID is signalled
+    // via `kill -SIGCONT` directly. SIGCONT cannot be
+    // blocked/ignored and doesn't terminate; it wakes the manager's
+    // poll loop so it observes "wrapper gone, container gone, time
+    // to clean up".
     //
     // When `None`, neither the spawn block nor the cleanup forward
     // are rendered — the cleanup trap reduces to the CMD_RELAY-only
@@ -137,6 +162,13 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // `XDG_RUNTIME_DIR=$SYSTEMD_USER_RUNTIME_DIR` so the bus client
     // sees the correct value for that single command. Symmetric:
     // the bus-presence probe uses the same captured var.
+    //
+    // StandardOutput/StandardError=append:<path> on the unit replaces
+    // the shell-redirect of stdout/stderr that scope-mode used.
+    // Service-mode hands stdio ownership to systemd, so the wrapper's
+    // `</dev/null >>LOG 2>&1` no longer applies — systemd needs to be
+    // told where to route the child's fds. `append:` matches the
+    // previous `>>` semantics (no truncation across job retries).
     let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
         match cfg.shutdown_manager_bin_path {
             Some(path) => {
@@ -146,29 +178,46 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
                         r##"SHUTDOWN_MODE=""
 SHUTDOWN_SCOPE=""
 SHUTDOWN_PID=""
+SHUTDOWN_LOG_PATH="$RNDTMP/shutdown-manager.log"
 if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run >/dev/null 2>&1; then
-    SHUTDOWN_MODE=systemd
     SHUTDOWN_SCOPE="dynrunner-shutdown-{rnd_suffix}"
     # XDG_RUNTIME_DIR= prefix is a per-command env override (NOT
     # exported globally — podman needs the $PODMAN_RUN value set
     # below). The systemd-user-bus client embedded in systemd-run
     # reads this to find the per-uid bus socket.
-    XDG_RUNTIME_DIR="$SYSTEMD_USER_RUNTIME_DIR" systemd-run --user --scope --quiet --collect --unit="$SHUTDOWN_SCOPE" -- \
-        {bin_q} \
-            --container-name "$CONTAINER_NAME" \
-            --storage-root "$PODMAN_STORAGE" \
-            --runroot "$PODMAN_RUN" \
-            --tmp-prefix "$RNDTMP" \
-            --pid-file "$RNDTMP/shutdown-manager.pid" \
-            --wrapper-pid "$$" \
-            </dev/null >>"$RNDTMP/shutdown-manager.log" 2>&1 &
-    # `systemd-run --user --scope` is foreground-by-default; the
-    # `&` backgrounds the wait-for-scope-process, not the scope
-    # itself. The scope's lifetime is the shutdown manager's.
-    echo "Spawned shutdown manager in scope $SHUTDOWN_SCOPE (cgroup escape via user.slice)"
-elif command -v setsid >/dev/null 2>&1; then
+    #
+    # Service mode (no `--scope`): systemd-run BLOCKS until the
+    # registration handshake with user-systemd completes, then
+    # returns its exit code. No `&` — eliminates the previous race
+    # where SLURM TIMEOUT could reap a still-handshaking systemd-run
+    # in scope-mode before the scope was ever registered (silent
+    # no-op: no journal entry, no log file). systemd-run's own
+    # stderr is captured into the same log file so registration-
+    # failure diagnostics land alongside any later manager output.
+    if XDG_RUNTIME_DIR="$SYSTEMD_USER_RUNTIME_DIR" systemd-run --user --quiet \
+            --unit="$SHUTDOWN_SCOPE" \
+            --property=Restart=no \
+            --property="StandardOutput=append:$SHUTDOWN_LOG_PATH" \
+            --property="StandardError=append:$SHUTDOWN_LOG_PATH" \
+            -- \
+            {bin_q} \
+                --container-name "$CONTAINER_NAME" \
+                --storage-root "$PODMAN_STORAGE" \
+                --runroot "$PODMAN_RUN" \
+                --tmp-prefix "$RNDTMP" \
+                --pid-file "$RNDTMP/shutdown-manager.pid" \
+                --wrapper-pid "$$" 2>>"$SHUTDOWN_LOG_PATH"; then
+        SHUTDOWN_MODE=systemd
+        echo "Spawned shutdown manager in unit $SHUTDOWN_SCOPE (cgroup escape via user.slice service)"
+    else
+        SYSTEMD_RUN_RC=$?
+        echo "WARNING: systemd-run --user --unit failed (exit=$SYSTEMD_RUN_RC); falling back to setsid -- cgroup escape DISABLED" >&2
+        SHUTDOWN_SCOPE=""
+    fi
+fi
+if [ -z "$SHUTDOWN_MODE" ] && command -v setsid >/dev/null 2>&1; then
     SHUTDOWN_MODE=setsid
-    echo "WARNING: no user-systemd bus at $SYSTEMD_USER_RUNTIME_DIR/systemd/private; shutdown manager running under setsid -- cgroup escape DISABLED; SLURM TIMEOUT will reap the manager before cleanup." >&2
+    echo "WARNING: shutdown manager running under setsid -- cgroup escape DISABLED; SLURM TIMEOUT will reap the manager before cleanup." >&2
     setsid -f {bin_q} \
         --container-name "$CONTAINER_NAME" \
         --storage-root "$PODMAN_STORAGE" \
@@ -192,8 +241,9 @@ elif command -v setsid >/dev/null 2>&1; then
     else
         echo "ERROR: setsid-spawned shutdown manager did not write pid-file within 5s -- wrapper cleanup forward will be a no-op" >&2
     fi
-else
-    echo "ERROR: neither systemd-run --user --scope (bus probe failed) nor setsid available; orphan-container cleanup DISABLED on signal" >&2
+fi
+if [ -z "$SHUTDOWN_MODE" ]; then
+    echo "ERROR: neither systemd-run --user --unit (bus probe failed or registration failed) nor setsid available; orphan-container cleanup DISABLED on signal" >&2
 fi
 "##,
                     ),

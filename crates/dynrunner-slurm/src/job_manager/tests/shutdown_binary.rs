@@ -181,8 +181,8 @@ async fn upload_shutdown_manager_binary_surfaces_missing_source() {
 /// Wrapper-rendering integration: when the manager's
 /// `shutdown_manager_remote_path` is `Some(...)`, a wrapper render
 /// driven through it must include the uploaded path inside the
-/// `systemd-run --user --scope ... -- <path>` block (Step 4 of the
-/// dispatcher-integration plumbing).
+/// `systemd-run --user --quiet ... --unit=... -- <path>` block
+/// (Step 4 of the dispatcher-integration plumbing).
 ///
 /// This pins the manager → renderer boundary: the path the upload
 /// step records is the path the renderer consumes. A regression
@@ -233,9 +233,10 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
     let script = generate_wrapper_script(&cfg);
 
     assert!(
-        script.contains("systemd-run --user --scope"),
-        "rendered wrapper must contain the systemd-run spawn block when \
-         shutdown_manager_bin_path is Some; got script: {script}",
+        script.contains("systemd-run --user --quiet"),
+        "rendered wrapper must contain the systemd-run spawn block \
+         (service mode, --quiet) when shutdown_manager_bin_path is \
+         Some; got script: {script}",
     );
     assert!(
         script.contains(remote),

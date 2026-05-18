@@ -111,8 +111,8 @@ pub(super) fn run_preparation<'py>(
 
     // Stage the `dynrunner-slurm-shutdown` musl-static binary on the
     // gateway so per-job wrapper scripts can spawn it via
-    // `systemd-run --user --scope` and have it survive cgroup
-    // teardown. The Python bridge resolves the local source path
+    // `systemd-run --user --unit` (service mode) and have it survive
+    // cgroup teardown. The Python bridge resolves the local source path
     // (`DYNRUNNER_SLURM_SHUTDOWN_BIN_SOURCE` override > wheel-bundled
     // artifact under `dynamic_runner/_shutdown_manager/`) and raises
     // a `RuntimeError` when neither is available — orphan-container
