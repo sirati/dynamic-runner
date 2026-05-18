@@ -250,7 +250,10 @@ if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run 
                 --pid-file "$RNDTMP/shutdown-manager.pid" \
                 --wrapper-pid "$$" \
                 --log-file "$SHUTDOWN_LOG_PATH" \
-                --podman-path "$PODMAN_BIN" 2>>"$SHUTDOWN_LOG_PATH"; then
+                --podman-path "$PODMAN_BIN" \
+                --rm-path "$RM_BIN" \
+                --rmdir-path "$RMDIR_BIN" \
+                --find-path "$FIND_BIN" 2>>"$SHUTDOWN_LOG_PATH"; then
         SHUTDOWN_MODE=systemd
         echo "Spawned shutdown manager in unit $SHUTDOWN_SCOPE (cgroup escape via user.slice service)"
     else
@@ -271,6 +274,9 @@ if [ -z "$SHUTDOWN_MODE" ] && command -v setsid >/dev/null 2>&1; then
         --wrapper-pid "$$" \
         --log-file "$SHUTDOWN_LOG_PATH" \
         --podman-path "$PODMAN_BIN" \
+        --rm-path "$RM_BIN" \
+        --rmdir-path "$RMDIR_BIN" \
+        --find-path "$FIND_BIN" \
         </dev/null >>"$SHUTDOWN_LOG_PATH" 2>&1
     # Capture pid via the manager's own pid-file (written first
     # thing in main::run_with_config). 5-second wait (50 * 0.1s)
@@ -365,6 +371,35 @@ if [ -z "$PODMAN_BIN" ]; then
     PODMAN_BIN="podman"
 fi
 echo "Podman binary: $PODMAN_BIN"
+
+# Resolve coreutils absolute paths for the shutdown-manager's
+# per-entry cleanup walk. The manager's `podman unshare <rm|rmdir|find>`
+# invocations need explicit binaries because (a) the systemd-user-
+# service unit inherits a minimal PATH that may not contain GNU
+# coreutils on NixOS, and (b) `podman unshare` re-enters a userns
+# whose PATH resolution behaviour matches the host shell's at exec
+# time — i.e. the absolute path travels through unchanged. Without
+# these the manager's --rm-path / --rmdir-path / --find-path defaults
+# (literal "rm" / "rmdir" / "find") fall back to PATH lookup inside
+# the unit and likely ENOENT.
+RM_BIN="$(command -v rm 2>/dev/null || true)"
+if [ -z "$RM_BIN" ]; then
+    echo "WARNING: rm not found in wrapper PATH; shutdown-manager cleanup will rely on its --rm-path default (\"rm\", PATH lookup inside the podman-unshare userns) and likely ENOENT under systemd-user-service-mode" >&2
+    RM_BIN="rm"
+fi
+RMDIR_BIN="$(command -v rmdir 2>/dev/null || true)"
+if [ -z "$RMDIR_BIN" ]; then
+    echo "WARNING: rmdir not found in wrapper PATH; shutdown-manager cleanup will rely on its --rmdir-path default" >&2
+    RMDIR_BIN="rmdir"
+fi
+FIND_BIN="$(command -v find 2>/dev/null || true)"
+if [ -z "$FIND_BIN" ]; then
+    echo "WARNING: find not found in wrapper PATH; shutdown-manager cleanup walk will be impossible (no enumeration primitive available)" >&2
+    FIND_BIN="find"
+fi
+echo "Rm binary: $RM_BIN"
+echo "Rmdir binary: $RMDIR_BIN"
+echo "Find binary: $FIND_BIN"
 
 # Shutdown-manager spawn block follows immediately below. It is
 # rendered only when the caller plumbs the binary path through
