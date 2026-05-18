@@ -124,12 +124,41 @@ fn renders_shutdown_manager_spawn_when_path_set() {
         // pair, which silently lost the manager's stdio on the
         // deployed systemd stack (asm-tokenizer 2026-05-18).
         "--log-file \"$SHUTDOWN_LOG_PATH\"",
+        // --podman-path threads the wrapper-resolved absolute podman
+        // binary path so the systemd-user-service unit doesn't
+        // depend on the unit's (minimal) PATH (asm-tokenizer
+        // 2026-05-18 post-6a41e3a: every `Command::new("podman")`
+        // call ENOENT'd inside the unit). Mirrored in the setsid
+        // fallback for CLI-contract symmetry — the count-2 expectation
+        // is asserted by a sibling test below.
+        "--podman-path \"$PODMAN_BIN\"",
     ] {
         assert!(
             script.contains(arg),
             "spawn block must include `{arg}` (per CLI contract); render did not contain it"
         );
     }
+    // PODMAN_BIN resolution must run BEFORE the spawn block — the
+    // spawn block references `"$PODMAN_BIN"` in both dispatch
+    // branches, so the resolution has to be earlier in the rendered
+    // script. The rendered text is one string, so we just assert
+    // the resolution stanza is present (presence + the substring
+    // tests below + bash-syntax check together prove ordering).
+    assert!(
+        script.contains("PODMAN_BIN=\"$(command -v podman 2>/dev/null || true)\""),
+        "wrapper must resolve podman absolute path via `command -v` \
+         BEFORE the spawn block (the service unit's PATH does NOT \
+         inherit the wrapper's PATH); render did not contain the \
+         resolution"
+    );
+    assert!(
+        script.contains("WARNING: podman not found in wrapper PATH"),
+        "PODMAN_BIN resolution must emit a stderr WARNING when \
+         `command -v podman` returns empty (so an operator can spot \
+         the misconfiguration in the .err file); render did not \
+         contain the warning"
+    );
+
     // Bus-probe + setsid-fallback shape: the spawn block must pick
     // its primitive at runtime, NOT at render time. Probe is on the
     // captured user-systemd dir (the wrapper's $XDG_RUNTIME_DIR is
@@ -234,6 +263,23 @@ fn service_mode_renders_with_required_properties() {
          diagnostic safety net for panic backtraces; render did not \
          contain it"
     );
+    // PrivateTmp=false disables systemd's default per-unit /tmp
+    // namespace isolation. Without this, the manager's /tmp view
+    // diverges from the wrapper's; --tmp-prefix, --log-file,
+    // --pid-file, and the podman storage/runroot paths under
+    // $RNDTMP would resolve inside a phantom namespace-private
+    // tmpfs, NOT the on-disk directories the wrapper created
+    // (asm-tokenizer 2026-05-18: journal showed manager ran to
+    // completion but produced no on-disk artifacts).
+    assert!(
+        script.contains("--property=PrivateTmp=false"),
+        "service-mode unit must set PrivateTmp=false so the manager \
+         shares the wrapper's /tmp view; otherwise --tmp-prefix, \
+         --log-file, --pid-file, and storage paths under $RNDTMP \
+         resolve inside a namespace-private tmpfs and produce no \
+         on-disk artifacts (asm-tokenizer 2026-05-18); render did \
+         not contain the property"
+    );
     // Regression guard: the systemd `append:<path>` properties were
     // removed because they silently lost the manager's stdio on the
     // deployed systemd stack. Log routing is now the manager's
@@ -258,13 +304,78 @@ fn service_mode_renders_with_required_properties() {
     // is the closing of the systemd-run continuation block (right
     // before the bash `; then`) — if a `&` snuck in there it
     // would appear immediately before `; then`. The current
-    // continuation now ends with `--log-file "$SHUTDOWN_LOG_PATH"`
-    // (the trailing arg pre-redirect); guard on that.
+    // continuation now ends with `--podman-path "$PODMAN_BIN" 2>>...`
+    // (last arg before the redirect that opens `; then`); the
+    // legacy `--log-file "$SHUTDOWN_LOG_PATH" &` shape is also a
+    // valid past-regression to guard against.
     assert!(
-        !script.contains("--log-file \"$SHUTDOWN_LOG_PATH\" &"),
+        !script.contains("--podman-path \"$PODMAN_BIN\" &"),
         "systemd-run must NOT be backgrounded with `&` in service \
          mode — that would re-introduce the scope-mode race the \
          service-mode switch was meant to fix; render contained the `&`"
+    );
+    assert!(
+        !script.contains("--log-file \"$SHUTDOWN_LOG_PATH\" &"),
+        "systemd-run must NOT be backgrounded with `&` in service \
+         mode (legacy trailing-arg position guard); render contained `&`"
+    );
+}
+
+/// `--property=PrivateTmp=false` is the load-bearing systemd
+/// property that makes the manager's on-disk paths actually
+/// resolve to the wrapper's /tmp. Pin its literal presence so
+/// a regression that drops it (or changes it to `=true`) breaks
+/// loudly. The systemd default for transient units varies by
+/// distro/configuration: NixOS user-systemd has been observed to
+/// turn it on transparently, while many other distros default
+/// it off. Explicit `=false` is invariant across all backends.
+#[test]
+fn private_tmp_disabled_on_service_unit() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+    assert!(
+        script.contains("--property=PrivateTmp=false"),
+        "service-mode unit MUST explicitly disable PrivateTmp; \
+         render did not contain `--property=PrivateTmp=false`. Full \
+         script:\n{script}"
+    );
+    // Regression guard: a future maintainer must not switch this
+    // to `=true` to "harden" the unit — the wrapper's $RNDTMP
+    // tree is the entire mechanism by which the manager
+    // communicates artifacts to the wrapper/job, and a private
+    // namespace would silently sever that path. Explicit deny.
+    assert!(
+        !script.contains("--property=PrivateTmp=true"),
+        "service-mode unit MUST NOT set PrivateTmp=true — that would \
+         re-introduce the namespace-isolation bug (asm-tokenizer \
+         2026-05-18) that this property exists to neutralize; \
+         render contained the `=true` form"
+    );
+}
+
+/// `--podman-path` must be threaded into BOTH dispatch branches
+/// (systemd-run and setsid-f). The systemd-run branch is the
+/// critical one — the user-service unit's PATH does not inherit
+/// the wrapper's PATH, so without the explicit path `podman`
+/// invocations inside the manager ENOENT (asm-tokenizer
+/// 2026-05-18 post-6a41e3a). The setsid branch is mirrored for
+/// CLI-contract symmetry — both branches exercise the identical
+/// argv shape, so a future maintainer can't accidentally drift
+/// them apart.
+#[test]
+fn podman_path_flag_renders_in_both_dispatch_branches() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+    let count = script.matches("--podman-path \"$PODMAN_BIN\"").count();
+    assert_eq!(
+        count, 2,
+        "expected exactly two occurrences of `--podman-path \
+         \"$PODMAN_BIN\"` (one per dispatch branch: systemd-run + \
+         setsid-f), so the manager always knows its podman binary \
+         path regardless of which primitive the runtime probe picks; \
+         render contained {count}. Full script:\n{script}"
     );
 }
 
