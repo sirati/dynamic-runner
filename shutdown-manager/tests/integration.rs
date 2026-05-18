@@ -10,7 +10,7 @@ use dynrunner_slurm_shutdown::cleanup::{final_cleanup, write_pid_file};
 use dynrunner_slurm_shutdown::config::parse;
 use dynrunner_slurm_shutdown::poll_loop::{Outcome, PollConfig, run};
 use dynrunner_slurm_shutdown::shutdown_flag::ShutdownFlag;
-use dynrunner_slurm_shutdown::testing::{FakeClock, MockBackend};
+use dynrunner_slurm_shutdown::testing::{FakeClock, MockBackend, MockProcessProbe};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -21,7 +21,16 @@ fn cfg(poll_secs: u64, idle_secs: u64) -> PollConfig {
         idle_shutdown: Duration::from_secs(idle_secs),
         secondary_grace: Duration::from_secs(5),
         container_stop_grace: Duration::from_secs(10),
+        wrapper_pid: None,
     }
+}
+
+/// Default probe for integration tests that don't exercise the
+/// wrapper-monitor wake input. With `wrapper_pid = None` in the
+/// shared cfg, the probe is never consulted — `always_alive` is
+/// just a stable, non-noisy default.
+fn always_alive() -> MockProcessProbe {
+    MockProcessProbe::always_alive()
 }
 
 /// Test 1: PID file is written on startup, removed on clean exit.
@@ -45,7 +54,7 @@ fn flag_set_before_run_yields_signal_shutdown() {
     let flag = ShutdownFlag::new();
     flag.set_for_test(); // simulates SIGTERM handler
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(outcome, Outcome::SignalShutdown);
 }
 
@@ -60,7 +69,7 @@ fn sigcont_path_is_identical_to_sigterm_path() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(outcome, Outcome::SignalShutdown);
 }
 
@@ -74,7 +83,7 @@ fn idle_shutdown_after_grace_following_sighting() {
     backend.script_exists(vec![true, false, false]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(outcome, Outcome::IdleShutdown);
     assert!(backend.rm_all_called());
 }
@@ -89,7 +98,7 @@ fn idle_shutdown_does_not_fire_without_prior_sighting() {
     // for a spurious idle-shutdown to fire if the guard is broken.
     let clock = FakeClock::new();
     clock.set_on_sleep(7, flag.clone());
-    let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(
         outcome,
         Outcome::SignalShutdown,
@@ -108,7 +117,7 @@ fn signal_shutdown_pgrep_some_no_stop_when_exits_in_grace() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     let calls = backend.calls();
     assert!(
         calls.contains(&"exec_signal(ctr, 42, TERM)".to_string()),
@@ -137,7 +146,7 @@ fn signal_shutdown_pgrep_none_belt_only() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     let calls = backend.calls();
     assert!(
         !calls.iter().any(|c| c.starts_with("exec_signal(")),
@@ -167,7 +176,7 @@ fn final_cleanup_runs_after_idle_path() {
     backend.script_unshare(vec![true]);
     let flag = ShutdownFlag::new();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(outcome, Outcome::IdleShutdown);
     final_cleanup(&backend, &tmp_prefix, &pid_path, |_| {});
     assert!(!pid_path.exists(), "pid file should be removed");
@@ -193,7 +202,7 @@ fn final_cleanup_runs_after_signal_path() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    let outcome = run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    let outcome = run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     assert_eq!(outcome, Outcome::SignalShutdown);
     final_cleanup(&backend, &tmp_prefix, &pid_path, |_| {});
     assert!(!pid_path.exists());
@@ -209,7 +218,7 @@ fn mock_records_call_order() {
     let flag = ShutdownFlag::new();
     flag.set_for_test();
     let clock = FakeClock::new();
-    run(&backend, &flag, &clock, &cfg(2, 4), |_| {});
+    run(&backend, &flag, &clock, &always_alive(), &cfg(2, 4), |_| {});
     let calls = backend.calls();
     // Expected exact prefix on the signal-shutdown branch when
     // pgrep=Some, container exits within grace.

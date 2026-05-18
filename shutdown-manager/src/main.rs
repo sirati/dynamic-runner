@@ -9,6 +9,7 @@ use dynrunner_slurm_shutdown::clock::RealClock;
 use dynrunner_slurm_shutdown::config::{Config, parse};
 use dynrunner_slurm_shutdown::poll_loop::{PollConfig, run};
 use dynrunner_slurm_shutdown::podman::RealPodman;
+use dynrunner_slurm_shutdown::process_probe::KillProbe;
 use dynrunner_slurm_shutdown::shutdown_flag::ShutdownFlag;
 use dynrunner_slurm_shutdown::signals;
 use std::process::ExitCode;
@@ -51,14 +52,19 @@ fn run_with_config(cfg: Config) -> ExitCode {
     }
     let backend = RealPodman::new(cfg.storage_root.clone(), cfg.runroot.clone());
     let clock = RealClock;
+    let probe = KillProbe;
     let poll_cfg = PollConfig {
         container_name: cfg.container_name.clone(),
         poll_interval: cfg.poll_interval,
         idle_shutdown: cfg.idle_shutdown,
         secondary_grace: cfg.secondary_grace,
         container_stop_grace: cfg.container_stop_grace,
+        wrapper_pid: cfg.wrapper_pid,
     };
-    let outcome = run(&backend, &flag, &clock, &poll_cfg, log);
+    if let Some(p) = cfg.wrapper_pid {
+        log(&format!("wrapper-monitor enabled; watching pid {}", p));
+    }
+    let outcome = run(&backend, &flag, &clock, &probe, &poll_cfg, log);
     log(&format!("state machine completed: {:?}", outcome));
     final_cleanup(&backend, &cfg.tmp_prefix, &cfg.pid_file, log);
     log("exit 0");
