@@ -83,19 +83,34 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
         .collect();
 
     // Out-of-cgroup shutdown-manager spawn block. When the caller
-    // supplies `shutdown_manager_bin_path`, the wrapper:
-    //   1. Spawns `<bin> --container-name … --storage-root … …` in a
-    //      transient systemd-user scope so the process lives in the
-    //      user's `user@<uid>.service` cgroup, NOT the slurmd job
-    //      cgroup. SLURM cgroup-v2 teardown of the job pidtree
-    //      therefore does not reap the manager (the inline
-    //      `setsid -f` watchdog this replaces died on cgroup
-    //      teardown — defeating its purpose).
-    //   2. Forwards SIGCONT to the scope from the wrapper's signal
-    //      trap (idle-wake the manager's poll loop so it observes
-    //      "wrapper gone, container gone, time to clean up").
+    // supplies `shutdown_manager_bin_path`, the wrapper picks one of
+    // two cgroup-escape primitives at RUNTIME based on whether the
+    // user-systemd bus is reachable:
     //
-    // When `None`, neither the spawn block nor the systemctl forward
+    //   1. `systemd-run --user --scope` (preferred): manager lives in
+    //      the user's `user@<uid>.service` cgroup, NOT the slurmd job
+    //      cgroup. SLURM cgroup-v2 teardown of the job pidtree
+    //      therefore does not reap the manager.
+    //   2. `setsid -f` (fallback): manager runs in a new session in
+    //      the slurmd job cgroup. SLURM TIMEOUT will reap it before
+    //      cleanup runs; the manager still gets a chance to react to
+    //      wrapper-exit on graceful terminations, but cgroup-induced
+    //      kills (SLURM TIMEOUT, scancel-after-grace, node reboot)
+    //      defeat it. The fallback exists because rootless-podman
+    //      compute hosts without `loginctl enable-linger <user>` and
+    //      hosts where slurmd strips XDG_RUNTIME_DIR have no user-bus
+    //      socket reachable — `systemd-run --user --scope` would
+    //      otherwise fail outright (asm-tokenizer 2026-05-18: log
+    //      content "Failed to connect to user scope bus via local
+    //      transport" — the binary never started).
+    //
+    // Cleanup-forward picks the same primitive symmetrically: SCOPE
+    // is signalled via `systemctl --user kill`; PID is signalled via
+    // `kill -SIGCONT` directly. SIGCONT cannot be blocked/ignored
+    // and doesn't terminate; it wakes the manager's poll loop so it
+    // observes "wrapper gone, container gone, time to clean up".
+    //
+    // When `None`, neither the spawn block nor the cleanup forward
     // are rendered — the cleanup trap reduces to the CMD_RELAY-only
     // teardown (no /tmp cleanup; callers opting in here accept that
     // tradeoff explicitly).
@@ -107,15 +122,38 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // wrapper uses, prefixed with `dynrunner-shutdown-`, so the unit
     // is uniquely named per job and can be re-targeted by
     // `systemctl --user kill` later.
+    //
+    // Why XDG_RUNTIME_DIR gets a defensive re-export at the top of
+    // the wrapper AND a per-call override here: the wrapper sets
+    // `XDG_RUNTIME_DIR=$PODMAN_RUN` further down for podman's
+    // benefit (its rootless storage cookie lives in $XDG_RUNTIME_DIR).
+    // The systemd-user bus client embedded in `systemd-run` reads the
+    // SAME env var to locate the per-uid bus socket
+    // (`$XDG_RUNTIME_DIR/systemd/private`). The two values disagree:
+    // podman wants `$PODMAN_RUN`, systemd-run wants
+    // `/run/user/$(id -u)`. We capture the original-user value into
+    // `$SYSTEMD_USER_RUNTIME_DIR` up-top BEFORE the podman override,
+    // then prefix the `systemd-run` invocation with
+    // `XDG_RUNTIME_DIR=$SYSTEMD_USER_RUNTIME_DIR` so the bus client
+    // sees the correct value for that single command. Symmetric:
+    // the bus-presence probe uses the same captured var.
     let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
         match cfg.shutdown_manager_bin_path {
             Some(path) => {
                 let bin_q = bash_quote(&path.display().to_string());
                 (
                     format!(
-                        r##"SHUTDOWN_SCOPE="dynrunner-shutdown-{rnd_suffix}"
-if command -v systemd-run >/dev/null 2>&1; then
-    systemd-run --user --scope --quiet --collect --unit="$SHUTDOWN_SCOPE" -- \
+                        r##"SHUTDOWN_MODE=""
+SHUTDOWN_SCOPE=""
+SHUTDOWN_PID=""
+if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run >/dev/null 2>&1; then
+    SHUTDOWN_MODE=systemd
+    SHUTDOWN_SCOPE="dynrunner-shutdown-{rnd_suffix}"
+    # XDG_RUNTIME_DIR= prefix is a per-command env override (NOT
+    # exported globally — podman needs the $PODMAN_RUN value set
+    # below). The systemd-user-bus client embedded in systemd-run
+    # reads this to find the per-uid bus socket.
+    XDG_RUNTIME_DIR="$SYSTEMD_USER_RUNTIME_DIR" systemd-run --user --scope --quiet --collect --unit="$SHUTDOWN_SCOPE" -- \
         {bin_q} \
             --container-name "$CONTAINER_NAME" \
             --storage-root "$PODMAN_STORAGE" \
@@ -124,25 +162,53 @@ if command -v systemd-run >/dev/null 2>&1; then
             --pid-file "$RNDTMP/shutdown-manager.pid" \
             --wrapper-pid "$$" \
             </dev/null >>"$RNDTMP/shutdown-manager.log" 2>&1 &
-    SHUTDOWN_SPAWN_PID=$!
     # `systemd-run --user --scope` is foreground-by-default; the
     # `&` backgrounds the wait-for-scope-process, not the scope
     # itself. The scope's lifetime is the shutdown manager's.
-    echo "Spawned shutdown manager in scope $SHUTDOWN_SCOPE"
+    echo "Spawned shutdown manager in scope $SHUTDOWN_SCOPE (cgroup escape via user.slice)"
+elif command -v setsid >/dev/null 2>&1; then
+    SHUTDOWN_MODE=setsid
+    echo "WARNING: no user-systemd bus at $SYSTEMD_USER_RUNTIME_DIR/systemd/private; shutdown manager running under setsid -- cgroup escape DISABLED; SLURM TIMEOUT will reap the manager before cleanup." >&2
+    setsid -f {bin_q} \
+        --container-name "$CONTAINER_NAME" \
+        --storage-root "$PODMAN_STORAGE" \
+        --runroot "$PODMAN_RUN" \
+        --tmp-prefix "$RNDTMP" \
+        --pid-file "$RNDTMP/shutdown-manager.pid" \
+        --wrapper-pid "$$" \
+        </dev/null >>"$RNDTMP/shutdown-manager.log" 2>&1
+    # Capture pid via the manager's own pid-file (written first
+    # thing in main::run_with_config). 5-second wait (50 * 0.1s)
+    # is well above worst-case fork+exec+pid-file-write latency.
+    for _ in $(seq 1 50); do
+        if [ -f "$RNDTMP/shutdown-manager.pid" ]; then
+            SHUTDOWN_PID=$(cat "$RNDTMP/shutdown-manager.pid" 2>/dev/null || true)
+            break
+        fi
+        sleep 0.1
+    done
+    if [ -n "$SHUTDOWN_PID" ]; then
+        echo "Spawned shutdown manager (setsid pid=$SHUTDOWN_PID); cgroup escape unavailable"
+    else
+        echo "ERROR: setsid-spawned shutdown manager did not write pid-file within 5s -- wrapper cleanup forward will be a no-op" >&2
+    fi
 else
-    echo "WARNING: systemd-run not available; orphan-container cleanup will be missing on signal" >&2
-    SHUTDOWN_SCOPE=""
+    echo "ERROR: neither systemd-run --user --scope (bus probe failed) nor setsid available; orphan-container cleanup DISABLED on signal" >&2
 fi
 "##,
                     ),
-                    // SIGCONT (cannot be blocked/ignored, doesn't
-                    // terminate) is the wake signal: the shutdown
-                    // manager's poll loop observes it and re-runs
-                    // its idle-shutdown check. The manager owns the
-                    // actual tmp-cleanup and orphan-container
-                    // teardown — the wrapper only nudges it.
+                    // Cleanup forward picks the matching primitive:
+                    // SCOPE => systemctl --user kill, PID => kill.
+                    // SIGCONT cannot be blocked/ignored and doesn't
+                    // terminate — it just wakes the manager's poll
+                    // loop so it re-evaluates idle-shutdown. The
+                    // manager owns the actual tmp-cleanup and
+                    // orphan-container teardown; the wrapper only
+                    // nudges it.
                     "    if [ -n \"${SHUTDOWN_SCOPE:-}\" ]; then\n        \
                      systemctl --user kill --signal=SIGCONT \"$SHUTDOWN_SCOPE\" 2>/dev/null || true\n    \
+                     elif [ -n \"${SHUTDOWN_PID:-}\" ]; then\n        \
+                     kill -SIGCONT \"$SHUTDOWN_PID\" 2>/dev/null || true\n    \
                      fi\n"
                         .to_string(),
                 )
@@ -165,6 +231,16 @@ RNDTMP="{rndtmp}"
 echo "Creating temporary directory: $RNDTMP"
 mkdir -p "$RNDTMP"
 mkdir -p "{src_tmp}" "{out_tmp}" "{log_tmp}" "{socket_dir}"
+
+# SLURM-job-env defensive: slurmd may have stripped XDG_RUNTIME_DIR
+# from the job environment entirely. Restore the canonical per-uid
+# value so the systemd-user bus probe below has a path to inspect.
+# Captured into SYSTEMD_USER_RUNTIME_DIR BEFORE the podman override
+# (next stanza) clobbers XDG_RUNTIME_DIR for podman's storage cookie.
+# Bus probe + systemd-run invocation read from the captured var, not
+# from $XDG_RUNTIME_DIR, so the two consumers don't collide.
+export XDG_RUNTIME_DIR="${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
+SYSTEMD_USER_RUNTIME_DIR="$XDG_RUNTIME_DIR"
 
 PODMAN_STORAGE="{podman_storage}"
 PODMAN_RUN="{podman_run}"
