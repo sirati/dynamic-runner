@@ -30,6 +30,19 @@ pub struct Config {
     /// before its signal trap can forward `systemctl --user kill`.
     /// `None` (the default) preserves pre-monitor behaviour.
     pub wrapper_pid: Option<u32>,
+    /// Optional path where the manager appends its own log lines.
+    /// When set, every `log()` line written to stderr is also
+    /// appended to this file (best-effort; failures are non-fatal
+    /// and surface on stderr only). When `None`, the manager logs
+    /// to stderr alone — the pre-2026-05-18 behaviour.
+    ///
+    /// Owning the log destination at the binary level (rather than
+    /// relying on the caller's stdio redirection — shell `>>` or
+    /// systemd `StandardOutput=append:`) was added after the
+    /// systemd-side append-properties were observed to silently
+    /// drop the manager's stdio under service mode on the deployed
+    /// systemd/MAC stack (asm-tokenizer 2026-05-18).
+    pub log_file: Option<PathBuf>,
 }
 
 /// Default per the CLI contract.
@@ -52,6 +65,7 @@ struct Builder {
     secondary_grace_secs: Option<u64>,
     container_stop_grace_secs: Option<u64>,
     wrapper_pid: Option<u32>,
+    log_file: Option<PathBuf>,
 }
 
 impl Builder {
@@ -85,6 +99,7 @@ impl Builder {
                     .unwrap_or(DEFAULT_CONTAINER_STOP_GRACE_SECS),
             ),
             wrapper_pid: self.wrapper_pid,
+            log_file: self.log_file,
         })
     }
 }
@@ -140,6 +155,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
                     .map_err(|_| format!("--wrapper-pid out of range: {}", n))?;
                 b.wrapper_pid = Some(pid);
             }
+            "--log-file" => b.log_file = Some(PathBuf::from(take_str(&mut iter)?)),
             other => return Err(format!("unknown flag: {}", other)),
         }
     }
@@ -301,5 +317,30 @@ mod tests {
         args.extend(argv(&["--wrapper-pid", "4294967296"]));
         let err = parse(args).unwrap_err();
         assert!(err.contains("out of range"), "got: {}", err);
+    }
+
+    #[test]
+    fn log_file_defaults_to_none() {
+        let cfg = parse(minimal_required()).expect("must parse");
+        assert!(
+            cfg.log_file.is_none(),
+            "--log-file omitted ⇒ None (stderr-only logging, pre-2026-05-18 default)"
+        );
+    }
+
+    #[test]
+    fn parses_log_file_optional() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--log-file", "/tmp/shutdown.log"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(cfg.log_file, Some(PathBuf::from("/tmp/shutdown.log")));
+    }
+
+    #[test]
+    fn log_file_equals_form() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--log-file=/tmp/shutdown.log"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(cfg.log_file, Some(PathBuf::from("/tmp/shutdown.log")));
     }
 }
