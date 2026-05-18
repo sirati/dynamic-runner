@@ -245,6 +245,106 @@ fn config_parse_rejects_missing_args() {
     assert!(err.contains("--storage-root"), "got: {}", err);
 }
 
+/// Test 11: --log-file ownership. The manager opens the destination
+/// file itself and appends its log lines to it AND stderr. End-to-end
+/// (subprocess), because the load-bearing behaviour is that the
+/// binary's first log line ("starting; container=") lands in the
+/// file — proving the open-then-log ordering survives bootstrap.
+///
+/// Why subprocess (not unit-test the closure): the entire premise of
+/// owning the log destination at the binary level is that systemd-
+/// side stdio routing was unreliable. The only meaningful test is
+/// that running the binary as a process — argv → file — works.
+///
+/// The manager exits non-zero in this test (it can't actually find
+/// podman in the sandbox), but the bootstrap logs are emitted long
+/// before any podman call, so the assertion still holds.
+#[test]
+fn log_file_flag_routes_first_log_lines_to_destination() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    // Resolve the binary path the cargo test harness built. CARGO_BIN_EXE_<name>
+    // is set by cargo for integration tests of the crate's own bins.
+    let bin = env!("CARGO_BIN_EXE_dynrunner-slurm-shutdown");
+
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("shutdown-manager.log");
+    let pid_path = dir.path().join("shutdown.pid");
+    let tmp_prefix = dir.path().join("asm-XXX");
+    let storage_root = dir.path().join("podman-root");
+    let runroot = dir.path().join("podman-run");
+    let wrapper_pid = std::process::id().to_string();
+
+    // Spawn the manager. It will install signal handlers, log the
+    // bootstrap lines, then enter the poll loop calling `podman ps`
+    // (likely failing in the test sandbox — irrelevant). Kill it
+    // after a short grace so the test runs in <1s.
+    let mut child = Command::new(bin)
+        .args([
+            "--container-name",
+            "ctr-does-not-exist",
+            "--storage-root",
+            storage_root.to_str().unwrap(),
+            "--runroot",
+            runroot.to_str().unwrap(),
+            "--tmp-prefix",
+            tmp_prefix.to_str().unwrap(),
+            "--pid-file",
+            pid_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "--poll-interval-secs",
+            "1",
+            "--idle-shutdown-secs",
+            "1",
+            "--wrapper-pid",
+            &wrapper_pid,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn shutdown-manager binary");
+
+    // Wait for the file to acquire BOTH bootstrap lines, then kill.
+    // The manager writes "starting" before signal-install and
+    // "wrapper-monitor enabled" after PollConfig assembly — both
+    // are pre-poll-loop, so they appear within milliseconds.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents.contains("starting; container=") && contents.contains("wrapper-monitor enabled") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Tear down: SIGTERM-equivalent via `kill()` on the child id.
+    // The manager has SIGTERM handlers that trigger SIGNAL_SHUTDOWN.
+    // If the wait fails (e.g. signal already delivered), we don't
+    // care — the assertions below speak to the file contents.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        contents.contains("starting; container=ctr-does-not-exist"),
+        "--log-file did not capture the manager's bootstrap line; \
+         contents:\n{contents}",
+    );
+    assert!(
+        contents.contains("wrapper-monitor enabled"),
+        "--log-file did not capture the wrapper-monitor-enabled log \
+         line; contents:\n{contents}",
+    );
+    assert!(
+        contents.contains("[shutdown-mgr]"),
+        "--log-file lines must keep the [shutdown-mgr] prefix so \
+         operators can grep for them; contents:\n{contents}",
+    );
+}
+
 #[test]
 fn config_parse_rejects_unknown_flag() {
     let argv = vec![

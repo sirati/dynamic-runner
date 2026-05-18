@@ -163,12 +163,26 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // sees the correct value for that single command. Symmetric:
     // the bus-presence probe uses the same captured var.
     //
-    // StandardOutput/StandardError=append:<path> on the unit replaces
-    // the shell-redirect of stdout/stderr that scope-mode used.
-    // Service-mode hands stdio ownership to systemd, so the wrapper's
-    // `</dev/null >>LOG 2>&1` no longer applies — systemd needs to be
-    // told where to route the child's fds. `append:` matches the
-    // previous `>>` semantics (no truncation across job retries).
+    // Service-mode handing stdio ownership to systemd interacted
+    // poorly with the deployed systemd/MAC stack: the binary was
+    // exec'd correctly (journal proof) but neither
+    // `StandardOutput=append:<path>` nor `StandardError=append:<path>`
+    // actually routed the child's stdio to that file (asm-tokenizer
+    // 2026-05-18). Foreground probe with identical argv confirmed
+    // the binary itself writes stderr fine — root cause is on
+    // systemd's stdio-routing side, not the manager.
+    //
+    // Rather than chase the systemd quirk, the manager binary now
+    // owns the log destination directly: `--log-file <PATH>` opens
+    // the file at startup and appends every log line to it (in
+    // addition to stderr). The wrapper passes the same `$SHUTDOWN_LOG_PATH`
+    // it would have used for the systemd properties — operator-visible
+    // behaviour (single log file per job in `$RNDTMP/shutdown-manager.log`)
+    // is unchanged.
+    //
+    // `--property=StandardError=journal` stays so panic backtraces
+    // and any pre-`--log-file-open` stderr land in
+    // `journalctl --user -u <unit>` as a diagnostic safety net.
     let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
         match cfg.shutdown_manager_bin_path {
             Some(path) => {
@@ -197,8 +211,7 @@ if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run 
     if XDG_RUNTIME_DIR="$SYSTEMD_USER_RUNTIME_DIR" systemd-run --user --quiet \
             --unit="$SHUTDOWN_SCOPE" \
             --property=Restart=no \
-            --property="StandardOutput=append:$SHUTDOWN_LOG_PATH" \
-            --property="StandardError=append:$SHUTDOWN_LOG_PATH" \
+            --property=StandardError=journal \
             -- \
             {bin_q} \
                 --container-name "$CONTAINER_NAME" \
@@ -206,7 +219,8 @@ if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run 
                 --runroot "$PODMAN_RUN" \
                 --tmp-prefix "$RNDTMP" \
                 --pid-file "$RNDTMP/shutdown-manager.pid" \
-                --wrapper-pid "$$" 2>>"$SHUTDOWN_LOG_PATH"; then
+                --wrapper-pid "$$" \
+                --log-file "$SHUTDOWN_LOG_PATH" 2>>"$SHUTDOWN_LOG_PATH"; then
         SHUTDOWN_MODE=systemd
         echo "Spawned shutdown manager in unit $SHUTDOWN_SCOPE (cgroup escape via user.slice service)"
     else
@@ -225,7 +239,8 @@ if [ -z "$SHUTDOWN_MODE" ] && command -v setsid >/dev/null 2>&1; then
         --tmp-prefix "$RNDTMP" \
         --pid-file "$RNDTMP/shutdown-manager.pid" \
         --wrapper-pid "$$" \
-        </dev/null >>"$RNDTMP/shutdown-manager.log" 2>&1
+        --log-file "$SHUTDOWN_LOG_PATH" \
+        </dev/null >>"$SHUTDOWN_LOG_PATH" 2>&1
     # Capture pid via the manager's own pid-file (written first
     # thing in main::run_with_config). 5-second wait (50 * 0.1s)
     # is well above worst-case fork+exec+pid-file-write latency.

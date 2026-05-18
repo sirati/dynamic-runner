@@ -118,6 +118,12 @@ fn renders_shutdown_manager_spawn_when_path_set() {
         "--tmp-prefix \"$RNDTMP\"",
         "--pid-file \"$RNDTMP/shutdown-manager.pid\"",
         "--wrapper-pid \"$$\"",
+        // --log-file routes the manager's own log lines to the same
+        // per-job file the wrapper expects. Replaces the prior
+        // systemd `--property=StandardOutput/StandardError=append:`
+        // pair, which silently lost the manager's stdio on the
+        // deployed systemd stack (asm-tokenizer 2026-05-18).
+        "--log-file \"$SHUTDOWN_LOG_PATH\"",
     ] {
         assert!(
             script.contains(arg),
@@ -192,13 +198,18 @@ fn renders_shutdown_manager_spawn_when_path_set() {
     assert_bash_syntax_ok(&script);
 }
 
-/// Service-mode requires three `--property=` overrides:
+/// Service-mode requires two `--property=` overrides:
 ///   - `Restart=no` so systemd doesn't auto-restart the manager
 ///     after it intentionally exits at cleanup completion.
-///   - `StandardOutput=append:<LOG>` and `StandardError=append:<LOG>`
-///     so the spawned binary's stdio (now owned by systemd, not the
-///     wrapper shell) lands in the same per-job log file the
-///     cleanup-trap diagnostics expect.
+///   - `StandardError=journal` so panic backtraces and any
+///     pre-`--log-file-open` stderr land in `journalctl --user`
+///     as a diagnostic safety net. The manager's normal log
+///     output is routed by the binary itself via `--log-file`,
+///     NOT by systemd's `StandardOutput/StandardError=append:`
+///     properties (those were observed to silently lose stdio
+///     under service mode on the deployed systemd stack at
+///     asm-tokenizer 2026-05-18 — journal proved the binary
+///     exec'd but no output reached the configured path).
 ///
 /// AND: no `&` follows the systemd-run invocation — regression
 /// guard against re-introducing the scope-mode race (systemd-run in
@@ -218,28 +229,62 @@ fn service_mode_renders_with_required_properties() {
          exit; render did not contain the property"
     );
     assert!(
-        script.contains("--property=\"StandardOutput=append:$SHUTDOWN_LOG_PATH\""),
-        "service-mode unit must route stdout to the manager log via \
-         StandardOutput=append (systemd owns the spawned binary's fds \
-         in service mode; the wrapper shell's `>>LOG` no longer applies); \
-         render did not contain it"
+        script.contains("--property=StandardError=journal"),
+        "service-mode unit must route stderr to the journal as a \
+         diagnostic safety net for panic backtraces; render did not \
+         contain it"
+    );
+    // Regression guard: the systemd `append:<path>` properties were
+    // removed because they silently lost the manager's stdio on the
+    // deployed systemd stack. Log routing is now the manager's
+    // responsibility via `--log-file`, NOT systemd's.
+    assert!(
+        !script.contains("StandardOutput=append:"),
+        "service-mode unit must NOT use `StandardOutput=append:` — \
+         the property was observed to silently lose stdio on the \
+         deployed systemd stack (asm-tokenizer 2026-05-18); the \
+         manager now owns its log destination via `--log-file`. \
+         Render contained the legacy property."
     );
     assert!(
-        script.contains("--property=\"StandardError=append:$SHUTDOWN_LOG_PATH\""),
-        "service-mode unit must route stderr to the manager log via \
-         StandardError=append; render did not contain it"
+        !script.contains("StandardError=append:"),
+        "service-mode unit must NOT use `StandardError=append:` — \
+         see StandardOutput rationale above; render contained the \
+         legacy property."
     );
     // No `&` after the systemd-run invocation. Service mode is
     // synchronous; backgrounding would re-introduce the race that
     // this whole change exists to fix. The substring we look for
     // is the closing of the systemd-run continuation block (right
     // before the bash `; then`) — if a `&` snuck in there it
-    // would appear immediately before `; then`.
+    // would appear immediately before `; then`. The current
+    // continuation now ends with `--log-file "$SHUTDOWN_LOG_PATH"`
+    // (the trailing arg pre-redirect); guard on that.
     assert!(
-        !script.contains("--wrapper-pid \"$$\" &"),
+        !script.contains("--log-file \"$SHUTDOWN_LOG_PATH\" &"),
         "systemd-run must NOT be backgrounded with `&` in service \
          mode — that would re-introduce the scope-mode race the \
          service-mode switch was meant to fix; render contained the `&`"
+    );
+}
+
+/// `--log-file` must be passed in BOTH dispatch branches (systemd-run
+/// and setsid-f), so the manager always owns its log destination
+/// regardless of which primitive the runtime probe picks. The render
+/// emits the spawn block twice — once per branch — so we expect
+/// exactly two occurrences of the flag.
+#[test]
+fn log_file_flag_renders_in_both_dispatch_branches() {
+    let config = SlurmConfig::default();
+    let bin = PathBuf::from(SHUTDOWN_BIN);
+    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
+    let count = script.matches("--log-file \"$SHUTDOWN_LOG_PATH\"").count();
+    assert_eq!(
+        count, 2,
+        "expected exactly two occurrences of `--log-file \
+         \"$SHUTDOWN_LOG_PATH\"` (one per dispatch branch: systemd-run \
+         + setsid-f), so the manager owns its log destination under \
+         either primitive; render contained {count}. Full script:\n{script}"
     );
 }
 
