@@ -65,8 +65,12 @@ IDLE_SHUTDOWN:
   podman rm -af
 
 FINAL_CLEANUP (both paths):
-  podman unshare rm -rf <tmp_prefix>   (fallback: host rm -rf)
-  unlink <pid_file>                    (missing is OK)
+  # Per-entry walk: NO recursive primitive, NO host-side fallback.
+  podman unshare find <tmp_prefix> -mindepth 1 -type f -print0
+  for each file: podman unshare rm -- <file>
+  podman unshare find <tmp_prefix> -depth -type d -print0   # leaf-first
+  for each dir : podman unshare rmdir -- <dir>
+  unlink <pid_file>                                          # missing is OK
 ```
 
 The shutdown flag is set by SIGTERM **or** SIGCONT handlers

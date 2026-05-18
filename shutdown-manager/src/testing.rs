@@ -13,7 +13,7 @@ use crate::podman::PodmanBackend;
 use crate::process_probe::ProcessProbe;
 use crate::shutdown_flag::ShutdownFlag;
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Programmable backend. Each method has a *script* of return values
@@ -25,7 +25,10 @@ pub struct MockBackend {
     calls: RefCell<Vec<String>>,
     exists_script: RefCell<Vec<bool>>,
     pgrep_script: RefCell<Vec<Option<u32>>>,
-    unshare_script: RefCell<Vec<bool>>,
+    find_files_script: RefCell<Vec<Result<Vec<PathBuf>, String>>>,
+    find_dirs_script: RefCell<Vec<Result<Vec<PathBuf>, String>>>,
+    unlink_script: RefCell<Vec<Result<(), String>>>,
+    rmdir_script: RefCell<Vec<Result<(), String>>>,
     rm_all_called: RefCell<bool>,
 }
 
@@ -40,8 +43,28 @@ impl MockBackend {
     pub fn script_pgrep(&self, results: Vec<Option<u32>>) {
         *self.pgrep_script.borrow_mut() = results;
     }
-    pub fn script_unshare(&self, results: Vec<bool>) {
-        *self.unshare_script.borrow_mut() = results;
+
+    /// Scripted return values for `unshare_find_files`. Each call
+    /// consumes one slot; past the script the method returns
+    /// `Ok(Vec::new())` (empty enumeration) as a safe default.
+    pub fn script_find_files(&self, results: Vec<Result<Vec<PathBuf>, String>>) {
+        *self.find_files_script.borrow_mut() = results;
+    }
+    /// Scripted return values for `unshare_find_dirs`. Same shape as
+    /// `script_find_files`.
+    pub fn script_find_dirs(&self, results: Vec<Result<Vec<PathBuf>, String>>) {
+        *self.find_dirs_script.borrow_mut() = results;
+    }
+    /// Scripted return values for `unshare_unlink` — one per file the
+    /// cleanup walk attempts to unlink. Past the script the method
+    /// returns `Ok(())` (best-case default).
+    pub fn script_unlink(&self, results: Vec<Result<(), String>>) {
+        *self.unlink_script.borrow_mut() = results;
+    }
+    /// Scripted return values for `unshare_rmdir` — one per directory
+    /// the walk attempts to rmdir.
+    pub fn script_rmdir(&self, results: Vec<Result<(), String>>) {
+        *self.rmdir_script.borrow_mut() = results;
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -65,6 +88,25 @@ impl MockBackend {
         let mut v = slot.borrow_mut();
         match v.is_empty() {
             true => None,
+            false => v.remove(0),
+        }
+    }
+    /// Pop next find-result; default to `Ok(empty)` so tests that
+    /// don't script enumeration get a no-op walk.
+    fn pop_find(
+        slot: &RefCell<Vec<Result<Vec<PathBuf>, String>>>,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut v = slot.borrow_mut();
+        match v.is_empty() {
+            true => Ok(Vec::new()),
+            false => v.remove(0),
+        }
+    }
+    /// Pop next unlink/rmdir result; default `Ok(())`.
+    fn pop_unit(slot: &RefCell<Vec<Result<(), String>>>) -> Result<(), String> {
+        let mut v = slot.borrow_mut();
+        match v.is_empty() {
+            true => Ok(()),
             false => v.remove(0),
         }
     }
@@ -98,13 +140,49 @@ impl PodmanBackend for MockBackend {
         self.record("rm_all".to_string());
         true
     }
-    fn unshare_remove(&self, path: &Path) -> Result<(), String> {
-        let r = Self::pop_bool(&self.unshare_script);
-        self.record(format!("unshare_remove({}) -> {}", path.display(), r));
-        match r {
-            true => Ok(()),
-            false => Err("mock-failure".to_string()),
-        }
+    fn unshare_find_files(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+        let r = Self::pop_find(&self.find_files_script);
+        let summary = match &r {
+            Ok(v) => format!("Ok({} entries)", v.len()),
+            Err(e) => format!("Err({})", e),
+        };
+        self.record(format!(
+            "unshare_find_files({}) -> {}",
+            root.display(),
+            summary
+        ));
+        r
+    }
+    fn unshare_find_dirs(&self, root: &Path) -> Result<Vec<PathBuf>, String> {
+        let r = Self::pop_find(&self.find_dirs_script);
+        let summary = match &r {
+            Ok(v) => format!("Ok({} entries)", v.len()),
+            Err(e) => format!("Err({})", e),
+        };
+        self.record(format!(
+            "unshare_find_dirs({}) -> {}",
+            root.display(),
+            summary
+        ));
+        r
+    }
+    fn unshare_unlink(&self, file: &Path) -> Result<(), String> {
+        let r = Self::pop_unit(&self.unlink_script);
+        let summary = match &r {
+            Ok(()) => "Ok".to_string(),
+            Err(e) => format!("Err({})", e),
+        };
+        self.record(format!("unshare_unlink({}) -> {}", file.display(), summary));
+        r
+    }
+    fn unshare_rmdir(&self, dir: &Path) -> Result<(), String> {
+        let r = Self::pop_unit(&self.rmdir_script);
+        let summary = match &r {
+            Ok(()) => "Ok".to_string(),
+            Err(e) => format!("Err({})", e),
+        };
+        self.record(format!("unshare_rmdir({}) -> {}", dir.display(), summary));
+        r
     }
 }
 
