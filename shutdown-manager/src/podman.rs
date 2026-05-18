@@ -61,17 +61,29 @@ pub trait PodmanBackend {
     fn unshare_remove(&self, path: &Path) -> Result<(), String>;
 }
 
-/// Production backend. Holds the storage/runroot prefix so callers do
-/// not have to know about it.
+/// Production backend. Holds the podman binary path AND the
+/// storage/runroot prefix so callers do not have to know about
+/// either.
+///
+/// `podman_path` is an explicit input (not a hard-coded `"podman"`)
+/// because the manager runs inside a systemd-user-service unit whose
+/// `PATH` does NOT inherit the parent shell's PATH — on NixOS workers
+/// `podman` lives at `/run/current-system/sw/bin/podman`, which is
+/// not on the default user-systemd PATH and would ENOENT under
+/// `Command::new("podman").spawn()` (asm-tokenizer 2026-05-18). The
+/// wrapper script resolves `command -v podman` once at render time
+/// and passes the absolute path via `--podman-path`.
 #[derive(Debug, Clone)]
 pub struct RealPodman {
+    podman_path: PathBuf,
     storage_root: PathBuf,
     runroot: PathBuf,
 }
 
 impl RealPodman {
-    pub fn new(storage_root: PathBuf, runroot: PathBuf) -> Self {
+    pub fn new(podman_path: PathBuf, storage_root: PathBuf, runroot: PathBuf) -> Self {
         Self {
+            podman_path,
             storage_root,
             runroot,
         }
@@ -82,7 +94,7 @@ impl RealPodman {
     /// All subcommands flow through this helper to keep the prefix
     /// in exactly one place.
     fn cmd(&self) -> Command {
-        let mut c = Command::new("podman");
+        let mut c = Command::new(&self.podman_path);
         c.arg("--root")
             .arg(&self.storage_root)
             .arg("--runroot")
@@ -192,13 +204,19 @@ impl PodmanBackend for RealPodman {
 mod tests {
     use super::*;
 
-    /// Smoke: builder records storage/runroot in the command vector
-    /// (we can't easily inspect a `Command` post-hoc without spawning,
-    /// so this is more a constructor sanity-check than a behaviour
-    /// test — behaviour is exercised via the mock in `tests/common`).
+    /// Smoke: builder records podman_path/storage/runroot in the
+    /// command vector (we can't easily inspect a `Command` post-hoc
+    /// without spawning, so this is more a constructor sanity-check
+    /// than a behaviour test — behaviour is exercised via the mock
+    /// in `tests/common`).
     #[test]
     fn real_backend_constructs() {
-        let b = RealPodman::new(PathBuf::from("/r"), PathBuf::from("/rr"));
+        let b = RealPodman::new(
+            PathBuf::from("/nix/store/x/bin/podman"),
+            PathBuf::from("/r"),
+            PathBuf::from("/rr"),
+        );
+        assert_eq!(b.podman_path, Path::new("/nix/store/x/bin/podman"));
         assert_eq!(b.storage_root, Path::new("/r"));
         assert_eq!(b.runroot, Path::new("/rr"));
     }

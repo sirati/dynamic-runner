@@ -43,6 +43,21 @@ pub struct Config {
     /// drop the manager's stdio under service mode on the deployed
     /// systemd/MAC stack (asm-tokenizer 2026-05-18).
     pub log_file: Option<PathBuf>,
+    /// Absolute path to the `podman` binary the manager invokes for
+    /// all container/storage operations. Resolving this at the caller
+    /// side (wrapper script) and threading it through argv eliminates
+    /// the PATH dependency that the systemd-user-service-mode unit
+    /// inherits — systemd-run --user --unit does NOT inherit the
+    /// parent shell's PATH; the unit starts with the minimal user-
+    /// systemd PATH, which on NixOS workers does NOT include
+    /// `/run/current-system/sw/bin` where `podman` actually lives
+    /// (asm-tokenizer 2026-05-18: `Command::new("podman").spawn()`
+    /// returned ENOENT for every cleanup call).
+    ///
+    /// Defaulted to the literal `"podman"` so omitting the flag
+    /// preserves the pre-2026-05-18 PATH-lookup behaviour for
+    /// callers that haven't been updated.
+    pub podman_path: PathBuf,
 }
 
 /// Default per the CLI contract.
@@ -66,6 +81,7 @@ struct Builder {
     container_stop_grace_secs: Option<u64>,
     wrapper_pid: Option<u32>,
     log_file: Option<PathBuf>,
+    podman_path: Option<PathBuf>,
 }
 
 impl Builder {
@@ -100,6 +116,9 @@ impl Builder {
             ),
             wrapper_pid: self.wrapper_pid,
             log_file: self.log_file,
+            podman_path: self
+                .podman_path
+                .unwrap_or_else(|| PathBuf::from("podman")),
         })
     }
 }
@@ -156,6 +175,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> 
                 b.wrapper_pid = Some(pid);
             }
             "--log-file" => b.log_file = Some(PathBuf::from(take_str(&mut iter)?)),
+            "--podman-path" => b.podman_path = Some(PathBuf::from(take_str(&mut iter)?)),
             other => return Err(format!("unknown flag: {}", other)),
         }
     }
@@ -342,5 +362,49 @@ mod tests {
         args.extend(argv(&["--log-file=/tmp/shutdown.log"]));
         let cfg = parse(args).expect("must parse");
         assert_eq!(cfg.log_file, Some(PathBuf::from("/tmp/shutdown.log")));
+    }
+
+    /// Omitting `--podman-path` resolves to the literal `"podman"`,
+    /// preserving the pre-2026-05-18 PATH-lookup behaviour for
+    /// callers that haven't been updated. Non-Option type on the
+    /// resolved config keeps downstream consumption clean (no
+    /// caller has to choose between an explicit path and a default
+    /// — the resolution is centralized here).
+    #[test]
+    fn podman_path_defaults_to_literal_podman() {
+        let cfg = parse(minimal_required()).expect("must parse");
+        assert_eq!(
+            cfg.podman_path,
+            PathBuf::from("podman"),
+            "--podman-path omitted ⇒ literal \"podman\" (PATH lookup, \
+             pre-2026-05-18 back-compat default)"
+        );
+    }
+
+    /// Setting `--podman-path /abs/path/to/podman` threads the path
+    /// into the resolved config verbatim. The wrapper script's role
+    /// (next commit) is to resolve `command -v podman` once at
+    /// render time and pass the absolute result here, removing the
+    /// PATH dependency for the systemd-user-service-mode unit.
+    #[test]
+    fn parses_podman_path_optional() {
+        let mut args = minimal_required();
+        args.extend(argv(&[
+            "--podman-path",
+            "/nix/store/x/bin/podman",
+        ]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(
+            cfg.podman_path,
+            PathBuf::from("/nix/store/x/bin/podman"),
+        );
+    }
+
+    #[test]
+    fn podman_path_equals_form() {
+        let mut args = minimal_required();
+        args.extend(argv(&["--podman-path=/usr/bin/podman"]));
+        let cfg = parse(args).expect("must parse");
+        assert_eq!(cfg.podman_path, PathBuf::from("/usr/bin/podman"));
     }
 }

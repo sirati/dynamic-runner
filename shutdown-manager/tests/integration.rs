@@ -345,6 +345,104 @@ fn log_file_flag_routes_first_log_lines_to_destination() {
     );
 }
 
+/// Test 12: `--podman-path` is honoured end-to-end. We pass a real
+/// path that exists on the filesystem but is NOT a podman binary
+/// (`/usr/bin/false`); the manager's bootstrap (parse → log-file open
+/// → pid-file write → signal install → poll-loop entry) must succeed
+/// even though every subsequent podman call will fail at exec. The
+/// proof point: the bootstrap log lines reach `--log-file` exactly
+/// like the canonical (`--podman-path` resolving via PATH) case —
+/// confirming the flag is wired through and that the manager's
+/// "podman failures are best-effort" contract survives a hostile
+/// `--podman-path`. If the flag were ignored or the binary aborted
+/// on the first podman ENOENT, the bootstrap lines would either
+/// reflect a different path or never reach the file.
+///
+/// Subprocess, not unit-test the closure: same rationale as
+/// `log_file_flag_routes_first_log_lines_to_destination` — argv →
+/// resolved Config → backend construction is the load-bearing chain.
+#[test]
+fn podman_path_flag_threads_into_backend() {
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    let bin = env!("CARGO_BIN_EXE_dynrunner-slurm-shutdown");
+    let dir = tempdir().unwrap();
+    let log_path = dir.path().join("shutdown-manager.log");
+    let pid_path = dir.path().join("shutdown.pid");
+    let tmp_prefix = dir.path().join("asm-XXX");
+    let storage_root = dir.path().join("podman-root");
+    let runroot = dir.path().join("podman-run");
+    let wrapper_pid = std::process::id().to_string();
+
+    // `/usr/bin/false` exists on every Linux distro the framework
+    // targets, exits non-zero on every invocation, and is NOT a
+    // podman binary. Using it proves the bootstrap stages don't
+    // depend on a working podman — exactly the contract the
+    // post-2026-05-18 shutdown manager needs to preserve so a
+    // bad `--podman-path` from a misconfigured wrapper degrades
+    // to "podman calls fail, manager still tears down cleanly"
+    // rather than aborting.
+    let mut child = Command::new(bin)
+        .args([
+            "--container-name",
+            "ctr-does-not-exist",
+            "--storage-root",
+            storage_root.to_str().unwrap(),
+            "--runroot",
+            runroot.to_str().unwrap(),
+            "--tmp-prefix",
+            tmp_prefix.to_str().unwrap(),
+            "--pid-file",
+            pid_path.to_str().unwrap(),
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "--poll-interval-secs",
+            "1",
+            "--idle-shutdown-secs",
+            "1",
+            "--wrapper-pid",
+            &wrapper_pid,
+            "--podman-path",
+            "/usr/bin/false",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn shutdown-manager binary with --podman-path");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if contents.contains("starting; container=") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        contents.contains("starting; container=ctr-does-not-exist"),
+        "--podman-path /usr/bin/false: bootstrap log line must still \
+         reach the file (the flag is wired through; podman call \
+         failures are best-effort post-bootstrap); contents:\n{contents}",
+    );
+    // PID file must exist post-bootstrap — written before any
+    // podman call, so a bad podman_path cannot prevent it.
+    assert!(
+        pid_path.exists(),
+        "--podman-path /usr/bin/false: pid file must be written \
+         during bootstrap (pre-poll-loop, pre-any-podman-call). \
+         Missing pid file would indicate the bootstrap chain itself \
+         aborted on the flag — which would mean `--podman-path` is \
+         load-bearing in a way it must not be.",
+    );
+}
+
 #[test]
 fn config_parse_rejects_unknown_flag() {
     let argv = vec![

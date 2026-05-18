@@ -183,6 +183,34 @@ pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     // `--property=StandardError=journal` stays so panic backtraces
     // and any pre-`--log-file-open` stderr land in
     // `journalctl --user -u <unit>` as a diagnostic safety net.
+    //
+    // `--property=PrivateTmp=false` disables systemd's default
+    // per-unit /tmp namespace isolation. Without this, the
+    // shutdown-manager's view of `/tmp/asm-XXX/...` is a different
+    // mount namespace from the wrapper's — the wrapper's
+    // `--tmp-prefix`, `--storage-root`, `--runroot`, `--pid-file`,
+    // and `--log-file` paths under `$RNDTMP` would resolve to a
+    // private tmpfs inside the unit's namespace, NOT the on-disk
+    // directories the wrapper created and the rest of the SLURM job
+    // expects (asm-tokenizer 2026-05-18: journal trace showed the
+    // manager running to completion, but no on-disk artifacts — the
+    // log file, pid file, and `podman unshare rm -rf` were all
+    // operating on a phantom namespace-private /tmp). NixOS's
+    // user-systemd defaults can enable PrivateTmp transparently on
+    // transient units; the explicit `=false` neutralizes that.
+    //
+    // `--podman-path "$PODMAN_BIN"` plumbs the wrapper-resolved
+    // absolute podman path (from `command -v podman` earlier in this
+    // script) into the manager. The systemd-user-service unit does
+    // NOT inherit the wrapper's PATH; on NixOS workers podman lives
+    // at `/run/current-system/sw/bin/podman`, which is NOT on the
+    // default user-systemd PATH — `Command::new("podman")` would
+    // ENOENT inside the unit. Threading the absolute path makes the
+    // manager's podman invocations work regardless of the unit's
+    // PATH. Mirrored in the setsid fallback below for symmetry: the
+    // setsid path DOES inherit the wrapper's PATH (no new session
+    // PATH reset), but threading the same arg keeps both branches
+    // exercising the identical CLI contract.
     let (shutdown_manager_spawn_block, shutdown_manager_cleanup_forward) =
         match cfg.shutdown_manager_bin_path {
             Some(path) => {
@@ -211,6 +239,7 @@ if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run 
     if XDG_RUNTIME_DIR="$SYSTEMD_USER_RUNTIME_DIR" systemd-run --user --quiet \
             --unit="$SHUTDOWN_SCOPE" \
             --property=Restart=no \
+            --property=PrivateTmp=false \
             --property=StandardError=journal \
             -- \
             {bin_q} \
@@ -220,7 +249,8 @@ if [ -S "$SYSTEMD_USER_RUNTIME_DIR/systemd/private" ] && command -v systemd-run 
                 --tmp-prefix "$RNDTMP" \
                 --pid-file "$RNDTMP/shutdown-manager.pid" \
                 --wrapper-pid "$$" \
-                --log-file "$SHUTDOWN_LOG_PATH" 2>>"$SHUTDOWN_LOG_PATH"; then
+                --log-file "$SHUTDOWN_LOG_PATH" \
+                --podman-path "$PODMAN_BIN" 2>>"$SHUTDOWN_LOG_PATH"; then
         SHUTDOWN_MODE=systemd
         echo "Spawned shutdown manager in unit $SHUTDOWN_SCOPE (cgroup escape via user.slice service)"
     else
@@ -240,6 +270,7 @@ if [ -z "$SHUTDOWN_MODE" ] && command -v setsid >/dev/null 2>&1; then
         --pid-file "$RNDTMP/shutdown-manager.pid" \
         --wrapper-pid "$$" \
         --log-file "$SHUTDOWN_LOG_PATH" \
+        --podman-path "$PODMAN_BIN" \
         </dev/null >>"$SHUTDOWN_LOG_PATH" 2>&1
     # Capture pid via the manager's own pid-file (written first
     # thing in main::run_with_config). 5-second wait (50 * 0.1s)
@@ -317,6 +348,23 @@ echo "Podman run root: $PODMAN_RUN"
 echo "XDG_RUNTIME_DIR: $XDG_RUNTIME_DIR"
 
 CONTAINER_NAME="{container_name}"
+
+# Resolve podman absolute path so the shutdown-manager service unit
+# (which inherits systemd-user's minimal PATH, NOT the wrapper's
+# shell PATH) can invoke podman during cleanup. On NixOS workers the
+# binary lives at /run/current-system/sw/bin/podman, which is NOT on
+# the default user-systemd PATH; without this resolution the
+# manager's `Command::new("podman").spawn()` calls ENOENT for every
+# cleanup operation (asm-tokenizer 2026-05-18 post-6a41e3a). On
+# standard distros podman is at /usr/bin/podman which IS on the
+# default PATH, but explicit resolution removes the dependency
+# entirely — the same wrapper render now works on either stack.
+PODMAN_BIN="$(command -v podman 2>/dev/null || true)"
+if [ -z "$PODMAN_BIN" ]; then
+    echo "WARNING: podman not found in wrapper PATH; shutdown-manager cleanup will rely on its --podman-path default (\"podman\", PATH lookup inside the service unit) and may ENOENT under systemd-user-service-mode" >&2
+    PODMAN_BIN="podman"
+fi
+echo "Podman binary: $PODMAN_BIN"
 
 # Shutdown-manager spawn block follows immediately below. It is
 # rendered only when the caller plumbs the binary path through
