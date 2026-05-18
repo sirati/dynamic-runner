@@ -48,39 +48,6 @@ pub trait PodmanBackend {
     /// root, releasing layer references. Idempotent.
     fn rm_all(&self) -> bool;
 
-    /// `podman unmount --all` — explicitly `umount(2)` every
-    /// container-storage mountpoint under this storage root.
-    ///
-    /// Rootless podman uses fuse-overlayfs as its storage driver;
-    /// each container's rootfs is an overlay mount at
-    /// `<storage>/overlay/<id>/merged` backed by a fuse-overlayfs
-    /// daemon process running as a SIBLING of the container's
-    /// process tree (not a child). Under SLURM TIMEOUT, the
-    /// wrapper's process tree gets SIGKILL'd as a unit; the
-    /// fuse-overlayfs daemon dies with everything else, leaving
-    /// the kernel mount table referencing a dead FUSE backend.
-    ///
-    /// `podman rm -af` removes container records cleanly — it does
-    /// not "leave mounts behind" by design — but the unmount step
-    /// only fires for containers podman knows about at rm-time. If
-    /// the secondary's container auto-rm'd on exit (or rm-af raced
-    /// with auto-rm), `rm -af` finds nothing to do and the dead
-    /// FUSE mountpoint is no longer associated with any container
-    /// podman tracks. Calling `unmount --all` after `rm -af` is
-    /// the documented way to flush any residual storage-driver
-    /// mounts the rm path didn't reach.
-    ///
-    /// Observed under the SLURM-TIMEOUT shape (asm-tokenizer
-    /// 2026-05-18 12:05 on a70d3bf): cleanup rm -rf hits EBUSY on
-    /// `storage/overlay`, leaving ~40K of mountpoint-stub residue
-    /// per prefix. After the explicit unmount the kernel drops
-    /// the mount and the cleanup walk finishes empty.
-    ///
-    /// Best-effort: failure does not propagate. The cleanup walk
-    /// will simply hit the same EBUSY and leave the residue,
-    /// which the operator inspects via the captured stderr.
-    fn unmount_all(&self) -> bool;
-
     /// `podman unshare <rm-path> <abs-path> -rf` — drop into the
     /// user-namespace where the storage subuids are owned and remove
     /// a directory tree. Required because subuid-owned files under
@@ -257,12 +224,6 @@ impl PodmanBackend for RealPodman {
     fn rm_all(&self) -> bool {
         let mut c = self.cmd();
         c.arg("rm").arg("-af");
-        Self::run_silent(c)
-    }
-
-    fn unmount_all(&self) -> bool {
-        let mut c = self.cmd();
-        c.arg("unmount").arg("--all");
         Self::run_silent(c)
     }
 
