@@ -5,7 +5,7 @@
 //! `default_payload_json` / `default_uses_file_based_items`) that keep
 //! the wire format backward-compatible with pre-Phase-4b senders.
 
-use dynrunner_core::{Identifier, SoftPreferredSecondaries, TaskInfo};
+use dynrunner_core::{Identifier, SoftPreferredSecondaries, TaskDep, TaskInfo};
 use serde::{Deserialize, Serialize};
 
 /// Binary info as serialized in distributed messages.
@@ -55,10 +55,14 @@ pub struct DistributedBinaryInfo<I> {
     /// stays backward-compatible.
     #[serde(default)]
     pub task_id: Option<String>,
-    /// Task ids of prerequisites (see `TaskInfo::task_depends_on`).
-    /// Defaults to empty for pre-task-deps senders.
+    /// Per-edge dep records of prerequisites (see
+    /// `TaskInfo::task_depends_on`). Defaults to empty for pre-task-deps
+    /// senders. Wire backcompat: `TaskDep`'s `#[serde(untagged)]`
+    /// deserializer accepts both legacy bare-string elements (which decode
+    /// as `inherit_outputs: false`) and the full struct shape, so pre-keyed-
+    /// outputs payloads that emitted `["foo", "bar"]` continue to load.
     #[serde(default)]
-    pub task_depends_on: Vec<String>,
+    pub task_depends_on: Vec<TaskDep>,
     /// Soft hint of preferred secondaries (see
     /// [`TaskInfo::preferred_secondaries`]). Carried verbatim across
     /// the wire so the receiving secondary's hydrated `TaskInfo`
