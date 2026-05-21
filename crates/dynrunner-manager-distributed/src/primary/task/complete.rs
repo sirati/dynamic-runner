@@ -28,6 +28,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             secondary_id,
             worker_id,
             task_hash,
+            result_data,
             ..
         } = &msg
         {
@@ -73,7 +74,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             self.apply_and_broadcast_cluster_mutations(vec![
                 ClusterMutation::TaskCompleted {
                     hash: task_hash.clone(),
-                    result_data: None,
+                    result_data: result_data.clone(),
                 },
             ])
             .await;
