@@ -160,9 +160,9 @@ pub fn validate_spawn_tasks<I: Identifier>(
             continue;
         }
         let mut bad_dep: Option<String> = None;
-        for dep_id in &task.task_depends_on {
-            if !known_task_ids.contains(dep_id) {
-                bad_dep = Some(dep_id.clone());
+        for dep in &task.task_depends_on {
+            if !known_task_ids.contains(&dep.task_id) {
+                bad_dep = Some(dep.task_id.clone());
                 break;
             }
         }

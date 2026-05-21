@@ -4,7 +4,9 @@
 //! - [`identifiers`]: opaque `Arc<str>` newtypes for resource/phase/type/affinity ids
 //!   plus the [`Identifier`] trait alias and [`RunnerIdentifier`] alias.
 //! - [`resource`]: [`ResourceAmount`], [`ResourceMap`], [`SoftPreferredSecondaries`].
-//! - [`task`]: [`TaskInfo`] (the scheduling unit) and the [`TaskInput`] alias.
+//! - [`task`]: [`TaskInfo`] (the scheduling unit), the [`TaskInput`] alias,
+//!   and the [`TaskDep`] dep-graph edge primitive.
+//! - [`outputs`]: [`TaskOutputs`], [`ResultValue`], and the soft-cap helper.
 //! - [`error`]: [`ErrorType`], [`TaskResult`], [`FailedTask`].
 //!
 //! Tests live in `types_tests.rs` (sibling of this `types/` directory) and
@@ -12,13 +14,15 @@
 
 pub mod error;
 pub mod identifiers;
+pub mod outputs;
 pub mod resource;
 pub mod task;
 
 pub use error::{ErrorType, FailedTask, TaskResult};
 pub use identifiers::{AffinityId, Identifier, PhaseId, ResourceKind, RunnerIdentifier, TypeId};
+pub use outputs::{ResultValue, TaskOutputs, check_soft_caps};
 pub use resource::{ResourceAmount, ResourceMap, SoftPreferredSecondaries};
-pub use task::{TaskInfo, TaskInput};
+pub use task::{TaskDep, TaskInfo, TaskInput};
 
 pub type WorkerId = u32;
 

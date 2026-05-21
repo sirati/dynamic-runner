@@ -1,9 +1,14 @@
 //! [`TaskInfo`] — the one scheduling unit handed to the runtime — and the
 //! [`TaskInput`] alias used by older call-sites.
+//!
+//! Also hosts [`TaskDep`], the dep-graph edge primitive. Co-located here
+//! because dependencies are a `TaskInfo` concern (the field, the
+//! validation rules, and the cycle-checker are all reached via
+//! `TaskInfo.task_depends_on`).
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::identifiers::{AffinityId, PhaseId, TypeId};
 use super::resource::SoftPreferredSecondaries;
@@ -74,7 +79,7 @@ pub struct TaskInfo<I> {
     /// transitively with a synthetic upstream-failed error rather
     /// than waiting forever for a satisfaction that will never come.
     #[serde(default)]
-    pub task_depends_on: Vec<String>,
+    pub task_depends_on: Vec<TaskDep>,
     /// Soft hint of preferred secondaries (by peer name) for this task.
     /// Empty == no preference (free pool); the scheduler is free to
     /// pick any secondary. See [`SoftPreferredSecondaries`] for the
@@ -108,3 +113,121 @@ pub struct TaskInfo<I> {
 }
 
 pub type TaskInput<I> = TaskInfo<I>;
+
+/// One edge in the per-task dep graph: the prerequisite's `task_id`
+/// plus a per-edge opt-in to receive the predecessor's transitive
+/// ancestors' outputs (not just the direct predecessor's).
+///
+/// `inherit_outputs = false` (the default, and the only shape legacy
+/// `Vec<String>` payloads decode to) means "wait for this task; read
+/// only its own outputs".
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct TaskDep {
+    pub task_id: String,
+    #[serde(default)]
+    pub inherit_outputs: bool,
+}
+
+// Untagged wire shape: a single `Vec<TaskDep>` JSON array may mix bare
+// strings (legacy) and full structs (new). serde's derive can't express
+// "accept either shape" on a single struct, so the canonical idiom is
+// to deserialise into a private untagged enum and then map. Without
+// this back-compat decoder, every existing snapshot / ledger / wire
+// fixture that serialises `task_depends_on` as `["foo", "bar"]` would
+// fail to load.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TaskDepWire {
+    Bare(String),
+    Full {
+        task_id: String,
+        #[serde(default)]
+        inherit_outputs: bool,
+    },
+}
+
+impl<'de> Deserialize<'de> for TaskDep {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match TaskDepWire::deserialize(d)? {
+            TaskDepWire::Bare(task_id) => TaskDep {
+                task_id,
+                inherit_outputs: false,
+            },
+            TaskDepWire::Full {
+                task_id,
+                inherit_outputs,
+            } => TaskDep {
+                task_id,
+                inherit_outputs,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod task_dep_tests {
+    use super::*;
+
+    #[test]
+    fn task_dep_bare_string_decodes_as_false() {
+        let dep: TaskDep = serde_json::from_str("\"foo\"").expect("bare string");
+        assert_eq!(
+            dep,
+            TaskDep {
+                task_id: "foo".to_string(),
+                inherit_outputs: false,
+            }
+        );
+    }
+
+    #[test]
+    fn task_dep_struct_decodes_inherit_outputs() {
+        let dep: TaskDep = serde_json::from_str("{\"task_id\":\"foo\",\"inherit_outputs\":true}")
+            .expect("struct with flag");
+        assert_eq!(
+            dep,
+            TaskDep {
+                task_id: "foo".to_string(),
+                inherit_outputs: true,
+            }
+        );
+    }
+
+    #[test]
+    fn task_dep_struct_default_inherit_outputs_false() {
+        // The `inherit_outputs` key may be omitted from the struct shape.
+        let dep: TaskDep =
+            serde_json::from_str("{\"task_id\":\"foo\"}").expect("struct without flag");
+        assert_eq!(
+            dep,
+            TaskDep {
+                task_id: "foo".to_string(),
+                inherit_outputs: false,
+            }
+        );
+    }
+
+    #[test]
+    fn vec_task_dep_mixed_array_decodes() {
+        let v: Vec<TaskDep> =
+            serde_json::from_str("[\"a\", {\"task_id\":\"b\",\"inherit_outputs\":true}]")
+                .expect("mixed array");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].task_id, "a");
+        assert!(!v[0].inherit_outputs);
+        assert_eq!(v[1].task_id, "b");
+        assert!(v[1].inherit_outputs);
+    }
+
+    #[test]
+    fn task_dep_serialises_to_struct_shape() {
+        // Forward shape is canonical: bare-string is decode-only.
+        let dep = TaskDep {
+            task_id: "foo".to_string(),
+            inherit_outputs: true,
+        };
+        let json = serde_json::to_value(&dep).expect("to_value");
+        assert_eq!(json["task_id"], "foo");
+        assert_eq!(json["inherit_outputs"], true);
+    }
+}

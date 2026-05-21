@@ -7,7 +7,8 @@ pub use bounded_string::BoundedString;
 pub use traits::{MessageReceiver, MessageSender};
 pub use path_resolve::{resolve_against_root, ResolvedPath};
 pub use types::{
-    AffinityId, TaskInfo, ErrorType, FailedTask, Identifier, PhaseId,
-    ResourceAmount, ResourceKind, ResourceMap, RunnerIdentifier,
-    SoftPreferredSecondaries, TaskInput, TaskResult, TypeId, WorkerId,
+    check_soft_caps, AffinityId, ErrorType, FailedTask, Identifier, PhaseId,
+    ResourceAmount, ResourceKind, ResourceMap, ResultValue, RunnerIdentifier,
+    SoftPreferredSecondaries, TaskDep, TaskInfo, TaskInput, TaskOutputs,
+    TaskResult, TypeId, WorkerId,
 };
