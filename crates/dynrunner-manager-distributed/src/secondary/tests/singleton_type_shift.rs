@@ -343,6 +343,8 @@ async fn fake_primary_singleton_chain(
                                     .to_string_lossy()
                                     .into_owned(),
                                 file_hash: hash,
+                                predecessor_outputs:
+                                    std::collections::BTreeMap::new(),
                             })
                             .unwrap();
                     }

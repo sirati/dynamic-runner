@@ -22,6 +22,7 @@ fn wire_format_flattened_identifier() {
         },
         local_path: "test".into(),
         file_hash: "h".into(),
+        predecessor_outputs: std::collections::BTreeMap::new(),
     };
 
     let json = serde_json::to_string(&msg).unwrap();
@@ -64,6 +65,7 @@ fn roundtrip_distributed_binary_info_phase_tags() {
         },
         local_path: "x".into(),
         file_hash: "h".into(),
+        predecessor_outputs: std::collections::BTreeMap::new(),
     };
     let bytes = serialize_message(&msg).unwrap();
     let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
@@ -172,6 +174,7 @@ fn distributed_binary_info_omits_empty_field_on_wire() {
         binary_info: populated.clone(),
         local_path: "l".into(),
         file_hash: "h".into(),
+        predecessor_outputs: std::collections::BTreeMap::new(),
     })
     .unwrap();
     let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();

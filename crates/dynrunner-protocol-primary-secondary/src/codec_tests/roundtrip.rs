@@ -81,6 +81,7 @@ fn roundtrip_task_assignment() {
         },
         local_path: "test".into(),
         file_hash: "abc123".into(),
+        predecessor_outputs: std::collections::BTreeMap::new(),
     };
 
     let bytes = serialize_message(&msg).unwrap();
@@ -174,3 +175,129 @@ fn roundtrip_peer_info() {
     }
 }
 
+/// Keyed-outputs feature: a populated `predecessor_outputs` map (one
+/// predecessor, one inline value + one file value) round-trips through
+/// the codec verbatim.
+#[test]
+fn roundtrip_task_assignment_predecessor_outputs_populated() {
+    use std::collections::BTreeMap;
+    use dynrunner_core::{ResultValue, TaskOutputs};
+
+    let mut producer_map: BTreeMap<String, ResultValue> = BTreeMap::new();
+    producer_map.insert("nonce".into(), ResultValue::Inline("xyz".into()));
+    producer_map.insert(
+        "artifact".into(),
+        ResultValue::File("/app/out-network/build/foo.tar".into()),
+    );
+
+    let mut preds: BTreeMap<String, TaskOutputs> = BTreeMap::new();
+    preds.insert("task_a".into(), TaskOutputs(producer_map));
+
+    let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        sender_id: "primary".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-1".into(),
+        worker_id: 0,
+        zip_file: None,
+        binary_info: DistributedBinaryInfo {
+            path: "/tmp/b".into(),
+            size: 1,
+            identifier: test_id("dependent"),
+            phase_id: "default".into(),
+            type_id: "default".into(),
+            affinity_id: None,
+            payload_json: "null".into(),
+            task_id: Some("task_b".into()),
+            task_depends_on: vec![],
+            preferred_secondaries: Default::default(),
+        },
+        local_path: "b".into(),
+        file_hash: "h".into(),
+        predecessor_outputs: preds.clone(),
+    };
+
+    let bytes = serialize_message(&msg).unwrap();
+    let (decoded, _) = decode_frame::<TestId>(&bytes).unwrap().unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { predecessor_outputs, .. } => {
+            assert_eq!(predecessor_outputs, preds);
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
+/// Backcompat: a JSON payload of `TaskAssignment` from a pre-keyed-
+/// outputs sender (the `predecessor_outputs` field absent entirely)
+/// decodes with the field empty. `#[serde(default)]` is what keeps
+/// rolling upgrades working: a primary that has not learned about the
+/// field yet can still ship `TaskAssignment` frames to a newer
+/// secondary, and vice versa.
+#[test]
+fn legacy_task_assignment_without_predecessor_outputs_decodes_empty() {
+    let legacy = serde_json::json!({
+        "msg_type": "task_assignment",
+        "sender_id": "primary",
+        "timestamp": 0.0,
+        "secondary_id": "sec-0",
+        "worker_id": 0,
+        "zip_file": null,
+        "binary_info": {
+            "path": "/tmp/x",
+            "size": 1,
+            "identifier": {
+                "binary_name": "legacy",
+                "platform": "x86_64",
+                "compiler": "gcc",
+                "version": "12.0",
+                "opt_level": "O2"
+            }
+        },
+        "local_path": "x",
+        "file_hash": "h"
+    });
+    let json = serde_json::to_vec(&legacy).unwrap();
+    let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { predecessor_outputs, .. } => {
+            assert!(predecessor_outputs.is_empty());
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
+/// Wire-bytes elision: an empty `predecessor_outputs` map serializes to
+/// bytes that do NOT contain the field name. Matches the
+/// `preferred_secondaries` / `task_depends_on` "optional fields elide
+/// when default" idiom so the no-dep common case keeps the same byte
+/// representation it had pre-feature.
+#[test]
+fn empty_predecessor_outputs_elided_on_wire() {
+    let msg: DistributedMessage<TestId> = DistributedMessage::TaskAssignment {
+        sender_id: "primary".into(),
+        timestamp: 0.0,
+        secondary_id: "sec-0".into(),
+        worker_id: 0,
+        zip_file: None,
+        binary_info: DistributedBinaryInfo {
+            path: "/tmp/x".into(),
+            size: 1,
+            identifier: test_id("no_deps"),
+            phase_id: "default".into(),
+            type_id: "default".into(),
+            affinity_id: None,
+            payload_json: "null".into(),
+            task_id: None,
+            task_depends_on: vec![],
+            preferred_secondaries: Default::default(),
+        },
+        local_path: "x".into(),
+        file_hash: "h".into(),
+        predecessor_outputs: std::collections::BTreeMap::new(),
+    };
+
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(
+        !json.contains("predecessor_outputs"),
+        "empty predecessor_outputs must be elided via skip_serializing_if, got: {json}"
+    );
+}

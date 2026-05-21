@@ -98,6 +98,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     binary_info: binary_to_distributed(&binary),
                     local_path: self.config.wire_local_path(&binary),
                     file_hash: task_hash.clone(),
+                    // Phase 4 will populate from the cluster-state
+                    // task-outputs cache. Empty here keeps wire bytes
+                    // identical to pre-feature on no-dep tasks.
+                    predecessor_outputs: std::collections::BTreeMap::new(),
                 };
 
                 // Transport-send failure rollback: pre-fix the
