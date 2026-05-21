@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use dynrunner_core::{ErrorType, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
+use dynrunner_core::{ErrorType, PhaseId, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId};
 use dynrunner_scheduler_api::{PendingPool, PhaseState};
 
 use super::super::test_helpers::{election_config, make_secondary, TestId};
@@ -356,7 +356,7 @@ async fn callback_can_invoke_apply_spawn_tasks_and_cluster_state_grows() {
         // task-a completes. After completion the placeholder
         // unblocks; the pool gains the new dispatchable item AND the
         // phase stays non-empty so the cascade doesn't drain it.
-        task_depends_on: vec!["task-a".into()],
+        task_depends_on: vec![TaskDep { task_id: "task-a".into(), inherit_outputs: false }],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
@@ -379,7 +379,7 @@ async fn callback_can_invoke_apply_spawn_tasks_and_cluster_state_grows() {
         affinity_id: None,
         payload: serde_json::Value::Null,
         task_id: Some("task-b".into()),
-        task_depends_on: vec!["task-a".into()],
+        task_depends_on: vec![TaskDep { task_id: "task-a".into(), inherit_outputs: false }],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
