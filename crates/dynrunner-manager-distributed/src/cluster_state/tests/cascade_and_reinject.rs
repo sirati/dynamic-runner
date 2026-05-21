@@ -235,7 +235,7 @@ fn task_completed_auto_resumes_blocked_dependents() {
     });
     // Prereq completes — every Blocked-on-prereq entry resumes.
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "prereq".into() }),
+        s.apply(ClusterMutation::TaskCompleted { hash: "prereq".into(), result_data: None }),
         ApplyOutcome::Applied
     );
     assert!(matches!(

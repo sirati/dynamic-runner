@@ -206,7 +206,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// completed.
     fn mirror_mutation_to_accounting(&mut self, m: &ClusterMutation<I>) {
         match m {
-            ClusterMutation::TaskCompleted { hash } => {
+            ClusterMutation::TaskCompleted { hash, .. } => {
                 self.failed_tasks.remove(hash);
                 self.completed_tasks.insert(hash.clone());
             }

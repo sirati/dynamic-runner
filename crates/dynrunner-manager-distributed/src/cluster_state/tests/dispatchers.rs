@@ -93,7 +93,8 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
     });
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
-            hash: "h-alpha".into()
+            hash: "h-alpha".into(),
+            result_data: None,
         }),
         ApplyOutcome::Applied
     );
@@ -197,13 +198,15 @@ async fn task_completed_dedup_does_not_re_emit() {
     });
     s.apply(ClusterMutation::TaskCompleted {
         hash: "h-delta".into(),
+        result_data: None,
     });
     // Drain the first (valid) event so we can prove the
     // dedup-apply doesn't enqueue a second.
     rx.try_recv().expect("first TaskCompleted must emit");
     assert_eq!(
         s.apply(ClusterMutation::TaskCompleted {
-            hash: "h-delta".into()
+            hash: "h-delta".into(),
+            result_data: None,
         }),
         ApplyOutcome::NoOp
     );

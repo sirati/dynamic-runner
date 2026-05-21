@@ -110,7 +110,7 @@ impl<I: Identifier> ClusterState<I> {
                 };
                 ApplyOutcome::Applied
             }
-            ClusterMutation::TaskCompleted { hash } => {
+            ClusterMutation::TaskCompleted { hash, .. } => {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };

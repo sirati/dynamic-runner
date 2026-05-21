@@ -42,7 +42,7 @@ fn assigned_late_after_completed_is_noop() {
         task: mk_task("a"),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "h".into() }),
+        s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None }),
         ApplyOutcome::Applied
     );
     assert_eq!(
@@ -63,9 +63,9 @@ fn duplicate_completed_is_noop() {
         hash: "h".into(),
         task: mk_task("a"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "h".into() });
+    s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "h".into() }),
+        s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None }),
         ApplyOutcome::NoOp
     );
 }
@@ -94,7 +94,7 @@ fn failed_then_completed_transitions_to_completed_retry_success() {
         error: "x".into(),
     });
     assert_eq!(
-        s.apply(ClusterMutation::TaskCompleted { hash: "h".into() }),
+        s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None }),
         ApplyOutcome::Applied
     );
     assert!(matches!(s.task_state("h"), Some(TaskState::Completed { .. })));
@@ -117,7 +117,7 @@ fn completed_then_failed_stays_completed_success_never_regresses() {
         hash: "h".into(),
         task: mk_task("a"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "h".into() });
+    s.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
     assert_eq!(
         s.apply(ClusterMutation::TaskFailed {
             hash: "h".into(),
@@ -146,7 +146,7 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
             hash: hash.into(),
             task: mk_task(hash),
         });
-        s.apply(ClusterMutation::TaskCompleted { hash: hash.into() });
+        s.apply(ClusterMutation::TaskCompleted { hash: hash.into(), result_data: None });
     }
     // 1 fail_retry (Recoverable)
     s.apply(ClusterMutation::TaskAdded {
@@ -339,7 +339,7 @@ fn iter_pending_only_returns_pending() {
         hash: "c".into(),
         task: mk_task("c"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "c".into() });
+    s.apply(ClusterMutation::TaskCompleted { hash: "c".into(), result_data: None });
 
     let mut pending: Vec<&str> = s.iter_pending().map(|(h, _)| h.as_str()).collect();
     pending.sort();
@@ -368,7 +368,7 @@ fn convergence_completed_can_race_assigned() {
         worker: 0,
     };
     let completed: ClusterMutation<RunnerIdentifier> =
-        ClusterMutation::TaskCompleted { hash: "h".into() };
+        ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None };
 
     let mut a = ClusterState::<RunnerIdentifier>::new();
     a.apply(added.clone());
@@ -403,7 +403,7 @@ fn convergence_under_duplicates() {
             secondary: "s".into(),
             worker: 0,
         },
-        ClusterMutation::TaskCompleted { hash: "h1".into() },
+        ClusterMutation::TaskCompleted { hash: "h1".into(), result_data: None },
         ClusterMutation::TaskFailed {
             hash: "h2".into(),
             kind: ErrorType::Recoverable,

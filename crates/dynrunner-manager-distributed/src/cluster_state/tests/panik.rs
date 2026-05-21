@@ -116,6 +116,7 @@ fn panik_preserves_completed_failed_unfulfillable() {
     });
     s.apply(ClusterMutation::TaskCompleted {
         hash: "h-comp".into(),
+        result_data: None,
     });
     // Failed
     s.apply(ClusterMutation::TaskAdded {
@@ -174,7 +175,7 @@ fn late_task_completed_against_cancelled_supersedes_to_completed() {
         s.task_state(&hash),
         Some(TaskState::Cancelled { .. })
     ));
-    let outcome = s.apply(ClusterMutation::TaskCompleted { hash: hash.clone() });
+    let outcome = s.apply(ClusterMutation::TaskCompleted { hash: hash.clone(), result_data: None });
     assert_eq!(outcome, ApplyOutcome::Applied);
     assert!(matches!(
         s.task_state(&hash),
@@ -240,6 +241,7 @@ fn counts_and_outcome_summary_include_cancelled_bucket() {
     });
     s.apply(ClusterMutation::TaskCompleted {
         hash: "h-a".into(),
+        result_data: None,
     });
     s.apply(ClusterMutation::PanikRequested {
         source_peer: "primary".into(),

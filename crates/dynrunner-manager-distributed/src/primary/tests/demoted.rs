@@ -254,6 +254,7 @@ async fn demoted_primary_applies_cluster_mutation_taskcompleted() {
                 TestId,
             >::TaskCompleted {
                 hash: hash.clone(),
+                result_data: None,
             }],
         };
         primary
@@ -354,6 +355,7 @@ async fn completed_and_failed_count_read_from_cluster_state_not_local_hashset() 
             primary.cluster_state.apply(
                 dynrunner_protocol_primary_secondary::ClusterMutation::<TestId>::TaskCompleted {
                     hash,
+                    result_data: None,
                 },
             );
         }
@@ -822,6 +824,7 @@ async fn step6_demoted_primary_observes_cluster_mutation_via_recv_peer_arm() {
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
                     hash: hash_a.clone(),
+                    result_data: None,
                 }],
             })
             .expect("tap accepts TaskCompleted");
@@ -1151,6 +1154,7 @@ async fn demoted_primary_ignores_partial_crdt_view_waits_for_run_complete() {
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
                     hash: hash_a.clone(),
+                    result_data: None,
                 }],
             })
             .unwrap();
@@ -1160,6 +1164,7 @@ async fn demoted_primary_ignores_partial_crdt_view_waits_for_run_complete() {
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
                     hash: hash_b.clone(),
+                    result_data: None,
                 }],
             })
             .unwrap();
