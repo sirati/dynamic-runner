@@ -8,7 +8,7 @@
 //! `Blocked { on, .. }` back to `Pending` when its prerequisite
 //! completes.
 
-use dynrunner_core::{ErrorType, Identifier, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, TaskInfo, TaskOutputs};
 
 use super::{ApplyOutcome, ClusterState, TaskState};
 
@@ -44,6 +44,87 @@ impl<I: Identifier> ClusterState<I> {
     /// so the returned `Vec<TaskInfo<I>>` is independent of further
     /// CRDT mutations — callers may hold the clones across additional
     /// apply calls.
+    /// Cache a completing task's `TaskOutputs` under its `task_id`.
+    ///
+    /// Invoked from the `TaskCompleted` apply arm with the completing
+    /// task's hash and the wire mutation's `result_data` payload. The
+    /// hash → task_id resolution reads `self.tasks` (already mutated to
+    /// `Completed` by the caller; the `task_id` is stable across that
+    /// transition because every `TaskState` variant carries the same
+    /// inner `TaskInfo`).
+    ///
+    /// Three branches, in priority order:
+    ///
+    /// 1. `result_data` is `None` (no outputs committed) — nothing to
+    ///    record. Callers are responsible for emitting `Some(_)` only
+    ///    when the worker actually published outputs; an empty
+    ///    `TaskOutputs` round-trips as `Some(b"{}"...)` so the
+    ///    `None` arm is a true "did not publish" signal.
+    /// 2. `result_data` decodes as `TaskOutputs` — insert under the
+    ///    completing task's `task_id`. Anonymous tasks (no `task_id`)
+    ///    cannot be referenced by dependents and are silently skipped
+    ///    (no key to insert under).
+    /// 3. `result_data` is malformed JSON — emit a `tracing::warn!`
+    ///    and insert an empty `TaskOutputs`. Storing the empty entry
+    ///    rather than skipping keeps dependents that hard-require a
+    ///    key from racing the cache between "populated" and "absent";
+    ///    the warn surfaces the wire-format mismatch to the operator.
+    ///
+    /// Single-write per task: `TaskCompleted` is the only writer and a
+    /// duplicate `TaskCompleted` for the same hash NoOps in the apply
+    /// arm before this helper fires, so the insert is effectively
+    /// first-write-wins under the apply rule. No explicit `.entry().
+    /// or_insert(_)` guard is needed at this layer.
+    pub(super) fn record_task_outputs(
+        &mut self,
+        hash: &str,
+        result_data: Option<Vec<u8>>,
+    ) {
+        let Some(bytes) = result_data else {
+            return;
+        };
+        let Some(task_id) = self.task_id_for_hash(hash) else {
+            // Anonymous task: no key under which to cache outputs.
+            // Dependents cannot reference an anonymous task by id, so
+            // there is no consumer for the cache entry anyway.
+            return;
+        };
+        match serde_json::from_slice::<TaskOutputs>(&bytes) {
+            Ok(outputs) => {
+                self.task_outputs.insert(task_id, outputs);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "dynrunner_cluster_state",
+                    error = %e,
+                    hash = %hash,
+                    task_id = %task_id,
+                    "TaskCompleted result_data failed to decode as TaskOutputs; \
+                     storing empty entry"
+                );
+                self.task_outputs.insert(task_id, TaskOutputs::default());
+            }
+        }
+    }
+
+    /// Private helper for `record_task_outputs`: extract a clone of the
+    /// `task_id` for the entry at `hash`, regardless of which
+    /// `TaskState` variant it currently occupies. Anonymous tasks
+    /// (`TaskInfo.task_id == None`) yield `None`.
+    fn task_id_for_hash(&self, hash: &str) -> Option<String> {
+        let state = self.tasks.get(hash)?;
+        let task = match state {
+            TaskState::Pending { task }
+            | TaskState::InFlight { task, .. }
+            | TaskState::Completed { task }
+            | TaskState::Failed { task, .. }
+            | TaskState::Unfulfillable { task, .. }
+            | TaskState::Blocked { task, .. }
+            | TaskState::Cancelled { task, .. } => task,
+        };
+        task.task_id.clone()
+    }
+
     pub(super) fn resume_blocked_on(&mut self, prereq_hash: &str) -> Vec<TaskInfo<I>> {
         let to_resume: Vec<String> = self
             .tasks

@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dynrunner_core::{Identifier, PhaseId};
+use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
 use dynrunner_protocol_primary_secondary::RoleTable;
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
@@ -154,6 +154,34 @@ pub struct ClusterState<I> {
     /// ("primary saw the file first" vs "secondary-3 propagated to
     /// us") but does NOT affect any apply rule's behaviour.
     pub(super) panik_source: Option<String>,
+    /// Replicated keyed-output cache. One entry per task that has
+    /// reached `Completed` and committed a non-empty `TaskOutputs`
+    /// via its `TaskCompleted` mutation's `result_data` payload.
+    ///
+    /// Keyed by `task_id` (not the CRDT-internal task hash) — dependents
+    /// reference predecessors by `task_id` (see `TaskDep.task_id`), and
+    /// `ClusterState` does not maintain a `task_id → hash` reverse
+    /// index. Keying the cache by `task_id` lets the dispatch-side
+    /// resolver look up a dependent's predecessor outputs in O(1)
+    /// without a linear scan, and matches the shape downstream consumers
+    /// see (Python-side task bindings dereference by user-chosen
+    /// `task_id` strings, never by internal hashes).
+    ///
+    /// Replicated CRDT data — clone preserves it (matches `tasks`,
+    /// `peer_holdings`, and `phase_deps` semantics). Included in
+    /// `snapshot` / `restore` so a late-joiner sees every committed
+    /// output set before the next live `TaskCompleted` broadcast
+    /// reaches it. Populated by the `TaskCompleted` apply arm (see
+    /// the `record_task_outputs` helper in `apply_tasks.rs`).
+    ///
+    /// Anonymous tasks (`TaskInfo.task_id == None`) cannot be
+    /// referenced as dependencies and are skipped — they have no key
+    /// to insert under. Malformed `result_data` (failed JSON decode)
+    /// logs a `tracing::warn!` and stores an empty `TaskOutputs` so
+    /// dependents that hard-require a key see a controlled-empty
+    /// view rather than racing the cache between "populated" and
+    /// "absent".
+    pub(super) task_outputs: HashMap<String, TaskOutputs>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -186,6 +214,8 @@ where
             panik_active: self.panik_active,
             panik_reason: self.panik_reason.clone(),
             panik_source: self.panik_source.clone(),
+            // Replicated CRDT data — clone preserves it.
+            task_outputs: self.task_outputs.clone(),
         }
     }
 }
@@ -211,6 +241,7 @@ where
             .field("panik_active", &self.panik_active)
             .field("panik_reason", &self.panik_reason)
             .field("panik_source", &self.panik_source)
+            .field("task_outputs", &self.task_outputs.len())
             .finish()
     }
 }
@@ -234,6 +265,7 @@ impl<I> Default for ClusterState<I> {
             panik_active: false,
             panik_reason: None,
             panik_source: None,
+            task_outputs: HashMap::new(),
         }
     }
 }

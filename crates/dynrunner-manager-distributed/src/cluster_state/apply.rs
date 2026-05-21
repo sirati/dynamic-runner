@@ -110,7 +110,7 @@ impl<I: Identifier> ClusterState<I> {
                 };
                 ApplyOutcome::Applied
             }
-            ClusterMutation::TaskCompleted { hash, .. } => {
+            ClusterMutation::TaskCompleted { hash, result_data } => {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
@@ -168,6 +168,15 @@ impl<I: Identifier> ClusterState<I> {
                 // baseline.
                 let event_task_id = task.task_id.clone();
                 *state = TaskState::Completed { task };
+                // Cache the wire mutation's `result_data` payload under
+                // the completing task's `task_id` so dispatch-time
+                // dependent resolution can attach predecessor outputs
+                // without re-decoding the wire bytes. Helper lives in
+                // `apply_tasks.rs` alongside other task-related apply
+                // helpers (`resume_blocked_on`). No-op for `None`
+                // payloads (worker did not publish outputs) and for
+                // anonymous tasks (no `task_id` to key under).
+                self.record_task_outputs(&hash, result_data);
                 // Auto-resume: any `Blocked { on: <this hash>, .. }`
                 // dependent transitions back to `Pending` so the next
                 // dispatch tick on the live primary picks it up. Event-
