@@ -59,6 +59,11 @@ pub async fn runner_main_loop<E: RunnerEndpoint>(
                 relative_path,
                 payload,
                 resolved_path,
+                // `predecessor_outputs` is plumbed from the manager
+                // through the wire codec to the worker's user code
+                // via the PyO3 bridge; the framework-side worker
+                // loop here is opaque to its contents.
+                ..
             }) => {
                 match executor
                     .execute(
@@ -138,7 +143,12 @@ mod tests {
         assert!(matches!(resp, Response::Ready));
 
         manager
-            .send(Command::ProcessTask { relative_path: "test/bin".into(), payload: None, resolved_path: None })
+            .send(Command::ProcessTask {
+                relative_path: "test/bin".into(),
+                payload: None,
+                resolved_path: None,
+                predecessor_outputs: std::collections::BTreeMap::new(),
+            })
             .await
             .unwrap();
 
@@ -177,7 +187,12 @@ mod tests {
         let _ = manager.recv().await;
 
         manager
-            .send(Command::ProcessTask { relative_path: "fail".into(), payload: None, resolved_path: None })
+            .send(Command::ProcessTask {
+                relative_path: "fail".into(),
+                payload: None,
+                resolved_path: None,
+                predecessor_outputs: std::collections::BTreeMap::new(),
+            })
             .await
             .unwrap();
 
