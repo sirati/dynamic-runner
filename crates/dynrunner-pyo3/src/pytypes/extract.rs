@@ -7,7 +7,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 
 use dynrunner_core::{
-    AffinityId, Identifier, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId,
+    AffinityId, Identifier, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo,
+    TypeId,
 };
 
 use super::identifier::{identifier_from_pyobj, PyBinaryIdentifier};
@@ -38,7 +39,15 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         affinity_id: task.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
         payload_json: serde_json::to_string(&task.payload).unwrap_or_else(|_| "null".into()),
         task_id: task.task_id.clone(),
-        task_depends_on: task.task_depends_on.clone(),
+        // Project `Vec<TaskDep>` down to bare task_ids for the Python
+        // bridge (kept consistent with `PyTaskInfo::from(&TaskInfo)`). The
+        // `inherit_outputs` flag does not cross this layer; it stays a
+        // Rust-side dispatch concern.
+        task_depends_on: task
+            .task_depends_on
+            .iter()
+            .map(|dep| dep.task_id.clone())
+            .collect(),
         preferred_secondaries: task.preferred_secondaries.as_slice().to_vec(),
     }
 }
@@ -108,11 +117,21 @@ pub(crate) fn extract_binaries(
                 .getattr("task_id")
                 .ok()
                 .and_then(|v| v.extract::<Option<String>>().ok().flatten());
-            let task_depends_on: Vec<String> = item
+            // Python contract is `tuple[str, ...]` of predecessor task_ids;
+            // lift each into a `TaskDep` with the legacy-default
+            // `inherit_outputs = false` (matches the untagged `Bare`
+            // deserializer arm in `dynrunner_core::types::task`).
+            let task_depends_on: Vec<TaskDep> = item
                 .getattr("task_depends_on")
                 .ok()
                 .and_then(|v| v.extract::<Vec<String>>().ok())
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(|task_id| TaskDep {
+                    task_id,
+                    inherit_outputs: false,
+                })
+                .collect();
             // Optional soft-preferred-secondaries hint. Missing /
             // None / wrong-type all collapse to the empty default;
             // the newtype keeps the soft-vs-strict semantic

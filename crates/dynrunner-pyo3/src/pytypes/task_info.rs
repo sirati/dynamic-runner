@@ -4,7 +4,9 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use dynrunner_core::{AffinityId, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId};
+use dynrunner_core::{
+    AffinityId, PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskDep, TaskInfo, TypeId,
+};
 
 use super::identifier::{split_identifier, PyBinaryIdentifier};
 
@@ -31,6 +33,14 @@ pub(crate) struct PyTaskInfo {
     pub(super) payload_json: String,
     #[pyo3(get)]
     pub(super) task_id: Option<String>,
+    /// Python-facing view of [`TaskInfo::task_depends_on`]. Exposed as a
+    /// `list[str]` of predecessor `task_id`s — matches the legacy
+    /// `tuple[str, ...]` shape the Python `TaskInfo` dataclass already
+    /// publishes. The Rust-side `TaskDep` carries an additional
+    /// `inherit_outputs` flag that is configured server-side (not via
+    /// this bridge), so the Python boundary stays bare-string and the
+    /// reverse direction reconstitutes with `inherit_outputs = false`
+    /// (the legacy-default, matching the untagged `Bare` deserializer arm).
     #[pyo3(get)]
     pub(super) task_depends_on: Vec<String>,
     /// Python-facing view of [`TaskInfo::preferred_secondaries`].
@@ -112,7 +122,18 @@ impl From<&PyTaskInfo> for TaskInfo<RunnerIdentifier> {
             affinity_id,
             payload,
             task_id: py.task_id.clone(),
-            task_depends_on: py.task_depends_on.clone(),
+            // Python contract is bare task_ids. Reconstitute the Rust-side
+            // `Vec<TaskDep>` with `inherit_outputs = false` per the legacy-
+            // default (matches the untagged `Bare` deserializer arm in
+            // `dynrunner_core::types::task`).
+            task_depends_on: py
+                .task_depends_on
+                .iter()
+                .map(|task_id| TaskDep {
+                    task_id: task_id.clone(),
+                    inherit_outputs: false,
+                })
+                .collect(),
             preferred_secondaries: SoftPreferredSecondaries::new(py.preferred_secondaries.clone()),
             resolved_path: None,
         }
@@ -138,7 +159,14 @@ impl From<&TaskInfo<RunnerIdentifier>> for PyTaskInfo {
             affinity_id: bi.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
             payload_json: serde_json::to_string(&bi.payload).unwrap_or_else(|_| "null".into()),
             task_id: bi.task_id.clone(),
-            task_depends_on: bi.task_depends_on.clone(),
+            // Project `Vec<TaskDep>` down to bare task_ids for Python — the
+            // `inherit_outputs` flag is not part of the Python contract at
+            // this bridge layer (a deeper config-time concern).
+            task_depends_on: bi
+                .task_depends_on
+                .iter()
+                .map(|dep| dep.task_id.clone())
+                .collect(),
             preferred_secondaries: bi.preferred_secondaries.as_slice().to_vec(),
         }
     }
