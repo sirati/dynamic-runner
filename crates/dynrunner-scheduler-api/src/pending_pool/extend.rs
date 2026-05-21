@@ -81,9 +81,9 @@ impl<I: Identifier> PendingPool<I> {
                 None => item.path.display().to_string(),
             };
             for dep in &item.task_depends_on {
-                if !known.contains(dep) {
+                if !known.contains(&dep.task_id) {
                     return Err(PendingPoolError::UnknownTaskDep {
-                        task: dep.clone(),
+                        task: dep.task_id.clone(),
                         referenced_by,
                     });
                 }
@@ -125,15 +125,15 @@ impl<I: Identifier> PendingPool<I> {
             };
             indegree.entry(id.clone()).or_insert(0);
             for dep in &item.task_depends_on {
-                if pre_resolved(dep) {
+                if pre_resolved(&dep.task_id) {
                     continue;
                 }
                 *indegree.entry(id.clone()).or_insert(0) += 1;
                 children_of
-                    .entry(dep.clone())
+                    .entry(dep.task_id.clone())
                     .or_default()
                     .push(id.clone());
-                indegree.entry(dep.clone()).or_insert(0);
+                indegree.entry(dep.task_id.clone()).or_insert(0);
             }
         }
         // Kahn's: drain zero-indegree, decrement children, count.
@@ -211,7 +211,7 @@ impl<I: Identifier> PendingPool<I> {
         let any_failed_dep = item
             .task_depends_on
             .iter()
-            .any(|d| self.failed_tasks.contains(d));
+            .any(|d| self.failed_tasks.contains(&d.task_id));
         if any_failed_dep {
             if let Some(id) = item.task_id.as_deref() {
                 self.failed_tasks.insert(id.to_string());
@@ -226,8 +226,8 @@ impl<I: Identifier> PendingPool<I> {
         let unresolved: HashSet<String> = item
             .task_depends_on
             .iter()
-            .filter(|d| !self.completed_tasks.contains(d.as_str()))
-            .cloned()
+            .map(|d| d.task_id.clone())
+            .filter(|id| !self.completed_tasks.contains(id.as_str()))
             .collect();
 
         let task_id = item.task_id.clone();

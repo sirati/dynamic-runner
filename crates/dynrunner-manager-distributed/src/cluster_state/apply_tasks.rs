@@ -157,7 +157,8 @@ impl<I: Identifier> ClusterState<I> {
             let mut cascade_fail = false;
             let mut blocked_on_unfulfillable: Option<String> = None;
             let mut blocked_on_pending: Option<String> = None;
-            for dep_id in &task.task_depends_on {
+            for dep in &task.task_depends_on {
+                let dep_id = dep.task_id.as_str();
                 let dep_hash = match self.task_hash_for_task_id(dep_id) {
                     Some(h) => h.to_string(),
                     None => {
