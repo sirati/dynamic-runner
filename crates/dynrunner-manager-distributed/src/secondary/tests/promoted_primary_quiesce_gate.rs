@@ -116,6 +116,7 @@ fn add_completed_task(
     });
     sec.cluster_state.apply(ClusterMutation::<TestId>::TaskCompleted {
         hash,
+        result_data: None,
     });
 }
 

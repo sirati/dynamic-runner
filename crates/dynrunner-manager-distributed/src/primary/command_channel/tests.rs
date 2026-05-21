@@ -629,6 +629,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             .apply_and_broadcast_cluster_mutations(vec![
                 ClusterMutation::TaskCompleted {
                     hash: prereq_hash.clone(),
+                    result_data: None,
                 },
             ])
             .await;
@@ -1015,6 +1016,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
         });
         coordinator.cluster_state.apply(ClusterMutation::TaskCompleted {
             hash: b_hash.clone(),
+            result_data: None,
         });
         seed_pool(&mut coordinator, &[&b.phase_id]);
 

@@ -158,7 +158,7 @@ fn seed_tasks(
             }
             "Completed" => {
                 coordinator.cluster_state.apply(
-                    ClusterMutation::TaskCompleted { hash: hash.clone() },
+                    ClusterMutation::TaskCompleted { hash: hash.clone(), result_data: None },
                 );
             }
             other => panic!("unsupported seed state: {other}"),

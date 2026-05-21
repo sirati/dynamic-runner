@@ -329,6 +329,10 @@ where
                     binary_info: DistributedBinaryInfo::from_task_info(&binary),
                     local_path: binary.path.to_string_lossy().into_owned(),
                     file_hash,
+                    // Phase 4 will populate from the cluster-state
+                    // task-outputs cache. Empty here keeps wire bytes
+                    // identical to pre-feature on no-dep tasks.
+                    predecessor_outputs: std::collections::BTreeMap::new(),
                 };
                 let _ = self
                     .peer_transport

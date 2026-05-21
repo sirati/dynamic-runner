@@ -1,0 +1,61 @@
+use super::*;
+use crate::cluster_mutation::ClusterMutation;
+
+#[test]
+fn roundtrip_task_completed_with_result_data() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskCompleted {
+        hash: "h-result".into(),
+        result_data: Some(b"foo".to_vec()),
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskCompleted { hash, result_data } => {
+            assert_eq!(hash, "h-result");
+            assert_eq!(result_data.as_deref(), Some(b"foo".as_ref()));
+        }
+        _ => panic!("expected TaskCompleted"),
+    }
+}
+
+/// Backward-compat: a pre-Phase-2a sender's JSON shape — bare `{ "hash": ... }`
+/// without the new `result_data` field — must decode with `result_data: None`.
+/// Without `#[serde(default)]` the decode would refuse the frame and break
+/// rolling upgrades.
+#[test]
+fn legacy_task_completed_decodes_without_result_data() {
+    let legacy = serde_json::json!({
+        "TaskCompleted": { "hash": "legacy-hash" }
+    });
+    let json = legacy.to_string();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::TaskCompleted { hash, result_data } => {
+            assert_eq!(hash, "legacy-hash");
+            assert!(result_data.is_none());
+        }
+        _ => panic!("expected TaskCompleted"),
+    }
+}
+
+/// `skip_serializing_if = "Option::is_none"` means an absent `result_data`
+/// elides from the JSON output entirely — the wire bytes are identical to
+/// the legacy bare-hash form, so new senders sending `result_data: None`
+/// don't bloat the wire.
+#[test]
+fn task_completed_omits_absent_result_data_on_wire() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::TaskCompleted {
+        hash: "h-bare".into(),
+        result_data: None,
+    };
+    let v = serde_json::to_value(&mutation).unwrap();
+    let inner = &v["TaskCompleted"];
+    assert!(
+        inner.get("result_data").is_none(),
+        "absent result_data must be omitted on the wire, got: {v}"
+    );
+    assert_eq!(inner["hash"], "h-bare");
+}

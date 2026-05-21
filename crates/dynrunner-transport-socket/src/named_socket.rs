@@ -221,7 +221,12 @@ mod tests {
 
         // Send command
         manager
-            .send(Command::ProcessTask { relative_path: "x/y".into(), payload: None, resolved_path: None, })
+            .send(Command::ProcessTask {
+                relative_path: "x/y".into(),
+                payload: None,
+                resolved_path: None,
+                predecessor_outputs: std::collections::BTreeMap::new(),
+            })
             .await
             .unwrap();
 

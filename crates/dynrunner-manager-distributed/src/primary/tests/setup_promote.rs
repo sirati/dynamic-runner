@@ -1356,6 +1356,7 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
                     hash: hash.clone(),
+                    result_data: None,
                 }],
             })
             .unwrap();
@@ -2095,6 +2096,7 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
                 timestamp: 0.0,
                 mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
                     hash: hash.clone(),
+                    result_data: None,
                 }],
             })
             .unwrap();

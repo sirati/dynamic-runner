@@ -1,4 +1,6 @@
-use dynrunner_core::ErrorType;
+use std::collections::BTreeMap;
+
+use dynrunner_core::{ErrorType, TaskOutputs};
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -29,10 +31,19 @@ pub enum Command {
     /// for output-tree mirroring". Decouples the two concerns that
     /// pre-fix collided in `relative_path` — see TaskInfo's
     /// `resolved_path` doc-comment for the why.
+    ///
+    /// `predecessor_outputs` carries the keyed outputs each
+    /// declared predecessor committed (keyed by predecessor
+    /// `task_id`). Empty map means "no predecessor outputs
+    /// attached" — the historical case for tasks with no deps or
+    /// deps whose producers committed nothing. On the wire the
+    /// field is omitted entirely when empty, preserving byte-
+    /// identical bare-path form for legacy tasks.
     ProcessTask {
         relative_path: String,
         payload: Option<String>,
         resolved_path: Option<String>,
+        predecessor_outputs: BTreeMap<String, TaskOutputs>,
     },
 }
 

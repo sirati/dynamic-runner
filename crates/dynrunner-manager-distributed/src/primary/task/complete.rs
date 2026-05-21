@@ -73,6 +73,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             self.apply_and_broadcast_cluster_mutations(vec![
                 ClusterMutation::TaskCompleted {
                     hash: task_hash.clone(),
+                    result_data: None,
                 },
             ])
             .await;

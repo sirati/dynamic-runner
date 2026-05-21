@@ -4,7 +4,9 @@
 //! task-related variants can carry runner-specific opaque keys without
 //! pulling crate-level details into the wire shape.
 
-use dynrunner_core::{ErrorType, ResourceAmount};
+use std::collections::BTreeMap;
+
+use dynrunner_core::{ErrorType, ResourceAmount, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
 use crate::address::Role;
@@ -17,12 +19,25 @@ use crate::messages::peer_info::{PeerConnectionInfo, WorkerReadyInfo};
 ///
 /// Generic over the identifier type `I` for binary info in task-related
 /// messages.
+///
+/// The `clippy::large_enum_variant` lint is suppressed at the enum
+/// level. The largest variant is `TaskAssignment`, dominated by its
+/// inline `binary_info` (DistributedBinaryInfo) payload — strings,
+/// identifier, dep records, soft-affinity hints, ~280 bytes total — the
+/// natural hot-path dispatch shape. Boxing `binary_info` would push
+/// every dispatch and destructure site through indirection for a
+/// one-time stack-size win, and that field is the bulk of the size;
+/// per-variant fields stay inline to match the rest of the enum. The
+/// existing Box wrappers on `Relay.inner` and `RoleAddressed.payload`
+/// exist for recursive-shape reasons (a self-referential variant must
+/// be boxed), not for size containment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg_type", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "I: Serialize",
     deserialize = "I: for<'a> Deserialize<'a>",
 ))]
+#[allow(clippy::large_enum_variant)]
 pub enum DistributedMessage<I> {
     SecondaryWelcome {
         sender_id: String,
@@ -122,6 +137,25 @@ pub enum DistributedMessage<I> {
         binary_info: DistributedBinaryInfo<I>,
         local_path: String,
         file_hash: String,
+        /// Predecessor `TaskOutputs` keyed by predecessor task id —
+        /// the channel by which the primary delivers a dependent
+        /// task's predecessor results to the secondary that will
+        /// run it. The secondary forwards the map into the worker's
+        /// `Command::ProcessTask`; the framework never inspects keys
+        /// or values, they round-trip through serde-JSON only.
+        ///
+        /// `#[serde(default)]` keeps pre-keyed-outputs senders
+        /// wire-compatible (their `TaskAssignment` omits the field
+        /// and decodes as an empty map).
+        /// `#[serde(skip_serializing_if = "BTreeMap::is_empty")]`
+        /// elides the field on the wire when the dependent has no
+        /// recorded predecessor outputs, matching the
+        /// `preferred_secondaries` / `task_depends_on` "optional
+        /// fields elide when default" idiom in this crate. The
+        /// no-dep common case keeps the same byte representation
+        /// it had pre-feature.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        predecessor_outputs: BTreeMap<String, TaskOutputs>,
     },
     TransferComplete {
         sender_id: String,

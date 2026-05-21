@@ -25,7 +25,11 @@ pub enum ClusterMutation<I> {
         secondary: String,
         worker: WorkerId,
     },
-    TaskCompleted { hash: String },
+    TaskCompleted {
+        hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_data: Option<Vec<u8>>,
+    },
     TaskFailed {
         hash: String,
         kind: ErrorType,

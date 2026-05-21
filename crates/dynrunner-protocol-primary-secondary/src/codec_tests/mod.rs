@@ -21,6 +21,7 @@ use dynrunner_core::{ErrorType, ResourceKind};
 use serde::{Deserialize, Serialize};
 
 mod binary_info;
+mod cluster_mutation;
 mod frame;
 mod role;
 mod roundtrip;

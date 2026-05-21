@@ -408,7 +408,7 @@ pub(super) async fn fake_secondary_with_addrs(
                         ClusterMutation::TaskAdded { hash, .. } => {
                             pending_hashes.insert(hash);
                         }
-                        ClusterMutation::TaskCompleted { hash }
+                        ClusterMutation::TaskCompleted { hash, .. }
                         | ClusterMutation::TaskFailed { hash, .. } => {
                             pending_hashes.remove(&hash);
                         }

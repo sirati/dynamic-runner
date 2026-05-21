@@ -29,7 +29,7 @@ fn snapshot_round_trip_preserves_state() {
         hash: "c".into(),
         task: mk_task("c"),
     });
-    s.apply(ClusterMutation::TaskCompleted { hash: "c".into() });
+    s.apply(ClusterMutation::TaskCompleted { hash: "c".into(), result_data: None });
     s.apply(ClusterMutation::PrimaryChanged {
         new: "s1".into(),
         epoch: 3,
@@ -131,7 +131,7 @@ fn restore_lattice_merge_preserves_local_terminal() {
         hash: "h".into(),
         task: mk_task("h"),
     });
-    joiner.apply(ClusterMutation::TaskCompleted { hash: "h".into() });
+    joiner.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
 
     let mut peer = ClusterState::<RunnerIdentifier>::new();
     peer.apply(ClusterMutation::TaskAdded {
@@ -213,7 +213,7 @@ fn restore_idempotent_under_double_apply() {
         hash: "h".into(),
         task: mk_task("h"),
     });
-    peer.apply(ClusterMutation::TaskCompleted { hash: "h".into() });
+    peer.apply(ClusterMutation::TaskCompleted { hash: "h".into(), result_data: None });
 
     let snap = peer.snapshot();
     let mut joiner = ClusterState::<RunnerIdentifier>::new();

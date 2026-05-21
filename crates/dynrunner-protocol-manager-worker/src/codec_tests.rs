@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use super::*;
-use dynrunner_core::ResourceKind;
+use dynrunner_core::{ResourceKind, ResultValue, TaskOutputs};
 
 #[test]
 fn command_stop_roundtrip() {
@@ -11,7 +13,12 @@ fn command_stop_roundtrip() {
 
 #[test]
 fn command_process_task_roundtrip() {
-    let cmd = Command::ProcessTask { relative_path: "path/to/binary".into(), payload: None, resolved_path: None, };
+    let cmd = Command::ProcessTask {
+        relative_path: "path/to/binary".into(),
+        payload: None,
+        resolved_path: None,
+        predecessor_outputs: BTreeMap::new(),
+    };
     let bytes = serialize_command(&cmd);
     assert_eq!(bytes, b"path/to/binary\n");
     let parsed = parse_command("path/to/binary\n").unwrap();
@@ -21,6 +28,85 @@ fn command_process_task_roundtrip() {
         }
         _ => panic!("expected ProcessTask"),
     }
+}
+
+#[test]
+fn command_process_task_predecessor_outputs_roundtrip() {
+    // Two predecessors, each carrying a tagged-enum value, round-trip
+    // verbatim through the `task:<json>` wrapper.
+    let mut outputs_a = BTreeMap::new();
+    outputs_a.insert("nonce".to_string(), ResultValue::Inline("xyz".to_string()));
+    outputs_a.insert(
+        "artifact".to_string(),
+        ResultValue::File("/app/out-network/a.tar".to_string()),
+    );
+    let mut predecessor_outputs = BTreeMap::new();
+    predecessor_outputs.insert("task_a".to_string(), TaskOutputs(outputs_a));
+
+    let cmd = Command::ProcessTask {
+        relative_path: "task_b/item".into(),
+        payload: None,
+        resolved_path: None,
+        predecessor_outputs: predecessor_outputs.clone(),
+    };
+    let bytes = serialize_command(&cmd);
+    let line = std::str::from_utf8(&bytes).unwrap();
+    // Non-empty predecessor_outputs forces the `task:` wrapper form.
+    assert!(line.starts_with("task:"));
+    let parsed = parse_command(line).unwrap();
+    match parsed {
+        Command::ProcessTask {
+            relative_path,
+            payload,
+            resolved_path,
+            predecessor_outputs: parsed_outputs,
+        } => {
+            assert_eq!(relative_path, "task_b/item");
+            assert!(payload.is_none());
+            assert!(resolved_path.is_none());
+            assert_eq!(parsed_outputs, predecessor_outputs);
+        }
+        _ => panic!("expected ProcessTask"),
+    }
+}
+
+#[test]
+fn command_process_task_legacy_wrapper_backcompat() {
+    // Wire fixture from before `predecessor_outputs` existed: the
+    // `task:<json>` wrapper carries only `path` / `payload` /
+    // `resolved_path`. Parser must accept it cleanly and default
+    // `predecessor_outputs` to empty.
+    let legacy = "task:{\"path\":\"bin/x\",\"payload\":\"{\\\"a\\\":1}\",\"resolved_path\":\"/abs/bin/x\"}\n";
+    let parsed = parse_command(legacy).unwrap();
+    match parsed {
+        Command::ProcessTask {
+            relative_path,
+            payload,
+            resolved_path,
+            predecessor_outputs,
+        } => {
+            assert_eq!(relative_path, "bin/x");
+            assert_eq!(payload.as_deref(), Some("{\"a\":1}"));
+            assert_eq!(resolved_path.as_deref(), Some("/abs/bin/x"));
+            assert!(predecessor_outputs.is_empty());
+        }
+        _ => panic!("expected ProcessTask"),
+    }
+}
+
+#[test]
+fn command_process_task_bare_path_preserved_when_all_empty() {
+    // The bare-path fast-path is preserved when `predecessor_outputs`
+    // is empty AND every other optional is absent — pre-feature tasks
+    // remain byte-identical on the wire.
+    let cmd = Command::ProcessTask {
+        relative_path: "path/to/binary".into(),
+        payload: None,
+        resolved_path: None,
+        predecessor_outputs: BTreeMap::new(),
+    };
+    let bytes = serialize_command(&cmd);
+    assert_eq!(bytes, b"path/to/binary\n");
 }
 
 #[test]

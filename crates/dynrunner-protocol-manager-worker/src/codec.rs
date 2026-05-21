@@ -1,6 +1,8 @@
+use std::collections::BTreeMap;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use dynrunner_core::ErrorType;
+use dynrunner_core::{ErrorType, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
 use crate::command::{Command, Response};
@@ -28,14 +30,20 @@ struct WorkerExceptionWire {
 ///
 /// Format:
 ///   "stop\n"
-///   "<relative_path>\n"                          (legacy ProcessTask, no payload, no resolved_path)
-///   "task:<json {path, payload?, resolved_path?}>\n"  (any new field present)
+///   "<relative_path>\n"                                                          (legacy ProcessTask, no optional fields)
+///   "task:<json {path, payload?, resolved_path?, predecessor_outputs?}>\n"  (any optional field present)
 ///
 /// The `task:` prefix routes the new form. Legacy paths starting
 /// with the literal string `task:` would collide; in practice
-/// paths don't, and consumers that need payload-bearing or
-/// resolved-path dispatch opt in via `Some(...)` knowing they
-/// shouldn't emit `task:`-prefixed paths in the same run.
+/// paths don't, and consumers that need payload-bearing,
+/// resolved-path, or predecessor-outputs dispatch opt in
+/// knowing they shouldn't emit `task:`-prefixed paths in the
+/// same run.
+///
+/// The bare-path form is preserved when every optional field is
+/// absent (`payload`/`resolved_path` are `None` AND
+/// `predecessor_outputs` is empty) — pre-feature tasks remain
+/// byte-identical on the wire.
 pub fn serialize_command(cmd: &Command) -> Vec<u8> {
     match cmd {
         Command::Stop => b"stop\n".to_vec(),
@@ -43,16 +51,19 @@ pub fn serialize_command(cmd: &Command) -> Vec<u8> {
             relative_path,
             payload: None,
             resolved_path: None,
-        } => format!("{relative_path}\n").into_bytes(),
+            predecessor_outputs,
+        } if predecessor_outputs.is_empty() => format!("{relative_path}\n").into_bytes(),
         Command::ProcessTask {
             relative_path,
             payload,
             resolved_path,
+            predecessor_outputs,
         } => {
             // serde_json::json! only includes keys with valid Value
             // shapes; build the map explicitly to omit absent fields
             // so legacy parsers that don't know about
-            // `resolved_path` don't trip on a `null`.
+            // `resolved_path` / `predecessor_outputs` don't trip on
+            // a `null`.
             let mut wrapper = serde_json::Map::new();
             wrapper.insert(
                 "path".into(),
@@ -66,6 +77,14 @@ pub fn serialize_command(cmd: &Command) -> Vec<u8> {
                     "resolved_path".into(),
                     serde_json::Value::String(rp.clone()),
                 );
+            }
+            if !predecessor_outputs.is_empty() {
+                // serde_json::to_value never fails for a
+                // `BTreeMap<String, TaskOutputs>` (string keys,
+                // serde-derived values) — unwrap is sound.
+                let outputs_value = serde_json::to_value(predecessor_outputs)
+                    .expect("BTreeMap<String, TaskOutputs> always serialises");
+                wrapper.insert("predecessor_outputs".into(), outputs_value);
             }
             let value = serde_json::Value::Object(wrapper);
             // serde_json compact never emits newlines, so this is
@@ -87,14 +106,16 @@ pub fn parse_command(line: &str) -> Option<Command> {
         return Some(Command::Stop);
     }
     if let Some(rest) = line.strip_prefix("task:") {
-        // New form: task:<json {path, payload?, resolved_path?}>.
+        // New form: task:<json {path, payload?, resolved_path?, predecessor_outputs?}>.
         // Falls back to legacy interpretation if the JSON is
         // malformed (treat the whole line as a literal path) —
         // defensive, since a legacy emitter that happened to send a
         // `task:`-prefixed path would otherwise hit a parse error
-        // here. Missing `payload` / `resolved_path` deserialise as
-        // `None`, preserving wire compatibility with senders that
-        // omit either.
+        // here. Missing `payload` / `resolved_path` /
+        // `predecessor_outputs` deserialise as `None` / empty,
+        // preserving wire compatibility with senders that omit any
+        // of them. Unknown keys are silently ignored, so a future
+        // sender adding more optionals stays decode-compatible.
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(rest) {
             let path = value
                 .get("path")
@@ -109,10 +130,17 @@ pub fn parse_command(line: &str) -> Option<Command> {
                 .get("resolved_path")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_owned());
+            let predecessor_outputs = value
+                .get("predecessor_outputs")
+                .cloned()
+                .map(serde_json::from_value::<BTreeMap<String, TaskOutputs>>)
+                .and_then(Result::ok)
+                .unwrap_or_default();
             return Some(Command::ProcessTask {
                 relative_path: path,
                 payload,
                 resolved_path,
+                predecessor_outputs,
             });
         }
     }
@@ -120,6 +148,7 @@ pub fn parse_command(line: &str) -> Option<Command> {
         relative_path: line.to_owned(),
         payload: None,
         resolved_path: None,
+        predecessor_outputs: BTreeMap::new(),
     })
 }
 
