@@ -32,6 +32,13 @@ fn command_into_py(py: Python<'_>, cmd: RustCommand) -> PyResult<Py<PyAny>> {
             relative_path,
             payload,
             resolved_path,
+            // `predecessor_outputs` is bridged to Python as a
+            // JSON string field on `PyProcessBinaryCommand` by a
+            // follow-up change. Until that change lands, the
+            // PyO3 codec is one-way (Rust → Python) for the
+            // existing fields and the predecessor outputs simply
+            // don't cross the bridge yet.
+            predecessor_outputs: _,
         } => Ok(Py::new(
             py,
             (

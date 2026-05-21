@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
 use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, TaskResult};
@@ -97,6 +98,12 @@ impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
             relative_path,
             payload,
             resolved_path,
+            // `predecessor_outputs` is threaded through a future
+            // signature extension on `assign_task` once the
+            // `manager-local` cache lands. Until then it's always
+            // empty and the codec collapses to the bare-path form
+            // for legacy tasks.
+            predecessor_outputs: BTreeMap::new(),
         };
         match self.transport.send(cmd).await {
             Ok(()) => AssignResult::Assigned(RunnerProtocol {

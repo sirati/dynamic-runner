@@ -93,6 +93,11 @@ impl PyProcessBinaryCommand {
             relative_path: self.relative_path.clone(),
             payload: self.payload.clone(),
             resolved_path: self.resolved_path.clone(),
+            // `predecessor_outputs` will become a JSON-string field
+            // on this pyclass once the Python-side `Task.predecessor_outputs`
+            // wiring lands; until then the bridge always serialises
+            // an empty map.
+            predecessor_outputs: std::collections::BTreeMap::new(),
         };
         rust_bytes_to_py(py, codec_serialize_command(&cmd))
     }
