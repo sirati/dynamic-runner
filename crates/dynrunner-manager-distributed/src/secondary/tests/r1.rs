@@ -586,6 +586,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 binary_info: DistributedBinaryInfo::from_task_info(&binary),
                 local_path: binary.path.to_string_lossy().into_owned(),
                 file_hash: file_hash.clone(),
+                predecessor_outputs: std::collections::BTreeMap::new(),
             };
 
             // The critical call: route via peer_transport handler.
