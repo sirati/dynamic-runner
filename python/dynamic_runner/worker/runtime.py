@@ -200,15 +200,20 @@ class Task:
 
     def publish(self, src, dst=None, *, key: Optional[str] = None) -> None:
         from .publish import publish as _publish
-        _publish(src, dst)
+        # `_publish` returns the resolved destination (either the
+        # caller-supplied `dst` verbatim or `dst_root / (src - src_root)`
+        # when omitted). The accumulator records that resolved path so a
+        # downstream consumer reading `predecessor_outputs[...][key]`
+        # sees the actual destination on the shared mount even when the
+        # caller relied on the auto-derived dst. Destination resolution
+        # is the single concern of `dynamic_runner.worker.publish`; the
+        # Task wrapper only owns the keyed-outputs side-effect.
+        resolved_dst = _publish(src, dst)
         if key is not None:
-            # The accumulator captures the post-publish destination so a
-            # downstream consumer reading `predecessor_outputs[...][key]`
-            # sees the path on the shared mount, not the staging
-            # location. `_publish` does the actual file delivery; the
-            # Task wrapper owns the keyed-outputs side-effect so
-            # `dynamic_runner.worker.publish` stays single-concern.
-            self._outputs_accumulator[key] = {"kind": "file", "value": str(dst)}
+            self._outputs_accumulator[key] = {
+                "kind": "file",
+                "value": str(resolved_dst),
+            }
 
     def publish_string(self, key: str, value: str) -> None:
         """Record an inline string output under ``key``.
