@@ -121,6 +121,100 @@ fn legacy_distributed_binary_info_decodes_with_defaults() {
     }
 }
 
+/// Wire backcompat for the `task_depends_on` upgrade from `Vec<String>`
+/// to `Vec<TaskDep>`: a `DistributedBinaryInfo` payload emitted by a
+/// pre-keyed-outputs sender carries bare-string elements
+/// (`["a", "b"]`). `TaskDep`'s `#[serde(untagged)]` deserializer must
+/// accept those without an explicit `inherit_outputs` key and decode
+/// each as `TaskDep { task_id, inherit_outputs: false }`. Without the
+/// nested untagged decoder, rolling upgrades would refuse legacy
+/// assignment frames.
+#[test]
+fn distributed_binary_info_task_depends_on_decodes_bare_strings() {
+    let legacy = serde_json::json!({
+        "msg_type": "task_assignment",
+        "sender_id": "primary",
+        "timestamp": 0.0,
+        "secondary_id": "sec-0",
+        "worker_id": 0,
+        "zip_file": null,
+        "binary_info": {
+            "path": "/tmp/x",
+            "size": 1,
+            "identifier": {
+                "binary_name": "legacy",
+                "platform": "x86_64",
+                "compiler": "gcc",
+                "version": "12.0",
+                "opt_level": "O2"
+            },
+            "task_depends_on": ["a", "b"]
+        },
+        "local_path": "x",
+        "file_hash": "h"
+    });
+    let json = serde_json::to_vec(&legacy).unwrap();
+    let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { binary_info, .. } => {
+            assert_eq!(binary_info.task_depends_on.len(), 2);
+            assert_eq!(binary_info.task_depends_on[0].task_id, "a");
+            assert!(!binary_info.task_depends_on[0].inherit_outputs);
+            assert_eq!(binary_info.task_depends_on[1].task_id, "b");
+            assert!(!binary_info.task_depends_on[1].inherit_outputs);
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
+/// Mixed wire shape forwards-compat: a sender that emits a mix of
+/// bare-string and full-struct entries within `task_depends_on` decodes
+/// element-by-element. Pin alongside the legacy-only case because the
+/// `Vec<TaskDep>` derive on `DistributedBinaryInfo` defers to the
+/// element's `Deserialize`, and this test guards against accidental
+/// `serde(with = ...)` collapses that would force a uniform-shape
+/// constraint.
+#[test]
+fn distributed_binary_info_task_depends_on_decodes_mixed_shapes() {
+    let mixed = serde_json::json!({
+        "msg_type": "task_assignment",
+        "sender_id": "primary",
+        "timestamp": 0.0,
+        "secondary_id": "sec-0",
+        "worker_id": 0,
+        "zip_file": null,
+        "binary_info": {
+            "path": "/tmp/x",
+            "size": 1,
+            "identifier": {
+                "binary_name": "mixed",
+                "platform": "x86_64",
+                "compiler": "gcc",
+                "version": "12.0",
+                "opt_level": "O2"
+            },
+            "task_depends_on": [
+                "legacy_dep",
+                { "task_id": "modern_dep", "inherit_outputs": true }
+            ]
+        },
+        "local_path": "x",
+        "file_hash": "h"
+    });
+    let json = serde_json::to_vec(&mixed).unwrap();
+    let decoded: DistributedMessage<TestId> = serde_json::from_slice(&json).unwrap();
+    match decoded {
+        DistributedMessage::TaskAssignment { binary_info, .. } => {
+            assert_eq!(binary_info.task_depends_on.len(), 2);
+            assert_eq!(binary_info.task_depends_on[0].task_id, "legacy_dep");
+            assert!(!binary_info.task_depends_on[0].inherit_outputs);
+            assert_eq!(binary_info.task_depends_on[1].task_id, "modern_dep");
+            assert!(binary_info.task_depends_on[1].inherit_outputs);
+        }
+        _ => panic!("expected TaskAssignment"),
+    }
+}
+
 /// StageFile roundtrip: per-file location notification serializes
 /// cleanly and the secondary-side fields are intact after decode.
 #[test]
