@@ -22,5 +22,5 @@
 mod complete;
 mod failed;
 mod mutation;
-pub(in crate::primary) mod predecessor_outputs;
+pub(crate) mod predecessor_outputs;
 mod request;

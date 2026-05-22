@@ -25,7 +25,7 @@ use crate::cluster_state::ClusterState;
 /// helper to `state`'s replicated `task_outputs` cache and ledger
 /// view. Returned map is owned; callers wire it directly into the
 /// wire message.
-pub(in crate::primary) fn gather_predecessor_outputs<I: Identifier>(
+pub(crate) fn gather_predecessor_outputs<I: Identifier>(
     state: &ClusterState<I>,
     task: &TaskInfo<I>,
 ) -> BTreeMap<String, TaskOutputs> {

@@ -16,6 +16,8 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
+use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
+
 use super::super::wire::timestamp_now;
 use super::super::{PrimaryInFlightItem, SecondaryCoordinator};
 use super::task_file_hash;
@@ -214,6 +216,8 @@ where
                                 "primary self-assign: type-bind respawn issued; \
                                  stashing binary in pending_first_bind until Ready arrives"
                             );
+                            let predecessor_outputs =
+                                gather_predecessor_outputs(&self.cluster_state, &actual_binary);
                             self.pending_first_bind.insert(
                                 wid,
                                 super::super::PendingFirstBind {
@@ -221,22 +225,7 @@ where
                                     file_hash,
                                     estimated,
                                     source: super::super::BindSource::PrimarySelfAssign,
-                                    // Primary self-assign path: the
-                                    // predecessor-output gather
-                                    // mirrors the Phase 4 helper used
-                                    // at `primary/task/request.rs`
-                                    // and `primary/lifecycle/dispatch.rs`,
-                                    // but is not yet plumbed at this
-                                    // self-assign site (out of scope
-                                    // for keyed-outputs Phase 5 —
-                                    // local manager). Empty map keeps
-                                    // wire bytes identical to
-                                    // pre-feature for no-dep tasks
-                                    // and yields present-but-empty
-                                    // entries to the worker for dep
-                                    // tasks (graceful degradation).
-                                    predecessor_outputs:
-                                        std::collections::BTreeMap::new(),
+                                    predecessor_outputs,
                                 },
                             );
                             return Ok(());
@@ -254,20 +243,10 @@ where
                         self.recover_in_flight_to_pool(&file_hash);
                         return Ok(());
                     }
+                    let predecessor_outputs =
+                        gather_predecessor_outputs(&self.cluster_state, &actual_binary);
                     match self.pool.workers[wid as usize]
-                        .assign_task(
-                            actual_binary,
-                            estimated,
-                            false,
-                            // Primary self-assign path: see the
-                            // PendingFirstBind insert above; the
-                            // cluster-state-driven gather is
-                            // out-of-scope for the keyed-outputs
-                            // Phase 5 (local manager) wire-up and
-                            // lands when the distributed self-assign
-                            // path picks up the Phase 4 helper.
-                            std::collections::BTreeMap::new(),
-                        )
+                        .assign_task(actual_binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {
