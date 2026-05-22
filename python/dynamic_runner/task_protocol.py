@@ -71,6 +71,31 @@ framework's untagged-deserialiser and stays equivalent to
 the flag explicitly when the dependent task needs to read its
 predecessor's predecessors' outputs too.
 
+Python consumers express the structured shape with the
+:class:`dynamic_runner.TaskDep` dataclass. ``discover_items``
+returns may mix bare strings and ``TaskDep`` instances in the same
+``task_depends_on`` tuple::
+
+    from dynamic_runner import TaskDep
+
+    yield TaskInfo(
+        ...,
+        task_id="C",
+        task_depends_on=(
+            "B",                                       # legacy, no inherit
+            TaskDep("A", inherit_outputs=True),        # transitive read
+        ),
+    )
+
+The PyO3 bridge (``crates/dynrunner-pyo3/src/pytypes/extract.rs``)
+duck-types each entry: bare ``str`` becomes ``TaskDep { task_id,
+inherit_outputs: false }``; ``TaskDep``-shaped objects (or any
+duck-typed thing exposing ``task_id`` + ``inherit_outputs``) carry
+both fields verbatim. The reverse direction (Rust→Python read of
+``TaskInfo.task_depends_on``) renders as the legacy ``tuple[str,
+...]`` — ``inherit_outputs`` is a declarer-side concern that does
+not need to be observable post-extract.
+
 When a worker handler runs, ``task.predecessor_outputs`` carries
 the keyed outputs of every direct (and, when the edge sets
 ``inherit_outputs=True``, transitive) predecessor. The shape is::

@@ -26,6 +26,35 @@ class BinaryIdentifier:
     opt_level: str
 
 
+@dataclass(frozen=True)
+class TaskDep:
+    """One edge in a task's prerequisite-dependency graph.
+
+    Mirrors the Rust-side ``TaskDep`` in
+    ``crates/dynrunner-core/src/types/task.rs``. Consumer code uses
+    this dataclass on the declarer side (``TaskInfo.task_depends_on``)
+    to opt into the framework's transitive-ancestry output read.
+
+    Wire-equivalent shapes accepted by the PyO3 bridge:
+
+    * Bare ``str`` — legacy / default. The extractor lifts it into
+      ``TaskDep(task_id=<str>, inherit_outputs=False)``; semantically
+      identical to the ``Vec<String>`` Python contract pre-feature.
+    * ``TaskDep(task_id, inherit_outputs=True)`` — opts the dependent
+      task into receiving its predecessor's transitive ancestors'
+      published outputs in addition to the direct predecessor's.
+
+    The Rust→Python read direction (``TaskInfo.task_depends_on``
+    surfaced from a round-trip through the runtime) keeps the legacy
+    ``tuple[str, ...]`` projection — the ``inherit_outputs`` flag is a
+    declarer-side concern and the runtime stops carrying it past the
+    primary's dispatcher.
+    """
+
+    task_id: str
+    inherit_outputs: bool = False
+
+
 @dataclass
 class TaskInfo:
     path: Path
@@ -53,7 +82,17 @@ class TaskInfo:
     # continuously as toolchains drain instead of barriering on the
     # whole phase. Validated for unknown ids and cycles at run start;
     # mismatch fails loud with the offending ids in the error.
-    task_depends_on: tuple[str, ...] = field(default_factory=tuple)
+    #
+    # Entries may be bare ``str`` task ids (legacy shape, equivalent
+    # to ``TaskDep(task_id=<str>, inherit_outputs=False)``) or
+    # :class:`TaskDep` instances. Bare strings keep the pre-feature
+    # contract — the PyO3 bridge lifts each into a Rust ``TaskDep``
+    # with ``inherit_outputs=False``. Setting
+    # ``TaskDep(..., inherit_outputs=True)`` opts the dependent task
+    # into the framework's transitive-ancestry output read: it sees
+    # not only the direct predecessor's published outputs but also
+    # those predecessor's predecessors' outputs (and so on, transitively).
+    task_depends_on: tuple["TaskDep | str", ...] = field(default_factory=tuple)
 
     @property
     def binary_name(self) -> str:
@@ -90,8 +129,28 @@ class TaskInfo:
             "affinity_id": self.affinity_id,
             "payload": self.payload,
             "task_id": self.task_id,
-            "task_depends_on": list(self.task_depends_on),
+            # Normalise each dep to a JSON-friendly shape: bare-strings
+            # stay strings (legacy wire), ``TaskDep`` instances render as
+            # ``{"task_id": ..., "inherit_outputs": ...}``. Matches the
+            # untagged ``TaskDepWire`` decoder on the Rust side
+            # (``crates/dynrunner-core/src/types/task.rs``) so the dict
+            # form round-trips through serde without ambiguity.
+            "task_depends_on": [_dep_to_jsonable(dep) for dep in self.task_depends_on],
         }
+
+
+def _dep_to_jsonable(dep: "TaskDep | str") -> "str | dict":
+    """Coerce one ``task_depends_on`` entry to its JSON-canonical shape.
+
+    Single concern: be the one place that knows about both legal entry
+    shapes (bare-string vs ``TaskDep`` dataclass) for the on-disk
+    ``to_dict`` projection. The PyO3 extractor has its own boundary
+    (attribute-based, not JSON-based); the two paths share the same
+    legal-shape set but not the same wire encoder.
+    """
+    if isinstance(dep, TaskDep):
+        return {"task_id": dep.task_id, "inherit_outputs": dep.inherit_outputs}
+    return dep
 
 
 def format_size(size: int) -> str:

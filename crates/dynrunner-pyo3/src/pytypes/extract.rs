@@ -52,6 +52,63 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
     }
 }
 
+/// Extract one ``task_depends_on`` entry into a Rust-side ``TaskDep``.
+///
+/// Single concern: bridge the two legal Python shapes — bare ``str``
+/// (legacy ``Vec<String>`` contract) and ``TaskDep`` dataclass (new,
+/// carrying ``inherit_outputs``) — into one Rust value. Order of
+/// attempts:
+///
+/// 1. Try ``extract::<String>``. Succeeds for plain ``str`` values; the
+///    result becomes ``TaskDep { task_id, inherit_outputs: false }``,
+///    matching the untagged ``Bare`` arm in
+///    ``dynrunner_core::types::task::TaskDepWire``.
+/// 2. Fall back to attribute reads (``task_id`` / ``inherit_outputs``).
+///    Works for the Python ``TaskDep`` dataclass (and any duck-typed
+///    object exposing those two attributes). Missing
+///    ``inherit_outputs`` is NOT inferred — it must be a ``bool``;
+///    a ``TaskDep`` instance always carries it (default ``False``).
+///
+/// Failure surfaces as a ``PyErr`` propagated up to ``extract_binaries``,
+/// which becomes a ``ValueError`` / ``AttributeError`` at the Python
+/// boundary — the same shape the surrounding extractors raise for
+/// malformed inputs.
+fn extract_task_dep(obj: &Bound<'_, PyAny>) -> PyResult<TaskDep> {
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(TaskDep {
+            task_id: s,
+            inherit_outputs: false,
+        });
+    }
+    let task_id: String = obj.getattr("task_id")?.extract()?;
+    let inherit_outputs: bool = obj.getattr("inherit_outputs")?.extract()?;
+    Ok(TaskDep {
+        task_id,
+        inherit_outputs,
+    })
+}
+
+/// Walk a Python iterable of ``task_depends_on`` entries and produce
+/// the Rust-side ``Vec<TaskDep>``. Each entry is bridged by
+/// :func:`extract_task_dep`; the first per-entry error propagates and
+/// aborts the walk.
+fn extract_task_depends_on(value: &Bound<'_, PyAny>) -> PyResult<Vec<TaskDep>> {
+    // ``None`` collapses to the empty default — matches the historical
+    // ``v.extract::<Vec<String>>().ok().unwrap_or_default()`` behaviour
+    // for consumers passing ``task_depends_on=None`` (or omitting the
+    // attribute entirely upstream in the caller, which the
+    // ``.getattr().ok()`` chain handles before reaching us).
+    if value.is_none() {
+        return Ok(Vec::new());
+    }
+    let iter = value.try_iter()?;
+    let mut out = Vec::new();
+    for item in iter {
+        out.push(extract_task_dep(&item?)?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn extract_binaries(
     binaries: &Bound<'_, PyList>,
 ) -> PyResult<Vec<TaskInfo<RunnerIdentifier>>> {
@@ -117,21 +174,21 @@ pub(crate) fn extract_binaries(
                 .getattr("task_id")
                 .ok()
                 .and_then(|v| v.extract::<Option<String>>().ok().flatten());
-            // Python contract is `tuple[str, ...]` of predecessor task_ids;
-            // lift each into a `TaskDep` with the legacy-default
-            // `inherit_outputs = false` (matches the untagged `Bare`
-            // deserializer arm in `dynrunner_core::types::task`).
+            // ``task_depends_on`` entries cross the FFI boundary as
+            // either bare strings (legacy ``Vec<String>`` shape) or
+            // ``TaskDep`` dataclass instances (new — opts into the
+            // transitive-ancestry output read via ``inherit_outputs``).
+            // ``extract_task_dep`` is the single duck-typed walker that
+            // knows both shapes; ``extract_task_depends_on`` applies it
+            // to every entry of the iterable. Missing / wrong-typed
+            // ``task_depends_on`` collapses to the empty-default,
+            // matching the legacy back-compat path.
             let task_depends_on: Vec<TaskDep> = item
                 .getattr("task_depends_on")
                 .ok()
-                .and_then(|v| v.extract::<Vec<String>>().ok())
-                .unwrap_or_default()
-                .into_iter()
-                .map(|task_id| TaskDep {
-                    task_id,
-                    inherit_outputs: false,
-                })
-                .collect();
+                .map(|v| extract_task_depends_on(&v))
+                .transpose()?
+                .unwrap_or_default();
             // Optional soft-preferred-secondaries hint. Missing /
             // None / wrong-type all collapse to the empty default;
             // the newtype keeps the soft-vs-strict semantic
@@ -157,4 +214,91 @@ pub(crate) fn extract_binaries(
             })
         })
         .collect()
+}
+
+#[cfg(all(test, feature = "test-with-python"))]
+mod tests {
+    //! Python-interpreter-backed tests for the ``task_depends_on``
+    //! mixed-shape bridge. Single concern: ensure ``extract_task_dep``
+    //! accepts bare ``str`` AND attribute-bearing ``TaskDep`` instances
+    //! without regressing either path. Pure-Rust round-trip tests for
+    //! the surrounding ``PyTaskInfo`` boundary live in
+    //! ``pytypes::task_info::tests``.
+    use super::*;
+    use pyo3::types::PyAnyMethods;
+
+    /// Construct a Python dataclass with the ``TaskDep`` shape via
+    /// ``types.SimpleNamespace`` — equivalent for ``getattr`` purposes
+    /// to the real ``dynamic_runner._shared.TaskDep`` dataclass, but
+    /// avoids importing the Python package from a pure-Rust test.
+    fn make_task_dep<'py>(
+        py: Python<'py>,
+        task_id: &str,
+        inherit_outputs: bool,
+    ) -> Bound<'py, PyAny> {
+        let types = py.import("types").expect("types module");
+        let simplens = types.getattr("SimpleNamespace").expect("SimpleNamespace");
+        let kwargs = pyo3::types::PyDict::new(py);
+        kwargs.set_item("task_id", task_id).unwrap();
+        kwargs.set_item("inherit_outputs", inherit_outputs).unwrap();
+        simplens.call((), Some(&kwargs)).expect("SimpleNamespace(...)")
+    }
+
+    #[test]
+    fn extract_task_dep_bare_string_defaults_inherit_outputs_false() {
+        Python::attach(|py| {
+            let obj = pyo3::types::PyString::new(py, "alpha");
+            let dep = extract_task_dep(&obj.into_any()).expect("bare string");
+            assert_eq!(dep.task_id, "alpha");
+            assert!(!dep.inherit_outputs);
+        });
+    }
+
+    #[test]
+    fn extract_task_dep_dataclass_carries_inherit_outputs() {
+        Python::attach(|py| {
+            let obj = make_task_dep(py, "beta", true);
+            let dep = extract_task_dep(&obj).expect("attribute-bearing object");
+            assert_eq!(dep.task_id, "beta");
+            assert!(dep.inherit_outputs);
+
+            let obj2 = make_task_dep(py, "gamma", false);
+            let dep2 = extract_task_dep(&obj2).expect("attribute-bearing object");
+            assert_eq!(dep2.task_id, "gamma");
+            assert!(!dep2.inherit_outputs);
+        });
+    }
+
+    #[test]
+    fn extract_task_depends_on_mixed_iterable() {
+        // The wire-equivalent of `["A", TaskDep("B", inherit_outputs=True)]`:
+        // a Python tuple mixing the two legal entry shapes. The bridge
+        // must preserve order and the inherit-outputs flag.
+        Python::attach(|py| {
+            let bare = pyo3::types::PyString::new(py, "A").into_any();
+            let struct_dep = make_task_dep(py, "B", true);
+            let tuple = pyo3::types::PyTuple::new(py, [bare, struct_dep])
+                .expect("mixed tuple");
+            let deps =
+                extract_task_depends_on(tuple.as_any()).expect("mixed iterable");
+            assert_eq!(deps.len(), 2);
+            assert_eq!(deps[0].task_id, "A");
+            assert!(!deps[0].inherit_outputs);
+            assert_eq!(deps[1].task_id, "B");
+            assert!(deps[1].inherit_outputs);
+        });
+    }
+
+    #[test]
+    fn extract_task_depends_on_none_defaults_empty() {
+        // Consumers may pass `task_depends_on=None`; the bridge collapses
+        // to the empty default rather than raising. Matches the historical
+        // behaviour where the wrong-type path collapsed via
+        // `extract::<Vec<String>>().ok().unwrap_or_default()`.
+        Python::attach(|py| {
+            let none = py.None().into_bound(py);
+            let deps = extract_task_depends_on(&none).expect("None");
+            assert!(deps.is_empty());
+        });
+    }
 }

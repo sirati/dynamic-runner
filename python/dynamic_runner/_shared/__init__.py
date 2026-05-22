@@ -34,12 +34,14 @@ from .selection_args import (
 )
 from .task_info import (
     BinaryIdentifier,
+    TaskDep,
     TaskInfo,
     format_size,
 )
 
 __all__ = [
     "TaskInfo",
+    "TaskDep",
     "BinaryIdentifier",
     "format_size",
     "increase_csv_field_size_limit",
