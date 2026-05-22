@@ -6,9 +6,12 @@
 //! progress). The handle reads from its transport on a background
 //! task and sends [`WorkerEvent`]s into the shared manager channel.
 
+use std::collections::BTreeMap;
 use std::time::Instant;
 
-use dynrunner_core::{ErrorType, Identifier, ResourceMap, TaskInfo, TaskResult, TypeId, WorkerId};
+use dynrunner_core::{
+    ErrorType, Identifier, ResourceMap, TaskInfo, TaskOutputs, TaskResult, TypeId, WorkerId,
+};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_manager_worker::state::{
     AssignResult, PollResult, Processing, RunnerProtocol, RunnerProtocolState, WaitReadyResult,
@@ -481,11 +484,21 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
     /// Spawns a background task that reads from the transport and sends
     /// `WorkerEvent`s to the shared event channel. The manager receives
     /// events for all workers from a single channel without blocking.
+    ///
+    /// `predecessor_outputs` is the dispatch-time-assembled map from
+    /// each declared `task_depends_on` predecessor's `task_id` to its
+    /// cached [`TaskOutputs`] (gathered by the manager via
+    /// [`dynrunner_core::gather_predecessor_outputs`]). Forwarded
+    /// verbatim through the protocol layer onto
+    /// `Command::ProcessTask.predecessor_outputs`. Pass
+    /// `BTreeMap::new()` for tasks with no deps; legacy tasks
+    /// continue to ride the bare-path codec form.
     pub async fn assign_task(
         &mut self,
         binary: TaskInfo<I>,
         estimated_resources: ResourceMap,
         opportunistic: bool,
+        predecessor_outputs: BTreeMap<String, TaskOutputs>,
     ) -> Result<(), String> {
         let idle = self
             .protocol
@@ -516,7 +529,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             .resolved_path
             .as_ref()
             .map(|p| p.to_string_lossy().into_owned());
-        match idle.assign_task(relative_path, payload, resolved_path).await {
+        match idle
+            .assign_task(relative_path, payload, resolved_path, predecessor_outputs)
+            .await
+        {
             AssignResult::Assigned(processing) => {
                 // Spawn a background task that polls the worker protocol.
                 let worker_id = self.worker_id;

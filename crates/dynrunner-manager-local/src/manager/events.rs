@@ -54,6 +54,37 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 if result.success
                     && let Some(b) = binary.as_ref()
                 {
+                    // Populate the keyed-outputs cache BEFORE
+                    // `handle_task_completed` — that helper releases
+                    // dependents for dispatch via the scheduler, and
+                    // `try_assign_normal` reads from this cache to
+                    // assemble each dispatched task's
+                    // `predecessor_outputs`. The cache write must
+                    // happen first to avoid a dispatch-before-cache
+                    // race. Decode contract mirrors the distributed
+                    // `cluster_state/apply_tasks.rs` `TaskCompleted`
+                    // arm: a present-but-undecodable payload still
+                    // inserts an empty entry so dependents can rely
+                    // on key presence.
+                    if let Some(bytes) = &result_data
+                        && let Some(task_id) = b.task_id.as_ref()
+                    {
+                        match serde_json::from_slice::<dynrunner_core::TaskOutputs>(bytes) {
+                            Ok(outputs) => {
+                                self.task_outputs_cache.insert(task_id.clone(), outputs);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    task_id = %task_id,
+                                    "TaskCompleted result_data failed to decode in local manager; \
+                                     storing empty entry",
+                                );
+                                self.task_outputs_cache
+                                    .insert(task_id.clone(), dynrunner_core::TaskOutputs::default());
+                            }
+                        }
+                    }
                     self.task_payloads.push((b.clone(), result_data));
                 }
 

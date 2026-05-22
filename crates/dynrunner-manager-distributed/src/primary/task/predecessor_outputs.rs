@@ -1,141 +1,49 @@
-//! Dispatch-time predecessor-output gathering.
+//! Dispatch-time predecessor-output gathering — distributed-mode wrapper.
 //!
-//! Single concern: given a `TaskInfo` about to be dispatched, assemble
-//! the `BTreeMap<task_id, TaskOutputs>` that rides on its
-//! `DistributedMessage::TaskAssignment.predecessor_outputs` field.
+//! Single concern: bind the generic [`dynrunner_core::gather_predecessor_outputs`]
+//! free function to the [`ClusterState`] storage shape. Both primary
+//! dispatch construction sites (`primary/lifecycle/dispatch.rs` and
+//! `primary/task/request.rs`) call into this wrapper so the assembled
+//! map's shape matches the local-mode dispatch path (which binds the
+//! same core helper to its per-manager cache).
 //!
-//! Read-only over the replicated [`ClusterState`] — no mutation, no
-//! panic on missing predecessor entries. Both primary dispatch
-//! construction sites (`primary/lifecycle/dispatch.rs` and
-//! `primary/task/request.rs`) call into this helper so the assembly
-//! shape is identical regardless of which dispatch path fires.
-//!
-//! Contract per the keyed-outputs feature plan:
-//!   * For every direct entry in `task.task_depends_on`, the result
-//!     contains a key for that dep's `task_id`. The value is the
-//!     dep's cached outputs if recorded, otherwise an empty
-//!     [`TaskOutputs`] so dependents that hard-require a key see a
-//!     stable "present-but-empty" shape rather than an absent entry.
-//!   * For each direct dep with `inherit_outputs == true`, the
-//!     transitive ancestry reachable through that dep's OWN
-//!     `task_depends_on` edges is also included. Ancestors that
-//!     produced no outputs likewise yield an empty `TaskOutputs`.
-//!     Ancestry-walk traversal does not re-consult `inherit_outputs`
-//!     on inner edges — the flag on the first edge selects between
-//!     "direct only" and "transitive closure of the predecessor's
-//!     ancestry".
-//!   * A direct dep whose `inherit_outputs == false` contributes only
-//!     its own key; its predecessors are not walked from this site
-//!     (they will reach the assembled map only if some other direct
-//!     edge from `task` reaches them).
-//!
-//! Cycle defence: the ancestry walk carries a visited set keyed by
-//! `task_id`. The scheduler's BFS spawn-time check rejects cyclic
-//! dep graphs before they reach this code path, but defensive coding
-//! keeps a malformed snapshot (or a future regression in the
-//! validator) from looping the dispatch path.
+//! The gather contract (direct deps emit a present-but-empty key when
+//! no outputs were recorded; `inherit_outputs=true` widens to the
+//! transitive ancestry; cycle defence via a visited set) lives in
+//! [`dynrunner_core::output_gather`]. This file is purely the
+//! [`ClusterState`]-shaped binding.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::BTreeMap;
 
-use dynrunner_core::{Identifier, TaskInfo, TaskOutputs};
+use dynrunner_core::{
+    gather_predecessor_outputs as core_gather, Identifier, TaskInfo, TaskOutputs,
+};
 
 use crate::cluster_state::ClusterState;
 
-/// Assemble the predecessor-output map for `task`. See module doc for
-/// the per-edge contract.
-///
-/// Returned map is owned; callers wire it directly into the wire
-/// message. Empty map if `task.task_depends_on` is empty.
+/// Assemble the predecessor-output map for `task` by binding the core
+/// helper to `state`'s replicated `task_outputs` cache and ledger
+/// view. Returned map is owned; callers wire it directly into the
+/// wire message.
 pub(in crate::primary) fn gather_predecessor_outputs<I: Identifier>(
     state: &ClusterState<I>,
     task: &TaskInfo<I>,
 ) -> BTreeMap<String, TaskOutputs> {
-    let mut result: BTreeMap<String, TaskOutputs> = BTreeMap::new();
-
-    for dep in &task.task_depends_on {
-        insert_outputs_for(state, &dep.task_id, &mut result);
-        if dep.inherit_outputs {
-            walk_ancestry(state, &dep.task_id, &mut result);
-        }
-    }
-
-    result
+    core_gather(
+        &task.task_depends_on,
+        // Cached outputs lookup: O(1) via the CRDT's task_id-keyed cache.
+        |task_id| state.outputs_for(task_id).cloned(),
+        // Deps-of lookup: linear scan over `state.iter_all()`. The
+        // CRDT does not maintain a `task_id → hash` reverse index by
+        // design; the ancestry walk fires only at dispatch time (not
+        // the hot path) and per-task chains are short, so the O(n)
+        // scan is acceptable. Adding a replicated reverse index
+        // would be a larger refactor (PhaseDepsSet / TaskAdded apply
+        // paths must agree).
+        |task_id| find_task_info_by_id(state, task_id).map(|t| t.task_depends_on.clone()),
+    )
 }
 
-/// Insert the cached outputs for `task_id` into `result`. If the cache
-/// has no entry, insert an empty [`TaskOutputs`] so the dependent sees
-/// a present-but-empty key (the contract documented on the module).
-///
-/// Idempotent on `result`: a second insert for the same `task_id` is
-/// a no-op (the first write wins) — important because the transitive
-/// walk and the direct-dep loop can both reach the same ancestor
-/// through different paths.
-fn insert_outputs_for<I: Identifier>(
-    state: &ClusterState<I>,
-    task_id: &str,
-    result: &mut BTreeMap<String, TaskOutputs>,
-) {
-    if result.contains_key(task_id) {
-        return;
-    }
-    let outputs = state
-        .outputs_for(task_id)
-        .cloned()
-        .unwrap_or_default();
-    result.insert(task_id.to_string(), outputs);
-}
-
-/// Breadth-first traversal of the ancestry rooted at `root_id`,
-/// inserting each ancestor's outputs (or empty) into `result`.
-///
-/// The visited set is a cycle defence — the scheduler's BFS check
-/// at spawn time forbids cyclic dep graphs, but a malformed
-/// snapshot or a future regression in the validator would otherwise
-/// loop this walk forever. Re-using `result.keys()` as the visited
-/// set is not enough on its own because the walk inserts the root
-/// only on the first visit; the dedicated `HashSet` guards the
-/// queue against re-enqueueing across siblings.
-fn walk_ancestry<I: Identifier>(
-    state: &ClusterState<I>,
-    root_id: &str,
-    result: &mut BTreeMap<String, TaskOutputs>,
-) {
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    visited.insert(root_id.to_string());
-    queue.push_back(root_id.to_string());
-
-    while let Some(current_id) = queue.pop_front() {
-        let Some(current_task) = find_task_info_by_id(state, &current_id) else {
-            // Unknown task_id — pre-apply spawn validation rejects
-            // unknown deps, but a snapshot containing only a subset
-            // of the run's tasks (late-joiner partial restore) can
-            // reach this branch. Skip silently: the direct-dep
-            // loop already emitted a present-but-empty key for any
-            // missing direct ancestor, and missing transitives are
-            // a strictly weaker concern than missing direct deps.
-            continue;
-        };
-        for dep in &current_task.task_depends_on {
-            if visited.insert(dep.task_id.clone()) {
-                insert_outputs_for(state, &dep.task_id, result);
-                queue.push_back(dep.task_id.clone());
-            }
-        }
-    }
-}
-
-/// Linear-scan `state.tasks.values()` for the entry whose `task_id ==
-/// Some(task_id)`. Returns `None` if no entry carries that id.
-///
-/// O(n) over the ledger; acceptable here because the ancestry walk
-/// fires only at dispatch time (not the hot path) and per-task chains
-/// are short. The CRDT does not maintain a `task_id → hash` reverse
-/// index by design — the `outputs_for` accessor already keys by
-/// `task_id` so the cached-output lookup is O(1); only the secondary
-/// hop "predecessor's own dep list" needs a `TaskInfo` borrow, and
-/// adding a replicated reverse index would be a larger refactor
-/// (PhaseDepsSet / TaskAdded apply paths must agree).
 fn find_task_info_by_id<'a, I: Identifier>(
     state: &'a ClusterState<I>,
     task_id: &str,
@@ -147,12 +55,10 @@ fn find_task_info_by_id<'a, I: Identifier>(
 
 #[cfg(test)]
 mod tests {
-    //! Pin the gather behaviour against the four documented shapes:
-    //! direct dep with outputs, direct dep without outputs, transitive
-    //! inheritance through one edge, inherit_outputs=false stops the
-    //! walk. Plus a cycle-defence smoke test against a hypothetical
-    //! self-loop (the validator forbids it but defensive coding lives
-    //! here too).
+    //! Pin the [`ClusterState`]-bound wrapper against the same four
+    //! documented shapes the core helper's unit tests pin, but
+    //! through the full CRDT apply path so the binding glue
+    //! (`outputs_for`, `iter_all`) is exercised end-to-end.
 
     use super::*;
     use std::collections::BTreeMap;

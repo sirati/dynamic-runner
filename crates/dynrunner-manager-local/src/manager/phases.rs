@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
+    gather_predecessor_outputs, ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -82,6 +82,23 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // first task's `type_id`; the same-type fast path
                 // covers every subsequent assignment to that slot
                 // until a `type_id` shift.
+                // Initial-assignment dispatches at run start, before
+                // any task has completed, so `task_outputs_cache` is
+                // empty; the gather returns either an empty map (no
+                // deps) or present-but-empty entries (deps that have
+                // not produced outputs yet). Uniform shape with
+                // `try_assign_normal` so the contract is identical
+                // across both local-mode dispatch sites.
+                let predecessor_outputs = gather_predecessor_outputs(
+                    &binary.task_depends_on,
+                    |task_id| self.task_outputs_cache.get(task_id).cloned(),
+                    |task_id| {
+                        self.task_payloads
+                            .iter()
+                            .find(|(t, _)| t.task_id.as_deref() == Some(task_id))
+                            .map(|(t, _)| t.task_depends_on.clone())
+                    },
+                );
                 let print_pid = self.config.print_pid;
                 if let Err(e) = self
                     .pool
@@ -94,7 +111,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     return;
                 }
                 let worker = &mut self.pool.workers[worker_id as usize];
-                match worker.assign_task(binary.clone(), estimated_usage.clone(), opportunistic).await {
+                match worker
+                    .assign_task(
+                        binary.clone(),
+                        estimated_usage.clone(),
+                        opportunistic,
+                        predecessor_outputs,
+                    )
+                    .await
+                {
                     Ok(()) => {
                         tracing::info!(
                             worker_id,

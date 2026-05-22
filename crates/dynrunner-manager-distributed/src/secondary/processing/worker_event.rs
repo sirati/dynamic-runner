@@ -417,6 +417,7 @@ where
                         file_hash,
                         estimated,
                         source,
+                        predecessor_outputs,
                     } = pending;
                     let log_task_hash = file_hash.clone();
                     let task_id_log = binary.task_id.clone();
@@ -425,7 +426,7 @@ where
                     let estimated_mb =
                         estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
                     match self.pool.workers[worker_id as usize]
-                        .assign_task(binary, estimated, false)
+                        .assign_task(binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {

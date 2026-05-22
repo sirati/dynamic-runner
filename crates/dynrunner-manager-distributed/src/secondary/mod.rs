@@ -109,6 +109,15 @@ pub(super) struct PendingFirstBind<I: Identifier> {
     pub(super) file_hash: String,
     pub(super) estimated: dynrunner_core::ResourceMap,
     pub(super) source: BindSource,
+    /// Predecessor-output map preserved across the
+    /// stash-until-Ready bounce. The router destructured this off
+    /// the `TaskAssignment` wire message; the post-Ready first-bind
+    /// dispatch (`processing/worker_event.rs`) forwards it verbatim
+    /// to `WorkerHandle::assign_task` so the dependent worker
+    /// observes the same `predecessor_outputs` shape it would have
+    /// seen on a same-type fast-path assignment.
+    pub(super) predecessor_outputs:
+        std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
 }
 
 /// One entry in the secondary's `primary_failed` ledger. Carries

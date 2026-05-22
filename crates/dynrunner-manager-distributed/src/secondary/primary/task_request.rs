@@ -221,6 +221,22 @@ where
                                     file_hash,
                                     estimated,
                                     source: super::super::BindSource::PrimarySelfAssign,
+                                    // Primary self-assign path: the
+                                    // predecessor-output gather
+                                    // mirrors the Phase 4 helper used
+                                    // at `primary/task/request.rs`
+                                    // and `primary/lifecycle/dispatch.rs`,
+                                    // but is not yet plumbed at this
+                                    // self-assign site (out of scope
+                                    // for keyed-outputs Phase 5 —
+                                    // local manager). Empty map keeps
+                                    // wire bytes identical to
+                                    // pre-feature for no-dep tasks
+                                    // and yields present-but-empty
+                                    // entries to the worker for dep
+                                    // tasks (graceful degradation).
+                                    predecessor_outputs:
+                                        std::collections::BTreeMap::new(),
                                 },
                             );
                             return Ok(());
@@ -239,7 +255,19 @@ where
                         return Ok(());
                     }
                     match self.pool.workers[wid as usize]
-                        .assign_task(actual_binary, estimated, false)
+                        .assign_task(
+                            actual_binary,
+                            estimated,
+                            false,
+                            // Primary self-assign path: see the
+                            // PendingFirstBind insert above; the
+                            // cluster-state-driven gather is
+                            // out-of-scope for the keyed-outputs
+                            // Phase 5 (local manager) wire-up and
+                            // lands when the distributed self-assign
+                            // path picks up the Phase 4 helper.
+                            std::collections::BTreeMap::new(),
+                        )
                         .await
                     {
                         Ok(()) => {

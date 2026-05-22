@@ -801,7 +801,7 @@ mod orphan_poll_task_tests {
             let binary = make_binary("delayed");
             let est = ResourceMap::from([(ResourceKind::memory(), 100)]);
             pool.workers[0]
-                .assign_task(binary, est, false)
+                .assign_task(binary, est, false, std::collections::BTreeMap::new())
                 .await
                 .expect("assign");
 
@@ -898,7 +898,7 @@ mod orphan_poll_task_tests {
             let binary = make_binary("delayed");
             let est = ResourceMap::from([(ResourceKind::memory(), 100)]);
             pool.workers[0]
-                .assign_task(binary, est, false)
+                .assign_task(binary, est, false, std::collections::BTreeMap::new())
                 .await
                 .expect("assign");
 
@@ -982,7 +982,7 @@ mod orphan_poll_task_tests {
 let binary = make_binary("delayed");
             let est = ResourceMap::from([(ResourceKind::memory(), 100)]);
             pool.workers[0]
-                .assign_task(binary, est, false)
+                .assign_task(binary, est, false, std::collections::BTreeMap::new())
                 .await
                 .expect("assign");
 
