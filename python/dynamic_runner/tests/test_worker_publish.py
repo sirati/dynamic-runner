@@ -157,6 +157,44 @@ class TaskMethodTests(_PublishFixture):
         t.publish(src)
         self.assertEqual((self.dst_root / "hookless.txt").read_text(), "ok")
 
+    def test_task_publish_with_key_records_resolved_dst_when_dst_omitted(self):
+        # End-to-end regression for the `dst=None` accumulator bug:
+        # the underlying publish helper resolves the destination via
+        # src_root/dst_root; the Task wrapper must record the
+        # resolved path, not the literal `None` the caller passed.
+        # No mocks here — the real publish() resolves the path,
+        # delivers the file, and returns the resolved dst the
+        # accumulator captures.
+        src = self._stage("nested/a/b/keyed.bin", "payload")
+        t = Task(relative_path="/x")
+        t.publish(src, key="out")
+        expected_dst = self.dst_root / "nested/a/b/keyed.bin"
+        self.assertEqual(
+            t._outputs_accumulator,
+            {"out": {"kind": "file", "value": str(expected_dst)}},
+        )
+        # Bonus: confirm the file actually lives at that path —
+        # ties the accumulator's recorded value to the real on-disk
+        # delivery so a future regression can't silently desync them.
+        self.assertTrue(expected_dst.exists())
+        self.assertEqual(expected_dst.read_text(), "payload")
+
+    def test_publish_returns_resolved_dst_with_explicit_override(self):
+        # The Path-return contract holds for the explicit-dst path
+        # too — callers like Task.publish capture this verbatim.
+        src = self._stage("explicit.txt", "v")
+        explicit_dst = self.dst_root / "alias.txt"
+        returned = publish(src, explicit_dst)
+        self.assertEqual(returned, explicit_dst)
+
+    def test_publish_returns_resolved_dst_when_derived(self):
+        # The Path-return contract for the derive-from-src_root path.
+        # This is the single source of truth Task.publish relies on
+        # when the caller omitted dst.
+        src = self._stage("d/e/derive.txt", "v")
+        returned = publish(src)
+        self.assertEqual(returned, self.dst_root / "d/e/derive.txt")
+
 
 class EnvOverrideTests(unittest.TestCase):
     """Confirms env vars actually steer publish — not just module

@@ -58,6 +58,40 @@ without observable harm (compressed archives with internal
 checksums, append-only logs), the partial-rename pattern is
 optional but still recommended for the ``--skip-existing``
 correctness reason.
+
+Keyed task outputs (per-edge data, not per-task policy)
+-------------------------------------------------------
+
+Each entry on :attr:`TaskInfo.task_depends_on` is a ``TaskDep``
+(``crates/dynrunner-core/src/types/task.rs``) with a string
+``task_id`` and a ``bool`` ``inherit_outputs`` flag. The legacy
+bare-string shape (``["task-a"]``) is still accepted by the
+framework's untagged-deserialiser and stays equivalent to
+``[TaskDep(task_id="task-a", inherit_outputs=False)]``; only set
+the flag explicitly when the dependent task needs to read its
+predecessor's predecessors' outputs too.
+
+When a worker handler runs, ``task.predecessor_outputs`` carries
+the keyed outputs of every direct (and, when the edge sets
+``inherit_outputs=True``, transitive) predecessor. The shape is::
+
+    {
+        predecessor_task_id: {
+            output_key: {"kind": "inline" | "file", "value": str}
+        }
+    }
+
+``kind == "inline"`` denotes a string the producing task committed
+via :meth:`Task.publish_string`; ``kind == "file"`` denotes a
+post-publish destination path on the shared mount, committed by
+the producing task via ``Task.publish(src, dst, key=...)``. The
+``value`` carries the string in both cases; the producing task's
+worker module owns the schema of inline strings (the framework
+does not inspect them).
+
+A predecessor that emits no outputs still appears as a key with
+an empty inner dict, so the dependent's lookup pattern
+``task.predecessor_outputs["task-a"].get("nonce")`` is uniform.
 """
 
 from __future__ import annotations

@@ -87,15 +87,25 @@ def _resolve(src: PathLike, dst: PathLike | None) -> tuple[Path, Path, Path]:
     return src_path, dst_root / rel, src_root
 
 
-def publish(src: PathLike, dst: PathLike | None = None) -> None:
+def publish(src: PathLike, dst: PathLike | None = None) -> Path:
     """Atomically deliver ``src`` to its destination.
 
     See module docstring for the (src_root, dst_root) contract.
     Raises ``PublishError`` on any failure (path validation,
     cross-FS copy, fsync, rename, unlink).
+
+    Returns the resolved destination ``Path`` that ``src`` was
+    delivered to — the verbatim ``dst`` when the caller supplied
+    one, otherwise the mirrored ``dst_root / (src - src_root)``.
+    The return is single source of truth for "where did this
+    file land": callers wiring the destination into downstream
+    bookkeeping (e.g. ``Task.publish(..., key=...)``'s keyed-outputs
+    accumulator) MUST capture this rather than re-deriving, since
+    only this module owns the resolution contract.
     """
     src_p, dst_p, src_root_p = _resolve(src, dst)
     _native_publish_one(src_p, dst_p, src_root_p)
+    return dst_p
 
 
 def publish_all(*srcs: PathLike) -> None:
