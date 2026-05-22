@@ -32,25 +32,30 @@ fn command_into_py(py: Python<'_>, cmd: RustCommand) -> PyResult<Py<PyAny>> {
             relative_path,
             payload,
             resolved_path,
-            // `predecessor_outputs` is bridged to Python as a
-            // JSON string field on `PyProcessBinaryCommand` by a
-            // follow-up change. Until that change lands, the
-            // PyO3 codec is one-way (Rust → Python) for the
-            // existing fields and the predecessor outputs simply
-            // don't cross the bridge yet.
-            predecessor_outputs: _,
-        } => Ok(Py::new(
-            py,
-            (
-                PyProcessBinaryCommand {
-                    relative_path,
-                    payload,
-                    resolved_path,
-                },
-                PyCommand,
-            ),
-        )?
-        .into_any()),
+            predecessor_outputs,
+        } => {
+            // `TaskOutputs` is a serde-derived type and the outer map is
+            // a `BTreeMap<String, _>` (string keys). `serde_json::to_string`
+            // only fails on i/o errors or non-string map keys, neither of
+            // which apply — the `expect` is sound. Empty map serialises
+            // to `"{}"` (symmetric with `json.loads("{}") == {}` on the
+            // Python side).
+            let predecessor_outputs_json = serde_json::to_string(&predecessor_outputs)
+                .expect("BTreeMap<String, TaskOutputs> always serialises to JSON");
+            Ok(Py::new(
+                py,
+                (
+                    PyProcessBinaryCommand {
+                        relative_path,
+                        payload,
+                        resolved_path,
+                        predecessor_outputs_json,
+                    },
+                    PyCommand,
+                ),
+            )?
+            .into_any())
+        }
     }
 }
 
