@@ -121,9 +121,16 @@ where
 
     /// React to a panik-watcher signal on this secondary.
     ///
-    /// Single concern: turn the watcher's "the operator wants the
-    /// cluster to stop now" event into the three side effects the
-    /// emergency-stop contract requires:
+    /// Single concern: turn the watcher's panik event into the side
+    /// effects the emergency-stop contract requires. Behaviour branches
+    /// on the watcher-documented source predicate
+    /// [`crate::panik_watcher::is_sigterm_signal`] applied to
+    /// `matched_path` — file-source vs SIGTERM-source carry different
+    /// cluster semantics:
+    ///
+    /// **File source** (`matched_path` is a real filesystem path,
+    /// matched by [`crate::panik_watcher::PanikWatcherConfig::paths`]):
+    /// operator-initiated cluster-wide stop. All three steps fire:
     ///   1. Originate `ClusterMutation::PanikRequested` carrying the
     ///      matched-path-derived reason — applied locally (so this
     ///      node's own `cluster_state.panik_active` flips immediately)
@@ -133,49 +140,82 @@ where
     ///      cluster-wide stop here.
     ///   2. Take down every worker pgid this secondary owns via
     ///      [`dynrunner_manager_local::pool::WorkerPool::kill_all_workers_with_grace`].
-    ///      The kill primitive uses negative-pgid `kill(-pgid, ...)`
-    ///      so worker descendants (subprocess pools, container exec
-    ///      children, etc.) are taken down too. The 5-second grace
-    ///      is the same window the SubprocessWorkerFactory uses for
-    ///      `terminate_children` — workers that installed a SIGTERM
-    ///      handler get a chance to exit cleanly before the
-    ///      escalation.
-    ///   3. Surface the matched path + reason to the caller so it
-    ///      can return [`crate::secondary::RunOutcome::PanikShutdown`]
-    ///      and the PyO3 wrapper can call `std::process::exit(137)`.
+    ///   3. Surface the matched path + reason to the caller for
+    ///      [`crate::secondary::RunOutcome::PanikShutdown`].
     ///
-    /// Side effects are best-effort: broadcast errors are logged but
-    /// never propagated (the panik-react path must always finish even
-    /// if the peer mesh is degraded — the local kill + exit are the
-    /// load-bearing terminal steps). Kill timing is bounded by the
-    /// supplied `grace`.
+    /// **SIGTERM source** (`matched_path` is the documented sentinel
+    /// [`crate::panik_watcher::SIGTERM_SENTINEL_PATH`], fired by the
+    /// watcher's SIGTERM arm when
+    /// [`crate::panik_watcher::PanikWatcherConfig::listen_for_sigterm`]
+    /// is enabled): per-host SIGTERM (e.g. SLURM time-limit /
+    /// `scancel` forwarded as `podman exec <c> kill -TERM <pid>`).
+    /// This host's SIGTERM does NOT carry cluster-wide operator
+    /// intent — a delayed/missed-SIGTERM peer should remain free to
+    /// re-elect and continue the run. The cluster broadcast is
+    /// SKIPPED; only steps 2 and 3 fire (local-only teardown). The
+    /// CRDT's sticky-monotonic `PanikRequested` apply rule would
+    /// otherwise force every peer to exit — that is the cascade-
+    /// shutdown bug this branching prevents.
+    ///
+    /// Kill primitive uses negative-pgid `kill(-pgid, ...)` so worker
+    /// descendants (subprocess pools, container exec children, etc.)
+    /// are taken down too. The supplied `kill_grace` is the same
+    /// window the SubprocessWorkerFactory uses for
+    /// `terminate_children` — workers that installed a SIGTERM
+    /// handler get a chance to exit cleanly before the escalation.
+    ///
+    /// Side effects are best-effort: broadcast errors (file-source
+    /// only) are logged but never propagated (the panik-react path
+    /// must always finish even if the peer mesh is degraded — the
+    /// local kill + exit are the load-bearing terminal steps). Kill
+    /// timing is bounded by the supplied `grace`.
     pub(in crate::secondary) async fn handle_panik_signal(
         &mut self,
         matched_path: std::path::PathBuf,
         kill_grace: std::time::Duration,
     ) -> (std::path::PathBuf, String) {
-        let reason = format!("panik file: {}", matched_path.display());
-        tracing::warn!(
-            secondary = %self.config.secondary_id,
-            matched_path = %matched_path.display(),
-            "panik signal observed; broadcasting PanikRequested and \
-             tearing down workers"
-        );
-        let source_peer = self.config.secondary_id.clone();
-        let mutation = ClusterMutation::PanikRequested {
-            source_peer,
-            reason: reason.clone(),
+        // Source dispatch on the watcher's documented predicate.
+        // File-source matched_path's reason is preserved verbatim for
+        // downstream log-parser compatibility ("panik file: <path>");
+        // SIGTERM-source uses a distinct reason that does not conflate
+        // "file" with the source type.
+        let is_sigterm = crate::panik_watcher::is_sigterm_signal(&matched_path);
+        let reason = if is_sigterm {
+            "panik SIGTERM (per-host)".to_string()
+        } else {
+            format!("panik file: {}", matched_path.display())
         };
-        if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
+        if is_sigterm {
             tracing::warn!(
-                error = %e,
-                "panik PanikRequested apply+broadcast failed; \
-                 proceeding with local worker teardown anyway"
+                secondary = %self.config.secondary_id,
+                matched_path = %matched_path.display(),
+                "SIGTERM panik signal observed; local-only worker teardown \
+                 (no cluster broadcast — mesh remains free to re-elect)"
             );
+        } else {
+            tracing::warn!(
+                secondary = %self.config.secondary_id,
+                matched_path = %matched_path.display(),
+                "panik file observed; broadcasting PanikRequested and \
+                 tearing down workers"
+            );
+            let source_peer = self.config.secondary_id.clone();
+            let mutation = ClusterMutation::PanikRequested {
+                source_peer,
+                reason: reason.clone(),
+            };
+            if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
+                tracing::warn!(
+                    error = %e,
+                    "panik PanikRequested apply+broadcast failed; \
+                     proceeding with local worker teardown anyway"
+                );
+            }
         }
         // Tear down every worker pgid with the SIGTERM → grace →
         // SIGKILL ladder. Owned by the pool concern; coordinator
-        // just calls.
+        // just calls. Runs on both source paths — local teardown is
+        // unconditional.
         self.pool.kill_all_workers_with_grace(kill_grace).await;
         (matched_path, reason)
     }
