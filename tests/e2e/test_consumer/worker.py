@@ -100,6 +100,16 @@ def _maybe_sleep() -> None:
         time.sleep(secs)
 
 
+def _expected_nonce(idx: int) -> str:
+    """Deterministic per-produce-task nonce string.
+
+    Both ``_produce`` (when it commits the value) and ``_consume`` (when
+    it asserts the value) derive the expected string from this single
+    helper so a future rename touches exactly one place.
+    """
+    return f"nonce-{idx}"
+
+
 def _produce(task: Task, source_dir: Path) -> WorkerOutput:
     """Read the input, write an output, publish it."""
     payload = task.payload or {}
@@ -129,6 +139,13 @@ def _produce(task: Task, source_dir: Path) -> WorkerOutput:
         "produce-%d: wrote %d bytes to %s, publishing", idx, out_path.stat().st_size, out_path
     )
     _publish(out_path)
+    # Keyed-outputs exercise: emit a deterministic inline nonce so the
+    # downstream consume task can assert the value-and-kind through the
+    # framework's predecessor_outputs plumbing. Gated on the payload
+    # flag (set by SyntheticTask.discover_items when --keyed-outputs)
+    # so existing scenarios that use this consumer stay unchanged.
+    if payload.get("keyed_outputs"):
+        task.publish_string("nonce", _expected_nonce(idx))
     return WorkerOutput()
 
 
@@ -155,6 +172,15 @@ def _consume(task: Task, source_dir: Path) -> WorkerOutput:
         )
     producer_bytes = expected.read_bytes()
 
+    # Keyed-outputs exercise: when the run was dispatched with the
+    # keyed-outputs flag, the predecessor produce task committed an
+    # inline "nonce" output. Verify the value AND the kind round-trip
+    # cleanly. A mismatch indicates a regression somewhere on the
+    # publish_string → result_data → cluster cache → dispatch →
+    # predecessor_outputs_json → Task.predecessor_outputs chain.
+    if payload.get("keyed_outputs"):
+        _assert_predecessor_nonce(task, idx)
+
     staging = _staging_root()
     staging.mkdir(parents=True, exist_ok=True)
     out_name = f"consume-{idx}.out"
@@ -168,6 +194,43 @@ def _consume(task: Task, source_dir: Path) -> WorkerOutput:
     )
     _publish(out_path)
     return WorkerOutput()
+
+
+def _assert_predecessor_nonce(task: Task, idx: int) -> None:
+    """Verify ``task.predecessor_outputs`` carries produce-{idx}'s nonce.
+
+    Single concern: the keyed-outputs read path. Fails loud with a
+    detailed diagnostic so the operator can tell whether the predecessor
+    key was missing, the inner key was missing, the kind was wrong, or
+    the value drifted. Any of those discriminates a different layer of
+    the publish_string → predecessor_outputs round-trip.
+    """
+    producer_id = f"produce-{idx}"
+    producer_outputs = task.predecessor_outputs.get(producer_id)
+    if producer_outputs is None:
+        raise NonRecoverableError(
+            f"consume-{idx}: predecessor_outputs missing "
+            f"{producer_id!r} key; available keys: "
+            f"{sorted(task.predecessor_outputs)}"
+        )
+    nonce_entry = producer_outputs.get("nonce")
+    if nonce_entry is None:
+        raise NonRecoverableError(
+            f"consume-{idx}: predecessor_outputs[{producer_id!r}] "
+            f"missing 'nonce' key; available keys: "
+            f"{sorted(producer_outputs)}"
+        )
+    actual_value = nonce_entry.get("value")
+    actual_kind = nonce_entry.get("kind")
+    expected_value = _expected_nonce(idx)
+    expected_kind = "inline"
+    if actual_value != expected_value or actual_kind != expected_kind:
+        raise NonRecoverableError(
+            f"consume-{idx}: predecessor_outputs[{producer_id!r}]['nonce'] "
+            f"mismatch — expected (kind={expected_kind!r}, "
+            f"value={expected_value!r}), got (kind={actual_kind!r}, "
+            f"value={actual_value!r})"
+        )
 
 
 @task_function
@@ -219,6 +282,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--num-tasks", type=int, default=2)
+    # Accept-and-ignore: SyntheticTask.build_worker_command_args may
+    # forward --keyed-outputs so the worker process's argparser
+    # tolerates it. The actual per-task branch reads
+    # ``task.payload['keyed_outputs']`` set on the dispatcher side.
+    parser.add_argument("--keyed-outputs", action="store_true")
     return parser
 
 
