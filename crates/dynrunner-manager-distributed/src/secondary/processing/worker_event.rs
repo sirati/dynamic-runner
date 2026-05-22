@@ -105,6 +105,34 @@ where
                     }
 
                     if result.success {
+                        // Promoted-secondary apply→dispatch race
+                        // (keyed-outputs): when this node is the
+                        // primary, `note_primary_item_completed`
+                        // releases dependents in `primary_pending`
+                        // and the same-frame
+                        // `request_task_for_worker` below routes
+                        // straight into `handle_primary_task_request`,
+                        // which reads `predecessor_outputs` from
+                        // `self.cluster_state`. The canonical
+                        // `ClusterMutation::TaskCompleted`
+                        // originator on the live-primary path is
+                        // the demoted-local primary's
+                        // `handle_task_complete`, reached via the
+                        // `send_to_current_primary` loopback below —
+                        // that runs strictly later (its inbound is
+                        // an mpsc enqueue, processed in another
+                        // await frame). Without this synchronous
+                        // local apply the dispatch sees empty
+                        // `task_outputs` for the just-completed
+                        // prerequisite and ships the dependent with
+                        // `predecessor_outputs: {}`. Idempotent /
+                        // no-broadcast — see
+                        // [`Self::apply_task_completed_locally_if_primary`]
+                        // for the invariants this preserves.
+                        self.apply_task_completed_locally_if_primary(
+                            hash.clone(),
+                            result_data.clone(),
+                        );
                         // Drive the primary's phase machine if
                         // this node is acting as one and dispatched
                         // the task — a no-op otherwise. Mid-run

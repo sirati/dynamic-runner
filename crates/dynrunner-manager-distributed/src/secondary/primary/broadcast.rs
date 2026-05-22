@@ -119,6 +119,64 @@ where
         Ok(())
     }
 
+    /// Apply a `ClusterMutation::TaskCompleted` LOCALLY on this
+    /// secondary's `cluster_state` without broadcasting.
+    ///
+    /// Single concern: synchronise the local CRDT mirror for a
+    /// completion this node is about to act on in the SAME await frame
+    /// (the `note_primary_item_completed` → `on_item_finished` cascade
+    /// releases a dependent in `primary_pending`, and the immediate
+    /// follow-up `request_task_for_worker(...).await` on a still-idle
+    /// worker dispatches into `handle_primary_task_request`, which
+    /// reads `predecessor_outputs` from `self.cluster_state` via
+    /// [`crate::primary::task::predecessor_outputs::gather_predecessor_outputs`]).
+    ///
+    /// Without this synchronisation, the dispatch reads an empty
+    /// `task_outputs` for the just-completed prerequisite: the
+    /// canonical `ClusterMutation::TaskCompleted` originator on this
+    /// completion path is the demoted-local primary, which only
+    /// applies + broadcasts after the loopback
+    /// `DistributedMessage::TaskComplete` arrives over its
+    /// `primary_transport` channel and is dequeued by its own
+    /// operational loop — strictly later than the same-frame self-
+    /// assign on this node.
+    ///
+    /// Broadcast is intentionally NOT performed here: the
+    /// demoted-local primary remains the single broadcast originator
+    /// for completion mutations on the live-primary path, and the
+    /// wire-side fan-out continues to flow through its
+    /// `apply_and_broadcast_cluster_mutations`. The CRDT's idempotent
+    /// `TaskCompleted` arm makes the demoted primary's later apply +
+    /// broadcast → receive-side apply on this node a NoOp; the
+    /// invariant "one originator per mutation" is preserved.
+    ///
+    /// Gated on `is_primary`: off the primary path this node forwards
+    /// the completion via `send_to_current_primary` and does NOT
+    /// dispatch in the same await frame, so the same-frame race does
+    /// not exist and the local apply is unnecessary (and would
+    /// duplicate the receive-side apply that the inbound broadcast
+    /// triggers).
+    ///
+    /// Called from the two completion-receive sites that may dispatch
+    /// in the same await frame on the promoted-secondary side:
+    ///   - own-worker completion in
+    ///     `secondary/processing/worker_event.rs`'s `TaskCompleted` arm
+    ///   - peer-observed completion in
+    ///     `secondary/peer/message_handler.rs`'s `TaskComplete` arm
+    pub(in crate::secondary) fn apply_task_completed_locally_if_primary(
+        &mut self,
+        task_hash: String,
+        result_data: Option<Vec<u8>>,
+    ) {
+        if !self.is_primary {
+            return;
+        }
+        self.cluster_state.apply(ClusterMutation::TaskCompleted {
+            hash: task_hash,
+            result_data,
+        });
+    }
+
     /// React to a panik-watcher signal on this secondary.
     ///
     /// Single concern: turn the watcher's panik event into the side
