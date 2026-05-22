@@ -533,5 +533,148 @@ class KeyedOutputsTests(unittest.TestCase):
         self.assertEqual(t.predecessor_outputs, {})
 
 
+class KeyedOutputsEndToEndTests(unittest.TestCase):
+    """End-to-end coverage of the keyed-outputs path through
+    `_process_one` / `run()`. The Task-level unit tests above pin
+    each surface (accumulator, encoder, decode) in isolation; these
+    tests pin the *integration*: a real `ProcessBinaryCommand`
+    dispatched into the runtime loop, a real handler that publishes
+    or reads predecessor outputs, and a real `DoneResponse` observed
+    on the wire (the `ScriptedComm` outbox).
+
+    The plan's "Verification → Worker (Python)" subsection lists the
+    full-completion DoneResponse byte-shape AND a handler that reads
+    `task.predecessor_outputs[A][k]["value"]`. Those are integration
+    contracts: they fail if the seam between `_encode_done_payload`,
+    `task._outputs_accumulator`, `task.predecessor_outputs`, and the
+    `ProcessBinaryCommand.predecessor_outputs_json` bridge ever
+    breaks even when the individual unit tests still pass.
+    """
+
+    def _drive_with_predecessor_outputs(
+        self, handler, predecessor_outputs_json: str = "{}"
+    ):
+        """Helper: drive `run()` with a single ProcessBinaryCommand
+        carrying the given `predecessor_outputs_json`. Returns the
+        comm fixture so the caller can inspect the outbox.
+
+        The default `"{}"` mirrors `PyProcessBinaryCommand`'s own
+        default — a task with no deps sees an empty dict on the
+        Python side. Tests that exercise the consumer side pass a
+        non-empty JSON object literal.
+        """
+        cmd = ProcessBinaryCommand(
+            relative_path="/some/binary",
+            payload=None,
+            resolved_path=None,
+            predecessor_outputs_json=predecessor_outputs_json,
+        )
+        return _drive(handler, [cmd, StopCommand()])
+
+    def test_publish_string_flows_into_done_response_bytes(self):
+        # Plan §"Verification → Worker (Python)" item 1, second half:
+        # a handler that calls `task.publish_string(k, v)` must cause
+        # the runtime to emit a `DoneResponse` whose `result_data`
+        # decodes to `{"outputs": {k: {"kind":"inline","value":v}}}`.
+        # The unit test pinned the encoder in isolation; this pins
+        # the lifetime seam — `_process_one` reads the accumulator
+        # off `task` *after* the handler returned, which only works
+        # because Phase 6b hoisted `task` past the try-block.
+        def handle(task: Task):
+            task.publish_string("nonce", "xyz")
+            return None
+
+        comm = self._drive_with_predecessor_outputs(handle)
+
+        done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(done), 1)
+        self.assertIsNotNone(done[0].result_data)
+        decoded = json.loads(done[0].result_data.decode("utf-8"))
+        self.assertEqual(
+            decoded,
+            {"outputs": {"nonce": {"kind": "inline", "value": "xyz"}}},
+        )
+
+    def test_worker_output_and_publish_string_merge_in_done_response(self):
+        # Plan §"Verification → Worker (Python)" item 4: a handler
+        # that BOTH returns `WorkerOutput(warnings=2)` AND calls
+        # `publish_string("k","v")` must emit
+        # `{"warnings":2, "outputs":{"k":{"kind":"inline","value":"v"}}}`
+        # on the wire. Unit-level merge is covered by
+        # `test_encode_done_payload_merges_counters_and_outputs`;
+        # this guards the integration with the loop's
+        # `output = result if result is not None else _DEFAULT_OUTPUT`
+        # plumbing.
+        def handle(task: Task):
+            task.publish_string("k", "v")
+            return WorkerOutput(warnings=2)
+
+        comm = self._drive_with_predecessor_outputs(handle)
+
+        done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(done), 1)
+        self.assertIsNotNone(done[0].result_data)
+        decoded = json.loads(done[0].result_data.decode("utf-8"))
+        self.assertEqual(
+            decoded,
+            {
+                "warnings": 2,
+                "outputs": {"k": {"kind": "inline", "value": "v"}},
+            },
+        )
+
+    def test_predecessor_outputs_json_decodes_into_task(self):
+        # Plan §"Verification → Worker (Python)" item 5, consumer
+        # half: a handler reads
+        # `task.predecessor_outputs["A"]["nonce"]["value"]` and gets
+        # the value the dispatcher attached. The producer-side
+        # contract is verified end-to-end above; here we pin the
+        # JSON-string bridge → `Task.predecessor_outputs` dict step,
+        # which lives at `runtime.py:_process_one` and is the seam
+        # the PyO3 `predecessor_outputs_json` field feeds.
+        captured: list[Task] = []
+
+        def handle(task: Task):
+            captured.append(task)
+            return None
+
+        outputs_json = json.dumps(
+            {"A": {"nonce": {"kind": "inline", "value": "xyz"}}}
+        )
+        comm = self._drive_with_predecessor_outputs(handle, outputs_json)
+
+        # The handler ran exactly once; its captured Task carries
+        # the parsed predecessor outputs verbatim with `kind`
+        # preserved so consumers can branch on inline vs file.
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0].predecessor_outputs["A"]["nonce"],
+            {"kind": "inline", "value": "xyz"},
+        )
+        # DoneResponse still fires cleanly (the consumer-side read
+        # path is non-destructive — verifying no exception leaked).
+        done = [r for r in comm.outbox if isinstance(r, DoneResponse)]
+        self.assertEqual(len(done), 1)
+
+    def test_default_predecessor_outputs_json_yields_empty_dict(self):
+        # Regression-guard: `PyProcessBinaryCommand`'s constructor
+        # defaults `predecessor_outputs_json` to `"{}"`. A handler
+        # that never opts into deps must see an empty dict, not
+        # crash on `None` or a missing attribute. The legacy test
+        # helper `_process()` constructs the command without
+        # passing `predecessor_outputs_json` explicitly, exercising
+        # the PyO3 default path.
+        captured: list[Task] = []
+
+        def handle(task: Task):
+            captured.append(task)
+            return None
+
+        _drive(handle, [_process(), StopCommand()])
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].predecessor_outputs, {})
+
+
 if __name__ == "__main__":
     unittest.main()
