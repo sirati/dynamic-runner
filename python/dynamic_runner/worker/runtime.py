@@ -140,13 +140,47 @@ class Task:
     the full contract and env-var configuration. These methods are
     process-state, not task-state — they work whether or not
     ``_emit`` is wired, so unit-test handlers can call them directly.
+
+    ``predecessor_outputs`` carries the keyed outputs of every direct
+    (and, when ``TaskDep.inherit_outputs`` is set, transitive)
+    predecessor in this task's dependency graph. Shape:
+    ``{predecessor_task_id -> {output_key -> {"kind": "inline"|"file",
+    "value": str}}}``. ``kind`` discriminates between an inline string
+    value and a post-publish destination path (a file on the shared
+    mount); ``value`` is the string in both cases, and the wire format
+    intentionally preserves ``kind`` so consumers can branch without
+    guessing whether a string happens to look like a path. The dict
+    is empty for tasks with no deps or whose predecessors produced no
+    outputs. The framework populates this at task construction from
+    the ``ProcessBinaryCommand.predecessor_outputs_json`` field set by
+    the dispatcher; direct construction in tests defaults to ``{}``.
+
+    ``publish_string(key, value)`` records an inline string output
+    under ``key``; ``publish(src, dst, key=k)`` records a file output
+    at the post-publish destination ``dst``. Both accumulate into
+    ``_outputs_accumulator``, which the runtime flushes into
+    ``DoneResponse.result_data`` on task return. Consumers reach the
+    accumulated values via the dependent task's
+    ``predecessor_outputs`` dict.
     """
 
     relative_path: str
     payload: Any = None
     payload_str: Optional[str] = None
     resolved_path: Optional[str] = None
+    predecessor_outputs: dict[str, dict[str, dict[str, str]]] = field(
+        default_factory=dict
+    )
     _emit: Optional[Callable[[Any], None]] = field(default=None, repr=False)
+    # {output_key -> {"kind": "inline"|"file", "value": str}}. Built up
+    # by publish_string and publish(key=...); flushed into
+    # DoneResponse.result_data on task return. Lives on the Task so
+    # the loop's post-handler code can read it; the underlying
+    # `publish.publish` call in `dynamic_runner.worker.publish` stays
+    # untouched (the accumulator side-effect lives at the Task wrapper).
+    _outputs_accumulator: dict[str, dict[str, str]] = field(
+        default_factory=dict, repr=False
+    )
 
     @property
     def open_path(self) -> str:
@@ -164,9 +198,26 @@ class Task:
         if self._emit is not None:
             self._emit(PhaseUpdateResponse(phase_name=phase_name))
 
-    def publish(self, src, dst=None) -> None:
+    def publish(self, src, dst=None, *, key: Optional[str] = None) -> None:
         from .publish import publish as _publish
         _publish(src, dst)
+        if key is not None:
+            # The accumulator captures the post-publish destination so a
+            # downstream consumer reading `predecessor_outputs[...][key]`
+            # sees the path on the shared mount, not the staging
+            # location. `_publish` does the actual file delivery; the
+            # Task wrapper owns the keyed-outputs side-effect so
+            # `dynamic_runner.worker.publish` stays single-concern.
+            self._outputs_accumulator[key] = {"kind": "file", "value": str(dst)}
+
+    def publish_string(self, key: str, value: str) -> None:
+        """Record an inline string output under ``key``.
+
+        See :class:`Task` docstring for the merged-with-WorkerOutput
+        wire shape. Consumers reach the value via the dependent task's
+        ``predecessor_outputs[my_task_id][key]["value"]``.
+        """
+        self._outputs_accumulator[key] = {"kind": "inline", "value": value}
 
     def publish_all(self, *srcs) -> None:
         from .publish import publish_all as _publish_all
@@ -194,20 +245,42 @@ class WorkerOutput:
 _DEFAULT_OUTPUT = WorkerOutput()
 
 
-def _encode_done_payload(output: WorkerOutput) -> Optional[bytes]:
-    """Convert a ``WorkerOutput`` into the opaque bytes the framework
-    threads through ``DoneResponse.result_data``. The framework's wire
-    contract is "anything richer than ``done`` vs ``error`` is
-    consumer-defined opaque bytes" — see ``DoneResponse`` and the
-    Rust ``codec.rs``. ``None`` here means "emit a bare ``done``";
-    a JSON object means "the consumer's primary may opt in to
-    decoding ``{warnings, filtered}``".
+def _encode_done_payload(
+    output: WorkerOutput,
+    outputs_accumulator: dict[str, dict[str, str]],
+) -> Optional[bytes]:
+    """Convert a ``WorkerOutput`` plus a keyed-outputs accumulator
+    into the opaque bytes the framework threads through
+    ``DoneResponse.result_data``. The framework's wire contract is
+    "anything richer than ``done`` vs ``error`` is consumer-defined
+    opaque bytes" — see ``DoneResponse`` and the Rust ``codec.rs``.
+    ``None`` here means "emit a bare ``done``"; a JSON object means
+    "the consumer's primary may opt in to decoding the keys".
+
+    Merge shape (post-keyed-outputs): emits a JSON object containing
+    only the keys whose values are present. ``warnings`` and
+    ``filtered`` are omitted when zero; ``outputs`` is omitted when
+    the accumulator is empty. When all three are absent the function
+    returns ``None`` so the wire bytes stay byte-identical to the
+    pre-feature path for tasks that don't use any of these surfaces.
+    The Rust-side decoder (``apply_tasks.rs``) reads ``outputs`` as
+    ``TaskOutputs::default()`` when the key is absent, so a payload
+    that only carries counters round-trips losslessly.
     """
-    if output.warnings == 0 and output.filtered == 0:
+    body: dict[str, Any] = {}
+    if output.warnings:
+        body["warnings"] = output.warnings
+    if output.filtered:
+        body["filtered"] = output.filtered
+    if outputs_accumulator:
+        body["outputs"] = outputs_accumulator
+    if not body:
+        # Preserves the byte-identical legacy wire shape: a task that
+        # uses none of the WorkerOutput counters and never calls
+        # publish_string / publish(key=...) emits the same bare-`done`
+        # bytes it did pre-feature.
         return None
-    return json.dumps(
-        {"warnings": output.warnings, "filtered": output.filtered}
-    ).encode("utf-8")
+    return json.dumps(body).encode("utf-8")
 
 
 _HandlerFn = Callable[[Task], Optional[WorkerOutput]]
@@ -422,6 +495,12 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
         payload=_parse_payload(command.payload),
         payload_str=command.payload,
         resolved_path=command.resolved_path,
+        # The PyO3 bridge guarantees `predecessor_outputs_json` is a
+        # JSON object literal even when the dispatcher attached no
+        # outputs (`"{}"` default in `PyProcessBinaryCommand::__new__`),
+        # so `json.loads` always yields a dict — see the bridge's own
+        # contract docstring at `commands.rs`.
+        predecessor_outputs=json.loads(command.predecessor_outputs_json),
         _emit=lambda response, _ctx=ctx: _try_send(_ctx, response),
     )
 
@@ -484,7 +563,14 @@ def _process_one(ctx: _RunCtx, command: Any) -> bool:
         return not ctx.last_send_failed
     else:
         output = result if result is not None else _DEFAULT_OUTPUT
-        _try_send(ctx, DoneResponse(result_data=_encode_done_payload(output)))
+        _try_send(
+            ctx,
+            DoneResponse(
+                result_data=_encode_done_payload(
+                    output, task._outputs_accumulator
+                ),
+            ),
+        )
         return not ctx.last_send_failed
     finally:
         ctx.task_in_flight = False

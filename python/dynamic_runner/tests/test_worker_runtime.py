@@ -17,6 +17,7 @@ import subprocess
 import unittest
 from dataclasses import dataclass, field
 from typing import Optional
+from unittest.mock import patch
 
 from dynamic_runner.comm import (
     Command,
@@ -40,7 +41,7 @@ from dynamic_runner.worker import (
     run,
     task_function,
 )
-from dynamic_runner.worker.runtime import _REGISTRY
+from dynamic_runner.worker.runtime import _REGISTRY, _encode_done_payload
 
 
 @dataclass
@@ -387,6 +388,116 @@ class WorkerRuntimeTests(unittest.TestCase):
         t = Task(relative_path="/x")
         t.keepalive()
         t.set_phase("phase-a")
+
+
+class KeyedOutputsTests(unittest.TestCase):
+    """Phase 6b: keyed task outputs API on the worker `Task`.
+
+    Covers the producer side (publish_string / publish(key=)),
+    the encode-merge with WorkerOutput counters, and the
+    predecessor_outputs read seam constructed from the
+    `predecessor_outputs_json` PyO3 bridge field.
+    """
+
+    def test_publish_string_accumulates_inline_output(self):
+        # `publish_string` records `{kind: inline, value: ...}` under
+        # the requested key. The runtime flushes the accumulator into
+        # DoneResponse.result_data on task return; here we inspect the
+        # in-memory accumulator directly so the test stays free of
+        # encode-path concerns (covered separately below).
+        t = Task(relative_path="/x")
+        t.publish_string("nonce", "xyz")
+        self.assertEqual(
+            t._outputs_accumulator,
+            {"nonce": {"kind": "inline", "value": "xyz"}},
+        )
+
+    def test_publish_with_key_accumulates_file_output(self):
+        # `publish(src, dst, key=k)` records the *post-publish*
+        # destination under `k` so the downstream consumer reads the
+        # path on the shared mount. The underlying file delivery is
+        # owned by `dynamic_runner.worker.publish.publish`; mock it
+        # out so the unit test doesn't depend on disk state.
+        with patch("dynamic_runner.worker.publish.publish") as mock_pub:
+            t = Task(relative_path="/x")
+            t.publish("/staging/x.csv", "/network/out/x.csv", key="result")
+            mock_pub.assert_called_once_with("/staging/x.csv", "/network/out/x.csv")
+        self.assertEqual(
+            t._outputs_accumulator,
+            {"result": {"kind": "file", "value": "/network/out/x.csv"}},
+        )
+
+    def test_publish_without_key_leaves_accumulator_empty(self):
+        # The keyed-outputs side-effect is opt-in: a caller that
+        # publishes without `key=` gets the legacy file-delivery
+        # behaviour and nothing else. This guards against accidentally
+        # treating every published file as a keyed output.
+        with patch("dynamic_runner.worker.publish.publish") as mock_pub:
+            t = Task(relative_path="/x")
+            t.publish("/staging/x.csv", "/network/out/x.csv")
+            mock_pub.assert_called_once()
+        self.assertEqual(t._outputs_accumulator, {})
+
+    def test_encode_done_payload_empty_returns_none(self):
+        # Byte-identical legacy wire shape: a task that uses neither
+        # WorkerOutput counters nor the keyed-outputs accumulator
+        # emits a bare `done` (None payload). This is the contract
+        # the framework relies on to keep pre-feature tasks
+        # wire-compatible.
+        self.assertIsNone(
+            _encode_done_payload(WorkerOutput(warnings=0, filtered=0), {})
+        )
+
+    def test_encode_done_payload_merges_counters_and_outputs(self):
+        # The merge shape: warnings present, filtered absent (zero),
+        # outputs present. The encoded JSON carries only the present
+        # keys so a consumer that decodes the old shape and ignores
+        # unknown keys (the existing `json.loads` + `.get` pattern)
+        # sees no regression.
+        accumulator = {"k": {"kind": "inline", "value": "v"}}
+        encoded = _encode_done_payload(
+            WorkerOutput(warnings=2, filtered=0), accumulator
+        )
+        self.assertIsNotNone(encoded)
+        decoded = json.loads(encoded.decode("utf-8"))
+        self.assertEqual(
+            decoded,
+            {
+                "warnings": 2,
+                "outputs": {"k": {"kind": "inline", "value": "v"}},
+            },
+        )
+
+    def test_encode_done_payload_outputs_only(self):
+        # WorkerOutput counters absent, accumulator populated → JSON
+        # carries only `outputs`. Guards the "omit empty counters"
+        # branch from regressing into emitting `warnings: 0`.
+        accumulator = {"k": {"kind": "file", "value": "/network/out/k.csv"}}
+        encoded = _encode_done_payload(WorkerOutput(), accumulator)
+        decoded = json.loads(encoded.decode("utf-8"))
+        self.assertEqual(decoded, {"outputs": accumulator})
+
+    def test_predecessor_outputs_populated_from_dataclass(self):
+        # Direct dataclass-construction path (no PyO3 round-trip): the
+        # `predecessor_outputs` field stores the shape the dispatcher
+        # emits verbatim, preserving `kind` so consumers can branch
+        # without guessing whether a string happens to look like a
+        # path. This is the contract the runtime's
+        # `json.loads(command.predecessor_outputs_json)` call relies
+        # on at `_process_one`.
+        outputs = json.loads('{"A":{"nonce":{"kind":"inline","value":"xyz"}}}')
+        t = Task(relative_path="/x", predecessor_outputs=outputs)
+        self.assertEqual(
+            t.predecessor_outputs["A"]["nonce"],
+            {"kind": "inline", "value": "xyz"},
+        )
+
+    def test_predecessor_outputs_defaults_empty_for_no_deps(self):
+        # Tasks with no predecessors see an empty dict, NOT None.
+        # The dict shape is uniform so handlers can iterate without
+        # special-casing the no-dep case.
+        t = Task(relative_path="/x")
+        self.assertEqual(t.predecessor_outputs, {})
 
 
 if __name__ == "__main__":
