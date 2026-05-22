@@ -115,6 +115,12 @@ class SyntheticTask:
         scale the workload without touching this file.
         """
         n = getattr(args, "num_tasks", _NUM_TASKS_PER_PHASE)
+        # Optional payload flag opting tasks into the keyed-outputs API
+        # exercise (Task.publish_string on produce, Task.predecessor_outputs
+        # read on consume). The flag rides on every task's payload so
+        # the worker can branch on it per-task without re-parsing CLI;
+        # discovery is the single place that knows the run-wide opt-in.
+        keyed_outputs = bool(getattr(args, "keyed_outputs", False))
         items: list[TaskInfo] = []
 
         for idx in range(n):
@@ -132,7 +138,11 @@ class SyntheticTask:
                     type_id=_TYPE_PRODUCE,
                     task_id=_produce_task_id(idx),
                     task_depends_on=prev,
-                    payload={"kind": _PHASE_PRODUCE, "idx": idx},
+                    payload={
+                        "kind": _PHASE_PRODUCE,
+                        "idx": idx,
+                        "keyed_outputs": keyed_outputs,
+                    },
                 )
             )
 
@@ -153,6 +163,7 @@ class SyntheticTask:
                         "kind": _PHASE_CONSUME,
                         "idx": idx,
                         "expects_output": _produce_output_filename(idx),
+                        "keyed_outputs": keyed_outputs,
                     },
                 )
             )
@@ -184,6 +195,21 @@ class SyntheticTask:
                 "The driver also creates exactly this many input files."
             ),
         )
+        # Opt-in flag for the keyed-outputs API exercise. When set,
+        # discovered tasks carry ``payload["keyed_outputs"] = True``
+        # and the worker calls ``task.publish_string`` on produce
+        # and reads ``task.predecessor_outputs`` on consume. Default
+        # off so existing scenarios using this consumer are unaffected.
+        parser.add_argument(
+            "--keyed-outputs",
+            action="store_true",
+            help=(
+                "Exercise the keyed-outputs API: produce tasks call "
+                "Task.publish_string('nonce', ...) and consume tasks "
+                "assert Task.predecessor_outputs carries the value. "
+                "Failure mode: worker raises NonRecoverableError."
+            ),
+        )
 
     def build_worker_command_args(
         self,
@@ -196,8 +222,14 @@ class SyntheticTask:
         # The worker reads --source / --output / --skip_existing already
         # (framework-injected). Forward --num-tasks just so workers can
         # emit a startup line that mentions the configured size if they
-        # ever need to debug a mismatch.
-        return ["--num-tasks", str(args.num_tasks)]
+        # ever need to debug a mismatch. Forward --keyed-outputs so
+        # the worker-side argparser accepts the flag even though the
+        # discovery side already injected it into payloads (the worker
+        # branches on payload, not argv — see worker.handle).
+        argv = ["--num-tasks", str(args.num_tasks)]
+        if getattr(args, "keyed_outputs", False):
+            argv.append("--keyed-outputs")
+        return argv
 
     def get_output_filename_pattern(
         self, type_id: TypeId, item: TaskInfo

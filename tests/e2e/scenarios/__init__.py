@@ -29,6 +29,7 @@ _SCENARIO_NAMES: tuple[str, ...] = (
     "phase-deps",
     "task-deps-intra",
     "task-deps-cross",
+    "keyed-outputs",
     "publish-atomic",
     "already-done",
     "parallel-4-workers",
