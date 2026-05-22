@@ -23,6 +23,7 @@ mod oom_bucket;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
+mod result_data_plumbing;
 mod retry;
 mod setup_promote;
 mod stranded;
