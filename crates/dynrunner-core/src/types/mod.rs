@@ -7,17 +7,22 @@
 //! - [`task`]: [`TaskInfo`] (the scheduling unit), the [`TaskInput`] alias,
 //!   and the [`TaskDep`] dep-graph edge primitive.
 //! - [`outputs`]: [`TaskOutputs`], [`ResultValue`], and the soft-cap helper.
+//! - [`done_payload`]: [`DonePayload`] — the Python worker's wire
+//!   wrapper around `TaskOutputs` plus the `warnings`/`filtered`
+//!   counters; consumed by both manager crates' decoder paths.
 //! - [`error`]: [`ErrorType`], [`TaskResult`], [`FailedTask`].
 //!
 //! Tests live in `types_tests.rs` (sibling of this `types/` directory) and
 //! exercise the public API of all sub-modules through the re-exports below.
 
+pub mod done_payload;
 pub mod error;
 pub mod identifiers;
 pub mod outputs;
 pub mod resource;
 pub mod task;
 
+pub use done_payload::DonePayload;
 pub use error::{ErrorType, FailedTask, TaskResult};
 pub use identifiers::{AffinityId, Identifier, PhaseId, ResourceKind, RunnerIdentifier, TypeId};
 pub use outputs::{ResultValue, TaskOutputs, check_soft_caps};

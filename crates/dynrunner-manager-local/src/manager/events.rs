@@ -63,21 +63,27 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     // happen first to avoid a dispatch-before-cache
                     // race. Decode contract mirrors the distributed
                     // `cluster_state/apply_tasks.rs` `TaskCompleted`
-                    // arm: a present-but-undecodable payload still
-                    // inserts an empty entry so dependents can rely
-                    // on key presence.
+                    // arm: deserialise the Python worker's
+                    // `DonePayload` wrapper and extract the inner
+                    // `outputs` (the wrapper's `warnings`/`filtered`
+                    // counters are not consumed in the local manager
+                    // path either — serde drops them silently). A
+                    // present-but-undecodable payload still inserts
+                    // an empty entry so dependents can rely on key
+                    // presence.
                     if let Some(bytes) = &result_data
                         && let Some(task_id) = b.task_id.as_ref()
                     {
-                        match serde_json::from_slice::<dynrunner_core::TaskOutputs>(bytes) {
-                            Ok(outputs) => {
-                                self.task_outputs_cache.insert(task_id.clone(), outputs);
+                        match serde_json::from_slice::<dynrunner_core::DonePayload>(bytes) {
+                            Ok(body) => {
+                                self.task_outputs_cache
+                                    .insert(task_id.clone(), body.outputs);
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
                                     task_id = %task_id,
-                                    "TaskCompleted result_data failed to decode in local manager; \
+                                    "TaskCompleted result_data failed to decode as DonePayload in local manager; \
                                      storing empty entry",
                                 );
                                 self.task_outputs_cache
