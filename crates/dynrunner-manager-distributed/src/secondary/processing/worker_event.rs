@@ -53,6 +53,7 @@ where
             WorkerEvent::TaskCompleted {
                 worker_id,
                 result,
+                result_data,
                 binary,
                 ..
             } => {
@@ -118,7 +119,7 @@ where
                             secondary_id: self.config.secondary_id.clone(),
                             worker_id,
                             task_hash: hash.clone(),
-                            result_data: None,
+                            result_data,
                         };
                         self.send_to_current_primary(msg.clone()).await?;
                         let _ = self.peer_transport.broadcast(msg).await;
