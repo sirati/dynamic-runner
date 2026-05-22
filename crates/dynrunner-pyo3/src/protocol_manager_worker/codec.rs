@@ -210,3 +210,208 @@ pub(crate) fn py_parse_response(py: Python<'_>, line: &str) -> PyResult<Option<P
         Some(resp) => response_into_py(py, resp).map(Some),
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod tests {
+    //! Contract tests for the `predecessor_outputs` PyO3 bridge —
+    //! `Command::ProcessTask.predecessor_outputs` (`BTreeMap<String,
+    //! TaskOutputs>`) crosses the boundary as a JSON string field on
+    //! `PyProcessBinaryCommand`. The tests pin the empty-map shape
+    //! (`"{}"`), the populated-map shape (adjacent-tagging via the
+    //! `ResultValue` serde attribute), and the Python→Rust reverse
+    //! path through `serialize()`.
+    //!
+    //! Gated on the `test-with-python` feature because the
+    //! `command_into_py` and `PyProcessBinaryCommand::serialize`
+    //! surfaces both require an embedded CPython interpreter. Invoke
+    //! as: `cargo test -p dynrunner-pyo3 --lib --no-default-features
+    //!        --features test-with-python protocol_manager_worker`.
+    use super::*;
+    use dynrunner_core::{ResultValue, TaskOutputs};
+    use dynrunner_protocol_manager_worker::codec::parse_command as codec_parse_command;
+    use std::collections::BTreeMap;
+
+    /// Pull the `predecessor_outputs_json` attribute off the boxed
+    /// `Py<PyAny>` returned by `command_into_py`. Centralised here so
+    /// the per-test arrangement stays focused on the input shape.
+    fn extract_predecessor_outputs_json(py: Python<'_>, any: &Py<PyAny>) -> String {
+        any.bind(py)
+            .getattr("predecessor_outputs_json")
+            .expect("ProcessBinaryCommand exposes predecessor_outputs_json")
+            .extract::<String>()
+            .expect("predecessor_outputs_json is a str")
+    }
+
+    /// Empty `predecessor_outputs` must surface as `"{}"` so the
+    /// Python-side `json.loads(...)` yields an empty dict (not a
+    /// `JSONDecodeError` on an empty string).
+    #[test]
+    fn empty_predecessor_outputs_serialises_to_empty_json_object() {
+        Python::attach(|py| {
+            let cmd = RustCommand::ProcessTask {
+                relative_path: "bin/a".into(),
+                payload: None,
+                resolved_path: None,
+                predecessor_outputs: BTreeMap::new(),
+            };
+            let py_any = command_into_py(py, cmd).expect("command_into_py succeeds");
+            let json = extract_predecessor_outputs_json(py, &py_any);
+            assert_eq!(json, "{}");
+        });
+    }
+
+    /// Populated map must surface as a JSON object keyed by
+    /// `predecessor_task_id`, with the inner `ResultValue` rendered
+    /// via adjacent tagging (`{"kind","value"}`) — this shape is the
+    /// load-bearing contract the Python worker runtime parses.
+    #[test]
+    fn populated_predecessor_outputs_uses_adjacent_tagging() {
+        Python::attach(|py| {
+            let mut inner = BTreeMap::new();
+            inner.insert("nonce".to_string(), ResultValue::Inline("xyz".to_string()));
+            inner.insert(
+                "artifact".to_string(),
+                ResultValue::File("/shared/out.bin".to_string()),
+            );
+            let mut outer = BTreeMap::new();
+            outer.insert("task_a".to_string(), TaskOutputs(inner));
+            let cmd = RustCommand::ProcessTask {
+                relative_path: "bin/b".into(),
+                payload: None,
+                resolved_path: None,
+                predecessor_outputs: outer.clone(),
+            };
+            let py_any = command_into_py(py, cmd).expect("command_into_py succeeds");
+            let json = extract_predecessor_outputs_json(py, &py_any);
+
+            // Parse it back into a Value and assert per-key shape so
+            // the assertion doesn't depend on serde-json's whitespace.
+            let value: serde_json::Value =
+                serde_json::from_str(&json).expect("JSON parses");
+            let task_a = value.get("task_a").expect("task_a present");
+            let nonce = task_a.get("nonce").expect("nonce present");
+            assert_eq!(nonce.get("kind").and_then(|v| v.as_str()), Some("inline"));
+            assert_eq!(nonce.get("value").and_then(|v| v.as_str()), Some("xyz"));
+            let artifact = task_a.get("artifact").expect("artifact present");
+            assert_eq!(
+                artifact.get("kind").and_then(|v| v.as_str()),
+                Some("file"),
+            );
+            assert_eq!(
+                artifact.get("value").and_then(|v| v.as_str()),
+                Some("/shared/out.bin"),
+            );
+
+            // Strongly typed round-trip: the JSON parses back into the
+            // exact same `BTreeMap<String, TaskOutputs>` (modulo the
+            // BTreeMap's stable ordering).
+            let parsed: BTreeMap<String, TaskOutputs> =
+                serde_json::from_str(&json).expect("round-trip");
+            assert_eq!(parsed, outer);
+        });
+    }
+
+    /// Reverse path: a `PyProcessBinaryCommand` constructed Python-
+    /// side with a populated `predecessor_outputs_json` must encode
+    /// back through `serialize()` to a wire frame whose decoded
+    /// `Command::ProcessTask.predecessor_outputs` matches the source
+    /// map. This pins the symmetric Python→Rust JSON parse.
+    use super::super::commands::{PyCommand, PyProcessBinaryCommand};
+
+    #[test]
+    fn serialize_reverse_path_round_trips_predecessor_outputs() {
+        Python::attach(|py| {
+            let mut inner = BTreeMap::new();
+            inner.insert("nonce".to_string(), ResultValue::Inline("xyz".to_string()));
+            let mut outer = BTreeMap::new();
+            outer.insert("task_a".to_string(), TaskOutputs(inner));
+            let json = serde_json::to_string(&outer).expect("serialise outer");
+
+            let py_cmd = Py::new(
+                py,
+                (
+                    PyProcessBinaryCommand {
+                        relative_path: "bin/b".into(),
+                        payload: None,
+                        resolved_path: None,
+                        predecessor_outputs_json: json,
+                    },
+                    PyCommand,
+                ),
+            )
+            .expect("construct PyProcessBinaryCommand");
+
+            let bytes_any = py_cmd
+                .bind(py)
+                .call_method0("serialize")
+                .expect("serialize() returns bytes");
+            let bytes = bytes_any
+                .cast::<PyBytes>()
+                .expect("serialize() returns PyBytes")
+                .as_bytes()
+                .to_vec();
+            let line = std::str::from_utf8(&bytes)
+                .expect("wire frame is UTF-8")
+                .trim_end_matches('\n')
+                .to_string();
+            let decoded = codec_parse_command(&line).expect("codec parses wire frame");
+            match decoded {
+                RustCommand::ProcessTask {
+                    predecessor_outputs,
+                    ..
+                } => assert_eq!(predecessor_outputs, outer),
+                other => panic!("expected ProcessTask, got {other:?}"),
+            }
+        });
+    }
+
+    /// Reverse-path fault tolerance: a malformed
+    /// `predecessor_outputs_json` must NOT crash `serialize()`; the
+    /// bridge falls back to an empty map (and warns via `tracing`).
+    /// Verifies the `unwrap_or_else` arm in
+    /// `PyProcessBinaryCommand::serialize`.
+    #[test]
+    fn serialize_reverse_path_falls_back_to_empty_on_invalid_json() {
+        Python::attach(|py| {
+            let py_cmd = Py::new(
+                py,
+                (
+                    PyProcessBinaryCommand {
+                        relative_path: "bin/b".into(),
+                        payload: None,
+                        resolved_path: None,
+                        predecessor_outputs_json: "{not-json".into(),
+                    },
+                    PyCommand,
+                ),
+            )
+            .expect("construct PyProcessBinaryCommand");
+
+            let bytes_any = py_cmd
+                .bind(py)
+                .call_method0("serialize")
+                .expect("serialize() returns bytes");
+            let bytes = bytes_any
+                .cast::<PyBytes>()
+                .expect("serialize() returns PyBytes")
+                .as_bytes()
+                .to_vec();
+            let line = std::str::from_utf8(&bytes)
+                .expect("wire frame is UTF-8")
+                .trim_end_matches('\n')
+                .to_string();
+            let decoded = codec_parse_command(&line).expect("codec parses wire frame");
+            match decoded {
+                RustCommand::ProcessTask {
+                    predecessor_outputs,
+                    ..
+                } => assert!(
+                    predecessor_outputs.is_empty(),
+                    "malformed JSON should fall back to empty map",
+                ),
+                other => panic!("expected ProcessTask, got {other:?}"),
+            }
+        });
+    }
+}
