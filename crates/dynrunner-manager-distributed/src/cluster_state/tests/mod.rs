@@ -22,6 +22,7 @@ mod peer_lifecycle;
 mod peer_resources;
 mod role_table;
 mod snapshot;
+mod task_outputs;
 
 pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
     TaskInfo {
