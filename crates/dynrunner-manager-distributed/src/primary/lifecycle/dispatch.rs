@@ -9,6 +9,7 @@ use dynrunner_scheduler_api::{
 };
 
 use crate::primary::PrimaryCoordinator;
+use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
 use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
 use super::dispatch_order;
@@ -89,6 +90,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 self.workers[worker_idx].is_idle = false;
 
                 let task_hash = compute_task_hash(&binary);
+                // Resolve the per-edge predecessor-output map from the
+                // replicated `cluster_state.task_outputs` cache. The
+                // helper handles both the direct-dep present-but-empty
+                // contract and the `inherit_outputs` transitive walk;
+                // an empty map results when the task has no deps. The
+                // same helper is consumed by the sibling dispatch site
+                // in `primary/task/request.rs` so the wire shape is
+                // identical regardless of which path fires.
+                let predecessor_outputs =
+                    gather_predecessor_outputs(&self.cluster_state, &binary);
                 let assignment_msg = DistributedMessage::TaskAssignment {
                     sender_id: self.config.node_id.clone(),
                     timestamp: timestamp_now(),
@@ -98,10 +109,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     binary_info: binary_to_distributed(&binary),
                     local_path: self.config.wire_local_path(&binary),
                     file_hash: task_hash.clone(),
-                    // Phase 4 will populate from the cluster-state
-                    // task-outputs cache. Empty here keeps wire bytes
-                    // identical to pre-feature on no-dep tasks.
-                    predecessor_outputs: std::collections::BTreeMap::new(),
+                    predecessor_outputs,
                 };
 
                 // Transport-send failure rollback: pre-fix the
