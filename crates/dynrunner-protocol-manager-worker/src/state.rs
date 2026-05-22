@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, TaskResult};
+use dynrunner_core::{ErrorType, MessageReceiver, MessageSender, TaskOutputs, TaskResult};
 use crate::command::{Command, Response};
 
 /// Composite trait: a manager endpoint can send commands and receive responses.
@@ -88,22 +88,24 @@ impl<M: ManagerEndpoint> RunnerProtocol<Idle, M> {
     /// outside the worker's configured source dir. Pass `None` for
     /// the LocalManager and any distributed dispatch that didn't
     /// trigger cache resolution.
+    ///
+    /// `predecessor_outputs` is the dispatch-time-assembled map from
+    /// each declared `task_depends_on` predecessor's `task_id` to its
+    /// cached [`TaskOutputs`]. The codec collapses an empty map to
+    /// the bare-path wire form so legacy tasks remain byte-identical
+    /// on the wire.
     pub async fn assign_task(
         mut self,
         relative_path: String,
         payload: Option<String>,
         resolved_path: Option<String>,
+        predecessor_outputs: BTreeMap<String, TaskOutputs>,
     ) -> AssignResult<M> {
         let cmd = Command::ProcessTask {
             relative_path,
             payload,
             resolved_path,
-            // `predecessor_outputs` is threaded through a future
-            // signature extension on `assign_task` once the
-            // `manager-local` cache lands. Until then it's always
-            // empty and the codec collapses to the bare-path form
-            // for legacy tasks.
-            predecessor_outputs: BTreeMap::new(),
+            predecessor_outputs,
         };
         match self.transport.send(cmd).await {
             Ok(()) => AssignResult::Assigned(RunnerProtocol {

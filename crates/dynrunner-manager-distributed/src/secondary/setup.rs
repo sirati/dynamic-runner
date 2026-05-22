@@ -336,7 +336,18 @@ where
                     continue;
                 }
                 match self.pool.workers[wid as usize]
-                    .assign_task(binary, estimated, false)
+                    .assign_task(
+                        binary,
+                        estimated,
+                        false,
+                        // Initial assignments fire at run start before
+                        // any task has produced outputs. The wire
+                        // `InitialAssignment` message carries no
+                        // `predecessor_outputs` field (there are none
+                        // to gather), so an empty map is the correct
+                        // wire shape here.
+                        std::collections::BTreeMap::new(),
+                    )
                     .await
                 {
                     Ok(()) => {

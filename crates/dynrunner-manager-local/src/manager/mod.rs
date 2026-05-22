@@ -3,7 +3,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use dynrunner_core::{
-    FailedTask, Identifier, PhaseId, ResourceKind, ResourceMap, TaskInfo, TypeId, WorkerId,
+    FailedTask, Identifier, PhaseId, ResourceKind, ResourceMap, TaskInfo, TaskOutputs, TypeId,
+    WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
@@ -207,6 +208,25 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// Successful per-task opaque payloads, surfaced for the Python-side
     /// task-specific aggregator. Populated as TaskCompleted events arrive.
     task_payloads: Vec<(TaskInfo<I>, Option<Vec<u8>>)>,
+    /// Per-manager keyed-outputs cache for the local-mode dispatch path.
+    ///
+    /// Keyed by `task_id` (same shape as
+    /// `ClusterState.task_outputs` in distributed mode). Populated by
+    /// the [`super::manager::events`] `TaskCompleted` arm (decoding
+    /// `result_data` as `TaskOutputs` JSON) BEFORE
+    /// `handle_task_completed` releases dependents for dispatch.
+    /// Read by [`super::manager::worker_loop::try_assign_normal`] to
+    /// assemble each dispatched task's `predecessor_outputs` via the
+    /// shared [`dynrunner_core::gather_predecessor_outputs`] helper.
+    ///
+    /// When `manager-local` runs INSIDE a secondary in distributed
+    /// mode, the cache is populated by the same seam but is NOT
+    /// READ by the secondary's dispatch path — the secondary does
+    /// not run `try_assign_normal`; the primary writes
+    /// `predecessor_outputs` directly into `TaskAssignment` and the
+    /// secondary forwards it verbatim. The cache population in
+    /// distributed mode is cheap-but-unused; no conditional gate.
+    pub(crate) task_outputs_cache: HashMap<String, TaskOutputs>,
 }
 
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
@@ -230,6 +250,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             on_phase_end_cb: None,
             deferred_drain_notifications: Vec::new(),
             task_payloads: Vec::new(),
+            task_outputs_cache: HashMap::new(),
         }
     }
 

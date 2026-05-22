@@ -37,7 +37,7 @@ pub mod preferred_secondaries;
 pub mod respawn;
 pub(crate) mod retry_bucket;
 pub mod staging;
-mod task;
+pub(crate) mod task;
 pub mod wire;
 
 #[cfg(test)]

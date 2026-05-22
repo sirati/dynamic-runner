@@ -59,6 +59,7 @@ where
                 binary_info,
                 zip_file,
                 local_path,
+                predecessor_outputs,
                 ..
             } => {
                 // Resolve binary path via the three-mode helper
@@ -206,6 +207,7 @@ where
                                     file_hash,
                                     estimated,
                                     source: super::super::BindSource::PeerAssigned,
+                                    predecessor_outputs,
                                 },
                             );
                             return Ok(());
@@ -240,7 +242,10 @@ where
                         return Ok(());
                     }
                     let worker = &mut self.pool.workers[target_wid as usize];
-                    match worker.assign_task(binary, estimated, false).await {
+                    match worker
+                        .assign_task(binary, estimated, false, predecessor_outputs)
+                        .await
+                    {
                         Ok(()) => {
                             self.active_tasks.insert(file_hash, target_wid);
                             self.primary_link.reset_backoff(target_wid);

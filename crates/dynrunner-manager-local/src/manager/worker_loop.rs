@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{
-    ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
+    gather_predecessor_outputs, ErrorType, FailedTask, Identifier, ResourceKind, TaskInfo, WorkerId,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{
@@ -293,6 +293,26 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 let binary = self.pool_mut().take_from_view(view, binary_index);
                 let name = binary.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let estimated_mb = estimated_usage.get(&ResourceKind::memory()) / (1024 * 1024);
+                // Assemble the predecessor-outputs map BEFORE the
+                // worker-mutation borrow opens — the gather reads
+                // from `self.task_outputs_cache` (direct deps) and
+                // `self.task_payloads` (inherit_outputs ancestry
+                // walk via each predecessor's TaskInfo). Both
+                // closures are shared-borrow over `self`, so the
+                // gather must complete before `&mut self.pool` for
+                // the `ensure_worker_for_type` / `assign_task`
+                // path. Identical wire shape to the distributed
+                // primary's call into the same core helper.
+                let predecessor_outputs = gather_predecessor_outputs(
+                    &binary.task_depends_on,
+                    |task_id| self.task_outputs_cache.get(task_id).cloned(),
+                    |task_id| {
+                        self.task_payloads
+                            .iter()
+                            .find(|(t, _)| t.task_id.as_deref() == Some(task_id))
+                            .map(|(t, _)| t.task_depends_on.clone())
+                    },
+                );
                 // Per-type subprocess dispatch: if the worker's loaded
                 // type does not match this task's `type_id`, the pool
                 // kills + respawns the subprocess through
@@ -311,7 +331,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 }
                 let worker = &mut self.pool.workers[worker_id as usize];
                 match worker
-                    .assign_task(binary.clone(), estimated_usage.clone(), opportunistic)
+                    .assign_task(
+                        binary.clone(),
+                        estimated_usage.clone(),
+                        opportunistic,
+                        predecessor_outputs,
+                    )
                     .await
                 {
                     Ok(()) => {
