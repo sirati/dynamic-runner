@@ -8,7 +8,7 @@
 //! `Blocked { on, .. }` back to `Pending` when its prerequisite
 //! completes.
 
-use dynrunner_core::{ErrorType, Identifier, TaskInfo, TaskOutputs};
+use dynrunner_core::{DonePayload, ErrorType, Identifier, TaskInfo, TaskOutputs};
 
 use super::{ApplyOutcome, ClusterState, TaskState};
 
@@ -60,10 +60,14 @@ impl<I: Identifier> ClusterState<I> {
     ///    when the worker actually published outputs; an empty
     ///    `TaskOutputs` round-trips as `Some(b"{}"...)` so the
     ///    `None` arm is a true "did not publish" signal.
-    /// 2. `result_data` decodes as `TaskOutputs` — insert under the
-    ///    completing task's `task_id`. Anonymous tasks (no `task_id`)
-    ///    cannot be referenced by dependents and are silently skipped
-    ///    (no key to insert under).
+    /// 2. `result_data` decodes as [`DonePayload`] — extract the
+    ///    inner `outputs` (a [`TaskOutputs`]) and insert it under the
+    ///    completing task's `task_id`. The wrapper's counter fields
+    ///    (`warnings`/`filtered`) are not consumed cluster-side; serde
+    ///    drops them silently because the struct does NOT use
+    ///    `deny_unknown_fields`. Anonymous tasks (no `task_id`) cannot
+    ///    be referenced by dependents and are silently skipped (no key
+    ///    to insert under).
     /// 3. `result_data` is malformed JSON — emit a `tracing::warn!`
     ///    and insert an empty `TaskOutputs`. Storing the empty entry
     ///    rather than skipping keeps dependents that hard-require a
@@ -89,9 +93,9 @@ impl<I: Identifier> ClusterState<I> {
             // there is no consumer for the cache entry anyway.
             return;
         };
-        match serde_json::from_slice::<TaskOutputs>(&bytes) {
-            Ok(outputs) => {
-                self.task_outputs.insert(task_id, outputs);
+        match serde_json::from_slice::<DonePayload>(&bytes) {
+            Ok(body) => {
+                self.task_outputs.insert(task_id, body.outputs);
             }
             Err(e) => {
                 tracing::warn!(
@@ -99,7 +103,7 @@ impl<I: Identifier> ClusterState<I> {
                     error = %e,
                     hash = %hash,
                     task_id = %task_id,
-                    "TaskCompleted result_data failed to decode as TaskOutputs; \
+                    "TaskCompleted result_data failed to decode as DonePayload; \
                      storing empty entry"
                 );
                 self.task_outputs.insert(task_id, TaskOutputs::default());

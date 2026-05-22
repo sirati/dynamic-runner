@@ -4,6 +4,17 @@
 //! mutation's `result_data` payload, the `outputs_for(task_id)`
 //! reader, the malformed-payload warn-and-store-empty path, and the
 //! snapshot/restore round-trip.
+//!
+//! Wire-shape contract: `result_data` is the Python worker's
+//! [`DonePayload`] wrapper — a JSON object containing optional
+//! `warnings`/`filtered` counters and an optional `outputs` map of
+//! the producing task's keyed outputs. The decoder extracts only the
+//! `outputs` field; counters are dropped silently. Tests in this
+//! module construct payloads via [`encode_wire`] so the bytes are
+//! byte-identical to what `python/dynamic_runner/worker/runtime.py`
+//! `_encode_done_payload` produces — preventing a regression where
+//! tests use a different (broken) shape than the encoder and mask
+//! the very bug they should pin.
 
 use super::*;
 
@@ -14,6 +25,19 @@ fn outputs_with(key: &str, value: &str) -> TaskOutputs {
     let mut m: BTreeMap<String, ResultValue> = BTreeMap::new();
     m.insert(key.to_string(), ResultValue::Inline(value.to_string()));
     TaskOutputs(m)
+}
+
+/// Build the Python encoder's wire bytes for a `result_data` payload
+/// carrying `outputs` only (the common case for a task that publishes
+/// keyed outputs without using the `WorkerOutput` counters). The
+/// shape is byte-identical to `_encode_done_payload`'s output for
+/// `WorkerOutput()` (default zero counters) + a non-empty
+/// `_outputs_accumulator`: `{"outputs": {key → {"kind": ..., "value": ...}}}`.
+fn encode_wire(outputs: &TaskOutputs) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "outputs": outputs,
+    }))
+    .expect("encode wire")
 }
 
 #[test]
@@ -36,7 +60,7 @@ fn task_completed_populates_task_outputs_cache() {
         task: mk_task("a"),
     });
     let outputs = outputs_with("nonce", "xyz");
-    let bytes = serde_json::to_vec(&outputs).expect("serialise outputs");
+    let bytes = encode_wire(&outputs);
     let outcome = s.apply(ClusterMutation::TaskCompleted {
         hash: "h".into(),
         result_data: Some(bytes),
@@ -99,7 +123,7 @@ fn anonymous_task_outputs_are_silently_dropped() {
         task: anon,
     });
     let outputs = outputs_with("k", "v");
-    let bytes = serde_json::to_vec(&outputs).expect("serialise");
+    let bytes = encode_wire(&outputs);
     s.apply(ClusterMutation::TaskCompleted {
         hash: "h".into(),
         result_data: Some(bytes),
@@ -122,7 +146,7 @@ fn task_outputs_round_trip_via_snapshot() {
         task: mk_task("a"),
     });
     let outputs = outputs_with("nonce", "xyz");
-    let bytes = serde_json::to_vec(&outputs).expect("serialise");
+    let bytes = encode_wire(&outputs);
     s.apply(ClusterMutation::TaskCompleted {
         hash: "h".into(),
         result_data: Some(bytes),
@@ -153,7 +177,7 @@ fn restore_first_write_wins_on_task_outputs_collision() {
     });
     local.apply(ClusterMutation::TaskCompleted {
         hash: "h".into(),
-        result_data: Some(serde_json::to_vec(&local_outputs).unwrap()),
+        result_data: Some(encode_wire(&local_outputs)),
     });
 
     let mut source = ClusterState::<RunnerIdentifier>::new();
@@ -163,10 +187,114 @@ fn restore_first_write_wins_on_task_outputs_collision() {
     });
     source.apply(ClusterMutation::TaskCompleted {
         hash: "h".into(),
-        result_data: Some(serde_json::to_vec(&snap_outputs).unwrap()),
+        result_data: Some(encode_wire(&snap_outputs)),
     });
 
     local.restore(source.snapshot());
     // Local's entry survives; snapshot's same-key entry is ignored.
     assert_eq!(local.outputs_for("a"), Some(&local_outputs));
+}
+
+#[test]
+fn python_encode_full_wrapper_decodes_outputs() {
+    // Pins the bug-vector that motivated the wrapper-decode fix:
+    // the Python worker's `_encode_done_payload` emits a JSON
+    // object with `warnings` + `filtered` + `outputs` top-level
+    // keys (counters present, keyed outputs present). The decoder
+    // MUST extract `outputs` and drop the counters silently — the
+    // pre-fix decoder tried to deserialise the whole body as
+    // `TaskOutputs` and failed with "missing field `kind`",
+    // landing in the warn-and-store-empty path.
+    //
+    // This test constructs the wire bytes byte-identical to the
+    // Python encoder (see `python/dynamic_runner/worker/runtime.py
+    // ::_encode_done_payload`) and asserts the cache populates with
+    // the inner outputs map. If the decoder ever regresses to
+    // unwrapping the wrong layer, this test fails.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("a"),
+    });
+    let wire = serde_json::to_vec(&serde_json::json!({
+        "warnings": 2,
+        "filtered": 1,
+        "outputs": {
+            "nonce": {"kind": "inline", "value": "xyz"},
+            "artifact": {"kind": "file", "value": "/app/out/foo.tar"},
+        }
+    }))
+    .expect("encode python wire shape");
+    let outcome = s.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: Some(wire),
+    });
+    assert_eq!(outcome, ApplyOutcome::Applied);
+
+    let cached = s.outputs_for("a").expect("cache populated");
+    assert_eq!(
+        cached.0.get("nonce"),
+        Some(&ResultValue::Inline("xyz".to_string()))
+    );
+    assert_eq!(
+        cached.0.get("artifact"),
+        Some(&ResultValue::File("/app/out/foo.tar".to_string()))
+    );
+    assert_eq!(cached.0.len(), 2);
+}
+
+#[test]
+fn python_encode_outputs_only_decodes_outputs() {
+    // Encoder shape when the task uses `publish_string` / `publish`
+    // but `WorkerOutput()` is default-constructed (zero counters):
+    // both `warnings` and `filtered` are omitted, only `outputs`
+    // rides the wire. Decoder must still extract the map.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("a"),
+    });
+    let wire = serde_json::to_vec(&serde_json::json!({
+        "outputs": {
+            "k": {"kind": "inline", "value": "v"},
+        }
+    }))
+    .expect("encode python wire shape");
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: Some(wire),
+    });
+    let cached = s.outputs_for("a").expect("cache populated");
+    assert_eq!(
+        cached.0.get("k"),
+        Some(&ResultValue::Inline("v".to_string()))
+    );
+}
+
+#[test]
+fn python_encode_counters_only_populates_empty_cache() {
+    // Encoder shape when the task returns a `WorkerOutput` with
+    // nonzero counters but never calls `publish_string` /
+    // `publish(key=...)`: `outputs` is omitted, `warnings` and/or
+    // `filtered` are present. Decoder's `#[serde(default)]` on the
+    // `outputs` field yields `TaskOutputs::default()`; the cache
+    // gains an empty entry under the completing task's `task_id`
+    // (matches the snapshot-restore-after-empty-completion
+    // semantics — present-key-with-empty-value is a load-bearing
+    // signal vs. absent-key).
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("a"),
+    });
+    let wire = serde_json::to_vec(&serde_json::json!({
+        "warnings": 7,
+    }))
+    .expect("encode python wire shape");
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "h".into(),
+        result_data: Some(wire),
+    });
+    let cached = s.outputs_for("a").expect("cache populated");
+    assert!(cached.0.is_empty());
 }
