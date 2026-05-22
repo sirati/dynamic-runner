@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use dynrunner_core::{Identifier, PhaseId};
+use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
 use serde::{Deserialize, Serialize};
 
 use super::ClusterState;
@@ -46,6 +46,13 @@ use super::TaskState;
 ///   `PeerResourceHoldingsUpdated` apply path is the steady-state
 ///   writer; the snapshot field exists so a late-joiner sees
 ///   current per-peer holdings before any live announce arrives.
+/// - `task_outputs`: per-key first-write-wins. Each entry is set
+///   exactly once by the originating `TaskCompleted` apply arm, so
+///   a snapshot's entry and a live-applied entry for the same
+///   `task_id` carry the same value — the merge inserts a snapshot
+///   entry only when the local map has no entry for that key. This
+///   matches the `tasks` lattice's monotonic-terminal-wins shape
+///   projected onto the cache's single-write-per-key semantics.
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -103,6 +110,28 @@ pub struct ClusterStateSnapshot<I> {
     /// `#[serde(default)]` for wire compat.
     #[serde(default)]
     pub panik_source: Option<String>,
+    /// Replicated keyed-output cache (one entry per task that has
+    /// reached `Completed` with a non-empty `result_data` payload).
+    /// Carried so a late-joiner can resolve a dependent's predecessor
+    /// outputs immediately on snapshot-restore, before the next live
+    /// `TaskCompleted` broadcast reaches it — symmetric with how
+    /// `tasks` carries terminal task states for the same reason.
+    ///
+    /// Merge rule on `restore`: per-key first-write-wins. Each entry
+    /// is set exactly once (by the originating `TaskCompleted` apply
+    /// arm; duplicate `TaskCompleted`s NoOp before reaching the
+    /// populate helper), so a snapshot entry and a live-applied
+    /// entry for the same `task_id` carry the same value — the merge
+    /// keeps whichever landed first and ignores the duplicate. This
+    /// matches the `tasks` lattice's "terminal wins; among terminals,
+    /// local wins" rule projected onto the cache's monotonic
+    /// insertion semantics.
+    ///
+    /// `#[serde(default)]` keeps wire compat with pre-feature senders
+    /// (missing field deserializes as an empty map, identical to the
+    /// pre-cache shape).
+    #[serde(default)]
+    pub task_outputs: HashMap<String, TaskOutputs>,
 }
 
 fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
@@ -157,6 +186,10 @@ impl<I: Identifier> ClusterState<I> {
             panik_active: self.panik_active,
             panik_reason: self.panik_reason.clone(),
             panik_source: self.panik_source.clone(),
+            // Replicated keyed-output cache — carried so a late-joiner
+            // can resolve a dependent's predecessor outputs without
+            // waiting for the prereq's `TaskCompleted` to retransmit.
+            task_outputs: self.task_outputs.clone(),
         }
     }
 
@@ -242,6 +275,20 @@ impl<I: Identifier> ClusterState<I> {
             self.panik_active = true;
             self.panik_reason = snap.panik_reason;
             self.panik_source = snap.panik_source;
+        }
+        // Keyed-output cache merge: per-key first-write-wins. Each
+        // `TaskCompleted` apply for a given hash records exactly one
+        // entry (duplicate `TaskCompleted`s NoOp before reaching the
+        // populate helper), so a snapshot's entry and a live-applied
+        // entry for the same `task_id` carry the same value — keeping
+        // the local entry when present and inserting the snapshot's
+        // entry when missing converges every replica to the same map
+        // regardless of (live-broadcast, snapshot) arrival order. The
+        // `entry().or_insert(_)` shape is the CRDT-coherent choice;
+        // a blanket replace would clobber legitimately-applied local
+        // entries when the snapshot interleaves with live broadcasts.
+        for (task_id, outputs) in snap.task_outputs {
+            self.task_outputs.entry(task_id).or_insert(outputs);
         }
     }
 }

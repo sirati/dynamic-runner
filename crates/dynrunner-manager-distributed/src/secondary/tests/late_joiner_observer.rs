@@ -91,6 +91,7 @@
             panik_active: false,
             panik_reason: None,
             panik_source: None,
+            task_outputs: HashMap::new(),
         }
     }
 

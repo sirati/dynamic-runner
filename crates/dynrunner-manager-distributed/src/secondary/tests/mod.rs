@@ -45,6 +45,7 @@ mod phase_lifecycle_callback;
 mod processing;
 mod promoted_primary_quiesce_gate;
 mod r1;
+mod result_data_plumbing;
 mod retry_bucket_cascade;
 mod setup_promote_discriminator;
 mod singleton_type_shift;

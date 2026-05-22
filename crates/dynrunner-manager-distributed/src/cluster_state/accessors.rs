@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, WorkerId};
+use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
 use dynrunner_protocol_primary_secondary::RoleTable;
 
 use super::{ClusterState, OutcomeSummary, StateCounts, TaskState};
@@ -236,6 +236,23 @@ impl<I: Identifier> ClusterState<I> {
             };
             (task.task_id.as_deref() == Some(task_id)).then_some(h.as_str())
         })
+    }
+
+    /// Borrow a completed task's cached [`TaskOutputs`] by `task_id`.
+    /// Returns `None` if no task with that `task_id` has reached
+    /// `Completed` with a non-empty `result_data` payload yet (the
+    /// task is still in-flight, never published outputs, was anonymous,
+    /// or the payload failed to decode and dependents that need a
+    /// non-empty view should treat the empty `TaskOutputs` insert as
+    /// their answer — see the cache-populate helper).
+    ///
+    /// The dispatch-time predecessor-outputs assembler reads this
+    /// accessor to attach each dependent's predecessor outputs to its
+    /// `TaskAssignment`. The borrow is invalidated by the next
+    /// `&mut self` apply call; callers that need ownership across an
+    /// apply boundary must `.clone()` the returned reference.
+    pub fn outputs_for(&self, task_id: &str) -> Option<&TaskOutputs> {
+        self.task_outputs.get(task_id)
     }
 
     /// Whether the run has been declared finished by the primary.
