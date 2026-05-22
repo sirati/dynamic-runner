@@ -21,6 +21,7 @@ Public surface:
   form above; reach it as `dynamic_runner._native.TaskInfo` if needed.
 """
 
+from ._shared import TaskDep
 from .deployment_spec import TaskDeploymentSpec
 from .run import run
 from .subprocess_spec import SubprocessSpec
@@ -64,6 +65,7 @@ __all__ = [
     "run",
     "TaskDeploymentSpec",
     "TaskDefinition",
+    "TaskDep",
     "PhaseSpec",
     "TaskTypeSpec",
     "BinaryIdentifier",
