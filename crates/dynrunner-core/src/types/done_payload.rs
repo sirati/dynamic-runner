@@ -39,7 +39,7 @@
 //! the struct in each consumer crate would violate the "no duplicated
 //! logic" rule — both call sites must use this single re-export.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::outputs::TaskOutputs;
 
@@ -63,7 +63,7 @@ use super::outputs::TaskOutputs;
 /// Python worker produces it. Tests that construct the wire bytes
 /// for round-trip coverage use `serde_json::json!(...)` literals
 /// that mirror the encoder's output verbatim.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DonePayload {
     #[serde(default)]
     pub outputs: TaskOutputs,
