@@ -113,7 +113,11 @@ mod tests {
             task,
         });
         if let Some(o) = outputs {
-            let bytes = serde_json::to_vec(&o).expect("serialise outputs");
+            // Mirror the Python encoder's wrapper shape: result_data is
+            // a DonePayload `{warnings, filtered, outputs}` body, not a
+            // bare TaskOutputs. See `dynrunner_core::types::DonePayload`.
+            let payload = dynrunner_core::DonePayload { outputs: o };
+            let bytes = serde_json::to_vec(&payload).expect("serialise DonePayload");
             state.apply(ClusterMutation::TaskCompleted {
                 hash,
                 result_data: Some(bytes),

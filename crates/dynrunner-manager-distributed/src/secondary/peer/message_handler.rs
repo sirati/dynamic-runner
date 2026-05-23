@@ -69,6 +69,27 @@ where
                 // backoff so the next dispatch cycle can re-target it.
                 // Mirrors regular primary's TaskComplete handler.
                 self.clear_primary_peer_backpressure(&secondary_id);
+                // Promoted-secondary apply→dispatch race
+                // (keyed-outputs): when this node is the primary,
+                // `note_primary_item_completed` below releases
+                // dependents in `primary_pending` and a follow-up
+                // self-`TaskRequest` (e.g. from a peer's keepalive
+                // tick or a worker that just freed) may route into
+                // `handle_primary_task_request` before the
+                // canonical `ClusterMutation::TaskCompleted`
+                // originator (the demoted-local primary's
+                // `handle_task_complete`) has applied + broadcast
+                // back. Apply locally first so
+                // `self.cluster_state.task_outputs` is populated
+                // when `gather_predecessor_outputs` runs. Mirrors
+                // the same call in
+                // `secondary/processing/worker_event.rs`. See
+                // [`Self::apply_task_completed_locally_if_primary`]
+                // for the no-broadcast / idempotency rationale.
+                self.apply_task_completed_locally_if_primary(
+                    task_hash.clone(),
+                    result_data.clone(),
+                );
                 // Drive the primary's phase machine: if this
                 // node dispatched the task as primary, the
                 // peer's completion message is the only signal the
