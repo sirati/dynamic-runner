@@ -182,6 +182,8 @@ mod drive_rust;
 mod preparation;
 mod respawn;
 mod run_pipeline;
+mod run_remote_podman;
 
 pub(crate) use preparation::run_preparation_py;
 pub(crate) use run_pipeline::run_slurm_pipeline;
+pub(crate) use run_remote_podman::run_remote_podman_pipeline;

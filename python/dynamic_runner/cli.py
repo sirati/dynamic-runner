@@ -318,8 +318,13 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument(
         "--multi-computer",
         type=str,
-        choices=["slurm", "local", "single-process"],
-        help="Enable multi-computer distributed mode (slurm, local, or single-process)",
+        choices=["slurm", "local", "single-process", "remote-podman"],
+        help=(
+            "Enable multi-computer distributed mode (slurm, local, "
+            "single-process, or remote-podman). remote-podman SSHes to one "
+            "remote host and runs the consumer's podman image there; "
+            "single-secondary by design (no --jobs, no respawn)."
+        ),
     )
     parser.add_argument(
         "--slurm",
@@ -561,10 +566,11 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
       exists to take the setup hand-off. Plain local mode
       (``--multi-computer`` absent) runs everything in-process with
       no peer to delegate to, so the combination is rejected here.
-      The three ``--multi-computer`` modes (``slurm``, ``local``,
-      ``single-process``) all participate in the setup-promote
-      handshake; the deprecated ``--slurm`` shorthand is treated as
-      equivalent to ``--multi-computer slurm`` for this check.
+      The four ``--multi-computer`` modes (``slurm``, ``local``,
+      ``single-process``, ``remote-podman``) all participate in the
+      setup-promote handshake; the deprecated ``--slurm`` shorthand
+      is treated as equivalent to ``--multi-computer slurm`` for this
+      check.
 
     Called from ``dynamic_runner.run.run`` immediately after
     ``parser.parse_args``. Failures route through ``parser.error``,
@@ -590,8 +596,35 @@ def validate_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPars
         if not has_distributed_mode:
             parser.error(
                 "--source-already-staged requires a distributed mode "
-                "(--multi-computer slurm|local|single-process); plain "
-                "local mode has no secondary to delegate setup to."
+                "(--multi-computer slurm|local|single-process|remote-podman); "
+                "plain local mode has no secondary to delegate setup to."
+            )
+
+    # remote-podman is a single-secondary mode by construction: the
+    # spawn callback bakes a static argv (secondary_id + listen port +
+    # wrapper path), so any second invocation would collide on
+    # container name and port-probe. The wrapper renderer also bakes
+    # the gateway-host/port into the container-command argv, so a
+    # respawn with a fresh secondary-id would still re-register as
+    # secondary-0. Reject both --jobs (other than the argparse default
+    # of 1) and --respawn-policy=on-secondary-death up-front so the
+    # operator learns at parse time rather than at the first peer
+    # collision.
+    if getattr(args, "multi_computer", None) == "remote-podman":
+        if getattr(args, "jobs", 1) != 1:
+            parser.error(
+                "--jobs is incompatible with --multi-computer remote-podman "
+                "(single-secondary by design; the wrapper bakes secondary-0 "
+                "and a fixed listen port, so a second concurrent secondary "
+                "on the same remote would collide). Rerun without --jobs."
+            )
+        if getattr(args, "respawn_policy", "disabled") == "on-secondary-death":
+            parser.error(
+                "--respawn-policy=on-secondary-death is incompatible with "
+                "--multi-computer remote-podman: the wrapper bakes "
+                "secondary-0 at render time, so a respawn would re-register "
+                "under the same id. For a single-machine deployment, "
+                "re-dispatch the whole run instead."
             )
 
     # --observer-join-from-peer-info-dir is a late-joiner-OBSERVER role
