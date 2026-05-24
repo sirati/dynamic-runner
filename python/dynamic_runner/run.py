@@ -100,6 +100,14 @@ def run(
             logger.error("--multi-computer local requires `deployment=TaskDeploymentSpec(...)` in run()")
             return
         _dispatch_multi_computer_local(task, args, deployment, logger)
+    elif args.multi_computer == "remote-podman":
+        if deployment is None:
+            logger.error(
+                "--multi-computer remote-podman requires "
+                "`deployment=TaskDeploymentSpec(...)` in run()"
+            )
+            return
+        _dispatch_remote_podman(task, args, deployment, logger)
     elif args.multi_computer == "single-process":
         _dispatch_single_process(task, args, config, logger)
     else:
@@ -764,3 +772,16 @@ def _dispatch_slurm(task, args, deployment: TaskDeploymentSpec, logger) -> None:
     from .packaging import run_slurm_pipeline
 
     run_slurm_pipeline(task, args, deployment, logger)
+
+
+def _dispatch_remote_podman(task, args, deployment: TaskDeploymentSpec, logger) -> None:
+    """Single-remote podman mode — image build, transfer, ssh+podman exec, then Rust primary.
+
+    Same shape as ``_dispatch_slurm``: the orchestration body is in
+    Rust (``crates/dynrunner-pyo3/src/slurm/pipeline/run_remote_podman.rs``);
+    this dispatcher is a one-line delegation so the run.py branch
+    surface stays uniform across all four ``--multi-computer`` modes.
+    """
+    from .packaging import run_remote_podman_pipeline
+
+    run_remote_podman_pipeline(task, args, deployment, logger)

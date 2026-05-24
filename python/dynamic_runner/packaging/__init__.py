@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 from .pipeline import run_slurm_pipeline
 from .podman import PodmanImageMetadata, PodmanPackaging
+from .remote_podman import run_remote_podman_pipeline
 
 
 @dataclass
@@ -40,4 +41,5 @@ __all__ = [
     "PackagingConfig",
     "make_packaging",
     "run_slurm_pipeline",
+    "run_remote_podman_pipeline",
 ]
