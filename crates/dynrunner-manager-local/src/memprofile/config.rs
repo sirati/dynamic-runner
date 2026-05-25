@@ -3,6 +3,22 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Compile-time constant for the container-internal path the SLURM
+/// wrapper bind-mounts the gateway-shared output filesystem into.
+///
+/// When `--memprofile` is set on a SLURM secondary WITHOUT an explicit
+/// operator-supplied output override, the secondary uses this path so
+/// the resulting `.jsonl.zst` files land on the gateway-shared output
+/// drive (alongside the rest of the run's artifacts).
+///
+/// Source of truth for the bind-mount target itself lives in
+/// `crates/dynrunner-slurm/src/wrapper_script/generate.rs` (search
+/// for the `/app/out-network` literal in the `-v` block). Changing
+/// either constant without the other breaks the artifact-retrieval
+/// contract — the wrapper would bind-mount one path while the
+/// secondary wrote to another.
+pub const SLURM_SECONDARY_OUTPUT_DIR: &str = "/app/out-network";
+
 /// Configuration for [`super::MemProfileSampler`].
 ///
 /// `output_dir` is the run-level directory (e.g.

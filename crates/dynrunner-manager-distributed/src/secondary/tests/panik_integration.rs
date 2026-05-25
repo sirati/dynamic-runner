@@ -89,6 +89,7 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 promoted_primary_quiesce_grace: Duration::from_secs(2),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =
@@ -348,6 +349,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 promoted_primary_quiesce_grace: Duration::from_secs(2),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =

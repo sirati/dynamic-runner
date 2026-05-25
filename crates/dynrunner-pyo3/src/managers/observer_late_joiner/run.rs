@@ -206,6 +206,9 @@ impl PyObserverLateJoiner {
                     // be a write against a path no PID ever attaches
                     // to. Leave unset.
                     mem_manager_reserved_bytes: None,
+                    // Observer doesn't run workers; no per-task
+                    // memprofile to write. Leave unset.
+                    output_dir: None,
                 };
 
                 // No-op factory: the run loop's only `factory`

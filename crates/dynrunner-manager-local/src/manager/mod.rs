@@ -371,18 +371,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // spawns a background tokio task on the current runtime — at
         // construction time the caller may not be inside one.
         // Constructed AFTER `initialize_workers` so an error there
-        // returns without leaking a sampler background task.
-        //
-        // Scope note: the production `initialize_workers` path above
-        // passes `None` for the pool's `mem_manager_reserved_bytes`,
-        // which means `WorkerPool::cgroup_handle` stays `None`,
-        // which means each `WorkerHandle::subcgroup_dir()` returns
-        // `None`, which means the sampler's `on_task_assigned` hook
-        // silently skips (no per-worker cgroup leaf to read from).
-        // The hook wiring is correct end-to-end; a future CLI-flag
-        // path that promotes `mem_manager_reserved_bytes` from
-        // `None` to `Some(0)` will cause profile files to populate
-        // without any change to this site.
+        // returns without leaking a sampler background task. The
+        // same `output_dir.is_some()` predicate that constructs the
+        // sampler also drove `mem_manager_reserved_bytes` to
+        // `Some(0)` above (in `initialize_workers`), so the per-
+        // worker cgroup leaves the sampler needs to read from exist
+        // by the time we hit this site.
         self.sampler = self
             .config
             .output_dir
@@ -672,6 +666,37 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         let max = self.config.max_resources.clone();
+        // The cgroup-nesting knob has two distinct callers here:
+        //   * `Some(n)` — the SecondaryCoordinator path's classic
+        //     "reserve n bytes for the manager process so a worker
+        //     kernel-OOM doesn't reap it"; LocalManager doesn't
+        //     surface that yet (one-process local mode shares its
+        //     cgroup with its workers, so the kernel-OOM-isolation
+        //     benefit is moot).
+        //   * `Some(0)` — "create the cgroup leaves but don't tighten
+        //     `memory.max`". This is what the memprofile sampler
+        //     needs: per-worker subgroups exist (`WorkerHandle.
+        //     subcgroup` becomes `Some(...)`) so the sampler can read
+        //     `memory.current`, but no enforcement changes.
+        // We pick the latter when memprofile is enabled (`output_dir`
+        // set) and leave `None` (legacy flat layout) otherwise. The
+        // sampler hooks shipped previously fire either way, but
+        // without the per-worker cgroup they have nothing to read.
+        //
+        // When the cgroup setup itself fails (no cgroup-v2, missing
+        // memory controller, non-delegated subtree, read-only sysfs)
+        // the run aborts loudly: the operator explicitly opted into
+        // `--memprofile`, and silently degrading to "no profile
+        // files" would be a confusing failure mode. The graceful-
+        // fallback paths inside `cgroup::setup_worker_cgroup` already
+        // cover the three "expected" missing-env conditions (returning
+        // `Ok(None)` + warn); anything past those is a genuine
+        // environment problem the operator should fix.
+        let mem_manager_reserved_bytes = if self.config.output_dir.is_some() {
+            Some(0)
+        } else {
+            None
+        };
         self.pool
             .initialize(
                 self.config.num_workers,
@@ -679,17 +704,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 &self.scheduler,
                 factory,
                 self.config.print_pid,
-                // LocalManager does not currently surface the nested-
-                // cgroup knob — the in-process / single-host local
-                // path runs workers and the manager in the same
-                // address space's cgroup, so the kernel-OOM
-                // isolation benefit doesn't apply at this scope. The
-                // SecondaryCoordinator path passes the operator-
-                // supplied `mem_manager_reserved_bytes` through; if a
-                // future single-host workload wants the same
-                // isolation it would extend `LocalManagerConfig` and
-                // forward the value here.
-                None,
+                mem_manager_reserved_bytes,
             )
             .await
     }

@@ -267,6 +267,24 @@ pub struct SecondaryConfig {
     /// [`crate::cgroup`] module; this field is the wire-shape
     /// the secondary-side config carries.
     pub mem_manager_reserved_bytes: Option<u64>,
+
+    /// Run-level output directory for memprofile artifacts.
+    ///
+    /// Resolved at the PyO3 boundary
+    /// (`PySecondaryCoordinator::run`) from the operator's
+    /// `--memprofile` flag plus the
+    /// [`dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR`]
+    /// constant; `Some(path)` means "operator opted in AND the
+    /// SLURM wrapper's `/app/out-network` bind-mount is present".
+    /// `None` (default) disables profiling entirely.
+    ///
+    /// The secondary's `WorkerPool` does not currently consume
+    /// this field — the sampler hookup (mirroring
+    /// `LocalManager::process_binaries`) is a separate follow-up.
+    /// The wire is in place so that future change is a single
+    /// constructor call against `WorkerPool::set_sampler` (or the
+    /// equivalent), with zero argv / config-struct churn.
+    pub output_dir: Option<PathBuf>,
 }
 
 impl Default for SecondaryConfig {
@@ -296,6 +314,7 @@ impl Default for SecondaryConfig {
             promoted_primary_quiesce_grace: Duration::from_secs(2),
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
+            output_dir: None,
         }
     }
 }

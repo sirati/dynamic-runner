@@ -45,6 +45,7 @@ impl PySecondaryCoordinator {
         panik_watcher_poll_interval_secs = 10.0,
         unfulfillable_reinject_max_per_task = None,
         mem_manager_reserved_bytes = None,
+        memprofile_enabled = false,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -73,6 +74,7 @@ impl PySecondaryCoordinator {
         panik_watcher_poll_interval_secs: f64,
         unfulfillable_reinject_max_per_task: Option<u32>,
         mem_manager_reserved_bytes: Option<u64>,
+        memprofile_enabled: bool,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -151,6 +153,7 @@ impl PySecondaryCoordinator {
             ),
             completed: 0,
             mem_manager_reserved_bytes,
+            memprofile_enabled,
         })
     }
 

@@ -45,6 +45,22 @@ pub(crate) struct PyLocalManagerConfig {
     /// Default `false`.
     #[pyo3(get, set)]
     pub(crate) log_oom_watcher: bool,
+    /// Run-level output directory the operator passed via `--output`
+    /// (Python side resolves to an absolute path). `Some(...)` here
+    /// is the necessary precondition for memprofile sampling — the
+    /// `to_rust` builder composes `{output_dir}/memprofile/` into
+    /// `LocalManagerConfig.output_dir`, which in turn drives sampler
+    /// construction. The pairing with `memprofile_enabled` controls
+    /// whether the composition happens at all; this field on its
+    /// own does nothing.
+    #[pyo3(get, set)]
+    pub(crate) output_dir: Option<std::path::PathBuf>,
+    /// Python-side `--memprofile` opt-in. The flag's behaviour lives
+    /// entirely in Rust (`to_rust` decides whether to compose the
+    /// memprofile path into `LocalManagerConfig.output_dir`); Python
+    /// is just the bridge that toggles this bool from the CLI parser.
+    #[pyo3(get, set)]
+    pub(crate) memprofile_enabled: bool,
 }
 
 #[pymethods]
@@ -64,6 +80,8 @@ impl PyLocalManagerConfig {
         phase_status_log_intervals_secs = None,
         scheduler_config = None,
         log_oom_watcher = false,
+        output_dir = None,
+        memprofile_enabled = false,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -82,6 +100,8 @@ impl PyLocalManagerConfig {
         phase_status_log_intervals_secs: Option<Vec<f64>>,
         scheduler_config: Option<SchedulerConfig>,
         log_oom_watcher: bool,
+        output_dir: Option<std::path::PathBuf>,
+        memprofile_enabled: bool,
     ) -> Self {
         Self {
             num_workers,
@@ -99,6 +119,8 @@ impl PyLocalManagerConfig {
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
             scheduler_config: scheduler_config.unwrap_or_default(),
             log_oom_watcher,
+            output_dir,
+            memprofile_enabled,
         }
     }
 }
@@ -147,10 +169,67 @@ impl PyLocalManagerConfig {
                 .map(|s| Duration::from_secs_f64(*s))
                 .collect(),
             log_oom_watcher: self.log_oom_watcher,
-            // The memprofile sampler's run-level output directory.
-            // Until the Python CLI surfaces a flag for it, the local-
-            // manager binding stays opt-out (sampler disabled).
-            output_dir: None,
+            // Composes the memprofile sampler's output directory
+            // when both opt-in pieces are present: the user passed
+            // `--memprofile` (so `memprofile_enabled = true`) AND
+            // there's a run-level `output_dir` to anchor the
+            // `memprofile/` subdirectory under. Either piece
+            // missing collapses to `None`, which disables the
+            // sampler at construction time. The Rust core (in
+            // `LocalManager`) consumes this single `Option<PathBuf>`
+            // and never sees the two-flag form.
+            output_dir: resolve_memprofile_dir(
+                self.memprofile_enabled,
+                self.output_dir.as_deref(),
+            ),
         }
+    }
+}
+
+/// Compose the memprofile output directory from the two Python-side
+/// inputs. Single concern: combine `memprofile_enabled` and the
+/// run-level `output_dir` into the `Option<PathBuf>` shape the
+/// Rust-side `LocalManagerConfig` consumes. Lives at the PyO3
+/// boundary because Python is the only producer of these two values
+/// and the Rust side intentionally accepts only one.
+pub(crate) fn resolve_memprofile_dir(
+    memprofile_enabled: bool,
+    output_dir: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    if !memprofile_enabled {
+        return None;
+    }
+    output_dir.map(|p| p.join("memprofile"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_memprofile_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn memprofile_off_returns_none_regardless_of_output_dir() {
+        assert!(resolve_memprofile_dir(false, None).is_none());
+        assert!(
+            resolve_memprofile_dir(false, Some(std::path::Path::new("/tmp/run"))).is_none()
+        );
+    }
+
+    #[test]
+    fn memprofile_on_without_output_dir_returns_none() {
+        // The LocalManager path treats `None` as "profiling
+        // disabled"; no sampler is constructed. The Python caller
+        // is responsible for refusing to set memprofile when no
+        // output_dir is available (since the operator's `--output`
+        // is mandatory in practice, this branch only fires in
+        // mis-wired tests).
+        assert!(resolve_memprofile_dir(true, None).is_none());
+    }
+
+    #[test]
+    fn memprofile_on_with_output_dir_appends_subdir() {
+        let resolved = resolve_memprofile_dir(true, Some(std::path::Path::new("/tmp/run")))
+            .expect("memprofile_enabled + output_dir must compose");
+        assert_eq!(resolved, PathBuf::from("/tmp/run/memprofile"));
     }
 }

@@ -146,6 +146,7 @@ async fn e2e_primary_secondary_over_wss() {
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
@@ -284,6 +285,7 @@ async fn e2e_primary_secondary_over_quic() {
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =

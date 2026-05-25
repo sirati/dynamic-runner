@@ -133,4 +133,11 @@ pub(crate) struct PySecondaryCoordinator {
     /// `mem_manager_reserved_bytes` kwarg on `__init__`; forwarded
     /// into the inner `SecondaryConfig` at `run()` entry.
     pub(super) mem_manager_reserved_bytes: Option<u64>,
+    /// Operator-supplied `--memprofile` opt-in. Forwarded to the
+    /// inner `SecondaryConfig` at `run()` entry via the dedicated
+    /// `resolve_secondary_memprofile_dir` helper, which picks the
+    /// SLURM wrapper bind-mount as the output path when the
+    /// container is the runtime. See
+    /// `dynrunner_manager_distributed::SecondaryConfig::output_dir`.
+    pub(super) memprofile_enabled: bool,
 }
