@@ -153,23 +153,205 @@ fn leaf_subtree_writable_false_when_missing() {
 }
 
 #[test]
-fn attach_pid_writes_decimal_to_cgroup_procs() {
-    let root = tempfile::tempdir().unwrap();
-    let leaf = make_fake_leaf(root.path(), "memory\n", "max\n");
-    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
-
-    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
-    super::attach_pid(&handle, 12345).unwrap();
-
-    let body = std::fs::read_to_string(workers_path.join("cgroup.procs")).unwrap();
-    assert_eq!(body.trim(), "12345");
-}
-
-#[test]
 fn workers_path_accessor_returns_materialised_dir() {
     let root = tempfile::tempdir().unwrap();
     let leaf = make_fake_leaf(root.path(), "memory\n", "max\n");
     let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
     let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
     assert_eq!(handle.workers_path(), workers_path);
+}
+
+#[test]
+fn write_workers_subgroup_enables_subtree_control_on_workers() {
+    // After init on a clean leaf (no pids in workers/cgroup.procs),
+    // workers/cgroup.subtree_control must be written (the kernel
+    // pseudo-file accumulates each `+controller` write into a single
+    // displayed list, e.g. "memory pids"). Our tempdir fake is a
+    // regular file under tmpfs, so each `std::fs::write` truncates
+    // and only the LAST controller written ("+pids" in CONTROLLERS
+    // order) survives. We assert (a) the file exists, (b) it is
+    // non-empty (the writer DID attempt to enable subtree_control),
+    // (c) it contains the last token from the writer's controller
+    // list. The integration-level "both controllers landed" check is
+    // out of unit-test reach without a real cgroup-v2 host; covered
+    // by the integration smoke (Phase F).
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+
+    let subtree_path = workers_path.join("cgroup.subtree_control");
+    assert!(subtree_path.exists(), "workers/cgroup.subtree_control should be created");
+    let subtree = std::fs::read_to_string(&subtree_path).unwrap();
+    assert!(
+        !subtree.is_empty(),
+        "workers/cgroup.subtree_control should have been written; got empty"
+    );
+    // Under the fake's truncate-on-write semantics only the last
+    // token from CONTROLLERS ("+pids") survives.
+    assert!(
+        subtree.contains("pids"),
+        "expected last controller write ('+pids') to be present; got: {subtree:?}"
+    );
+}
+
+#[test]
+fn workers_with_existing_pids_skips_subtree_control() {
+    // LegacyFlat upgrade case: a previous run left pids attached to
+    // workers/cgroup.procs (flat layout). Enabling subtree_control on
+    // workers/ would fail with EBUSY at the kernel level. The writer
+    // detects the non-empty procs file and SKIPS the workers/
+    // subtree_control writes, returning successfully so the caller
+    // can continue running in flat mode this run.
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+    let workers_path = leaf.join("workers");
+    std::fs::create_dir_all(&workers_path).unwrap();
+    write_fixture(&workers_path.join("cgroup.procs"), "12345\n");
+    // Pre-create the subtree_control file (empty) so we can later
+    // assert it stayed empty — the test fake is a regular file, not
+    // a kernel pseudo-file that auto-creates on first read.
+    write_fixture(&workers_path.join("cgroup.subtree_control"), "");
+
+    let returned = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    assert_eq!(returned, workers_path);
+
+    // workers/subtree_control must be untouched (still empty fixture).
+    let subtree = std::fs::read_to_string(workers_path.join("cgroup.subtree_control")).unwrap();
+    assert_eq!(
+        subtree, "",
+        "subtree_control should stay empty in LegacyFlat fallback; got: {subtree:?}"
+    );
+    // The legacy procs file still contains the original pid.
+    let procs = std::fs::read_to_string(workers_path.join("cgroup.procs")).unwrap();
+    assert_eq!(procs.trim(), "12345");
+}
+
+#[test]
+fn prepare_worker_subgroup_creates_leaf_with_swap_max() {
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+
+    let sub = super::prepare_worker_subgroup(&handle, 3).unwrap();
+
+    let expected = workers_path.join("worker-3");
+    assert_eq!(sub.cgroup_dir(), expected);
+    assert!(expected.is_dir(), "per-worker leaf should be a directory");
+    let swap = std::fs::read_to_string(expected.join("memory.swap.max")).unwrap();
+    assert_eq!(swap.trim(), "max");
+    // Intentional: NO memory.max on per-worker leaf (observability
+    // only; aggregate cap lives on the parent workers/).
+    assert!(
+        !expected.join("memory.max").exists(),
+        "per-worker memory.max must NOT be written"
+    );
+
+    // Prevent Drop from rmdir'ing during the test (we want the
+    // assertions above to be visible at scope-exit).
+    std::mem::forget(sub);
+}
+
+#[test]
+fn prepare_worker_subgroup_is_idempotent() {
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    let handle = NestedCgroupHandle { workers_path };
+
+    let first = super::prepare_worker_subgroup(&handle, 7).unwrap();
+    let first_path = first.cgroup_dir().to_path_buf();
+    std::mem::forget(first);
+
+    let second = super::prepare_worker_subgroup(&handle, 7).unwrap();
+    assert_eq!(second.cgroup_dir(), first_path);
+    std::mem::forget(second);
+}
+
+#[test]
+fn subcgroup_attach_pid_writes_decimal_to_leaf_procs() {
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+    let sub = super::prepare_worker_subgroup(&handle, 42).unwrap();
+    let leaf_dir = sub.cgroup_dir().to_path_buf();
+
+    sub.attach_pid(99887).unwrap();
+
+    let body = std::fs::read_to_string(leaf_dir.join("cgroup.procs")).unwrap();
+    assert_eq!(body.trim(), "99887");
+    // Cleanup: drop the handle; the leaf still has the pid fixture
+    // so Drop will hit the ENOTEMPTY warn path. That's exercised in
+    // a dedicated test below — here we only care about the write.
+}
+
+#[test]
+fn subcgroup_handle_drop_rmdirs_empty_leaf() {
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    let handle = NestedCgroupHandle { workers_path: workers_path.clone() };
+    let sub = super::prepare_worker_subgroup(&handle, 5).unwrap();
+    let leaf_dir = sub.cgroup_dir().to_path_buf();
+    assert!(leaf_dir.is_dir());
+
+    // The fixture wrote memory.swap.max as a regular file; rmdir
+    // would fail with ENOTEMPTY against that. To exercise the "empty
+    // leaf" path we have to remove that file first. This mirrors the
+    // real-world case where the kernel auto-removes pseudo-files
+    // when the cgroup is empty (no procs, no controllers configured
+    // on a leaf about to be rmdir'd).
+    std::fs::remove_file(leaf_dir.join("memory.swap.max")).unwrap();
+
+    drop(sub);
+
+    assert!(!leaf_dir.exists(), "empty leaf should be rmdir'd by Drop");
+}
+
+#[test]
+fn subcgroup_handle_drop_swallows_nonempty() {
+    // The per-worker leaf contains the fixture's memory.swap.max
+    // regular file (and potentially a cgroup.procs we write below).
+    // rmdir against a non-empty dir returns ENOTEMPTY; Drop must
+    // swallow it without panicking and leave the directory intact
+    // for an operator to find.
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    let handle = NestedCgroupHandle { workers_path };
+    let sub = super::prepare_worker_subgroup(&handle, 11).unwrap();
+    let leaf_dir = sub.cgroup_dir().to_path_buf();
+    // Simulate an attached pid by writing cgroup.procs explicitly.
+    write_fixture(&leaf_dir.join("cgroup.procs"), "31337\n");
+
+    drop(sub); // must not panic.
+
+    // Directory survived (rmdir refused; warn line was emitted but
+    // unobserved in this test — log capture isn't worth the
+    // dependency churn for one line).
+    assert!(leaf_dir.is_dir(), "non-empty leaf should remain after Drop");
+}
+
+#[test]
+fn subcgroup_handle_drop_silent_on_already_gone() {
+    // Race: another teardown path (or the kernel auto-removal on
+    // last-pid-exit) removed the leaf before Drop ran. ENOENT must
+    // be silent — no panic, no warn line.
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    let handle = NestedCgroupHandle { workers_path };
+    let sub = super::prepare_worker_subgroup(&handle, 13).unwrap();
+    let leaf_dir = sub.cgroup_dir().to_path_buf();
+
+    // Remove fixture + dir before Drop. We have to nuke the
+    // memory.swap.max child first because the test fixture is a
+    // regular file under a regular directory.
+    std::fs::remove_file(leaf_dir.join("memory.swap.max")).unwrap();
+    std::fs::remove_dir(&leaf_dir).unwrap();
+
+    drop(sub); // must not panic.
+    assert!(!leaf_dir.exists());
 }
