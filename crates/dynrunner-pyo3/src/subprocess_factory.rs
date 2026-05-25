@@ -845,15 +845,15 @@ mod tests {
         let procs_path = tmp.path().join("cgroup.procs");
 
         let rendered = RenderedCommand {
-            argv: vec!["/bin/true".to_string()],
+            argv: vec!["true".to_string()],
             env: std::collections::HashMap::new(),
             cwd: None,
         };
         let mut cmd = factory.command_from_rendered(&rendered, Some(procs_path.clone()));
-        let mut child = cmd.spawn().expect("spawn /bin/true");
+        let mut child = cmd.spawn().expect("spawn true");
         let pid = child.id();
-        let status = child.wait().expect("wait /bin/true");
-        assert!(status.success(), "/bin/true exited non-success: {status:?}");
+        let status = child.wait().expect("wait true");
+        assert!(status.success(), "true exited non-success: {status:?}");
 
         let written = std::fs::read_to_string(&procs_path)
             .expect("pre_exec should have written cgroup.procs");
@@ -862,7 +862,7 @@ mod tests {
 
     /// When `command_from_rendered` is handed `None`, no `pre_exec`
     /// cgroup closure is installed and no cgroup-related file is
-    /// created. Spawns `/bin/true` (no env/cwd plumbing) and asserts
+    /// created. Spawns `true` (no env/cwd plumbing) and asserts
     /// the tempdir is empty post-spawn.
     #[test]
     fn command_from_rendered_without_subcgroup_writes_nothing() {
@@ -870,13 +870,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
 
         let rendered = RenderedCommand {
-            argv: vec!["/bin/true".to_string()],
+            argv: vec!["true".to_string()],
             env: std::collections::HashMap::new(),
             cwd: None,
         };
         let mut cmd = factory.command_from_rendered(&rendered, None);
-        let mut child = cmd.spawn().expect("spawn /bin/true");
-        child.wait().expect("wait /bin/true");
+        let mut child = cmd.spawn().expect("spawn true");
+        child.wait().expect("wait true");
 
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .expect("read tempdir")
