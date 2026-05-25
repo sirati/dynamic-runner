@@ -405,7 +405,6 @@ impl PyDistributedManager {
                             manual_start_worker: false,
                             worker_spec: sec_worker_spec.clone(),
                             child_processes: Vec::new(),
-                            workers_cgroup_procs: None,
                         };
 
                         let mut secondary = SecondaryCoordinator::new(
