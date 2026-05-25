@@ -78,13 +78,14 @@ fn compute_workers_memory_max(leaf: &Path, reserved_bytes: u64) -> Result<Option
     }
 }
 
-/// Materialise `<leaf>/workers/` with the tightened cap and swap
-/// reset. Idempotent on every step:
+/// Materialise `<leaf>/workers/` with the tightened cap, swap reset,
+/// and per-worker subtree delegation. Idempotent on every step:
 ///
 ///   1. `create_dir_all(workers_path)` — re-creating an existing
 ///      directory is a no-op.
-///   2. `+memory +pids` writes to `cgroup.subtree_control`, each via
-///      [`enable_controller`] which absorbs `EBUSY` / `EINVAL`.
+///   2. `+memory +pids` writes to `<leaf>/cgroup.subtree_control`,
+///      each via [`enable_controller`] which absorbs `EBUSY` /
+///      `EINVAL`.
 ///   3. `<workers>/memory.max` — computed via
 ///      [`compute_workers_memory_max`]. Skipped when the parent
 ///      container has no concrete cap (logged at info level).
@@ -93,9 +94,31 @@ fn compute_workers_memory_max(leaf: &Path, reserved_bytes: u64) -> Result<Option
 ///      regardless of the parent's `--memory-swap=-1`. Per the
 ///      design contract: workers must have all swap available so
 ///      ResourceStealingScheduler's swap-aware budget math holds.
+///   5. `+memory +pids` writes to `<workers>/cgroup.subtree_control`
+///      so per-worker children inherit those controllers and the
+///      memprofile sampler can read each worker's `memory.current`.
+///
+/// **cgroup-v2 "no internal processes" invariant:** after step 5,
+/// `<workers>/` becomes an interior node — the kernel rejects any
+/// subsequent write to `<workers>/cgroup.procs` with `EBUSY`. From
+/// that moment forward, worker PIDs MUST be attached to a per-worker
+/// leaf `<workers>/worker-<id>/` (see
+/// [`write_worker_subgroup`] + [`super::SubcgroupHandle::attach_pid`]).
+/// The legacy [`write_attach_pid_to_workers`] helper is retained for
+/// the LegacyFlat fallback path only.
+///
+/// **LegacyFlat fallback:** if `<workers>/cgroup.procs` already
+/// contains pids (operator upgraded from the flat-cgroup version
+/// mid-run), enabling subtree_control would fail with `EBUSY`.
+/// Detection: a non-empty `<workers>/cgroup.procs` after the swap
+/// write. Action: skip step 5 entirely and emit one warn line; the
+/// caller continues to write pids into `<workers>/cgroup.procs` via
+/// the legacy helper until the next clean restart. This phase keeps
+/// the API shape unchanged for upstream callers; the tagged-result
+/// surface (Nested vs LegacyFlat) is introduced in a later phase.
 ///
 /// Returns the constructed workers path so the caller can hand it
-/// (or its `cgroup.procs` child) to the spawn site.
+/// (or its `cgroup.procs` child / per-worker leaf) to the spawn site.
 pub(super) fn write_workers_subgroup(
     leaf: &Path,
     reserved_bytes: u64,
@@ -128,20 +151,91 @@ pub(super) fn write_workers_subgroup(
     // `--memory-swap=-1` is otherwise silently overridden.
     std::fs::write(workers_path.join("memory.swap.max"), "max").map_err(CgroupSetupError::Io)?;
 
+    if workers_cgroup_procs_has_pids(&workers_path)? {
+        tracing::warn!(
+            workers_path = %workers_path.display(),
+            "workers/ has existing pids; subtree_control deferred — running in flat mode this run. \
+             Per-worker memory observability will be unavailable until the next clean restart."
+        );
+        return Ok(workers_path);
+    }
+
+    for controller in CONTROLLERS {
+        enable_controller(&workers_path, controller)?;
+    }
+    tracing::info!(
+        workers_path = %workers_path.display(),
+        "workers/ subtree_control enabled (+memory +pids); per-worker subgroups ready"
+    );
+
     Ok(workers_path)
 }
 
-/// Append `pid` (decimal) to `<workers>/cgroup.procs`. The kernel
-/// migrates the named pid into the workers subgroup at the moment
-/// of the write — used in the `pre_exec` closure of every worker
-/// `Command` so the child lands in the workers subgroup BEFORE
-/// `execve(2)` returns.
+/// Materialise `<workers>/worker-<id>/` so the spawn site can attach
+/// the worker's pid to a leaf cgroup (the parent `workers/` is an
+/// interior node after [`write_workers_subgroup`] enables
+/// subtree_control on it). Idempotent: `create_dir_all` is
+/// re-entrant; the `memory.swap.max` write is overwrite.
+///
+/// Intentionally writes NO `memory.max`: per-worker enforcement is
+/// out of scope; the aggregate cap lives on `workers/memory.max`.
+/// `memory.swap.max=max` is written for the same load-bearing reason
+/// documented on [`write_workers_subgroup`] — cgroup-v2 children
+/// default to zero-swap and must be told otherwise explicitly.
+///
+/// Returns the absolute path to the worker leaf so the caller can
+/// hand it (or its `cgroup.procs` child) to the spawn site.
+pub(super) fn write_worker_subgroup(
+    workers_path: &Path,
+    worker_id: u32,
+) -> Result<PathBuf, CgroupSetupError> {
+    let worker_path = workers_path.join(format!("worker-{worker_id}"));
+    std::fs::create_dir_all(&worker_path).map_err(CgroupSetupError::Io)?;
+    std::fs::write(worker_path.join("memory.swap.max"), "max").map_err(CgroupSetupError::Io)?;
+    Ok(worker_path)
+}
+
+/// Read `<workers>/cgroup.procs`; return `true` if any non-whitespace
+/// content is present (i.e. the kernel has at least one pid attached
+/// to the workers subgroup). Used to detect the LegacyFlat upgrade
+/// path — a non-empty workers/cgroup.procs at init time means the
+/// previous run left pids attached at the workers/ level (flat
+/// layout), so enabling subtree_control on workers/ would fail with
+/// EBUSY per the cgroup-v2 "no internal processes" rule.
+///
+/// `NotFound` means the kernel has not yet created `cgroup.procs`
+/// for a freshly-mkdir'd cgroup; treat as empty (no pids attached).
+/// Any other I/O error propagates so callers see kernel/mountpoint
+/// anomalies loudly.
+fn workers_cgroup_procs_has_pids(workers_path: &Path) -> Result<bool, CgroupSetupError> {
+    match std::fs::read_to_string(workers_path.join("cgroup.procs")) {
+        Ok(content) => Ok(!content.trim().is_empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(CgroupSetupError::Io(e)),
+    }
+}
+
+/// Append `pid` (decimal) to `<workers>/cgroup.procs` directly.
+/// **LegacyFlat fallback path only** — once
+/// [`write_workers_subgroup`] enables subtree_control on `workers/`,
+/// this write fails with `EBUSY` per the cgroup-v2 "no internal
+/// processes" rule. The fallback is taken only when subtree_control
+/// is deferred (existing pids found at init); see the LegacyFlat
+/// section of [`write_workers_subgroup`].
 ///
 /// `std::fs::write` opens with `O_WRONLY | O_CREAT | O_TRUNC`; the
 /// kernel ignores the truncation flag on `cgroup.procs` (it's a
 /// pseudo-file accepting append-style writes). The write is a single
 /// syscall, fork-safe, and never allocates beyond a small stack
 /// buffer for the decimal digits.
-pub(super) fn write_attach_pid(workers_path: &Path, pid: u32) -> std::io::Result<()> {
+///
+/// Currently unused at the call-site level — the production caller
+/// is wired in a later phase that introduces the tagged Nested /
+/// LegacyFlat return surface on the orchestrator. Kept here behind
+/// `pub(crate)` (and `#[allow(dead_code)]`) so the fallback writer
+/// lives alongside its sibling subtree_control logic instead of
+/// being parachuted in later from a separate module.
+#[allow(dead_code)]
+pub(crate) fn write_attach_pid_to_workers(workers_path: &Path, pid: u32) -> std::io::Result<()> {
     std::fs::write(workers_path.join("cgroup.procs"), pid.to_string())
 }
