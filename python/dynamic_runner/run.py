@@ -666,6 +666,10 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         secondary_id="<template>",
         num_workers=workers_per_secondary,
         max_resources=_rs.ResourceMap({"memory": ram_per_secondary}),
+        # `--memprofile` opt-in forwarded uniformly with the slurm and
+        # local-multi-computer dispatch paths (Rust resolves the actual
+        # output path; Python just forwards the bool).
+        memprofile_enabled=getattr(args, "memprofile", False),
     )
     # Pre-staged-source plumbing: `_collect_binaries` already returned
     # `[]` and set `args._setup_deferred_to_secondary` when
