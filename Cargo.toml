@@ -57,6 +57,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 base64 = "0.22"
 url = "2"
+zstd = { version = "0.13", default-features = false }
 
 # Internal crates
 dynrunner-core = { path = "crates/dynrunner-core" }
