@@ -8,8 +8,8 @@ pub mod memprofile;
 pub mod stats;
 
 pub use cgroup::{
-    attach_pid as attach_worker_cgroup_pid, setup_worker_cgroup, setup_worker_cgroup_default,
-    CgroupSetupError, NestedCgroupHandle,
+    prepare_worker_subgroup, setup_worker_cgroup, setup_worker_cgroup_default, CgroupSetupError,
+    NestedCgroupHandle, SubcgroupHandle,
 };
 pub use manager::{
     LocalManager, LocalManagerConfig, RestartContext, RestartPredicate, WorkerFactory,
