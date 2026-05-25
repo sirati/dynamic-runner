@@ -31,7 +31,7 @@ use crate::estimator::PyMemoryEstimatorBridge;
 use crate::task_def::TypeRegistry;
 
 mod new;
-mod run;
+pub(crate) mod run;
 
 #[pyclass(name = "RustSecondaryCoordinator")]
 pub(crate) struct PySecondaryCoordinator {
@@ -135,9 +135,10 @@ pub(crate) struct PySecondaryCoordinator {
     pub(super) mem_manager_reserved_bytes: Option<u64>,
     /// Operator-supplied `--memprofile` opt-in. Forwarded to the
     /// inner `SecondaryConfig` at `run()` entry via the dedicated
-    /// `resolve_secondary_memprofile_dir` helper, which picks the
-    /// SLURM wrapper bind-mount as the output path when the
-    /// container is the runtime. See
+    /// `resolve_secondary_memprofile_dir` helper, which prefers
+    /// the operator's `output_dir` (always set) and falls back to
+    /// the SLURM wrapper bind-mount when the caller intentionally
+    /// supplies no dir. See
     /// `dynrunner_manager_distributed::SecondaryConfig::output_dir`.
     pub(super) memprofile_enabled: bool,
 }

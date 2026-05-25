@@ -70,6 +70,7 @@ fn arm_watchdog_no_peers(
         unfulfillable_reinject_max_per_task: None,
         mem_manager_reserved_bytes: None,
         output_dir: None,
+        memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,
@@ -317,6 +318,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
             let binaries = vec![
                 make_binary("a", 50),
@@ -452,6 +454,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         unfulfillable_reinject_max_per_task: None,
         mem_manager_reserved_bytes: None,
         output_dir: None,
+        memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
         ChannelPrimaryTransportEnd<TestId>,

@@ -112,6 +112,7 @@ task_args = SimpleNamespace()
             /* scheduler_config */ None,
             /* panik_watcher_paths */ None,
             /* panik_watcher_poll_interval_secs */ 10.0,
+            /* memprofile_enabled */ false,
         )?;
         Py::new(py, mgr)
     }

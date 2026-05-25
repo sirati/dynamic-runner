@@ -25,6 +25,14 @@ pub const SLURM_SECONDARY_OUTPUT_DIR: &str = "/app/out-network";
 /// resolver pin the same on-disk layout (`{output_dir}/memprofile/...`).
 pub const MEMPROFILE_SUBDIR: &str = "memprofile";
 
+/// Filename for the per-secondary aggregate memuse log appended to
+/// at every task completion. Single source of truth so every
+/// dispatch path (LocalManager direct, SLURM secondary, in-process
+/// distributed secondary, multi-computer-local secondary) picks
+/// the same filename without re-stating the literal at each call
+/// site. See `crate::memuse::log_resource_usage` for the writer.
+pub const MEMUSE_LOG_FILENAME: &str = "memuse.log";
+
 /// Configuration for [`super::MemProfileSampler`].
 ///
 /// `output_dir` is the run-level directory (e.g.

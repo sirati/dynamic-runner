@@ -226,6 +226,7 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         unfulfillable_reinject_max_per_task: None,
         mem_manager_reserved_bytes: None,
         output_dir: None,
+        memuse_log_path: None,
     }
 }
 

@@ -294,7 +294,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         }
     }
 
-    /// Log resource usage to memuse.log in CSV format: size,estimated_mem,actual_mem,filename,status
+    /// Log resource usage to memuse.log in CSV format: size,estimated_mem,actual_mem,filename,status.
+    /// Thin wrapper that forwards to the crate-level shared writer
+    /// in [`crate::memuse::log_resource_usage`]; the secondary
+    /// coordinator calls the same primitive from its own
+    /// `TaskCompleted` handler so both dispatch paths produce
+    /// identical row shapes.
     pub(super) fn log_resource_usage(
         &self,
         binary: Option<&TaskInfo<I>>,
@@ -302,39 +307,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         actual: &ResourceMap,
         errored: bool,
     ) {
-        let log_path = match &self.config.memuse_log_path {
-            Some(p) => p,
-            None => return,
+        let Some(log_path) = self.config.memuse_log_path.as_deref() else {
+            return;
         };
-        let binary = match binary {
-            Some(b) => b,
-            None => return,
-        };
-
-        let status = if errored { "ERROR" } else { "OK" };
-        let filename = binary
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        let estimated_mem = estimated.get(&ResourceKind::memory());
-        let actual_mem = actual.get(&ResourceKind::memory());
-
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
-            Ok(mut f) => {
-                // Format: size,estimated,actual,filename,status
-                let _ = writeln!(f, "{},{},{},{},{}", binary.size, estimated_mem, actual_mem, filename, status);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to write memuse log");
-            }
-        }
+        crate::memuse::log_resource_usage(log_path, binary, estimated, actual, errored);
     }
 
     pub(super) fn record_result(&mut self, result: &TaskResult, binary: Option<&TaskInfo<I>>) {

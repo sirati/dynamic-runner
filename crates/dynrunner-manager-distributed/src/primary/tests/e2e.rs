@@ -315,6 +315,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     unfulfillable_reinject_max_per_task: None,
                     mem_manager_reserved_bytes: None,
                     output_dir: None,
+                    memuse_log_path: None,
                 };
                 let mut secondary = SecondaryCoordinator::new(
                     config,

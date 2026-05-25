@@ -185,6 +185,7 @@ async fn secondary_with_real_workers_processes_tasks() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let binaries = vec![
@@ -255,6 +256,7 @@ async fn secondary_multi_worker_processes_tasks() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..6)
@@ -331,6 +333,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let binaries: Vec<TaskInfo<TestId>> = (0..15)
@@ -433,6 +436,7 @@ async fn stage_file_then_assign_task_succeeds() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let secondary_id_clone = config.secondary_id.clone();

@@ -209,6 +209,9 @@ impl PyObserverLateJoiner {
                     // Observer doesn't run workers; no per-task
                     // memprofile to write. Leave unset.
                     output_dir: None,
+                    // Observer doesn't run workers; no per-task
+                    // memuse rows to append. Leave unset.
+                    memuse_log_path: None,
                 };
 
                 // No-op factory: the run loop's only `factory`

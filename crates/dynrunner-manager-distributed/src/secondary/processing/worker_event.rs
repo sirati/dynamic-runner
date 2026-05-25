@@ -64,6 +64,25 @@ where
                 {
                     self.local_tasks_run += 1;
                 }
+                // Capture the per-worker estimated + actual usage
+                // BEFORE `clear_task` zeroes the slot. Mirrors
+                // `LocalManager::handle_task_completed`'s ordering;
+                // the snapshots feed the shared memuse writer so
+                // every secondary's `memuse.log` row carries the
+                // same shape as the LocalManager's.
+                let estimated_for_memuse =
+                    self.pool.workers[worker_id as usize].estimated_resources.clone();
+                let actual_for_memuse =
+                    self.pool.workers[worker_id as usize].actual_usage.clone();
+                if let Some(log_path) = self.config.memuse_log_path.as_deref() {
+                    dynrunner_manager_local::memuse::log_resource_usage(
+                        log_path,
+                        binary.as_ref(),
+                        &estimated_for_memuse,
+                        &actual_for_memuse,
+                        !result.success,
+                    );
+                }
                 // Reclaim protocol state from the spawned poll task
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();

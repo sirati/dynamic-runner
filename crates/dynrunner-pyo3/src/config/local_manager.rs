@@ -159,7 +159,15 @@ impl PyLocalManagerConfig {
             restart_predicate,
             retry_max_attempts: self.retry_max_attempts,
             print_pid: self.print_pid,
-            memuse_log_path: self.memuse_log_path.clone(),
+            // Shared derivation: the explicit `memuse_log_path`
+            // kwarg wins (test fixtures + custom-location use
+            // case); otherwise default to `{output_dir}/memuse.log`
+            // when an output_dir is present. Single source of
+            // truth for the filename via `MEMUSE_LOG_FILENAME`.
+            memuse_log_path: dynrunner_manager_local::memuse::derive_memuse_log_path(
+                self.output_dir.as_deref(),
+                self.memuse_log_path.as_deref(),
+            ),
             stage_timeouts,
             low_resource_thresholds: self.low_resource_thresholds.to_rust(),
             resource_check_interval: Duration::from_secs_f64(self.resource_check_interval_secs),
@@ -231,5 +239,72 @@ mod tests {
         let resolved = resolve_memprofile_dir(true, Some(std::path::Path::new("/tmp/run")))
             .expect("memprofile_enabled + output_dir must compose");
         assert_eq!(resolved, PathBuf::from("/tmp/run/memprofile"));
+    }
+
+    use super::PyLocalManagerConfig;
+    use crate::config::resources::PyResourceMap;
+    use pyo3::prelude::*;
+
+    /// Construct a minimal-kwargs `PyLocalManagerConfig` for the
+    /// `to_rust` tests below. `output_dir` and `memuse_log_path`
+    /// are the only fields these tests vary; everything else is
+    /// stock default so the tests focus on the memuse derivation
+    /// in isolation.
+    fn make_config(
+        output_dir: Option<PathBuf>,
+        memuse_log_path: Option<PathBuf>,
+    ) -> PyLocalManagerConfig {
+        PyLocalManagerConfig {
+            num_workers: 1,
+            max_resources: PyResourceMap::from_single("memory", 64 * 1024 * 1024),
+            low_resource_thresholds: PyResourceMap::from_single("memory", 300 * 1024 * 1024),
+            always_restart_worker: false,
+            restart_predicate: None,
+            retry_max_attempts: 1,
+            print_pid: false,
+            memuse_log_path,
+            stage_timeouts_secs: Default::default(),
+            resource_check_interval_secs: 0.1,
+            phase_status_log_intervals_secs: vec![60.0],
+            scheduler_config: Default::default(),
+            log_oom_watcher: false,
+            output_dir,
+            memprofile_enabled: false,
+        }
+    }
+
+    #[test]
+    fn default_memuse_log_path_derives_from_output_dir() {
+        // `--output` set, no explicit `memuse_log_path` → default
+        // to `{output_dir}/memuse.log`. The fix that closes the
+        // "memuse silently never written on non-default dispatch
+        // paths" gap (matching what `RustLocalManager` already
+        // does directly via the shared helper).
+        Python::attach(|py| {
+            let cfg = make_config(Some(PathBuf::from("/tmp/run-out")), None);
+            let rust = cfg.to_rust(py);
+            assert_eq!(
+                rust.memuse_log_path,
+                Some(PathBuf::from("/tmp/run-out/memuse.log")),
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_memuse_log_path_is_honoured() {
+        // Explicit `memuse_log_path` wins over the default
+        // derivation; preserves the test-fixture and custom-
+        // location use cases.
+        Python::attach(|py| {
+            let cfg = make_config(
+                Some(PathBuf::from("/tmp/run-out")),
+                Some(PathBuf::from("/var/log/custom.csv")),
+            );
+            let rust = cfg.to_rust(py);
+            assert_eq!(
+                rust.memuse_log_path,
+                Some(PathBuf::from("/var/log/custom.csv")),
+            );
+        });
     }
 }

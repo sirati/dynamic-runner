@@ -134,4 +134,12 @@ pub(crate) struct PyDistributedManager {
     pub(super) panik_watcher_paths: Vec<PathBuf>,
     /// Poll cadence (seconds) for the panik watcher.
     pub(super) panik_watcher_poll_interval_secs: f64,
+    /// Operator-supplied `--memprofile` opt-in. Forwarded from the
+    /// `secondary_template`'s `memprofile_enabled` field by the
+    /// Python `run_distributed` bridge. Combined with
+    /// `self.output_dir` (always set) at `run()` entry via the
+    /// shared resolver helper so the in-process secondaries
+    /// receive the same memprofile output dir as their
+    /// out-of-process counterparts.
+    pub(super) memprofile_enabled: bool,
 }

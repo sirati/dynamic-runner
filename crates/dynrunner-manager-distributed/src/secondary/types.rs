@@ -271,12 +271,13 @@ pub struct SecondaryConfig {
     /// Run-level output directory for memprofile artifacts.
     ///
     /// Resolved at the PyO3 boundary
-    /// (`PySecondaryCoordinator::run`) from the operator's
-    /// `--memprofile` flag plus the
+    /// (`PySecondaryCoordinator::run` and `PyDistributedManager::run`)
+    /// from the operator's `--memprofile` flag plus the secondary's
+    /// operator-supplied `output_dir` (preferred) or the
     /// [`dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR`]
-    /// constant; `Some(path)` means "operator opted in AND the
-    /// SLURM wrapper's `/app/out-network` bind-mount is present".
-    /// `None` (default) disables profiling entirely.
+    /// constant (legacy backstop). `Some(path)` means "operator
+    /// opted in AND at least one anchor is available". `None`
+    /// (default) disables profiling entirely.
     ///
     /// `Some(path)` drives two coupled effects through
     /// `SecondaryCoordinator::run_until_setup_or_done`:
@@ -297,6 +298,17 @@ pub struct SecondaryConfig {
     /// `None` leaves the workers cgroup behaviour untouched and
     /// every hook short-circuits as a no-op.
     pub output_dir: Option<PathBuf>,
+
+    /// Path the per-task `WorkerEvent::TaskCompleted` handler
+    /// appends a CSV row to for every task completion. Mirrors
+    /// `LocalManagerConfig::memuse_log_path`; resolved at the
+    /// PyO3 boundary via
+    /// [`dynrunner_manager_local::memuse::derive_memuse_log_path`]
+    /// from the operator's run-level output dir (default:
+    /// `{output_dir}/memuse.log`). `None` keeps the secondary
+    /// silent — preserves the test-fixture flexibility every
+    /// other dispatch path has.
+    pub memuse_log_path: Option<PathBuf>,
 }
 
 impl Default for SecondaryConfig {
@@ -327,6 +339,7 @@ impl Default for SecondaryConfig {
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
             output_dir: None,
+            memuse_log_path: None,
         }
     }
 }
