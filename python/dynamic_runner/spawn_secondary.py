@@ -90,6 +90,19 @@ def build_subprocess_spawn(
     multiple secondaries share one host's RAM, so this is left
     unchanged from the pre-fix behaviour pending an explicit memory
     policy decision.
+
+    **Task-specific flags** (``--memprofile``, ``--unified-vocab``,
+    anything else the consumer's argparse declared) are propagated
+    verbatim via :data:`args.forwarded_argv`, which is the operator's
+    ``sys.argv[1:]`` filtered through
+    :func:`dynamic_runner._forwarded_argv.filter_framework_argv` —
+    framework-regenerated flags (``--secondary``, ``--secondary-id``,
+    ``--secondary-quic-port``, ``--src-network``, ``--cores``,
+    ``--max-memory``, ``--log-dir``) are stripped there so they don't
+    duplicate the explicit emissions above. Boolean store_true flags
+    that ARE manually re-emitted (``--raw-logs``, ``--log-oom-watcher``)
+    may appear twice if the operator passed them; argparse's
+    store_true tolerates that.
     """
 
     def spawn_secondary(
@@ -118,6 +131,13 @@ def build_subprocess_spawn(
             cmd.append("--raw-logs")
         if getattr(args, "log_oom_watcher", False):
             cmd.append("--log-oom-watcher")
+        # Task-specific + memprofile + any other operator flags the
+        # consumer's argparse declared. Pre-filtered by
+        # ``filter_framework_argv`` so the framework-regenerated flags
+        # emitted above don't duplicate here.
+        forwarded = getattr(args, "forwarded_argv", None)
+        if forwarded:
+            cmd += list(forwarded)
         return SubprocessSpec(argv=cmd)
 
     return spawn_secondary
