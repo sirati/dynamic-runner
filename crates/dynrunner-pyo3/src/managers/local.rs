@@ -303,6 +303,12 @@ impl PyLocalManager {
                 .map(|s| std::time::Duration::from_secs_f64(*s))
                 .collect(),
             log_oom_watcher: self.log_oom_watcher,
+            // `output_dir` is the run-level directory the
+            // memprofile sampler writes per-task `.jsonl.zst` files
+            // to. `None` disables profiling — the Python CLI is the
+            // surface where the operator opts in; until that lands
+            // here the local-manager binding stays opt-out.
+            output_dir: None,
         };
 
         // Per-type subprocess dispatch: the factory carries the full

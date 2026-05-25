@@ -147,6 +147,10 @@ impl PyLocalManagerConfig {
                 .map(|s| Duration::from_secs_f64(*s))
                 .collect(),
             log_oom_watcher: self.log_oom_watcher,
+            // The memprofile sampler's run-level output directory.
+            // Until the Python CLI surfaces a flag for it, the local-
+            // manager binding stays opt-out (sampler disabled).
+            output_dir: None,
         }
     }
 }
