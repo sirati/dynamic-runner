@@ -345,7 +345,6 @@ impl PySecondaryCoordinator {
                     manual_start_worker: false,
                     worker_spec,
                     child_processes: Vec::new(),
-                    workers_cgroup_procs: None,
                 };
 
                 let mut secondary: SecondaryCoordinator<_, _, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(

@@ -111,28 +111,32 @@ impl Default for LocalManagerConfig {
 /// The manager is transport-agnostic. The caller provides a factory that
 /// creates new `ManagerEndpoint` connections (e.g. socketpair, channel).
 pub trait WorkerFactory<M: ManagerEndpoint> {
-    /// Receive the workers/ cgroup procs path the pool's nested-cgroup
-    /// setup produced (or `None` to fall back to the flat layout).
-    /// Default impl is a no-op so factories that don't spawn OS
-    /// subprocesses (in-process channel test factories) inherit
-    /// graceful ignore semantics. Real subprocess factories override
-    /// this to stash the path and add a `pre_exec` closure to every
-    /// `Command` that writes the child PID into `cgroup.procs`
-    /// post-fork / pre-exec.
-    ///
-    /// Single concern: hand the cgroup boundary across the
-    /// pool/factory interface. The factory does NOT learn anything
-    /// about cgroup-v2 detection, controller probing, or
-    /// `memory.max` math — those live entirely in the
-    /// [`crate::cgroup`] module.
-    fn set_workers_cgroup(&mut self, _handle: Option<crate::cgroup::NestedCgroupHandle>) {}
-
     /// Create a new transport connection for the given worker.
     /// Called at initial startup and on restart.
     /// Returns (transport, optional_pid) on success.
     /// Returns an error string if the spawn fails (caller decides whether to
     /// abort the run, log and continue with fewer workers, etc.).
-    fn spawn_worker(&mut self, worker_id: WorkerId) -> Result<(M, Option<u32>), String>;
+    ///
+    /// `subcgroup` is the per-worker sub-cgroup leaf the pool prepared
+    /// (or `None` if the pool is running without nested cgroups: graceful
+    /// fallback, in-process channel test factories, operator opt-out).
+    /// Subprocess-spawning factories thread the handle into a `pre_exec`
+    /// closure that writes the post-fork child pid to
+    /// `<subcgroup>/cgroup.procs`; factories that don't spawn OS
+    /// subprocesses ignore it. The pool retains ownership of the
+    /// handle for the worker's lifetime — the factory only borrows it
+    /// for the duration of the spawn call.
+    ///
+    /// Single concern: hand the cgroup boundary across the
+    /// pool/factory interface, per spawn. The factory does NOT learn
+    /// anything about cgroup-v2 detection, controller probing, or
+    /// `memory.max` math — those live entirely in the
+    /// [`crate::cgroup`] module.
+    fn spawn_worker(
+        &mut self,
+        worker_id: WorkerId,
+        subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
+    ) -> Result<(M, Option<u32>), String>;
 
     /// Spawn (or respawn) a worker bound to a specific `TypeId`.
     ///
@@ -148,6 +152,8 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
     /// [`spawn_worker`], which keeps single-type runs and the test
     /// matrix observably unchanged.
     ///
+    /// `subcgroup` has the same meaning as in [`Self::spawn_worker`].
+    ///
     /// Returning an error here mirrors `spawn_worker`'s contract:
     /// the caller decides whether the slot is fatally dead (abort
     /// the run) or recoverable on the next pass.
@@ -155,8 +161,9 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
         &mut self,
         worker_id: WorkerId,
         _type_id: &TypeId,
+        subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
     ) -> Result<(M, Option<u32>), String> {
-        self.spawn_worker(worker_id)
+        self.spawn_worker(worker_id, subcgroup)
     }
 }
 

@@ -240,7 +240,6 @@ impl PyObserverLateJoiner {
                     manual_start_worker: false,
                     worker_spec: None,
                     child_processes: Vec::new(),
-                    workers_cgroup_procs: None,
                 };
 
                 let mut secondary: SecondaryCoordinator<
