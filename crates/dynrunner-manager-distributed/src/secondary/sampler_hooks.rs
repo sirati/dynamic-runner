@@ -83,11 +83,10 @@ where
     }
 
     /// Notify the sampler that the task identified by `task_id` has
-    /// completed. No-op when the sampler is disabled or when
-    /// `task_id` is `None` (legacy task without an ID — the assign
-    /// hook will have skipped the same id, so the sampler holds no
-    /// state to flush).
-    pub(super) fn notify_sampler_completed(&self, task_id: Option<String>) {
+    /// completed. No-op when the sampler is disabled. `task_id` is
+    /// required (every task carries one per the framework's
+    /// boundary contract).
+    pub(super) fn notify_sampler_completed(&self, task_id: String) {
         let Some(sampler) = self.sampler.as_ref() else {
             return;
         };

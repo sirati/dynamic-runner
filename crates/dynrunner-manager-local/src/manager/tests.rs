@@ -519,7 +519,7 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
             type_id: TypeId::from(type_str),
             affinity_id: None,
             payload: serde_json::Value::Null,
-            task_id: None,
+            task_id: name.into(),
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
@@ -1000,16 +1000,16 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
         );
         manager.install_sampler_for_test(sampler);
 
-        // Drive the hooks. `binary.task_id == Some("task-A")` so the
+        // Drive the hooks. `binary.task_id == "task-A"` so the
         // expected file is `task-A.worker-0.memprofile.jsonl.zst`.
         let mut binary = make_binary("a", 50);
-        binary.task_id = Some("task-A".to_string());
+        binary.task_id = "task-A".to_string();
         manager.notify_sampler_assigned(0, &binary);
 
         // Let several ticks fire so the writer accumulates samples.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        manager.notify_sampler_completed(Some("task-A".to_string()));
+        manager.notify_sampler_completed("task-A".to_string());
 
         // Shutdown drains the sampler's queue and joins the
         // background task, so the on-disk file is final by the time

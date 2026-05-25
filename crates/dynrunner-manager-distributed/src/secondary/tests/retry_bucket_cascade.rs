@@ -74,7 +74,7 @@ fn make_binary(name: &str, phase: &str) -> TaskInfo<TestId> {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: Some(format!("task-{name}")),
+        task_id: format!("task-{name}"),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

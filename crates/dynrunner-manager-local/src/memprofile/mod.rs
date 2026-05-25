@@ -86,23 +86,20 @@ impl MemProfileSampler {
         }
     }
 
-    /// Open a per-task profile file and start sampling. `task_id ==
-    /// None` is the documented "legacy task without ID" path: log at
-    /// debug level and skip silently. `task_id` containing `..` or an
-    /// absolute-path prefix is rejected with a warn — defensive
+    /// Open a per-task profile file and start sampling. `task_id` is
+    /// required (non-empty) — the framework's boundary contract
+    /// guarantees every TaskInfo carries one, so the legacy
+    /// "skip-on-None" path is gone. `task_id` containing `..` or an
+    /// absolute-path prefix is still rejected with a warn (defensive
     /// against malformed identifiers that would otherwise let a task
-    /// write outside `output_dir`.
+    /// write outside `output_dir`).
     pub fn on_task_assigned(
         &self,
-        task_id: Option<String>,
+        task_id: String,
         worker_id: u32,
         subcgroup_dir: PathBuf,
         started_at: Instant,
     ) {
-        let Some(task_id) = task_id else {
-            tracing::debug!(worker_id, "memprofile skipped: task_id absent");
-            return;
-        };
         if path_is_unsafe(&task_id) {
             tracing::warn!(
                 task_id,
@@ -120,11 +117,9 @@ impl MemProfileSampler {
     }
 
     /// Finalise the per-task file. Idempotent if the task was never
-    /// assigned (no-op).
-    pub fn on_task_completed(&self, task_id: Option<String>) {
-        if let Some(task_id) = task_id {
-            let _ = self.tx.send(Cmd::Complete { task_id });
-        }
+    /// assigned (no-op inside the tick loop's `handle_complete`).
+    pub fn on_task_completed(&self, task_id: String) {
+        let _ = self.tx.send(Cmd::Complete { task_id });
     }
 
     /// Finalise every open profile for this worker. Used when the
@@ -256,6 +251,13 @@ fn handle_assign(
     subcgroup_dir: PathBuf,
     started_at: Instant,
 ) {
+    // Task ids are unique across the run by `PendingPool::extend`
+    // validation; a collision here would mean validation leaked. Loud
+    // in dev, free in release.
+    debug_assert!(
+        !active.contains_key(&task_id),
+        "memprofile: task_id `{task_id}` reused; PendingPool dedup leaked",
+    );
     let path = config
         .output_dir
         .join(format!("{task_id}.worker-{worker_id}.memprofile.jsonl.zst"));

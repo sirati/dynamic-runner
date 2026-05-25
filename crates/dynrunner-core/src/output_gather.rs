@@ -171,18 +171,19 @@ mod tests {
         TaskOutputs(m)
     }
 
+    type OutputsLookup = Box<dyn Fn(&str) -> Option<TaskOutputs>>;
+    type DepsLookup = Box<dyn Fn(&str) -> Option<Vec<TaskDep>>>;
+
     /// Build the two lookups from a pair of HashMaps. The closures
     /// returned own clones of the maps so the test bodies stay
     /// concise.
     fn lookups(
         outputs: HashMap<String, TaskOutputs>,
         deps: HashMap<String, Vec<TaskDep>>,
-    ) -> (
-        impl Fn(&str) -> Option<TaskOutputs>,
-        impl Fn(&str) -> Option<Vec<TaskDep>>,
-    ) {
-        let outputs_for = move |task_id: &str| outputs.get(task_id).cloned();
-        let deps_of = move |task_id: &str| deps.get(task_id).cloned();
+    ) -> (OutputsLookup, DepsLookup) {
+        let outputs_for: OutputsLookup =
+            Box::new(move |task_id: &str| outputs.get(task_id).cloned());
+        let deps_of: DepsLookup = Box::new(move |task_id: &str| deps.get(task_id).cloned());
         (outputs_for, deps_of)
     }
 

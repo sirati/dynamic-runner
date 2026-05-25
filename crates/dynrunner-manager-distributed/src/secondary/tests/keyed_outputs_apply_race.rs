@@ -58,7 +58,7 @@ fn mk_task(name: &str) -> TaskInfo<TestId> {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: Some(name.into()),
+        task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
@@ -182,7 +182,7 @@ async fn pre_apply_dispatch_observes_empty_outputs() {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: Some("dependent".into()),
+        task_id: "dependent".into(),
         task_depends_on: vec![TaskDep {
             task_id: "producer".into(),
             inherit_outputs: false,

@@ -68,12 +68,13 @@ impl TaskCompletedListener for PyTaskCompletedListener {
         // cost is one attach + one call; the apply path's emit is
         // non-blocking so this latency is invisible to the CRDT.
         let outcome: PyResult<()> = Python::attach(|py| {
-            // `task_id` and `error_kind` round-trip through
-            // `Option<&str>` → Python `str | None` automatically;
-            // PyO3's IntoPyObject impl for `Option<T>` handles the
-            // None case.
+            // `task_id` is non-optional per the framework's boundary
+            // contract; it round-trips as Python `str`. `error_kind`
+            // remains optional (the success arm leaves it `None`)
+            // and goes through `Option<&str> → str | None` via
+            // PyO3's IntoPyObject for `Option<T>`.
             let args = (
-                event.task_id.as_deref(),
+                event.task_id.as_str(),
                 event.success,
                 event.error_kind.as_deref(),
             );
@@ -143,10 +144,13 @@ mod tests {
     }
 
     /// Pull a captured `calls` entry out of the module globals.
+    /// `task_id` is always a Python `str` (the framework's boundary
+    /// contract guarantees a non-empty id on every event);
+    /// `error_kind` remains `str | None` (success → `None`).
     fn captured_call(
         globals: &Py<PyAny>,
         idx: usize,
-    ) -> (Option<String>, bool, Option<String>) {
+    ) -> (String, bool, Option<String>) {
         Python::attach(|py| {
             let g = globals.bind(py);
             let calls = g
@@ -158,12 +162,7 @@ mod tests {
             let list = calls.cast::<PyList>().unwrap();
             let entry = list.get_item(idx).unwrap();
             let tuple = entry.cast::<pyo3::types::PyTuple>().unwrap();
-            let task_id_obj = tuple.get_item(0).unwrap();
-            let task_id = if task_id_obj.is_none() {
-                None
-            } else {
-                Some(task_id_obj.extract::<String>().unwrap())
-            };
+            let task_id: String = tuple.get_item(0).unwrap().extract().unwrap();
             let success: bool = tuple.get_item(1).unwrap().extract().unwrap();
             let error_kind_obj = tuple.get_item(2).unwrap();
             let error_kind = if error_kind_obj.is_none() {
@@ -181,13 +180,13 @@ mod tests {
         let (callable, globals) = make_recording_listener();
         let bridge = PyTaskCompletedListener::new(callable);
         bridge.on_event(&TaskCompletedEvent {
-            task_id: Some("alpha".into()),
+            task_id: "alpha".into(),
             task_hash: "h-alpha".into(),
             success: true,
             error_kind: None,
         });
         let (task_id, success, error_kind) = captured_call(&globals, 0);
-        assert_eq!(task_id.as_deref(), Some("alpha"));
+        assert_eq!(task_id, "alpha");
         assert!(success);
         assert!(error_kind.is_none());
     }
@@ -200,31 +199,15 @@ mod tests {
         let (callable, globals) = make_recording_listener();
         let bridge = PyTaskCompletedListener::new(callable);
         bridge.on_event(&TaskCompletedEvent {
-            task_id: Some("beta".into()),
+            task_id: "beta".into(),
             task_hash: "h-beta".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
         });
         let (task_id, success, error_kind) = captured_call(&globals, 0);
-        assert_eq!(task_id.as_deref(), Some("beta"));
+        assert_eq!(task_id, "beta");
         assert!(!success);
         assert_eq!(error_kind.as_deref(), Some("non_recoverable"));
-    }
-
-    /// `task_id = None` rounds-trips to Python `None`. Covers the
-    /// branch where a `TaskInfo.task_id` was never supplied.
-    #[test]
-    fn task_completed_listener_handles_none_task_id() {
-        let (callable, globals) = make_recording_listener();
-        let bridge = PyTaskCompletedListener::new(callable);
-        bridge.on_event(&TaskCompletedEvent {
-            task_id: None,
-            task_hash: "h-x".into(),
-            success: true,
-            error_kind: None,
-        });
-        let (task_id, _success, _error_kind) = captured_call(&globals, 0);
-        assert!(task_id.is_none());
     }
 
     /// A panicking Python listener must surface as a Rust panic so
@@ -257,7 +240,7 @@ mod tests {
         // `bridge.on_event(...)` returns cleanly and the test passes
         // by virtue of NOT panicking.
         bridge.on_event(&TaskCompletedEvent {
-            task_id: Some("oops".into()),
+            task_id: "oops".into(),
             task_hash: "h-oops".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
@@ -292,7 +275,7 @@ mod tests {
         let bridge = PyTaskCompletedListener::new(callable);
         // Must NOT propagate; the bridge swallows to tracing::warn.
         bridge.on_event(&TaskCompletedEvent {
-            task_id: None,
+            task_id: "explodes".into(),
             task_hash: "h".into(),
             success: false,
             error_kind: Some("recoverable".into()),

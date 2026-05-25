@@ -234,7 +234,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Blocked { task, .. }
                 | TaskState::Cancelled { task, .. } => task,
             };
-            (task.task_id.as_deref() == Some(task_id)).then_some(h.as_str())
+            (task.task_id == task_id).then_some(h.as_str())
         })
     }
 

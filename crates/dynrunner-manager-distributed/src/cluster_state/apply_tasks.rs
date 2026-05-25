@@ -88,9 +88,9 @@ impl<I: Identifier> ClusterState<I> {
             return;
         };
         let Some(task_id) = self.task_id_for_hash(hash) else {
-            // Anonymous task: no key under which to cache outputs.
-            // Dependents cannot reference an anonymous task by id, so
-            // there is no consumer for the cache entry anyway.
+            // Hash with no entry in the task ledger: late-arriving
+            // mutation against a task this replica never saw. Nothing
+            // to key the cache against.
             return;
         };
         match serde_json::from_slice::<DonePayload>(&bytes) {
@@ -111,10 +111,12 @@ impl<I: Identifier> ClusterState<I> {
         }
     }
 
-    /// Private helper for `record_task_outputs`: extract a clone of the
-    /// `task_id` for the entry at `hash`, regardless of which
-    /// `TaskState` variant it currently occupies. Anonymous tasks
-    /// (`TaskInfo.task_id == None`) yield `None`.
+    /// Private helper for `record_task_outputs`: extract a clone of
+    /// the `task_id` for the entry at `hash`, regardless of which
+    /// `TaskState` variant it currently occupies. Returns `None`
+    /// when the hash is unknown to this replica's ledger (every
+    /// known task carries a `task_id` by the framework's boundary
+    /// contract; the variant is the missing-state case).
     fn task_id_for_hash(&self, hash: &str) -> Option<String> {
         let state = self.tasks.get(hash)?;
         let task = match state {
@@ -126,7 +128,7 @@ impl<I: Identifier> ClusterState<I> {
             | TaskState::Blocked { task, .. }
             | TaskState::Cancelled { task, .. } => task,
         };
-        task.task_id.clone()
+        Some(task.task_id.clone())
     }
 
     pub(super) fn resume_blocked_on(&mut self, prereq_hash: &str) -> Vec<TaskInfo<I>> {

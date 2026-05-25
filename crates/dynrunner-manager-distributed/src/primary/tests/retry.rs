@@ -820,7 +820,7 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                 type_id: TypeId::from("default"),
                 affinity_id: None,
                 payload: serde_json::Value::Null,
-                task_id: Some(name.into()),
+                task_id: name.into(),
                 task_depends_on: vec![],
                 preferred_secondaries: SoftPreferredSecondaries::default(),
                 resolved_path: None,
@@ -868,7 +868,6 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
                     _ => None,
                 };
                 if let Some((h, task_id)) = assignment {
-                    let task_id = task_id.unwrap_or_default();
                     if task_id == "a_task" {
                         tx.send(DistributedMessage::TaskFailed {
                             sender_id: id.clone(), timestamp: 0.0,

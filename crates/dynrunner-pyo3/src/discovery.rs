@@ -162,6 +162,13 @@ impl Visitor for PyVisitorBridge {
 /// resulting `TaskInfo<RunnerIdentifier>` is converted to its Python
 /// wrapper. Phase / type / affinity / payload are left at defaults —
 /// the caller's `organize_items` pass owns those assignments.
+///
+/// `task_id` is seeded from `relative_path` (the relative-to-root
+/// filesystem path of the discovered file) so the framework-side
+/// invariant (`TaskInfo.task_id` is a non-empty `String`) holds for the
+/// transient discovery output. Consumers typically overwrite the
+/// task_id in `organize_items` with their domain-specific identity
+/// scheme; the seeded value is a stable placeholder, not a contract.
 fn pytaskinfo_from_mark(
     py: Python<'_>,
     relative_path: &std::path::Path,
@@ -169,6 +176,11 @@ fn pytaskinfo_from_mark(
     payload: &Py<PyAny>,
 ) -> PyResult<PyTaskInfo> {
     let identifier: RunnerIdentifier = identifier_from_pyobj(payload.bind(py))?;
+    // Seed task_id from the relative path so the framework invariant
+    // holds even for the placeholder pre-`organize_items` shape. The
+    // path is guaranteed non-empty by the walker (a marked file always
+    // has at least its own filename).
+    let placeholder_task_id = relative_path.to_string_lossy().into_owned();
     let task: TaskInfo<RunnerIdentifier> = TaskInfo {
         path: relative_path.to_path_buf(),
         size,
@@ -177,7 +189,7 @@ fn pytaskinfo_from_mark(
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: None,
+        task_id: placeholder_task_id,
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

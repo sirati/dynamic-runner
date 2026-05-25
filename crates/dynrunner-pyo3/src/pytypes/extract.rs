@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
@@ -38,6 +39,9 @@ pub(crate) fn task_to_pytask<I: Identifier>(task: &TaskInfo<I>) -> PyTaskInfo {
         type_id: task.type_id.as_str().to_owned(),
         affinity_id: task.affinity_id.as_ref().map(|a| a.as_str().to_owned()),
         payload_json: serde_json::to_string(&task.payload).unwrap_or_else(|_| "null".into()),
+        // `TaskInfo.task_id` is non-optional + non-empty by the
+        // boundary contract validated at `extract_binaries` / the
+        // `PyTaskInfo::__new__` constructor; this is a verbatim move.
         task_id: task.task_id.clone(),
         // Project `Vec<TaskDep>` down to bare task_ids for the Python
         // bridge (kept consistent with `PyTaskInfo::from(&TaskInfo)`). The
@@ -167,13 +171,35 @@ pub(crate) fn extract_binaries(
                 _ => serde_json::Value::Null,
             };
 
-            // Optional task-level dependency fields. Both default
-            // to "absent / empty" so existing consumers without
-            // these attributes (or with None) parse cleanly.
-            let task_id: Option<String> = item
+            // Mandatory task identifier. Missing attribute, `None`,
+            // or empty string are all rejected with an
+            // operator-actionable ValueError so producer-side bugs
+            // (forgotten task_id, accidental "") surface here rather
+            // than later as opaque "feature doesn't work" symptoms.
+            // The framework treats `task_id` opaquely; the producer
+            // composes whatever identity scheme suits its domain.
+            let task_id_opt: Option<String> = item
                 .getattr("task_id")
                 .ok()
                 .and_then(|v| v.extract::<Option<String>>().ok().flatten());
+            let task_id = match task_id_opt {
+                Some(s) if !s.is_empty() => s,
+                Some(_) => {
+                    return Err(PyValueError::new_err(
+                        "TaskInfo.task_id must be a non-empty str; \
+                         consumer set it to the empty string. \
+                         See `dynamic_runner._shared.task_info.TaskInfo`.",
+                    ));
+                }
+                None => {
+                    return Err(PyValueError::new_err(
+                        "TaskInfo.task_id is required (non-empty str). \
+                         Consumer must populate it at every TaskInfo \
+                         construction. \
+                         See `dynamic_runner._shared.task_info.TaskInfo`.",
+                    ));
+                }
+            };
             // ``task_depends_on`` entries cross the FFI boundary as
             // either bare strings (legacy ``Vec<String>`` shape) or
             // ``TaskDep`` dataclass instances (new — opts into the

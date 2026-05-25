@@ -16,7 +16,7 @@ fn wire_format_flattened_identifier() {
             type_id: "default".into(),
             affinity_id: None,
             payload_json: "null".into(),
-            task_id: None,
+            task_id: "test-task".into(),
             task_depends_on: vec![],
             preferred_secondaries: Default::default(),
         },
@@ -59,7 +59,7 @@ fn roundtrip_distributed_binary_info_phase_tags() {
             type_id: "tokenize".into(),
             affinity_id: Some("shard_7".into()),
             payload_json: "{\"shard\":7,\"chunk\":\"abc\"}".into(),
-            task_id: None,
+            task_id: "phased-task".into(),
             task_depends_on: vec![],
             preferred_secondaries: Default::default(),
         },
@@ -81,10 +81,13 @@ fn roundtrip_distributed_binary_info_phase_tags() {
 }
 
 /// Backward-compat: a JSON payload from a pre-Phase-4b sender (missing
-/// the new four fields) decodes with sensible defaults — `default` for
-/// `phase_id`/`type_id`, `None` for `affinity_id`, `"null"` for
-/// `payload_json`. Without `#[serde(default)]` this would refuse the
-/// frame and break rolling upgrades.
+/// `phase_id`/`type_id`/`affinity_id`/`payload_json`) decodes with
+/// sensible defaults — `default` for `phase_id`/`type_id`, `None` for
+/// `affinity_id`, `"null"` for `payload_json`. `task_id` is REQUIRED
+/// on the wire post-breaking-change so the JSON includes it
+/// explicitly; pre-task_id senders are wire-incompatible (a
+/// missing-field error is the intentional loud-fail rather than the
+/// prior silent-drop-on-anonymous behaviour).
 #[test]
 fn legacy_distributed_binary_info_decodes_with_defaults() {
     let legacy = serde_json::json!({
@@ -103,7 +106,8 @@ fn legacy_distributed_binary_info_decodes_with_defaults() {
                 "compiler": "gcc",
                 "version": "12.0",
                 "opt_level": "O2"
-            }
+            },
+            "task_id": "legacy-task"
         },
         "local_path": "x",
         "file_hash": "h"
@@ -116,9 +120,45 @@ fn legacy_distributed_binary_info_decodes_with_defaults() {
             assert_eq!(binary_info.type_id, "default");
             assert_eq!(binary_info.affinity_id, None);
             assert_eq!(binary_info.payload_json, "null");
+            assert_eq!(binary_info.task_id, "legacy-task");
         }
         _ => panic!("expected TaskAssignment"),
     }
+}
+
+/// Wire contract: a payload that omits `task_id` fails to decode loudly
+/// (no silent default). Pins the breaking-change behaviour so a future
+/// re-introduction of `#[serde(default)]` on `task_id` would be caught
+/// by this test.
+#[test]
+fn distributed_binary_info_missing_task_id_fails_decode() {
+    let missing_task_id = serde_json::json!({
+        "msg_type": "task_assignment",
+        "sender_id": "primary",
+        "timestamp": 0.0,
+        "secondary_id": "sec-0",
+        "worker_id": 0,
+        "zip_file": null,
+        "binary_info": {
+            "path": "/tmp/x",
+            "size": 1,
+            "identifier": {
+                "binary_name": "no-task-id",
+                "platform": "x86_64",
+                "compiler": "gcc",
+                "version": "12.0",
+                "opt_level": "O2"
+            }
+        },
+        "local_path": "x",
+        "file_hash": "h"
+    });
+    let json = serde_json::to_vec(&missing_task_id).unwrap();
+    let result: Result<DistributedMessage<TestId>, _> = serde_json::from_slice(&json);
+    assert!(
+        result.is_err(),
+        "missing `task_id` must fail decode loudly; got {result:?}"
+    );
 }
 
 /// Wire backcompat for the `task_depends_on` upgrade from `Vec<String>`
@@ -148,6 +188,7 @@ fn distributed_binary_info_task_depends_on_decodes_bare_strings() {
                 "version": "12.0",
                 "opt_level": "O2"
             },
+            "task_id": "legacy-task",
             "task_depends_on": ["a", "b"]
         },
         "local_path": "x",
@@ -193,6 +234,7 @@ fn distributed_binary_info_task_depends_on_decodes_mixed_shapes() {
                 "version": "12.0",
                 "opt_level": "O2"
             },
+            "task_id": "mixed-task",
             "task_depends_on": [
                 "legacy_dep",
                 { "task_id": "modern_dep", "inherit_outputs": true }
@@ -227,7 +269,7 @@ fn distributed_binary_info_omits_empty_field_on_wire() {
         type_id: "default".into(),
         affinity_id: None,
         payload_json: "null".into(),
-        task_id: None,
+        task_id: "wire-task".into(),
         task_depends_on: vec![],
         preferred_secondaries: Default::default(),
     };
@@ -245,7 +287,7 @@ fn distributed_binary_info_omits_empty_field_on_wire() {
         type_id: "default".into(),
         affinity_id: None,
         payload_json: "null".into(),
-        task_id: None,
+        task_id: "wire-task".into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::new(vec![
             "sec-alpha".into(),

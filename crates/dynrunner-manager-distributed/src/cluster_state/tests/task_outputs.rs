@@ -53,7 +53,7 @@ fn task_completed_populates_task_outputs_cache() {
     // Happy path: a `TaskCompleted` carrying a JSON-encoded
     // `TaskOutputs` payload inserts an entry under the completing
     // task's `task_id`. `mk_task("a")` constructs a task with
-    // `task_id = Some("a")`.
+    // `task_id = "a"`.
     let mut s = ClusterState::<RunnerIdentifier>::new();
     s.apply(ClusterMutation::TaskAdded {
         hash: "h".into(),
@@ -106,32 +106,6 @@ fn task_completed_malformed_result_data_stores_empty_outputs() {
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
     assert_eq!(s.outputs_for("a"), Some(&TaskOutputs::default()));
-}
-
-#[test]
-fn anonymous_task_outputs_are_silently_dropped() {
-    // A task with `task_id = None` cannot be referenced by dependents
-    // (deps key by `task_id`). The populate path silently skips the
-    // insert — no key under which to cache. Pins the anonymous-task
-    // behaviour against any future regression that accidentally keys
-    // by hash for anonymous tasks.
-    let mut anon = mk_task("ignored");
-    anon.task_id = None;
-    let mut s = ClusterState::<RunnerIdentifier>::new();
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h".into(),
-        task: anon,
-    });
-    let outputs = outputs_with("k", "v");
-    let bytes = encode_wire(&outputs);
-    s.apply(ClusterMutation::TaskCompleted {
-        hash: "h".into(),
-        result_data: Some(bytes),
-    });
-    // The cache is empty — the insert was skipped because the task
-    // has no `task_id`. Reading any key returns None.
-    assert!(s.outputs_for("ignored").is_none());
-    assert!(s.outputs_for("").is_none());
 }
 
 #[test]

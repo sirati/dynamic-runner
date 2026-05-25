@@ -126,9 +126,12 @@ pub fn validate_spawn_tasks<I: Identifier>(
     // validate). The wire-side apply rule does its own dep resolution
     // per-task; this pre-pass surfaces failures for the caller before
     // the broadcast happens.
+    // Every task carries a non-optional `task_id` per the framework's
+    // boundary contract; the known-set is the union of every
+    // ledger-known id plus every id from the input batch.
     let mut known_task_ids: std::collections::HashSet<String> = cluster_state
         .tasks_iter()
-        .filter_map(|(_, s)| {
+        .map(|(_, s)| {
             let task = match s {
                 crate::cluster_state::TaskState::Pending { task }
                 | crate::cluster_state::TaskState::InFlight { task, .. }
@@ -142,9 +145,7 @@ pub fn validate_spawn_tasks<I: Identifier>(
         })
         .collect();
     for task in &tasks {
-        if let Some(id) = task.task_id.as_deref() {
-            known_task_ids.insert(id.to_string());
-        }
+        known_task_ids.insert(task.task_id.clone());
     }
     // Per-task validation pass. A task can fail multiple checks
     // (duplicate hash AND unknown dep); we surface the FIRST failure

@@ -202,13 +202,13 @@ async fn memprofile_smoke_local_two_tasks_produces_two_files() {
 
     let started = Instant::now();
     sampler.on_task_assigned(
-        Some("task-A".to_string()),
+        "task-A".to_string(),
         0,
         leaf_w0.clone(),
         started,
     );
     sampler.on_task_assigned(
-        Some("task-B".to_string()),
+        "task-B".to_string(),
         1,
         leaf_w1.clone(),
         started,
@@ -219,8 +219,8 @@ async fn memprofile_smoke_local_two_tasks_produces_two_files() {
     // for the assertion below.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    sampler.on_task_completed(Some("task-A".to_string()));
-    sampler.on_task_completed(Some("task-B".to_string()));
+    sampler.on_task_completed("task-A".to_string());
+    sampler.on_task_completed("task-B".to_string());
 
     // `shutdown` drains the command queue and joins the background
     // task, so the on-disk files are final by the time it returns.

@@ -74,9 +74,11 @@ where
                 // wire broadcasts below does not matter for
                 // correctness — the sampler's command queue
                 // serialises events.
-                self.notify_sampler_completed(
-                    binary.as_ref().and_then(|b| b.task_id.clone()),
-                );
+                if let Some(b) = binary.as_ref() {
+                    // `task_id` is non-optional by the framework's
+                    // boundary contract; clone the verbatim value.
+                    self.notify_sampler_completed(b.task_id.clone());
+                }
 
                 // Find the file hash for this worker's task
                 let file_hash = self
@@ -225,7 +227,7 @@ where
                 tracing::debug!(
                     secondary = %self.config.secondary_id,
                     worker_id,
-                    task_id = ?binary.as_ref().and_then(|b| b.task_id.as_deref()),
+                    task_id = ?binary.as_ref().map(|b| b.task_id.as_str()),
                     phase = ?binary.as_ref().map(|b| b.phase_id.to_string()),
                     task_type = ?binary.as_ref().map(|b| b.type_id.to_string()),
                     task_hash = ?log_task_hash,

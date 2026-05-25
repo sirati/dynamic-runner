@@ -50,7 +50,7 @@ fn find_task_info_by_id<'a, I: Identifier>(
 ) -> Option<&'a TaskInfo<I>> {
     state
         .iter_all()
-        .find_map(|(_, task)| (task.task_id.as_deref() == Some(task_id)).then_some(task))
+        .find_map(|(_, task)| (task.task_id == task_id).then_some(task))
 }
 
 #[cfg(test)]
@@ -81,7 +81,7 @@ mod tests {
             type_id: TypeId::from("t0"),
             affinity_id: None,
             payload: serde_json::Value::Null,
-            task_id: Some(name.into()),
+            task_id: name.into(),
             task_depends_on: deps,
             preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
@@ -104,10 +104,9 @@ mod tests {
         task: TaskInfo<RunnerIdentifier>,
         outputs: Option<TaskOutputs>,
     ) {
-        let hash = task
-            .task_id
-            .clone()
-            .unwrap_or_else(|| format!("anon-{:p}", &task));
+        // task_id is non-empty per the framework boundary contract;
+        // use it directly as the cluster_state hash for this helper.
+        let hash = task.task_id.clone();
         state.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
             task,
