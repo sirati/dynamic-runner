@@ -19,6 +19,12 @@ use std::time::Duration;
 /// secondary wrote to another.
 pub const SLURM_SECONDARY_OUTPUT_DIR: &str = "/app/out-network";
 
+/// Sub-directory the plumbing layer joins onto the operator's run
+/// `output_dir` before passing it to the sampler. Lifted to a single
+/// constant so both the local-mode resolver and the secondary-mode
+/// resolver pin the same on-disk layout (`{output_dir}/memprofile/...`).
+pub const MEMPROFILE_SUBDIR: &str = "memprofile";
+
 /// Configuration for [`super::MemProfileSampler`].
 ///
 /// `output_dir` is the run-level directory (e.g.

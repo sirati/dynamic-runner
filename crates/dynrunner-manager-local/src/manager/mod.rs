@@ -372,11 +372,19 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // construction time the caller may not be inside one.
         // Constructed AFTER `initialize_workers` so an error there
         // returns without leaking a sampler background task. The
-        // same `output_dir.is_some()` predicate that constructs the
-        // sampler also drove `mem_manager_reserved_bytes` to
-        // `Some(0)` above (in `initialize_workers`), so the per-
-        // worker cgroup leaves the sampler needs to read from exist
-        // by the time we hit this site.
+        // same `output_dir.is_some()` predicate also drove
+        // `mem_manager_reserved_bytes` to `Some(0)` in
+        // `initialize_workers`, BUT cgroup setup may still
+        // gracefully return `Ok(None)` on a host that doesn't
+        // expose delegated cgroup-v2 (no v2, no memory controller,
+        // non-writable subtree). In that case `WorkerHandle.subcgroup`
+        // is `None` and `notify_sampler_assigned` silently skips
+        // per-task profile creation — the operator sees the warn
+        // line emitted at setup time and no `.jsonl.zst` files
+        // appear. We construct the sampler regardless so its event
+        // queue exists for non-cgroup messages (Disconnected fan-out)
+        // and so the local-mode integration test can pin lifecycle
+        // semantics independently of cgroup-v2 availability.
         self.sampler = self
             .config
             .output_dir

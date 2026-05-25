@@ -199,7 +199,7 @@ pub(crate) fn resolve_memprofile_dir(
     if !memprofile_enabled {
         return None;
     }
-    output_dir.map(|p| p.join("memprofile"))
+    output_dir.map(|p| p.join(dynrunner_manager_local::memprofile::config::MEMPROFILE_SUBDIR))
 }
 
 #[cfg(test)]

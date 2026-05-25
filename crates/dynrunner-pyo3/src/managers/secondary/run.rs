@@ -780,7 +780,7 @@ fn resolve_secondary_memprofile_dir_with_probe(
         );
         return None;
     }
-    Some(bind_mount.join("memprofile"))
+    Some(bind_mount.join(dynrunner_manager_local::memprofile::config::MEMPROFILE_SUBDIR))
 }
 
 #[cfg(test)]
@@ -790,10 +790,17 @@ mod tests {
 
     #[test]
     fn disabled_returns_none_regardless_of_probe() {
+        // Both probe outcomes when disabled: still None.
         assert!(resolve_secondary_memprofile_dir_with_probe(
             false,
             Path::new("/whatever"),
             |_| true,
+        )
+        .is_none());
+        assert!(resolve_secondary_memprofile_dir_with_probe(
+            false,
+            Path::new("/whatever"),
+            |_| false,
         )
         .is_none());
         // The production wrapper also short-circuits when disabled.
