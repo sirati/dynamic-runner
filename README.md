@@ -149,6 +149,48 @@ if __name__ == "__main__":
   `dynrunner-slurm`, `dynrunner-gateway`. See [`crates/`](crates/) for
   the full set.
 
+## Per-task memory profiling (`--memprofile`)
+
+Opt-in 1Hz per-task memory profiler. Each worker writes one zstd-framed
+JSONL file per task it processes, capturing the worker's cgroup-v2
+`memory.current`, `memory.swap.current`, and full `memory.stat` once per
+second. Frame-per-sample makes the file `zstd -dc`-recoverable after a
+hard manager death (the last in-flight sample is the most the consumer
+can lose).
+
+```bash
+python -m <your-task> --multi-computer local --memprofile \
+    --output-dir /tmp/run-out --jobs 12
+```
+
+Output lands at `{--output-dir}/memprofile/{task_id}.worker-{N}.memprofile.jsonl.zst`.
+`task_id` is treated as a relative path, so a slash-bearing identifier
+like `nping/x86/clang/9/Os` becomes
+`memprofile/nping/x86/clang/9/Os.worker-3.memprofile.jsonl.zst` (the
+writer `mkdir -p`s the parents).
+
+**SLURM mode:** the same flag works on the SLURM secondary. The
+secondary's container has `/app/out-network` bind-mounted to the
+gateway-shared output filesystem; when `--memprofile` is set the
+secondary writes there by default. Post-run, profiles land alongside
+the rest of the run's artifacts on the dispatcher's gateway output
+directory. Operator checklist after a `--memprofile` SLURM run:
+
+- `ls {gateway.output_path}/memprofile/` should list one
+  `.jsonl.zst` per completed task.
+- `zstd -dc {gateway.output_path}/memprofile/<task>.worker-0.memprofile.jsonl.zst | head -1 | jq`
+  to spot-check a sample.
+- If the directory is empty, check the secondary's logs for
+  `--memprofile set but /app/out-network is not present` (operator
+  ran the secondary outside the wrapper) or a cgroup-v2 fallback warn
+  (`cgroup-v2 leaf not found` etc.) — both downgrade to a no-op with
+  a single warn line.
+
+**Requires** delegated cgroup-v2 on the host (rootless podman with
+`--cgroup-manager=cgroupfs`, or `systemd-run --user` with `Delegate=yes`).
+Without delegation the sampler exists but produces no files; one warn
+line surfaces the reason at startup.
+
 ## Development
 
 The development environment is provided by the flake — there is no
