@@ -94,6 +94,16 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     self.task_payloads.push((b.clone(), result_data));
                 }
 
+                // Flush the per-task memprofile writer (if any).
+                // Sampler hook is fire-and-forget mpsc-send; ordering
+                // relative to `handle_task_completed` (which may
+                // restart the worker subprocess and trigger the next
+                // assignment) does not matter for correctness — the
+                // sampler's command queue serialises events.
+                self.notify_sampler_completed(
+                    binary.as_ref().and_then(|b| b.task_id.clone()),
+                );
+
                 self.handle_task_completed(
                     worker_id,
                     result,
@@ -165,6 +175,17 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 if on_failure_increment_failed {
                     self.stats.errored += 1;
                 }
+
+                // Flush any per-task memprofile writers attached to
+                // this worker BEFORE `restart_worker` replaces the
+                // slot. Restart drops the prior `WorkerHandle`, whose
+                // `SubcgroupHandle::Drop` best-effort rmdirs the
+                // per-worker cgroup leaf — if the sampler ran after
+                // the rmdir, its last tick would fail to read
+                // `memory.current`. No matching `TaskCompleted` will
+                // arrive on a transport disconnect; this is the only
+                // flush opportunity.
+                self.notify_sampler_disconnected(worker_id);
 
                 // Restart worker and keep it in the active set (matching Python's
                 // _handle_monitor_result which restarts on NonRecoverable errors)

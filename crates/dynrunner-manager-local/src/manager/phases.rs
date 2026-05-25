@@ -121,6 +121,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     .await
                 {
                     Ok(()) => {
+                        self.notify_sampler_assigned(worker_id, &binary);
                         tracing::info!(
                             worker_id,
                             binary = %name,

@@ -227,6 +227,23 @@ impl SubcgroupHandle {
     pub fn attach_pid(&self, pid: u32) -> std::io::Result<()> {
         std::fs::write(self.procs_path(), pid.to_string())
     }
+
+    /// Test seam mirroring
+    /// [`NestedCgroupHandle::from_workers_path_for_test`]: callers
+    /// (the memprofile manager-loop integration test, in particular)
+    /// build a handle from an arbitrary tempdir-rooted directory so
+    /// `cgroup_dir()` returns a path the sampler can read fake
+    /// `memory.current` / `memory.stat` files from, without
+    /// exercising the real cgroup-v2 setup.
+    ///
+    /// The handle's `Drop` will still attempt `remove_dir` on the
+    /// given path; tests should pass a dir they're happy to see
+    /// removed (or that the tempdir wrapper will clean up after a
+    /// failed rmdir).
+    #[doc(hidden)]
+    pub fn from_cgroup_dir_for_test(cgroup_dir: PathBuf) -> Self {
+        Self { cgroup_dir }
+    }
 }
 
 impl Drop for SubcgroupHandle {

@@ -79,6 +79,19 @@ pub struct LocalManagerConfig {
     /// drives the scheduler decision but emits no log events. Surfaced
     /// to operators via the `--log-oom-watcher` CLI flag.
     pub log_oom_watcher: bool,
+    /// Run-level output directory for memprofile artifacts. When
+    /// `Some(path)`, the manager constructs a
+    /// [`crate::memprofile::MemProfileSampler`] whose per-task files
+    /// land under
+    /// `path/{task_id}.worker-{N}.memprofile.jsonl.zst`. The caller
+    /// is responsible for pre-joining the `memprofile/`
+    /// subdirectory onto its run output dir — the sampler does NOT
+    /// inject `memprofile/` itself (single concern: it writes
+    /// wherever it's told).
+    ///
+    /// `None` disables profiling entirely; no sampler is constructed
+    /// and the assign / complete / disconnect hooks short-circuit.
+    pub output_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for LocalManagerConfig {
@@ -102,6 +115,7 @@ impl Default for LocalManagerConfig {
                 Duration::from_secs(3600),
             ],
             log_oom_watcher: false,
+            output_dir: None,
         }
     }
 }
@@ -234,6 +248,21 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// secondary forwards it verbatim. The cache population in
     /// distributed mode is cheap-but-unused; no conditional gate.
     pub(crate) task_outputs_cache: HashMap<String, TaskOutputs>,
+    /// Per-task memory-profile sampler. `Some` iff
+    /// [`LocalManagerConfig::output_dir`] was set when
+    /// `process_binaries` started — sampler construction defers to
+    /// the start of the run because `MemProfileSampler::spawn`
+    /// requires a running tokio runtime (the `LocalManager::new`
+    /// caller may not be inside one).
+    ///
+    /// Owns one background tokio task that ticks at the configured
+    /// `sample_interval` (1 s by default), reads each active worker's
+    /// cgroup memory stats, and writes zstd-framed JSONL through the
+    /// sampler's writers. Drained + joined via `shutdown` at the
+    /// start of the per-run teardown sequence, BEFORE the pool's
+    /// `SubcgroupHandle::drop` rmdir's the leaf cgroups the sampler
+    /// would otherwise still be sampling from.
+    pub(crate) sampler: Option<crate::memprofile::MemProfileSampler>,
 }
 
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
@@ -258,6 +287,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             deferred_drain_notifications: Vec::new(),
             task_payloads: Vec::new(),
             task_outputs_cache: HashMap::new(),
+            sampler: None,
         }
     }
 
@@ -334,11 +364,48 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         );
 
         self.initialize_workers(factory).await?;
+
+        // Construct the per-task memory-profile sampler if the
+        // operator enabled it via `config.output_dir`. Deferred to
+        // here (and not `LocalManager::new`) because the sampler
+        // spawns a background tokio task on the current runtime — at
+        // construction time the caller may not be inside one.
+        // Constructed AFTER `initialize_workers` so an error there
+        // returns without leaking a sampler background task.
+        //
+        // Scope note: the production `initialize_workers` path above
+        // passes `None` for the pool's `mem_manager_reserved_bytes`,
+        // which means `WorkerPool::cgroup_handle` stays `None`,
+        // which means each `WorkerHandle::subcgroup_dir()` returns
+        // `None`, which means the sampler's `on_task_assigned` hook
+        // silently skips (no per-worker cgroup leaf to read from).
+        // The hook wiring is correct end-to-end; a future CLI-flag
+        // path that promotes `mem_manager_reserved_bytes` from
+        // `None` to `Some(0)` will cause profile files to populate
+        // without any change to this site.
+        self.sampler = self
+            .config
+            .output_dir
+            .as_ref()
+            .map(|dir| {
+                crate::memprofile::MemProfileSampler::spawn(
+                    crate::memprofile::MemProfileConfig::new(dir.clone()),
+                )
+            });
+
         self.run_initial_assignments(factory).await;
         self.run_main_phase(factory).await;
         self.run_retry_phase(factory).await;
         self.run_resource_pressure_phase(factory).await;
         self.run_unassigned_phase(factory).await;
+        // Drain + flush the sampler BEFORE `stop_all_workers` so the
+        // last tick's `memory.current` reads still see the per-worker
+        // cgroup leaves the pool's teardown is about to Drop-rmdir.
+        // After this returns the sampler is fully gone (background
+        // task joined, every writer's last frame finalised).
+        if let Some(sampler) = self.sampler.take() {
+            sampler.shutdown().await;
+        }
         self.stop_all_workers().await;
 
         // Surface any drain transitions accumulated during the run.
@@ -397,6 +464,49 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     #[doc(hidden)]
     pub(super) fn install_pool_for_test(&mut self, pool: PendingPool<I>) {
         self.pending = Some(pool);
+    }
+
+    /// Test seam mirroring `install_pool_for_test`: stand up the
+    /// memprofile sampler on a manager built outside the
+    /// `process_binaries` runtime-context dance. Lets sampler-hook
+    /// integration tests fire `notify_sampler_assigned` /
+    /// `notify_sampler_completed` directly against a manager whose
+    /// `WorkerPool` was populated by alternate means (e.g. injected
+    /// `WorkerHandle::subcgroup` pointing at a tempdir-rooted fake
+    /// cgroup leaf).
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(super) fn install_sampler_for_test(
+        &mut self,
+        sampler: crate::memprofile::MemProfileSampler,
+    ) {
+        self.sampler = Some(sampler);
+    }
+
+    /// Test seam: inject a [`crate::cgroup::SubcgroupHandle`] onto an
+    /// existing worker slot so the sampler-hook integration test can
+    /// hand the sampler a tempdir-rooted leaf path. In production the
+    /// pool's spawn site materialises the handle before
+    /// `factory.spawn_worker`; tests that use the in-process channel
+    /// factories never enter that code path, hence this seam.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(super) fn install_worker_subcgroup_for_test(
+        &mut self,
+        worker_id: WorkerId,
+        handle: crate::cgroup::SubcgroupHandle,
+    ) {
+        self.pool.workers[worker_id as usize].subcgroup = Some(handle);
+    }
+
+    /// Test accessor: snapshot of `self.sampler.is_some()`. Used by
+    /// the run-level smoke that asserts the manager constructs the
+    /// sampler when `output_dir` is set and tears it down by the end
+    /// of `process_binaries`.
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(super) fn sampler_is_some(&self) -> bool {
+        self.sampler.is_some()
     }
 
     /// Bookkeeping for a finished task: bumps the per-phase counter and
@@ -588,6 +698,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
 mod events;
 mod monitor;
 mod phases;
+mod sampler_hooks;
 mod worker_loop;
 
 #[cfg(test)]

@@ -125,5 +125,6 @@ pub(super) fn test_config(num_workers: u32) -> LocalManagerConfig {
         resource_check_interval: std::time::Duration::from_millis(100),
         phase_status_log_intervals: Vec::new(),
         log_oom_watcher: false,
+        output_dir: None,
     }
 }
