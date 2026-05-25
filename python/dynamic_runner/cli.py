@@ -91,6 +91,21 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--memprofile",
+        action="store_true",
+        help=(
+            "Enable 1Hz per-task memory profiling. The framework writes "
+            "one zstd-framed JSONL file per task under "
+            "`<output>/memprofile/{task_id}.worker-{N}.memprofile.jsonl.zst`. "
+            "Requires a delegated cgroup-v2 hierarchy on the host (rootless "
+            "podman with `--cgroup-manager=cgroupfs`, or `systemd-run --user "
+            "--scope -p Delegate=yes ...`). On SLURM the secondary writes "
+            "into `/app/out-network` (the wrapper's bind-mount to the "
+            "gateway-shared output drive) so the files survive job teardown. "
+            "Off by default."
+        ),
+    )
+    parser.add_argument(
         "--oom-cgroup-safety-margin",
         type=str,
         default="1G",

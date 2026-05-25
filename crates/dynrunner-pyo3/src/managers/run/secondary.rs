@@ -77,6 +77,10 @@ pub(crate) fn run_secondary<'py>(
     if let Some(reserved) = config.mem_manager_reserved_bytes {
         kwargs.set_item("mem_manager_reserved_bytes", reserved)?;
     }
+    // `--memprofile` opt-in. Forwarded as a plain bool — the
+    // SecondaryCoordinator resolves the actual output directory at
+    // run start (via the `/app/out-network` bind-mount probe).
+    kwargs.set_item("memprofile_enabled", config.memprofile_enabled)?;
     if let Some(sc) = scheduler_config.as_ref() {
         kwargs.set_item("scheduler_config", sc.clone())?;
     }

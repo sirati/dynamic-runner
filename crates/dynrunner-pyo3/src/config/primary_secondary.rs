@@ -134,6 +134,16 @@ pub(crate) struct PySecondaryConfig {
     /// for the full contract.
     #[pyo3(get, set)]
     pub(crate) mem_manager_reserved_bytes: Option<u64>,
+    /// Python-side `--memprofile` opt-in. The Rust-side coordinator
+    /// (`PySecondaryCoordinator`) resolves the actual output
+    /// directory at run start: enabled + present
+    /// `/app/out-network` bind-mount → write under the SLURM
+    /// wrapper's gateway-shared output filesystem; enabled but no
+    /// bind-mount → warn and skip; disabled → no resolution. The
+    /// flag's behaviour lives entirely in Rust; Python only flips
+    /// this bool.
+    #[pyo3(get, set)]
+    pub(crate) memprofile_enabled: bool,
 }
 
 #[pymethods]
@@ -188,6 +198,7 @@ impl PySecondaryConfig {
         output_dir = None,
         distributed_config = None,
         mem_manager_reserved_bytes = None,
+        memprofile_enabled = false,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -202,6 +213,7 @@ impl PySecondaryConfig {
         output_dir: Option<PathBuf>,
         distributed_config: Option<DistributedConfig>,
         mem_manager_reserved_bytes: Option<u64>,
+        memprofile_enabled: bool,
     ) -> PyResult<Self> {
         let num_workers = num_workers.unwrap_or_else(detect_num_workers);
         let max_resources = max_resources
@@ -245,6 +257,7 @@ impl PySecondaryConfig {
             output_dir,
             distributed_config: distributed_config.unwrap_or_default(),
             mem_manager_reserved_bytes,
+            memprofile_enabled,
         })
     }
 }
@@ -336,6 +349,18 @@ impl PySecondaryConfig {
             // — the live secondary-construction sites set it directly.
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: self.mem_manager_reserved_bytes,
+            // `PySecondaryConfig::to_rust` is the documented-but-
+            // unused conversion path; the live secondary-
+            // construction site
+            // (`PySecondaryCoordinator::run` in
+            // `managers/secondary/run.rs`) resolves the memprofile
+            // directory at run start from `memprofile_enabled` plus
+            // the wrapper-bind-mount check, and feeds it into
+            // `SecondaryConfig.output_dir` directly. This wrapper
+            // path stays opt-out (None) so PyO3 callers that go
+            // through `to_rust` don't accidentally get a
+            // half-resolved sampler path.
+            output_dir: None,
         }
     }
 }

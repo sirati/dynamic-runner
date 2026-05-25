@@ -90,6 +90,7 @@ pub(crate) fn run_local<'py>(
     )?;
     kwargs.set_item("stage_timeouts_secs", config.stage_timeouts_secs.clone())?;
     kwargs.set_item("log_oom_watcher", config.log_oom_watcher)?;
+    kwargs.set_item("memprofile_enabled", config.memprofile_enabled)?;
     if let Some(paths) = panik_watcher_paths.as_ref() {
         kwargs.set_item("panik_watcher_paths", paths.clone())?;
     }

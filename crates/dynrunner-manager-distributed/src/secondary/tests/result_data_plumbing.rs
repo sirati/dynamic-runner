@@ -145,6 +145,7 @@ async fn worker_event_task_completed_forwards_result_data_to_distributed_message
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let binary = make_binary("payload-task", 100);

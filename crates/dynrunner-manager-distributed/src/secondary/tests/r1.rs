@@ -381,6 +381,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let mut secondary = SecondaryCoordinator::new(
@@ -469,6 +470,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             // FixedPeerCount(2) reports peer_count() == 2 without
@@ -547,6 +549,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 promoted_primary_quiesce_grace: Duration::from_millis(100),
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
+                output_dir: None,
             };
 
             let mut secondary = SecondaryCoordinator::new(

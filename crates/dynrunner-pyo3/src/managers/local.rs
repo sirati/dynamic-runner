@@ -57,6 +57,14 @@ pub(crate) struct PyLocalManager {
     /// legacy pyclass so callers that bypass the typed
     /// `LocalManagerConfig` path still pick up the flag.
     log_oom_watcher: bool,
+    /// Python-side `--memprofile` opt-in. Pairs with `output_dir`
+    /// (already captured above) to drive
+    /// `LocalManagerConfig.output_dir` via the shared
+    /// `resolve_memprofile_dir` helper. Default `false`; flipped to
+    /// `true` by the dispatcher when the operator passes
+    /// `--memprofile`. The flag's behaviour lives in Rust — Python
+    /// only flips the bool.
+    memprofile_enabled: bool,
     types: TypeRegistry,
     phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     skip_existing: bool,
@@ -105,6 +113,7 @@ impl PyLocalManager {
         log_dir = None,
         panik_watcher_paths = None,
         panik_watcher_poll_interval_secs = 10.0,
+        memprofile_enabled = false,
     ))]
     // PyO3 kwargs surface — collapsing to a builder is a separate
     // API refactor.
@@ -137,6 +146,7 @@ impl PyLocalManager {
         log_dir: Option<String>,
         panik_watcher_paths: Option<Vec<PathBuf>>,
         panik_watcher_poll_interval_secs: f64,
+        memprofile_enabled: bool,
     ) -> PyResult<Self> {
         let task = LoadedTaskDefinition::from_python(
             py,
@@ -231,6 +241,7 @@ impl PyLocalManager {
                 .unwrap_or_else(|| vec![60.0, 300.0, 600.0, 1800.0, 3600.0]),
             stage_timeouts_secs: stage_timeouts_secs.unwrap_or_default(),
             log_oom_watcher,
+            memprofile_enabled,
             types: task.types,
             phase_deps: task.phase_deps,
             skip_existing,
@@ -303,12 +314,16 @@ impl PyLocalManager {
                 .map(|s| std::time::Duration::from_secs_f64(*s))
                 .collect(),
             log_oom_watcher: self.log_oom_watcher,
-            // `output_dir` is the run-level directory the
-            // memprofile sampler writes per-task `.jsonl.zst` files
-            // to. `None` disables profiling — the Python CLI is the
-            // surface where the operator opts in; until that lands
-            // here the local-manager binding stays opt-out.
-            output_dir: None,
+            // Composes the memprofile sampler's output directory
+            // from the two Python-side inputs (the run-level
+            // `output_dir` and the boolean `--memprofile` opt-in).
+            // Shared helper at the PyO3 boundary so both this
+            // legacy class and the typed `PyLocalManagerConfig`
+            // path produce identical results.
+            output_dir: crate::config::local_manager::resolve_memprofile_dir(
+                self.memprofile_enabled,
+                Some(self.output_dir.as_path()),
+            ),
         };
 
         // Per-type subprocess dispatch: the factory carries the full

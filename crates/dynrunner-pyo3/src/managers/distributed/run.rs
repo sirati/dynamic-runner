@@ -389,6 +389,15 @@ impl PyDistributedManager {
                             // SLURM container) opts in via
                             // `--mem-manager-reserved`.
                             mem_manager_reserved_bytes: None,
+                            // In-process mode has no SLURM wrapper
+                            // bind-mount, so the secondary's
+                            // memprofile path would have nowhere
+                            // sensible to land. Leave unset — the
+                            // operator's `--memprofile` here
+                            // affects only the in-process LocalManager
+                            // (when one is created), not the
+                            // multi-secondary channel-based path.
+                            output_dir: None,
                         };
 
                         let estimator = sec_estimator;

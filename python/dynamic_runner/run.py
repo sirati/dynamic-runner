@@ -324,6 +324,15 @@ def _dispatch_local(task, args, config, logger) -> None:
         print_pid=args.pid,
         log_oom_watcher=getattr(args, "log_oom_watcher", False),
         scheduler_config=scheduler_config,
+        # `--memprofile` opt-in. The run-level output directory
+        # (operator's `--output`, already resolved to an absolute
+        # path by `process_selection_arguments`) is the anchor; the
+        # Rust-side PyO3 boundary composes `<output>/memprofile/`
+        # and constructs the sampler. Passing `output_dir`
+        # unconditionally is harmless — the Rust resolver skips
+        # composition when `memprofile_enabled = False`.
+        output_dir=str(config.output_dir),
+        memprofile_enabled=getattr(args, "memprofile", False),
     )
     result = _rs.run_local(
         cfg,
@@ -520,6 +529,11 @@ def _dispatch_secondary(task, args, logger) -> None:
         src_tmp=args.src_tmp,
         distributed_config=distributed_config,
         mem_manager_reserved_bytes=mem_manager_reserved_bytes,
+        # `--memprofile` opt-in. The Rust-side
+        # `PySecondaryCoordinator::run` resolves the actual output
+        # path against the SLURM wrapper's `/app/out-network`
+        # bind-mount, so the Python side just forwards the bool.
+        memprofile_enabled=getattr(args, "memprofile", False),
     )
 
     logger.info(f"Secondary ID: {cfg.secondary_id}")

@@ -51,6 +51,14 @@ impl PySecondaryCoordinator {
         let dist_resource_check_interval = self.distributed_config.resource_check_interval();
         let dist_log_oom_watcher = self.distributed_config.log_oom_watcher();
         let cfg_mem_manager_reserved_bytes = self.mem_manager_reserved_bytes;
+        // Resolve the memprofile output directory at run-start.
+        // The two-input shape (`memprofile_enabled` + the
+        // implicit `/app/out-network` constant) lives in the
+        // dedicated `resolve_secondary_memprofile_dir` helper so
+        // the policy is in one place and unit-testable; the
+        // resulting `Option<PathBuf>` is what crosses into
+        // `SecondaryConfig.output_dir`.
+        let memprofile_output_dir = resolve_secondary_memprofile_dir(self.memprofile_enabled);
         // Per-type subprocess dispatch: the factory carries the full
         // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
         // for initial pool init (preserves pre-fix single-type
@@ -331,6 +339,7 @@ impl PySecondaryCoordinator {
                     promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
                     unfulfillable_reinject_max_per_task,
                     mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,
+                    output_dir: memprofile_output_dir.clone(),
                 };
 
                 let mut factory = SubprocessWorkerFactory {
@@ -716,5 +725,99 @@ impl PySecondaryCoordinator {
     #[getter]
     fn completed(&self) -> u32 {
         self.completed
+    }
+}
+
+/// Compose the secondary's memprofile output directory from the
+/// operator's `--memprofile` opt-in.
+///
+/// Production callers use
+/// [`resolve_secondary_memprofile_dir`], which probes the on-disk
+/// `/app/out-network` bind-mount. The policy itself lives in
+/// [`resolve_secondary_memprofile_dir_with_probe`] so tests can
+/// inject the probe result without touching the real filesystem.
+///
+/// Single concern: decide where (if anywhere) the secondary writes
+/// `.jsonl.zst` files. The policy is "always the wrapper's
+/// `/app/out-network` bind-mount, but only when it actually exists";
+/// the absent-bind-mount case (operator ran the secondary outside
+/// the SLURM wrapper) collapses to `None` with a warn log so the
+/// reason surfaces in the dispatcher log.
+///
+/// The function deliberately takes only `memprofile_enabled` —
+/// there is no operator-supplied per-secondary output override flag
+/// in the CLI, and the secondary's own
+/// [`crate::config::primary_secondary::PySecondaryConfig::output_dir`]
+/// is a per-WORKER output path (the worker-output-mount, not the
+/// memprofile target). Plumbing it would conflate two distinct
+/// concerns.
+fn resolve_secondary_memprofile_dir(memprofile_enabled: bool) -> Option<std::path::PathBuf> {
+    let bind_mount =
+        std::path::Path::new(dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR);
+    resolve_secondary_memprofile_dir_with_probe(memprofile_enabled, bind_mount, |p| p.exists())
+}
+
+/// Pure-function form of [`resolve_secondary_memprofile_dir`].
+/// `bind_mount` is the path that gets returned (with the `memprofile`
+/// subdir appended) when the probe says it exists. Lifted out so
+/// unit tests can supply a tempdir without writing to
+/// `/app/out-network`.
+fn resolve_secondary_memprofile_dir_with_probe(
+    memprofile_enabled: bool,
+    bind_mount: &std::path::Path,
+    probe: impl FnOnce(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    if !memprofile_enabled {
+        return None;
+    }
+    if !probe(bind_mount) {
+        tracing::warn!(
+            path = %bind_mount.display(),
+            "--memprofile set but the SLURM wrapper bind-mount is not \
+             present; per-task memory profiling is disabled. (This is \
+             expected when the secondary is launched outside the SLURM \
+             wrapper.)"
+        );
+        return None;
+    }
+    Some(bind_mount.join("memprofile"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_secondary_memprofile_dir, resolve_secondary_memprofile_dir_with_probe};
+    use std::path::Path;
+
+    #[test]
+    fn disabled_returns_none_regardless_of_probe() {
+        assert!(resolve_secondary_memprofile_dir_with_probe(
+            false,
+            Path::new("/whatever"),
+            |_| true,
+        )
+        .is_none());
+        // The production wrapper also short-circuits when disabled.
+        assert!(resolve_secondary_memprofile_dir(false).is_none());
+    }
+
+    #[test]
+    fn enabled_with_present_bind_mount_returns_subdir() {
+        let resolved = resolve_secondary_memprofile_dir_with_probe(
+            true,
+            Path::new("/app/out-network"),
+            |_| true,
+        )
+        .expect("present bind-mount + enabled flag must resolve");
+        assert_eq!(resolved, std::path::PathBuf::from("/app/out-network/memprofile"));
+    }
+
+    #[test]
+    fn enabled_with_absent_bind_mount_returns_none() {
+        assert!(resolve_secondary_memprofile_dir_with_probe(
+            true,
+            Path::new("/app/out-network"),
+            |_| false,
+        )
+        .is_none());
     }
 }
