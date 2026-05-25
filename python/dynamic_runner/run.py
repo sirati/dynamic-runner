@@ -666,6 +666,16 @@ def _dispatch_single_process(task, args, config, logger) -> None:
         secondary_id="<template>",
         num_workers=workers_per_secondary,
         max_resources=_rs.ResourceMap({"memory": ram_per_secondary}),
+        # Pin the template's `output_dir` to the run-level output
+        # path so per-template-field documentation matches the
+        # actual data the in-process `PyDistributedManager.run`
+        # threads into each spawned secondary's `SecondaryConfig`.
+        # The manager derives its own per-secondary
+        # `SecondaryConfig.output_dir` from
+        # `self.output_dir` + the `memprofile_enabled` bool below,
+        # so this template value is informational; setting it
+        # keeps Python and Rust agreeing on the same path.
+        output_dir=str(config.output_dir),
         # `--memprofile` opt-in forwarded uniformly with the slurm and
         # local-multi-computer dispatch paths (Rust resolves the actual
         # output path; Python just forwards the bool).

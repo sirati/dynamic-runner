@@ -126,6 +126,13 @@ pub(crate) fn run_distributed<'py>(
         "panik_watcher_poll_interval_secs",
         panik_watcher_poll_interval_secs,
     )?;
+    // Forward the secondary template's `--memprofile` opt-in to
+    // the manager so the per-secondary `SecondaryConfig.output_dir`
+    // composed at `run()` entry can be plumbed uniformly with the
+    // out-of-process secondary path. Without this, the in-process
+    // pipeline silently dropped the flag and `--memprofile` on
+    // single-process runs produced no `.jsonl.zst` files.
+    kwargs.set_item("memprofile_enabled", secondary_template.memprofile_enabled)?;
 
     let cls = module(py)?.getattr("RustDistributedManager")?;
     let args = (

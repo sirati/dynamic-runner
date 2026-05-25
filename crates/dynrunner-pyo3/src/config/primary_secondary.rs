@@ -136,12 +136,11 @@ pub(crate) struct PySecondaryConfig {
     pub(crate) mem_manager_reserved_bytes: Option<u64>,
     /// Python-side `--memprofile` opt-in. The Rust-side coordinator
     /// (`PySecondaryCoordinator`) resolves the actual output
-    /// directory at run start: enabled + present
-    /// `/app/out-network` bind-mount → write under the SLURM
-    /// wrapper's gateway-shared output filesystem; enabled but no
-    /// bind-mount → warn and skip; disabled → no resolution. The
-    /// flag's behaviour lives entirely in Rust; Python only flips
-    /// this bool.
+    /// directory at run start by combining this flag with
+    /// `RustSecondaryCoordinator.output_dir` (operator-supplied,
+    /// always set) and the SLURM wrapper's `/app/out-network`
+    /// bind-mount probe (legacy backstop). The flag's behaviour
+    /// lives entirely in Rust; Python only flips this bool.
     #[pyo3(get, set)]
     pub(crate) memprofile_enabled: bool,
 }

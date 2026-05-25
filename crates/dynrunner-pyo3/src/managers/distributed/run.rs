@@ -53,6 +53,18 @@ impl PyDistributedManager {
         let panik_watcher_poll_interval = std::time::Duration::from_secs_f64(
             self.panik_watcher_poll_interval_secs,
         );
+        // Compose the per-secondary memprofile output dir once on
+        // the GIL thread so the per-secondary spawn closures below
+        // receive identical `Option<PathBuf>` values without each
+        // re-deriving from `self`. The operator's `output_dir`
+        // (always set) wins over the SLURM wrapper bind-mount
+        // probe — in-process distributed runs never expose the
+        // wrapper but always have a Python-supplied output dir.
+        let memprofile_output_dir =
+            crate::managers::secondary::run::resolve_secondary_memprofile_dir(
+                self.memprofile_enabled,
+                Some(self.output_dir.as_path()),
+            );
 
         // Pre-compute per-secondary log directories under the GIL —
         // `resolve_log_dir` calls into Python's `datetime` module —
@@ -323,6 +335,7 @@ impl PyDistributedManager {
                     let sec_scheduler_config = scheduler_config.clone();
                     let sec_panik_paths = panik_watcher_paths.clone();
                     let sec_panik_poll = panik_watcher_poll_interval;
+                    let sec_memprofile_output_dir = memprofile_output_dir.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -389,15 +402,15 @@ impl PyDistributedManager {
                             // SLURM container) opts in via
                             // `--mem-manager-reserved`.
                             mem_manager_reserved_bytes: None,
-                            // In-process mode has no SLURM wrapper
-                            // bind-mount, so the secondary's
-                            // memprofile path would have nowhere
-                            // sensible to land. Leave unset — the
-                            // operator's `--memprofile` here
-                            // affects only the in-process LocalManager
-                            // (when one is created), not the
-                            // multi-secondary channel-based path.
-                            output_dir: None,
+                            // Per-secondary memprofile output dir
+                            // resolved on the GIL thread above from
+                            // the operator's `--memprofile` opt-in
+                            // plus `self.output_dir` (always set).
+                            // `Some(path)` activates per-task
+                            // sampling on the in-process secondary
+                            // path symmetrically with the SLURM and
+                            // multi-computer-local secondaries.
+                            output_dir: sec_memprofile_output_dir.clone(),
                         };
 
                         let estimator = sec_estimator;

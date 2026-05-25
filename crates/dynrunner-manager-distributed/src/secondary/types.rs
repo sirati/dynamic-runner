@@ -271,12 +271,13 @@ pub struct SecondaryConfig {
     /// Run-level output directory for memprofile artifacts.
     ///
     /// Resolved at the PyO3 boundary
-    /// (`PySecondaryCoordinator::run`) from the operator's
-    /// `--memprofile` flag plus the
+    /// (`PySecondaryCoordinator::run` and `PyDistributedManager::run`)
+    /// from the operator's `--memprofile` flag plus the secondary's
+    /// operator-supplied `output_dir` (preferred) or the
     /// [`dynrunner_manager_local::memprofile::config::SLURM_SECONDARY_OUTPUT_DIR`]
-    /// constant; `Some(path)` means "operator opted in AND the
-    /// SLURM wrapper's `/app/out-network` bind-mount is present".
-    /// `None` (default) disables profiling entirely.
+    /// constant (legacy backstop). `Some(path)` means "operator
+    /// opted in AND at least one anchor is available". `None`
+    /// (default) disables profiling entirely.
     ///
     /// `Some(path)` drives two coupled effects through
     /// `SecondaryCoordinator::run_until_setup_or_done`:
