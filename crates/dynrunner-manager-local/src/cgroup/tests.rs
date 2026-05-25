@@ -8,8 +8,10 @@
 //!     tightened `memory.max`, resets `memory.swap.max` to "max".
 //!   * Graceful fallback: cgroup-v1 host, missing memory controller,
 //!     non-writable subtree_control. Each returns `Ok(None)`.
-//!   * Attach-pid primitive: writes the pid as decimal to
-//!     `workers/cgroup.procs`.
+//!   * Per-worker leaf attach: `SubcgroupHandle::attach_pid` writes
+//!     the pid as decimal to `<worker-N>/cgroup.procs` (the old
+//!     `workers/cgroup.procs` path is forbidden once subtree_control
+//!     is enabled on `workers/`).
 //!   * Idempotence: a second call against an already-prepared leaf
 //!     does not error and ends with the same on-disk shape.
 //!

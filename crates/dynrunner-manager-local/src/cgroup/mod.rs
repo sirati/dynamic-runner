@@ -22,13 +22,14 @@
 //! * [`prepare_worker_subgroup`] — per-worker leaf factory. Called
 //!   once per OS worker process at spawn time; returns a
 //!   [`SubcgroupHandle`] whose `Drop` best-effort `rmdir`s the leaf.
-//! * [`SubcgroupHandle::attach_pid`] — single-call primitive that
-//!   writes a pid to `<worker-N>/cgroup.procs`. Called from the spawn
-//!   site's `pre_exec` closure after `fork(2)` and before
-//!   `execve(2)`. Replaces the previous top-level `attach_pid`
+//! * [`SubcgroupHandle::procs_path`] — owned `PathBuf` for the leaf's
+//!   `cgroup.procs`. The spawn site clones it into a `pre_exec` closure
+//!   and writes the formatted pid (stack-allocated digits) into it
+//!   post-fork. Replaces the previous top-level `attach_pid`
 //!   primitive (deleted): the cgroup-v2 "no internal processes" rule
 //!   forbids pids in `<workers>/cgroup.procs` once subtree_control is
-//!   enabled on it.
+//!   enabled on it. [`SubcgroupHandle::attach_pid`] is the equivalent
+//!   parent-side convenience (not async-signal-safe).
 //!
 //! Graceful fallback contract: any of (a) not cgroup-v2, (b) no
 //! `memory` controller exposed on the leaf, (c) leaf not writable
@@ -169,8 +170,9 @@ pub fn setup_worker_cgroup(
 /// Constructed by [`prepare_worker_subgroup`]; carried on the worker
 /// pool's `WorkerHandle` for the worker's lifetime so the memprofile
 /// sampler can read `memory.current` without re-walking the cgroup
-/// tree, and so [`Self::attach_pid`] can route the pid into the leaf
-/// from a `pre_exec` closure.
+/// tree, and so [`Self::procs_path`] can hand the spawn site a
+/// pre-computed `cgroup.procs` path to clone into its `pre_exec`
+/// closure.
 ///
 /// On `Drop`: best-effort `rmdir` of the leaf. Empty leaf (worker
 /// exited cleanly, kernel reaped the `cgroup.procs` entry) →
@@ -185,9 +187,9 @@ pub fn setup_worker_cgroup(
 #[derive(Debug)]
 pub struct SubcgroupHandle {
     /// Absolute path to the `<workers>/worker-<id>/` directory the
-    /// per-worker setup materialised. Carried so `attach_pid` can
-    /// hit `cgroup.procs` without a re-walk and so `Drop` knows
-    /// where to `rmdir`.
+    /// per-worker setup materialised. Carried so `procs_path` can
+    /// hand the spawn site a pre-joined path without a re-walk and
+    /// so `Drop` knows where to `rmdir`.
     cgroup_dir: PathBuf,
 }
 
@@ -200,24 +202,30 @@ impl SubcgroupHandle {
         &self.cgroup_dir
     }
 
-    /// Write `pid` (decimal) to `<cgroup_dir>/cgroup.procs`. The
-    /// kernel migrates the named pid into the per-worker leaf at the
-    /// moment of the write.
+    /// Pre-computed `<cgroup_dir>/cgroup.procs` path. Built once in
+    /// the parent so a `pre_exec` spawn-site closure can clone an
+    /// owned `PathBuf` into its `'static` environment and then issue
+    /// a single `std::fs::write(&procs, &digits[..n])` post-fork
+    /// without further path manipulation. Returns an owned value
+    /// (not a borrow) precisely so the move-into-closure pattern
+    /// works without lifetime gymnastics.
+    pub fn procs_path(&self) -> PathBuf {
+        self.cgroup_dir.join("cgroup.procs")
+    }
+
+    /// Parent-side convenience: format `pid` and write it to the
+    /// leaf's `cgroup.procs`. Equivalent to
+    /// `std::fs::write(self.procs_path(), pid.to_string())`.
     ///
-    /// **fork-safety:** this method is callable from a `pre_exec`
-    /// closure post-fork pre-exec. The implementation does exactly
-    /// one open + one write + one close via `std::fs::write`. DO NOT
-    /// add logging, formatting, panics, or other async-signal-unsafe
-    /// calls — those would corrupt the child. The small heap
-    /// allocation inside `pid.to_string()` and the equivalent
-    /// allocation inside `std::fs::write`'s path-join are part of the
-    /// stdlib's tolerated post-fork allocator activity (the
-    /// immediate open-write-close sequence has no observable race
-    /// window between alloc and exec); callers that want absolute
-    /// zero-allocation pre_exec should pre-format the pid in the
-    /// parent and call into a lower-level write helper.
+    /// **Do not call from `pre_exec`.** Both `pid.to_string()` and
+    /// the inner `PathBuf` join allocate post-fork; that is fine for
+    /// parent-side use (tests, diagnostic harness) but a pre_exec
+    /// closure must use [`Self::procs_path`] from the parent, format
+    /// the pid into a stack buffer post-fork, and call `std::fs::write`
+    /// directly — see `subprocess_factory.rs` for the gold-standard
+    /// pattern.
     pub fn attach_pid(&self, pid: u32) -> std::io::Result<()> {
-        std::fs::write(self.cgroup_dir.join("cgroup.procs"), pid.to_string())
+        std::fs::write(self.procs_path(), pid.to_string())
     }
 }
 
@@ -240,10 +248,19 @@ impl Drop for SubcgroupHandle {
         match std::fs::remove_dir(&self.cgroup_dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            // Real cgroup-v2 kernel returns EBUSY (ResourceBusy) when
+            // a cgroup still contains processes; tmpfs (test fixtures)
+            // returns ENOTEMPTY (DirectoryNotEmpty). Either way the
+            // semantics are "leaf not empty, leave it for the operator".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::ResourceBusy
+                ) =>
+            {
                 tracing::warn!(
                     cgroup_dir = %self.cgroup_dir.display(),
-                    "subcgroup rmdir failed: directory not empty (worker still attached?)"
+                    "subcgroup rmdir failed: leaf not empty (worker still attached?)"
                 );
             }
             Err(e) => {
