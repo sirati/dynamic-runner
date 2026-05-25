@@ -692,6 +692,7 @@ fn renders_no_shutdown_manager_when_path_none() {
 /// primitive the spawn block picked at runtime:
 ///   - systemd-run path => `systemctl --user kill --signal=SIGCONT`
 ///   - setsid-f path    => `kill -SIGCONT "$SHUTDOWN_PID"`
+///
 /// The manager owns the idle-shutdown logic; the wrapper only
 /// nudges it.
 #[test]

@@ -125,7 +125,7 @@
             type_id: TypeId::from("default"),
             affinity_id: None,
             payload: serde_json::Value::Null,
-            task_id: None,
+            task_id: "bin1".into(),
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,

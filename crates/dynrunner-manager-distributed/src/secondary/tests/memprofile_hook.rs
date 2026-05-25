@@ -168,7 +168,7 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
                 type_id: dynrunner_core::TypeId::from("default"),
                 affinity_id: None,
                 payload: serde_json::Value::Null,
-                task_id: Some("task-A".to_string()),
+                task_id: "task-A".to_string(),
                 task_depends_on: vec![],
                 preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
                 resolved_path: None,
@@ -183,7 +183,7 @@ async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
             let _ = Instant::now();
             tokio::time::sleep(Duration::from_millis(150)).await;
 
-            secondary.notify_sampler_completed(Some("task-A".to_string()));
+            secondary.notify_sampler_completed("task-A".to_string());
 
             // Drain through the same shutdown helper the production
             // teardown paths use — this both flushes the writer's

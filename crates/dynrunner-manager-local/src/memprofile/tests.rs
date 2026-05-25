@@ -72,7 +72,7 @@ async fn assign_tick_complete_round_trip() {
     ));
 
     sampler.on_task_assigned(
-        Some("task-1".to_string()),
+        "task-1".to_string(),
         7,
         cg.path().to_path_buf(),
         Instant::now(),
@@ -83,7 +83,7 @@ async fn assign_tick_complete_round_trip() {
     // before the Assign command is processed in select! ordering).
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    sampler.on_task_completed(Some("task-1".to_string()));
+    sampler.on_task_completed("task-1".to_string());
     sampler.shutdown().await;
 
     let path = out.path().join("task-1.worker-7.memprofile.jsonl.zst");
@@ -116,7 +116,7 @@ async fn disconnect_with_active_task_flushes() {
     ));
 
     sampler.on_task_assigned(
-        Some("task-1".to_string()),
+        "task-1".to_string(),
         7,
         cg.path().to_path_buf(),
         Instant::now(),
@@ -156,7 +156,7 @@ async fn shutdown_race_no_panic() {
     ));
 
     sampler.on_task_assigned(
-        Some("task-1".to_string()),
+        "task-1".to_string(),
         7,
         cg.path().to_path_buf(),
         Instant::now(),
@@ -173,40 +173,11 @@ async fn shutdown_race_no_panic() {
     // acceptable — the test only documents no-panic + file-exists.
 }
 
-/// `task_id == None` is the legacy-task path: log at debug, skip
-/// silently, never open a file. The output directory stays empty.
-#[tokio::test(flavor = "current_thread")]
-async fn task_id_none_skipped() {
-    let out = tempdir().expect("out dir");
-    let cg = tempdir().expect("cg dir");
-    make_fake_cgroup(cg.path(), 1_024, 0);
-
-    let sampler = MemProfileSampler::spawn(config(
-        out.path().to_path_buf(),
-        Duration::from_millis(30),
-    ));
-
-    sampler.on_task_assigned(None, 7, cg.path().to_path_buf(), Instant::now());
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    sampler.shutdown().await;
-
-    let entries: Vec<_> = fs::read_dir(out.path())
-        .expect("read output dir")
-        .filter_map(Result::ok)
-        .collect();
-    assert!(
-        entries.is_empty(),
-        "no file should be created for task_id=None, found {:?}",
-        entries
-            .iter()
-            .map(|e| e.path())
-            .collect::<Vec<_>>(),
-    );
-}
-
 /// Defensive: a malformed `task_id` containing `..` or an absolute
 /// prefix must not let a task write outside the configured output
-/// dir. The sampler warn-logs and skips.
+/// dir. The sampler warn-logs and skips. (The framework's boundary
+/// contract makes `task_id` non-optional + non-empty; the unsafe-
+/// segment guard is the only remaining defensive check on this path.)
 #[tokio::test(flavor = "current_thread")]
 async fn unsafe_task_id_skipped() {
     let out = tempdir().expect("out dir");
@@ -219,13 +190,13 @@ async fn unsafe_task_id_skipped() {
     ));
 
     sampler.on_task_assigned(
-        Some("../../etc/passwd".to_string()),
+        "../../etc/passwd".to_string(),
         7,
         cg.path().to_path_buf(),
         Instant::now(),
     );
     sampler.on_task_assigned(
-        Some("/absolute/path".to_string()),
+        "/absolute/path".to_string(),
         8,
         cg.path().to_path_buf(),
         Instant::now(),
@@ -264,13 +235,13 @@ async fn slash_task_id_creates_nested_subdir() {
     ));
 
     sampler.on_task_assigned(
-        Some("nping/x86/clang/9/Os".to_string()),
+        "nping/x86/clang/9/Os".to_string(),
         3,
         cg.path().to_path_buf(),
         Instant::now(),
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    sampler.on_task_completed(Some("nping/x86/clang/9/Os".to_string()));
+    sampler.on_task_completed("nping/x86/clang/9/Os".to_string());
     sampler.shutdown().await;
 
     let path = out
@@ -300,13 +271,13 @@ async fn per_worker_isolation() {
     ));
 
     sampler.on_task_assigned(
-        Some("task-a".to_string()),
+        "task-a".to_string(),
         1,
         cg_a.path().to_path_buf(),
         Instant::now(),
     );
     sampler.on_task_assigned(
-        Some("task-b".to_string()),
+        "task-b".to_string(),
         2,
         cg_b.path().to_path_buf(),
         Instant::now(),
@@ -314,8 +285,8 @@ async fn per_worker_isolation() {
 
     tokio::time::sleep(Duration::from_millis(120)).await;
 
-    sampler.on_task_completed(Some("task-a".to_string()));
-    sampler.on_task_completed(Some("task-b".to_string()));
+    sampler.on_task_completed("task-a".to_string());
+    sampler.on_task_completed("task-b".to_string());
     sampler.shutdown().await;
 
     let path_a = out.path().join("task-a.worker-1.memprofile.jsonl.zst");

@@ -180,7 +180,7 @@ fn singleton_task(name: &str, phase: &str, type_str: &str) -> TaskInfo<TestId> {
         type_id: dynrunner_core::TypeId::from(type_str),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: Some(name.into()),
+        task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         resolved_path: None,

@@ -85,7 +85,7 @@ fn roundtrip_all_message_types() {
                 type_id: "default".into(),
                 affinity_id: None,
                 payload_json: "null".into(),
-                task_id: None,
+                task_id: "test-frame-task".into(),
                 task_depends_on: vec![],
                 preferred_secondaries: Default::default(),
             },

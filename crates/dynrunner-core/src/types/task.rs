@@ -39,19 +39,27 @@ pub struct TaskInfo<I> {
     /// Opaque per-item data passed through to the worker. The framework never
     /// inspects this; consumers can stash JSON-serializable metadata here.
     pub payload: serde_json::Value,
-    /// Optional consumer-supplied task identifier. Other tasks reference
-    /// this id from their `task_depends_on` to express a "wait for that
-    /// task to complete before dispatching me" ordering constraint.
-    /// `None` means the task cannot itself be referenced as a
-    /// prerequisite (anonymous task); it may still have its own
-    /// `task_depends_on` entries pointing at named tasks. Consumers
-    /// SHOULD pick stable, readable ids
-    /// (e.g. `"toolchain__aarch64__clang15"`) so the corresponding
-    /// dependent tasks can reference them without re-deriving a hash.
-    /// Validated for uniqueness across the run at
-    /// `PendingPool::extend` time.
-    #[serde(default)]
-    pub task_id: Option<String>,
+    /// Stable consumer-supplied task identifier. REQUIRED — every
+    /// task carries a non-empty id. Validated at the Python→Rust
+    /// boundary (`crate::pytypes::extract_binaries` + `PyTaskInfo`
+    /// construction) and again for uniqueness inside the run at
+    /// `PendingPool::extend` time. Producers that omit the id or
+    /// supply an empty string fail loudly at registration; the
+    /// silent-skip path that used to mask producer-side bugs is
+    /// gone.
+    ///
+    /// Other tasks reference this id from their `task_depends_on`
+    /// to express a "wait for that task to complete before
+    /// dispatching me" ordering constraint. Used by the memprofile
+    /// sampler for per-task file naming, by the retry tracker for
+    /// attempt-counting, and by the failure reporter to group
+    /// results by task identity. The framework treats it
+    /// opaquely; consumers compose whatever identity scheme makes
+    /// sense for their domain (asm-tokenizer uses slash-separated
+    /// paths like `nping/x86/clang/9/Os`). Pick stable, readable
+    /// ids so the corresponding dependent tasks can reference them
+    /// without re-deriving a hash.
+    pub task_id: String,
     /// Task ids of prerequisite tasks that must terminate (success
     /// OR permanent failure) before this task is eligible for
     /// dispatch. Default `Vec::new()` means "no per-task ordering

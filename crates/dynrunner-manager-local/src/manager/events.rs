@@ -71,9 +71,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     // present-but-undecodable payload still inserts
                     // an empty entry so dependents can rely on key
                     // presence.
-                    if let Some(bytes) = &result_data
-                        && let Some(task_id) = b.task_id.as_ref()
-                    {
+                    if let Some(bytes) = &result_data {
+                        // `task_id` is non-optional by the framework's
+                        // boundary contract.
+                        let task_id = &b.task_id;
                         match serde_json::from_slice::<dynrunner_core::DonePayload>(bytes) {
                             Ok(body) => {
                                 self.task_outputs_cache
@@ -100,9 +101,11 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 // restart the worker subprocess and trigger the next
                 // assignment) does not matter for correctness — the
                 // sampler's command queue serialises events.
-                self.notify_sampler_completed(
-                    binary.as_ref().and_then(|b| b.task_id.clone()),
-                );
+                if let Some(b) = binary.as_ref() {
+                    // `task_id` is non-optional by the framework's
+                    // boundary contract; clone the verbatim value.
+                    self.notify_sampler_completed(b.task_id.clone());
+                }
 
                 self.handle_task_completed(
                     worker_id,
@@ -317,7 +320,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         // (deferred when the item lands in a side queue; see
         // `LocalManager::process_drain_transitions`).
         if let Some(b) = binary {
-            self.record_phase_completion(&b.phase_id, result.success, b.task_id.as_deref());
+            // `task_id` is non-optional per the framework's boundary
+            // contract; pass the borrowed view to the pool helper
+            // (which still accepts `Option<&str>` because passing
+            // `None` is the documented "transient-failure" signal —
+            // a separate semantic concern from "task carried no id").
+            self.record_phase_completion(&b.phase_id, result.success, Some(b.task_id.as_str()));
         }
         if result.success {
             self.stats.completed += 1;

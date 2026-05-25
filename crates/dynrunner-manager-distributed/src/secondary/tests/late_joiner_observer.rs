@@ -65,7 +65,7 @@
                 type_id: dynrunner_core::TypeId::from("default"),
                 affinity_id: None,
                 payload: serde_json::Value::Null,
-                task_id: None,
+                task_id: ident.into(),
                 task_depends_on: vec![],
                 preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
                 resolved_path: None,

@@ -89,7 +89,7 @@ where
     pub(super) fn task_meta_for_hash(
         &self,
         hash: &str,
-    ) -> Option<(dynrunner_core::PhaseId, Option<String>)> {
+    ) -> Option<(dynrunner_core::PhaseId, String)> {
         let state = self.cluster_state.task_state(hash)?;
         let task = match state {
             TaskState::Pending { task }
@@ -153,10 +153,12 @@ where
         // list is the dependents that the pool just gave up on; how
         // the caller observes them depends on the error class
         // (cascade-pause for Unfulfillable, cascade-fail otherwise).
-        let cascaded_blocks: Vec<(String, String)> = if let Some(id) = task_id.as_deref() {
+        // `task_id` is non-optional per the framework's boundary
+        // contract.
+        let cascaded_blocks: Vec<(String, String)> = {
             let cascaded = self
                 .pool_mut()
-                .on_item_failed_permanent(&phase_id, id);
+                .on_item_failed_permanent(&phase_id, task_id.as_str());
             let is_unfulfillable = matches!(error, ErrorType::Unfulfillable { .. });
             let mut blocks = Vec::new();
             for cascaded_binary in &cascaded {
@@ -170,14 +172,12 @@ where
                 }
             }
             blocks
-        } else {
-            Vec::new()
         };
 
         // Phase + lifecycle bookkeeping. Must run AFTER the pool
         // mutation so `process_phase_lifecycle` observes the post-
         // cascade pool state.
-        self.note_item_failed(&phase_id, task_id.as_deref(), command_rx).await;
+        self.note_item_failed(&phase_id, Some(task_id.as_str()), command_rx).await;
 
         // Broadcast the terminal state for the originating task plus
         // any cascade-paused dependents (Unfulfillable case only).

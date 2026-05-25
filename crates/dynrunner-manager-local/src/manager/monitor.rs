@@ -187,14 +187,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     self.record_phase_completion(
                         &binary.phase_id,
                         false,
-                        binary.task_id.as_deref(),
+                        Some(binary.task_id.as_str()),
                     );
                     return;
                 }
                 self.record_phase_completion(
                     &binary.phase_id,
                     false,
-                    binary.task_id.as_deref(),
+                    Some(binary.task_id.as_str()),
                 );
                 self.resource_pressure_tasks.push(FailedTask {
                     binary: *binary,

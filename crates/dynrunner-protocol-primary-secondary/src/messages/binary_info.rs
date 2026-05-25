@@ -50,11 +50,13 @@ pub struct DistributedBinaryInfo<I> {
     /// the contents — it's pass-through metadata for the worker.
     #[serde(default = "default_payload_json")]
     pub payload_json: String,
-    /// Optional consumer-supplied task id (see `TaskInfo::task_id`).
-    /// Defaults to `None` for pre-task-deps senders so the wire
-    /// stays backward-compatible.
-    #[serde(default)]
-    pub task_id: Option<String>,
+    /// Consumer-supplied task id (see `TaskInfo::task_id`).
+    /// REQUIRED on the wire — every task carries a non-empty id by
+    /// the framework's boundary contract. No `#[serde(default)]`
+    /// so a pre-task-deps payload that omits the field fails the
+    /// decode loudly rather than silently land an empty/anonymous
+    /// task.
+    pub task_id: String,
     /// Per-edge dep records of prerequisites (see
     /// `TaskInfo::task_depends_on`). Defaults to empty for pre-task-deps
     /// senders. Wire backcompat: `TaskDep`'s `#[serde(untagged)]`
@@ -109,6 +111,8 @@ impl<I: Identifier> DistributedBinaryInfo<I> {
             // representation verbatim. `to_string` on `serde_json::Value`
             // is infallible.
             payload_json: task.payload.to_string(),
+            // `TaskInfo.task_id` is non-optional + non-empty per the
+            // framework boundary contract — verbatim move.
             task_id: task.task_id.clone(),
             task_depends_on: task.task_depends_on.clone(),
             preferred_secondaries: task.preferred_secondaries.clone(),

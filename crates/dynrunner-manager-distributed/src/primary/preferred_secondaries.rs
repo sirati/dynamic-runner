@@ -209,7 +209,7 @@ mod tests {
             type_id: TypeId::from("T"),
             affinity_id: None,
             payload: serde_json::Value::Null,
-            task_id: None,
+            task_id: name.into(),
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::new(
                 prefs.iter().map(|s| (*s).to_string()).collect(),
@@ -309,7 +309,9 @@ mod tests {
                 Some(AffinityId::from(affinity))
             },
             payload: serde_json::Value::Null,
-            task_id: None,
+            // Synthesise a unique fixture id from the bucket coords +
+            // size to avoid PendingPool dedup collisions across calls.
+            task_id: format!("{phase}_{ty}_{affinity}_{size}"),
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::new(
                 prefs.iter().map(|s| (*s).to_string()).collect(),

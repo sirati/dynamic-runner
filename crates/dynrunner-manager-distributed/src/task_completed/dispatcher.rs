@@ -136,14 +136,14 @@ mod tests {
         let dispatcher = tokio::spawn(run_task_completed_dispatcher(rx, listeners));
 
         tx.send(TaskCompletedEvent {
-            task_id: Some("a".into()),
+            task_id: "a".into(),
             task_hash: "h1".into(),
             success: true,
             error_kind: None,
         })
         .unwrap();
         tx.send(TaskCompletedEvent {
-            task_id: Some("b".into()),
+            task_id: "b".into(),
             task_hash: "h2".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
@@ -181,14 +181,14 @@ mod tests {
         let dispatcher = tokio::spawn(run_task_completed_dispatcher(rx, listeners));
 
         tx.send(TaskCompletedEvent {
-            task_id: None,
+            task_id: "a".into(),
             task_hash: "h1".into(),
             success: true,
             error_kind: None,
         })
         .unwrap();
         tx.send(TaskCompletedEvent {
-            task_id: Some("b".into()),
+            task_id: "b".into(),
             task_hash: "h2".into(),
             success: false,
             error_kind: Some("oom".into()),

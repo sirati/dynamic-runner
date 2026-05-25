@@ -62,7 +62,7 @@ fn phased_task(name: &str, phase: &str, size: u64) -> TaskInfo<TestId> {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: Some(name.into()),
+        task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
@@ -314,8 +314,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                         ..
                     } = msg
                     {
-                        let task_id = binary_info.task_id.unwrap_or_default();
-                        got.push((task_id, worker_id));
+                        got.push((binary_info.task_id, worker_id));
                     }
                 }
                 assignments.insert(sec_id, got);

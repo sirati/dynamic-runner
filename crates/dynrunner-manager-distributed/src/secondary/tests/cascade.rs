@@ -49,7 +49,7 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: None,
+        task_id: "variant".into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

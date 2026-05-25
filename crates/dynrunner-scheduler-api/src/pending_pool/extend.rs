@@ -24,7 +24,10 @@ impl<I: Identifier> PendingPool<I> {
     /// well-formedness:
     /// * `DuplicateTaskId` — a new item's `task_id` collides with
     ///   another in the same batch, or with an existing
-    ///   queued / blocked / completed / failed task.
+    ///   queued / blocked / completed / failed task. Hard error
+    ///   because the contract is "every task_id is unique within a
+    ///   run" — a collision is a producer-side bug that would
+    ///   otherwise mask one of the colliding tasks.
     /// * `UnknownTaskDep` — a `task_depends_on` entry references an id
     ///   that is not present in the union of (existing pool tasks,
     ///   batch tasks, completed tasks, failed tasks).
@@ -45,22 +48,20 @@ impl<I: Identifier> PendingPool<I> {
         let new_items: Vec<TaskInfo<I>> = items.into_iter().collect();
 
         // ---------- 1. Validate duplicate task_ids ----------
-        // Duplicate within batch.
+        // Duplicate within batch. `task_id` is non-optional per the
+        // boundary contract (see `dynrunner_core::types::task::TaskInfo`)
+        // so the dedup loop reads the field directly.
         let mut seen_in_batch: HashSet<&str> = HashSet::new();
         for item in &new_items {
-            if let Some(id) = item.task_id.as_deref()
-                && !seen_in_batch.insert(id)
-            {
-                return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
+            if !seen_in_batch.insert(item.task_id.as_str()) {
+                return Err(PendingPoolError::DuplicateTaskId(item.task_id.clone()));
             }
         }
         // Duplicate against existing state.
         let existing_ids = self.collect_known_task_ids();
         for item in &new_items {
-            if let Some(id) = item.task_id.as_deref()
-                && existing_ids.contains(id)
-            {
-                return Err(PendingPoolError::DuplicateTaskId(id.to_string()));
+            if existing_ids.contains(item.task_id.as_str()) {
+                return Err(PendingPoolError::DuplicateTaskId(item.task_id.clone()));
             }
         }
 
@@ -68,23 +69,14 @@ impl<I: Identifier> PendingPool<I> {
         // Known = existing pool tasks ∪ batch tasks ∪ completed ∪ failed.
         let mut known: HashSet<String> = existing_ids;
         for item in &new_items {
-            if let Some(id) = item.task_id.as_deref() {
-                known.insert(id.to_string());
-            }
+            known.insert(item.task_id.clone());
         }
         for item in &new_items {
-            let referenced_by = match item.task_id.as_deref() {
-                Some(id) => id.to_string(),
-                // Anonymous task with deps: validation still applies, but
-                // we have no id to report; use the path as a best-effort
-                // identifier so the error message is debuggable.
-                None => item.path.display().to_string(),
-            };
             for dep in &item.task_depends_on {
                 if !known.contains(&dep.task_id) {
                     return Err(PendingPoolError::UnknownTaskDep {
                         task: dep.task_id.clone(),
-                        referenced_by,
+                        referenced_by: item.task_id.clone(),
                     });
                 }
             }
@@ -117,12 +109,11 @@ impl<I: Identifier> PendingPool<I> {
                 indegree.entry(dep.clone()).or_insert(0);
             }
         }
-        // New batch nodes.
+        // New batch nodes. Every task carries a `task_id` (boundary
+        // contract); the cycle-check graph nodes are exactly the
+        // batch's task_ids unioned with the existing-blocked set.
         for item in &new_items {
-            let id = match item.task_id.as_deref() {
-                Some(s) => s.to_string(),
-                None => continue, // anonymous tasks aren't graph nodes
-            };
+            let id = item.task_id.clone();
             indegree.entry(id.clone()).or_insert(0);
             for dep in &item.task_depends_on {
                 if pre_resolved(&dep.task_id) {
@@ -213,9 +204,7 @@ impl<I: Identifier> PendingPool<I> {
             .iter()
             .any(|d| self.failed_tasks.contains(&d.task_id));
         if any_failed_dep {
-            if let Some(id) = item.task_id.as_deref() {
-                self.failed_tasks.insert(id.to_string());
-            }
+            self.failed_tasks.insert(item.task_id.clone());
             // Drop the TaskInfo — extend-time cascade does not surface
             // it (the consumer hasn't given us a place to land it
             // because it specified a hard prereq that's already failed).
@@ -232,8 +221,8 @@ impl<I: Identifier> PendingPool<I> {
 
         let task_id = item.task_id.clone();
         let phase_id = item.phase_id.clone();
-        if unresolved.is_empty() || task_id.is_none() {
-            // Ready (or anonymous): straight into the bucket.
+        if unresolved.is_empty() {
+            // Ready: straight into the bucket.
             let key = (phase_id, item.type_id.clone(), affinity_key(&item));
             self.buckets
                 .entry(key)
@@ -243,16 +232,15 @@ impl<I: Identifier> PendingPool<I> {
             return;
         }
         // Blocked: register in the dep maps and counters, NOT in any bucket.
-        let id = task_id.expect("checked above");
         for dep in &unresolved {
             self.dependents_of
                 .entry(dep.clone())
                 .or_default()
-                .push(id.clone());
+                .push(task_id.clone());
         }
-        self.task_deps.insert(id.clone(), unresolved);
+        self.task_deps.insert(task_id.clone(), unresolved);
         *self.blocked_per_phase.entry(phase_id).or_insert(0) += 1;
-        self.blocked.insert(id, item);
+        self.blocked.insert(task_id, item);
     }
 
     /// Return the union of every task_id the pool currently knows
@@ -262,9 +250,7 @@ impl<I: Identifier> PendingPool<I> {
         let mut out: HashSet<String> = HashSet::new();
         for bucket in self.buckets.values() {
             for item in &bucket.items {
-                if let Some(id) = item.task_id.as_deref() {
-                    out.insert(id.to_string());
-                }
+                out.insert(item.task_id.clone());
             }
         }
         for id in self.blocked.keys() {
