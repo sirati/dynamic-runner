@@ -278,12 +278,24 @@ pub struct SecondaryConfig {
     /// SLURM wrapper's `/app/out-network` bind-mount is present".
     /// `None` (default) disables profiling entirely.
     ///
-    /// The secondary's `WorkerPool` does not currently consume
-    /// this field — the sampler hookup (mirroring
-    /// `LocalManager::process_binaries`) is a separate follow-up.
-    /// The wire is in place so that future change is a single
-    /// constructor call against `WorkerPool::set_sampler` (or the
-    /// equivalent), with zero argv / config-struct churn.
+    /// `Some(path)` drives two coupled effects through
+    /// `SecondaryCoordinator::run_until_setup_or_done`:
+    ///   * `initialize_workers` flips the `mem_manager_reserved_bytes`
+    ///     argument to `Some(0)` if the operator did not already
+    ///     supply one, so per-worker cgroup-v2 leaves materialise
+    ///     under `<workers>/worker-<id>/` even when no
+    ///     enforcement reservation was configured;
+    ///   * a [`dynrunner_manager_local::memprofile::MemProfileSampler`]
+    ///     is spawned post-`initialize_workers` and its hooks fire
+    ///     from every assign / complete / disconnect site on the
+    ///     secondary (initial-assignment, peer-routed dispatch,
+    ///     primary self-assign, post-Ready pending-first-bind,
+    ///     `WorkerEvent::TaskCompleted`, `WorkerEvent::Disconnected`).
+    ///     The sampler is drained before every worker-pool teardown
+    ///     path (`stop_all_workers`, `kill_all_workers_with_grace`).
+    ///
+    /// `None` leaves the workers cgroup behaviour untouched and
+    /// every hook short-circuits as a no-op.
     pub output_dir: Option<PathBuf>,
 }
 
