@@ -25,6 +25,9 @@ thiserror = { workspace = true }
 # the document via `serde_json::json!` keeps field-name shape
 # the consumer locked in lined up with one source of truth.
 serde_json = { workspace = true }
+# Per-task memprofile `Sample` derives `Serialize` so each frame's
+# JSON payload comes from one schema-of-truth (`memprofile::sample`).
+serde = { workspace = true }
 # Per-task memory profile sink: zstd-framed JSONL (one self-contained
 # frame per sample so a hard manager death loses at most the
 # in-flight sample). `default-features = false` keeps us off the
