@@ -20,6 +20,7 @@ use dynrunner_scheduler_api::WorkerBudgetInfo;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::cgroup::SubcgroupHandle;
 use crate::monitor::{ProcStatmMonitor, ResourceMonitor};
 
 use super::event::WorkerEvent;
@@ -44,6 +45,19 @@ pub struct WorkerHandle<M: ManagerEndpoint, I: Identifier> {
     pub actual_usage: ResourceMap,
     pub assignment_failure_count: u32,
     pub pid: Option<u32>,
+    /// Per-worker cgroup-v2 leaf the pool's spawn site materialised
+    /// before handing the borrow to `WorkerFactory::spawn_worker`'s
+    /// `pre_exec` for pid-attachment. `None` when the runtime does
+    /// not support delegated cgroup-v2 nesting (graceful-fallback
+    /// contract on [`crate::cgroup::prepare_worker_subgroup`]).
+    ///
+    /// Lifetime is the worker's lifetime: dropping the handle (slot
+    /// replacement, pool teardown) runs the `SubcgroupHandle::Drop`
+    /// best-effort rmdir on the leaf. The [`Self::subcgroup_dir`]
+    /// accessor exposes the leaf path to the memprofile sampler so
+    /// it can read `memory.current` / `memory.stat` at task-assigned
+    /// time.
+    pub subcgroup: Option<SubcgroupHandle>,
     /// `TypeId` the worker subprocess was last spawned (or respawned)
     /// for. `None` until the pool has loaded a type into this slot —
     /// typically because the factory's freshly-initialised spawn did
@@ -92,6 +106,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
             actual_usage: ResourceMap::new(),
             assignment_failure_count: 0,
             pid: None,
+            subcgroup: None,
             loaded_type_id: None,
             phase: None,
             last_keepalive: None,
@@ -105,6 +120,21 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerHandle<M, I> {
 
     pub fn is_ready(&self) -> bool {
         self.protocol.is_idle() || self.protocol.is_processing()
+    }
+
+    /// `<workers>/worker-<id>/` path the pool's spawn site
+    /// materialised for this worker, when a per-worker cgroup-v2
+    /// leaf was created. `None` covers the graceful-fallback case
+    /// (host does not support delegated cgroup-v2 nesting).
+    ///
+    /// Surfaced for the memprofile sampler so it can read
+    /// `memory.current` / `memory.stat` from the leaf at
+    /// task-assigned time; production code in the pool itself does
+    /// not need this — the borrow handed to
+    /// `WorkerFactory::spawn_worker` carries everything the
+    /// `pre_exec` needs for pid-attachment.
+    pub fn subcgroup_dir(&self) -> Option<&std::path::Path> {
+        self.subcgroup.as_ref().map(|h| h.cgroup_dir())
     }
 
     /// Reap the worker subprocess if the framework tracks its PID, and

@@ -59,6 +59,7 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
     fn spawn_worker(
         &mut self,
         _worker_id: u32,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
         let (manager_end, runner_end) = channel_pair();
         tokio::task::spawn_local(async move {

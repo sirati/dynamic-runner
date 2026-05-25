@@ -114,6 +114,7 @@ impl WorkerFactory<ChannelManagerEnd> for TypedFakeWorkerFactory {
     fn spawn_worker(
         &mut self,
         _worker_id: dynrunner_core::WorkerId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
         spawn_fake_worker_task(Duration::ZERO)
     }
@@ -122,6 +123,7 @@ impl WorkerFactory<ChannelManagerEnd> for TypedFakeWorkerFactory {
         &mut self,
         _worker_id: dynrunner_core::WorkerId,
         type_id: &dynrunner_core::TypeId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
         self.type_shift_spawns
             .set(self.type_shift_spawns.get() + 1);
