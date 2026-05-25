@@ -129,6 +129,7 @@ pub(super) fn spawn_real_secondary_with_src_network(
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
             output_dir: None,
+            memuse_log_path: None,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -190,6 +191,7 @@ pub(super) fn spawn_real_secondary_slow(
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
             output_dir: None,
+            memuse_log_path: None,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,
@@ -257,6 +259,7 @@ pub(super) fn spawn_real_secondary_flaky(
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
             output_dir: None,
+            memuse_log_path: None,
         };
         let mut secondary = SecondaryCoordinator::new(
             config,

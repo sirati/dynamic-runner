@@ -411,6 +411,7 @@ async fn run_singleton_chain_with_factory(
         mem_manager_reserved_bytes: None,
         oom_retry_max_passes: 1,
         output_dir: None,
+        memuse_log_path: None,
     };
 
     let keepalive_arrivals: std::rc::Rc<std::cell::RefCell<Vec<Duration>>> =

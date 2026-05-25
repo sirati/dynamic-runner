@@ -65,6 +65,18 @@ impl PyDistributedManager {
                 self.memprofile_enabled,
                 Some(self.output_dir.as_path()),
             );
+        // Same shape as `PySecondaryCoordinator::run`: derive the
+        // memuse log path on the GIL thread so every per-secondary
+        // spawn closure clones it as a ready-made
+        // `Option<PathBuf>`. Defaults to
+        // `{self.output_dir}/memuse.log`; `None` only if
+        // `self.output_dir` is itself unset (it isn't — the field
+        // is always populated by the constructor).
+        let memuse_log_path =
+            dynrunner_manager_local::memuse::derive_memuse_log_path(
+                Some(self.output_dir.as_path()),
+                None,
+            );
 
         // Pre-compute per-secondary log directories under the GIL —
         // `resolve_log_dir` calls into Python's `datetime` module —
@@ -336,6 +348,7 @@ impl PyDistributedManager {
                     let sec_panik_paths = panik_watcher_paths.clone();
                     let sec_panik_poll = panik_watcher_poll_interval;
                     let sec_memprofile_output_dir = memprofile_output_dir.clone();
+                    let sec_memuse_log_path = memuse_log_path.clone();
 
                     let handle = tokio::task::spawn_local(async move {
                         let transport = ChannelPrimaryTransportEnd {
@@ -411,6 +424,13 @@ impl PyDistributedManager {
                             // path symmetrically with the SLURM and
                             // multi-computer-local secondaries.
                             output_dir: sec_memprofile_output_dir.clone(),
+                            // Default-on aggregate memuse log under
+                            // `{self.output_dir}/memuse.log`. Same
+                            // shape every other dispatch path
+                            // produces; preserves the
+                            // `Option<PathBuf>` test-fixture
+                            // flexibility (None = silent).
+                            memuse_log_path: sec_memuse_log_path.clone(),
                         };
 
                         let estimator = sec_estimator;

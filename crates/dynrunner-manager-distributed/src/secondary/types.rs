@@ -298,6 +298,17 @@ pub struct SecondaryConfig {
     /// `None` leaves the workers cgroup behaviour untouched and
     /// every hook short-circuits as a no-op.
     pub output_dir: Option<PathBuf>,
+
+    /// Path the per-task `WorkerEvent::TaskCompleted` handler
+    /// appends a CSV row to for every task completion. Mirrors
+    /// `LocalManagerConfig::memuse_log_path`; resolved at the
+    /// PyO3 boundary via
+    /// [`dynrunner_manager_local::memuse::derive_memuse_log_path`]
+    /// from the operator's run-level output dir (default:
+    /// `{output_dir}/memuse.log`). `None` keeps the secondary
+    /// silent — preserves the test-fixture flexibility every
+    /// other dispatch path has.
+    pub memuse_log_path: Option<PathBuf>,
 }
 
 impl Default for SecondaryConfig {
@@ -328,6 +339,7 @@ impl Default for SecondaryConfig {
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
             output_dir: None,
+            memuse_log_path: None,
         }
     }
 }

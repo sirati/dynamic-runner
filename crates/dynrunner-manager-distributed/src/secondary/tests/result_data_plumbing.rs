@@ -146,6 +146,7 @@ async fn worker_event_task_completed_forwards_result_data_to_distributed_message
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let binary = make_binary("payload-task", 100);

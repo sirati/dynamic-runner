@@ -68,6 +68,18 @@ impl PySecondaryCoordinator {
             self.memprofile_enabled,
             Some(self.output_dir.as_path()),
         );
+        // Compose the per-secondary memuse log path on the GIL
+        // thread so the spawn closure receives a ready-made
+        // `Option<PathBuf>`. Defaults to
+        // `{self.output_dir}/memuse.log` so every dispatch path
+        // writes the same shape; preserves the
+        // `Option<PathBuf>` shape (None = disabled) for tests
+        // and operators who want to opt out.
+        let cfg_memuse_log_path =
+            dynrunner_manager_local::memuse::derive_memuse_log_path(
+                Some(self.output_dir.as_path()),
+                None,
+            );
         // Per-type subprocess dispatch: the factory carries the full
         // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
         // for initial pool init (preserves pre-fix single-type
@@ -349,6 +361,7 @@ impl PySecondaryCoordinator {
                     unfulfillable_reinject_max_per_task,
                     mem_manager_reserved_bytes: cfg_mem_manager_reserved_bytes,
                     output_dir: memprofile_output_dir.clone(),
+                    memuse_log_path: cfg_memuse_log_path.clone(),
                 };
 
                 let mut factory = SubprocessWorkerFactory {

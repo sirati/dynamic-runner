@@ -360,6 +360,12 @@ impl PySecondaryConfig {
             // through `to_rust` don't accidentally get a
             // half-resolved sampler path.
             output_dir: None,
+            // Same rationale as `output_dir`: the live
+            // construction site derives the memuse log path from
+            // `self.output_dir`; this opt-out wrapper stays
+            // silent so callers that go through it don't pick
+            // up an unintended log target.
+            memuse_log_path: None,
         }
     }
 }

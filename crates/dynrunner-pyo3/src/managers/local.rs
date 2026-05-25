@@ -275,7 +275,18 @@ impl PyLocalManager {
         let estimator = self.estimator.clone();
         let scheduler = self.scheduler_config.build_memory_scheduler();
 
-        let memuse_log_path = Some(self.output_dir.join("memuse.log"));
+        // Shared derivation: every dispatch path with an
+        // `output_dir` defaults memuse logging on under
+        // `{output_dir}/memuse.log`. Pre-shared-helper this site
+        // hard-coded the join inline and the secondary paths
+        // (SLURM / in-process distributed / multi-computer-local
+        // subprocess) silently shipped without the log; the
+        // `derive_memuse_log_path` helper pins the filename so
+        // every caller picks the same shape.
+        let memuse_log_path = dynrunner_manager_local::memuse::derive_memuse_log_path(
+            Some(self.output_dir.as_path()),
+            None,
+        );
 
         let restart_predicate = self.restart_predicate.as_ref().map(|cb| {
             let cb = cb.clone_ref(py);

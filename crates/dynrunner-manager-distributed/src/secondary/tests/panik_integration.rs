@@ -90,6 +90,7 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =
@@ -350,6 +351,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =
