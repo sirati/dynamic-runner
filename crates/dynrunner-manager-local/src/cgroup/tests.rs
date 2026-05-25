@@ -230,6 +230,95 @@ fn workers_with_existing_pids_skips_subtree_control() {
 }
 
 #[test]
+fn self_move_into_secondary_when_leaf_has_only_self_pid() {
+    // Bare `systemd-run --user --scope` case: the secondary is the
+    // ONLY pid in the leaf. The writer must move us into a
+    // `<leaf>/secondary/` sub-cgroup so the subsequent
+    // subtree_control write on the leaf doesn't trip the cgroup-v2
+    // "no internal processes" rule.
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+    let self_pid = std::process::id();
+    write_fixture(&leaf.join("cgroup.procs"), &format!("{self_pid}\n"));
+
+    let workers_path = super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    assert_eq!(workers_path, leaf.join("workers"));
+
+    let secondary_dir = leaf.join("secondary");
+    assert!(
+        secondary_dir.is_dir(),
+        "expected <leaf>/secondary/ to be created by the self-move"
+    );
+    let moved_procs = std::fs::read_to_string(secondary_dir.join("cgroup.procs")).unwrap();
+    assert_eq!(
+        moved_procs.trim(),
+        self_pid.to_string(),
+        "<leaf>/secondary/cgroup.procs should contain our pid post-move"
+    );
+}
+
+#[test]
+fn self_move_is_noop_when_leaf_procs_is_empty() {
+    // Container case: the runtime nested us in a sub-cgroup already,
+    // so the leaf's cgroup.procs is empty. No self-move needed; the
+    // subtree_control write below works directly.
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+    write_fixture(&leaf.join("cgroup.procs"), "");
+
+    super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+
+    assert!(
+        !leaf.join("secondary").exists(),
+        "no self-move expected when leaf already has no pids"
+    );
+}
+
+#[test]
+fn self_move_skipped_when_leaf_has_foreign_pids() {
+    // Mixed-pid case: leaf contains a pid we don't own (e.g. some
+    // sibling tool the operator left running). We can't safely move
+    // foreign processes, so the writer warns and the subsequent
+    // subtree_control write proceeds — and would fail under a real
+    // kernel; under the tempdir fake it silently succeeds because
+    // we're writing to a regular file.
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+    let self_pid = std::process::id();
+    write_fixture(
+        &leaf.join("cgroup.procs"),
+        &format!("{self_pid}\n99999999\n"),
+    );
+
+    super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+
+    assert!(
+        !leaf.join("secondary").exists(),
+        "self-move must not happen when foreign pids are present"
+    );
+}
+
+#[test]
+fn self_move_is_idempotent() {
+    // Re-running the writer must not error or double-write — once
+    // self-moved, the leaf's cgroup.procs is empty (on a real kernel
+    // it would be; in the tempdir we manually clear it to simulate
+    // the post-move state).
+    let root = tempfile::tempdir().unwrap();
+    let leaf = make_fake_leaf(root.path(), "memory pids\n", "1073741824\n");
+    let self_pid = std::process::id();
+    write_fixture(&leaf.join("cgroup.procs"), &format!("{self_pid}\n"));
+
+    super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    // Simulate the kernel's post-move state: leaf cgroup.procs empty.
+    write_fixture(&leaf.join("cgroup.procs"), "");
+
+    // Second call must succeed (mkdir is idempotent, no-op branch).
+    super::writer::write_workers_subgroup(&leaf, 0).unwrap();
+    assert!(leaf.join("secondary").is_dir());
+}
+
+#[test]
 fn prepare_worker_subgroup_creates_leaf_with_swap_max() {
     let root = tempfile::tempdir().unwrap();
     let leaf = make_fake_leaf(root.path(), "memory pids\n", "max\n");

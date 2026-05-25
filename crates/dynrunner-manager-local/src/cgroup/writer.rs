@@ -123,6 +123,16 @@ pub(super) fn write_workers_subgroup(
     leaf: &Path,
     reserved_bytes: u64,
 ) -> Result<PathBuf, CgroupSetupError> {
+    // cgroup-v2 "no internal processes" rule: a cgroup with
+    // `subtree_control` set may NOT directly contain processes. Under
+    // a bare `systemd-run --user --scope` the secondary IS the only
+    // pid in the leaf, so the upcoming `enable_controller(leaf, ...)`
+    // would hit EBUSY/EACCES. Self-move our pid into `<leaf>/secondary/`
+    // first so the leaf is empty of procs. No-op under rootless-podman
+    // (the secondary lives in a runtime-managed sub-cgroup already, so
+    // `<leaf>/cgroup.procs` is empty when we get here).
+    self_move_into_secondary_if_needed(leaf)?;
+
     let workers_path = leaf.join("workers");
     std::fs::create_dir_all(&workers_path).map_err(CgroupSetupError::Io)?;
 
@@ -193,6 +203,72 @@ pub(super) fn write_worker_subgroup(
     std::fs::create_dir_all(&worker_path).map_err(CgroupSetupError::Io)?;
     std::fs::write(worker_path.join("memory.swap.max"), "max").map_err(CgroupSetupError::Io)?;
     Ok(worker_path)
+}
+
+/// Move our own pid into `<leaf>/secondary/` so the leaf becomes
+/// empty of processes and the kernel allows the upcoming
+/// `subtree_control` write on it. Required when the secondary IS the
+/// only pid in the leaf (bare `systemd-run --user --scope` case);
+/// no-op when the secondary is already nested below the leaf
+/// (rootless-podman puts the container init in a runtime-managed
+/// sub-cgroup, leaving `<leaf>/cgroup.procs` empty).
+///
+/// Behaviour by leaf state:
+/// - `cgroup.procs` empty → no move; return `Ok(())`.
+/// - `cgroup.procs` contains ONLY our own pid → mkdir
+///   `<leaf>/secondary/` (idempotent), write our pid into its
+///   `cgroup.procs`, return `Ok(())`. Re-running this on the same
+///   leaf is itself a no-op because once we've moved, the leaf is
+///   empty and we hit the first branch.
+/// - `cgroup.procs` contains foreign pids → warn and return `Ok(())`
+///   WITHOUT attempting the move (we don't own those processes).
+///   The caller's subsequent `enable_controller(leaf, ...)` will
+///   then fail with EBUSY/EACCES and surface as a real error; the
+///   `secondary/` self-move is the only safe rescue we can offer.
+///
+/// We do NOT rmdir `<leaf>/secondary/` on shutdown: the kernel
+/// preserves empty cgroups until the parent is removed, and the
+/// `systemd-run` scope / podman container teardown removes the whole
+/// tree at process exit. The orphan empty leaf is harmless.
+fn self_move_into_secondary_if_needed(leaf: &Path) -> Result<(), CgroupSetupError> {
+    let leaf_procs = leaf.join("cgroup.procs");
+    let content = match std::fs::read_to_string(&leaf_procs) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(CgroupSetupError::Io(e)),
+    };
+
+    let pids: Vec<u32> = content
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect();
+
+    if pids.is_empty() {
+        return Ok(());
+    }
+
+    let self_pid = std::process::id();
+    let foreign_pids: Vec<u32> = pids.iter().copied().filter(|&p| p != self_pid).collect();
+    if !foreign_pids.is_empty() {
+        tracing::warn!(
+            leaf = %leaf.display(),
+            foreign_pid_count = foreign_pids.len(),
+            "leaf cgroup contains foreign pids; cannot self-move. \
+             subtree_control write will likely fail and trip the orchestrator's fallback."
+        );
+        return Ok(());
+    }
+
+    let secondary_path = leaf.join("secondary");
+    std::fs::create_dir_all(&secondary_path).map_err(CgroupSetupError::Io)?;
+    std::fs::write(secondary_path.join("cgroup.procs"), self_pid.to_string())
+        .map_err(CgroupSetupError::Io)?;
+    tracing::info!(
+        leaf = %leaf.display(),
+        self_pid,
+        "self-moved into <leaf>/secondary/ so leaf subtree_control is writable"
+    );
+    Ok(())
 }
 
 /// Read `<workers>/cgroup.procs`; return `true` if any non-whitespace
