@@ -15,13 +15,20 @@
 //!   `cgroup_root` so tests can drive the flow against a tempdir-
 //!   rooted fake `/sys/fs/cgroup`. Production callers go through
 //!   [`setup_worker_cgroup_default`].
-//! * [`NestedCgroupHandle`] — opaque RAII-style holder of the
+//! * [`NestedCgroupHandle`] — opaque holder of the
 //!   workers/ path. Carried on the worker pool; cloned into each
-//!   `WorkerFactory` so the spawn site can attach the child PID
+//!   `WorkerFactory` so the spawn site can reach per-worker leaves
 //!   without re-traversing the cgroup tree.
-//! * [`attach_pid`] — single-call primitive that writes a pid to
-//!   `<workers>/cgroup.procs`. Called from the spawn site's
-//!   `pre_exec` closure after `fork(2)` and before `execve(2)`.
+//! * [`prepare_worker_subgroup`] — per-worker leaf factory. Called
+//!   once per OS worker process at spawn time; returns a
+//!   [`SubcgroupHandle`] whose `Drop` best-effort `rmdir`s the leaf.
+//! * [`SubcgroupHandle::attach_pid`] — single-call primitive that
+//!   writes a pid to `<worker-N>/cgroup.procs`. Called from the spawn
+//!   site's `pre_exec` closure after `fork(2)` and before
+//!   `execve(2)`. Replaces the previous top-level `attach_pid`
+//!   primitive (deleted): the cgroup-v2 "no internal processes" rule
+//!   forbids pids in `<workers>/cgroup.procs` once subtree_control is
+//!   enabled on it.
 //!
 //! Graceful fallback contract: any of (a) not cgroup-v2, (b) no
 //! `memory` controller exposed on the leaf, (c) leaf not writable
@@ -47,22 +54,23 @@ const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
 
 /// Opaque handle to the materialised `workers/` subgroup. Held on
 /// the worker pool for the run lifetime; cloned/referenced by every
-/// worker `Command` builder so the per-spawn `pre_exec` closure can
-/// reach `cgroup.procs` without a fresh cgroup-tree walk.
+/// per-worker subgroup factory call so the spawn site can reach the
+/// per-worker leaves without a fresh cgroup-tree walk.
 #[derive(Debug, Clone)]
 pub struct NestedCgroupHandle {
     /// Absolute path to the `<leaf>/workers/` directory the setup
-    /// flow materialised. Used directly by [`attach_pid`] (which
-    /// joins `cgroup.procs`) and exposed via [`Self::workers_path`]
-    /// for callers that need the directory itself (e.g. teardown).
+    /// flow materialised. Consumed by [`prepare_worker_subgroup`]
+    /// (which `mkdir`s a `worker-<id>/` leaf beneath it) and
+    /// exposed via [`Self::workers_path`] for callers that need the
+    /// directory itself (e.g. teardown).
     workers_path: PathBuf,
 }
 
 impl NestedCgroupHandle {
     /// The absolute `<leaf>/workers/` path the setup flow created.
     /// Production callers shouldn't need this — they use
-    /// [`attach_pid`] — but it's surfaced for diagnostic logging
-    /// and tests that assert on the materialised layout.
+    /// [`prepare_worker_subgroup`] — but it's surfaced for diagnostic
+    /// logging and tests that assert on the materialised layout.
     pub fn workers_path(&self) -> &Path {
         &self.workers_path
     }
@@ -157,20 +165,118 @@ pub fn setup_worker_cgroup(
     Ok(Some(NestedCgroupHandle { workers_path }))
 }
 
-/// Attach `pid` to the workers subgroup represented by `handle`.
-/// Single-syscall primitive used from a spawn-side `pre_exec`
-/// closure where the child has just `fork()`ed and needs to land in
-/// the workers cgroup before `execve(2)`.
+/// Handle to a per-worker sub-cgroup `<workers>/worker-<id>/`.
+/// Constructed by [`prepare_worker_subgroup`]; carried on the worker
+/// pool's `WorkerHandle` for the worker's lifetime so the memprofile
+/// sampler can read `memory.current` without re-walking the cgroup
+/// tree, and so [`Self::attach_pid`] can route the pid into the leaf
+/// from a `pre_exec` closure.
 ///
-/// Returns `std::io::Error` on failure so the caller (a `pre_exec`
-/// closure) can propagate the error through `Result<(), io::Error>`
-/// — the kernel will then abort the exec and the parent's
-/// `Command::spawn` returns the same error. Failures here are
-/// near-impossible in production (the path was validated during
-/// setup) but propagated rather than swallowed to surface kernel-
-/// level regressions loudly.
-pub fn attach_pid(handle: &NestedCgroupHandle, pid: u32) -> std::io::Result<()> {
-    writer::write_attach_pid(&handle.workers_path, pid)
+/// On `Drop`: best-effort `rmdir` of the leaf. Empty leaf (worker
+/// exited cleanly, kernel reaped the `cgroup.procs` entry) →
+/// succeeds. Non-empty (process still attached, e.g. zombie or hard
+/// shutdown) → swallowed with one warn line. Already-gone (concurrent
+/// teardown or kernel auto-removal) → silent.
+///
+/// Single concern: own one per-worker leaf's lifetime. Knows nothing
+/// about the parent `workers/` setup, controller probing, or
+/// `memory.max` math — those live entirely in the orchestrator path
+/// ([`setup_worker_cgroup`] + [`writer::write_workers_subgroup`]).
+#[derive(Debug)]
+pub struct SubcgroupHandle {
+    /// Absolute path to the `<workers>/worker-<id>/` directory the
+    /// per-worker setup materialised. Carried so `attach_pid` can
+    /// hit `cgroup.procs` without a re-walk and so `Drop` knows
+    /// where to `rmdir`.
+    cgroup_dir: PathBuf,
+}
+
+impl SubcgroupHandle {
+    /// The absolute `<workers>/worker-<id>/` path. Surfaced for the
+    /// memprofile sampler (which reads `memory.current`,
+    /// `memory.swap.current`, `memory.stat` underneath this dir) and
+    /// for diagnostic logging.
+    pub fn cgroup_dir(&self) -> &Path {
+        &self.cgroup_dir
+    }
+
+    /// Write `pid` (decimal) to `<cgroup_dir>/cgroup.procs`. The
+    /// kernel migrates the named pid into the per-worker leaf at the
+    /// moment of the write.
+    ///
+    /// **fork-safety:** this method is callable from a `pre_exec`
+    /// closure post-fork pre-exec. The implementation does exactly
+    /// one open + one write + one close via `std::fs::write`. DO NOT
+    /// add logging, formatting, panics, or other async-signal-unsafe
+    /// calls — those would corrupt the child. The small heap
+    /// allocation inside `pid.to_string()` and the equivalent
+    /// allocation inside `std::fs::write`'s path-join are part of the
+    /// stdlib's tolerated post-fork allocator activity (the
+    /// immediate open-write-close sequence has no observable race
+    /// window between alloc and exec); callers that want absolute
+    /// zero-allocation pre_exec should pre-format the pid in the
+    /// parent and call into a lower-level write helper.
+    pub fn attach_pid(&self, pid: u32) -> std::io::Result<()> {
+        std::fs::write(self.cgroup_dir.join("cgroup.procs"), pid.to_string())
+    }
+}
+
+impl Drop for SubcgroupHandle {
+    /// Best-effort `rmdir` of the per-worker leaf. Three outcomes:
+    ///
+    ///   * Empty leaf (worker exited cleanly) → `rmdir` succeeds.
+    ///   * Non-empty leaf (worker still attached: zombie, hard kill
+    ///     before the kernel reaped `cgroup.procs`) → `ENOTEMPTY`,
+    ///     swallowed with one warn line so an operator can find the
+    ///     stale leaf manually if needed.
+    ///   * Already gone (concurrent teardown, kernel auto-removal on
+    ///     last-pid-exit) → `ENOENT`, silent.
+    ///
+    /// Other `ErrorKind`s (permission errors, transient sysfs
+    /// failures) emit one warn line and proceed — `Drop` cannot
+    /// propagate failures, but we surface them so they're not
+    /// silently lost.
+    fn drop(&mut self) {
+        match std::fs::remove_dir(&self.cgroup_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                tracing::warn!(
+                    cgroup_dir = %self.cgroup_dir.display(),
+                    "subcgroup rmdir failed: directory not empty (worker still attached?)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cgroup_dir = %self.cgroup_dir.display(),
+                    error = %e,
+                    "subcgroup rmdir failed"
+                );
+            }
+        }
+    }
+}
+
+/// Create `<workers>/worker-<id>/` and return a [`SubcgroupHandle`]
+/// scoped to the worker's lifetime. Called by the pool spawn-site
+/// once per OS worker process; the handle drops when the worker
+/// exits, which attempts `rmdir` on the leaf.
+///
+/// `parent` is the existing handle pointing at `<workers>/`. The leaf
+/// inherits `<workers>/memory.max` (no per-worker enforcement cap by
+/// design — observability only). `memory.swap.max` is forced to
+/// `"max"` on the leaf for the same load-bearing reason it's forced
+/// on the parent (cgroup-v2 children default to zero-swap).
+///
+/// Idempotent: re-running with the same `worker_id` against an
+/// already-materialised leaf is a no-op (`create_dir_all` re-entrant,
+/// `memory.swap.max` write is overwrite).
+pub fn prepare_worker_subgroup(
+    parent: &NestedCgroupHandle,
+    worker_id: u32,
+) -> Result<SubcgroupHandle, CgroupSetupError> {
+    let cgroup_dir = writer::write_worker_subgroup(parent.workers_path(), worker_id)?;
+    Ok(SubcgroupHandle { cgroup_dir })
 }
 
 /// Resolve the calling process's cgroup-v2 leaf by reading
