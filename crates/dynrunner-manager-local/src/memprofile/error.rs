@@ -42,6 +42,14 @@ pub enum MemProfileError {
         line: Option<usize>,
         message: String,
     },
+
+    /// A sample could not be serialised to JSON on the write path.
+    /// Separate from [`Self::Parse`] (which is read-side) so callers
+    /// matching on the variant can distinguish "kernel handed us
+    /// something we couldn't decode" from "we tried to encode our
+    /// own struct and it failed".
+    #[error("memprofile serialize at {path}: {message}")]
+    Serialize { path: PathBuf, message: String },
 }
 
 impl MemProfileError {
@@ -66,6 +74,15 @@ impl MemProfileError {
         Self::Parse {
             path: path.into(),
             line,
+            message: message.into(),
+        }
+    }
+
+    /// Construct an [`MemProfileError::Serialize`] from a path and
+    /// the serde-side failure message.
+    pub(crate) fn serialize(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
+        Self::Serialize {
+            path: path.into(),
             message: message.into(),
         }
     }

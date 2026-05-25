@@ -48,9 +48,8 @@ impl JsonlZstdWriter {
     /// write(json + '\n') → finish() sequence so the frame is
     /// fully flushed to disk before returning.
     pub fn write_sample_as_frame(&mut self, sample: &Sample) -> Result<(), MemProfileError> {
-        let json = serde_json::to_vec(sample).map_err(|e| {
-            MemProfileError::parse(self.path.clone(), None, format!("serde_json: {e}"))
-        })?;
+        let json = serde_json::to_vec(sample)
+            .map_err(|e| MemProfileError::serialize(self.path.clone(), e.to_string()))?;
 
         let mut encoder = zstd::stream::write::Encoder::new(&mut self.file, ZSTD_LEVEL)
             .map_err(|e| MemProfileError::io(self.path.clone(), e))?;
