@@ -73,6 +73,12 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 self.total_assigned_resources.sub(&estimated);
             }
 
+            // Flush the in-flight memprofile BEFORE restart_worker drops
+            // the SubcgroupHandle (rmdir of the leaf): this is a third
+            // worker-kill path that bypasses the events.rs Disconnected
+            // route, so the sampler needs an explicit nudge.
+            self.notify_sampler_disconnected(worker_id);
+
             // Restart the worker
             self.restart_worker(worker_id, factory).await;
             self.pending_worker_assignments.insert(worker_id);
