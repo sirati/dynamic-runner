@@ -37,6 +37,7 @@ impl WorkerFactory<SocketpairManagerEnd> for PythonWorkerFactory {
     fn spawn_worker(
         &mut self,
         worker_id: WorkerId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(SocketpairManagerEnd, Option<u32>), String> {
         let (manager_end, child_fd) =
             create_socketpair().expect("failed to create socketpair");

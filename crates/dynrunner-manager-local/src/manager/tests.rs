@@ -176,6 +176,7 @@ async fn always_restart_worker_respawns_after_success() {
         fn spawn_worker(
             &mut self,
             _worker_id: WorkerId,
+            _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
             let (manager_end, runner_end) = channel_pair();
@@ -324,6 +325,7 @@ async fn non_recoverable_error_restarts_worker_and_continues() {
         fn spawn_worker(
             &mut self,
             _worker_id: WorkerId,
+            _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             let count = self.spawn_count.fetch_add(1, Ordering::SeqCst);
             let (manager_end, runner_end) = channel_pair();
@@ -471,6 +473,7 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
         fn spawn_worker(
             &mut self,
             _worker_id: WorkerId,
+            _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             self.spawns.lock().unwrap().push(None);
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
@@ -483,6 +486,7 @@ async fn ensure_worker_for_type_respawns_on_type_shift_and_is_idempotent_on_matc
             &mut self,
             _worker_id: WorkerId,
             type_id: &TypeId,
+            _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             self.spawns.lock().unwrap().push(Some(type_id.clone()));
             let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);

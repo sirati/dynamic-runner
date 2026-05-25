@@ -58,6 +58,7 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
     fn spawn_worker(
         &mut self,
         _worker_id: WorkerId,
+        _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
     ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
         let (manager_end, runner_end) = channel_pair();
         let mode = self.mode.clone();

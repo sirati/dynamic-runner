@@ -35,6 +35,7 @@ impl WorkerFactory<ChannelManagerEnd> for PayloadWorkerFactory {
     fn spawn_worker(
         &mut self,
         _worker_id: WorkerId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
         let (manager_end, runner_end) = channel_pair();
         let payload = self.payload.clone();

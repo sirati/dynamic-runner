@@ -141,6 +141,7 @@ impl WorkerFactory<EitherManagerEnd> for NamedSocketWorkerFactory {
     fn spawn_worker(
         &mut self,
         worker_id: WorkerId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         let socket_path = self.socket_dir.join(format!("worker_{worker_id}.sock"));
         let manager_end = NamedSocketManagerEnd::bind(&socket_path)

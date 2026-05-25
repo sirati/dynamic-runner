@@ -3,9 +3,30 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{KillReason, ResourcePressureDecision, Scheduler, WorkerBudgetInfo};
 use tokio::sync::mpsc;
 
-use crate::cgroup::{self, NestedCgroupHandle};
+use crate::cgroup::{self, NestedCgroupHandle, SubcgroupHandle};
 use crate::manager::WorkerFactory;
 use crate::worker::{WorkerEvent, WorkerHandle};
+
+/// Per-spawn cgroup-v2 leaf creation helper.
+///
+/// Single concern: cross the boundary between the pool's stashed
+/// parent handle and the per-worker leaf the spawn site needs.
+/// Returns `Ok(None)` when no parent handle exists (graceful-
+/// fallback environment, or caller opted out at init); the spawn
+/// site then proceeds with the inherited cgroup. Errors from the
+/// leaf-creation primitive bubble up as a formatted string the
+/// surrounding spawn-site uses verbatim — keeping the error-string
+/// shape parallel to the existing factory.spawn_worker error path.
+fn prepare_worker_leaf(
+    cgroup_handle: &Option<NestedCgroupHandle>,
+    worker_id: WorkerId,
+) -> Result<Option<SubcgroupHandle>, String> {
+    cgroup_handle
+        .as_ref()
+        .map(|h| cgroup::prepare_worker_subgroup(h, worker_id))
+        .transpose()
+        .map_err(|e| format!("per-worker cgroup setup failed for worker {worker_id}: {e}"))
+}
 
 /// Outcome of [`WorkerPool::ensure_worker_for_type`].
 ///
@@ -102,9 +123,11 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
     /// Accessor for the materialised workers/ cgroup handle, if any.
     /// Exposed for tests + diagnostic logging; production callers do
-    /// not need this — the factory is wired with the handle through
-    /// [`WorkerFactory::set_workers_cgroup`] at [`Self::initialize`]
-    /// time.
+    /// not need this — the pool's per-spawn sites materialise a
+    /// per-worker leaf from this parent handle (via
+    /// [`cgroup::prepare_worker_subgroup`]) and hand the leaf borrow
+    /// directly to [`WorkerFactory::spawn_worker`] for `pre_exec`-
+    /// time pid-attachment.
     pub fn workers_cgroup(&self) -> Option<&NestedCgroupHandle> {
         self.workers_cgroup.as_ref()
     }
@@ -157,19 +180,20 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // Set up the nested workers cgroup once per pool, BEFORE the
         // spawn loop. If the caller opted out (`None`) or the
         // environment doesn't support nesting (graceful fallback),
-        // the factory receives `None` and falls back to the flat
-        // pre-fix behaviour. Errors here are I/O-level (corrupted
-        // /proc or sysfs) and bubble up so the caller can abort the
-        // run with a clear cause.
+        // the per-spawn leaf-creation helper returns `None` and the
+        // factory leaves the child in the inherited cgroup (pre-
+        // nested layout, unchanged behaviour). Errors here are I/O-
+        // level (corrupted /proc or sysfs) and bubble up so the
+        // caller can abort the run with a clear cause.
         if let Some(reserved) = mem_manager_reserved_bytes {
             self.workers_cgroup = cgroup::setup_worker_cgroup_default(reserved)
                 .map_err(|e| format!("nested workers cgroup setup failed: {e}"))?;
         }
-        factory.set_workers_cgroup(self.workers_cgroup.clone());
 
         for i in 0..num_workers {
+            let subcgroup = prepare_worker_leaf(&self.workers_cgroup, i)?;
             let (transport, pid) = factory
-                .spawn_worker(i)
+                .spawn_worker(i, subcgroup.as_ref())
                 .map_err(|e| format!("failed to spawn worker {i}: {e}"))?;
             if print_pid
                 && let Some(pid) = pid
@@ -178,6 +202,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
             }
             let mut handle = WorkerHandle::new(i, transport, self.event_tx.clone());
             handle.pid = pid;
+            handle.subcgroup = subcgroup;
             let budget = scheduler.initial_budget(i, max_resources);
             let budget_mb = budget.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
             handle.reserved_budgets = budget;
@@ -251,14 +276,25 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         old.abort_poll_task();
 
         let preserved_type = self.workers[worker_id as usize].loaded_type_id.clone();
+        // Drop the prior slot's `SubcgroupHandle` BEFORE creating
+        // the replacement leaf: `SubcgroupHandle::Drop` best-effort
+        // rmdirs the previous `worker-<id>/` directory, and the
+        // per-spawn `prepare_worker_subgroup` is idempotent
+        // (`mkdir` returns OK on a re-created leaf), so an interim
+        // residual directory between drop + recreate is harmless.
+        // The explicit take also keeps the slot's `subcgroup`
+        // field consistent with the doomed protocol state across
+        // the kill+spawn window.
+        self.workers[worker_id as usize].subcgroup = None;
+        let subcgroup = prepare_worker_leaf(&self.workers_cgroup, worker_id)?;
         let (transport, pid) = match &preserved_type {
             Some(type_id) => factory
-                .spawn_worker_for_type(worker_id, type_id)
+                .spawn_worker_for_type(worker_id, type_id, subcgroup.as_ref())
                 .map_err(|e| {
                     format!("failed to respawn worker {worker_id} for type {type_id}: {e}")
                 })?,
             None => factory
-                .spawn_worker(worker_id)
+                .spawn_worker(worker_id, subcgroup.as_ref())
                 .map_err(|e| format!("failed to respawn worker {worker_id}: {e}"))?,
         };
         if print_pid
@@ -272,6 +308,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
         let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
         handle.pid = pid;
+        handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
         handle.loaded_type_id = preserved_type;
@@ -358,9 +395,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // on the pool.
         old.abort_poll_task();
         old.kill_subprocess();
+        // See `restart_worker` for the drop-before-recreate
+        // rationale on the slot's prior `SubcgroupHandle`.
+        old.subcgroup = None;
 
+        let subcgroup = prepare_worker_leaf(&self.workers_cgroup, worker_id)?;
         let (transport, pid) = factory
-            .spawn_worker_for_type(worker_id, required_type)
+            .spawn_worker_for_type(worker_id, required_type, subcgroup.as_ref())
             .map_err(|e| {
                 format!(
                     "failed to respawn worker {worker_id} for type {required_type}: {e}"
@@ -382,6 +423,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
         let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
         handle.pid = pid;
+        handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
         handle.loaded_type_id = Some(required_type.clone());
@@ -495,9 +537,13 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
         // tracking without reaping the prior `Child` (no zombie
         // race window).
         old.kill_subprocess();
+        // See `restart_worker` for the drop-before-recreate
+        // rationale on the slot's prior `SubcgroupHandle`.
+        old.subcgroup = None;
 
+        let subcgroup = prepare_worker_leaf(&self.workers_cgroup, worker_id)?;
         let (transport, pid) = factory
-            .spawn_worker_for_type(worker_id, required_type)
+            .spawn_worker_for_type(worker_id, required_type, subcgroup.as_ref())
             .map_err(|e| {
                 format!(
                     "failed to respawn worker {worker_id} for type {required_type}: {e}"
@@ -519,6 +565,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> WorkerPool<M, I> {
 
         let mut handle = WorkerHandle::new(worker_id, transport, self.event_tx.clone());
         handle.pid = pid;
+        handle.subcgroup = subcgroup;
         handle.reserved_budgets = reserved_budgets;
         handle.assignment_failure_count = failure_count;
         handle.loaded_type_id = Some(required_type.clone());
@@ -754,6 +801,7 @@ mod orphan_poll_task_tests {
         fn spawn_worker(
             &mut self,
             worker_id: WorkerId,
+            _subcgroup: Option<&SubcgroupHandle>,
         ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
             spawn_delayed_done_worker(self.spawn_count.clone())(worker_id)
         }
@@ -868,6 +916,7 @@ mod orphan_poll_task_tests {
                 fn spawn_worker(
                     &mut self,
                     worker_id: WorkerId,
+                    _subcgroup: Option<&SubcgroupHandle>,
                 ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
                     spawn_delayed_done_worker(self.spawn_count.clone())(worker_id)
                 }
@@ -875,8 +924,9 @@ mod orphan_poll_task_tests {
                     &mut self,
                     worker_id: WorkerId,
                     _type_id: &dynrunner_core::TypeId,
+                    subcgroup: Option<&SubcgroupHandle>,
                 ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
-                    self.spawn_worker(worker_id)
+                    self.spawn_worker(worker_id, subcgroup)
                 }
             }
 
@@ -954,6 +1004,7 @@ mod orphan_poll_task_tests {
                 fn spawn_worker(
                     &mut self,
                     worker_id: WorkerId,
+                    _subcgroup: Option<&SubcgroupHandle>,
                 ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
                     spawn_delayed_done_worker(self.spawn_count.clone())(worker_id)
                 }
@@ -961,8 +1012,9 @@ mod orphan_poll_task_tests {
                     &mut self,
                     worker_id: WorkerId,
                     _type_id: &dynrunner_core::TypeId,
+                    subcgroup: Option<&SubcgroupHandle>,
                 ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
-                    self.spawn_worker(worker_id)
+                    self.spawn_worker(worker_id, subcgroup)
                 }
             }
 
@@ -1045,51 +1097,50 @@ mod cgroup_wiring_tests {
     use dynrunner_core::WorkerId;
     use dynrunner_protocol_manager_worker::ManagerEndpoint;
 
-    /// Minimal stand-in transport: `ManagerEndpoint` is implemented
-    /// for the unit type via `dynrunner-transport-channel`. We avoid
-    /// pulling that crate's full setup just to test the wiring; the
-    /// fake factory below never returns a transport (its
-    /// `spawn_worker` errors), which is enough to exercise the
-    /// pre-spawn cgroup wiring without running real workers.
+    /// Per-spawn cgroup-wiring contract: the pool either hands the
+    /// factory a fresh per-worker `SubcgroupHandle` (when the parent
+    /// `NestedCgroupHandle` exists) or `None` (graceful fallback).
+    /// The tracker records whether the borrow it observed was
+    /// `Some`/`None` so the test can assert against the
+    /// `mem_manager_reserved_bytes` knob's arm. The factory deliberately
+    /// errors so `initialize` aborts after the first spawn — enough to
+    /// observe the cgroup wiring without running real workers.
     struct CgroupCallTracker {
-        last_handle_set: Option<Option<NestedCgroupHandle>>,
+        last_subcgroup_was_some: Option<bool>,
     }
 
     impl<M: ManagerEndpoint> WorkerFactory<M> for CgroupCallTracker {
-        fn set_workers_cgroup(&mut self, handle: Option<NestedCgroupHandle>) {
-            self.last_handle_set = Some(handle);
-        }
         fn spawn_worker(
             &mut self,
             _worker_id: WorkerId,
+            subcgroup: Option<&SubcgroupHandle>,
         ) -> Result<(M, Option<u32>), String> {
-            // Force `initialize` to abort BEFORE any spawn —
-            // we only want to confirm the pre-spawn cgroup wiring,
-            // not actually run workers.
+            self.last_subcgroup_was_some = Some(subcgroup.is_some());
             Err("test factory: never spawns".into())
         }
     }
 
     /// `WorkerPool::initialize(None)` skips the cgroup setup entirely
-    /// and hands the factory `None`. Verifies the opt-out arm.
+    /// and the per-spawn helper returns `None` so the factory sees
+    /// no per-worker leaf.
     #[tokio::test]
-    async fn initialize_none_skips_cgroup_setup_and_forwards_none() {
+    async fn initialize_none_skips_cgroup_setup_and_passes_none_to_spawn() {
         use dynrunner_scheduler::ResourceStealingScheduler;
         use dynrunner_transport_channel::ChannelManagerEnd;
 
         let mut pool: WorkerPool<ChannelManagerEnd, ()> = WorkerPool::new();
-        let mut factory = CgroupCallTracker { last_handle_set: None };
+        let mut factory = CgroupCallTracker { last_subcgroup_was_some: None };
         let scheduler = ResourceStealingScheduler::memory();
         let max = ResourceMap::new();
 
-        // Spawn will error, but `set_workers_cgroup` MUST have been
-        // called BEFORE the spawn loop, so we can assert on it via
-        // the tracker regardless of the spawn outcome.
+        // Spawn will error, but the `subcgroup` borrow MUST have been
+        // computed BEFORE the spawn call so we can assert on it via the
+        // tracker regardless of the spawn outcome.
         let _ = pool
             .initialize(1, &max, &scheduler, &mut factory, false, None)
             .await;
 
-        assert!(matches!(factory.last_handle_set, Some(None)));
+        assert_eq!(factory.last_subcgroup_was_some, Some(false));
         assert!(pool.workers_cgroup().is_none());
     }
 
@@ -1098,32 +1149,29 @@ mod cgroup_wiring_tests {
     /// typically returns `Ok(None)` via one of the three documented
     /// graceful-fallback predicates (no cgroup-v2 leaf, missing
     /// `memory` controller on the leaf, non-writable
-    /// `subtree_control`), in which case `factory.set_workers_cgroup`
-    /// is called with `None` BEFORE the spawn loop. If the host
-    /// happens to expose a writable cgroup-v2 leaf with the memory
-    /// controller delegated, the orchestrator MAY actually
-    /// materialise the workers subgroup — in which case
-    /// `factory.set_workers_cgroup(Some(_))` fires. Either way the
-    /// factory MUST have been called with `Some(_)` (an outer
-    /// `Option<Option<NestedCgroupHandle>>` whose outer `Some` records
-    /// the call itself).
+    /// `subtree_control`), in which case the per-spawn helper also
+    /// returns `None` and the factory sees `None`. If the host happens
+    /// to expose a writable cgroup-v2 leaf with the memory controller
+    /// delegated, the orchestrator MAY actually materialise the
+    /// workers subgroup AND the per-spawn helper MAY successfully
+    /// create a `worker-0/` leaf — in which case the factory sees
+    /// `Some(_)`. Either way the factory MUST have observed a value
+    /// (the tracker's `last_subcgroup_was_some.is_some()`).
     ///
     /// Real I/O failures (rare; mostly hosts where the kernel
     /// rejects a child-cgroup write because the parent has internal
-    /// processes) propagate as `Err(_)` from `initialize`. The
-    /// contract for "graceful degrade is not an error" is exercised
-    /// by the `None` arm of `last_handle_set` when the orchestrator
-    /// returns `Ok(None)`; the I/O-error arm bubbles up uniformly
-    /// with any other spawn failure and is acceptable here. The
-    /// test's load-bearing assertion is therefore the pre-spawn
-    /// `set_workers_cgroup` call shape.
+    /// processes) propagate as `Err(_)` from `initialize` BEFORE the
+    /// spawn helper runs. The contract for "graceful degrade is not
+    /// an error" is exercised by either branch of the
+    /// `last_subcgroup_was_some` flag; the I/O-error arm bubbles up
+    /// uniformly with any other spawn failure and is acceptable here.
     #[tokio::test]
     async fn initialize_some_invokes_cgroup_orchestrator() {
         use dynrunner_scheduler::ResourceStealingScheduler;
         use dynrunner_transport_channel::ChannelManagerEnd;
 
         let mut pool: WorkerPool<ChannelManagerEnd, ()> = WorkerPool::new();
-        let mut factory = CgroupCallTracker { last_handle_set: None };
+        let mut factory = CgroupCallTracker { last_subcgroup_was_some: None };
         let scheduler = ResourceStealingScheduler::memory();
         let max = ResourceMap::new();
 
@@ -1132,20 +1180,22 @@ mod cgroup_wiring_tests {
             .await;
 
         match outcome {
-            // Happy path 1: orchestrator returned Ok (Some or None)
-            // and the factory's spawn errored — we observed
-            // `set_workers_cgroup` getting called.
+            // Happy path 1: orchestrator returned Ok (Some or None),
+            // the per-spawn helper produced a value, and the factory's
+            // spawn errored — we observed the borrow on the first
+            // spawn.
             Err(msg) if msg.starts_with("failed to spawn worker") => {
-                assert!(factory.last_handle_set.is_some());
+                assert!(factory.last_subcgroup_was_some.is_some());
             }
-            // Happy path 2: orchestrator's setup hit a real I/O
-            // error (kernel rejected the workers/ mkdir or the
-            // controller-delegate write because processes are in
-            // the parent leaf). The factory was NOT called because
-            // setup failed early. That's the documented "Err on
-            // unexpected I/O" contract.
+            // Happy path 2: orchestrator's setup OR the per-spawn
+            // leaf creation hit a real I/O error (kernel rejected the
+            // workers/ mkdir or the worker-0/ mkdir because processes
+            // are in the parent leaf, or the controller-delegate
+            // write failed). The factory was NOT called because setup
+            // failed early. That's the documented "Err on unexpected
+            // I/O" contract.
             Err(msg) if msg.contains("cgroup") => {
-                assert!(factory.last_handle_set.is_none());
+                assert!(factory.last_subcgroup_was_some.is_none());
             }
             other => panic!("unexpected initialize outcome: {other:?}"),
         }

@@ -80,6 +80,7 @@ impl WorkerFactory<EitherManagerEnd> for PyCallbackWorkerFactory {
     fn spawn_worker(
         &mut self,
         worker_id: WorkerId,
+        _subcgroup: Option<&dynrunner_manager_local::cgroup::SubcgroupHandle>,
     ) -> Result<(EitherManagerEnd, Option<u32>), String> {
         match &self.named_socket_dir {
             None => {
