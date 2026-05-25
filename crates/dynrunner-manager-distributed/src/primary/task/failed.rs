@@ -207,7 +207,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tracing::debug!(
                 secondary = %secondary_id,
                 worker_id,
-                task_id = ?recovered_binary.as_ref().and_then(|b| b.task_id.as_deref()),
+                task_id = ?recovered_binary.as_ref().map(|b| b.task_id.as_str()),
                 phase = ?recovered_binary.as_ref().map(|b| b.phase_id.to_string()),
                 task_type = ?recovered_binary.as_ref().map(|b| b.type_id.to_string()),
                 task_hash = %task_hash,
@@ -216,7 +216,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
             if let Some(binary) = recovered_binary {
                 self.release_type_slot(&binary.type_id);
-                self.note_item_failed(&binary.phase_id, binary.task_id.as_deref(), command_rx).await;
+                self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
             }
 
             // Same kickstart rationale as `handle_task_complete`:

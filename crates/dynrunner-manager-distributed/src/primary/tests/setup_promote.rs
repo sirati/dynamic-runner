@@ -1728,7 +1728,7 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
             type_id: dynrunner_core::TypeId::from("default"),
             affinity_id: None,
             payload: serde_json::Value::Null,
-            task_id: Some("task-discovered".into()),
+            task_id: "task-discovered".into(),
             task_depends_on: vec![],
             preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
             resolved_path: None,

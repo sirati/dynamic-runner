@@ -92,10 +92,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // can fold it into per-phase counters, release the
             // per-type concurrency slot, and run the phase lifecycle
             // cascade.
+            // `task_id` is non-optional per the framework's boundary
+            // contract; the snapshot tuple stores it as `String`.
             let mut completed_meta: Option<(
                 dynrunner_core::PhaseId,
                 dynrunner_core::TypeId,
-                Option<String>,
+                String,
             )> = None;
             let mut local_idx: u32 = 0;
             for w in &mut self.workers {
@@ -136,7 +138,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             tracing::debug!(
                 secondary = %secondary_id,
                 worker_id,
-                task_id = ?completed_meta.as_ref().and_then(|(_, _, t)| t.as_deref()),
+                task_id = ?completed_meta.as_ref().map(|(_, _, t)| t.as_str()),
                 phase = ?completed_meta.as_ref().map(|(p, _, _)| p.to_string()),
                 task_type = ?completed_meta.as_ref().map(|(_, t, _)| t.to_string()),
                 task_hash = %task_hash,
@@ -145,7 +147,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
             if let Some((phase, type_id, task_id)) = completed_meta {
                 self.release_type_slot(&type_id);
-                self.note_item_completed(&phase, task_id.as_deref(), command_rx).await;
+                self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
             }
 
             // Kickstart dispatch to every idle worker. After

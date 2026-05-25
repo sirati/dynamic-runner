@@ -63,7 +63,7 @@ where
     fn task_meta_for_hash_with_binary(
         &self,
         hash: &str,
-    ) -> Option<(dynrunner_core::PhaseId, Option<String>, dynrunner_core::TaskInfo<I>)> {
+    ) -> Option<(dynrunner_core::PhaseId, String, dynrunner_core::TaskInfo<I>)> {
         let state = self.cluster_state.task_state(hash)?;
         let task = match state {
             TaskState::Pending { task }
@@ -140,10 +140,11 @@ where
         // caller observes them depends on the error class
         // (cascade-pause for Unfulfillable, cascade-fail otherwise).
         // `primary_pending` may be `None` pre-promotion — silent skip;
-        // the originator's broadcast still goes out.
-        let cascaded_blocks: Vec<(String, String)> = if let Some(id) = task_id.as_deref() {
+        // the originator's broadcast still goes out. `task_id` is
+        // non-optional per the framework's boundary contract.
+        let cascaded_blocks: Vec<(String, String)> = {
             let cascaded = if let Some(pool) = self.primary_pending.as_mut() {
-                pool.on_item_failed_permanent(&phase_id, id)
+                pool.on_item_failed_permanent(&phase_id, task_id.as_str())
             } else {
                 Vec::new()
             };
@@ -165,8 +166,6 @@ where
                 }
             }
             blocks
-        } else {
-            Vec::new()
         };
 
         // Per-phase counter bump + lifecycle cascade. Mirrors the
@@ -181,7 +180,7 @@ where
             .entry(phase_id.clone())
             .or_insert(0) += 1;
         if let Some(pool) = self.primary_pending.as_mut() {
-            pool.on_item_finished(&phase_id, task_id.as_deref());
+            pool.on_item_finished(&phase_id, Some(task_id.as_str()));
         }
         self.process_primary_phase_lifecycle(command_rx).await;
 

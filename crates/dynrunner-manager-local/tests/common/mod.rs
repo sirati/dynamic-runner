@@ -100,7 +100,7 @@ pub fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: None,
+        task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

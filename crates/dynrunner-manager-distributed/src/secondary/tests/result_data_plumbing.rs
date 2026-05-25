@@ -69,7 +69,7 @@ fn make_binary(name: &str, size: u64) -> TaskInfo<TestId> {
         type_id: dynrunner_core::TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: None,
+        task_id: name.into(),
         task_depends_on: vec![],
         preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
         resolved_path: None,

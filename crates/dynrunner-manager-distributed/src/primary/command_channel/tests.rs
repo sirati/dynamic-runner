@@ -437,12 +437,12 @@ async fn fail_permanent_unfulfillable_blocks_dependents() {
         // Prereq carries an explicit task_id so the pool can wire
         // the dep-cascade reverse-index.
         let mut prereq = make_binary("prereq", 100);
-        prereq.task_id = Some("prereq_id".into());
+        prereq.task_id = "prereq_id".into();
         let prereq_hash = compute_task_hash(&prereq);
 
         // Dependent declares task_depends_on for the cascade walk.
         let mut dep = make_binary("dep", 100);
-        dep.task_id = Some("dep_id".into());
+        dep.task_id = "dep_id".into();
         dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), inherit_outputs: false }];
         let dep_hash = compute_task_hash(&dep);
 
@@ -534,11 +534,11 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
         let mut coordinator = make_coordinator();
 
         let mut prereq = make_binary("prereq", 100);
-        prereq.task_id = Some("prereq_id".into());
+        prereq.task_id = "prereq_id".into();
         let prereq_hash = compute_task_hash(&prereq);
 
         let mut dep = make_binary("dep", 100);
-        dep.task_id = Some("dep_id".into());
+        dep.task_id = "dep_id".into();
         dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), inherit_outputs: false }];
         let dep_hash = compute_task_hash(&dep);
 
@@ -589,7 +589,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             !coordinator
                 .pool()
                 .iter()
-                .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                .any(|t| t.task_id == "dep_id"),
             "dep should be dropped from pool after Unfulfillable cascade"
         );
 
@@ -617,7 +617,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             !coordinator
                 .pool()
                 .iter()
-                .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                .any(|t| t.task_id == "dep_id"),
             "dep must still be absent from pool until root completes"
         );
 
@@ -644,7 +644,7 @@ async fn unfulfillable_reinject_root_complete_resumes_blocked_dependents_in_pool
             coordinator
                 .pool()
                 .iter()
-                .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                .any(|t| t.task_id == "dep_id"),
             "dep must be back in the pool after auto-resume"
         );
         // The dep's phase must be dispatchable (not Blocked).
@@ -675,11 +675,11 @@ async fn reinject_resets_blocked_dependents_pool_state() {
         let mut coordinator = make_coordinator();
 
         let mut prereq = make_binary("prereq", 100);
-        prereq.task_id = Some("prereq_id".into());
+        prereq.task_id = "prereq_id".into();
         let prereq_hash = compute_task_hash(&prereq);
 
         let mut dep = make_binary("dep", 100);
-        dep.task_id = Some("dep_id".into());
+        dep.task_id = "dep_id".into();
         dep.task_depends_on = vec![TaskDep { task_id: "prereq_id".into(), inherit_outputs: false }];
         let dep_hash = compute_task_hash(&dep);
 
@@ -754,7 +754,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
             !coordinator
                 .pool()
                 .iter()
-                .any(|t| t.task_id.as_deref() == Some("dep_id")),
+                .any(|t| t.task_id == "dep_id"),
             "dep must stay out of pool until root completes"
         );
         // Root IS back in the pool.
@@ -762,7 +762,7 @@ async fn reinject_resets_blocked_dependents_pool_state() {
             coordinator
                 .pool()
                 .iter()
-                .any(|t| t.task_id.as_deref() == Some("prereq_id")),
+                .any(|t| t.task_id == "prereq_id"),
             "root must be back in pool after reinject"
         );
     }).await;
@@ -781,7 +781,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
     local.run_until(async {
         let mut coordinator = make_coordinator();
         let mut binary = make_binary("a", 100);
-        binary.task_id = Some("a_id".into());
+        binary.task_id = "a_id".into();
         let hash = compute_task_hash(&binary);
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: hash.clone(),
@@ -805,7 +805,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
         let pre = coordinator
             .pool()
             .iter()
-            .find(|t| t.task_id.as_deref() == Some("a_id"))
+            .find(|t| t.task_id == "a_id")
             .expect("task in pool")
             .preferred_secondaries
             .clone();
@@ -845,7 +845,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
         let post = coordinator
             .pool()
             .iter()
-            .find(|t| t.task_id.as_deref() == Some("a_id"))
+            .find(|t| t.task_id == "a_id")
             .expect("task still in pool")
             .preferred_secondaries
             .clone();
@@ -922,11 +922,11 @@ async fn spawn_tasks_all_pending_dispatched() {
     local.run_until(async {
         let mut coordinator = make_coordinator();
         let mut a = make_binary("a", 100);
-        a.task_id = Some("a_id".into());
+        a.task_id = "a_id".into();
         let mut b = make_binary("b", 100);
-        b.task_id = Some("b_id".into());
+        b.task_id = "b_id".into();
         let mut c = make_binary("c", 100);
-        c.task_id = Some("c_id".into());
+        c.task_id = "c_id".into();
         seed_pool(&mut coordinator, &[&a.phase_id]);
 
         let errors = spawn_via_handler(
@@ -968,7 +968,7 @@ async fn spawn_tasks_with_pending_dep_lands_blocked() {
     local.run_until(async {
         let mut coordinator = make_coordinator();
         let mut b = make_binary("b", 100);
-        b.task_id = Some("b_id".into());
+        b.task_id = "b_id".into();
         let b_hash = compute_task_hash(&b);
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: b_hash.clone(),
@@ -977,7 +977,7 @@ async fn spawn_tasks_with_pending_dep_lands_blocked() {
         seed_pool(&mut coordinator, &[&b.phase_id]);
 
         let mut a = make_binary("a", 100);
-        a.task_id = Some("a_id".into());
+        a.task_id = "a_id".into();
         a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), inherit_outputs: false }];
 
         let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
@@ -1008,7 +1008,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
     local.run_until(async {
         let mut coordinator = make_coordinator();
         let mut b = make_binary("b", 100);
-        b.task_id = Some("b_id".into());
+        b.task_id = "b_id".into();
         let b_hash = compute_task_hash(&b);
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: b_hash.clone(),
@@ -1021,7 +1021,7 @@ async fn spawn_tasks_with_completed_dep_lands_pending() {
         seed_pool(&mut coordinator, &[&b.phase_id]);
 
         let mut a = make_binary("a", 100);
-        a.task_id = Some("a_id".into());
+        a.task_id = "a_id".into();
         a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), inherit_outputs: false }];
 
         let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
@@ -1055,7 +1055,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
     local.run_until(async {
         let mut coordinator = make_coordinator();
         let mut b = make_binary("b", 100);
-        b.task_id = Some("b_id".into());
+        b.task_id = "b_id".into();
         let b_hash = compute_task_hash(&b);
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: b_hash.clone(),
@@ -1071,7 +1071,7 @@ async fn spawn_tasks_with_unfulfillable_dep_lands_blocked() {
         seed_pool(&mut coordinator, &[&b.phase_id]);
 
         let mut a = make_binary("a", 100);
-        a.task_id = Some("a_id".into());
+        a.task_id = "a_id".into();
         a.task_depends_on = vec![TaskDep { task_id: "b_id".into(), inherit_outputs: false }];
 
         let errors = spawn_via_handler(&mut coordinator, vec![a.clone()])
@@ -1104,7 +1104,7 @@ async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
         let mut coordinator = make_coordinator();
         // Pre-seed `dup` so the second input clashes.
         let mut dup = make_binary("dup", 100);
-        dup.task_id = Some("dup_id".into());
+        dup.task_id = "dup_id".into();
         let dup_hash = compute_task_hash(&dup);
         coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
             hash: dup_hash.clone(),
@@ -1113,9 +1113,9 @@ async fn spawn_tasks_duplicate_hash_returns_per_index_error() {
         seed_pool(&mut coordinator, &[&dup.phase_id]);
 
         let mut a = make_binary("a", 100);
-        a.task_id = Some("a_id".into());
+        a.task_id = "a_id".into();
         let mut c = make_binary("c", 100);
-        c.task_id = Some("c_id".into());
+        c.task_id = "c_id".into();
 
         let errors = spawn_via_handler(
             &mut coordinator,
@@ -1158,13 +1158,13 @@ async fn spawn_tasks_unknown_dependency_returns_per_index_error() {
     local.run_until(async {
         let mut coordinator = make_coordinator();
         let mut a = make_binary("a", 100);
-        a.task_id = Some("a_id".into());
+        a.task_id = "a_id".into();
         seed_pool(&mut coordinator, &[&a.phase_id]);
         let mut bad = make_binary("bad", 100);
-        bad.task_id = Some("bad_id".into());
+        bad.task_id = "bad_id".into();
         bad.task_depends_on = vec![TaskDep { task_id: "nope".into(), inherit_outputs: false }];
         let mut c = make_binary("c", 100);
-        c.task_id = Some("c_id".into());
+        c.task_id = "c_id".into();
 
         let errors = spawn_via_handler(
             &mut coordinator,
@@ -1239,7 +1239,7 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
         let mut pre_spawn: Vec<dynrunner_core::TaskInfo<TestId>> = Vec::new();
         for i in 0..4 {
             let mut b = make_binary(&format!("pre_{i}"), 100);
-            b.task_id = Some(format!("pre_{i}_id"));
+            b.task_id = format!("pre_{i}_id");
             let h = compute_task_hash(&b);
             coordinator.cluster_state.apply(ClusterMutation::TaskAdded {
                 hash: h,
@@ -1261,7 +1261,7 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
         // post-apply reinject has a destination. Every other
         // spawn_tasks test uses the same `seed_pool` helper.
         let mut spawned = make_binary("memmap_0", 100);
-        spawned.task_id = Some("memmap_0_id".into());
+        spawned.task_id = "memmap_0_id".into();
         seed_pool(&mut coordinator, &[&spawned.phase_id]);
 
         // M=1 brand-new task with no deps: the asm-tokenizer phase-3
@@ -1342,9 +1342,9 @@ async fn spawn_tasks_refreshes_total_tasks_from_cluster_state() {
 #[test]
 fn tasks_spawned_mutation_round_trips_through_serde() {
     let mut a = make_binary("a", 100);
-    a.task_id = Some("a_id".into());
+    a.task_id = "a_id".into();
     let mut b = make_binary("b", 100);
-    b.task_id = Some("b_id".into());
+    b.task_id = "b_id".into();
     b.task_depends_on = vec![TaskDep { task_id: "a_id".into(), inherit_outputs: false }];
     let m: ClusterMutation<TestId> = ClusterMutation::TasksSpawned {
         tasks: vec![a.clone(), b.clone()],
@@ -1355,8 +1355,8 @@ fn tasks_spawned_mutation_round_trips_through_serde() {
     match round {
         ClusterMutation::TasksSpawned { tasks } => {
             assert_eq!(tasks.len(), 2);
-            assert_eq!(tasks[0].task_id.as_deref(), Some("a_id"));
-            assert_eq!(tasks[1].task_id.as_deref(), Some("b_id"));
+            assert_eq!(tasks[0].task_id, "a_id");
+            assert_eq!(tasks[1].task_id, "b_id");
             assert_eq!(
                 tasks[1].task_depends_on,
                 vec![TaskDep { task_id: "a_id".to_string(), inherit_outputs: false }]

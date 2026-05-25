@@ -46,7 +46,7 @@ pub(super) fn split_identifier(id: &str) -> (String, String, String, String, Str
 
 /// Python-visible wrapper for BinaryIdentifier.
 #[pyclass(name = "BinaryIdentifier", from_py_object)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct PyBinaryIdentifier {
     #[pyo3(get)]
     pub(super) binary_name: String,

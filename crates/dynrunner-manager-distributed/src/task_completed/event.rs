@@ -20,10 +20,11 @@
 /// apply moves a task into a terminal state.
 ///
 /// Field semantics:
-/// - `task_id`: the consumer-supplied identifier from `TaskInfo.task_id`
-///   when the task carried one; `None` when the task had no id.
-///   Surfaced rather than the hash because every consumer documented
-///   so far keys their bookkeeping by task_id.
+/// - `task_id`: the consumer-supplied identifier from `TaskInfo.task_id`.
+///   Always populated (non-empty) — every task carries a required id
+///   per the framework's boundary contract. Surfaced rather than the
+///   hash because every consumer documented so far keys their
+///   bookkeeping by task_id.
 /// - `task_hash`: the wire-canonical content hash (matches the
 ///   `hash` field on the originating mutation). Stable across replicas
 ///   so consumers that DO want the CRDT-internal key can still get it.
@@ -43,7 +44,7 @@
 ///   tag automatically without a re-build).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskCompletedEvent {
-    pub task_id: Option<String>,
+    pub task_id: String,
     pub task_hash: String,
     pub success: bool,
     pub error_kind: Option<String>,

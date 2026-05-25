@@ -210,7 +210,9 @@ impl<I: Identifier> ClusterState<I> {
                 // applied. The arms that NoOp return early and never
                 // reach the emit; the two "Applied" arms set this to
                 // `Some(...)` before exiting via the bottom emit.
-                let mut emit_payload: Option<(Option<String>, String)> = None;
+                // `task.task_id` is non-optional per the framework's
+                // boundary contract; the captured payload is `String`.
+                let mut emit_payload: Option<(String, String)> = None;
                 let outcome = match state {
                     // Strongest terminals lock out incoming TaskFailed.
                     // `Completed` never regresses; `Unfulfillable` is a

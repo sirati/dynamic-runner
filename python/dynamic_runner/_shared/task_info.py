@@ -64,15 +64,25 @@ class TaskInfo:
     type_id: str = ""
     affinity_id: str | None = None
     payload: dict = field(default_factory=dict)
-    # Optional consumer-supplied task identifier. Other tasks reference
-    # this from their `task_depends_on` to express a "wait for that
-    # task to complete before dispatching me" ordering constraint.
-    # `None` means the task cannot itself be referenced as a
-    # prerequisite (anonymous task); it can still have its own
-    # `task_depends_on` entries pointing at named tasks. Pick stable,
-    # readable ids (e.g. ``"toolchain__aarch64__clang15"``) so
-    # dependent tasks can reference them without re-deriving a hash.
-    task_id: str | None = None
+    # Stable consumer-supplied task identifier. REQUIRED — every
+    # task carries a non-empty id. The framework rejects ``None`` /
+    # empty strings at the Python→Rust boundary
+    # (``crate::pytypes::extract_binaries``) so producer-side
+    # mistakes surface as a loud ``ValueError`` rather than as
+    # opaque "feature doesn't work" symptoms later. The empty-string
+    # default here lets dataclass-positional construction stay
+    # backward-source-compatible (no field reorder); the Rust
+    # extractor's rejection of ``""`` is what enforces the contract.
+    #
+    # Other tasks reference this from their ``task_depends_on`` to
+    # express a "wait for that task to complete before dispatching
+    # me" ordering constraint. Used by the memprofile sampler for
+    # per-task file naming, by the retry tracker for attempt-
+    # counting, and by the failure reporter to group results by
+    # task identity. Pick stable, readable ids (e.g.
+    # ``"toolchain__aarch64__clang15"``) so dependent tasks can
+    # reference them without re-deriving a hash.
+    task_id: str = ""
     # Task ids of prerequisite tasks that must terminate (success or
     # permanent failure) before this task is eligible for dispatch.
     # Default `()` means "no per-task ordering constraint; eligibility

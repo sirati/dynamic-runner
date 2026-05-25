@@ -101,7 +101,7 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
     match rx.try_recv() {
         Ok(event) => {
             assert_eq!(event.task_hash, "h-alpha");
-            assert_eq!(event.task_id.as_deref(), Some("alpha"));
+            assert_eq!(event.task_id, "alpha");
             assert!(event.success);
             assert!(event.error_kind.is_none());
         }
@@ -135,7 +135,7 @@ async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
     match rx.try_recv() {
         Ok(event) => {
             assert_eq!(event.task_hash, "h-beta");
-            assert_eq!(event.task_id.as_deref(), Some("beta"));
+            assert_eq!(event.task_id, "beta");
             assert!(!event.success);
             assert_eq!(event.error_kind.as_deref(), Some("non_recoverable"));
         }

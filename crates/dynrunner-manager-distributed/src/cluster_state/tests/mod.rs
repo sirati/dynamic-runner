@@ -33,7 +33,7 @@ pub(super) fn mk_task(name: &str) -> TaskInfo<RunnerIdentifier> {
         type_id: TypeId::from("t0"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: Some(name.into()),
+        task_id: name.into(),
         task_depends_on: Vec::new(),
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

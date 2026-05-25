@@ -101,15 +101,17 @@ impl Gateway for RecordingGateway {
 }
 
 fn make_binary(path: impl Into<PathBuf>) -> TaskInfo<String> {
+    let path = path.into();
+    let task_id = path.display().to_string();
     TaskInfo {
-        path: path.into(),
+        path,
         size: 0,
         identifier: "test".to_string(),
         phase_id: PhaseId::from("default"),
         type_id: TypeId::from("default"),
         affinity_id: None,
         payload: serde_json::Value::Null,
-        task_id: None,
+        task_id,
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

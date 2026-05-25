@@ -5,6 +5,7 @@
 //! `PendingPool` / `PendingPoolError` / `PhaseState` from this file.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) use super::{PendingPool, PendingPoolError, PhaseState};
 pub(super) use dynrunner_core::{AffinityId, PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
@@ -16,10 +17,19 @@ mod take_first_match;
 mod task_deps;
 mod worker_view;
 
+/// Monotonic per-fixture counter so each `t(...)`-built task gets a
+/// unique synthetic task_id. The framework's contract is that every
+/// task_id is unique within a run; the fixture honours that even
+/// where the test body doesn't reference the id, so dedup-validation
+/// never trips on an unrelated test fixture.
+static T_FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Test fixture: build a `TaskInfo<()>` with the provided phase / type / affinity.
 /// An empty affinity string is mapped to `None` so the bucket falls into the
-/// free-pool sentinel inside the pool.
+/// free-pool sentinel inside the pool. Synthesises a unique
+/// per-call `task_id` to satisfy the boundary contract.
 pub(super) fn t(phase: &str, ty: &str, affinity: &str, size: u64) -> TaskInfo<()> {
+    let n = T_FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
     TaskInfo {
         path: std::path::PathBuf::from(format!("/tmp/{phase}_{ty}_{affinity}_{size}")),
         size,
@@ -32,7 +42,7 @@ pub(super) fn t(phase: &str, ty: &str, affinity: &str, size: u64) -> TaskInfo<()
             Some(AffinityId::from(affinity))
         },
         payload: serde_json::Value::Null,
-        task_id: None,
+        task_id: format!("fixture-{n}"),
         task_depends_on: vec![],
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,

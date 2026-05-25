@@ -9,7 +9,9 @@ use dynrunner_core::{SoftPreferredSecondaries, TaskDep, TaskInfo};
 
 use super::{PendingPoolError, phase, pool_with, t};
 
-/// Test fixture variant carrying a task_id and (optional) deps.
+/// Test fixture variant carrying a caller-chosen task_id and
+/// (optional) deps. Overrides the synthetic id `t(...)` assigns so
+/// tests that assert against the id can pin a stable value.
 fn t_with_id(
     phase: &str,
     ty: &str,
@@ -19,7 +21,7 @@ fn t_with_id(
     deps: &[&str],
 ) -> TaskInfo<()> {
     let mut item = t(phase, ty, affinity, size);
-    item.task_id = Some(id.to_string());
+    item.task_id = id.to_string();
     item.task_depends_on = deps
         .iter()
         .map(|d| TaskDep {
@@ -74,17 +76,17 @@ fn task_deps_blocked_until_dep_completes() {
     // Bucket iteration only sees A; B is in the blocked map.
     let queued_ids: Vec<_> = p
         .iter()
-        .map(|i| i.task_id.clone().unwrap())
+        .map(|i| i.task_id.clone())
         .collect();
     assert_eq!(queued_ids, vec!["a".to_string()]);
     let first = p.pop_for_worker(1).expect("a is dispatchable");
-    assert_eq!(first.task_id.as_deref(), Some("a"));
+    assert_eq!(first.task_id, "a");
     // No more queued items; B still blocked, phase still has work.
     assert!(p.pop_for_worker(1).is_none());
     p.on_item_finished(&phase("P"), Some("a"));
     // Now B is unblocked.
     let second = p.pop_for_worker(1).expect("b unblocked");
-    assert_eq!(second.task_id.as_deref(), Some("b"));
+    assert_eq!(second.task_id, "b");
 }
 
 #[test]
@@ -98,14 +100,14 @@ fn task_deps_unblocked_lands_at_bucket_front() {
     .expect("valid extend");
     // A is dispatched first (it's in front of C; B is blocked).
     let a = p.pop_for_worker(1).expect("a");
-    assert_eq!(a.task_id.as_deref(), Some("a"));
+    assert_eq!(a.task_id, "a");
     // Finish A → B unblocks and lands at the FRONT of the bucket,
     // ahead of C which has been queued behind A all along.
     p.on_item_finished(&phase("P"), Some("a"));
     let next = p.pop_for_worker(1).expect("b before c");
-    assert_eq!(next.task_id.as_deref(), Some("b"));
+    assert_eq!(next.task_id, "b");
     let last = p.pop_for_worker(1).expect("c last");
-    assert_eq!(last.task_id.as_deref(), Some("c"));
+    assert_eq!(last.task_id, "c");
 }
 
 #[test]
@@ -123,7 +125,7 @@ fn task_deps_seeded_completed_id_resolves_unknown_dep() {
     // Variant is dispatchable immediately because its only dep is
     // already considered complete.
     let item = p.pop_for_worker(1).expect("variant ready");
-    assert_eq!(item.task_id.as_deref(), Some("variant"));
+    assert_eq!(item.task_id, "variant");
 }
 
 #[test]
@@ -136,11 +138,11 @@ fn task_deps_cascade_fail_on_permanent_prereq_failure() {
     ])
     .expect("valid extend");
     let a = p.pop_for_worker(1).expect("a");
-    assert_eq!(a.task_id.as_deref(), Some("a"));
+    assert_eq!(a.task_id, "a");
     let cascaded = p.on_item_failed_permanent(&phase("P"), "a");
     let mut cascaded_ids: Vec<_> = cascaded
         .iter()
-        .map(|i| i.task_id.clone().unwrap())
+        .map(|i| i.task_id.clone())
         .collect();
     cascaded_ids.sort();
     assert_eq!(cascaded_ids, vec!["b".to_string(), "c".to_string()]);
@@ -161,7 +163,7 @@ fn update_first_match_in_place_mutates_queued_match() {
     ])
     .expect("valid extend");
     let updated = p.update_first_match_in_place(
-        |t| t.task_id.as_deref() == Some("b"),
+        |t| t.task_id == "b",
         |t| {
             t.preferred_secondaries =
                 SoftPreferredSecondaries::new(vec!["sec-x".into()]);
@@ -172,7 +174,7 @@ fn update_first_match_in_place_mutates_queued_match() {
         .iter()
         .map(|t| {
             (
-                t.task_id.clone().unwrap(),
+                t.task_id.clone(),
                 t.preferred_secondaries.as_slice().to_vec(),
             )
         })
@@ -198,10 +200,10 @@ fn update_first_match_in_place_visits_blocked_items() {
     ])
     .expect("valid extend");
     // Sanity: `b` is not in the bucket-side iter (it's in `blocked`).
-    let ids_in_buckets: Vec<_> = p.iter().map(|t| t.task_id.clone().unwrap()).collect();
+    let ids_in_buckets: Vec<_> = p.iter().map(|t| t.task_id.clone()).collect();
     assert_eq!(ids_in_buckets, vec!["a".to_string()]);
     let updated = p.update_first_match_in_place(
-        |t| t.task_id.as_deref() == Some("b"),
+        |t| t.task_id == "b",
         |t| {
             t.preferred_secondaries =
                 SoftPreferredSecondaries::new(vec!["sec-y".into()]);
@@ -212,7 +214,7 @@ fn update_first_match_in_place_visits_blocked_items() {
     p.pop_for_worker(1).expect("a");
     p.on_item_finished(&phase("P"), Some("a"));
     let b = p.pop_for_worker(1).expect("b unblocked");
-    assert_eq!(b.task_id.as_deref(), Some("b"));
+    assert_eq!(b.task_id, "b");
     assert_eq!(
         b.preferred_secondaries.as_slice(),
         &["sec-y".to_string()][..]
@@ -224,7 +226,7 @@ fn update_first_match_in_place_returns_false_on_no_match() {
     let mut p = pool_with(&["P"], &[]);
     p.extend([t_with_id("P", "T", "", 1, "a", &[])]).expect("valid");
     let updated = p.update_first_match_in_place(
-        |t| t.task_id.as_deref() == Some("nonexistent"),
+        |t| t.task_id == "nonexistent",
         |t| {
             t.preferred_secondaries =
                 SoftPreferredSecondaries::new(vec!["never".into()]);

@@ -95,7 +95,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                     |task_id| {
                         self.task_payloads
                             .iter()
-                            .find(|(t, _)| t.task_id.as_deref() == Some(task_id))
+                            .find(|(t, _)| t.task_id == task_id)
                             .map(|(t, _)| t.task_depends_on.clone())
                     },
                 );

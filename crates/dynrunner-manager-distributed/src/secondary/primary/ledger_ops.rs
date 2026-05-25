@@ -79,7 +79,7 @@ where
             .entry(phase_id.clone())
             .or_insert(0) += 1;
         if let Some(pool) = self.primary_pending.as_mut() {
-            pool.on_item_finished(&phase_id, task_id.as_deref());
+            pool.on_item_finished(&phase_id, Some(task_id.as_str()));
         }
         // Cascade drain + fire the registered `on_phase_end` /
         // `on_phase_start` callbacks (no-ops when no callback is
@@ -128,6 +128,11 @@ where
             None => return,
         };
         let phase_id = item.phase_id.clone();
+        // `task_id` is non-optional per the framework's boundary
+        // contract; keep as `String` and convert to `&str` at the
+        // pool call below. Behaviour preserved verbatim — the prior
+        // code took `Option<String> -> Option<&str>` and passed it
+        // through; with the new contract that's a `Some(id)` always.
         let task_id = item.binary.task_id.clone();
         // Mirror the live-primary's `failed_tasks.insert` step:
         // every error class lands in the ledger; the retry-bucket
@@ -151,7 +156,7 @@ where
             .entry(phase_id.clone())
             .or_insert(0) += 1;
         if let Some(pool) = self.primary_pending.as_mut() {
-            pool.on_item_finished(&phase_id, task_id.as_deref());
+            pool.on_item_finished(&phase_id, Some(task_id.as_str()));
         }
         self.process_primary_phase_lifecycle(command_rx).await;
     }

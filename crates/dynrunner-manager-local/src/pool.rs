@@ -752,7 +752,7 @@ mod orphan_poll_task_tests {
             type_id: dynrunner_core::TypeId::from("default"),
             affinity_id: None,
             payload: serde_json::Value::Null,
-            task_id: None,
+            task_id: name.into(),
             task_depends_on: Vec::new(),
             preferred_secondaries: dynrunner_core::SoftPreferredSecondaries::default(),
             resolved_path: None,

@@ -85,9 +85,7 @@ where
                 // and shouldn't be re-running this hash regardless.
                 | TaskState::Cancelled { task, .. } => {
                     primary_completed.insert(hash.clone());
-                    if let Some(id) = &task.task_id {
-                        completed_task_ids.insert(id.clone());
-                    }
+                    completed_task_ids.insert(task.task_id.clone());
                 }
                 // Cascade-paused dependent. Re-seed as Pending into the
                 // new primary's pool: the prereq's TaskCompleted apply
@@ -122,9 +120,7 @@ where
                         // and the pool counter drains correctly
                         // when this node's worker reports
                         // completion through `note_primary_item_completed`.
-                        if let Some(id) = &task.task_id {
-                            in_flight_pairs.push((id.clone(), task.phase_id.clone()));
-                        }
+                        in_flight_pairs.push((task.task_id.clone(), task.phase_id.clone()));
                         in_flight_seed.push((
                             hash.clone(),
                             task.phase_id.clone(),
@@ -160,9 +156,7 @@ where
                     //      forwards to `pool.on_item_finished`.
                     // (1) and (2) are owned by the pool via
                     // `mark_tasks_in_flight` below; (3) is local state.
-                    if let Some(id) = &task.task_id {
-                        in_flight_pairs.push((id.clone(), task.phase_id.clone()));
-                    }
+                    in_flight_pairs.push((task.task_id.clone(), task.phase_id.clone()));
                     in_flight_seed.push((
                         hash.clone(),
                         task.phase_id.clone(),
