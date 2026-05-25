@@ -241,12 +241,19 @@ where
                         let _ = self.peer_transport.broadcast(task_failed).await;
                         return Ok(());
                     }
+                    // Snapshot the assigned binary for the sampler
+                    // hook before the move into `assign_task`. The
+                    // hook only reads `task_id` so cloning the
+                    // whole `TaskInfo` once is cheap relative to
+                    // the assignment-write hot path.
+                    let binary_for_hook = binary.clone();
                     let worker = &mut self.pool.workers[target_wid as usize];
                     match worker
                         .assign_task(binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {
+                            self.notify_sampler_assigned(target_wid, &binary_for_hook);
                             self.active_tasks.insert(file_hash, target_wid);
                             self.primary_link.reset_backoff(target_wid);
                             tracing::info!(

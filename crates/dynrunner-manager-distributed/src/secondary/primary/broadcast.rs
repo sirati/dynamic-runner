@@ -270,6 +270,15 @@ where
                 );
             }
         }
+        // Drain the per-task memprofile sampler BEFORE the bulk
+        // kill drops the worker pool's `SubcgroupHandle`s (which
+        // best-effort rmdirs the leaf cgroups the sampler reads
+        // from). Mirrors the same ordering invariant the clean
+        // teardown path uses — see `shutdown_sampler_if_present`.
+        // Sampler shutdown is bounded by its own command-channel
+        // drain so it can't extend the panik path's wallclock
+        // budget meaningfully.
+        self.shutdown_sampler_if_present().await;
         // Tear down every worker pgid with the SIGTERM → grace →
         // SIGKILL ladder. Owned by the pool concern; coordinator
         // just calls. Runs on both source paths — local teardown is
