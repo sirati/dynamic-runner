@@ -341,6 +341,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 {
                     Ok(()) => {
                         self.total_assigned_resources.add(&estimated_usage);
+                        self.notify_sampler_assigned(worker_id, &binary);
                         tracing::info!(
                             worker_id,
                             binary = %name,

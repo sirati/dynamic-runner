@@ -274,6 +274,7 @@ async fn memuse_log_written() {
             resource_check_interval: std::time::Duration::from_millis(100),
             phase_status_log_intervals: Vec::new(),
             log_oom_watcher: false,
+            output_dir: None,
         };
 
         let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
@@ -828,4 +829,189 @@ async fn retry_phase_leftover_lands_in_failed_tasks_as_recoverable() {
             );
         })
         .await;
+}
+
+// ── Memprofile sampler wiring ────────────────────────────────────────
+//
+// Two scopes:
+//
+//   1. `memprofile_run_level_smoke` — drives `process_binaries` end-to-end
+//      with `output_dir = Some(tempdir)`. Asserts: the manager
+//      constructs the sampler at run start, tears it down before the
+//      pool teardown, and the run completes without panic on the
+//      "no per-worker subcgroup" path (the current default of
+//      `LocalManager` mode, which passes `None` for
+//      `mem_manager_reserved_bytes` to `pool.initialize`, leaving every
+//      `WorkerHandle.subcgroup == None`). The output dir stays empty
+//      because the sampler's `on_task_assigned` short-circuits without
+//      a leaf path — see the scope note on
+//      `LocalManagerConfig::output_dir`.
+//
+//   2. `memprofile_hook_writes_profile_with_fake_subcgroup` — drives
+//      the `notify_sampler_*` hooks directly against a manager whose
+//      `WorkerHandle.subcgroup` is hand-injected to point at a
+//      tempdir-rooted fake cgroup leaf. This is the test that proves
+//      the wiring writes the file once the cgroup leaf is real;
+//      when the production path eventually materialises real leaves
+//      it will be covered by the existing `memprofile/tests.rs`
+//      round-trip coverage, not by re-testing the hook here.
+
+/// Run-level smoke: enabling profiling does not crash the standard
+/// `process_binaries` happy path; the sampler is constructed at the
+/// start of the run and `take()`n on the teardown path.
+#[tokio::test(flavor = "current_thread")]
+async fn memprofile_run_level_smoke() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let tmp = tempfile::tempdir().expect("output_dir tempdir");
+        let mut config = test_config(1);
+        config.output_dir = Some(tmp.path().to_path_buf());
+        let mut manager =
+            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
+        let mut factory = FakeWorkerFactory {
+            mode: FakeWorkerMode::AlwaysSucceed,
+        };
+
+        let binaries = vec![make_binary("a", 50), make_binary("b", 60)];
+
+        // Sampler is None pre-run (constructed lazily inside
+        // `process_binaries` because `MemProfileSampler::spawn`
+        // requires a running tokio runtime).
+        assert!(!manager.sampler_is_some(), "sampler must be lazy");
+
+        manager
+            .process_binaries(
+                binaries,
+                std::collections::HashMap::new(),
+                |_phase| {},
+                |_phase, _completed, _failed| {},
+                &mut factory,
+            )
+            .await
+            .unwrap();
+
+        // Sampler torn down by the teardown path (start of run) so
+        // the next run can construct a fresh one.
+        assert!(!manager.sampler_is_some(), "sampler must be torn down");
+        assert_eq!(manager.stats().completed, 2);
+
+        // Tasks ran without per-worker subcgroups (FakeWorkerFactory
+        // never installs one), so the sampler's on_task_assigned
+        // short-circuit fired and no profile files were written.
+        // The output dir is still the tempdir we passed; assert no
+        // unexpected files leaked.
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read output_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "output_dir should be empty when no per-worker subcgroup is configured; found {leftovers:?}"
+        );
+    }).await;
+}
+
+/// Hook-level integration: hand-inject a fake `SubcgroupHandle`
+/// pointing at a tempdir with cgroup-v2 pseudo-files, drive
+/// `notify_sampler_assigned` + `notify_sampler_completed` through
+/// the public hook seams, and assert the profile file lands at the
+/// expected path with at least one sample. This pins the manager-
+/// side wiring contract: when the pool DOES surface a per-worker
+/// subcgroup, the sampler hooks fire and the file materialises.
+#[tokio::test(flavor = "current_thread")]
+async fn memprofile_hook_writes_profile_with_fake_subcgroup() {
+    use std::io::Read;
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        // Output dir for profile files.
+        let out = tempfile::tempdir().expect("out tempdir");
+        // Fake cgroup leaf with the three pseudo-files the reader needs.
+        let cg = tempfile::tempdir().expect("cg tempdir");
+        let leaf = cg.path().join("worker-0");
+        std::fs::create_dir(&leaf).unwrap();
+        std::fs::write(leaf.join("memory.current"), "4096\n").unwrap();
+        std::fs::write(leaf.join("memory.swap.current"), "0\n").unwrap();
+        std::fs::write(leaf.join("memory.stat"), "anon 4096\nfile 0\n").unwrap();
+
+        // Build a manager, populate its WorkerPool with one worker via
+        // the existing `FakeWorkerFactory` path so the sampler hooks
+        // have a real `WorkerHandle` slot to look up.
+        let mut config = test_config(1);
+        // Tight sampler interval so the test runs quickly.
+        config.output_dir = Some(out.path().to_path_buf());
+        let mut manager: LocalManager<ChannelManagerEnd, _, _, super::test_helpers::TestId> =
+            LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
+        let mut factory = FakeWorkerFactory {
+            mode: FakeWorkerMode::AlwaysSucceed,
+        };
+        // Bring up one worker without running process_binaries (we
+        // want to drive the hook surface directly, not the full
+        // dispatch pipeline). `initialize_workers` is the
+        // pool-bootstrap step that allocates `WorkerHandle`s.
+        manager
+            .initialize_workers(&mut factory)
+            .await
+            .expect("worker init");
+
+        // Inject the fake subcgroup onto worker 0 — production
+        // would materialise this via `prepare_worker_subgroup` at
+        // pool spawn time, gated on `mem_manager_reserved_bytes`
+        // being `Some(_)` (currently `None` in `LocalManager` mode);
+        // injecting it directly lets us test the sampler wiring
+        // end-to-end without that surface change.
+        let handle = crate::cgroup::SubcgroupHandle::from_cgroup_dir_for_test(leaf.clone());
+        manager.install_worker_subcgroup_for_test(0, handle);
+
+        // Stand up the sampler with a tight sample interval so the
+        // test doesn't pay the 1 s production cadence. Direct
+        // construction (not via `process_binaries`) keeps the test
+        // focused on the hook surface.
+        let sampler = crate::memprofile::MemProfileSampler::spawn(
+            crate::memprofile::MemProfileConfig {
+                output_dir: out.path().to_path_buf(),
+                sample_interval: std::time::Duration::from_millis(20),
+            },
+        );
+        manager.install_sampler_for_test(sampler);
+
+        // Drive the hooks. `binary.task_id == Some("task-A")` so the
+        // expected file is `task-A.worker-0.memprofile.jsonl.zst`.
+        let mut binary = make_binary("a", 50);
+        binary.task_id = Some("task-A".to_string());
+        manager.notify_sampler_assigned(0, &binary);
+
+        // Let several ticks fire so the writer accumulates samples.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        manager.notify_sampler_completed(Some("task-A".to_string()));
+
+        // Shutdown drains the sampler's queue and joins the
+        // background task, so the on-disk file is final by the time
+        // shutdown returns.
+        let sampler = manager.sampler.take().expect("sampler installed");
+        sampler.shutdown().await;
+
+        let expected = out.path().join("task-A.worker-0.memprofile.jsonl.zst");
+        assert!(
+            expected.exists(),
+            "expected profile file at {}",
+            expected.display()
+        );
+        // Round-trip: zstd-decode + JSONL parse. At least one
+        // complete frame (sample) must have been written.
+        let file = std::fs::File::open(&expected).expect("open profile");
+        let mut decoder = zstd::stream::read::Decoder::new(file).expect("decoder");
+        let mut decoded = Vec::new();
+        let _ = decoder.read_to_end(&mut decoded);
+        let text = std::str::from_utf8(&decoded).expect("utf8");
+        let lines: Vec<&str> = text.split_terminator('\n').collect();
+        assert!(
+            !lines.is_empty(),
+            "expected >= 1 sample in profile file, got 0 (raw: {decoded:?})"
+        );
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+        assert_eq!(first["worker_id"].as_u64(), Some(0));
+        assert_eq!(first["memory_current"].as_u64(), Some(4096));
+    }).await;
 }
