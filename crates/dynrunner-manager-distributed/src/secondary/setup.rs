@@ -28,6 +28,27 @@ where
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         let max = self.max_resources();
+        // Two distinct callers materialise nested cgroups here:
+        //   * `Some(n)` — operator-supplied `--mem-manager-reserved`
+        //     reserves `n` bytes for the secondary process so a
+        //     worker kernel-OOM doesn't reap the secondary too;
+        //   * `Some(0)` — "create the cgroup leaves but don't
+        //     tighten `memory.max`". This is what the memprofile
+        //     sampler needs: per-worker subgroups exist
+        //     (`WorkerHandle.subcgroup` becomes `Some(...)`) so the
+        //     sampler can read `memory.current`, but no enforcement
+        //     changes.
+        // We pick the latter when memprofile is enabled
+        // (`output_dir` set) and no explicit reservation is set,
+        // and leave the operator's explicit value untouched when
+        // both are configured. `None` (legacy flat layout) when
+        // neither feature is opted into. Mirrors
+        // `LocalManager::initialize_workers`.
+        let mem_manager_reserved_bytes = if self.config.output_dir.is_some() {
+            self.config.mem_manager_reserved_bytes.or(Some(0))
+        } else {
+            self.config.mem_manager_reserved_bytes
+        };
         self.pool
             .initialize(
                 self.config.num_workers,
@@ -35,12 +56,7 @@ where
                 &self.scheduler,
                 factory,
                 false,
-                // Operator-supplied via `--mem-manager-reserved` →
-                // SecondaryConfig → here. `None` = skip nesting
-                // (legacy flat layout); `Some(n)` = create the
-                // workers cgroup and reserve n bytes for the
-                // secondary process. See SecondaryConfig docs.
-                self.config.mem_manager_reserved_bytes,
+                mem_manager_reserved_bytes,
             )
             .await
     }
@@ -335,6 +351,11 @@ where
                     );
                     continue;
                 }
+                // Snapshot for the sampler hook before the binary
+                // is moved into `assign_task`. The hook reads
+                // `task_id` off the borrowed `TaskInfo`; cloning
+                // once here keeps the success arm simple.
+                let binary_for_hook = binary.clone();
                 match self.pool.workers[wid as usize]
                     .assign_task(
                         binary,
@@ -351,6 +372,7 @@ where
                     .await
                 {
                     Ok(()) => {
+                        self.notify_sampler_assigned(wid, &binary_for_hook);
                         self.active_tasks.insert(hash, wid);
                         tracing::info!(
                             worker_id = wid,
