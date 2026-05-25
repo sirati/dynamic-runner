@@ -4,6 +4,7 @@ pub mod monitor;
 pub mod oom;
 pub mod pool;
 pub mod manager;
+pub mod memprofile;
 pub mod stats;
 
 pub use cgroup::{

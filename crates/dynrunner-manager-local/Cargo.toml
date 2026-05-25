@@ -25,6 +25,12 @@ thiserror = { workspace = true }
 # the document via `serde_json::json!` keeps field-name shape
 # the consumer locked in lined up with one source of truth.
 serde_json = { workspace = true }
+# Per-task memory profile sink: zstd-framed JSONL (one self-contained
+# frame per sample so a hard manager death loses at most the
+# in-flight sample). `default-features = false` keeps us off the
+# bundled compile path; libzstd-sys picks up the system library
+# provided by the nix dev-shell.
+zstd = { workspace = true, default-features = false }
 
 # `nix::sys::wait::waitpid` for non-blocking reap of dead worker
 # subprocesses. The `process` feature gates `sys::wait`. Cfg-gated
