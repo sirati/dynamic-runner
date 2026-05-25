@@ -68,6 +68,16 @@ where
                 self.pool.workers[worker_id as usize].reclaim_protocol().await;
                 self.pool.workers[worker_id as usize].clear_task();
 
+                // Flush the per-task memprofile writer (if any).
+                // Sampler hook is a fire-and-forget mpsc-send;
+                // ordering relative to the cluster-state apply +
+                // wire broadcasts below does not matter for
+                // correctness — the sampler's command queue
+                // serialises events.
+                self.notify_sampler_completed(
+                    binary.as_ref().and_then(|b| b.task_id.clone()),
+                );
+
                 // Find the file hash for this worker's task
                 let file_hash = self
                     .active_tasks
@@ -372,6 +382,21 @@ where
 
                 let _ = binary; // binary info already reported
 
+                // Flush any per-task memprofile writers attached to
+                // this worker BEFORE we return — the outer loop's
+                // `pool.restart_worker(wid, ...)` Drops the prior
+                // `WorkerHandle`, whose `SubcgroupHandle::Drop`
+                // best-effort rmdirs the per-worker cgroup leaf.
+                // A sampler tick that races past the rmdir would
+                // read `memory.current` against a now-empty
+                // directory and the last frame silently drops. No
+                // matching `TaskCompleted` will arrive on a
+                // transport disconnect; this is the only flush
+                // opportunity. Mirrors the same ordering invariant
+                // in `LocalManager::handle_event`'s Disconnected
+                // arm.
+                self.notify_sampler_disconnected(worker_id);
+
                 // Signal that this worker needs restart
                 Ok(Some(worker_id))
             }
@@ -453,11 +478,17 @@ where
                     let type_log = binary.type_id.clone();
                     let estimated_mb =
                         estimated.get(&dynrunner_core::ResourceKind::memory()) / (1024 * 1024);
+                    // Snapshot for the sampler hook before the
+                    // move into `assign_task`. Same pattern as
+                    // the other secondary assign sites — see
+                    // `notify_sampler_assigned` doc.
+                    let binary_for_hook = binary.clone();
                     match self.pool.workers[worker_id as usize]
                         .assign_task(binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {
+                            self.notify_sampler_assigned(worker_id, &binary_for_hook);
                             self.active_tasks.insert(file_hash, worker_id);
                             tracing::info!(
                                 worker_id,

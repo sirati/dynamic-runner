@@ -47,6 +47,7 @@ mod primary_link;
 mod processing;
 pub(crate) mod resource;
 mod retry_budget;
+mod sampler_hooks;
 mod setup;
 mod staging;
 mod types;
@@ -777,4 +778,25 @@ where
     /// so the budget effectively resets across the demotion boundary.
     /// Documented in `secondary/primary/reinject_task.rs`.
     pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
+
+    /// Per-task memory-profile sampler. `Some` iff
+    /// [`SecondaryConfig::output_dir`] was set when the secondary's
+    /// `run_until_setup_or_done` started — sampler construction
+    /// defers to the post-`initialize_workers` step because
+    /// `MemProfileSampler::spawn` requires a running tokio runtime
+    /// (the coordinator's caller may not be inside one when
+    /// `new()` runs).
+    ///
+    /// Owns one background tokio task that ticks at the configured
+    /// `sample_interval` (1 s by default), reads each active worker's
+    /// cgroup memory stats, and writes zstd-framed JSONL through the
+    /// sampler's writers. Drained + joined via
+    /// [`Self::shutdown_sampler_if_present`] at the start of every
+    /// terminal teardown sequence — BEFORE the pool's
+    /// `SubcgroupHandle::drop` rmdir's the leaf cgroups the sampler
+    /// would otherwise still be sampling from.
+    ///
+    /// Mirrors the same field on
+    /// [`dynrunner_manager_local::manager::LocalManager`].
+    pub(super) sampler: Option<dynrunner_manager_local::memprofile::MemProfileSampler>,
 }

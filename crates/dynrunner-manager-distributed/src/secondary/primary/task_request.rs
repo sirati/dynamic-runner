@@ -245,11 +245,16 @@ where
                     }
                     let predecessor_outputs =
                         gather_predecessor_outputs(&self.cluster_state, &actual_binary);
+                    // Snapshot for the sampler hook before the
+                    // move into `assign_task`. See `notify_sampler_assigned`
+                    // doc for why we clone the whole `TaskInfo`.
+                    let binary_for_hook = actual_binary.clone();
                     match self.pool.workers[wid as usize]
                         .assign_task(actual_binary, estimated, false, predecessor_outputs)
                         .await
                     {
                         Ok(()) => {
+                            self.notify_sampler_assigned(wid, &binary_for_hook);
                             self.active_tasks.insert(file_hash, wid);
                             self.primary_link.reset_backoff(wid);
                         }

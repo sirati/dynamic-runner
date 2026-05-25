@@ -138,6 +138,10 @@ where
             command_rx: Some(command_rx),
             command_tx,
             unfulfillable_reinject_remaining: HashMap::new(),
+            // Lazily constructed in `run_until_setup_or_done_inner`
+            // post-`initialize_workers` — see the doc on the
+            // `sampler` field for the runtime-context rationale.
+            sampler: None,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
         // `PeerJoined` / `PeerRemoved` apply rules' emit calls route
@@ -563,6 +567,47 @@ where
         self.local_tasks_run
     }
 
+    /// Test accessor: snapshot of `self.sampler.is_some()`. Mirrors
+    /// `LocalManager::sampler_is_some` — used by the secondary's
+    /// memprofile lifecycle test to pin "constructed iff
+    /// `output_dir` was set, torn down by terminal cleanup".
+    #[cfg(test)]
+    pub(in crate::secondary) fn sampler_is_some(&self) -> bool {
+        self.sampler.is_some()
+    }
+
+    /// Test seam mirroring `LocalManager::install_sampler_for_test`:
+    /// stand up the memprofile sampler on a coordinator built
+    /// outside the `run_until_setup_or_done` runtime-context dance.
+    /// Lets sampler-hook integration tests fire
+    /// `notify_sampler_assigned` / `notify_sampler_completed` /
+    /// `notify_sampler_disconnected` directly without going through
+    /// the full `process_tasks` loop.
+    #[cfg(test)]
+    pub(in crate::secondary) fn install_sampler_for_test(
+        &mut self,
+        sampler: dynrunner_manager_local::memprofile::MemProfileSampler,
+    ) {
+        self.sampler = Some(sampler);
+    }
+
+    /// Test seam mirroring
+    /// `LocalManager::install_worker_subcgroup_for_test`: inject a
+    /// `SubcgroupHandle` onto an existing worker slot so the
+    /// sampler-hook integration test can hand the sampler a
+    /// tempdir-rooted leaf path. In production the pool's spawn site
+    /// materialises the handle before `factory.spawn_worker`; tests
+    /// that use the in-process channel factories never enter that
+    /// code path, hence this seam.
+    #[cfg(test)]
+    pub(in crate::secondary) fn install_worker_subcgroup_for_test(
+        &mut self,
+        worker_id: dynrunner_core::WorkerId,
+        handle: dynrunner_manager_local::cgroup::SubcgroupHandle,
+    ) {
+        self.pool.workers[worker_id as usize].subcgroup = Some(handle);
+    }
+
     /// Run the secondary coordination loop:
     /// 1. Initialize local workers
     /// 2. Send welcome and cert exchange to primary
@@ -718,6 +763,44 @@ where
             // Initialize workers (local pool — no network, no deadline).
             self.initialize_workers(factory).await?;
 
+            // Construct the per-task memory-profile sampler if the
+            // operator enabled it via `config.output_dir`. Deferred
+            // to here (and not `SecondaryCoordinator::new`) because
+            // the sampler spawns a background tokio task on the
+            // current runtime — at construction time the caller may
+            // not be inside one. Built AFTER `initialize_workers`
+            // so a failure there returns without leaking a sampler
+            // background task; built BEFORE `wait_for_setup` so the
+            // initial-assignment hook on
+            // `handle_initial_assignment` (the secondary's first
+            // assign site) captures the first batch of tasks too.
+            //
+            // The same `output_dir.is_some()` predicate also drove
+            // `mem_manager_reserved_bytes` to `Some(0)` in
+            // `initialize_workers`, but cgroup setup may still
+            // gracefully return without per-worker leaves on a host
+            // that doesn't expose delegated cgroup-v2. In that case
+            // `WorkerHandle.subcgroup` is `None` and
+            // `notify_sampler_assigned` silently skips per-task
+            // profile creation — operators see the warn emitted at
+            // setup time and no `.jsonl.zst` files appear. We
+            // construct the sampler regardless so its event queue
+            // exists for non-cgroup messages (Disconnected fan-out)
+            // and the secondary-side lifecycle test can pin
+            // construction independently of cgroup-v2 availability.
+            // Mirrors `LocalManager::process_binaries`.
+            if self.sampler.is_none()
+                && let Some(dir) = self.config.output_dir.as_ref()
+            {
+                self.sampler = Some(
+                    dynrunner_manager_local::memprofile::MemProfileSampler::spawn(
+                        dynrunner_manager_local::memprofile::MemProfileConfig::new(
+                            dir.clone(),
+                        ),
+                    ),
+                );
+            }
+
             // Network-touching setup (Phases 1-4) is bounded by
             // `setup_deadline`. See SecondaryConfig::setup_deadline for
             // the rationale. The deadline is applied at the orchestration
@@ -736,11 +819,18 @@ where
             match tokio::time::timeout(deadline, setup).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    // Drain the sampler BEFORE `stop_all_workers`
+                    // so the last tick reads still see the
+                    // per-worker cgroup leaves the pool's teardown
+                    // is about to Drop-rmdir. Same ordering
+                    // invariant as the terminal-cleanup path below.
+                    self.shutdown_sampler_if_present().await;
                     self.stop_all_workers().await;
                     return Err(e);
                 }
                 Err(_elapsed) => {
                     let peers = self.peer_transport.peer_count();
+                    self.shutdown_sampler_if_present().await;
                     self.stop_all_workers().await;
                     if peers == 0 {
                         // The asm-dataset-nix T7 attempt 2 scenario:
@@ -794,7 +884,12 @@ where
 
         match &outcome {
             RunOutcome::Done => {
-                // Normal termination — stop workers and log finish.
+                // Normal termination — drain the sampler BEFORE
+                // `stop_all_workers` so its last tick still sees
+                // the per-worker cgroup leaves the pool's teardown
+                // is about to Drop-rmdir. Mirrors
+                // `LocalManager::process_binaries`'s teardown order.
+                self.shutdown_sampler_if_present().await;
                 self.stop_all_workers().await;
                 tracing::info!(
                     secondary = %self.config.secondary_id,
