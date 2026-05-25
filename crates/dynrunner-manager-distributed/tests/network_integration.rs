@@ -147,6 +147,7 @@ async fn e2e_primary_secondary_over_wss() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
@@ -286,6 +287,7 @@ async fn e2e_primary_secondary_over_quic() {
                 unfulfillable_reinject_max_per_task: None,
                 mem_manager_reserved_bytes: None,
                 output_dir: None,
+                memuse_log_path: None,
             };
 
             let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
