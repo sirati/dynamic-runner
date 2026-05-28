@@ -48,7 +48,32 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let mut sample_interval = oom_watcher.sample_interval_ticker();
         let mut decision_interval = oom_watcher.decision_interval_ticker();
 
+        // Take the command-channel receiver out of `self.command_rx`
+        // so we can `recv()` it inside `select!` without borrowing
+        // `&mut self` twice. Restored at end-of-loop so subsequent
+        // phase calls into `process_worker_loop` (retry, pressure,
+        // unassigned) and the post-pipeline tail drain in
+        // `process_binaries` can re-take it. Re-entrant
+        // `process_worker_loop` calls would trip the expect here —
+        // by design, only one phase loop runs at a time.
+        let mut command_rx = self
+            .command_rx
+            .take()
+            .expect("command_rx absent; process_worker_loop re-entrant?");
+
         while !active_workers.is_empty() {
+            // Drain any commands queued during the prior iteration's
+            // event handling (e.g. a `spawn_tasks` issued from
+            // `on_phase_end` inside `process_drain_transitions`).
+            // Applying these BEFORE `assign_idle_workers` ensures
+            // the pool's `is_empty()` check sees freshly-spawned
+            // tasks; without the drain a late `SpawnTasks` would
+            // race the loop's break check and risk a missed
+            // dispatch this iteration.
+            while let Ok(cmd) = command_rx.try_recv() {
+                crate::manager::command_channel::handle_local_command(self, cmd).await;
+            }
+
             // Try to assign tasks to any idle workers
             self.assign_idle_workers(active_workers, allow_stop, phase, factory).await;
 
@@ -61,14 +86,33 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 break;
             }
 
-            // Wait for either a worker event, the sample tick, or
-            // the decision tick.
+            // Wait for either a worker event, an external command,
+            // the sample tick, or the decision tick.
             //
-            // Cancellation safety: `pool.recv_event` is
-            // `mpsc::Receiver::recv` (cancel-safe). The interval ticks
-            // are cancel-safe per tokio docs. Each arm dropping the
-            // others' futures is harmless.
+            // Cancellation safety: `pool.recv_event` and
+            // `command_rx.recv` are both `mpsc::Receiver::recv`
+            // (cancel-safe). The interval ticks are cancel-safe per
+            // tokio docs. Each arm dropping the others' futures is
+            // harmless.
+            //
+            // `biased;` ensures the command arm wins against ticks
+            // at the same instant — an external `spawn_tasks` /
+            // `fail_permanent` from `PyPrimaryHandle` is operationally
+            // ahead of forensic sampling.
             tokio::select! {
+                biased;
+                cmd = command_rx.recv() => {
+                    if let Some(cmd) = cmd {
+                        crate::manager::command_channel::handle_local_command(self, cmd).await;
+                    }
+                    // Channel-closed (`None`): the manager's
+                    // command_tx (held by `self.command_tx`) is
+                    // still alive for the manager's lifetime, so
+                    // this arm only fires if all external clones
+                    // have dropped — non-fatal; future `recv()`
+                    // calls keep returning `None` and the arm
+                    // becomes a no-op until a fresh clone surfaces.
+                }
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
                         self.handle_event(
@@ -125,6 +169,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 }
             }
         }
+
+        // Restore the command-channel receiver onto `self` so the
+        // next phase's `process_worker_loop` call (or the
+        // outer-loop tail drain in `process_binaries`) can re-take
+        // it. The phase functions call us sequentially, never
+        // concurrently — the `take` / restore dance keeps the
+        // borrow checker happy without an `Arc<Mutex<...>>`.
+        self.command_rx = Some(command_rx);
 
         // Move remaining pending to the recoverable retry channel at
         // the end of the retry phase (main-phase leftovers go to

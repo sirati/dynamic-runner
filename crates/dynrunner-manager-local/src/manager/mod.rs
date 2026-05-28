@@ -3,11 +3,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use dynrunner_core::{
-    FailedTask, Identifier, PhaseId, ResourceKind, ResourceMap, TaskInfo, TaskOutputs, TypeId,
-    WorkerId,
+    compute_task_hash, FailedTask, Identifier, PhaseId, PrimaryCommand, ResourceKind, ResourceMap,
+    TaskInfo, TaskOutputs, TypeId, WorkerId, COMMAND_CHANNEL_CAPACITY,
 };
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_scheduler_api::{PendingPool, PhaseState, ResourceEstimator, Scheduler};
+use tokio::sync::mpsc as tokio_mpsc;
 use crate::pool::WorkerPool;
 use crate::stats::ProcessingStats;
 
@@ -92,6 +93,16 @@ pub struct LocalManagerConfig {
     /// `None` disables profiling entirely; no sampler is constructed
     /// and the assign / complete / disconnect hooks short-circuit.
     pub output_dir: Option<std::path::PathBuf>,
+    /// Per-task budget cap for `PrimaryCommand::ReinjectTask`. `None`
+    /// disables the cap (unbounded reinjections, the same default as
+    /// the distributed primary's `PrimaryConfig::
+    /// unfulfillable_reinject_max_per_task`). `Some(n)` allows at most
+    /// `n` reinjections per task hash before the handler refuses with
+    /// the `unfulfillable_reinject_budget_exhausted` structured-log
+    /// event. The same per-handle setter (`PyPrimaryHandle::
+    /// set_unfulfillable_reinject_max_per_task`) seeds this value from
+    /// Python so the local backend mirrors the distributed surface.
+    pub unfulfillable_reinject_max_per_task: Option<u32>,
 }
 
 impl Default for LocalManagerConfig {
@@ -116,6 +127,7 @@ impl Default for LocalManagerConfig {
             ],
             log_oom_watcher: false,
             output_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         }
     }
 }
@@ -188,7 +200,7 @@ pub trait WorkerFactory<M: ManagerEndpoint> {
 /// Generic over `I` (the identifier type) so different task definitions
 /// can use different identifier structures.
 pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier = ()> {
-    config: LocalManagerConfig,
+    pub(crate) config: LocalManagerConfig,
     scheduler: S,
     estimator: E,
     pool: WorkerPool<M, I>,
@@ -196,13 +208,13 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// `process_binaries` run; populated at run-start with the current
     /// batch's phase set + dependency graph and torn down at run-end.
     pending: Option<PendingPool<I>>,
-    failed_tasks: Vec<FailedTask<I>>,
-    resource_pressure_tasks: Vec<FailedTask<I>>,
-    unassigned_tasks: Vec<TaskInfo<I>>,
+    pub(crate) failed_tasks: Vec<FailedTask<I>>,
+    pub(crate) resource_pressure_tasks: Vec<FailedTask<I>>,
+    pub(crate) unassigned_tasks: Vec<TaskInfo<I>>,
     pending_worker_assignments: HashSet<WorkerId>,
     in_pressure_phase: bool,
     total_assigned_resources: ResourceMap,
-    stats: ProcessingStats,
+    pub(crate) stats: ProcessingStats,
     /// Per-`PhaseId` (completed, failed) counters surfaced through the
     /// `on_phase_end` callback when a phase drains.
     phase_completion_counts: HashMap<PhaseId, (u32, u32)>,
@@ -263,10 +275,92 @@ pub struct LocalManager<M: ManagerEndpoint, S: Scheduler<I>, E: ResourceEstimato
     /// `SubcgroupHandle::drop` rmdir's the leaf cgroups the sampler
     /// would otherwise still be sampling from.
     pub(crate) sampler: Option<crate::memprofile::MemProfileSampler>,
+
+    /// Cross-thread command-channel sender — clone-source for every
+    /// `PyPrimaryHandle` minted by the wrapping PyO3 layer.
+    ///
+    /// Both the local and the distributed backends feed the same
+    /// `tokio::sync::mpsc::Sender<PrimaryCommand<I>>` wire type into
+    /// `PyPrimaryHandle::from_sender`; only the receiver-side handler
+    /// differs. See [`crate::manager::command_channel`] for the local
+    /// per-variant dispatch.
+    ///
+    /// Cloned (not moved) on every `command_sender()` call so multiple
+    /// handles can share one manager. The sender stays alive for the
+    /// manager's full lifetime; closing only happens when the manager
+    /// is dropped, at which point every outstanding handle's
+    /// `send().await` returns `SendError` and the Python side surfaces
+    /// `PyRuntimeError`.
+    command_tx: tokio_mpsc::Sender<PrimaryCommand<I>>,
+
+    /// Command-channel receiver. `Option` so `process_binaries` can
+    /// `take()` it into a stack-local for the duration of the run
+    /// (the receiver is passed by `&mut` through the phase functions
+    /// down into `process_worker_loop`'s `select!`) and put it back
+    /// afterwards. The single-`take` invariant catches accidental
+    /// re-entrant `process_binaries` calls early.
+    pub(crate) command_rx: Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
+
+    /// Mirror of every task ever passed through `pool.extend` /
+    /// `PrimaryCommand::SpawnTasks` keyed by wire-canonical content
+    /// hash. Used by the command-channel handler to resolve
+    /// `PrimaryHandle::fail_permanent(hash, ...)` and
+    /// `update_preferred_secondaries(hash, ...)` calls against the
+    /// task's `(phase_id, task_id)` metadata without walking the
+    /// pool's buckets.
+    ///
+    /// Persistent for the run's lifetime: never shrinks even on
+    /// terminal events. The pool's buckets / blocked map / failed
+    /// queues are the authoritative dispatch state; this mirror only
+    /// needs to keep enough metadata to resolve a hash to a
+    /// `TaskInfo<I>` clone. Outer-loop reinvocation of the 5-phase
+    /// pipeline keys off `task_by_hash.len()` growth — strict
+    /// monotonic growth means the break condition is a length
+    /// comparison.
+    pub(crate) task_by_hash: HashMap<String, TaskInfo<I>>,
+
+    /// Per-task remaining reinjection budget. Lazily initialised on
+    /// the first `PrimaryCommand::ReinjectTask` for a hash from
+    /// `config.unfulfillable_reinject_max_per_task` (if `Some(n)`,
+    /// the entry starts at `n`); each subsequent reinject decrements
+    /// by one. When the entry hits 0 the handler refuses with the
+    /// `unfulfillable_reinject_budget_exhausted` structured-log
+    /// event. Mirrors the distributed primary's per-task budget map
+    /// shape so the contract on the Python side is uniform across
+    /// backends. Empty when `config.unfulfillable_reinject_max_per_task`
+    /// is `None` (unbounded).
+    pub(crate) unfulfillable_reinject_remaining: HashMap<String, u32>,
 }
 
 impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> LocalManager<M, S, E, I> {
+    /// Construct a manager with a freshly-minted command channel.
+    /// The Rust-test surface uses this form — the test never needs to
+    /// reach into the channel sender, so a self-built pair is the
+    /// minimal-friction shape. PyO3 callers that need to hand the
+    /// sender to a `PyPrimaryHandle` BEFORE entering
+    /// `process_binaries` use [`Self::with_command_channel`] and
+    /// pre-mint the pair on the Python side.
     pub fn new(config: LocalManagerConfig, scheduler: S, estimator: E) -> Self {
+        let (command_tx, command_rx) =
+            tokio_mpsc::channel::<PrimaryCommand<I>>(COMMAND_CHANNEL_CAPACITY);
+        Self::with_command_channel(config, scheduler, estimator, command_tx, command_rx)
+    }
+
+    /// Construct a manager wired to an externally-minted command-channel
+    /// pair. PyO3 callers use this so the sender can be cloned into a
+    /// `PyPrimaryHandle` synchronously at `RustLocalManager.__new__`
+    /// time — long before `process_binaries` actually constructs the
+    /// inner `LocalManager` inside its detached tokio runtime. The
+    /// receiver is held in `Self::command_rx` (Option-wrapped) and
+    /// `take()`n into a stack-local by `process_binaries` for the
+    /// duration of the run.
+    pub fn with_command_channel(
+        config: LocalManagerConfig,
+        scheduler: S,
+        estimator: E,
+        command_tx: tokio_mpsc::Sender<PrimaryCommand<I>>,
+        command_rx: tokio_mpsc::Receiver<PrimaryCommand<I>>,
+    ) -> Self {
         Self {
             config,
             scheduler,
@@ -288,7 +382,21 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             task_payloads: Vec::new(),
             task_outputs_cache: HashMap::new(),
             sampler: None,
+            command_tx,
+            command_rx: Some(command_rx),
+            task_by_hash: HashMap::new(),
+            unfulfillable_reinject_remaining: HashMap::new(),
         }
+    }
+
+    /// Clone of the command-channel sender. Symmetric with
+    /// `PrimaryCoordinator::command_sender` on the distributed
+    /// backend — both feed the same `PyPrimaryHandle::from_sender`
+    /// constructor on the PyO3 layer. Callable at any time; the
+    /// returned `Sender<PrimaryCommand<I>>` stays valid as long as
+    /// the manager is alive.
+    pub fn command_sender(&self) -> tokio_mpsc::Sender<PrimaryCommand<I>> {
+        self.command_tx.clone()
     }
 
     pub fn stats(&self) -> &ProcessingStats {
@@ -348,6 +456,23 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
         let pool = PendingPool::new(phase_ids, phase_deps)
             .map_err(|e| e.to_string())?;
         self.pending = Some(pool);
+        // Mirror the initial batch into `task_by_hash` BEFORE
+        // `pool.extend`. The mirror is the command-channel handler's
+        // hash → TaskInfo lookup table (FailPermanent /
+        // UpdatePreferredSecondaries / SpawnTasks duplicate detection
+        // all key against it). Doing this before `extend` keeps the
+        // invariant "every task the pool knows about is mirrored"
+        // valid throughout the run; `extend` is also fallible so
+        // mirroring first means a rejected batch still tracks the
+        // intended-to-be-injected tasks, which is the diagnostic
+        // shape we want (FailPermanent against a hash that the pool
+        // rejected returns "unknown hash" today via the side queue
+        // path; the mirror keeps it resolvable via a `task_by_hash`
+        // lookup if a future handler wants to surface it).
+        for task in &binaries {
+            self.task_by_hash
+                .insert(compute_task_hash(task), task.clone());
+        }
         self.pool_mut()
             .extend(binaries)
             .map_err(|e| format!("PendingPool::extend rejected task graph: {e}"))?;
@@ -395,11 +520,62 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
                 )
             });
 
-        self.run_initial_assignments(factory).await;
-        self.run_main_phase(factory).await;
-        self.run_retry_phase(factory).await;
-        self.run_resource_pressure_phase(factory).await;
-        self.run_unassigned_phase(factory).await;
+        // Outer loop: every iteration runs the full 5-phase pipeline
+        // and breaks when `task_by_hash` did not grow during the pass.
+        // Growth happens iff a `PrimaryCommand::SpawnTasks` (issued
+        // from a Python `on_phase_end` callback for the lazy-phase-
+        // chain idiom) extended the task set mid-run; the pipeline
+        // restart catches the new phase's initial-assignment + main +
+        // retry + pressure + unassigned coverage that the just-
+        // finished pass missed. Defensive cap at 1000 iterations
+        // surfaces a pathological recursive `on_phase_end` as a
+        // tracing::error rather than an infinite loop. Persistent
+        // `task_by_hash` (no shrink on terminal events) means the
+        // length comparison is the cheap correct break condition;
+        // strict-monotonic-growth via `SpawnTasks` is the only path
+        // that flips the inequality.
+        const OUTER_LOOP_ITERATION_CAP: usize = 1000;
+        for loop_iteration in 0..OUTER_LOOP_ITERATION_CAP {
+            let prior_total = self.task_by_hash.len();
+            self.run_initial_assignments(factory).await;
+            self.run_main_phase(factory).await;
+            self.run_retry_phase(factory).await;
+            self.run_resource_pressure_phase(factory).await;
+            self.run_unassigned_phase(factory).await;
+            // Drain any commands queued during the unassigned phase's
+            // tail. The worker-loop drain only fires while a worker is
+            // running; once the loop exits, a late `SpawnTasks`
+            // command would otherwise sit in the channel until the
+            // next pass — or never if there isn't one. Pulling the
+            // receiver out for one pass keeps the borrow checker happy
+            // while we still hold `&mut self` for the handler.
+            let mut command_rx = self
+                .command_rx
+                .take()
+                .expect("command_rx absent; process_binaries re-entrant?");
+            while let Ok(cmd) = command_rx.try_recv() {
+                crate::manager::command_channel::handle_local_command(self, cmd).await;
+            }
+            self.command_rx = Some(command_rx);
+            if self.task_by_hash.len() == prior_total {
+                break;
+            }
+            tracing::info!(
+                loop_iteration,
+                prior_total,
+                new_total = self.task_by_hash.len(),
+                "LocalManager: spawn_tasks grew the task set during pass; \
+                 restarting 5-phase pipeline"
+            );
+            if loop_iteration + 1 == OUTER_LOOP_ITERATION_CAP {
+                tracing::error!(
+                    cap = OUTER_LOOP_ITERATION_CAP,
+                    new_total = self.task_by_hash.len(),
+                    "LocalManager: outer pipeline restart cap exceeded; \
+                     aborting to surface pathological recursive spawn"
+                );
+            }
+        }
         // Drain + flush the sampler BEFORE `stop_all_workers` so the
         // last tick's `memory.current` reads still see the per-worker
         // cgroup leaves the pool's teardown is about to Drop-rmdir.
@@ -444,14 +620,14 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     }
 
     /// Borrow the active pool. Panics if called outside a run.
-    pub(super) fn pool_ref(&self) -> &PendingPool<I> {
+    pub(crate) fn pool_ref(&self) -> &PendingPool<I> {
         self.pending
             .as_ref()
             .expect("pending pool not initialised; called outside process_binaries")
     }
 
     /// Mutably borrow the active pool. Panics if called outside a run.
-    pub(super) fn pool_mut(&mut self) -> &mut PendingPool<I> {
+    pub(crate) fn pool_mut(&mut self) -> &mut PendingPool<I> {
         self.pending
             .as_mut()
             .expect("pending pool not initialised; called outside process_binaries")
@@ -718,11 +894,15 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
     }
 }
 
+mod command_channel;
 mod events;
 mod monitor;
 mod phases;
 mod sampler_hooks;
 mod worker_loop;
+
+#[cfg(test)]
+mod command_channel_tests;
 
 #[cfg(test)]
 mod test_helpers;
