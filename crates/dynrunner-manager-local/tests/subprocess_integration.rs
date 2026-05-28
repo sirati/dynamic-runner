@@ -42,6 +42,7 @@ async fn single_worker_subprocess_processes_all() {
             phase_status_log_intervals: Vec::new(),
             log_oom_watcher: false,
             output_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut factory = PythonWorkerFactory {
@@ -218,6 +219,7 @@ async fn single_worker_named_socket_processes_all() {
             phase_status_log_intervals: Vec::new(),
             log_oom_watcher: false,
             output_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -284,6 +286,7 @@ async fn multi_worker_named_socket_processes_all() {
             phase_status_log_intervals: Vec::new(),
             log_oom_watcher: false,
             output_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut factory = NamedSocketWorkerFactory {
@@ -347,6 +350,7 @@ async fn multi_worker_subprocess_processes_all() {
             phase_status_log_intervals: Vec::new(),
             log_oom_watcher: false,
             output_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut factory = PythonWorkerFactory {

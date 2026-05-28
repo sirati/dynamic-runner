@@ -275,6 +275,7 @@ async fn memuse_log_written() {
             phase_status_log_intervals: Vec::new(),
             log_oom_watcher: false,
             output_dir: None,
+            unfulfillable_reinject_max_per_task: None,
         };
 
         let mut manager = LocalManager::new(config, ResourceStealingScheduler::memory(), FixedEstimator(100));
