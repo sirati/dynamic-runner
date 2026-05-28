@@ -110,14 +110,28 @@ pub(crate) fn run_local<'py>(
     );
     let manager = cls.call(args, Some(&kwargs))?;
 
+    // Pre-run handle factory: the local manager now mints its own
+    // command-channel pair at `__new__` time so `.handle()` is
+    // callable BEFORE `process_binaries`. Symmetric with
+    // `run_secondary` / `run_primary` / `run_distributed`: every
+    // dispatch path produces the same `PyPrimaryHandle` shape so
+    // modern tasks can drive `primary_handle.spawn_tasks(...)` from
+    // inside their lifecycle hooks regardless of `--multi-computer`
+    // mode. Legacy tasks (no `primary_handle` kwarg) fall back via
+    // `fire_on_run_start`'s TypeError-retry path.
+    let primary_handle = manager.call_method0("handle")?.unbind();
+
     // Phase 5B: fire `on_run_start` synchronously under the GIL before
     // any item dispatches. A failure here aborts the run — the
     // consumer's setup hasn't completed, so dispatching would race
-    // half-built resources. The in-process local manager has no
-    // `PrimaryHandle` (single-node, no command-channel coordinator), so
-    // the kwarg is `None` and legacy + modern task signatures both go
-    // through the positional-only call path.
-    fire_on_run_start(task_definition, &source_dir, &output_dir, task_args, None)?;
+    // half-built resources.
+    fire_on_run_start(
+        task_definition,
+        &source_dir,
+        &output_dir,
+        task_args,
+        Some(primary_handle),
+    )?;
 
     let run_outcome = manager.call_method1("process_binaries", (binaries.clone(),));
 

@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use dynrunner_core::{resolve_against_root, PhaseId, ResourceKind, ResourceMap, TaskInfo};
+use dynrunner_core::{
+    resolve_against_root, PhaseId, PrimaryCommand, ResourceKind, ResourceMap, TaskInfo,
+    COMMAND_CHANNEL_CAPACITY,
+};
 use dynrunner_manager_local::{LocalManager, LocalManagerConfig, ProcessingStats};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::config::connection::ConnectionMode;
 use crate::config::log_paths::LogPathConfig;
@@ -15,6 +20,7 @@ use crate::config::scheduler::SchedulerConfig;
 use crate::config::worker_spec::WorkerSpec;
 use crate::estimator::PyMemoryEstimatorBridge;
 use crate::identifier::RunnerIdentifier;
+use crate::managers::primary_handle::{PyPrimaryHandle, ReinjectCapCell};
 use crate::network::gethostname;
 use crate::pytypes::{PyTaskInfo, PyFailedTask, PyProcessingStats, extract_binaries};
 use crate::subprocess_factory::SubprocessWorkerFactory;
@@ -81,6 +87,34 @@ pub(crate) struct PyLocalManager {
     /// `FnMut + Send + 'static` bounds on `process_binaries`'s closure
     /// arguments.
     task_definition: Py<PyAny>,
+
+    /// Command-channel sender, minted at `__new__` so `.handle()` is
+    /// callable BEFORE `process_binaries`. Clone-source for every
+    /// `PyPrimaryHandle` the Python side fetches; the same clone is
+    /// also threaded into the inner `LocalManager` at
+    /// `process_binaries` time via [`LocalManager::with_command_channel`]
+    /// so the receiver-side of the same channel pair lives on the
+    /// manager.
+    command_tx: tokio_mpsc::Sender<PrimaryCommand<RunnerIdentifier>>,
+
+    /// Command-channel receiver. `Mutex<Option<...>>` so
+    /// `process_binaries` (which holds `&mut self` through the
+    /// pyclass method dispatch) can `.lock().take()` the receiver
+    /// once and hand it to `LocalManager::with_command_channel`.
+    /// `Mutex` (not `RwLock`) because the only access pattern is a
+    /// single `take()`; contention is moot.
+    command_rx: Mutex<Option<tokio_mpsc::Receiver<PrimaryCommand<RunnerIdentifier>>>>,
+
+    /// Shared per-handle cell for the reinject cap setter. Symmetric
+    /// with the in-process distributed manager and the network
+    /// primary's coordinator: every `PyPrimaryHandle` minted by
+    /// `.handle()` carries a clone of this cell, and every setter
+    /// call from Python ripples back to the value
+    /// `process_binaries` reads when it builds the
+    /// `LocalManagerConfig`. Defaults to `None` (unbounded
+    /// reinjections) — flipped only by the operator's CLI knob or
+    /// by `PyPrimaryHandle::set_unfulfillable_reinject_max_per_task`.
+    reinject_cap: ReinjectCapCell,
 }
 
 #[pymethods]
@@ -220,6 +254,17 @@ impl PyLocalManager {
                 )])
             });
 
+        // Pre-mint the command-channel pair so `.handle()` is
+        // callable BEFORE `process_binaries`. Both halves are
+        // synchronous to construct (tokio mpsc does not require a
+        // running runtime); the receiver moves into the inner
+        // `LocalManager` at `process_binaries` time via
+        // `command_rx.lock().take()`.
+        let (command_tx, command_rx) =
+            tokio_mpsc::channel::<PrimaryCommand<RunnerIdentifier>>(
+                COMMAND_CHANNEL_CAPACITY,
+            );
+
         Ok(Self {
             python_executable: task.python_executable,
             num_workers,
@@ -253,7 +298,31 @@ impl PyLocalManager {
             oom_tasks: Vec::new(),
             task_payloads: Vec::new(),
             task_definition: task_definition.clone().unbind(),
+            command_tx,
+            command_rx: Mutex::new(Some(command_rx)),
+            reinject_cap: ReinjectCapCell::default(),
         })
+    }
+
+    /// Mint a `PrimaryHandle` for this manager. Symmetric with
+    /// `PyDistributedManager::handle` / `PyPrimaryCoordinator::handle`
+    /// on the network-primary path: every call returns a freshly-built
+    /// handle whose `Sender<PrimaryCommand>` clone-shares the
+    /// manager's command channel. Callable BEFORE `process_binaries`
+    /// — the Python caller passes the handle to its `on_run_start`
+    /// hook so the task can drive `spawn_tasks(...)` from inside its
+    /// lifecycle.
+    ///
+    /// Local-mode parity with distributed: `PyPrimaryHandle::
+    /// from_sender(self.command_tx.clone(), self.reinject_cap.clone())`
+    /// — same constructor, same per-task budget cell semantics. The
+    /// only Python-visible difference is that local-mode
+    /// `update_preferred_secondaries` is a pool-mirror-only operation
+    /// (no peer broadcast); see
+    /// `dynrunner_manager_local::manager::command_channel` for the
+    /// per-variant handler.
+    fn handle(&self) -> PyResult<PyPrimaryHandle> {
+        PyPrimaryHandle::from_sender(self.command_tx.clone(), self.reinject_cap.clone())
     }
 
     /// Process a list of PyTaskInfo objects.
@@ -297,6 +366,15 @@ impl PyLocalManager {
             predicate
         });
 
+        // Snapshot the reinject cap and mark the cell as run-started
+        // so any subsequent `PyPrimaryHandle::
+        // set_unfulfillable_reinject_max_per_task` call raises
+        // `PyRuntimeError` (the inner manager owns its own copy of
+        // the cap from this moment on, matching the distributed
+        // primary's contract).
+        let unfulfillable_reinject_max_per_task = self.reinject_cap.snapshot();
+        self.reinject_cap.mark_run_started();
+
         let config = LocalManagerConfig {
             num_workers: self.num_workers,
             max_resources: self.max_resources.clone(),
@@ -335,7 +413,30 @@ impl PyLocalManager {
                 self.memprofile_enabled,
                 Some(self.output_dir.as_path()),
             ),
+            unfulfillable_reinject_max_per_task,
         };
+
+        // Take the receiver out of the manager-side mutex so it can
+        // be handed to `LocalManager::with_command_channel`. The
+        // sender (`self.command_tx`) stays alive — every existing
+        // `PyPrimaryHandle` clone still routes to the same receiver
+        // once it moves into the inner manager.
+        let command_tx = self.command_tx.clone();
+        let command_rx = self
+            .command_rx
+            .lock()
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "RustLocalManager: command_rx mutex poisoned: {e}"
+                ))
+            })?
+            .take()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "RustLocalManager.process_binaries called twice: \
+                     command_rx already consumed",
+                )
+            })?;
 
         // Per-type subprocess dispatch: the factory carries the full
         // `TypeRegistry`. `spawn_worker` defaults to `types.first()`
@@ -439,7 +540,13 @@ impl PyLocalManager {
                 let panik_rx = panik_watcher.take_signal_rx();
 
                 let mut manager: LocalManager<EitherManagerEnd, _, _, _> =
-                    LocalManager::new(config, scheduler, estimator);
+                    LocalManager::with_command_channel(
+                        config,
+                        scheduler,
+                        estimator,
+                        command_tx,
+                        command_rx,
+                    );
                 // phase_deps comes from LoadedTaskDefinition (5A);
                 // on_phase_* closures bridge to Python (5B).
                 //
@@ -589,6 +696,181 @@ impl PyLocalManager {
                 error_message: t.error_message.clone(),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "test-with-python")]
+mod tests {
+    //! Pre-run `handle()` factory contract tests for the in-process
+    //! local manager. Mirrors `PyDistributedManager::handle`'s shape
+    //! 1:1 — same single concern: can the Python caller fetch a
+    //! `PrimaryHandle` BEFORE `process_binaries` enters its detached
+    //! tokio runtime?
+    //!
+    //! Tests require an embedded CPython interpreter (gated behind
+    //! the `test-with-python` feature). Invoke as:
+    //!   `cargo test -p dynrunner-pyo3 --lib --no-default-features \
+    //!        --features test-with-python pylocal_manager`
+    //!
+    //! Scope: limited to (1) the factory call surface and (2) the
+    //! clone-equivalence of two `handle()` results. End-to-end
+    //! command dispatch is exercised by the
+    //! `primary_handle.rs::primary_handle_spawn_tasks_releases_gil`
+    //! test against a stub receiver; the channel wiring on this
+    //! manager carries the same `PyPrimaryHandle::from_sender`
+    //! constructor, so the same dispatch contract holds transitively.
+    use super::*;
+    use pyo3::types::{PyAnyMethods, PyModule};
+
+    /// Compile a tiny Python module that exports a `TaskDefinition`-
+    /// shaped stub + a default `task_args` Namespace. Same shape as
+    /// the distributed-manager test stub.
+    fn build_task_definition_module(py: Python<'_>) -> Bound<'_, PyModule> {
+        let source = r#"
+from types import SimpleNamespace
+
+def estimate_memory(item):
+    return 1024 * 1024
+
+_TYPE = SimpleNamespace(
+    type_id="t",
+    worker_module="stub_worker_module",
+    estimator_attr="estimate_memory",
+    timeout_seconds=None,
+    reserved_memory_per_worker=0,
+    max_concurrent=None,
+)
+
+_PHASE = SimpleNamespace(
+    phase_id="p",
+    depends_on=[],
+    types=(_TYPE,),
+)
+
+class _StubTask:
+    uses_file_based_items = False
+    estimate_memory = staticmethod(estimate_memory)
+    def get_phases(self):
+        return (_PHASE,)
+    def build_worker_command_args(self, type_id, args, source_dir, output_dir, skip_existing):
+        return []
+
+task = _StubTask()
+task_args = SimpleNamespace()
+"#;
+        PyModule::from_code(
+            py,
+            std::ffi::CString::new(source).unwrap().as_c_str(),
+            std::ffi::CString::new("stub_local_task_def.py").unwrap().as_c_str(),
+            std::ffi::CString::new("stub_local_task_def").unwrap().as_c_str(),
+        )
+        .expect("compile stub TaskDefinition module")
+    }
+
+    /// Construct a `PyLocalManager` with the minimum args required.
+    /// Output dir is a tempdir so the per-run log-dir creation
+    /// succeeds.
+    fn build_manager(py: Python<'_>) -> PyResult<Py<PyLocalManager>> {
+        let module = build_task_definition_module(py);
+        let task = module.getattr("task")?;
+        let task_args = module.getattr("task_args")?;
+        // tempdir: PyLocalManager::new creates log_dir under it.
+        let tmp = std::env::temp_dir().join(format!(
+            "rust_pylocal_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let source = tmp.join("src");
+        let output = tmp.join("out");
+        std::fs::create_dir_all(&source).expect("src");
+        std::fs::create_dir_all(&output).expect("out");
+        let mgr = PyLocalManager::new(
+            py,
+            /* num_workers */ 1,
+            /* max_memory */ 64 * 1024 * 1024,
+            /* source_dir */ source.to_string_lossy().into_owned(),
+            /* output_dir */ output.to_string_lossy().into_owned(),
+            &task,
+            &task_args,
+            /* skip_existing */ false,
+            /* always_restart_worker */ false,
+            /* restart_predicate */ None,
+            /* retry_max_attempts */ 1,
+            /* print_pid */ false,
+            /* connection_mode */ "socketpair",
+            /* socket_dir */ None,
+            /* manual_start_worker */ false,
+            /* log_paths */ None,
+            /* worker_spec */ None,
+            /* low_memory_threshold */ None,
+            /* scheduler_config */ None,
+            /* phase_status_log_intervals_secs */ None,
+            /* stage_timeouts_secs */ None,
+            /* max_resources */ None,
+            /* low_resource_thresholds */ None,
+            /* log_oom_watcher */ false,
+            /* log_dir */ None,
+            /* panik_watcher_paths */ None,
+            /* panik_watcher_poll_interval_secs */ 10.0,
+            /* memprofile_enabled */ false,
+        )?;
+        Py::new(py, mgr)
+    }
+
+    /// Factory test: `handle()` succeeds BEFORE `process_binaries`.
+    #[test]
+    fn handle_returns_pyprimaryhandle_before_process_binaries() {
+        Python::attach(|py| {
+            let mgr = build_manager(py).expect("manager constructs");
+            let handle_obj = mgr
+                .bind(py)
+                .call_method0("handle")
+                .expect("handle() must succeed before process_binaries");
+            // Downcast to prove the type contract.
+            let _handle: pyo3::PyRef<'_, PyPrimaryHandle> = handle_obj
+                .downcast::<PyPrimaryHandle>()
+                .expect("handle() must return a PrimaryHandle pyclass")
+                .borrow();
+        });
+    }
+
+    /// Two `handle()` calls return distinct `PrimaryHandle`
+    /// instances backed by the same underlying channel — proven via
+    /// `tokio::sync::mpsc::Sender::same_channel`. The factory must
+    /// not mint a fresh channel per call.
+    #[test]
+    fn handle_clones_share_same_command_channel() {
+        Python::attach(|py| {
+            let mgr = build_manager(py).expect("manager constructs");
+            let h1 = mgr
+                .bind(py)
+                .call_method0("handle")
+                .expect("first handle");
+            let h2 = mgr
+                .bind(py)
+                .call_method0("handle")
+                .expect("second handle");
+            let r1 = h1
+                .downcast::<PyPrimaryHandle>()
+                .unwrap();
+            let r2 = h2
+                .downcast::<PyPrimaryHandle>()
+                .unwrap();
+            let r1_sender = r1.borrow().sender.clone();
+            let r2_sender = r2.borrow().sender.clone();
+            assert!(
+                r1_sender.same_channel(&r2_sender),
+                "two handles minted from the same manager must clone the same Sender"
+            );
+            // And the manager's own command_tx must also be the same
+            // channel — pin the round trip via the pyclass field.
+            let mgr_ref = mgr.borrow(py);
+            assert!(
+                mgr_ref.command_tx.same_channel(&r1_sender),
+                "manager.command_tx must be the same channel as the minted handle"
+            );
+        });
     }
 }
 

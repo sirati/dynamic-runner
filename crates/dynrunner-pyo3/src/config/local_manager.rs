@@ -190,6 +190,17 @@ impl PyLocalManagerConfig {
                 self.memprofile_enabled,
                 self.output_dir.as_deref(),
             ),
+            // `PyLocalManagerConfig` does not currently expose the
+            // per-task reinject cap as a typed kwarg — operators
+            // setting the cap on the local backend use the
+            // `RustLocalManager` legacy class (which threads it
+            // through via the per-handle `ReinjectCapCell`) or the
+            // `PrimaryHandle::set_unfulfillable_reinject_max_per_task`
+            // setter directly. Default to `None` (unbounded) here
+            // so the typed-config callers get backward-compatible
+            // semantics; surfacing it on `PyLocalManagerConfig` is
+            // a follow-up.
+            unfulfillable_reinject_max_per_task: None,
         }
     }
 }
