@@ -74,7 +74,32 @@ where
         &mut self,
         tasks: Vec<TaskInfo<I>>,
     ) -> Result<Vec<(usize, SpawnError)>, String> {
-        let (valid_tasks, errors) = validate_spawn_tasks(&self.cluster_state, tasks);
+        // Closure-based shared validator: same shape the primary's
+        // `apply_spawn_tasks` uses, same `cluster_state` probe — the
+        // helper itself lives in `dynrunner-core` so the local-manager
+        // command-channel handler can call it too without a manager →
+        // manager dependency edge. The two closures expose the
+        // `task_state(hash)` / `tasks_iter()` reads the validator
+        // needs; the rule set (duplicate-hash, unknown-dep) stays
+        // single-source in the core helper.
+        let (valid_tasks, errors) = validate_spawn_tasks(
+            |hash| self.cluster_state.task_state(hash).is_some(),
+            |task_id| {
+                self.cluster_state.tasks_iter().any(|(_, s)| {
+                    let task = match s {
+                        crate::cluster_state::TaskState::Pending { task }
+                        | crate::cluster_state::TaskState::InFlight { task, .. }
+                        | crate::cluster_state::TaskState::Completed { task }
+                        | crate::cluster_state::TaskState::Failed { task, .. }
+                        | crate::cluster_state::TaskState::Unfulfillable { task, .. }
+                        | crate::cluster_state::TaskState::Blocked { task, .. }
+                        | crate::cluster_state::TaskState::Cancelled { task, .. } => task,
+                    };
+                    task.task_id == task_id
+                })
+            },
+            tasks,
+        );
 
         if valid_tasks.is_empty() {
             // No mutation to broadcast; the per-index errors are the

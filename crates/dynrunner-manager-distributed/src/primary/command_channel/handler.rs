@@ -355,11 +355,30 @@ where
     ) -> Result<Vec<(usize, SpawnError)>, String> {
         // Shared validator: pure read against `cluster_state` —
         // mirrored on the promoted-secondary path
-        // (`SecondaryCoordinator::apply_spawn_tasks`) so the
-        // duplicate-hash + unknown-dep rules can't drift between the
-        // two apply sites. See `validate_spawn_tasks` for the
-        // single-writer contract.
-        let (valid_tasks, errors) = validate_spawn_tasks(&self.cluster_state, tasks);
+        // (`SecondaryCoordinator::apply_spawn_tasks`) AND on the local
+        // manager's command-channel handler so the duplicate-hash +
+        // unknown-dep rules can't drift between the three apply sites.
+        // The closure-based signature lets the shared helper live in
+        // `dynrunner-core` (no `ClusterState` dependency); each backend
+        // supplies two closures that probe its own ledger shape.
+        let (valid_tasks, errors) = validate_spawn_tasks(
+            |hash| self.cluster_state.task_state(hash).is_some(),
+            |task_id| {
+                self.cluster_state.tasks_iter().any(|(_, s)| {
+                    let task = match s {
+                        crate::cluster_state::TaskState::Pending { task }
+                        | crate::cluster_state::TaskState::InFlight { task, .. }
+                        | crate::cluster_state::TaskState::Completed { task }
+                        | crate::cluster_state::TaskState::Failed { task, .. }
+                        | crate::cluster_state::TaskState::Unfulfillable { task, .. }
+                        | crate::cluster_state::TaskState::Blocked { task, .. }
+                        | crate::cluster_state::TaskState::Cancelled { task, .. } => task,
+                    };
+                    task.task_id == task_id
+                })
+            },
+            tasks,
+        );
 
         if valid_tasks.is_empty() {
             // No mutation to broadcast; the per-index errors are the

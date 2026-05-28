@@ -16,6 +16,12 @@ serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# `tokio::sync::oneshot::Sender<_>` lives inside the `PrimaryCommand`
+# enum variants — every command carries a reply oneshot back to the
+# `PyPrimaryHandle` caller. `features = ["sync"]` keeps the dependency
+# narrow (no runtime, no I/O); the heavy tokio features still live on
+# the consuming crates that actually drive the runtime.
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true
