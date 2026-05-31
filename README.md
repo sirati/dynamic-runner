@@ -1,40 +1,35 @@
 # dynamic_runner
 
-A multi-process / multi-host Python task runner with a Rust backend. The
-user supplies a `TaskDefinition` (a duck-typed Protocol describing the
-work, worker subprocess, and resource estimates); the runner schedules
-the work across local processes or a pool of remote secondaries, with
+A multi-process / multi-host Python task runner with a Rust backend. You
+supply a `TaskDefinition` (a duck-typed Protocol describing the work,
+worker subprocess, and resource estimates); the runner schedules it
+across local processes or a pool of remote secondaries, with
 memory-aware admission control, retry/failure handling, and pluggable
 transports (QUIC, Unix sockets, in-process channels). The Python frontend
 in `python/dynamic_runner/` is intentionally thin — argparse, logging,
-binary discovery, and dispatch — and delegates execution to a native
-extension compiled from a 14-crate Rust workspace.
+config, binary discovery, dispatch — and delegates all runtime,
+lifecycle, and scheduling to a native extension compiled from a Rust
+workspace.
 
 ## Status
 
 Pre-1.0; API may change. License: Apache-2.0.
 
-## Quickstart (FHS)
-
-`dynamic_runner` is not yet published to PyPI. Until v0.1.0 ships:
+## Install
 
 ```bash
-pip install git+https://github.com/sirati/dynamic-runner@v0.1.0
+pip install dynamic-runner          # once published to PyPI
+pip install git+https://github.com/sirati/dynamic-runner@v0.4.0   # from a tag
 ```
 
-The wheel is built with maturin in mixed layout, so the import name is
+The wheel is built with maturin in mixed layout: the import name is
 `dynamic_runner` and the native extension lives at
 `dynamic_runner._native`.
 
-Once v0.1.0 is on PyPI:
+### Nix
 
-```bash
-pip install dynamic-runner
-```
-
-## Quickstart (Nix)
-
-Add the flake as an input and apply its overlay:
+Add the flake as an input and apply its overlay; this exposes
+`pkgs.python3Packages.dynamic-runner`:
 
 ```nix
 {
@@ -47,7 +42,6 @@ Add the flake as an input and apply its overlay:
       overlays = [ dynamic-runner.overlays.default ];
     };
   in {
-    # `pkgs.python3Packages.dynamic-runner` is now available.
     devShells.x86_64-linux.default = pkgs.mkShell {
       packages = [ (pkgs.python3.withPackages (ps: [ ps.dynamic-runner ])) ];
     };
@@ -58,11 +52,10 @@ Add the flake as an input and apply its overlay:
 ## Minimal task example
 
 A task is any object whose attributes match the `TaskDefinition`
-protocol. No subclassing is required. Topology is declared as
-**phases** of **task types**; each item carries its `phase_id`,
-`type_id`, and (optionally) an `affinity_id` for soft worker
-pinning. See [`docs/PHASES.md`](docs/PHASES.md) for the full
-migration guide and a deeper walk-through of the model.
+protocol — no subclassing. Topology is declared as **phases** of
+**task types**; each discovered item carries its `phase_id`, `type_id`,
+and (optionally) an `affinity_id` for soft worker pinning. See
+[`docs/PHASES.md`](docs/PHASES.md) for the full model.
 
 ```python
 from argparse import ArgumentParser, Namespace
@@ -133,68 +126,81 @@ if __name__ == "__main__":
     dynamic_runner.run(MyTask(), description="My analysis task")
 ```
 
+Run it with `--source`/`--output` for the I/O directories and `--cores`
+to size the local worker pool (`0` = all detected cores):
+
+```bash
+python -m my_task --source ./in --output ./out --cores 8
+```
+
+Plain local mode (no `--multi-computer`) runs everything in-process.
+The four `--multi-computer` modes (`slurm`, `local`, `single-process`,
+`remote-podman`) enable distributed dispatch; the SLURM modes also take
+a `--gateway`, `--packaging`, `--slurm-root-folder`, and `--jobs`
+(number of secondary nodes to spawn).
+
 ## Architecture
 
-- **Pure-Python frontend** in `python/dynamic_runner/` — CLI parsing,
-  logging, binary discovery, secondary spawning, and dispatch into the
-  native runtime via `run()`.
-- **Native runtime** in `dynamic_runner._native` — a cdylib built from
-  `crates/dynrunner-pyo3` that re-exports manager classes, config
-  dataclasses, and the `run_local` / `run_distributed` /
-  `run_primary` / `run_secondary` entry points.
-- **14 internal Rust crates** under `crates/dynrunner-*`. The most
-  relevant: `dynrunner-core` (traits), `dynrunner-scheduler`,
+- **Python frontend** (`python/dynamic_runner/`) — CLI parsing, logging,
+  binary discovery, secondary spawning, and dispatch into the native
+  runtime via `run()`.
+- **Native runtime** (`dynamic_runner._native`) — extension module built
+  from `crates/dynrunner-pyo3`, re-exporting manager classes, config
+  dataclasses, and the `run_local` / `run_distributed` / `run_primary` /
+  `run_secondary` / `run_observer_late_joiner` entry points.
+- **18 internal Rust crates** under `crates/dynrunner-*`. Notable ones:
+  `dynrunner-core` (traits), `dynrunner-scheduler`(`-api`),
   `dynrunner-manager-local`, `dynrunner-manager-distributed`,
-  `dynrunner-transport-quic` / `-socket` / `-channel`,
-  `dynrunner-slurm`, `dynrunner-gateway`. See [`crates/`](crates/) for
-  the full set.
+  `dynrunner-transport-quic` / `-socket` / `-channel` / `-tunnel`,
+  `dynrunner-worker`, `dynrunner-gateway`, `dynrunner-driver`,
+  `dynrunner-discovery`, `dynrunner-slurm`, `dynrunner-publish`, and the
+  two protocol crates. See [`crates/`](crates/) for the full set.
 
 ## Per-task memory profiling (`--memprofile`)
 
-Opt-in 1Hz per-task memory profiler. Each worker writes one zstd-framed
-JSONL file per task it processes, capturing the worker's cgroup-v2
-`memory.current`, `memory.swap.current`, and full `memory.stat` once per
-second. Frame-per-sample makes the file `zstd -dc`-recoverable after a
-hard manager death (the last in-flight sample is the most the consumer
-can lose).
+Opt-in 1 Hz per-task memory profiler. Each worker writes one
+zstd-framed JSONL file per task it processes, capturing the worker's
+cgroup-v2 `memory.current`, `memory.swap.current`, and full
+`memory.stat` once per second. Frame-per-sample keeps the file
+`zstd -dc`-recoverable after a hard manager death (the last in-flight
+sample is the most a consumer can lose).
 
 ```bash
-python -m <your-task> --multi-computer local --memprofile \
-    --output-dir /tmp/run-out --jobs 12
+python -m my_task --multi-computer local --memprofile \
+    --output /tmp/run-out --cores 12
 ```
 
-Output lands at `{--output-dir}/memprofile/{task_id}.worker-{N}.memprofile.jsonl.zst`.
+Output lands at
+`{--output}/memprofile/{task_id}.worker-{N}.memprofile.jsonl.zst`.
 `task_id` is treated as a relative path, so a slash-bearing identifier
 like `nping/x86/clang/9/Os` becomes
 `memprofile/nping/x86/clang/9/Os.worker-3.memprofile.jsonl.zst` (the
 writer `mkdir -p`s the parents).
 
-**SLURM mode:** the same flag works on the SLURM secondary. The
-secondary's container has `/app/out-network` bind-mounted to the
-gateway-shared output filesystem; when `--memprofile` is set the
-secondary writes there by default. Post-run, profiles land alongside
-the rest of the run's artifacts on the dispatcher's gateway output
-directory. Operator checklist after a `--memprofile` SLURM run:
+**SLURM mode:** the same flag works on the SLURM secondary, whose
+container has `/app/out-network` bind-mounted to the gateway-shared
+output filesystem; the secondary writes there by default so profiles
+survive job teardown and land alongside the run's other artifacts.
+Operator checklist after a `--memprofile` SLURM run:
 
-- `ls {gateway.output_path}/memprofile/` should list one
-  `.jsonl.zst` per completed task.
+- `ls {gateway.output_path}/memprofile/` should list one `.jsonl.zst`
+  per completed task.
 - `zstd -dc {gateway.output_path}/memprofile/<task>.worker-0.memprofile.jsonl.zst | head -1 | jq`
   to spot-check a sample.
 - If the directory is empty, check the secondary's logs for
-  `--memprofile set but /app/out-network is not present` (operator
-  ran the secondary outside the wrapper) or a cgroup-v2 fallback warn
-  (`cgroup-v2 leaf not found` etc.) — both downgrade to a no-op with
-  a single warn line.
+  `--memprofile set but /app/out-network is not present` (ran outside
+  the wrapper) or a cgroup-v2 fallback warn (`cgroup-v2 leaf not found`
+  etc.) — both downgrade to a no-op with a single warn line.
 
 **Requires** delegated cgroup-v2 on the host (rootless podman with
-`--cgroup-manager=cgroupfs`, or `systemd-run --user` with `Delegate=yes`).
-Without delegation the sampler exists but produces no files; one warn
-line surfaces the reason at startup.
+`--cgroup-manager=cgroupfs`, or `systemd-run --user` with
+`Delegate=yes`). Without delegation the sampler produces no files and
+surfaces one warn line at startup.
 
 ## Development
 
-The development environment is provided by the flake — there is no
-`requirements.txt` or venv.
+The dev environment is provided by the flake — no `requirements.txt` or
+venv. Requires Python ≥ 3.12.
 
 ```bash
 nix develop
@@ -205,9 +211,11 @@ pytest
 
 ## Releases
 
-Tagging `vX.Y.Z` triggers `wheels.yml`, which builds wheels for the
-supported targets and publishes them to PyPI via trusted publishing
-(configured separately on PyPI; no token lives in the repo).
+Pushing a `v*` tag triggers `wheels.yml`, which builds wheels for the
+supported targets and uploads them as workflow artifacts. Publishing a
+GitHub Release against that tag triggers `publish.yml`, which fetches
+those wheels and uploads them to PyPI via Trusted Publishing (OIDC; no
+token lives in the repo).
 
 ## License
 

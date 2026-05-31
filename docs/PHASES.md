@@ -63,7 +63,13 @@ class TaskTypeSpec:
     estimator_attr: str = "estimate_memory"
     timeout_seconds: float | None = None
     reserved_memory_per_worker: int = 0
+    max_concurrent: int | None = None
 ```
+
+`max_concurrent` is an optional global cap on how many items of this
+type run concurrently across all workers (`None` = unconstrained). Use
+it to throttle a compile-heavy type (e.g. `cores // 4`) while cheaper
+IO-bound types run at the full `--jobs` width.
 
 `worker_module` names the Python module the framework runs as a
 subprocess for items of this type (`python -m <worker_module> ...`).
@@ -111,8 +117,9 @@ def discover_items(
 ```
 
 Yields the items for the run. Each item is a `TaskInfo`
-(`python/dynamic_runner/_shared/binary_info.py`) and must carry its
-`phase_id`, `type_id`, and (optionally) `affinity_id` fields populated.
+(`python/dynamic_runner/_shared/task_info.py`) and must carry its
+`phase_id`, `type_id`, `task_id`, and (optionally) `affinity_id` and
+`task_depends_on` fields populated.
 The discovery method is responsible for both finding the items and
 classifying them — the framework does no automatic bucketing.
 
@@ -152,7 +159,11 @@ output paths can be type-specific.
 
 ```python
 def on_run_start(
-    self, source_dir: Path, output_dir: Path, args: Namespace
+    self,
+    source_dir: Path,
+    output_dir: Path,
+    args: Namespace,
+    primary_handle: Optional["PrimaryHandle"] = None,
 ) -> None: ...
 
 def on_run_end(self, success: bool) -> None: ...
@@ -169,6 +180,16 @@ peer caches, warm long-lived connections, persist a final manifest,
 and so on. `on_phase_start` / `on_phase_end` are the per-phase
 boundaries; the consumer can compact intermediate output, snapshot
 invariants, or kick off cross-phase compaction work between phases.
+
+`primary_handle` is the in-flight runtime control surface for the
+primary coordinator (minted off `RustPrimaryCoordinator.handle()`). It
+is the live `PrimaryHandle` on primary-side dispatchers — so the task
+can drive `primary_handle.spawn_tasks(...)` from inside `on_run_start`
+— and `None` on secondaries, which own no coordinator. The framework
+passes it as the `primary_handle=` kwarg on every primary-side
+dispatcher; a legacy `on_run_start` that omits the parameter keeps
+working via a positional-only fallback in the PyO3 bridge
+(`crates/dynrunner-pyo3/src/managers/lifecycle.rs`).
 
 ## Migration: from old Protocol to new Protocol
 
@@ -199,25 +220,16 @@ invariants, or kick off cross-phase compaction work between phases.
 ### Lifecycle hooks (new)
 
 The old code paths used ad-hoc `setup_*` / `teardown` patterns that
-varied between consumers. The new Protocol provides four named hooks:
-
-- `on_run_start(source_dir, output_dir, args)` — once, before any
-  phase becomes active.
-- `on_run_end(success)` — once, after the last phase has drained.
-- `on_phase_start(phase_id)` — once per phase, when that phase
-  becomes active.
-- `on_phase_end(phase_id, completed, failed)` — once per phase, after
-  it has drained. The framework supplies the per-phase completion
-  counts.
-
-Use `on_run_start` / `on_run_end` for resources that span the whole
-run (peer-cache services, output writers, log handles). Use
-`on_phase_start` / `on_phase_end` for per-phase setup and teardown
-(intermediate output directories, cross-phase compaction).
+varied between consumers. The new Protocol replaces them with the four
+named hooks documented under [Lifecycle hooks](#lifecycle-hooks): use
+`on_run_start` / `on_run_end` for run-spanning resources (peer-cache
+services, output writers, log handles) and `on_phase_start` /
+`on_phase_end` for per-phase setup and teardown (intermediate output
+directories, cross-phase compaction).
 
 ### `BinaryInfo` → `TaskInfo`
 
-The data type was renamed and gained four scheduling-metadata fields:
+The data type was renamed and gained scheduling-metadata fields:
 
 ```python
 @dataclass
@@ -229,7 +241,26 @@ class TaskInfo:
     type_id: str = ""
     affinity_id: str | None = None
     payload: dict = field(default_factory=dict)
+    task_id: str = ""
+    task_depends_on: tuple["TaskDep | str", ...] = field(default_factory=tuple)
 ```
+
+`task_id` is a stable, consumer-supplied identifier. It is required —
+the empty-string default exists only to keep positional construction
+source-compatible; the Python→Rust extractor rejects empty/`None` ids
+with a loud `ValueError`. It is used by per-task dependency wiring, the
+memprofile sampler's file naming, the retry tracker, and the failure
+reporter.
+
+`task_depends_on` lists prerequisite `task_id`s that must terminate
+(success or permanent failure) before this task dispatches — a
+per-task ordering constraint independent of the phase barrier (e.g. a
+variant build depending on its toolchain build, both in one phase, so
+variants dispatch continuously as toolchains drain). Entries are bare
+`str` ids (legacy, equals `TaskDep(id, inherit_outputs=False)`) or
+`TaskDep` instances; `inherit_outputs=True` opts the dependent into
+reading its predecessors' transitive ancestors' published outputs.
+Unknown ids and cycles fail loud at run start.
 
 `BinaryIdentifier` (the inner identifier shape) is unchanged:
 
@@ -243,12 +274,11 @@ class BinaryIdentifier:
     opt_level: str
 ```
 
-The Python module path is preserved at
-`dynamic_runner._shared.binary_info`. The class export is
-`TaskInfo`. Convenience properties (`binary_name`, `platform`,
-`compiler`, `version`, `opt_level`) on `TaskInfo` still proxy through
-to the inner `identifier` for callers that don't unpack the
-identifier directly.
+`TaskInfo` is exported from `dynamic_runner._shared` (defined in
+`dynamic_runner._shared.task_info`). Convenience properties
+(`binary_name`, `platform`, `compiler`, `version`, `opt_level`) on
+`TaskInfo` proxy through to the inner `identifier` for callers that
+don't unpack the identifier directly.
 
 The `payload` field is opaque to the framework — consumers can stash
 JSON-serializable per-item metadata there for the worker to pick up.
@@ -296,6 +326,7 @@ class TokenizerTask:
                 identifier=self._parse(path),
                 phase_id="tokenize",
                 type_id="tokenize",
+                task_id=str(path),
             )
 
     def estimate_memory(self, item):
@@ -388,6 +419,7 @@ class CompilerSuitRunner:
                 phase_id="build_toolchain",
                 type_id="build_toolchain",
                 affinity_id=toolchain_class,
+                task_id=toolchain_class,
             )
             yield TaskInfo(
                 path=variant.source_path,
@@ -396,6 +428,8 @@ class CompilerSuitRunner:
                 phase_id="build_variant",
                 type_id="build_variant",
                 affinity_id=toolchain_class,
+                task_id=variant.variant_id,
+                task_depends_on=(toolchain_class,),
             )
 ```
 
@@ -488,10 +522,9 @@ A downstream consumer with an existing `TaskDefinition` should:
    `organize_and_sort_items` logic — the items the method yields
    are dispatched in yield order (modulo affinity pinning).
 5. Update every `BinaryInfo(...)` constructor call to `TaskInfo(...)`
-   and populate the new `phase_id`, `type_id`, and (optionally)
-   `affinity_id` fields. The class is exported from
-   `dynamic_runner._shared` (and from the same module path it had
-   before).
+   (exported from `dynamic_runner._shared`) and populate the required
+   `task_id`, the `phase_id` / `type_id` tags, and (optionally)
+   `affinity_id` / `task_depends_on`.
 6. Update `estimate_memory` to take `item: TaskInfo` instead of
    `binary_size: int`. Use `item.size` if no other field is needed.
 7. Update `build_worker_command_args` to accept the leading
