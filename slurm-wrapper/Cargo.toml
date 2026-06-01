@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["config", "wrapper"]
+
+# Standalone workspace, intentionally NOT part of the repo-root Cargo
+# workspace (root `Cargo.toml` lists `slurm-wrapper` under `exclude`).
+# The wrapper binary is musl-static infrastructure built with its own
+# `Cargo.lock` via `nix/wrapper-bin.nix` (`src = ../slurm-wrapper`), so
+# it does not rebuild whenever a framework crate changes. The `config`
+# member is ALSO consumed by the root workspace's `dynrunner-slurm`
+# crate as a path dependency (`../slurm-wrapper/config`) so the on-wire
+# `WrapperConfig` JSON schema has a single source-of-truth type shared
+# by the renderer (generate.rs) and the binary that consumes it.
+
+[workspace.package]
+version    = "0.1.0"
+edition    = "2021"
+license    = "Apache-2.0"
+authors    = ["sirati"]
+repository = "https://github.com/sirati/dynamic-runner"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dynrunner-slurm-wrapper-config = { path = "config" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+strip = true
+codegen-units = 1
+overflow-checks = false
+debug = false
+incremental = false
+
+[profile.release.package."*"]
+opt-level = "z"

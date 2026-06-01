@@ -1,0 +1,23 @@
+[package]
+name = "dynrunner-slurm-wrapper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Musl-static SLURM secondary wrapper: sets up scratch dirs + podman storage, runs the secondary container, logs signal provenance via signalfd, and tears down."
+
+[[bin]]
+name = "dynrunner-slurm-wrapper"
+path = "src/main.rs"
+
+[dependencies]
+dynrunner-slurm-wrapper-config = { workspace = true, features = ["cli"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "time", "sync", "fs"] }
+nix = { version = "0.29", features = ["signal", "process", "fs", "hostname", "user"] }
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"

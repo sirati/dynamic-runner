@@ -12,6 +12,28 @@ use crate::config::SlurmConfig;
 /// Configuration for generating a SLURM wrapper script.
 pub struct WrapperScriptConfig<'a> {
     pub slurm_config: &'a SlurmConfig,
+    /// Consumer-supplied short identifier for their program/deployment
+    /// (e.g. `"asm"`). Prefixes BOTH the scratch dir
+    /// `/tmp/<name_prefix>-<suffix>` and the container name
+    /// `<name_prefix>-<suffix>-<secondary_id>`, replacing the legacy
+    /// hardcoded `asm` literal — dynrunner is a framework and must not
+    /// bake in any one consumer's program name. The renderer threads
+    /// this verbatim into both the legacy bash path (the `/tmp/...` and
+    /// container-name literals) and, when `wrapper_bin_path` is `Some`,
+    /// the binary's [`WrapperConfig::name_prefix`]. There is NO default:
+    /// the caller (Python dispatch) must source it from the consumer's
+    /// deployment spec.
+    pub name_prefix: &'a str,
+    /// When `Some`, the renderer emits a TINY stub wrapper script that
+    /// `exec`s this compute-node binary path with the
+    /// [`WrapperConfig::to_args`] vector (each element bash-quoted)
+    /// instead of the legacy inline bash heredoc — the Rust musl
+    /// wrapper binary then performs the full secondary lifecycle the
+    /// bash used to. When `None`, the renderer emits the legacy bash
+    /// body unchanged (modulo the `name_prefix` substitution above).
+    /// The `#SBATCH`/entrypoint mechanics are identical in both cases;
+    /// only the script body differs.
+    pub wrapper_bin_path: Option<&'a Path>,
     /// Absolute (already tilde-expanded) path to the docker-archive
     /// tar on the gateway.
     pub image_path: &'a str,

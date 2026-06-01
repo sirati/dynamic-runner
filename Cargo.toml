@@ -4,7 +4,7 @@ resolver = "2"
 # and flake — it is intentionally NOT part of this workspace so the
 # stable musl-static teardown binary does not get rebuilt every time a
 # framework crate changes.
-exclude = ["shutdown-manager"]
+exclude = ["shutdown-manager", "slurm-wrapper"]
 members = [
     "crates/dynrunner-core",
     "crates/dynrunner-protocol-manager-worker",
@@ -78,6 +78,13 @@ dynrunner-discovery = { path = "crates/dynrunner-discovery" }
 dynrunner-slurm = { path = "crates/dynrunner-slurm" }
 dynrunner-pyo3 = { path = "crates/dynrunner-pyo3" }
 dynrunner-publish = { path = "crates/dynrunner-publish" }
+# Wrapper-binary config schema. Lives in the excluded `slurm-wrapper`
+# workspace (built into the musl binary), referenced here by explicit
+# path so `dynrunner-slurm`'s renderer can construct a `WrapperConfig`
+# and emit it via `to_args()`. `default-features = false` keeps the
+# `cli`/clap feature out of the framework build — only `to_args()` is
+# needed on the renderer side.
+dynrunner-slurm-wrapper-config = { path = "slurm-wrapper/config", default-features = false }
 
 [workspace.lints.clippy]
 # Catch std::sync::MutexGuard / RefCell::borrow held across `.await`. These
