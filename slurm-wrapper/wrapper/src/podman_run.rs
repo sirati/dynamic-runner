@@ -189,6 +189,7 @@ mod tests {
     /// Maximal config: every optional present, non-empty lists.
     fn maximal_cfg(connection: ConnectionMode) -> WrapperConfig {
         WrapperConfig {
+            name_prefix: "asm".to_string(),
             rand_suffix: "2f1d4e89".to_string(),
             secondary_id: "sec-0".to_string(),
             image_path: "/home/u/staged/asm-tokenizer.tar".to_string(),

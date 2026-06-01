@@ -28,10 +28,20 @@ use std::path::PathBuf;
 /// replaces so the port stays auditable against the bash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrapperConfig {
+    /// Consumer-supplied short identifier for their program/deployment
+    /// (the consumer passes e.g. `"asm"`). Prefixes BOTH the scratch dir
+    /// `/tmp/<name_prefix>-<suffix>` and the container name
+    /// `<name_prefix>-<suffix>-<secondary_id>`, replacing the legacy
+    /// hardcoded `asm` literal — dynrunner is a framework and must not bake
+    /// in any one consumer's program name. The framework provides NO
+    /// default: the renderer (`dynrunner-slurm` `generate.rs`) must source
+    /// this from the consumer's deployment spec.
+    pub name_prefix: String,
+
     /// Random hex-8 suffix, fixed at render time by the generator
     /// (`generate.rs:34` `rand_hex8()`). Drives the scratch-dir prefix
-    /// `/tmp/asm-<suffix>` (`:35`), the container name
-    /// `asm-<suffix>-<secondary_id>` (`:36`), and the shutdown-manager
+    /// `/tmp/<name_prefix>-<suffix>`, the container name
+    /// `<name_prefix>-<suffix>-<secondary_id>`, and the shutdown-manager
     /// unit name `dynrunner-shutdown-<suffix>` (`:225`). Kept render-time
     /// (not regenerated in the binary) so the suffix is stable across a
     /// re-exec of the same job script, matching legacy behaviour.
@@ -140,6 +150,7 @@ mod tests {
 
     fn sample(connection: ConnectionMode) -> WrapperConfig {
         WrapperConfig {
+            name_prefix: "asm".to_string(),
             rand_suffix: "2f1d4e89".to_string(),
             secondary_id: "sec-0".to_string(),
             image_path: "/home/u/staged/asm-tokenizer.tar".to_string(),
