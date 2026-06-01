@@ -10,6 +10,8 @@ fn reverse_mode_script_contains_tunnel_port() {
     let extra: [String; 0] = [];
     let cfg = WrapperScriptConfig {
         slurm_config: &config,
+        name_prefix: "asm",
+        wrapper_bin_path: None,
         image_path: "/images/test.tar",
         secondary_id: "sec-02",
         image_name: "test-app",
@@ -66,6 +68,8 @@ fn reverse_mode_script_renders_is_observer_true() {
     let extra: [String; 0] = [];
     let cfg = WrapperScriptConfig {
         slurm_config: &config,
+        name_prefix: "asm",
+        wrapper_bin_path: None,
         image_path: "/images/test.tar",
         secondary_id: "obs-01",
         image_name: "test-app",
