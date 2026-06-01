@@ -12,9 +12,7 @@ name = "dynrunner-slurm-wrapper"
 path = "src/main.rs"
 
 [dependencies]
-dynrunner-slurm-wrapper-config = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+dynrunner-slurm-wrapper-config = { workspace = true, features = ["cli"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "net", "io-util", "time", "sync", "fs"] }
 nix = { version = "0.29", features = ["signal", "process", "fs", "hostname", "user"] }
 libc = "0.2"
