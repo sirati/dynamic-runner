@@ -57,6 +57,7 @@ fn build_slurm_config(root_folder: &str) -> SlurmConfig {
     output_dir,
     cores_spec,
     max_memory_spec,
+    name_prefix,
     forwarded_argv = Vec::new(),
     run_log_dir = None,
     dynrunner_network_dir = None,
@@ -67,6 +68,7 @@ fn build_slurm_config(root_folder: &str) -> SlurmConfig {
     connection_info_dir = None,
     is_observer = false,
     shutdown_manager_bin_path = None,
+    wrapper_bin_path = None,
     mem_manager_reserved_bytes = None,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -83,6 +85,7 @@ pub fn generate_wrapper_script(
     output_dir: &str,
     cores_spec: &str,
     max_memory_spec: &str,
+    name_prefix: &str,
     forwarded_argv: Vec<String>,
     run_log_dir: Option<&str>,
     dynrunner_network_dir: Option<&str>,
@@ -93,6 +96,7 @@ pub fn generate_wrapper_script(
     connection_info_dir: Option<&str>,
     is_observer: bool,
     shutdown_manager_bin_path: Option<&str>,
+    wrapper_bin_path: Option<&str>,
     mem_manager_reserved_bytes: Option<u64>,
 ) -> PyResult<String> {
     let slurm_config = build_slurm_config(root_folder);
@@ -137,8 +141,17 @@ pub fn generate_wrapper_script(
     // path.
     let shutdown_manager_bin_path = shutdown_manager_bin_path.map(Path::new);
 
+    // When the Python preparation step plumbs the uploaded wrapper
+    // binary's gateway-side path, the renderer emits the tiny
+    // `exec <bin> <args>` stub instead of the legacy inline bash.
+    // `None` keeps the legacy body (renderer-internal unit tests +
+    // back-compat callers that don't exercise the SLURM dispatch path).
+    let wrapper_bin_path = wrapper_bin_path.map(Path::new);
+
     let cfg = WrapperScriptConfig {
         slurm_config: &slurm_config,
+        name_prefix,
+        wrapper_bin_path,
         image_path,
         secondary_id,
         image_name,
