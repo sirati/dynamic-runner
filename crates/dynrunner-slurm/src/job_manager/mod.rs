@@ -19,6 +19,10 @@
 //!   gateway alongside the per-job wrapper scripts so out-of-cgroup
 //!   orphan-container cleanup survives `/nix/store` not being shared
 //!   between dispatcher and compute node).
+//! - [`wrapper_binary`] — staging primitive for the
+//!   `dynrunner-slurm-wrapper` musl-static binary (uploaded the same
+//!   way so the per-job wrapper-script stub can `exec` it to run the
+//!   full secondary lifecycle in place of the legacy inline bash).
 //! - [`tests`] — module-internal tests.
 
 mod images;
@@ -28,6 +32,8 @@ mod shutdown_binary;
 #[cfg(test)]
 mod tests;
 mod types;
+mod wrapper_binary;
 
 pub use shutdown_binary::SHUTDOWN_BIN_REMOTE_BASENAME;
 pub use types::{JobStatus, JobStatusInfo, SlurmError, SlurmJobManager};
+pub use wrapper_binary::WRAPPER_BIN_REMOTE_BASENAME;
