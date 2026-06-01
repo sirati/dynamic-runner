@@ -6,7 +6,8 @@
 //! # Public API (for Phase 2 integration)
 //!
 //! ```ignore
-//! let mut monitor = signals::install()?;   // call BEFORE spawning any child
+//! signals::block_signals()?;               // SYNC, in fn main() BEFORE the runtime
+//! let mut monitor = signals::start_monitor()?; // async, AFTER the runtime exists
 //! // ... spawn child, run relay ...
 //! let term = monitor.recv_terminating().await; // resolves on first SIGTERM/INT/HUP/QUIT
 //! // term: TerminatingSignal { signo, signame, sender_pid, sender_uid, si_code, comm, cmdline }
@@ -21,7 +22,7 @@
 //! - [`start_monitor`] (async; call AFTER the runtime exists and AFTER
 //!   `block_signals`) creates the signalfd over the already-blocked set and
 //!   spawns the provenance-logging task.
-//! - [`child_mask_reset`] is the single owner of the child signal-mask
+//! - [`child_pre_exec`] is the single owner of the child signal-mask
 //!   reset (`SIG_SETMASK` to empty via `pre_exec`). Children inherit the
 //!   blocked mask across fork+exec; every child that must receive normal
 //!   signal disposition (shutdown manager, podman/conmon + container PID 1,
@@ -73,7 +74,13 @@ pub struct TerminatingSignal {
 /// Owns the signalfd monitor task and the channel that delivers the first
 /// terminating-signal provenance to `main`.
 pub struct SignalMonitor {
-    handle: tokio::task::JoinHandle<()>,
+    /// Held to keep the monitor task owned for the process lifetime. It is
+    /// deliberately never aborted/joined: the task is a `spawn_blocking` loop
+    /// parked in a blocking `read_signal()` syscall with no cancellation
+    /// point, so `JoinHandle::abort()` is a no-op against it and a join would
+    /// wedge forever. The runtime is detached via `shutdown_background()` at
+    /// exit and the parked thread dies with the process.
+    _handle: tokio::task::JoinHandle<()>,
     term_rx: mpsc::Receiver<TerminatingSignal>,
 }
 
@@ -95,13 +102,6 @@ impl SignalMonitor {
         })
     }
 
-    /// Abort the monitor task. Intended for shutdown after teardown is
-    /// complete; the blocked-signal mask itself is not restored (the
-    /// process is exiting).
-    pub fn shutdown(&self) {
-        self.handle.abort();
-    }
-
     /// Test-only constructor: a monitor backed by a caller-fed channel with
     /// NO signalfd thread. Lets the lifecycle's select!/teardown routing be
     /// tested deterministically by injecting a synthetic `TerminatingSignal`,
@@ -120,7 +120,7 @@ impl SignalMonitor {
         });
         (
             SignalMonitor {
-                handle,
+                _handle: handle,
                 term_rx: rx,
             },
             tx,
@@ -198,7 +198,10 @@ pub fn start_monitor() -> std::io::Result<SignalMonitor> {
         monitor_loop(sfd, term_tx, Path::new("/proc"));
     });
 
-    Ok(SignalMonitor { handle, term_rx })
+    Ok(SignalMonitor {
+        _handle: handle,
+        term_rx,
+    })
 }
 
 /// Single owner of the child signal-mask reset. Children inherit the

@@ -112,7 +112,19 @@ fn main() -> ExitCode {
         }
     };
 
-    runtime.block_on(run(cfg))
+    let code = runtime.block_on(run(cfg));
+
+    // The signal-provenance monitor is a `spawn_blocking` loop parked in the
+    // blocking `SignalFd::read_signal()` syscall, which has NO cancellation
+    // point: `JoinHandle::abort()` cannot interrupt an in-flight blocking
+    // closure (see signals.rs). Dropping a multi-thread runtime JOINS its
+    // outstanding blocking-pool threads, so a plain `drop(runtime)` here would
+    // wedge FOREVER and the container exit code would never reach SLURM.
+    // `shutdown_background()` detaches the runtime without joining the blocking
+    // pool — the parked thread dies at process exit. This mirrors bash's
+    // `exit $CONTAINER_EXIT_CODE`: return the container's code immediately.
+    runtime.shutdown_background();
+    code
 }
 
 /// Run the secondary lifecycle, composing the single-concern modules in the
@@ -201,8 +213,13 @@ async fn run(cfg: WrapperConfig) -> ExitCode {
     };
 
     // --- 11. teardown ALWAYS, then exit with the container's code ---
+    // NB: the signal monitor is NOT joined/aborted here. Its `spawn_blocking`
+    // loop is parked in a blocking `read_signal()` syscall with no
+    // cancellation point, so `JoinHandle::abort()` is a no-op against it; the
+    // runtime is detached via `shutdown_background()` in `main` and the parked
+    // thread dies at process exit.
+    let _ = monitor;
     teardown_all(&mode, relay).await;
-    monitor.shutdown();
     banner_job_completed();
     ExitCode::from(exit_code as u8)
 }
@@ -536,6 +553,59 @@ mod tests {
     fn exit_code_wait_error_is_one() {
         let err = std::io::Error::new(std::io::ErrorKind::Other, "boom");
         assert_eq!(exit_code_from_status(Err(err)), 1);
+    }
+
+    /// Regression for the exit-hang: the wrapper's signal monitor is a
+    /// `spawn_blocking` loop parked in a blocking `SignalFd::read_signal()`
+    /// syscall that has NO cancellation point. Dropping a multi-thread tokio
+    /// runtime JOINS its outstanding blocking-pool threads, so a plain
+    /// `drop(runtime)` would wedge FOREVER on such a parked thread and the
+    /// container exit code would never reach SLURM. `main` instead tears the
+    /// runtime down with `shutdown_background()`, which detaches WITHOUT
+    /// joining the blocking pool.
+    ///
+    /// This reproduces the hazard generically — WITHOUT a real signalfd and
+    /// WITHOUT touching the process-wide signal mask (which would leak into
+    /// sibling tests; that is exactly why the real-signalfd test is deferred
+    /// to Phase 5). A `spawn_blocking` closure parks on a channel `recv()`
+    /// that never receives, standing in for the parked `read_signal()`. We
+    /// confirm runtime liveness, then exercise the SAME teardown `main` uses
+    /// and assert it returns within a tight bound. A plain `drop(runtime)`
+    /// here would instead block until the test runner SIGKILLs the binary,
+    /// so this test bites the original bug.
+    #[test]
+    fn runtime_teardown_does_not_join_parked_blocking_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build multi-thread runtime");
+
+        // A blocking-pool closure parked indefinitely (never-fed channel),
+        // mirroring the monitor's parked `read_signal()`. No signalfd, no
+        // signal-mask mutation — pure generic hazard.
+        let (_never_tx, never_rx) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            // Blocks forever: the sender is held by this thread's frame and
+            // never sends, so recv() parks until the process exits.
+            let _ = never_rx.recv();
+        });
+
+        // Confirm the runtime is live before teardown.
+        let live = runtime.block_on(async { 21 * 2 });
+        assert_eq!(live, 42, "runtime must run a trivial future");
+
+        // Exercise the EXACT teardown main uses, timed on the spawning thread.
+        let start = std::time::Instant::now();
+        runtime.shutdown_background();
+        let elapsed = start.elapsed();
+
+        // `shutdown_background()` returns essentially immediately; a generous
+        // bound proves it did NOT join the parked blocking thread. (A plain
+        // `drop(runtime)` would hang here indefinitely.)
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "runtime teardown must not join the parked blocking task (took {elapsed:?})"
+        );
     }
 
     // ---- lifecycle orchestration: spawn_container + run_to_completion ----
