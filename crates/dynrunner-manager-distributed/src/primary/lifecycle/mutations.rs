@@ -1,8 +1,8 @@
 
-use dynrunner_core::Identifier;
+use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
+    RemovalCause, SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -141,27 +141,27 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
     /// React to a panik-watcher signal on the primary.
     ///
-    /// Single concern: turn the watcher's "the operator wants the
-    /// cluster to stop now" event into a `ClusterMutation::PanikRequested`
-    /// broadcast (applied locally + fanned out to every secondary)
-    /// and return the (matched_path, reason) pair for the caller to
-    /// surface as `RunError::PanikShutdown`.
+    /// Single concern: a node observing its OWN panik signal announces
+    /// its departure from the mesh and exits locally. It broadcasts a
+    /// self-authored `ClusterMutation::PeerRemoved { id: <self_id>,
+    /// cause: SelfDeparture(reason) }` so peers LOG the departure and
+    /// mark this peer Dead — observability only. The departure does
+    /// NOT cancel cluster work or terminate the run on peers; phase /
+    /// task management stays decoupled from membership.
     ///
-    /// Unlike the secondary's `handle_panik_signal`, the primary owns
-    /// no local worker pool — workers run on secondaries via the
-    /// `RemoteWorkerState` ledger. The broadcast is the load-bearing
-    /// step: secondaries that have not yet observed their own panik
-    /// file learn about the cluster-wide stop through this mutation
-    /// and run their own teardown (`pool.kill_all_workers_with_grace`
-    /// then exit) on their side. The primary's exit(137) is owned
+    /// Returns the (matched_path, reason) pair for the caller to
+    /// surface as `RunError::PanikShutdown` (the primary's local
+    /// self-exit). Unlike a worker-bearing node, the primary owns no
+    /// local worker pool — workers run on secondaries via the
+    /// `RemoteWorkerState` ledger — so there is nothing to tear down
+    /// here beyond the announcement; the primary's exit(137) is owned
     /// by the PyO3 wrapper once it sees `RunError::PanikShutdown`.
     ///
     /// Apply errors / broadcast failures are best-effort: logged at
     /// warn, never propagated. The panik-react path must always
     /// finish — operators rely on the SLURM container reaping via
     /// exit(137), and a degraded broadcast is no worse than the
-    /// pre-panik baseline (each secondary will eventually observe
-    /// its own panik file at the next 10s poll).
+    /// pre-panik baseline.
     pub(crate) async fn handle_panik_signal(
         &mut self,
         matched_path: std::path::PathBuf,
@@ -170,11 +170,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         tracing::warn!(
             node_id = %self.config.node_id,
             matched_path = %matched_path.display(),
-            "panik signal observed on primary; broadcasting PanikRequested"
+            "panik signal observed on primary; announcing self-departure and exiting locally"
         );
-        let mutation = ClusterMutation::PanikRequested {
-            source_peer: self.config.node_id.clone(),
-            reason: reason.clone(),
+        // Self-authored departure announcement. `BoundedString::from`
+        // truncates at the 1 KiB cap `SelfDeparture` carries.
+        let mutation = ClusterMutation::PeerRemoved {
+            id: self.config.node_id.clone(),
+            cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
         };
         self.apply_and_broadcast_cluster_mutations(vec![mutation])
             .await;

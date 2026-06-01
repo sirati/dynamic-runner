@@ -291,11 +291,11 @@ impl PyObserverLateJoiner {
 
                 // Wire the panik watcher in the same shape as the
                 // regular secondary. The observer doesn't own
-                // workers but still participates in the
-                // cluster-wide stop: its `process_tasks` panik arm
-                // broadcasts `PanikRequested` (peers that haven't
-                // tripped their own file learn about the stop
-                // here) and the post-loop scope below exits 137.
+                // workers but still announces its own departure on
+                // its own panik file: its `process_tasks` panik arm
+                // emits a self-authored `PeerRemoved { SelfDeparture }`
+                // (observability only — peers are not terminated) and
+                // the post-loop scope below exits 137.
                 let mut panik_watcher = dynrunner_manager_distributed::panik_watcher::spawn_panik_watcher(
                     dynrunner_manager_distributed::panik_watcher::PanikWatcherConfig {
                         paths: panik_watcher_paths,

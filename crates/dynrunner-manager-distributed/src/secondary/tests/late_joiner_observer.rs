@@ -88,9 +88,6 @@
             phase_deps: HashMap::new(),
             observers,
             peer_holdings: HashMap::new(),
-            panik_active: false,
-            panik_reason: None,
-            panik_source: None,
             task_outputs: HashMap::new(),
         }
     }

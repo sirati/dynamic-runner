@@ -208,8 +208,10 @@ where
     /// into the loop's local state on first entry).
     ///
     /// Single concern: the coordinator owns the panik-react logic
-    /// (broadcast `ClusterMutation::PanikRequested`, kill all worker
-    /// process trees, return `RunOutcome::PanikShutdown`). The PyO3
+    /// (announce a self-authored `ClusterMutation::PeerRemoved
+    /// { SelfDeparture }` on the file-source path — observability only,
+    /// no cluster-wide cancellation — kill all worker process trees,
+    /// return `RunOutcome::PanikShutdown`). The PyO3
     /// wrapper owns spawning [`crate::panik_watcher::spawn_panik_watcher`]
     /// and threading its `take_signal_rx()` here; that separation is
     /// what lets each Rust-only caller (tests, the existing `run`

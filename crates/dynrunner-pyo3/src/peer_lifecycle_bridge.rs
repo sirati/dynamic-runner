@@ -153,6 +153,10 @@ fn encode_cause<'py>(py: Python<'py>, cause: &RemovalCause) -> PyResult<Bound<'p
             dict.set_item("kind", "fatal_error")?;
             dict.set_item("reason", bs.as_str())?;
         }
+        RemovalCause::SelfDeparture(bs) => {
+            dict.set_item("kind", "self_departure")?;
+            dict.set_item("reason", bs.as_str())?;
+        }
     }
     Ok(dict)
 }

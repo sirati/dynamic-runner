@@ -88,28 +88,6 @@ pub struct ClusterStateSnapshot<I> {
     /// identical to the pre-variant shape).
     #[serde(default)]
     pub peer_holdings: HashMap<String, HashSet<String>>,
-    /// Replicated panik latch. Carried so a late-joining observer
-    /// learns of an in-progress emergency shutdown immediately on
-    /// snapshot-restore, before the next `PanikRequested` broadcast
-    /// reaches it. The latch is sticky monotonic: once true on any
-    /// replica it stays true forever, and `restore` honors that —
-    /// a snapshot with `panik_active = true` sets local state's
-    /// flag (and reason/source if they are still `None`); a
-    /// snapshot with `panik_active = false` is a NoOp against a
-    /// local `true`. `#[serde(default)]` keeps wire compat with
-    /// pre-feature senders (deserialize defaults to `false`).
-    #[serde(default)]
-    pub panik_active: bool,
-    /// First-applying panik reason from the originator's broadcast.
-    /// `Some(_)` iff `panik_active`. See [`Self::panik_active`].
-    /// `#[serde(default)]` for wire compat.
-    #[serde(default)]
-    pub panik_reason: Option<String>,
-    /// Peer that originated the first-applying panik. `Some(_)` iff
-    /// `panik_active`. Forensic-only; no apply rule consults it.
-    /// `#[serde(default)]` for wire compat.
-    #[serde(default)]
-    pub panik_source: Option<String>,
     /// Replicated keyed-output cache (one entry per task that has
     /// reached `Completed` with a non-empty `result_data` payload).
     /// Carried so a late-joiner can resolve a dependent's predecessor
@@ -149,12 +127,10 @@ fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
         // All terminals share the strongest rank. Convergence among
         // terminals follows the per-arm rules in `apply` (Completed
         // never regresses; Failed/Unfulfillable lock out incoming
-        // TaskFailed for their own hash; Cancelled is preserved by
-        // `TaskFailed` and only superseded by `TaskCompleted`).
+        // TaskFailed for their own hash).
         TaskState::Completed { .. }
         | TaskState::Failed { .. }
-        | TaskState::Unfulfillable { .. }
-        | TaskState::Cancelled { .. } => 3,
+        | TaskState::Unfulfillable { .. } => 3,
     }
 }
 
@@ -180,12 +156,6 @@ impl<I: Identifier> ClusterState<I> {
             // contract as `observers` (replaced on restore when
             // local is empty, otherwise kept).
             peer_holdings: self.peer_holdings.clone(),
-            // Sticky panik latch — carried so a late-joiner sees
-            // the in-progress emergency-stop immediately, in
-            // addition to via any live `PanikRequested` broadcast.
-            panik_active: self.panik_active,
-            panik_reason: self.panik_reason.clone(),
-            panik_source: self.panik_source.clone(),
             // Replicated keyed-output cache — carried so a late-joiner
             // can resolve a dependent's predecessor outputs without
             // waiting for the prereq's `TaskCompleted` to retransmit.
@@ -265,16 +235,6 @@ impl<I: Identifier> ClusterState<I> {
         // per-peer-announce signals, not snapshot-bootstrap signals.
         if self.peer_holdings.is_empty() && !snap.peer_holdings.is_empty() {
             self.peer_holdings = snap.peer_holdings;
-        }
-        // Sticky panik latch: monotonic-true. Snapshot with
-        // `panik_active = true` always sets local; local `true` never
-        // regresses to `false` even if the incoming snapshot omits it
-        // (#[serde(default)] = false case). Reason / source land
-        // alongside the flag the first time the latch flips to true.
-        if snap.panik_active && !self.panik_active {
-            self.panik_active = true;
-            self.panik_reason = snap.panik_reason;
-            self.panik_source = snap.panik_source;
         }
         // Keyed-output cache merge: per-key first-write-wins. Each
         // `TaskCompleted` apply for a given hash records exactly one

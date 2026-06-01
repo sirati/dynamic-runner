@@ -55,7 +55,6 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Failed { .. } => c.failed += 1,
                 TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
                 TaskState::Blocked { .. } => c.blocked += 1,
-                TaskState::Cancelled { .. } => c.cancelled += 1,
             }
         }
         c
@@ -109,14 +108,6 @@ impl<I: Identifier> ClusterState<I> {
                 // legacy `Failed { Unfulfillable, .. }` arm above so the
                 // total partition stays stable across the variant cutover.
                 TaskState::Unfulfillable { .. } => o.fail_final += 1,
-                // Operator-initiated panik cancellation. Partitioned
-                // separately from `fail_final` so a terminal-report
-                // log line distinguishes "operator stopped the run"
-                // from "the worker actually hit a non-recoverable
-                // failure". Mapping mirrors the rationale on
-                // `TaskState::Cancelled`: cancellation is not a
-                // failure class, it's an emergency-terminal class.
-                TaskState::Cancelled { .. } => o.cancelled += 1,
                 // Non-terminal: Pending, InFlight, and Blocked all
                 // contribute to neither bucket. Blocked tasks are
                 // cascade-paused dependents that will auto-resume to
@@ -144,8 +135,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
-                | TaskState::Blocked { task, .. }
-                | TaskState::Cancelled { task, .. } => task,
+                | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
         })
@@ -159,8 +149,7 @@ impl<I: Identifier> ClusterState<I> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Completed { task }
             | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. }
-            | TaskState::Cancelled { task, .. } => Some((h, task)),
+            | TaskState::Unfulfillable { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -231,8 +220,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
-                | TaskState::Blocked { task, .. }
-                | TaskState::Cancelled { task, .. } => task,
+                | TaskState::Blocked { task, .. } => task,
             };
             (task.task_id == task_id).then_some(h.as_str())
         })
@@ -261,29 +249,5 @@ impl<I: Identifier> ClusterState<I> {
     /// when the peer mesh is still up but the run is genuinely over.
     pub fn run_complete(&self) -> bool {
         self.run_complete
-    }
-
-    /// Whether a panik shutdown has been declared (any node observed
-    /// the panik filesystem signal and the broadcast
-    /// `ClusterMutation::PanikRequested` has applied locally). Sticky
-    /// monotonic flag: once set, never clears for the lifetime of
-    /// this state. Coordinators read this from the operational loop
-    /// to skip dispatch and gate shutdown.
-    pub fn panik_active(&self) -> bool {
-        self.panik_active
-    }
-
-    /// First-applying panik reason. `Some(_)` iff `panik_active`.
-    /// Carries the originator's caller-supplied justification (e.g.
-    /// `"file: /tmp/asm-tokenizer.panik"`).
-    pub fn panik_reason(&self) -> Option<&str> {
-        self.panik_reason.as_deref()
-    }
-
-    /// Peer that originated the first-applying `PanikRequested`
-    /// broadcast. `Some(_)` iff `panik_active`. Forensic-only — no
-    /// apply rule consults this field.
-    pub fn panik_source(&self) -> Option<&str> {
-        self.panik_source.as_deref()
     }
 }

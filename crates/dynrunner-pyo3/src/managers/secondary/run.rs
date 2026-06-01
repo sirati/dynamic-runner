@@ -547,8 +547,10 @@ impl PySecondaryCoordinator {
                             matched_path,
                             reason,
                         } => {
-                            // The coordinator has already broadcast
-                            // `ClusterMutation::PanikRequested` and
+                            // The coordinator has already announced
+                            // this node's departure (self-authored
+                            // `ClusterMutation::PeerRemoved
+                            // { SelfDeparture }`, file source only) and
                             // killed every worker pgid in this
                             // secondary. The PyO3 outer scope owns
                             // the actual `exit(137)` call (and the

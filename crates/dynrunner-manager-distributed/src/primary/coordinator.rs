@@ -494,10 +494,11 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// when the operator did not pass any `--panik-file` paths. The
     /// operational `select!` arm in
     /// `lifecycle/operational_loop.rs` reads this slot, parks on
-    /// `pending().await` when None, and on `Ok(signal)` broadcasts
-    /// `ClusterMutation::PanikRequested` then returns
-    /// `RunError::PanikShutdown` for the PyO3 wrapper to translate
-    /// into `std::process::exit(137)`.
+    /// `pending().await` when None, and on `Ok(signal)` announces a
+    /// self-authored `ClusterMutation::PeerRemoved { SelfDeparture }`
+    /// (membership/observability only — peers LOG it, the run is not
+    /// terminated on peers) then returns `RunError::PanikShutdown` for
+    /// the PyO3 wrapper to translate into `std::process::exit(137)`.
     ///
     /// Unlike the secondary, the primary owns no local worker pool
     /// (workers run on secondaries, accessed remotely via the
