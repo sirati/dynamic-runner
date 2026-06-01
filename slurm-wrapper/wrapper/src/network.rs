@@ -10,11 +10,6 @@ use std::path::Path;
 use std::process::Command;
 
 /// Peer-routable IPv4/IPv6 resolved via the node FQDN (generate.rs:583-585).
-///
-/// `allow(dead_code)`: this module is the not-yet-wired peer-info API; the
-/// orchestrator calls it in a later phase. The attribute drops once a
-/// caller exists.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct PeerIps {
     pub ipv4: Option<String>,
@@ -29,7 +24,6 @@ pub struct PeerIps {
 /// path the bash `getent ahostsv4/ahostsv6` walks — and the first IPv4 /
 /// first IPv6 candidate is picked. Any failure leaves the corresponding
 /// field `None`, mirroring the bash `${VAR:-<unresolved...>}` fallback.
-#[allow(dead_code)]
 pub fn detect_peer_ips() -> PeerIps {
     let node = std::env::var("SLURMD_NODENAME")
         .ok()
@@ -86,7 +80,6 @@ pub fn detect_peer_ips() -> PeerIps {
 /// listener so the port is free for the real listener to claim — the same
 /// get-free-port-then-release dance the bash `socket().bind(('',0))`
 /// one-liner performs.
-#[allow(dead_code)]
 pub fn alloc_free_port() -> std::io::Result<u16> {
     let listener = TcpListener::bind("0.0.0.0:0")?;
     let port = listener.local_addr()?.port();
@@ -106,7 +99,6 @@ pub fn alloc_free_port() -> std::io::Result<u16> {
 ///   5. `ipv6=<v6>`        (only if `ips.ipv6` is `Some`)
 ///   6. `quic_port=<quic_port>`
 ///   7. `is_observer=<true|false>`
-#[allow(dead_code)]
 pub fn write_connection_info(
     connection_info_dir: &Path,
     secondary_id: &str,

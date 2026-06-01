@@ -6,15 +6,27 @@
 //! # Public API (for Phase 2 integration)
 //!
 //! ```ignore
-//! let mut monitor = signals::install()?;   // call BEFORE spawning any child
+//! signals::block_signals()?;               // SYNC, in fn main() BEFORE the runtime
+//! let mut monitor = signals::start_monitor()?; // async, AFTER the runtime exists
 //! // ... spawn child, run relay ...
 //! let term = monitor.recv_terminating().await; // resolves on first SIGTERM/INT/HUP/QUIT
 //! // term: TerminatingSignal { signo, signame, sender_pid, sender_uid, si_code, comm, cmdline }
 //! // begin Phase 2 teardown using term.* for the shutdown log line.
 //! ```
 //!
-//! - [`install`] blocks the monitored set process-wide via `sigprocmask`
-//!   then creates the signalfd and spawns the provenance-logging task.
+//! - [`block_signals`] blocks the monitored set process-wide via
+//!   `sigprocmask`. It MUST run in SYNC `fn main()` BEFORE the tokio runtime
+//!   is built — otherwise a signal delivered to a worker/blocking-pool
+//!   thread that has not yet inherited the block triggers the default
+//!   disposition and the signalfd never sees it.
+//! - [`start_monitor`] (async; call AFTER the runtime exists and AFTER
+//!   `block_signals`) creates the signalfd over the already-blocked set and
+//!   spawns the provenance-logging task.
+//! - [`child_pre_exec`] is the single owner of the child signal-mask
+//!   reset (`SIG_SETMASK` to empty via `pre_exec`). Children inherit the
+//!   blocked mask across fork+exec; every child that must receive normal
+//!   signal disposition (shutdown manager, podman/conmon + container PID 1,
+//!   relay `bash -c`, image-load `bash -c`) applies it at its spawn site.
 //! - [`SignalMonitor::recv_terminating`] is the single async notification
 //!   surface: it resolves with the provenance of the FIRST terminating
 //!   signal observed (SIGTERM/SIGINT/SIGHUP/SIGQUIT). All signals (incl.
@@ -62,7 +74,13 @@ pub struct TerminatingSignal {
 /// Owns the signalfd monitor task and the channel that delivers the first
 /// terminating-signal provenance to `main`.
 pub struct SignalMonitor {
-    handle: tokio::task::JoinHandle<()>,
+    /// Held to keep the monitor task owned for the process lifetime. It is
+    /// deliberately never aborted/joined: the task is a `spawn_blocking` loop
+    /// parked in a blocking `read_signal()` syscall with no cancellation
+    /// point, so `JoinHandle::abort()` is a no-op against it and a join would
+    /// wedge forever. The runtime is detached via `shutdown_background()` at
+    /// exit and the parked thread dies with the process.
+    _handle: tokio::task::JoinHandle<()>,
     term_rx: mpsc::Receiver<TerminatingSignal>,
 }
 
@@ -84,11 +102,29 @@ impl SignalMonitor {
         })
     }
 
-    /// Abort the monitor task. Intended for shutdown after teardown is
-    /// complete; the blocked-signal mask itself is not restored (the
-    /// process is exiting).
-    pub fn shutdown(&self) {
-        self.handle.abort();
+    /// Test-only constructor: a monitor backed by a caller-fed channel with
+    /// NO signalfd thread. Lets the lifecycle's select!/teardown routing be
+    /// tested deterministically by injecting a synthetic `TerminatingSignal`,
+    /// without raising a real process-directed signal (which is unreliable
+    /// once the test harness is multithreaded — see the C1 note: `sigprocmask`
+    /// only reliably blocks the calling thread, so a process-directed signal
+    /// can hit an unblocked harness thread and trip the default disposition).
+    /// Real signalfd delivery is covered by Phase 5 on the cluster.
+    #[cfg(test)]
+    pub fn for_test() -> (SignalMonitor, mpsc::Sender<TerminatingSignal>) {
+        let (tx, rx) = mpsc::channel::<TerminatingSignal>(8);
+        // A parked, never-resolving task stands in for the monitor loop so the
+        // JoinHandle is valid; recv_terminating reads only the injected channel.
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        (
+            SignalMonitor {
+                _handle: handle,
+                term_rx: rx,
+            },
+            tx,
+        )
     }
 }
 
@@ -121,24 +157,37 @@ fn signame(signo: u32) -> String {
     }
 }
 
-/// Block the signal set and start the provenance-logging monitor. MUST
-/// run BEFORE any child is spawned so the blocked-signal mask and the
-/// process-group leadership are inherited correctly.
-pub fn install() -> std::io::Result<SignalMonitor> {
-    // Fix the monotonic anchor at install time.
-    let _ = mono_anchor();
-
-    // Build the monitored set.
+/// The monitored set as a `SigSet`. Single builder so `block_signals` and
+/// `start_monitor` operate over exactly the same set.
+fn monitored_set() -> SigSet {
     let mut set = SigSet::empty();
     for &sig in MONITORED {
         set.add(sig);
     }
+    set
+}
 
-    // Block process-wide BEFORE creating the signalfd, so deliveries are
-    // queued to the fd rather than acted on by default handlers.
-    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), None)
-        .map_err(std::io::Error::from)?;
+/// Block the monitored signal set process-wide via `sigprocmask`. MUST run
+/// in SYNC `fn main()` BEFORE the tokio runtime is built and BEFORE any
+/// thread is spawned, so every later thread (tokio workers + blocking pool)
+/// inherits the block and the signalfd is the sole consumer of deliveries.
+/// Pure mask side effect — no fd, no task; pair with [`start_monitor`].
+pub fn block_signals() -> std::io::Result<()> {
+    // Fix the monotonic anchor at block time (process start).
+    let _ = mono_anchor();
+    let set = monitored_set();
+    // Block process-wide so deliveries are queued (to the later signalfd)
+    // rather than acted on by default handlers.
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&set), None).map_err(std::io::Error::from)
+}
 
+/// Create the signalfd over the (already-blocked) monitored set and spawn
+/// the provenance-logging monitor task. MUST run AFTER [`block_signals`]
+/// AND after the tokio runtime exists (it `spawn_blocking`s the loop). The
+/// set is rebuilt identically here; it is already blocked process-wide, so
+/// the signalfd is the sole consumer of every monitored delivery.
+pub fn start_monitor() -> std::io::Result<SignalMonitor> {
+    let set = monitored_set();
     let sfd = SignalFd::new(&set).map_err(std::io::Error::from)?;
 
     // Bounded channel: a handful of slots is plenty — only the FIRST
@@ -149,7 +198,32 @@ pub fn install() -> std::io::Result<SignalMonitor> {
         monitor_loop(sfd, term_tx, Path::new("/proc"));
     });
 
-    Ok(SignalMonitor { handle, term_rx })
+    Ok(SignalMonitor {
+        _handle: handle,
+        term_rx,
+    })
+}
+
+/// Single owner of the child signal-mask reset. Children inherit the
+/// blocked mask across fork+exec (execve preserves the signal mask), which
+/// would break the shutdown manager (no SIGCONT nudge), podman/conmon +
+/// container PID 1 (no SIGTERM graceful stop), and the relay's per-command
+/// `bash -c` children. Register this on EVERY child spawn site so the child
+/// starts with an empty mask (`SIG_SETMASK` to empty) right before exec.
+///
+/// Async (`tokio::process::Command`) and sync (`std::process::Command`)
+/// both expose `pre_exec` via `CommandExt`; the closure runs in the forked
+/// child between fork and exec, where only async-signal-safe calls are
+/// permitted — `sigprocmask(2)` qualifies.
+///
+/// SAFETY: the `pre_exec` closure performs only an async-signal-safe
+/// `sigprocmask` syscall; it allocates nothing and touches no shared state.
+pub fn child_pre_exec() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    || {
+        let empty = SigSet::empty();
+        sigprocmask(SigmaskHow::SIG_SETMASK, Some(&empty), None)
+            .map_err(std::io::Error::from)
+    }
 }
 
 /// Blocking read loop over the signalfd. For each delivery it logs a

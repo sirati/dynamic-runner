@@ -246,14 +246,23 @@ async fn dispatch_command(
     let wrapped = format!(
         "exec > \"$DYNRUNNER_OUTPUT_SOCK\" 2>&1; {cmd}"
     );
-    let mut child = tokio::process::Command::new("bash")
+    let mut command = tokio::process::Command::new("bash");
+    command
         .arg("-c")
         .arg(wrapped)
         .env("DYNRUNNER_OUTPUT_SOCK", &output_sock)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    // Reset the inherited blocked signal mask before exec so relay user
+    // commands get normal signal disposition (the relay's own kill -SIGNAL
+    // forwarding targets this child's pid, but the command itself must not
+    // start with the wrapper's monitored set blocked).
+    // SAFETY: child_pre_exec runs only an async-signal-safe sigprocmask.
+    unsafe {
+        command.pre_exec(crate::signals::child_pre_exec());
+    }
+    let mut child = command.spawn()?;
 
     let cmd_pid = child.id().expect("child has a pid before wait") as i32;
 
