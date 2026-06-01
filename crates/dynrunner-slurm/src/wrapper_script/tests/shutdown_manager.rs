@@ -132,17 +132,14 @@ fn renders_shutdown_manager_spawn_when_path_set() {
         // fallback for CLI-contract symmetry — the count-2 expectation
         // is asserted by a sibling test below.
         "--podman-path \"$PODMAN_BIN\"",
-        // --rm-path / --rmdir-path / --find-path thread absolute
-        // coreutils binaries into the manager's per-entry cleanup
-        // walk. The walk runs every primitive via `podman unshare
-        // <bin>`; the bin must resolve absolutely because the unit's
-        // PATH is minimal and the userns inherits no host-shell
-        // PATH at exec time. Each flag is mirrored in both dispatch
-        // branches (count-2 expectations are asserted in dedicated
-        // tests below).
+        // --rm-path threads the absolute `rm` binary into the
+        // manager's single `podman unshare <rm> <validated-abs-path>
+        // -rf` cleanup invocation. The bin must resolve absolutely
+        // because the unit's PATH is minimal and the userns inherits
+        // no host-shell PATH at exec time. Mirrored in both dispatch
+        // branches (count-2 expectation is asserted in a dedicated
+        // test below).
         "--rm-path \"$RM_BIN\"",
-        "--rmdir-path \"$RMDIR_BIN\"",
-        "--find-path \"$FIND_BIN\"",
     ] {
         assert!(
             script.contains(arg),
@@ -170,43 +167,22 @@ fn renders_shutdown_manager_spawn_when_path_set() {
          contain the warning"
     );
 
-    // Coreutils resolution stanzas — same shape as PODMAN_BIN. The
-    // manager's `podman unshare <rm|rmdir|find>` walk needs absolute
-    // paths because the systemd-user-service unit's PATH is minimal
-    // and the userns inherits no host-shell PATH at exec time.
+    // Coreutils resolution stanza — same shape as PODMAN_BIN. The
+    // manager's `podman unshare <rm> <validated-abs-path> -rf`
+    // cleanup needs an absolute path because the systemd-user-service
+    // unit's PATH is minimal and the userns inherits no host-shell
+    // PATH at exec time.
     assert!(
         script.contains("RM_BIN=\"$(command -v rm 2>/dev/null || true)\""),
         "wrapper must resolve rm absolute path via `command -v` \
-         BEFORE the spawn block (the per-entry cleanup walk's \
-         --rm-path flag references $RM_BIN in both dispatch \
-         branches); render did not contain the resolution"
-    );
-    assert!(
-        script.contains("RMDIR_BIN=\"$(command -v rmdir 2>/dev/null || true)\""),
-        "wrapper must resolve rmdir absolute path via `command -v`; \
-         render did not contain the resolution"
-    );
-    assert!(
-        script.contains("FIND_BIN=\"$(command -v find 2>/dev/null || true)\""),
-        "wrapper must resolve find absolute path via `command -v`; \
-         render did not contain the resolution"
+         BEFORE the spawn block (the cleanup's --rm-path flag \
+         references $RM_BIN in both dispatch branches); render did \
+         not contain the resolution"
     );
     assert!(
         script.contains("WARNING: rm not found in wrapper PATH"),
         "RM_BIN resolution must emit a stderr WARNING when \
          `command -v rm` returns empty; render did not contain it"
-    );
-    assert!(
-        script.contains("WARNING: rmdir not found in wrapper PATH"),
-        "RMDIR_BIN resolution must emit a stderr WARNING when \
-         `command -v rmdir` returns empty; render did not contain it"
-    );
-    assert!(
-        script.contains("WARNING: find not found in wrapper PATH"),
-        "FIND_BIN resolution must emit a stderr WARNING when \
-         `command -v find` returns empty (find is load-bearing for \
-         the cleanup walk's enumeration primitive — no fallback); \
-         render did not contain it"
     );
 
     // Bus-probe + setsid-fallback shape: the spawn block must pick
@@ -429,11 +405,12 @@ fn podman_path_flag_renders_in_both_dispatch_branches() {
     );
 }
 
-/// `--rm-path` mirrors `--podman-path`: the cleanup walk's stage-2
-/// (`podman unshare <rm> -- <file>`) needs the absolute coreutils
-/// path because the systemd-user-service unit's PATH does NOT
-/// contain GNU coreutils on NixOS. Both dispatch branches must
-/// thread the flag so a future maintainer cannot drift them apart.
+/// `--rm-path` mirrors `--podman-path`: the manager's single
+/// `podman unshare <rm> <validated-abs-path> -rf` cleanup needs the
+/// absolute coreutils path because the systemd-user-service unit's
+/// PATH does NOT contain GNU coreutils on NixOS. Both dispatch
+/// branches must thread the flag so a future maintainer cannot drift
+/// them apart.
 #[test]
 fn rm_path_flag_renders_in_both_dispatch_branches() {
     let config = SlurmConfig::default();
@@ -445,41 +422,6 @@ fn rm_path_flag_renders_in_both_dispatch_branches() {
         "expected exactly two occurrences of `--rm-path \"$RM_BIN\"` \
          (one per dispatch branch: systemd-run + setsid-f); render \
          contained {count}. Full script:\n{script}"
-    );
-}
-
-/// `--rmdir-path` mirrors `--rm-path` for stage-4 of the cleanup
-/// walk (`podman unshare <rmdir> -- <dir>`).
-#[test]
-fn rmdir_path_flag_renders_in_both_dispatch_branches() {
-    let config = SlurmConfig::default();
-    let bin = PathBuf::from(SHUTDOWN_BIN);
-    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
-    let count = script.matches("--rmdir-path \"$RMDIR_BIN\"").count();
-    assert_eq!(
-        count, 2,
-        "expected exactly two occurrences of `--rmdir-path \
-         \"$RMDIR_BIN\"` (one per dispatch branch: systemd-run + \
-         setsid-f); render contained {count}. Full script:\n{script}"
-    );
-}
-
-/// `--find-path` is load-bearing: stages 1 and 3 of the cleanup
-/// walk invoke `podman unshare <find> <root> ...` to enumerate
-/// files and dirs. There is no host-side fallback enumeration
-/// (the host UID cannot read subuid-owned podman storage subdirs),
-/// so a missing find binary effectively disables cleanup.
-#[test]
-fn find_path_flag_renders_in_both_dispatch_branches() {
-    let config = SlurmConfig::default();
-    let bin = PathBuf::from(SHUTDOWN_BIN);
-    let script = generate_wrapper_script(&cfg_with_shutdown_bin(&config, &bin));
-    let count = script.matches("--find-path \"$FIND_BIN\"").count();
-    assert_eq!(
-        count, 2,
-        "expected exactly two occurrences of `--find-path \
-         \"$FIND_BIN\"` (one per dispatch branch: systemd-run + \
-         setsid-f); render contained {count}. Full script:\n{script}"
     );
 }
 

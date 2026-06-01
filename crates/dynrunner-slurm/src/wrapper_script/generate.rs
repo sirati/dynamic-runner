@@ -21,6 +21,12 @@
 //! addressed by name via `systemctl --user kill` from the wrapper's
 //! signal trap. See [`WrapperScriptConfig::shutdown_manager_bin_path`].
 
+use std::path::Path;
+
+use dynrunner_slurm_wrapper_config::{
+    ConnectionMode as WireConnectionMode, WrapperConfig,
+};
+
 use super::config::{ConnectionMode, WrapperScriptConfig, WRAPPER_SRC_NETWORK_CONTAINER_PATH};
 use super::quote::{bash_quote, rand_hex8};
 
@@ -32,8 +38,22 @@ use super::quote::{bash_quote, rand_hex8};
 /// requested connection mode.
 pub fn generate_wrapper_script(cfg: &WrapperScriptConfig<'_>) -> String {
     let rnd_suffix = rand_hex8();
-    let rndtmp = format!("/tmp/asm-{rnd_suffix}");
-    let container_name = format!("asm-{rnd_suffix}-{}", cfg.secondary_id);
+
+    // When the caller plumbs a wrapper-binary path, the whole bash
+    // body is replaced by a tiny `exec <bin> <to_args()…>` stub: the
+    // Rust musl wrapper binary performs the full secondary lifecycle
+    // the heredoc below otherwise renders. The `#SBATCH`/entrypoint
+    // mechanics (`submit_job` prepends those) are untouched — only the
+    // script body differs. Building the stub here keeps the legacy and
+    // binary code-paths in one place so the render-time inputs they
+    // share (`rnd_suffix`, `name_prefix`, the resolved mount sources,
+    // connection mode, …) cannot drift between the two.
+    if let Some(bin) = cfg.wrapper_bin_path {
+        return generate_wrapper_stub(cfg, bin, &rnd_suffix);
+    }
+
+    let rndtmp = format!("/tmp/{}-{rnd_suffix}", cfg.name_prefix);
+    let container_name = format!("{}-{rnd_suffix}-{}", cfg.name_prefix, cfg.secondary_id);
 
     let src_tmp = format!("{rndtmp}/src");
     let out_tmp = format!("{rndtmp}/out");
@@ -859,4 +879,92 @@ exit $CONTAINER_EXIT_CODE
     );
 
     script
+}
+
+/// Render the tiny binary-stub wrapper body: `#!/usr/bin/env bash`
+/// followed by a single `exec <bin> <args…>` line, where `<args…>` is
+/// the [`WrapperConfig::to_args`] vector with each element
+/// `bash_quote`-d and space-joined. The Rust musl wrapper binary
+/// parses those flags back into a `WrapperConfig` (its `cli` feature)
+/// and performs the full secondary lifecycle the legacy heredoc
+/// otherwise renders.
+///
+/// Every field of the emitted [`WrapperConfig`] is mapped from the
+/// [`WrapperScriptConfig`] the renderer was handed plus the
+/// render-time values the legacy path computes (`rnd_suffix`; the
+/// mount-source fallbacks; the `ConnectionMode` translation). The two
+/// paths therefore share one source of truth for those inputs and
+/// cannot drift.
+fn generate_wrapper_stub(
+    cfg: &WrapperScriptConfig<'_>,
+    bin: &Path,
+    rnd_suffix: &str,
+) -> String {
+    // Mount-source fallbacks: identical to the legacy bash path
+    // (generate.rs `srcbins_network`/`output_network`/`log_network`),
+    // so the binary receives the same resolved absolute paths the
+    // heredoc would have baked in.
+    let srcbins_network = cfg
+        .srcbins_mount_source
+        .map(String::from)
+        .unwrap_or_else(|| cfg.slurm_config.src_bins_path());
+    let output_network = cfg
+        .output_dir
+        .map(String::from)
+        .unwrap_or_else(|| cfg.slurm_config.output_path());
+    let log_network = cfg
+        .run_log_dir
+        .map(String::from)
+        .unwrap_or_else(|| cfg.slurm_config.log_path());
+
+    let connection = match &cfg.connection {
+        ConnectionMode::Standard {
+            gateway_host,
+            gateway_port,
+        } => WireConnectionMode::Standard {
+            gateway_host: (*gateway_host).to_string(),
+            gateway_port: *gateway_port,
+        },
+        ConnectionMode::Reverse {
+            connection_info_dir,
+        } => WireConnectionMode::Reverse {
+            connection_info_dir: (*connection_info_dir).to_string(),
+        },
+    };
+
+    let wire = WrapperConfig {
+        name_prefix: cfg.name_prefix.to_string(),
+        rand_suffix: rnd_suffix.to_string(),
+        secondary_id: cfg.secondary_id.to_string(),
+        image_path: cfg.image_path.to_string(),
+        image_tar_basename: cfg.image_tar_basename.to_string(),
+        image_name: cfg.image_name.to_string(),
+        image_tag: cfg.image_tag.to_string(),
+        load_command: cfg.load_command.to_string(),
+        container_command: cfg.container_command.to_string(),
+        cores_spec: cfg.cores_spec.to_string(),
+        max_memory_spec: cfg.max_memory_spec.to_string(),
+        mem_manager_reserved_bytes: cfg.mem_manager_reserved_bytes,
+        forwarded_argv: cfg.forwarded_argv.to_vec(),
+        extra_run_args: cfg.extra_run_args.to_vec(),
+        srcbins_network,
+        output_network,
+        log_network,
+        dynrunner_network_dir: cfg.dynrunner_network_dir.map(String::from),
+        connection,
+        is_observer: cfg.is_observer,
+        shutdown_manager_bin_path: cfg
+            .shutdown_manager_bin_path
+            .map(|p| p.to_path_buf()),
+    };
+
+    let bin_q = bash_quote(&bin.display().to_string());
+    let args_q: String = wire
+        .to_args()
+        .iter()
+        .map(|a| bash_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    format!("#!/usr/bin/env bash\nexec {bin_q} {args_q}\n")
 }

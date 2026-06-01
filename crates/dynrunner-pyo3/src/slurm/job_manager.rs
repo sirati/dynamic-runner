@@ -295,6 +295,63 @@ impl PyRustSlurmJobManager {
         }))
     }
 
+    /// Stage the `dynrunner-slurm-wrapper` binary on the gateway and
+    /// record the resolved remote path on the Rust manager (so later
+    /// wrapper-script renders pick it up via
+    /// `wrapper_bin_remote_path` and emit the `exec`-stub body).
+    ///
+    /// Takes the already-resolved local source path. Source-path
+    /// resolution (env-var override
+    /// `DYNRUNNER_SLURM_WRAPPER_BIN_SOURCE` > wheel-bundled artifact
+    /// under `dynamic_runner/_wrapper_manager/`) lives in the Python
+    /// bridge (`dynamic_runner._wrapper_manager.bundled_binary_path`);
+    /// the Rust side reads no process state. Missing source → raises a
+    /// Python `RuntimeError` (via `SlurmError::WrapperBinaryNotFound`)
+    /// so misconfigured dispatch surfaces loudly.
+    ///
+    /// Single-concern delegate: `SlurmJobManager::upload_wrapper_binary_from`
+    /// in `dynrunner-slurm/src/job_manager/wrapper_binary.rs` owns the
+    /// upload mechanics; this method is the GIL-release +
+    /// tokio-runtime wrapper. Mirrors
+    /// `upload_shutdown_manager_binary_from`.
+    fn upload_wrapper_binary_from(
+        &self,
+        py: Python<'_>,
+        local: String,
+    ) -> PyResult<String> {
+        let inner = self.inner.clone();
+        py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .upload_wrapper_binary_from(std::path::PathBuf::from(local))
+                    .await
+                    .map_err(slurm_err_to_py)
+            })
+        })
+    }
+
+    /// Read the gateway-side path of the previously-uploaded wrapper
+    /// binary. Returns `None` only when `upload_wrapper_binary_from`
+    /// has not yet been invoked on this manager.
+    ///
+    /// Exposed so the Python preparation step can thread the resolved
+    /// path into every per-secondary `generate_wrapper_script` kwarg
+    /// (including the respawn path) without re-uploading the binary.
+    /// Mirrors `shutdown_manager_remote_path`.
+    #[getter]
+    fn wrapper_bin_remote_path(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let inner = self.inner.clone();
+        Ok(py.detach(|| {
+            block_on_local(async move {
+                lock_manager(&inner)
+                    .await
+                    .wrapper_bin_remote_path()
+                    .map(str::to_owned)
+            })
+        }))
+    }
+
     /// Cancel a single SLURM job via `scancel`.
     fn cancel_job(&self, py: Python<'_>, job_id: String) -> PyResult<()> {
         let inner = self.inner.clone();

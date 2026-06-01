@@ -133,6 +133,52 @@ class SlurmJobManager:
         raw = self._rust.upload_shutdown_manager_binary_from(str(local))
         return self._expand_path(raw)
 
+    def upload_wrapper_binary(self) -> str:
+        """Stage the bundled ``dynrunner-slurm-wrapper`` binary on the gateway.
+
+        Resolves the local source path via
+        :func:`dynamic_runner._wrapper_manager.bundled_binary_path`
+        (env-var override > nix-bundled artifact) and hands the
+        resolved path to the Rust upload primitive. Hard error when
+        neither source is available — the SLURM dispatch path renders
+        each per-job wrapper as a tiny stub that ``exec``s this binary
+        to run the full secondary lifecycle, so a missing binary is
+        misconfiguration, not a benign skip.
+
+        Returns the tilde-expanded remote path the gateway-side
+        binary lives at. Tilde expansion happens here (mirrors
+        :meth:`upload_shutdown_manager_binary` — see that method's
+        docstring for the rationale).
+        """
+        from .._wrapper_manager import bundled_binary_path, ENV_VAR
+
+        local = bundled_binary_path()
+        if local is None:
+            raise RuntimeError(
+                f"wrapper binary not found. Either the framework wheel "
+                f"was built without the bundled binary (non-nix install) "
+                f"or {ENV_VAR} points at a missing path. SLURM dispatch "
+                f"renders each per-job wrapper as a stub that execs this "
+                f"binary to run the secondary lifecycle."
+            )
+        raw = self._rust.upload_wrapper_binary_from(str(local))
+        return self._expand_path(raw)
+
+    @property
+    def wrapper_remote_path(self) -> str | None:
+        """Gateway-side path of the uploaded wrapper binary.
+
+        Tilde-expanded (mirrors :meth:`upload_wrapper_binary`). ``None``
+        only when :meth:`upload_wrapper_binary` has not yet been called
+        on this manager. Read by the Rust preparation step when
+        threading the value into per-secondary ``generate_wrapper_script``
+        kwargs (initial cohort + respawn paths) as ``wrapper_bin_path``.
+        """
+        raw = self._rust.wrapper_bin_remote_path
+        if raw is None:
+            return None
+        return self._expand_path(raw)
+
     @property
     def shutdown_manager_remote_path(self) -> str | None:
         """Gateway-side path of the uploaded shutdown-manager binary.
@@ -257,6 +303,8 @@ class SlurmJobManager:
         run_log_dir: str | None = None,
         is_observer: bool = False,
         shutdown_manager_bin_path: str | None = None,
+        wrapper_bin_path: str | None = None,
+        name_prefix: str | None = None,
         mem_manager_reserved_bytes: int | None = None,
     ) -> str:
         """Generate the bash wrapper script for a SLURM job.
@@ -310,6 +358,22 @@ class SlurmJobManager:
         :meth:`upload_shutdown_manager_binary` always populates the
         path (or raises on missing source), so the spawn block is
         always emitted on the SLURM dispatch path.
+
+        ``wrapper_bin_path`` is the gateway-side absolute path of the
+        ``dynrunner-slurm-wrapper`` binary (as recorded by
+        :meth:`upload_wrapper_binary`). When set, the Rust renderer
+        emits a tiny ``exec <bin> <args>`` stub instead of the legacy
+        inline bash body; the binary parses the ``<args>`` flags and
+        runs the full secondary lifecycle. ``None`` keeps the legacy
+        bash body (back-compat / renderer-internal tests).
+
+        ``name_prefix`` is the consumer program-identity prefix for the
+        scratch dir (``/tmp/<name_prefix>-<suffix>``) and container name
+        (``<name_prefix>-<suffix>-<secondary_id>``), replacing the
+        framework's old hardcoded ``asm``. Defaults to the deployment
+        spec's :attr:`TaskDeploymentSpec.effective_job_name_prefix`
+        (``slurm_job_name_prefix`` or ``image_name``) — the same field
+        that names the SLURM job ``{prefix}-{secondary_id}``.
         """
         connection_info_dir = (
             self._expand_path(f"{run_log_dir or self.slurm_config.get_log_dir()}/connection_info")
@@ -345,6 +409,8 @@ class SlurmJobManager:
             connection_info_dir=connection_info_dir,
             is_observer=is_observer,
             shutdown_manager_bin_path=shutdown_manager_bin_path,
+            wrapper_bin_path=wrapper_bin_path,
+            name_prefix=name_prefix or self.deployment.effective_job_name_prefix,
             mem_manager_reserved_bytes=mem_manager_reserved_bytes,
         )
 

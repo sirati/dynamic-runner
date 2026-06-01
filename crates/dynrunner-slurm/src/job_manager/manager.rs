@@ -18,6 +18,7 @@ impl<G: Gateway> SlurmJobManager<G> {
             gateway,
             job_ids: Vec::new(),
             shutdown_manager_remote_path: None,
+            wrapper_bin_remote_path: None,
         }
     }
 
@@ -47,5 +48,21 @@ impl<G: Gateway> SlurmJobManager<G> {
     /// back-compat callers only.
     pub fn shutdown_manager_remote_path(&self) -> Option<&str> {
         self.shutdown_manager_remote_path.as_deref()
+    }
+
+    /// Gateway-side path of the uploaded `dynrunner-slurm-wrapper`
+    /// binary, set by
+    /// [`SlurmJobManager::upload_wrapper_binary_from`].
+    ///
+    /// Returns `None` only when the upload step has not yet been
+    /// invoked on this manager. Wrapper-script renderers consume the
+    /// value via
+    /// [`WrapperScriptConfig::wrapper_bin_path`](crate::wrapper_script::WrapperScriptConfig::wrapper_bin_path)
+    /// to emit the `exec`-stub body; the `None` branch in the renderer
+    /// keeps the legacy inline-bash body for unit tests and
+    /// back-compat callers that do not exercise the SLURM dispatch
+    /// path. Mirrors [`SlurmJobManager::shutdown_manager_remote_path`].
+    pub fn wrapper_bin_remote_path(&self) -> Option<&str> {
+        self.wrapper_bin_remote_path.as_deref()
     }
 }

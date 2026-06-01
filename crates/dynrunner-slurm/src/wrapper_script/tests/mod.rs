@@ -7,6 +7,7 @@ use crate::config::SlurmConfig;
 use crate::wrapper_script::{ConnectionMode, WrapperScriptConfig};
 
 mod argv_quoting;
+mod binary_stub;
 mod cleanup;
 mod preflight_podman;
 mod reverse_mode;
@@ -21,6 +22,14 @@ pub(super) fn standard_cfg<'a>(
 ) -> WrapperScriptConfig<'a> {
     WrapperScriptConfig {
         slurm_config,
+        // Generic baseline prefix; the legacy `asm` literal is no
+        // longer hardcoded in the generator, so the baseline supplies
+        // one explicitly. Tests asserting the de-hardcoded `/tmp/...`
+        // and container-name shapes override this.
+        name_prefix: "asm",
+        // Legacy bash path by default. The dedicated stub test flips
+        // this to `Some(...)` and asserts the round-trip.
+        wrapper_bin_path: None,
         image_path: "/images/test.tar",
         secondary_id: "sec-01",
         image_name: "test-app",
