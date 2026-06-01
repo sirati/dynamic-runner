@@ -4,6 +4,7 @@
 use crate::bin_resolve::ResolvedBins;
 use crate::dirs::Layout;
 use dynrunner_slurm_wrapper_config::WrapperConfig;
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 /// Operator-facing marker the bash prints to STDOUT on load failure
@@ -36,15 +37,30 @@ pub fn copy_and_load(
     // if ! {load_command}; then ... (generate.rs:700-711). The runtime's
     // own stdout/stderr is inherited so its diagnostic lands in the job's
     // .out/.err exactly as the bash left it.
+    //
+    // XDG_RUNTIME_DIR is set per-child to `layout.podman_run` (the bash
+    // exported it globally at generate.rs:347 for podman's rootless storage
+    // cookie; here it is a per-`Command` env so it never clobbers the
+    // wrapper's own value that `shutdown_spawn`'s bus probe reads).
+    //
+    // The child mask reset (signals::child_pre_exec) restores an empty
+    // signal mask before exec so the load command (and anything it spawns)
+    // sees normal signal disposition rather than the wrapper's blocked set.
     println!("Loading image into container runtime...");
-    let status = Command::new("bash")
-        .arg("-c")
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
         .arg(&cfg.load_command)
         .env("LOCAL_IMAGE", &layout.local_image)
         .env("PODMAN_STORAGE", &layout.podman_storage)
         .env("PODMAN_RUN", &layout.podman_run)
+        .env("XDG_RUNTIME_DIR", &layout.podman_run)
         .env("PODMAN_BIN", &bins.podman)
-        .env("RM_BIN", &bins.rm)
+        .env("RM_BIN", &bins.rm);
+    // SAFETY: child_pre_exec runs only an async-signal-safe sigprocmask.
+    unsafe {
+        cmd.pre_exec(crate::signals::child_pre_exec());
+    }
+    let status = cmd
         .status()
         .map_err(|e| format!("failed to spawn load command via bash: {e}"))?;
 

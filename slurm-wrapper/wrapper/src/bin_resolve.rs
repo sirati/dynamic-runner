@@ -13,15 +13,14 @@ pub struct ResolvedBins {
     pub rm: String,
 }
 
-/// Mirror `command -v <name>`: walk the `$PATH` entries, returning the
-/// first entry under which `name` is an existing, executable file. Falls
-/// back to the bare `name` when nothing matches (or `$PATH` is unset/empty),
-/// exactly as the bash `command -v ... || true` + `[ -z ]` branch does.
-fn resolve_one(name: &str) -> String {
-    let path = match std::env::var_os("PATH") {
-        Some(p) => p,
-        None => return name.to_string(),
-    };
+/// Single source of truth for `command -v <name>`: walk the `$PATH`
+/// entries and return the first entry under which `name` is an existing,
+/// executable file. `None` when nothing matches (or `$PATH` is
+/// unset/empty). Both [`resolve_one`] (absolute-or-bare-name resolution)
+/// and [`on_path`] (presence probe) build on this so PATH resolution lives
+/// in exactly one place and is uniformly exec-bit correct.
+pub fn which(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         // Empty PATH entries are skipped: `command -v` treats them as the
         // cwd, but resolving a system binary against cwd is never what the
@@ -31,10 +30,26 @@ fn resolve_one(name: &str) -> String {
         }
         let candidate = dir.join(name);
         if is_executable_file(&candidate) {
-            return candidate.to_string_lossy().into_owned();
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
-    name.to_string()
+    None
+}
+
+/// `command -v <name>` presence probe: true when `name` resolves to an
+/// executable on `$PATH`. Single source of truth shared with
+/// `shutdown_spawn`'s `systemd-run` / `setsid` probes — exec-bit correct
+/// (a `command -v` for an external requires the executable bit), unlike a
+/// bare `is_file()` check.
+pub fn on_path(name: &str) -> bool {
+    which(name).is_some()
+}
+
+/// Mirror `command -v <name>`: returns the resolved absolute path, falling
+/// back to the bare `name` when nothing matches (or `$PATH` is unset/empty),
+/// exactly as the bash `command -v ... || true` + `[ -z ]` branch does.
+fn resolve_one(name: &str) -> String {
+    which(name).unwrap_or_else(|| name.to_string())
 }
 
 /// True when `path` is a regular file with at least one executable bit set,

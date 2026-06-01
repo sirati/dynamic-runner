@@ -12,10 +12,11 @@
 //! correct for the bus probe / systemd-run while podman still sees its
 //! storage-cookie path.
 
-use crate::bin_resolve::ResolvedBins;
+use crate::bin_resolve::{on_path, ResolvedBins};
 use crate::dirs::Layout;
 use dynrunner_slurm_wrapper_config::WrapperConfig;
 use std::fs::OpenOptions;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -92,21 +93,6 @@ fn systemd_user_runtime_dir() -> PathBuf {
     }
 }
 
-/// `command -v <name>` equivalent: is `<name>` an executable on `$PATH`?
-/// Mirrors the bash `command -v systemd-run >/dev/null 2>&1` / `command -v
-/// setsid ...` probes.
-fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        // Existence as a regular/exec entry is sufficient here; the bash
-        // `command -v` likewise only checks resolvability, not the exec bit.
-        candidate.is_file()
-    })
-}
-
 /// Open `<shutdown_log_path>` in append mode for use as a child's stderr/stdout
 /// (mirrors the bash `2>>"$SHUTDOWN_LOG_PATH"` / `>>... 2>&1`).
 fn append_log(path: &Path) -> std::io::Result<std::fs::File> {
@@ -179,11 +165,19 @@ fn try_systemd_run(
             return None;
         }
     };
-    let status = Command::new("systemd-run")
-        .args(systemd_run_args(layout, bin, manager))
+    let mut cmd = Command::new("systemd-run");
+    cmd.args(systemd_run_args(layout, bin, manager))
         .env("XDG_RUNTIME_DIR", runtime_dir)
-        .stderr(stderr)
-        .status();
+        .stderr(stderr);
+    // Reset the inherited blocked signal mask before exec so the manager
+    // (and the unit systemd spawns) start with normal signal disposition —
+    // applied to the systemd-run invocation regardless of whether systemd
+    // re-derives the unit's mask, per the C2 safety note.
+    // SAFETY: child_pre_exec runs only an async-signal-safe sigprocmask.
+    unsafe {
+        cmd.pre_exec(crate::signals::child_pre_exec());
+    }
+    let status = cmd.status();
     match status {
         Ok(s) if s.success() => {
             println!(
@@ -237,12 +231,18 @@ fn run_setsid(
     // setsid -f detaches and returns immediately; we ignore its handle and rely
     // on the manager's pid-file for the pid (mirrors the bash, which does the
     // same poll rather than trusting setsid's exit pid).
-    let _ = Command::new("setsid")
-        .args(setsid_args(bin, manager))
+    let mut cmd = Command::new("setsid");
+    cmd.args(setsid_args(bin, manager))
         .stdin(devnull)
         .stdout(out)
-        .stderr(err)
-        .status();
+        .stderr(err);
+    // Reset the inherited blocked signal mask before exec (C2 safety note:
+    // applied to the setsid invocation regardless of session inheritance).
+    // SAFETY: child_pre_exec runs only an async-signal-safe sigprocmask.
+    unsafe {
+        cmd.pre_exec(crate::signals::child_pre_exec());
+    }
+    let _ = cmd.status();
 
     let pid_file = layout.shutdown_pid_file.as_path();
     for _ in 0..50 {
