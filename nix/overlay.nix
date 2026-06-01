@@ -15,6 +15,10 @@ final: prev: {
         # shutdown-manager-bin derivation needs `pkgsCross`, which
         # lives on the top-level pkgs, not on the Python package set.
         shutdownManagerBin = final.callPackage ./shutdown-manager-bin.nix { };
+        # Musl-static slurm-wrapper binary, same `pkgsCross` plumbing
+        # rationale as `shutdownManagerBin` above. Single source of
+        # truth in `./wrapper-bin.nix`.
+        wrapperManagerBin = final.callPackage ./wrapper-bin.nix { };
       };
     })
   ];

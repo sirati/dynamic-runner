@@ -6,6 +6,7 @@
   openssl,
   pkg-config,
   shutdownManagerBin,
+  wrapperManagerBin,
 }:
 
 # Wheel/Python-package derivation for dynamic_runner.
@@ -31,7 +32,7 @@ buildPythonPackage {
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     src = lib.cleanSource ./..;
-    hash = "sha256-AucVQwLQPGmX+imzStBARKvGbz8XXZu9N0UxrCnBT9w=";
+    hash = "sha256-6FBjH+Vt/pg0HNjk9dzvGZ2KR3kxNqoGyBi4l1BvfRo=";
   };
 
   nativeBuildInputs = [
@@ -58,6 +59,9 @@ buildPythonPackage {
     install -Dm755 \
       ${shutdownManagerBin}/bin/dynrunner-slurm-shutdown \
       $out/${python.sitePackages}/dynamic_runner/_shutdown_manager/dynrunner-slurm-shutdown
+    install -Dm755 \
+      ${wrapperManagerBin}/bin/dynrunner-slurm-wrapper \
+      $out/${python.sitePackages}/dynamic_runner/_wrapper_manager/dynrunner-slurm-wrapper
   '';
 
   meta = with lib; {
