@@ -106,7 +106,12 @@ pub(super) fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
 /// in `tests.rs` can drive it on a hand-built pool without
 /// instantiating a full `SecondaryCoordinator` — single concern,
 /// single dependency on `&mut PendingPool`.
-pub(in crate::secondary) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
+///
+/// `pub(crate)` so the symmetric primary-side hydration
+/// (`crate::primary::hydrate`) reuses the identical drain cascade
+/// rather than re-deriving the loop — single source of truth for
+/// "drain a freshly-seeded pool to quiescence".
+pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
     loop {
         pool.drain_empty_active_phases();
         let drained = pool.poll_drain_transitions();

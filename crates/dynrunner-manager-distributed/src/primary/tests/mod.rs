@@ -18,6 +18,7 @@ mod basic;
 mod coordinator_setup;
 mod demoted;
 mod e2e;
+mod hydrate;
 mod initial_assignment;
 mod oom_bucket;
 mod phase_ordering;

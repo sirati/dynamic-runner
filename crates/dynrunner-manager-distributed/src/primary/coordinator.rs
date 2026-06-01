@@ -127,6 +127,26 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// between runs.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
+    /// Pre-owned in-flight ledger seeded at hydration, keyed by task
+    /// hash. Each value is the `(phase_id, target_secondary_id, binary)`
+    /// of an `InFlight` task this coordinator inherited from the
+    /// replicated `cluster_state` rather than dispatching itself.
+    ///
+    /// Why it exists: the normal `TaskComplete` / `TaskFailed`
+    /// counter-decrement path keys off the local `RemoteWorkerState`
+    /// holding the task (`workers[*].current_task`). A pre-owned
+    /// in-flight task was dispatched by a different node before this
+    /// coordinator became authoritative, so no local worker holds it;
+    /// when its broadcast completion lands, the worker scan finds
+    /// nothing and the phase in-flight counter would never drop from
+    /// N+1 to N. The handlers consult this map as a fallback so the
+    /// CORRECT phase's `note_item_completed` / `note_item_failed`
+    /// fires. Entries are removed on first terminal observation
+    /// (idempotent with the `completed_tasks` / `failed_tasks` dedup
+    /// gate). Empty for a coordinator that built its pool from a
+    /// local task list rather than hydrating.
+    pub(super) pre_owned_in_flight:
+        HashMap<String, (PhaseId, String, TaskInfo<I>)>,
     /// Failed-task ledger keyed by task hash. The value carries the
     /// most-recent ErrorType so the dispatcher can report per-class
     /// failure counts (Recoverable → fail_retry, ResourceExhausted
@@ -619,6 +639,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             pending: None,
             phase_deps: HashMap::new(),
             completed_tasks: HashSet::new(),
+            pre_owned_in_flight: HashMap::new(),
             failed_tasks: HashMap::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
@@ -1271,6 +1292,27 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     #[cfg(test)]
     pub fn cluster_state_for_test(&self) -> &crate::cluster_state::ClusterState<I> {
         &self.cluster_state
+    }
+
+    /// Test-only mutable borrow of the replicated cluster ledger, used
+    /// by the hydration tests to seed task states (`TaskAdded` →
+    /// Pending, `TaskAssigned` → InFlight, `TaskCompleted` → terminal)
+    /// directly via `ClusterState::apply` before
+    /// `hydrate_from_cluster_state` runs — without going through the
+    /// broadcast path (which needs an initialised pool for the
+    /// auto-resume re-inject step).
+    #[cfg(test)]
+    pub fn cluster_state_mut_for_test(
+        &mut self,
+    ) -> &mut crate::cluster_state::ClusterState<I> {
+        &mut self.cluster_state
+    }
+
+    /// Test-only inspector for the pre-owned in-flight ledger seeded by
+    /// hydration. Returns the count of inherited in-flight entries.
+    #[cfg(test)]
+    pub fn pre_owned_in_flight_len_for_test(&self) -> usize {
+        self.pre_owned_in_flight.len()
     }
 
     /// Test-only inspector for whether the peer-lifecycle dispatcher

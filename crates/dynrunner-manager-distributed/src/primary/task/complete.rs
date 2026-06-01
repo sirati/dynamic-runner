@@ -148,6 +148,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             if let Some((phase, type_id, task_id)) = completed_meta {
                 self.release_type_slot(&type_id);
                 self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
+            } else if let Some((phase, _secondary, binary)) =
+                self.pre_owned_in_flight.remove(task_hash)
+            {
+                // Pre-owned in-flight task (hydrated from cluster_state,
+                // dispatched by another node before this coordinator
+                // became authoritative): no local worker held it, so the
+                // worker scan above found nothing and no local type-slot
+                // was ever taken — hence no `release_type_slot`. We still
+                // must decrement the correct phase's in-flight counter so
+                // `note_item_completed` drains it from N+1 to N. The
+                // `binary.task_id` resolves the same `task_depends_on`
+                // edges a locally-dispatched completion would.
+                self.note_item_completed(&phase, Some(binary.task_id.as_str()), command_rx).await;
             }
 
             // Kickstart dispatch to every idle worker. After
