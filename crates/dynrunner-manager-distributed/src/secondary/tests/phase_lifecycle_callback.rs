@@ -983,3 +983,162 @@ async fn apply_cluster_mutations_skips_pool_extension_on_non_promoted_secondary(
          reinject step is silently skipped, not panic-on-Unwrap"
     );
 }
+
+/// Build a 2-phase pool whose phase-a holds one in-flight item and
+/// whose phase-b holds one dispatchable (no task-level dep) item that
+/// is gated Blocked behind phase-a via `PhaseDepsSet`. This is the
+/// canonical phase-boundary shape: completing phase-a's lone item
+/// drains phase-a and flips phase-b Blocked → Active, at which point
+/// phase-b's item becomes dispatchable. Mirrors the pool shape
+/// `populate_primary_from_cluster_state` produces post-promotion.
+fn two_phase_pool_a_inflight_b_blocked(
+    phase_a: &PhaseId,
+    phase_b: &PhaseId,
+) -> PendingPool<TestId> {
+    let mut phase_ids = HashSet::new();
+    phase_ids.insert(phase_a.clone());
+    phase_ids.insert(phase_b.clone());
+    let mut deps = HashMap::new();
+    deps.insert(phase_b.clone(), vec![phase_a.clone()]);
+    let mut pool = PendingPool::<TestId>::new(phase_ids, deps).expect("graph valid");
+    // phase-a: one in-flight item (task-a), so its completion drains
+    // the phase.
+    pool.mark_tasks_in_flight(vec![("task-a".into(), phase_a.clone())]);
+    // phase-b: one queued, dispatchable item. NO task-level dep — the
+    // PHASE-level dep (PhaseDepsSet above) is what keeps it Blocked in
+    // the pool's phase-state machine until phase-a's drain flips it
+    // Active. Once Active, `take_first_match` can hand it to a worker.
+    let task_b = TaskInfo {
+        path: PathBuf::from("/tmp/b"),
+        size: 100,
+        identifier: TestId("b".into()),
+        phase_id: phase_b.clone(),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: "task-b".into(),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    pool.extend(vec![task_b]).expect("extend valid");
+    pool
+}
+
+/// (6) THE phase-boundary stall regression — PEER-completion arm.
+///
+/// Scenario (the asm-dataset-nix 1-worker stall): this node is the
+/// promoted primary. A PEER's worker completes the lone item of
+/// phase-a; the `DistributedMessage::TaskComplete` arrives via
+/// `handle_peer_message`. That handler runs `note_primary_item_completed`,
+/// which drains phase-a and flips phase-b Blocked → Active — but unlike
+/// the own-worker `worker_event` arm, the peer arm has NO follow-up
+/// `request_task_for_worker(worker_id)` for our own workers. Pre-fix it
+/// also had no `repoll_idle_workers`, so OUR lone idle worker never
+/// learned phase-b activated and the run hung at the phase boundary
+/// until the periodic safety-net repoll (per-worker backoff-rate-
+/// limited, 1s→60s) eventually rescued it — or never reliably did.
+///
+/// Post-fix the peer-completion arm mirrors the failure arm's
+/// synchronous `repoll_idle_workers(factory)`. This test asserts the
+/// phase-b item is dispatched to the idle worker WITHIN the
+/// `handle_peer_message` call frame: phase-b leaves the pool and lands
+/// in `primary_in_flight`.
+///
+/// Fixture: a real Ready (idle) worker via `pool.initialize` +
+/// `FakeWorkerFactory` (hence the `LocalSet` — the fake runner spawns
+/// via `spawn_local`). `request_task_for_worker`'s primary self-assign
+/// branch bypasses the per-worker backoff gate, so the first poll after
+/// the worker goes idle is NOT suppressed; the dispatch lands this tick.
+#[tokio::test(flavor = "current_thread")]
+async fn peer_completion_repolls_idle_worker_for_newly_active_phase() {
+    use dynrunner_protocol_primary_secondary::DistributedMessage;
+    use super::super::primary::task_file_hash;
+    use super::super::test_helpers::FakeWorkerFactory;
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let phase_a = PhaseId::from("phase-a");
+            let phase_b = PhaseId::from("phase-b");
+            let mut sec = make_secondary(election_config("sec-0"));
+            sec.is_primary = true;
+
+            // Bring the lone worker to Ready (idle) via the fake runner.
+            let max = sec.config.max_resources.clone();
+            let scheduler = dynrunner_scheduler::ResourceStealingScheduler::memory();
+            {
+                let mut factory = FakeWorkerFactory;
+                sec.pool
+                    .initialize(1, &max, &scheduler, &mut factory, false, None)
+                    .await
+                    .expect("pool init");
+            }
+
+            let pool = two_phase_pool_a_inflight_b_blocked(&phase_a, &phase_b);
+            // Capture the canonical pool key of phase-b's task — this is
+            // the key `handle_primary_task_request` will use when it
+            // marks the dispatched item in-flight.
+            let hash_b = pool
+                .iter()
+                .find(|t| t.task_id == "task-b")
+                .map(task_file_hash)
+                .expect("task-b present in the fixture pool");
+            sec.primary_pending = Some(pool);
+            // The peer dispatched task-a as primary-on-this-node's
+            // in-flight item; key `primary_in_flight` under the wire
+            // task_hash so `note_primary_item_completed` finds + drains
+            // it. (On the live path the wire `task_hash` IS this key.)
+            sec.primary_in_flight
+                .insert("hash-a".into(), make_in_flight("a", "phase-a"));
+
+            // Pre-condition: phase-b is Blocked (not yet dispatchable),
+            // and the worker is idle.
+            assert_eq!(
+                sec.primary_pending.as_ref().unwrap().phase_state(&phase_b),
+                Some(PhaseState::Blocked),
+                "phase-b starts Blocked behind phase-a"
+            );
+            assert!(
+                sec.pool.workers[0].is_idle_state(),
+                "worker idle before the completion"
+            );
+
+            // Drive the peer-completion wire arrival. `&mut None`
+            // command_rx (no spawn-tasks callback in this scenario);
+            // `&mut factory` so the repoll can dispatch.
+            let mut factory = FakeWorkerFactory;
+            let msg = DistributedMessage::TaskComplete {
+                sender_id: "peer-1".into(),
+                timestamp: 0.0,
+                secondary_id: "peer-1".into(),
+                worker_id: 99, // a PEER's worker, not ours
+                task_hash: "hash-a".into(),
+                result_data: None,
+            };
+            sec.handle_peer_message(msg, &mut None, &mut factory).await;
+
+            // Post-condition: phase-b's task was dispatched to OUR idle
+            // worker within the handler frame. THE regression-pin:
+            // pre-fix the peer arm did not repoll, so task-b stayed in
+            // the pool and the worker stayed idle.
+            assert!(
+                sec.primary_in_flight.contains_key(&hash_b),
+                "phase-b task dispatched (in_flight) via the success-path \
+                 repoll after the peer completion drained phase-a"
+            );
+            assert!(
+                sec.primary_pending
+                    .as_mut()
+                    .unwrap()
+                    .take_first_match(|t| t.task_id == "task-b")
+                    .is_none(),
+                "phase-b task removed from the pool by the dispatch"
+            );
+            assert!(
+                !sec.pool.workers[0].is_idle_state(),
+                "the lone worker is no longer idle — it received task-b"
+            );
+        })
+        .await;
+}

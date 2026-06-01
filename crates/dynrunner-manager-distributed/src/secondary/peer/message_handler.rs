@@ -95,6 +95,20 @@ where
                 // peer's completion message is the only signal the
                 // pool gets that the item is no longer in flight.
                 self.note_primary_item_completed(&task_hash, command_rx).await;
+                // Synchronous kickstart (mirrors the TaskFailed arm
+                // below and the live-primary's
+                // `dispatch_to_idle_workers` after
+                // `note_item_completed`): the phase-lifecycle cascade
+                // inside `note_primary_item_completed` may have just
+                // flipped a Blocked successor phase to Active. This is
+                // a PEER's completion — there is no own-worker
+                // `request_task_for_worker` follow-up on this arm, so
+                // without this re-poll OUR idle workers never learn the
+                // successor phase activated and the run stalls at the
+                // phase boundary until the periodic
+                // `repoll_idle_workers` safety net fires. No-op when no
+                // worker is idle.
+                self.repoll_idle_workers(factory).await;
                 tracing::debug!(
                     peer = %secondary_id,
                     task_hash,

@@ -170,6 +170,22 @@ where
                         // firing is what unblocks chained phases in
                         // the primary pool.
                         self.note_primary_item_completed(&hash, command_rx).await;
+                        // Synchronous kickstart (mirrors the failure
+                        // path below and the live-primary's
+                        // `dispatch_to_idle_workers` after
+                        // `note_item_completed` in
+                        // `primary/task/complete.rs`): the phase-
+                        // lifecycle cascade inside
+                        // `note_primary_item_completed` may have just
+                        // flipped a Blocked successor phase to Active.
+                        // Workers idle since their last "no work"
+                        // TaskRequest won't re-poll on their own —
+                        // re-poll OUR idle workers so a freshly-active
+                        // phase's items reach them on this tick rather
+                        // than waiting up to one keepalive interval for
+                        // the periodic `repoll_idle_workers` safety net.
+                        // No-op when no worker is idle.
+                        self.repoll_idle_workers(factory).await;
                         // Report completion to the current primary
                         // (whichever node currently holds authority).
                         let msg = DistributedMessage::TaskComplete {
