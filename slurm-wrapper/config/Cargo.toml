@@ -1,0 +1,18 @@
+[package]
+name = "dynrunner-slurm-wrapper-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Serde schema for the SLURM secondary wrapper binary's JSON config — single source of truth shared by the renderer (dynrunner-slurm) and the wrapper binary."
+
+[lib]
+name = "dynrunner_slurm_wrapper_config"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
