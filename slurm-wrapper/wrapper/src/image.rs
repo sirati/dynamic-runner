@@ -69,6 +69,7 @@ mod tests {
     /// overrides only `image_path`/`load_command` per case.
     fn cfg_with(image_path: String, load_command: String) -> WrapperConfig {
         WrapperConfig {
+            name_prefix: "asm".to_string(),
             rand_suffix: "2f1d4e89".to_string(),
             secondary_id: "sec-0".to_string(),
             image_path,

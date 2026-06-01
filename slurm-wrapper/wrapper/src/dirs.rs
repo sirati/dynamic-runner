@@ -12,8 +12,8 @@ use std::path::PathBuf;
 /// socket_dir, cmd_socket, the shutdown unit name, and LOCAL_IMAGE.
 #[derive(Debug, Clone)]
 pub struct Layout {
-    pub rndtmp: PathBuf,            // /tmp/asm-<suffix>              (generate.rs:35)
-    pub container_name: String,     // asm-<suffix>-<secondary_id>    (:36)
+    pub rndtmp: PathBuf,            // /tmp/<name_prefix>-<suffix>    (generate.rs:35)
+    pub container_name: String,     // <name_prefix>-<suffix>-<secondary_id> (:36)
     pub src_tmp: PathBuf,           // <rndtmp>/src                   (:38)
     pub out_tmp: PathBuf,           // <rndtmp>/out                   (:39)
     pub log_tmp: PathBuf,           // <rndtmp>/log                   (:40)
@@ -30,8 +30,9 @@ pub struct Layout {
 impl Layout {
     /// Pure derivation from config — no filesystem side effects.
     pub fn derive(cfg: &WrapperConfig) -> Self {
-        let rndtmp = PathBuf::from(format!("/tmp/asm-{}", cfg.rand_suffix));
-        let container_name = format!("asm-{}-{}", cfg.rand_suffix, cfg.secondary_id);
+        let rndtmp = PathBuf::from(format!("/tmp/{}-{}", cfg.name_prefix, cfg.rand_suffix));
+        let container_name =
+            format!("{}-{}-{}", cfg.name_prefix, cfg.rand_suffix, cfg.secondary_id);
 
         let src_tmp = rndtmp.join("src");
         let out_tmp = rndtmp.join("out");
@@ -90,6 +91,7 @@ mod tests {
 
     fn cfg_with(suffix: &str, secondary_id: &str, basename: &str) -> WrapperConfig {
         WrapperConfig {
+            name_prefix: "asm".to_string(),
             rand_suffix: suffix.to_string(),
             secondary_id: secondary_id.to_string(),
             image_path: "/staged/img.tar".to_string(),
