@@ -3,9 +3,11 @@
 //! [`WrapperConfig`] is the typed replacement for every value that the
 //! legacy bash generator
 //! (`crates/dynrunner-slurm/src/wrapper_script/generate.rs`) baked into
-//! the heredoc at render time. The renderer serializes a `WrapperConfig`
-//! to JSON next to the job script; the wrapper binary deserializes it
-//! and performs the work the bash used to do.
+//! the heredoc at render time. The renderer emits a `WrapperConfig` as
+//! command-line flags (`WrapperConfig::to_args`) onto the wrapper
+//! invocation; the wrapper binary parses those flags back into a
+//! `WrapperConfig` (the `cli` feature) and performs the work the bash
+//! used to do.
 //!
 //! Boundary contract: this struct holds ONLY render-time inputs — values
 //! the gateway/submission side knows. Everything the bash computed *at
@@ -17,16 +19,22 @@
 //! This crate is the single source of truth for the schema: it is a
 //! member of the standalone `slurm-wrapper` workspace (built into the
 //! musl binary) AND a path dependency of the repo-root `dynrunner-slurm`
-//! crate (which constructs and serializes it). Keeping one type on both
-//! sides removes any chance of the renderer and the consumer drifting.
+//! crate (which constructs and emits it). Keeping one type on both sides
+//! removes any chance of the renderer and the consumer drifting.
+//!
+//! Encode↔decode contract: [`WrapperConfig::to_args`] (always available,
+//! no clap needed) emits exactly the flags the `cli`-feature parser
+//! accepts, and the parser reconstructs the identical struct. The
+//! `to_args() -> parse -> assert_eq` round-trip test is the anti-drift
+//! guard. The renderer only links `to_args`; the wrapper binary enables
+//! the `cli` feature for the parser.
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Everything the wrapper binary needs that the submission side knows at
 /// render time. Field docs cite the `generate.rs` line/section each value
 /// replaces so the port stays auditable against the bash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrapperConfig {
     /// Consumer-supplied short identifier for their program/deployment
     /// (the consumer passes e.g. `"asm"`). Prefixes BOTH the scratch dir
@@ -128,7 +136,7 @@ pub struct WrapperConfig {
 
 /// How the secondary connects to the primary
 /// (`config.rs::ConnectionMode`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionMode {
     /// Secondary dials the primary via a gateway host:port
     /// (`generate.rs:781-790`, `:634-642`). The secondary URL is
@@ -144,11 +152,91 @@ pub enum ConnectionMode {
     Reverse { connection_info_dir: String },
 }
 
+impl WrapperConfig {
+    /// Emit the exact CLI flags the `cli`-feature parser accepts — the
+    /// inverse of parsing. ALWAYS available (no clap dependency): the
+    /// renderer (`dynrunner-slurm`) links only this side. `Option<T>`
+    /// fields are omitted when `None`; the two `Vec<String>` fields are
+    /// emitted as repeated flags; the `ConnectionMode` enum is emitted as
+    /// `--connection <variant>` plus its variant-specific flags.
+    pub fn to_args(&self) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
+
+        let mut push = |flag: &str, value: &str| {
+            a.push(flag.to_string());
+            a.push(value.to_string());
+        };
+
+        push("--name-prefix", &self.name_prefix);
+        push("--rand-suffix", &self.rand_suffix);
+        push("--secondary-id", &self.secondary_id);
+
+        push("--image-path", &self.image_path);
+        push("--image-tar-basename", &self.image_tar_basename);
+        push("--image-name", &self.image_name);
+        push("--image-tag", &self.image_tag);
+        push("--load-command", &self.load_command);
+
+        push("--container-command", &self.container_command);
+        push("--cores-spec", &self.cores_spec);
+        push("--max-memory-spec", &self.max_memory_spec);
+        if let Some(bytes) = self.mem_manager_reserved_bytes {
+            push("--mem-manager-reserved-bytes", &bytes.to_string());
+        }
+        for arg in &self.forwarded_argv {
+            push("--forwarded-arg", arg);
+        }
+        for arg in &self.extra_run_args {
+            push("--extra-run-arg", arg);
+        }
+
+        push("--srcbins-network", &self.srcbins_network);
+        push("--output-network", &self.output_network);
+        push("--log-network", &self.log_network);
+        if let Some(dir) = &self.dynrunner_network_dir {
+            push("--dynrunner-network-dir", dir);
+        }
+
+        match &self.connection {
+            ConnectionMode::Standard {
+                gateway_host,
+                gateway_port,
+            } => {
+                push("--connection", "standard");
+                push("--gateway-host", gateway_host);
+                push("--gateway-port", &gateway_port.to_string());
+            }
+            ConnectionMode::Reverse {
+                connection_info_dir,
+            } => {
+                push("--connection", "reverse");
+                push("--connection-info-dir", connection_info_dir);
+            }
+        }
+
+        // Emitted explicitly in both states so the round-trip is unambiguous
+        // (a bare presence-flag could not distinguish false from omitted).
+        push("--is-observer", if self.is_observer { "true" } else { "false" });
+
+        if let Some(path) = &self.shutdown_manager_bin_path {
+            push("--shutdown-manager-bin-path", &path.to_string_lossy());
+        }
+
+        a
+    }
+}
+
+#[cfg(feature = "cli")]
+mod cli;
+
+#[cfg(feature = "cli")]
+pub use cli::parse_args;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample(connection: ConnectionMode) -> WrapperConfig {
+    pub(crate) fn sample(connection: ConnectionMode) -> WrapperConfig {
         WrapperConfig {
             name_prefix: "asm".to_string(),
             rand_suffix: "2f1d4e89".to_string(),
@@ -173,45 +261,5 @@ mod tests {
             is_observer: false,
             shutdown_manager_bin_path: Some(PathBuf::from("/opt/dynrunner-slurm-shutdown")),
         }
-    }
-
-    /// The schema must survive a JSON round-trip byte-for-byte at the
-    /// value level — this is the renderer→binary contract.
-    #[test]
-    fn json_round_trip_reverse() {
-        let cfg = sample(ConnectionMode::Reverse {
-            connection_info_dir: "/net/conn".to_string(),
-        });
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: WrapperConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, back);
-    }
-
-    #[test]
-    fn json_round_trip_standard() {
-        let cfg = sample(ConnectionMode::Standard {
-            gateway_host: "gw.cluster".to_string(),
-            gateway_port: 4433,
-        });
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: WrapperConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, back);
-    }
-
-    /// Optional fields must round-trip in their `None`/empty shapes too.
-    #[test]
-    fn json_round_trip_minimal() {
-        let mut cfg = sample(ConnectionMode::Standard {
-            gateway_host: "gw".to_string(),
-            gateway_port: 1,
-        });
-        cfg.mem_manager_reserved_bytes = None;
-        cfg.forwarded_argv.clear();
-        cfg.extra_run_args.clear();
-        cfg.dynrunner_network_dir = None;
-        cfg.shutdown_manager_bin_path = None;
-        let json = serde_json::to_string(&cfg).unwrap();
-        let back: WrapperConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, back);
     }
 }

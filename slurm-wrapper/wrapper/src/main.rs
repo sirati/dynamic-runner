@@ -3,8 +3,9 @@
 //! This binary replaces the bash heredoc that
 //! `crates/dynrunner-slurm/src/wrapper_script/generate.rs` used to
 //! render. Invoked by a tiny stub script as the sbatch entrypoint
-//! (`exec <wrapper-bin> --config <cfg.json>`), it deserializes a
-//! [`WrapperConfig`] and performs the full secondary lifecycle:
+//! (`exec <wrapper-bin> --name-prefix ... --connection ...`), it parses a
+//! [`WrapperConfig`] from its CLI flags and performs the full secondary
+//! lifecycle:
 //!
 //!   1. derive scratch-dir layout + create dirs        (`dirs`)
 //!   2. resolve podman/rm absolute paths               (`bin_resolve`)
@@ -43,7 +44,6 @@ mod teardown;
 
 use dynrunner_slurm_wrapper_config::{ConnectionMode, WrapperConfig};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -72,22 +72,10 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let config_path = match parse_config_path(std::env::args().skip(1)) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!(target: LOG_TARGET, "argv error: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let cfg = match load_config(&config_path) {
+    let cfg = match dynrunner_slurm_wrapper_config::parse_args(std::env::args()) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(
-                target: LOG_TARGET,
-                "failed to load config {}: {e}",
-                config_path.display()
-            );
+            tracing::error!(target: LOG_TARGET, "argv error: {e}");
             return ExitCode::from(2);
         }
     };
@@ -462,25 +450,6 @@ fn banner_job_completed() {
     tracing::info!(target: LOG_TARGET, "==================================================");
 }
 
-/// `--config <path>` is the only argument. Mirrors the stub script's
-/// `exec <wrapper-bin> --config <cfg.json>`.
-fn parse_config_path<I: Iterator<Item = String>>(mut args: I) -> Result<PathBuf, String> {
-    match args.next().as_deref() {
-        Some("--config") => match args.next() {
-            Some(path) => Ok(PathBuf::from(path)),
-            None => Err("--config requires a path argument".to_string()),
-        },
-        Some(other) => Err(format!("unexpected argument: {other} (expected --config <path>)")),
-        None => Err("missing --config <path>".to_string()),
-    }
-}
-
-/// Read + deserialize the [`WrapperConfig`] JSON.
-fn load_config(path: &PathBuf) -> Result<WrapperConfig, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    serde_json::from_slice(&bytes).map_err(|e| e.to_string())
-}
-
 /// stderr logging via `tracing`, honouring `RUST_LOG` (default `info`).
 fn init_logging() {
     use tracing_subscriber::EnvFilter;
@@ -496,20 +465,60 @@ fn init_logging() {
 mod tests {
     use super::*;
 
+    /// The wrapper now parses its `WrapperConfig` straight from CLI flags.
+    /// A full standard-mode flag set parses into the expected struct (the
+    /// exhaustive encode↔decode round-trip lives in the config crate; here
+    /// we only confirm `main`'s entrypoint wiring through `parse_args`).
     #[test]
-    fn parses_config_flag() {
-        let args = vec!["--config".to_string(), "/tmp/cfg.json".to_string()];
+    fn parses_config_from_flags() {
+        let argv = [
+            "dynrunner-slurm-wrapper",
+            "--name-prefix", "asm",
+            "--rand-suffix", "2f1d4e89",
+            "--secondary-id", "sec-0",
+            "--image-path", "/staged/img.tar",
+            "--image-tar-basename", "img.tar",
+            "--image-name", "img",
+            "--image-tag", "latest",
+            "--load-command", "true",
+            "--container-command", "cmd",
+            "--cores-spec", "-2",
+            "--max-memory-spec", "-2G",
+            "--srcbins-network", "/net/srcbins",
+            "--output-network", "/net/out",
+            "--log-network", "/net/log",
+            "--connection", "standard",
+            "--gateway-host", "gw",
+            "--gateway-port", "4433",
+            "--is-observer", "false",
+        ];
+        let cfg = dynrunner_slurm_wrapper_config::parse_args(argv).unwrap();
+        assert_eq!(cfg.secondary_id, "sec-0");
         assert_eq!(
-            parse_config_path(args.into_iter()).unwrap(),
-            PathBuf::from("/tmp/cfg.json")
+            cfg.connection,
+            ConnectionMode::Standard {
+                gateway_host: "gw".to_string(),
+                gateway_port: 4433,
+            }
         );
     }
 
+    /// Argv errors (missing required flag, unknown flag, no args) surface
+    /// as `Err` so `main` can exit nonzero.
     #[test]
-    fn rejects_missing_flag() {
-        assert!(parse_config_path(Vec::<String>::new().into_iter()).is_err());
-        assert!(parse_config_path(vec!["--config".to_string()].into_iter()).is_err());
-        assert!(parse_config_path(vec!["bogus".to_string()].into_iter()).is_err());
+    fn rejects_bad_argv() {
+        assert!(dynrunner_slurm_wrapper_config::parse_args(
+            ["dynrunner-slurm-wrapper"]
+        )
+        .is_err());
+        assert!(dynrunner_slurm_wrapper_config::parse_args(
+            ["dynrunner-slurm-wrapper", "--name-prefix", "asm"]
+        )
+        .is_err());
+        assert!(dynrunner_slurm_wrapper_config::parse_args(
+            ["dynrunner-slurm-wrapper", "--bogus"]
+        )
+        .is_err());
     }
 
     #[test]

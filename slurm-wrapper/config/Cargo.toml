@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Serde schema for the SLURM secondary wrapper binary's JSON config — single source of truth shared by the renderer (dynrunner-slurm) and the wrapper binary."
+description = "CLI-flag schema for the SLURM secondary wrapper binary — single source of truth shared by the renderer (dynrunner-slurm, emits via to_args) and the wrapper binary (parses via the cli feature)."
 
 [lib]
 name = "dynrunner_slurm_wrapper_config"
 path = "src/lib.rs"
 
-[dependencies]
-serde = { workspace = true }
+[features]
+# `to_args()` is always available (no clap). The `cli` feature adds the
+# clap parser; the wrapper binary enables it, the renderer does not.
+default = []
+cli = ["dep:clap"]
 
-[dev-dependencies]
-serde_json = { workspace = true }
+[dependencies]
+clap = { version = "4", features = ["derive"], optional = true }
