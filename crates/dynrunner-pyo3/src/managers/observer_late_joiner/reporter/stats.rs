@@ -183,8 +183,8 @@ impl StatsSnapshot {
 /// True iff `state` is a terminal state for dependency-resolution
 /// purposes (the pool resolves a dep once its prereq is `Completed` OR
 /// permanently failed; in the CRDT the permanent-failure set is
-/// `Failed` ∪ `Unfulfillable`). `Blocked` is cascade-paused, not
-/// terminal.
+/// `Failed` ∪ `Unfulfillable` ∪ `InvalidTask`). `Blocked` is
+/// cascade-paused, not terminal.
 #[allow(dead_code)]
 fn is_terminal<I>(state: &TaskState<I>) -> bool {
     matches!(
@@ -192,6 +192,7 @@ fn is_terminal<I>(state: &TaskState<I>) -> bool {
         TaskState::Completed { .. }
             | TaskState::Failed { .. }
             | TaskState::Unfulfillable { .. }
+            | TaskState::InvalidTask { .. }
     )
 }
 
@@ -208,7 +209,8 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
         | TaskState::Completed { task }
         | TaskState::Failed { task, .. }
         | TaskState::Unfulfillable { task, .. }
-        | TaskState::Blocked { task, .. } => task,
+        | TaskState::Blocked { task, .. }
+        | TaskState::InvalidTask { task, .. } => task,
     }
 }
 
