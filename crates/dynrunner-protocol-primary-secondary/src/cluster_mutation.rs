@@ -5,10 +5,31 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{ErrorType, PhaseId, WorkerId, TaskInfo};
+use dynrunner_core::{ErrorType, PhaseId, ResourceAmount, WorkerId, TaskInfo};
 use serde::{Deserialize, Serialize};
 
 use crate::removal_cause::RemovalCause;
+
+/// The static, per-secondary capacity a secondary advertises once at
+/// connect time: how many worker slots it can run concurrently and the
+/// opaque resource amounts it brought to the cluster.
+///
+/// This is the value half of the replicated capacity map (see
+/// `dynrunner_manager_distributed::cluster_state`) and the payload the
+/// [`ClusterMutation::SecondaryCapacity`] variant carries. It is static
+/// for a secondary's lifetime in the run — the framework records it once
+/// and never overwrites it (set-once apply semantics), so a freshly-
+/// promoted primary and late-joining observers reconstruct the full
+/// roster from the replicated map alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryCapacityRecord {
+    /// Concurrent worker slots the secondary can run.
+    pub worker_count: u32,
+    /// Opaque resource amounts advertised at connect. The framework
+    /// does not interpret these; downstream scheduler / matcher policy
+    /// attaches meaning (same opacity contract as `peer_holdings`).
+    pub resources: Vec<ResourceAmount>,
+}
 
 /// One CRDT mutation. Idempotent under repetition; safe under reorder
 /// within the per-task happens-before constraint that the dispatcher
@@ -191,6 +212,31 @@ pub enum ClusterMutation<I> {
         peer_id: String,
         holdings: Vec<String>,
         epoch: u64,
+    },
+    /// A secondary's static, advertised capacity — the worker-slot
+    /// count and resource amounts it brought to the cluster.
+    ///
+    /// Originated by the primary at the same point it originates
+    /// `PeerJoined` (the `SecondaryWelcome` accept in `primary/connect.rs`),
+    /// carrying the `worker_count` + `resources` the welcome announced.
+    /// Replicated into the snapshotted `secondary_capacities` map on
+    /// `ClusterState` so a freshly-promoted primary AND late-joining
+    /// observers hold the full per-secondary roster the moment they
+    /// restore a snapshot — without it a promoted primary starts with
+    /// `alive_worker_count() == 0` and cannot dispatch (the roster was
+    /// 100% primary-local and `PeerJoined` dropped the `worker_count`).
+    ///
+    /// Set-once apply semantics (see `ClusterState::apply`): the first
+    /// apply for a given `secondary` records the record; every
+    /// subsequent apply for the same id is a NoOp. Capacity is static
+    /// for the secondary's lifetime in the run, so re-application
+    /// (snapshot replay, redundant peer-forwarding, the idempotent
+    /// PeerJoined re-emit from `send_peer_lists`) never clobbers the
+    /// first-recorded value.
+    SecondaryCapacity {
+        secondary: String,
+        worker_count: u32,
+        resources: Vec<ResourceAmount>,
     },
     /// Runtime task injection: introduce a batch of brand-new
     /// `TaskInfo<I>` entries into the replicated ledger so the live

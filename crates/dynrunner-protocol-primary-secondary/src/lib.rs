@@ -12,7 +12,7 @@ pub use address::{
     install_role_change_hook, new_role_cache, read_role_cache, seed_self_role, Address, Role,
     RoleCache, RoleChangeHookRegistrar, RoleTable, Scope,
 };
-pub use cluster_mutation::ClusterMutation;
+pub use cluster_mutation::{ClusterMutation, SecondaryCapacityRecord};
 pub use messages::*;
 pub use removal_cause::RemovalCause;
 pub use codec::{serialize_message, deserialize_message, decode_frame};

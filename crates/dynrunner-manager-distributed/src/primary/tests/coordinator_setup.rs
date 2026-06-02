@@ -164,6 +164,107 @@ fn drain_peer_joined(
     out
 }
 
+/// Drain the welcomed secondary's inbox and return every
+/// `ClusterMutation::SecondaryCapacity` mutation observed across all
+/// envelopes, as `(secondary, worker_count, resources)` tuples in
+/// arrival order. Mirrors `drain_peer_joined` for the capacity record
+/// originated at the same `handle_welcome` site.
+#[allow(clippy::type_complexity)]
+fn drain_secondary_capacity(
+    rx: &mut tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+) -> Vec<(String, u32, Vec<dynrunner_core::ResourceAmount>)> {
+    let mut out = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+            for m in mutations {
+                if let dynrunner_protocol_primary_secondary::ClusterMutation::SecondaryCapacity {
+                    secondary,
+                    worker_count,
+                    resources,
+                } = m
+                {
+                    out.push((secondary, worker_count, resources));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `handle_welcome` originates a `ClusterMutation::SecondaryCapacity`
+/// alongside the `PeerJoined`, carrying the `worker_count` + advertised
+/// resources the welcome announced (historically dropped at this site —
+/// the worker roster was 100% primary-local, so a promoted primary
+/// started `alive_worker_count() == 0`). Asserts both surfaces from one
+/// fixture: the broadcast envelope on the welcomed secondary's inbound
+/// channel, and the local apply recorded the capacity into the
+/// replicated ledger (readable via the CRDT accessors).
+#[tokio::test(flavor = "current_thread")]
+async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async {
+        let (transport, mut secondary_ends) = setup_test(1);
+        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            PrimaryCoordinator::new(
+                make_test_primary_config(1),
+                transport,
+                NoPeers,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+
+        let (id, mut to_sec_rx, _outgoing) = secondary_ends.remove(0);
+
+        // A welcome advertising a non-default worker count + a memory
+        // resource, so the assertion pins that the ORIGINATED capacity
+        // carries the welcome's values, not a default.
+        let welcome = DistributedMessage::SecondaryWelcome {
+            sender_id: id.clone(),
+            timestamp: 0.0,
+            secondary_id: id.clone(),
+            resources: vec![dynrunner_core::ResourceAmount {
+                kind: dynrunner_core::ResourceKind::memory(),
+                amount: 8 * 1024 * 1024 * 1024,
+            }],
+            worker_count: 6,
+            hostname: "test".into(),
+            is_observer: false,
+        };
+        primary.handle_welcome(welcome).await;
+
+        // Surface 1: the capacity record is broadcast over the mesh
+        // carrying the welcome's worker_count + resources.
+        let observed = drain_secondary_capacity(&mut to_sec_rx);
+        assert_eq!(
+            observed,
+            vec![(
+                id.clone(),
+                6,
+                vec![dynrunner_core::ResourceAmount {
+                    kind: dynrunner_core::ResourceKind::memory(),
+                    amount: 8 * 1024 * 1024 * 1024,
+                }]
+            )],
+            "handle_welcome must originate exactly one SecondaryCapacity \
+             carrying the welcome's worker_count + resources; got {:?}",
+            observed
+        );
+
+        // Surface 2: the local apply recorded the capacity into the
+        // replicated ledger — the roster + totals are CRDT-derivable.
+        let cs = primary.cluster_state_for_test();
+        let cap = cs
+            .secondary_capacity(&id)
+            .expect("SecondaryCapacity must be applied locally on the primary");
+        assert_eq!(cap.worker_count, 6);
+        assert_eq!(cs.total_worker_count(), 6);
+        assert_eq!(
+            cs.known_secondaries().collect::<Vec<_>>(),
+            vec![id.as_str()]
+        );
+    }).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
     let local = tokio::task::LocalSet::new();

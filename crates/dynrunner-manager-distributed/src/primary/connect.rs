@@ -230,6 +230,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "secondary connected"
             );
 
+            // Capture the advertised capacity before `resources` is
+            // moved into the per-secondary connection state below, so
+            // the same welcome originates the static `SecondaryCapacity`
+            // record into the replicated ledger (see the broadcast
+            // batch below). `worker_count` is `Copy`; `resources` is
+            // cloned once.
+            let advertised_resources = resources.clone();
             let conn = SecondaryConnection::new(secondary_id.clone());
             let conn = conn.receive_welcome(
                 worker_count,
@@ -260,10 +267,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // its observer batch idempotently (the `apply_peer_joined`
             // rule short-circuits NoOp on re-applies for an already-
             // alive id whose observer projection isn't changing).
+            // Originate the static `SecondaryCapacity` record alongside
+            // `PeerJoined`, carrying the `worker_count` + advertised
+            // resources the welcome announced (historically dropped
+            // here — the worker roster was 100% primary-local, so a
+            // promoted primary started `alive_worker_count() == 0`).
+            // Set-once apply: the idempotent re-emits this site shares
+            // with `PeerJoined` (e.g. via `send_peer_lists`) NoOp on
+            // re-application.
             self.apply_and_broadcast_cluster_mutations(vec![
                 ClusterMutation::PeerJoined {
-                    peer_id: secondary_id,
+                    peer_id: secondary_id.clone(),
                     is_observer,
+                },
+                ClusterMutation::SecondaryCapacity {
+                    secondary: secondary_id,
+                    worker_count,
+                    resources: advertised_resources,
                 },
             ])
             .await;

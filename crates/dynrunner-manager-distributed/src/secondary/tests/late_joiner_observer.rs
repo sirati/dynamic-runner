@@ -89,6 +89,7 @@
             observers,
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
+            secondary_capacities: HashMap::new(),
         }
     }
 

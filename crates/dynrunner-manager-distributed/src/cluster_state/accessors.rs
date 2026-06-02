@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, TaskInfo, TaskOutputs, WorkerId};
-use dynrunner_protocol_primary_secondary::RoleTable;
+use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
 
 use super::{ClusterState, OutcomeSummary, StateCounts, TaskState};
 
@@ -260,5 +260,33 @@ impl<I: Identifier> ClusterState<I> {
     /// when the peer mesh is still up but the run is genuinely over.
     pub fn run_complete(&self) -> bool {
         self.run_complete
+    }
+
+    /// Borrow a secondary's static capacity record (worker-slot count +
+    /// advertised resources), or `None` if no `SecondaryCapacity`
+    /// mutation for that id has been applied yet. Set once per
+    /// secondary by the `SecondaryCapacity` apply rule.
+    pub fn secondary_capacity(&self, secondary: &str) -> Option<&SecondaryCapacityRecord> {
+        self.secondary_capacities.get(secondary)
+    }
+
+    /// The set of secondary ids the cluster has a replicated capacity
+    /// record for — the known-secondary roster derived purely from the
+    /// CRDT. A freshly-promoted primary and observers read this to
+    /// reconstruct the worker roster on failover (the roster was
+    /// historically 100% primary-local and lost on promotion).
+    pub fn known_secondaries(&self) -> impl Iterator<Item = &str> {
+        self.secondary_capacities.keys().map(String::as_str)
+    }
+
+    /// Total advertised worker-slot count across every secondary with a
+    /// replicated capacity record. CRDT-derived occupancy DENOMINATOR
+    /// for the worker-roster stats and the failover roster
+    /// reconstruction — sum of every secondary's `worker_count`.
+    pub fn total_worker_count(&self) -> u64 {
+        self.secondary_capacities
+            .values()
+            .map(|c| u64::from(c.worker_count))
+            .sum()
     }
 }

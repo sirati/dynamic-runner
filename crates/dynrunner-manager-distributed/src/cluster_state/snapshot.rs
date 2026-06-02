@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
+use dynrunner_protocol_primary_secondary::SecondaryCapacityRecord;
 use serde::{Deserialize, Serialize};
 
 use super::ClusterState;
@@ -53,6 +54,16 @@ use super::TaskState;
 ///   entry only when the local map has no entry for that key. This
 ///   matches the `tasks` lattice's monotonic-terminal-wins shape
 ///   projected onto the cache's single-write-per-key semantics.
+/// - `secondary_capacities`: per-secondary first-write-wins. Each
+///   entry is set exactly once by the originating `SecondaryCapacity`
+///   apply arm (set-once; capacity is static for the run), so a
+///   snapshot's entry and a live-applied entry for the same secondary
+///   carry the same value — the merge inserts a snapshot entry only
+///   when the local map has no entry for that key. Same monotonic-
+///   insertion shape as `task_outputs`. Carried so a freshly-promoted
+///   primary and late-joining observers hold the full per-secondary
+///   roster on snapshot-restore, before any live `SecondaryCapacity`
+///   broadcast reaches them.
 ///
 /// These rules make `restore` an idempotent CRDT merge — applying the
 /// same snapshot twice is a no-op, applying overlapping snapshots
@@ -110,6 +121,26 @@ pub struct ClusterStateSnapshot<I> {
     /// pre-cache shape).
     #[serde(default)]
     pub task_outputs: HashMap<String, TaskOutputs>,
+    /// Replicated per-secondary static capacity (worker-slot count +
+    /// advertised resources, one entry per secondary the
+    /// `SecondaryCapacity` apply arm has recorded). Carried so a
+    /// freshly-promoted primary and late-joining observers reconstruct
+    /// the full worker roster immediately on snapshot-restore — without
+    /// it a promoted primary starts `alive_worker_count() == 0` and
+    /// cannot dispatch.
+    ///
+    /// Merge rule on `restore`: per-secondary first-write-wins. Each
+    /// entry is set exactly once (the `SecondaryCapacity` apply is
+    /// set-once; capacity is static for the run), so a snapshot entry
+    /// and a live-applied entry for the same secondary carry the same
+    /// value — the merge keeps whichever landed first and ignores the
+    /// duplicate. Same monotonic-insertion shape as `task_outputs`.
+    ///
+    /// `#[serde(default)]` keeps wire compat with pre-feature senders
+    /// (missing field deserializes as an empty map, identical to the
+    /// pre-feature shape).
+    #[serde(default)]
+    pub secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
 }
 
 fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
@@ -161,6 +192,10 @@ impl<I: Identifier> ClusterState<I> {
             // can resolve a dependent's predecessor outputs without
             // waiting for the prereq's `TaskCompleted` to retransmit.
             task_outputs: self.task_outputs.clone(),
+            // Per-secondary static capacity — carried so a freshly-
+            // promoted primary and late-joining observers reconstruct
+            // the full worker roster on snapshot-restore.
+            secondary_capacities: self.secondary_capacities.clone(),
         }
     }
 
@@ -250,6 +285,18 @@ impl<I: Identifier> ClusterState<I> {
         // entries when the snapshot interleaves with live broadcasts.
         for (task_id, outputs) in snap.task_outputs {
             self.task_outputs.entry(task_id).or_insert(outputs);
+        }
+        // Per-secondary capacity merge: per-secondary first-write-wins,
+        // identical shape to `task_outputs`. The `SecondaryCapacity`
+        // apply is set-once, so a snapshot entry and a live-applied
+        // entry for the same secondary carry the same value — keeping
+        // the local entry when present and inserting the snapshot's
+        // entry when missing converges every replica to the same map
+        // regardless of (live-broadcast, snapshot) arrival order. A
+        // blanket replace would clobber a legitimately-applied local
+        // entry when the snapshot interleaves with live broadcasts.
+        for (secondary, record) in snap.secondary_capacities {
+            self.secondary_capacities.entry(secondary).or_insert(record);
         }
     }
 }

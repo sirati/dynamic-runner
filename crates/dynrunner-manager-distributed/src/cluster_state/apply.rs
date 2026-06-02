@@ -434,6 +434,11 @@ impl<I: Identifier> ClusterState<I> {
                 holdings,
                 epoch,
             } => self.apply_peer_resource_holdings_updated(peer_id, holdings, epoch),
+            ClusterMutation::SecondaryCapacity {
+                secondary,
+                worker_count,
+                resources,
+            } => self.apply_secondary_capacity(secondary, worker_count, resources),
             ClusterMutation::TasksSpawned { tasks } => {
                 self.apply_tasks_spawned(tasks, newly_pending_from_spawn)
             }

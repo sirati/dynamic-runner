@@ -13,8 +13,8 @@
 
 use std::collections::HashSet;
 
-use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::RemovalCause;
+use dynrunner_core::{Identifier, ResourceAmount};
+use dynrunner_protocol_primary_secondary::{RemovalCause, SecondaryCapacityRecord};
 
 use super::types::{PeerEntry, PeerState};
 use super::{ApplyOutcome, ClusterState};
@@ -172,6 +172,35 @@ impl<I: Identifier> ClusterState<I> {
                 self.peer_holdings.insert(peer_id, incoming);
                 ApplyOutcome::Applied
             }
+        }
+    }
+
+    /// Apply a `ClusterMutation::SecondaryCapacity`.
+    ///
+    /// Set-once: the first apply for a given `secondary` records its
+    /// static capacity (worker-slot count + advertised resources);
+    /// every subsequent apply for the same id is an idempotent NoOp.
+    /// Capacity is static for the secondary's lifetime in the run, so
+    /// re-application (snapshot replay, redundant peer-forwarding, the
+    /// idempotent `PeerJoined` re-emit from `send_peer_lists`) must not
+    /// clobber the first-recorded value — mirroring the static-config
+    /// shape of the `PhaseDepsSet` arm, keyed per-secondary.
+    pub(super) fn apply_secondary_capacity(
+        &mut self,
+        secondary: String,
+        worker_count: u32,
+        resources: Vec<ResourceAmount>,
+    ) -> ApplyOutcome {
+        if let std::collections::hash_map::Entry::Vacant(e) =
+            self.secondary_capacities.entry(secondary)
+        {
+            e.insert(SecondaryCapacityRecord {
+                worker_count,
+                resources,
+            });
+            ApplyOutcome::Applied
+        } else {
+            ApplyOutcome::NoOp
         }
     }
 }
