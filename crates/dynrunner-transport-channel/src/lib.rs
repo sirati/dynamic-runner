@@ -23,11 +23,13 @@ use std::time::Instant;
 
 use dynrunner_protocol_primary_secondary::Clocks;
 
+pub mod either_primary;
 pub mod manager_runner;
 pub mod mesh;
 pub mod peer_transport;
 pub mod secondary_transport;
 
+pub use either_primary::EitherPrimaryTransport;
 pub use manager_runner::{channel_pair, ChannelManagerEnd, ChannelRunnerEnd};
 pub use mesh::{peer_mesh, peer_mesh_with_adjacency};
 pub use peer_transport::ChannelPeerTransport;
@@ -59,6 +61,8 @@ pub(crate) fn now_clocks() -> Clocks {
 // that span all four receiver-side cases; partitioning further
 // would scatter the per-case assertions across files for no
 // maintainability gain.
+#[cfg(test)]
+mod tests_either_primary;
 #[cfg(test)]
 mod tests_manager_runner;
 #[cfg(test)]
