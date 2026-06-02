@@ -37,7 +37,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// One concern: turn the in-memory CRDT ledger into a fresh
     /// `PendingPool` for post-composition dispatch. The lattice
     /// (Pending / InFlight / Completed / Failed / Unfulfillable /
-    /// Cancelled / Blocked) is iterated once; only `Pending` / `Blocked`
+    /// Blocked) is iterated once; only `Pending` / `Blocked`
     /// entries enter the pool, terminal entries contribute their
     /// `task_id` to the dep-resolution seed, and `InFlight` entries are
     /// recorded as pre-owned in-flight (the originating dispatcher owns
@@ -77,17 +77,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // pool work is needed for it.
                 TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
-                | TaskState::Unfulfillable { task, .. }
-                // Panik-cancelled tasks land here too: terminal for
-                // dep-resolution (their task_id seeds
-                // `completed_task_ids` so dependents' `extend()` is
-                // accepted) and the hash is marked completed in the
-                // primary-side ledger so the new primary doesn't
-                // attempt to re-dispatch. Cancelled is a panik-
-                // sticky terminal — a hydrating new-primary inherits
-                // the latched `panik_active` via the CRDT replica
-                // and shouldn't be re-running this hash regardless.
-                | TaskState::Cancelled { task, .. } => {
+                | TaskState::Unfulfillable { task, .. } => {
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
                 }
