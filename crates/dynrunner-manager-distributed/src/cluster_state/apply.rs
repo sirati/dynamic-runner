@@ -6,8 +6,8 @@
 //! `apply_peer`; the `TasksSpawned` batch arm delegates to
 //! `apply_tasks`; the simpler per-hash transitions (`TaskAdded`,
 //! `TaskAssigned`, `TaskCompleted`, `TaskFailed`, `PrimaryChanged`,
-//! `PhaseDepsSet`, `RunComplete`, `TaskReinjected`, `TaskBlocked`,
-//! `TaskPreferredSecondariesUpdated`) live inline here.
+//! `PhaseDepsSet`, `RunComplete`, `TaskReinjected`, `TaskRequeued`,
+//! `TaskBlocked`, `TaskPreferredSecondariesUpdated`) live inline here.
 //!
 //! Two entry points: the receiver-side `apply` convenience wrapper
 //! that discards the auto-resumed list AND the freshly-Pending
@@ -363,6 +363,32 @@ impl<I: Identifier> ClusterState<I> {
                 };
                 let task = match state {
                     TaskState::Unfulfillable { task, .. } => task.clone(),
+                    _ => return ApplyOutcome::NoOp,
+                };
+                *state = TaskState::Pending { task };
+                ApplyOutcome::Applied
+            }
+            ClusterMutation::TaskRequeued { hash } => {
+                // Dead-secondary recovery moves an `InFlight { .. }`
+                // entry back to `Pending` so the live primary re-
+                // dispatches it (and a post-failover hydrate routes it
+                // into the pool rather than the in-flight ledger). Any
+                // other state is a NoOp:
+                //   * a terminal (`Completed` / `Failed` /
+                //     `Unfulfillable` / `InvalidTask`) that arrived
+                //     first wins — a worker outcome that raced the
+                //     death observation must not be resurrected;
+                //   * `Pending` is idempotent under at-least-once
+                //     delivery;
+                //   * `Blocked` is a cascade-pause, not a dispatched
+                //     task — there is nothing in flight to requeue.
+                // The preserved `TaskInfo` is moved into the new
+                // `Pending` so re-dispatch carries the same binary.
+                let Some(state) = self.tasks.get_mut(&hash) else {
+                    return ApplyOutcome::NoOp;
+                };
+                let task = match state {
+                    TaskState::InFlight { task, .. } => task.clone(),
                     _ => return ApplyOutcome::NoOp,
                 };
                 *state = TaskState::Pending { task };

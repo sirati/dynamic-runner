@@ -101,6 +101,50 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         }
     }
 
+    /// Originate the CRDT `Pending → InFlight` transition for a task
+    /// that was just committed locally (`commit_assignment`) AND
+    /// successfully sent to its secondary.
+    ///
+    /// THE single origination point for `ClusterMutation::TaskAssigned`
+    /// on the live path: every dispatch site (initial assignment, the
+    /// `TaskRequest` reply, the per-tick dispatch fan-out) calls this
+    /// helper AFTER its send succeeds, so the in-flight assignment is
+    /// replicated into every replica's CRDT mirror and the per-task
+    /// `in_flight` ledger becomes a derived cache of `TaskState::InFlight`.
+    /// Routed through the canonical
+    /// `apply_and_broadcast_cluster_mutations` path so it inherits the
+    /// same local-apply + wire-fan-out + apply-filter semantics as every
+    /// other primary-originated mutation.
+    ///
+    /// Ordering (audit R-1): originate AFTER the successful `send_to`.
+    /// A send-failure path (`rollback_assignment`) runs BEFORE this
+    /// helper is reached, so a failed send leaves NO CRDT `InFlight` to
+    /// compensate — the rollback only has to undo the local
+    /// commit triple, never a replicated transition. `commit_assignment`
+    /// still writes the local ledger/slot BEFORE the send (so a
+    /// completion racing back is attributed by hash); the CRDT
+    /// origination is the post-send half.
+    ///
+    /// Repairs failover hydration: a promoted primary / observer now
+    /// sees the task as `InFlight` and does NOT re-dispatch it (the
+    /// hydrate in-flight arm, previously dead on the live path, is now
+    /// fed live). The terminal `TaskCompleted` / `TaskFailed` transitions
+    /// out of `InFlight` already exist; a dead-secondary recovery
+    /// transitions back via `ClusterMutation::TaskRequeued`.
+    pub(crate) async fn originate_task_assigned(
+        &mut self,
+        task_hash: String,
+        secondary: String,
+        worker: u32,
+    ) {
+        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::TaskAssigned {
+            hash: task_hash,
+            secondary,
+            worker,
+        }])
+        .await;
+    }
+
     /// Phase-S/B: seed the replicated cluster ledger with the run's
     /// task graph and phase-dependency graph. Emits one
     /// `PhaseDepsSet` (carrying the canonical per-run dep graph)

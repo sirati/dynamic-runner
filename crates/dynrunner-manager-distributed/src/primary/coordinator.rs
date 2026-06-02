@@ -1546,8 +1546,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// entry. Covers BOTH locally-dispatched (a slot held it — the
     /// slot is dropped separately by the caller) and inherited
     /// (pre-owned, no slot) tasks through the ONE ledger, mirroring the
-    /// reference `check_peer_timeouts` recovery. Returns the count
-    /// requeued for the caller's log line.
+    /// reference `check_peer_timeouts` recovery.
+    ///
+    /// Returns one `ClusterMutation::TaskRequeued { hash }` per requeued
+    /// task so the async caller broadcasts the `InFlight → Pending`
+    /// transition through `apply_and_broadcast_cluster_mutations` in
+    /// lockstep with the local pool requeue. This method owns the
+    /// in-flight-ledger + pool-side recovery (a sync, data-only concern);
+    /// the CRDT replication is owned by the broadcast helper, so the
+    /// mutation set is RETURNED rather than emitted here (mirroring the
+    /// pool-returns-data / manager-broadcasts split). Without the
+    /// returned mutation the local requeue would leave a stale CRDT
+    /// `InFlight` that strands the task on failover (`hydrate` routes
+    /// `InFlight` to the ledger, not the pool).
     ///
     /// Requeue is NOT a terminal outcome — the task re-enters
     /// `Pending` — so it never touches `completed_tasks`/`failed_tasks`.
@@ -1558,21 +1569,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     pub(super) fn recover_inflight_for_dead_secondary(
         &mut self,
         secondary_id: &str,
-    ) -> usize {
+    ) -> Vec<ClusterMutation<I>> {
         let hashes: Vec<String> = self
             .in_flight
             .iter()
             .filter(|(_, e)| e.secondary_id == secondary_id)
             .map(|(h, _)| h.clone())
             .collect();
-        let recovered = hashes.len();
+        let mut requeue_mutations = Vec::with_capacity(hashes.len());
         for hash in hashes {
             if let Some(entry) = self.in_flight.remove(&hash) {
                 self.release_type_slot(&entry.task.type_id);
                 self.pool_mut().requeue(entry.task);
+                requeue_mutations.push(ClusterMutation::TaskRequeued { hash });
             }
         }
-        recovered
+        requeue_mutations
     }
 
     pub(super) fn cap_filter_view(

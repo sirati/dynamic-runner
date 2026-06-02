@@ -169,6 +169,18 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                             return Ok(());
                         }
 
+                        // Send succeeded: originate the CRDT `Pending →
+                        // InFlight` transition (the single origination
+                        // point). After the send so a failure needs no
+                        // CRDT compensation (the rollback above runs
+                        // before we reach here).
+                        self.originate_task_assigned(
+                            task_hash.clone(),
+                            sec_id.clone(),
+                            worker_id,
+                        )
+                        .await;
+
                         // Operator-facing INFO: which secondary/
                         // worker just took the task. Per-task
                         // identity (task_id / phase / type) →

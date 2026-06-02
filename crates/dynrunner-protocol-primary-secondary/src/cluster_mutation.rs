@@ -98,6 +98,36 @@ pub enum ClusterMutation<I> {
     /// previous `reason` belongs to the pre-reinject Unfulfillable
     /// state and is reset on transition to Pending.
     TaskReinjected { hash: String },
+    /// Dead-secondary recovery requeue: the secondary that held
+    /// `hash` in `TaskState::InFlight { secondary, .. }` died, so the
+    /// authoritative primary takes the task back for re-dispatch and
+    /// transitions the CRDT entry `InFlight → Pending`.
+    ///
+    /// Originated by the primary's `recover_inflight_for_dead_secondary`
+    /// (one per requeued in-flight task) and broadcast through the
+    /// canonical `apply_and_broadcast_cluster_mutations` path, so every
+    /// replica's CRDT mirror moves the entry off `InFlight` in lockstep
+    /// with the primary's local pool requeue. Without it the local pool
+    /// requeue would have no CRDT counterpart: a stale `InFlight` would
+    /// survive in the ledger, and on failover `hydrate_from_cluster_state`
+    /// (which routes `InFlight` to the in-flight ledger, NOT the pool)
+    /// would neither re-dispatch the task nor keep it dispatchable — a
+    /// lost task.
+    ///
+    /// Distinct from [`Self::TaskReinjected`] (`Unfulfillable → Pending`,
+    /// external-control resolution of a missing-resource failure): this
+    /// is internal failover recovery transitioning OUT of `InFlight`, a
+    /// different source state and a different concern.
+    ///
+    /// Re-application is a NoOp when the local state isn't `InFlight`:
+    /// a terminal that arrived first wins (a `TaskCompleted` /
+    /// `TaskFailed` that raced the death observation must not be
+    /// resurrected to `Pending`), and an already-`Pending` entry is
+    /// idempotent under at-least-once delivery. Carries no payload
+    /// beyond `hash`: the `TaskInfo` preserved on the `InFlight` entry
+    /// is moved into the new `Pending` state verbatim so the requeued
+    /// task re-dispatches the same binary.
+    TaskRequeued { hash: String },
     /// A cascade-paused dependent: `hash`'s prerequisite (identified
     /// by `on`, the prereq's task hash) just transitioned to
     /// `TaskState::Unfulfillable` and the dependent cannot make

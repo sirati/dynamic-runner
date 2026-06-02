@@ -303,6 +303,96 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
     ));
 }
 
+// ── Dead-secondary requeue (`TaskRequeued`, InFlight → Pending) ──
+
+/// `ClusterMutation::TaskRequeued { hash }` transitions an `InFlight`
+/// entry back to `Pending`, preserving the `TaskInfo` so the requeued
+/// task re-dispatches the same binary. This is the CRDT half of
+/// dead-secondary recovery: the local pool requeue and this transition
+/// move in lockstep so no stale `InFlight` survives.
+#[test]
+fn task_requeued_transitions_in_flight_back_to_pending() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "h".into(),
+        secondary: "dead-sec".into(),
+        worker: 0,
+    });
+    assert!(matches!(s.task_state("h"), Some(TaskState::InFlight { .. })));
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "h".into() }),
+        ApplyOutcome::Applied
+    );
+    let Some(TaskState::Pending { task }) = s.task_state("h") else {
+        panic!("InFlight must requeue to Pending");
+    };
+    assert_eq!(task.task_id, "h", "the preserved TaskInfo re-dispatches the same task");
+}
+
+/// `TaskRequeued` is a NoOp against every non-`InFlight` state:
+///   * `Pending` — idempotent under at-least-once delivery;
+///   * `Blocked` — a cascade-pause, not a dispatched task;
+///   * terminals (`Completed` / `Failed` / `Unfulfillable` /
+///     `InvalidTask`) — a terminal that raced the death observation
+///     wins; the requeue must NOT resurrect it to `Pending`.
+#[test]
+fn task_requeued_is_noop_against_non_in_flight_states() {
+    // Unknown hash.
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "nope".into() }),
+        ApplyOutcome::NoOp
+    );
+    // Pending (idempotent).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "p".into(),
+        task: mk_task("p"),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "p".into() }),
+        ApplyOutcome::NoOp
+    );
+    assert!(matches!(s.task_state("p"), Some(TaskState::Pending { .. })));
+    // Completed terminal wins (the Complete-before-Requeue reorder).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "c".into(),
+        task: mk_task("c"),
+    });
+    s.apply(ClusterMutation::TaskAssigned {
+        hash: "c".into(),
+        secondary: "dead-sec".into(),
+        worker: 0,
+    });
+    s.apply(ClusterMutation::TaskCompleted { hash: "c".into(), result_data: None });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "c".into() }),
+        ApplyOutcome::NoOp,
+        "a completion that raced the death observation must win"
+    );
+    assert!(matches!(s.task_state("c"), Some(TaskState::Completed { .. })));
+    // InvalidTask terminal also wins.
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "i".into(),
+        task: mk_task("i"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "i".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "dup".to_string().into(),
+        },
+        error: "invalid_task:dup".into(),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskRequeued { hash: "i".into() }),
+        ApplyOutcome::NoOp
+    );
+    assert!(matches!(s.task_state("i"), Some(TaskState::InvalidTask { .. })));
+}
+
 // ── Discrete InvalidTask state pins ──
 
 /// `TaskFailed { kind: ErrorType::InvalidTask, .. }` lands in the

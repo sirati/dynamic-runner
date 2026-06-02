@@ -862,3 +862,142 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
         "recovered task must leave the queued bucket via dispatch kickstart"
     );
 }
+
+/// R-1: a dead-secondary requeue transitions the CRDT entry
+/// `InFlight → Pending` (via the `TaskRequeued` mutation
+/// `recover_inflight_for_dead_secondary` produces and
+/// `requeue_dead_secondary` broadcasts), so a snapshot taken after the
+/// recovery — restored into a freshly-promoted primary — hydrates the
+/// task into the pool and re-dispatches it EXACTLY once.
+///
+/// Without the `TaskRequeued` transition the local pool requeue would
+/// have no CRDT counterpart: a stale `InFlight` would survive the
+/// snapshot, `hydrate_from_cluster_state` would route it to the
+/// in-flight ledger (NOT the pool), and the promoted primary would
+/// never re-dispatch it — a lost task. The "exactly once" assertion
+/// pins both failure modes: zero (the lost-task regression) and twice
+/// (a stale-InFlight + pool double-count).
+#[tokio::test(flavor = "current_thread")]
+async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
+    let (transport, _sec_rx, _kept_alive) = empty_transport();
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport,
+        dynrunner_transport_quic::NoPeerTransport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    install_default_pool(&mut primary);
+
+    // Register the dead-to-be secondary, operational.
+    let conn = SecondaryConnection::new("dead-sec".into())
+        .receive_welcome(1, vec![], "host".into(), 0, None, false)
+        .receive_cert_exchange(String::new(), None, None, 0)
+        .begin_peer_discovery()
+        .peers_ready()
+        .assignments_sent();
+    primary.secondaries.insert(
+        "dead-sec".into(),
+        SecondaryConnectionState::Operational(conn),
+    );
+    primary.seed_keepalive("dead-sec");
+
+    // The victim task: dispatched (CRDT InFlight on dead-sec/w0) AND
+    // present in the local in-flight ledger via the real
+    // `commit_assignment` lifecycle. The hash is the content hash so
+    // the CRDT key and the ledger key align (production dispatch always
+    // keys both on `compute_task_hash`).
+    let victim = TaskInfo {
+        path: std::path::PathBuf::from("victim.bin"),
+        size: 100,
+        identifier: TestId("victim".into()),
+        phase_id: PhaseId::from("default"),
+        type_id: TypeId::from("default"),
+        affinity_id: None,
+        payload: serde_json::Value::Null,
+        task_id: "victim".into(),
+        task_depends_on: vec![],
+        preferred_secondaries: SoftPreferredSecondaries::default(),
+        resolved_path: None,
+    };
+    let victim_hash =
+        primary.stage_in_flight_for_test("dead-sec".into(), 0, victim.clone());
+    // Mirror the CRDT to InFlight, the state the live `TaskAssigned`
+    // origination would have written at dispatch.
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: victim_hash.clone(),
+            task: victim.clone(),
+        });
+        cs.apply(ClusterMutation::TaskAssigned {
+            hash: victim_hash.clone(),
+            secondary: "dead-sec".into(),
+            worker: 0,
+        });
+    }
+    assert!(
+        matches!(
+            primary.cluster_state_for_test().task_state(&victim_hash),
+            Some(crate::cluster_state::TaskState::InFlight { .. })
+        ),
+        "victim starts InFlight in the CRDT"
+    );
+
+    // dead-sec dies → the recovery path requeues locally AND broadcasts
+    // the `TaskRequeued` transition, applying it to the local CRDT.
+    let dead = super::DeadSecondary {
+        secondary_id: "dead-sec".into(),
+        last_keepalive: std::time::Instant::now(),
+    };
+    primary
+        .requeue_dead_secondary(dead, RemovalCause::KeepaliveMiss)
+        .await
+        .unwrap();
+
+    // The CRDT entry is now Pending (InFlight → Pending), in lockstep
+    // with the local pool requeue.
+    assert!(
+        matches!(
+            primary.cluster_state_for_test().task_state(&victim_hash),
+            Some(crate::cluster_state::TaskState::Pending { .. })
+        ),
+        "dead-secondary recovery must transition the CRDT InFlight → Pending"
+    );
+
+    // Snapshot the post-recovery ledger and restore it into a freshly-
+    // promoted primary (the failover hydration path).
+    let snapshot = primary.cluster_state_for_test().snapshot();
+
+    let (transport2, _sec_rx2, _kept_alive2) = empty_transport();
+    let mut promoted: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        config(Duration::from_millis(50), 2),
+        transport2,
+        dynrunner_transport_quic::NoPeerTransport,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator,
+    );
+    promoted.cluster_state_mut_for_test().restore(snapshot);
+    promoted.hydrate_from_cluster_state();
+
+    // EXACTLY ONCE: the requeued task hydrates into the pool as a
+    // dispatchable (queued) item — not stranded in the in-flight ledger
+    // (zero), not double-counted (twice).
+    let queued: Vec<_> = promoted.pool().iter().collect();
+    assert_eq!(
+        queued.len(),
+        1,
+        "the requeued task must hydrate as exactly one dispatchable pool item"
+    );
+    assert_eq!(queued[0].task_id, "victim");
+    assert_eq!(
+        promoted.in_flight_len_for_test(),
+        0,
+        "no stale in-flight ledger entry — the task is genuinely pending"
+    );
+    assert_eq!(
+        promoted.pool().in_flight(&PhaseId::from("default")),
+        0,
+        "no phase in-flight counter held for the requeued task"
+    );
+}

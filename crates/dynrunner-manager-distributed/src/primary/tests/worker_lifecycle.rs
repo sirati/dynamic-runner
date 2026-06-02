@@ -205,6 +205,84 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
         .await;
 }
 
+/// Live `TaskAssigned` origination: a clean `Pending → InFlight →
+/// Completed` cycle driven through the real dispatch path. Dispatching a
+/// task originates `ClusterMutation::TaskAssigned` AFTER the successful
+/// send, so the CRDT entry transitions `Pending → InFlight` live (not
+/// only in the primary-local `in_flight` ledger). The terminal
+/// completion then transitions the CRDT `InFlight → Completed` and
+/// drains the local in-flight ledger back to 0. Pins that the in-flight
+/// ledger is a derived cache of the replicated `TaskState::InFlight`.
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_originates_inflight_and_completion_clears_it() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let x = phased("task-x", "work");
+            let hash_x = compute_task_hash(&x);
+            let (mut primary, _ends) =
+                primary_with_pool_and_idle_worker(vec![x.clone()]);
+
+            // Seed the CRDT ledger so the live `TaskAssigned` origination
+            // has a `Pending` entry to transition (the pool seed alone
+            // does not populate `cluster_state`).
+            primary
+                .cluster_state_mut_for_test()
+                .apply(ClusterMutation::TaskAdded {
+                    hash: hash_x.clone(),
+                    task: x,
+                });
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&hash_x),
+                    Some(crate::cluster_state::TaskState::Pending { .. })
+                ),
+                "task starts Pending in the CRDT"
+            );
+
+            // Dispatch via the real request path → originates TaskAssigned
+            // after the successful send → CRDT transitions to InFlight.
+            primary
+                .handle_task_request(task_request("sec-0", 0))
+                .await
+                .unwrap();
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &hash_x),
+                "the worker holds X"
+            );
+            assert_eq!(primary.in_flight_len_for_test(), 1, "X in the ledger");
+            match primary.cluster_state_for_test().task_state(&hash_x) {
+                Some(crate::cluster_state::TaskState::InFlight {
+                    secondary,
+                    worker,
+                    ..
+                }) => {
+                    assert_eq!(secondary, "sec-0", "InFlight carries the target secondary");
+                    assert_eq!(*worker, 0, "InFlight carries the target worker");
+                }
+                other => panic!("dispatch must originate CRDT InFlight, got {other:?}"),
+            }
+
+            // Completion → CRDT InFlight → Completed, local ledger drained.
+            primary
+                .handle_task_complete(task_complete("sec-0", 0, &hash_x), &mut None)
+                .await;
+            assert!(
+                matches!(
+                    primary.cluster_state_for_test().task_state(&hash_x),
+                    Some(crate::cluster_state::TaskState::Completed { .. })
+                ),
+                "completion transitions the CRDT InFlight → Completed"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                0,
+                "the in-flight ledger returns to 0 once the CRDT entry is terminal"
+            );
+        })
+        .await;
+}
+
 /// (b) `TaskComplete(X)` arriving AFTER the worker was reassigned to a
 /// later task Y: the stale terminal must be a no-op on the slot (Y
 /// stays Assigned), and X's in-flight entry — already gone when the
@@ -451,7 +529,14 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
             // COMPACTS the Vec so sec-1's worker shifts from index 1 to
             // index 0 — the exact desync a stored positional index hits.
             let recovered = primary.recover_inflight_for_dead_secondary("sec-0");
-            assert_eq!(recovered, 1, "sec-0's one in-flight task recovered");
+            assert_eq!(recovered.len(), 1, "sec-0's one in-flight task recovered");
+            assert!(
+                matches!(
+                    recovered.first(),
+                    Some(ClusterMutation::TaskRequeued { hash }) if hash == &dead_hash
+                ),
+                "recovery emits a TaskRequeued for the dead secondary's in-flight hash"
+            );
             primary.workers.retain(|w| w.secondary_id != "sec-0");
             assert_eq!(primary.workers.len(), 1, "only sec-1's worker remains");
             assert_eq!(
