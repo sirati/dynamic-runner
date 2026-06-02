@@ -108,17 +108,11 @@ fn register_secondary_with_workers(
         .insert(secondary_id.into(), SecondaryConnectionState::Operational(conn));
     let next_global = primary.workers.len() as u32;
     for local in 0..num_workers {
-        primary.workers.push(crate::primary::RemoteWorkerState {
-            worker_id: next_global + local,
-            secondary_id: secondary_id.into(),
-            resource_budgets: ResourceMap::from([(
-                ResourceKind::memory(),
-                memory_bytes,
-            )]),
-            current_task: None,
-            estimated_resources: ResourceMap::new(),
-            is_idle: true,
-        });
+        primary.register_idle_worker_for_test(
+            secondary_id.into(),
+            next_global + local,
+            ResourceMap::from([(ResourceKind::memory(), memory_bytes)]),
+        );
     }
 }
 

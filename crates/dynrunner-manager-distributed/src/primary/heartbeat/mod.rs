@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{BoundedString, Identifier, ResourceMap};
+use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
     Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
     SecondaryTransport,
@@ -128,7 +128,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             sender_id: self.config.node_id.clone(),
             timestamp: timestamp_now(),
             secondary_id: self.config.node_id.clone(),
-            active_workers: self.workers.iter().filter(|w| !w.is_idle).count() as u32,
+            active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
         };
         if let Err(error) = self
             .peer_transport
@@ -175,8 +175,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             "secondary missed keepalives; requeueing in-flight tasks"
         );
 
-        let mut requeued = 0usize;
-        let mut survivors_workers = Vec::with_capacity(self.workers.len());
         // Snapshot the dead workers' global ids first; we need them to
         // call `pool.release_worker` AFTER requeue (release_worker
         // clears the affinity record, requeue uses it for routing —
@@ -188,23 +186,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             .filter(|w| w.secondary_id == secondary_id)
             .map(|w| w.worker_id)
             .collect();
-        for mut worker in std::mem::take(&mut self.workers) {
-            if worker.secondary_id == secondary_id {
-                if let Some(binary) = worker.current_task.take() {
-                    // requeue lands the item at the FRONT of its
-                    // (phase, type, affinity) bucket and decrements
-                    // the phase's in-flight count.
-                    self.pool_mut().requeue(binary);
-                    requeued += 1;
-                }
-                worker.estimated_resources = ResourceMap::new();
-                worker.is_idle = true;
-                // Drop this worker — its host is dead.
-                continue;
-            }
-            survivors_workers.push(worker);
-        }
-        self.workers = survivors_workers;
+        // Recover EVERY in-flight task targeting the dead secondary
+        // through the single hash-keyed ledger: requeue each (front of
+        // its bucket, phase in-flight counter decremented, type slot
+        // released) and drop the ledger entry. This covers both
+        // locally-dispatched tasks (a slot held them) AND inherited
+        // (pre-owned, no-slot) tasks the dead secondary owned —
+        // mirroring the reference dead-peer recovery. The held slots
+        // are then removed below; the ledger is the source of truth for
+        // the requeue so the two can't diverge.
+        let requeued = self.recover_inflight_for_dead_secondary(&secondary_id);
+        // Drop every worker hosted by the dead secondary — its host is
+        // gone. The slot state is discarded with the worker; the task
+        // it held (if any) was already requeued via the ledger above.
+        self.workers
+            .retain(|w| w.secondary_id != secondary_id);
         // Now clear pool-side affinity for the dead workers so any
         // bucket they pinned is free for survivors.
         for wid in dead_global_ids {

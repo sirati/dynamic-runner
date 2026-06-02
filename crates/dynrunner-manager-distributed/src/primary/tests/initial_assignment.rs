@@ -9,13 +9,22 @@ fn make_remote_worker(
     secondary_id: &str,
     busy: bool,
 ) -> RemoteWorkerState<TestId> {
+    let state = if busy {
+        let task = make_binary("placeholder", 0);
+        let task_hash = crate::primary::wire::compute_task_hash(&task);
+        crate::primary::SlotState::Assigned {
+            task_hash,
+            task,
+            estimated: dynrunner_core::ResourceMap::new(),
+        }
+    } else {
+        crate::primary::SlotState::Idle
+    };
     RemoteWorkerState {
         worker_id,
         secondary_id: secondary_id.into(),
         resource_budgets: dynrunner_core::ResourceMap::new(),
-        current_task: if busy { Some(make_binary("placeholder", 0)) } else { None },
-        estimated_resources: dynrunner_core::ResourceMap::new(),
-        is_idle: !busy,
+        state,
     }
 }
 

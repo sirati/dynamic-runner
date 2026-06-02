@@ -10,7 +10,7 @@ use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
-use crate::primary::{PrimaryConfig, PrimaryCoordinator, RemoteWorkerState};
+use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 
@@ -144,14 +144,7 @@ async fn dead_secondary_requeues_in_flight_task() {
         preferred_secondaries: SoftPreferredSecondaries::default(),
         resolved_path: None,
     };
-    primary.workers.push(RemoteWorkerState {
-        worker_id: 0,
-        secondary_id: "dead-sec".into(),
-        resource_budgets: ResourceMap::new(),
-        current_task: Some(in_flight.clone()),
-        estimated_resources: ResourceMap::new(),
-        is_idle: false,
-    });
+    primary.stage_in_flight_for_test("dead-sec".into(), 0, in_flight.clone());
 
     // Sleep past `keepalive_interval * miss_threshold` so the deadline
     // expires, then collect the report.
@@ -231,11 +224,10 @@ fn register_operational_secondary<T, P, S, E>(
         SecondaryConnectionState::Operational(conn),
     );
     primary.seed_keepalive(secondary_id);
-    primary.workers.push(RemoteWorkerState {
+    primary.stage_in_flight_for_test(
+        secondary_id.into(),
         worker_id,
-        secondary_id: secondary_id.into(),
-        resource_budgets: ResourceMap::new(),
-        current_task: Some(TaskInfo {
+        TaskInfo {
             path: std::path::PathBuf::from(format!("{in_flight_label}.bin")),
             size: 100,
             identifier: TestId(in_flight_label.into()),
@@ -247,10 +239,8 @@ fn register_operational_secondary<T, P, S, E>(
             task_depends_on: vec![],
             preferred_secondaries: SoftPreferredSecondaries::default(),
             resolved_path: None,
-        }),
-        estimated_resources: ResourceMap::new(),
-        is_idle: false,
-    });
+        },
+    );
 }
 
 fn config_with_mass_death(
@@ -784,17 +774,14 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
         SecondaryConnectionState::Operational(sec_b_conn),
     );
     primary.seed_keepalive("sec-b");
-    primary.workers.push(RemoteWorkerState {
-        worker_id: 1,
-        secondary_id: "sec-b".into(),
-        resource_budgets: ResourceMap::from([(
+    primary.register_idle_worker_for_test(
+        "sec-b".into(),
+        1,
+        ResourceMap::from([(
             dynrunner_core::ResourceKind::memory(),
             1024 * 1024 * 1024u64,
         )]),
-        current_task: None,
-        estimated_resources: ResourceMap::new(),
-        is_idle: true,
-    });
+    );
 
     // Sleep past the keepalive deadline so sec-a is dead. Refresh
     // sec-b's keepalive immediately before the tick so only sec-a
@@ -840,7 +827,7 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     // only) is the right shape: the task moved from queued to
     // in-flight on the kickstart's dispatch call.
     assert!(
-        primary.workers.iter().any(|w| w.secondary_id == "sec-b" && !w.is_idle),
+        primary.workers.iter().any(|w| w.secondary_id == "sec-b" && !w.is_idle()),
         "survivor's worker must flip to busy after the kickstart"
     );
     assert_eq!(

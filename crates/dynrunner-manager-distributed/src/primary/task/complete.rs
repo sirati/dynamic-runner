@@ -1,5 +1,5 @@
 
-use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
     SecondaryTransport,
@@ -87,20 +87,41 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // is still active.
             self.backpressured_secondaries.remove(&secondary_id);
 
-            // TODO(R1): resolve the just-finished item BY HASH from the
-            // single hash-keyed `in_flight` ledger and free the holding
-            // slot through `free_slot_on_terminal(secondary, worker,
-            // task_hash)` (frees ONLY if `held_hash == task_hash`). The
-            // removed code here did a blind `(secondary_id, worker_id)`
-            // slot scan with NO hash check and consulted the separate
-            // `pre_owned_in_flight` fallback — the P1 mis-attribution
-            // bug. `completed_meta` must come from the ledger entry
-            // (its phase / type / task_id), not from a worker scan.
+            // Resolve the just-finished item BY HASH and free its
+            // holding slot through the single terminal-free helper:
+            // `free_slot_on_terminal` frees the slot back to `Idle` AND
+            // removes the `in_flight` ledger entry ONLY if the addressed
+            // slot's held hash equals this `task_hash` (the hash IS the
+            // slot's held-task identity — not a reorder-detector). A
+            // reordered TaskRequest-then-Complete cannot misfire: the
+            // request never freed the slot, so the slot still holds
+            // this hash. A Complete for a slot already reassigned to a
+            // later task returns `None` (its ledger entry is gone /
+            // belongs to a different slot) and is a safe no-op. The
+            // entry also unifies the formerly-separate pre-owned
+            // (hydrated) in-flight tasks: a completion with no local
+            // holding slot is attributed by the ledger entry just the
+            // same.
+            //
+            // `completed_meta` (phase / type / task_id) comes from the
+            // freed ledger entry's `task`, not a worker scan. The
+            // type-slot release lives inside `free_slot_on_terminal`
+            // (paired with the reserve in `commit_assignment`), so the
+            // cascade below only runs the per-phase counter; `type_id`
+            // is carried purely for the diagnostic DEBUG line.
             let completed_meta: Option<(
                 dynrunner_core::PhaseId,
                 dynrunner_core::TypeId,
                 String,
-            )> = None;
+            )> = self
+                .free_slot_on_terminal(&secondary_id, worker_id, task_hash)
+                .map(|entry| {
+                    (
+                        entry.phase,
+                        entry.task.type_id.clone(),
+                        entry.task.task_id.clone(),
+                    )
+                });
 
             // Operator-facing INFO: enough to grep "did task X
             // complete and how are aggregate counts moving?". The
@@ -129,8 +150,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "task complete: identity"
             );
 
-            if let Some((phase, type_id, task_id)) = completed_meta {
-                self.release_type_slot(&type_id);
+            if let Some((phase, _type_id, task_id)) = completed_meta {
                 self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
             }
 

@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, ResourceMap, TaskInfo};
+use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
     SecondaryTransport,
@@ -70,16 +70,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let task_hash = task_hash.clone();
             let error_type = error_type.clone();
             let error_message = error_message.clone();
-            // TODO(R1): resolve the held binary BY HASH from the single
-            // hash-keyed `in_flight` ledger and free the holding slot
-            // through `free_slot_on_terminal(secondary, worker,
-            // task_hash)` on every terminal path (terminal TaskFailed,
-            // backpressure-requeue, stuck-worker timeout). The removed
-            // code did a blind `(secondary_id, worker_id)` slot scan
-            // with NO hash check and consulted the separate
-            // `pre_owned_in_flight` fallback — the P1 mis-attribution
-            // bug. `recovered_binary` must come from the ledger entry.
-            let recovered_binary: Option<TaskInfo<I>> = None;
+            // Resolve the held binary BY HASH and free its holding slot
+            // through the single terminal-free helper.
+            // `free_slot_on_terminal` frees the slot back to `Idle`,
+            // releases the per-type concurrency slot, and removes the
+            // `in_flight` ledger entry ONLY if the addressed slot's held
+            // hash equals this `task_hash`; it returns the freed entry
+            // (or the inherited pre-owned entry) so both the
+            // backpressure-requeue and terminal-failure arms below can
+            // recover the binary. A stale TaskFailed for a slot already
+            // reassigned to a later task returns `None` — a safe no-op.
+            // All three terminal-shaped paths in this function
+            // (backpressure-requeue, terminal TaskFailed) share this
+            // one resolution; the stuck-worker watchdog in
+            // `operational_loop` routes through the same helper.
+            let recovered_binary: Option<TaskInfo<I>> = self
+                .free_slot_on_terminal(&secondary_id, worker_id, &task_hash)
+                .map(|entry| entry.task);
 
             // Backpressure detection: secondary's dispatch.rs sends
             // this exact error_message when its `is_idle_state()`
@@ -148,8 +155,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     backoff_ms,
                     "secondary returned backpressure; re-queuing task and applying backoff"
                 );
+                // The slot + ledger + type-slot were already freed by
+                // `free_slot_on_terminal` above; backpressure means the
+                // task never ran, so requeue it into the pool (which
+                // decrements the phase's in-flight counter and re-adds
+                // the binary at the front of its bucket). No
+                // `release_type_slot` here — the helper already did it.
                 if let Some(binary) = recovered_binary {
-                    self.release_type_slot(&binary.type_id);
                     self.pool_mut().requeue(binary);
                 }
                 return;
@@ -209,8 +221,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "task failed: identity"
             );
 
+            // Terminal failure: the slot + ledger + type-slot were
+            // already freed by `free_slot_on_terminal` above. Run only
+            // the per-phase cascade so the phase machine drains the
+            // in-flight counter (N+1 → N) and any dependent phase that
+            // just became unblocked cascades. Covers both
+            // locally-dispatched and inherited (pre-owned) entries
+            // uniformly — the latter simply had no slot/type-slot to
+            // free, matching the deleted pre-owned fallback's contract.
             if let Some(binary) = recovered_binary {
-                self.release_type_slot(&binary.type_id);
                 self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
             }
 

@@ -164,20 +164,21 @@ fn hydrate_inflight_task_not_reoffered_and_counter_one() {
         1,
         "phase in-flight counter must read 1 for the single InFlight task"
     );
-    // The pre-owned ledger holds the entry so a later broadcast
-    // TaskComplete/TaskFailed finds it and decrements the right phase.
-    assert_eq!(primary.pre_owned_in_flight_len_for_test(), 1);
+    // The unified in-flight ledger holds the inherited entry so a later
+    // broadcast TaskComplete/TaskFailed finds it BY HASH and decrements
+    // the right phase.
+    assert_eq!(primary.in_flight_len_for_test(), 1);
 }
 
-/// (C4) A broadcast `TaskComplete` for a PRE-OWNED in-flight task —
+/// (C4) A broadcast `TaskComplete` for an INHERITED in-flight task —
 /// one this coordinator inherited via hydration, NOT dispatched to a
 /// local worker — must decrement the CORRECT phase's in-flight counter
-/// (N+1 → N) via the `pre_owned_in_flight` fallback in
-/// `handle_task_complete`, and drain its ledger entry. Without the
-/// fallback, the worker scan finds no holder, `note_item_completed`
-/// never fires, and the phase counter stays stuck at 1 forever.
+/// (N+1 → N) by resolving the unified `in_flight` ledger entry BY HASH
+/// in `free_slot_on_terminal` (no holding slot needed), and drain its
+/// ledger entry. Without the by-hash resolution, no `note_item_completed`
+/// fires and the phase counter stays stuck at 1 forever.
 #[tokio::test(flavor = "current_thread")]
-async fn pre_owned_in_flight_completion_decrements_phase_counter() {
+async fn inherited_in_flight_completion_decrements_phase_counter() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
@@ -208,13 +209,12 @@ async fn pre_owned_in_flight_completion_decrements_phase_counter() {
 
             let phase = PhaseId::from("work");
             assert_eq!(primary.pool().in_flight(&phase), 1);
-            assert_eq!(primary.pre_owned_in_flight_len_for_test(), 1);
+            assert_eq!(primary.in_flight_len_for_test(), 1);
 
-            // A broadcast TaskComplete lands for the pre-owned hash. No
+            // A broadcast TaskComplete lands for the inherited hash. No
             // local `RemoteWorkerState` holds it (none were registered),
-            // so the worker scan in `handle_task_complete` finds
-            // nothing — the `pre_owned_in_flight` fallback must carry
-            // the phase decrement.
+            // so `free_slot_on_terminal` resolves the ledger entry BY
+            // HASH (worker_idx = None) and carries the phase decrement.
             let msg = DistributedMessage::TaskComplete {
                 sender_id: "secondary-0".into(),
                 timestamp: 0.0,
@@ -231,9 +231,9 @@ async fn pre_owned_in_flight_completion_decrements_phase_counter() {
                 "pre-owned completion must drop the phase in-flight counter to 0"
             );
             assert_eq!(
-                primary.pre_owned_in_flight_len_for_test(),
+                primary.in_flight_len_for_test(),
                 0,
-                "pre-owned ledger entry must be drained on terminal observation"
+                "inherited ledger entry must be drained on terminal observation"
             );
             assert!(primary.completed_tasks.contains("inflight-1"));
         })

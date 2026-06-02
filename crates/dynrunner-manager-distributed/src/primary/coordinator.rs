@@ -48,34 +48,164 @@ pub(crate) struct PendingMassDeath {
     pub(super) last_keepalive_at_defer: Instant,
 }
 
+/// The single-task lifecycle typestate of a remote worker slot.
+///
+/// Replaces the removed `(current_task: Option<TaskInfo>, is_idle:
+/// bool)` two-source-of-truth pair. The held task — its identity hash
+/// included — lives INSIDE the `Assigned` variant, so a slot can never
+/// be simultaneously "idle but holding a task" or "busy but holding
+/// nothing": the divergence class is gone by construction.
+///
+/// Assignment is reachable ONLY from `Idle` (every assign site goes
+/// through [`RemoteWorkerState::assign`], which `debug_assert`s the
+/// pre-state and overwrites unconditionally only after the caller has
+/// established idleness). A slot returns to `Idle` ONLY through a
+/// terminal outcome keyed by the held `task_hash`
+/// ([`PrimaryCoordinator::free_slot_on_terminal`]) — never on a bare
+/// `TaskRequest`. This makes reassignment-before-terminal
+/// architecturally impossible: the `task_hash` is the slot's held-task
+/// IDENTITY (the ledger key), not a reorder-detector.
+#[derive(Debug, Clone)]
+pub(crate) enum SlotState<I: Identifier> {
+    /// No task held; the only state from which assignment is legal.
+    Idle,
+    /// Holds exactly one task. `task_hash` is the canonical
+    /// `compute_task_hash(&task)` identity recorded at dispatch and
+    /// matched against an inbound terminal's `task_hash` before the
+    /// slot frees.
+    Assigned {
+        task_hash: String,
+        task: TaskInfo<I>,
+        estimated: ResourceMap,
+    },
+}
+
+impl<I: Identifier> SlotState<I> {
+    fn is_idle(&self) -> bool {
+        matches!(self, SlotState::Idle)
+    }
+
+    /// The held task, if any. `None` for an `Idle` slot.
+    fn task(&self) -> Option<&TaskInfo<I>> {
+        match self {
+            SlotState::Idle => None,
+            SlotState::Assigned { task, .. } => Some(task),
+        }
+    }
+
+    /// The estimated resource footprint of the held task; empty when
+    /// `Idle`. Feeds the scheduler's `estimated_usage` budget view.
+    fn estimated(&self) -> ResourceMap {
+        match self {
+            SlotState::Idle => ResourceMap::new(),
+            SlotState::Assigned { estimated, .. } => estimated.clone(),
+        }
+    }
+}
+
 /// Virtual worker tracked by the authoritative primary for each remote worker.
 ///
-/// R1 replaces the removed `(current_task, is_idle)` pair with a
-/// `SlotState<I>` typestate: assignment reachable ONLY from `Idle`,
-/// the held task carried inside the `Assigned` variant. The pair is
-/// removed here so the slot-keyed attribution it enabled cannot
-/// survive the rebuild.
+/// R1 replaces the removed `(current_task, is_idle)` pair with a single
+/// [`SlotState<I>`] typestate field: assignment reachable ONLY from
+/// `Idle`, the held task (and its hash) carried inside the `Assigned`
+/// variant. The pair is removed here so the slot-keyed attribution it
+/// enabled cannot survive the rebuild.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteWorkerState<I: Identifier> {
     pub(super) worker_id: u32,
     pub(super) secondary_id: String,
     pub(super) resource_budgets: ResourceMap,
-    pub(super) estimated_resources: ResourceMap,
+    /// The slot's single-task lifecycle state. Sole source of truth
+    /// for "is this worker idle?" and "what does it hold?".
+    pub(super) state: SlotState<I>,
 }
 
 impl<I: Identifier> RemoteWorkerState<I> {
+    /// True iff no task is held — the only state from which assignment
+    /// is legal.
+    pub(super) fn is_idle(&self) -> bool {
+        self.state.is_idle()
+    }
+
+    /// The held task, if any.
+    pub(super) fn held_task(&self) -> Option<&TaskInfo<I>> {
+        self.state.task()
+    }
+
+    /// Move the slot `Idle -> Assigned`. The slot MUST be `Idle`; the
+    /// `debug_assert` makes a reassign-before-terminal bug a test-time
+    /// panic, while production faithfully overwrites (the caller has
+    /// already gated on idleness through the dispatch view / scheduler
+    /// decision). Mirrors `WorkerHandle::assign_task`'s
+    /// `take_idle().ok_or(...)` contract on the worker-process side.
+    pub(super) fn assign(
+        &mut self,
+        task_hash: String,
+        task: TaskInfo<I>,
+        estimated: ResourceMap,
+    ) {
+        debug_assert!(
+            self.state.is_idle(),
+            "slot assigned while not Idle (reassignment-before-terminal)"
+        );
+        self.state = SlotState::Assigned {
+            task_hash,
+            task,
+            estimated,
+        };
+    }
+
+    /// Force the slot back to `Idle`, returning the previously-held
+    /// task (if any). Used only by the dead-secondary requeue path
+    /// (the worker is being dropped) and the dispatch-send rollback;
+    /// the routine terminal path goes through
+    /// [`PrimaryCoordinator::free_slot_on_terminal`] which gates on the
+    /// hash.
+    pub(super) fn vacate(&mut self) -> Option<TaskInfo<I>> {
+        match std::mem::replace(&mut self.state, SlotState::Idle) {
+            SlotState::Idle => None,
+            SlotState::Assigned { task, .. } => Some(task),
+        }
+    }
+
     pub(super) fn budget_info(&self) -> WorkerBudgetInfo<I> {
         WorkerBudgetInfo {
             worker_id: self.worker_id,
             reserved_budgets: self.resource_budgets.clone(),
             actual_usage: ResourceMap::new(),
-            is_idle: self.is_idle,
+            is_idle: self.state.is_idle(),
             is_opportunistic: false,
-            has_initial_assignment: self.current_task.is_some(),
-            current_task: self.current_task.clone(),
-            estimated_usage: self.estimated_resources.clone(),
+            has_initial_assignment: !self.state.is_idle(),
+            current_task: self.state.task().cloned(),
+            estimated_usage: self.state.estimated(),
         }
     }
+}
+
+/// One entry in the primary's single hash-keyed in-flight ledger.
+///
+/// Records every task the authoritative primary believes is currently
+/// executing somewhere in the cluster — whether this coordinator
+/// dispatched it (a local `RemoteWorkerState` slot holds it,
+/// `worker_idx = Some`) or inherited it from the replicated
+/// `cluster_state` at hydration (no local slot, `worker_idx = None`).
+/// Folds in and replaces the deleted `pre_owned_in_flight` two-tier
+/// fallback: there is now ONE ledger, consulted BY HASH on every
+/// terminal, so attribution is unambiguous regardless of dispatch
+/// origin.
+#[derive(Debug, Clone)]
+pub(crate) struct InFlightEntry<I: Identifier> {
+    /// Phase whose in-flight counter this entry holds open; the
+    /// terminal cascade decrements it via `note_item_*`.
+    pub(super) phase: PhaseId,
+    /// Secondary the task was dispatched to (or inherited as targeting).
+    pub(super) secondary_id: String,
+    /// Index into `self.workers` of the holding slot, or `None` for an
+    /// inherited (pre-owned) task no local slot holds.
+    pub(super) worker_idx: Option<usize>,
+    /// The full task — its `task_id` resolves dep edges, its `type_id`
+    /// releases the per-type concurrency slot.
+    pub(super) task: TaskInfo<I>,
 }
 
 /// The primary coordinator: orchestrates work across secondaries.
@@ -132,6 +262,17 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// between runs.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
+    /// THE single hash-keyed in-flight ledger. Records every task the
+    /// primary believes is executing in the cluster, keyed by its
+    /// canonical `compute_task_hash`. Populated identically at dispatch
+    /// (locally-assigned, `worker_idx = Some`) AND at hydration
+    /// (inherited from `cluster_state`, `worker_idx = None`); drained
+    /// BY HASH on every terminal outcome through
+    /// [`Self::free_slot_on_terminal`]. Folds in and replaces the
+    /// deleted `pre_owned_in_flight` two-tier fallback — there is one
+    /// ledger, so a completion is attributed unambiguously to the held
+    /// task regardless of whether a local slot held it.
+    pub(super) in_flight: HashMap<String, InFlightEntry<I>>,
     /// Failed-task ledger keyed by task hash. The value carries the
     /// most-recent ErrorType so the dispatcher can report per-class
     /// failure counts (Recoverable → fail_retry, ResourceExhausted
@@ -588,6 +729,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             pending: None,
             phase_deps: HashMap::new(),
             completed_tasks: HashSet::new(),
+            in_flight: HashMap::new(),
             failed_tasks: HashMap::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
@@ -1077,6 +1219,200 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// most `N` items of that type can be in-flight across all
     /// workers. Items whose type's capacity is already reached are
     /// removed from the view so the scheduler never sees them.
+    /// Commit a freshly-scheduled LOCAL assignment as one atomic
+    /// in-flight-bookkeeping event: reserve the per-type concurrency
+    /// slot, move the holding slot `Idle -> Assigned{task_hash}`, AND
+    /// record the task in the hash-keyed `in_flight` ledger. Every
+    /// local dispatch site (`handle_task_request`,
+    /// `dispatch_to_idle_workers`, `perform_initial_assignment`) routes
+    /// through here so the three pieces of "this task is now in flight"
+    /// state can never diverge — they are written together or not at
+    /// all. The `take_from_view` that removes the binary from the pool
+    /// precedes this call (it yields the owned `task`).
+    ///
+    /// Reachable only from an `Idle` slot (enforced by
+    /// `RemoteWorkerState::assign`'s `debug_assert`); the caller has
+    /// already established idleness via the dispatch view / scheduler
+    /// decision.
+    pub(super) fn commit_assignment(
+        &mut self,
+        worker_idx: usize,
+        task: TaskInfo<I>,
+        task_hash: String,
+        estimated: ResourceMap,
+    ) {
+        let secondary_id = self.workers[worker_idx].secondary_id.clone();
+        let phase = task.phase_id.clone();
+        self.reserve_type_slot(&task.type_id);
+        self.workers[worker_idx].assign(task_hash.clone(), task.clone(), estimated);
+        self.in_flight.insert(
+            task_hash,
+            InFlightEntry {
+                phase,
+                secondary_id,
+                worker_idx: Some(worker_idx),
+                task,
+            },
+        );
+    }
+
+    /// Undo a `commit_assignment` whose `TaskAssignment` send failed:
+    /// the task was never delivered, so no terminal will ever arrive
+    /// for it. Symmetric inverse of `commit_assignment` — release the
+    /// type slot, vacate the slot to `Idle`, drop the ledger entry —
+    /// then the caller requeues the binary into the pool. Leaving any
+    /// of the three would strand the slot, the ledger, or the type
+    /// budget (the asm-tokenizer "33 in_flight / active=0" jam class).
+    pub(super) fn rollback_assignment(
+        &mut self,
+        worker_idx: usize,
+        task_hash: &str,
+        type_id: &dynrunner_core::TypeId,
+    ) {
+        self.release_type_slot(type_id);
+        self.workers[worker_idx].vacate();
+        self.in_flight.remove(task_hash);
+    }
+
+    /// Seed an inherited (pre-owned) in-flight task into the SAME
+    /// hash-keyed ledger at hydration. No local slot holds it
+    /// (`worker_idx = None`) — the originating dispatcher owns the
+    /// work; this coordinator observes completion via the broadcast
+    /// path. Folds in the deleted `pre_owned_in_flight` concept: the
+    /// terminal cascade reads this entry BY HASH exactly like a
+    /// locally-dispatched one.
+    pub(super) fn seed_inflight(
+        &mut self,
+        task_hash: String,
+        phase: PhaseId,
+        secondary_id: String,
+        task: TaskInfo<I>,
+    ) {
+        self.in_flight.insert(
+            task_hash,
+            InFlightEntry {
+                phase,
+                secondary_id,
+                worker_idx: None,
+                task,
+            },
+        );
+    }
+
+    /// THE single terminal-free helper. Given an inbound terminal's
+    /// `(secondary_id, worker_id, task_hash)`, free the holding slot
+    /// back to `Idle`, release the per-type concurrency slot, AND
+    /// remove the `in_flight` ledger entry — the symmetric inverse of
+    /// `commit_assignment`. Returns the freed `InFlightEntry` (phase /
+    /// secondary / task) so the caller runs ONLY the per-phase cascade
+    /// (`note_item_*`); the type-slot release is owned here so the
+    /// caller never has to know whether a slot was reserved.
+    ///
+    /// Returns `None` (a safe no-op) when:
+    ///   - the addressed slot holds a DIFFERENT hash (the worker was
+    ///     already reassigned to a later task `Y`; this terminal is a
+    ///     stale/reordered completion for the prior task `X`), or
+    ///   - the hash is absent from the ledger entirely (already
+    ///     terminal / never tracked).
+    ///
+    /// An inherited (pre-owned, `worker_idx = None`) entry has no
+    /// holding slot and no reserved type slot: it is removed from the
+    /// ledger and returned without a slot vacate or a type-slot
+    /// release — exactly the deleted `pre_owned_in_flight` branch's
+    /// "no local type-slot was ever taken" contract, now expressed
+    /// through the one ledger.
+    ///
+    /// Because the slot's `task_hash` IS the held-task identity (the
+    /// ledger key), a reassigned slot can NEVER be freed by a prior
+    /// task's terminal: reassignment-before-terminal is unreachable.
+    pub(super) fn free_slot_on_terminal(
+        &mut self,
+        secondary_id: &str,
+        worker_id: u32,
+        task_hash: &str,
+    ) -> Option<InFlightEntry<I>> {
+        // The ledger is the single source of truth. If the hash isn't
+        // tracked, the task is not (or no longer) in flight — nothing
+        // to free.
+        let worker_idx = match self.in_flight.get(task_hash) {
+            Some(e) => e.worker_idx,
+            None => {
+                tracing::trace!(
+                    secondary = %secondary_id,
+                    worker_id,
+                    task_hash = %task_hash,
+                    "terminal for non-tracked hash; ignoring"
+                );
+                return None;
+            }
+        };
+
+        match worker_idx {
+            // Locally-dispatched entry: a slot holds it. Verify the
+            // addressed slot still holds THIS hash before freeing — a
+            // slot that has moved on to a later task must not be
+            // vacated by a stale terminal.
+            Some(idx) => {
+                let held_matches = matches!(
+                    &self.workers[idx].state,
+                    SlotState::Assigned { task_hash: h, .. } if h == task_hash
+                );
+                if !held_matches {
+                    tracing::trace!(
+                        secondary = %secondary_id,
+                        worker_id,
+                        task_hash = %task_hash,
+                        "terminal for non-held hash; ignoring"
+                    );
+                    return None;
+                }
+                self.workers[idx].state = SlotState::Idle;
+                let entry = self.in_flight.remove(task_hash)?;
+                self.release_type_slot(&entry.task.type_id);
+                Some(entry)
+            }
+            // Inherited (pre-owned) entry: no local slot, no reserved
+            // type slot. Remove the ledger entry and return it — the
+            // cascade still decrements the correct phase's counter.
+            None => self.in_flight.remove(task_hash),
+        }
+    }
+
+    /// Recover every in-flight task targeting `secondary_id` when that
+    /// secondary dies: requeue each task into the pool (which
+    /// decrements its phase's in-flight counter) and drop the ledger
+    /// entry. Covers BOTH locally-dispatched (a slot held it — the
+    /// slot is dropped separately by the caller) and inherited
+    /// (pre-owned, no slot) tasks through the ONE ledger, mirroring the
+    /// reference `check_peer_timeouts` recovery. Returns the count
+    /// requeued for the caller's log line.
+    ///
+    /// Requeue is NOT a terminal outcome — the task re-enters
+    /// `Pending` — so it never touches `completed_tasks`/`failed_tasks`.
+    /// The per-type slot IS released (a requeued task no longer occupies
+    /// concurrency budget) and `pool.requeue` decrements the phase
+    /// in-flight counter, keeping the ledger, the type budget, and the
+    /// pool counters consistent.
+    pub(super) fn recover_inflight_for_dead_secondary(
+        &mut self,
+        secondary_id: &str,
+    ) -> usize {
+        let hashes: Vec<String> = self
+            .in_flight
+            .iter()
+            .filter(|(_, e)| e.secondary_id == secondary_id)
+            .map(|(h, _)| h.clone())
+            .collect();
+        let recovered = hashes.len();
+        for hash in hashes {
+            if let Some(entry) = self.in_flight.remove(&hash) {
+                self.release_type_slot(&entry.task.type_id);
+                self.pool_mut().requeue(entry.task);
+            }
+        }
+        recovered
+    }
+
     pub(super) fn cap_filter_view(
         &self,
         view: dynrunner_scheduler_api::WorkerView<I>,
@@ -1265,15 +1601,67 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     }
 
     /// Test-only count of workers the primary currently tracks as
-    /// mid-dispatch (`current_task.is_some()`). Used by the composition
-    /// hazard tests to assert a hydrated remote-in-flight task is NOT
-    /// also counted as a local-active worker (the double-count hazard).
+    /// mid-dispatch (slot `Assigned`). Used by the composition hazard
+    /// tests to assert a hydrated remote-in-flight task is NOT also
+    /// counted as a local-active worker (the double-count hazard).
     #[cfg(test)]
     pub fn active_workers_for_test(&self) -> usize {
         self.workers
             .iter()
-            .filter(|w| w.current_task.is_some())
+            .filter(|w| !w.is_idle())
             .count()
+    }
+
+    /// Test-only length of the hash-keyed in-flight ledger. Replaces
+    /// the removed `pre_owned_in_flight_len_for_test`: the ledger now
+    /// unifies locally-dispatched and inherited (pre-owned) in-flight
+    /// tasks, so hydration tests assert against this single count.
+    #[cfg(test)]
+    pub fn in_flight_len_for_test(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// Test-only inspector: does the `(secondary_id, worker_id)` slot
+    /// currently hold a task whose hash equals `task_hash`? Lets the
+    /// reorder/reassignment tests assert the slot's held-task identity
+    /// directly without reaching into `SlotState` internals.
+    #[cfg(test)]
+    pub fn slot_holds_hash_for_test(
+        &self,
+        secondary_id: &str,
+        worker_id: u32,
+        task_hash: &str,
+    ) -> bool {
+        let mut local_idx: u32 = 0;
+        for w in &self.workers {
+            if w.secondary_id == secondary_id {
+                if local_idx == worker_id {
+                    return matches!(
+                        &w.state,
+                        SlotState::Assigned { task_hash: h, .. } if h == task_hash
+                    );
+                }
+                local_idx += 1;
+            }
+        }
+        false
+    }
+
+    /// Test-only inspector: is the `(secondary_id, worker_id)` slot
+    /// idle? Mirrors `slot_holds_hash_for_test` for the negative
+    /// assertion (a stale terminal must NOT free a reassigned slot).
+    #[cfg(test)]
+    pub fn slot_is_idle_for_test(&self, secondary_id: &str, worker_id: u32) -> bool {
+        let mut local_idx: u32 = 0;
+        for w in &self.workers {
+            if w.secondary_id == secondary_id {
+                if local_idx == worker_id {
+                    return w.is_idle();
+                }
+                local_idx += 1;
+            }
+        }
+        false
     }
 
     /// Test-only seam: register one idle remote worker owned by
@@ -1294,9 +1682,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             worker_id,
             secondary_id,
             resource_budgets,
-            current_task: None,
-            estimated_resources: ResourceMap::new(),
-            is_idle: true,
+            state: SlotState::Idle,
         });
     }
 
@@ -1309,6 +1695,32 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     #[cfg(test)]
     pub fn lifecycle_dispatcher_handle_present_for_test(&self) -> bool {
         self.lifecycle_dispatcher_handle.is_some()
+    }
+
+    /// Test-only: register a worker and immediately stage one
+    /// in-flight task on it, routed through the real
+    /// `commit_assignment` lifecycle so the slot, the `in_flight`
+    /// ledger, and the per-type slot are all seeded consistently
+    /// (replaces the manual `RemoteWorkerState { current_task: Some(..)
+    /// }` construction the removed two-field model allowed). Returns the
+    /// computed task hash so the caller can drive a matching terminal.
+    #[cfg(test)]
+    pub fn stage_in_flight_for_test(
+        &mut self,
+        secondary_id: String,
+        worker_id: u32,
+        task: TaskInfo<I>,
+    ) -> String {
+        self.workers.push(RemoteWorkerState {
+            worker_id,
+            secondary_id,
+            resource_budgets: ResourceMap::new(),
+            state: SlotState::Idle,
+        });
+        let idx = self.workers.len() - 1;
+        let task_hash = crate::primary::wire::compute_task_hash(&task);
+        self.commit_assignment(idx, task, task_hash.clone(), ResourceMap::new());
+        task_hash
     }
 
     /// Run the full coordination pipeline.

@@ -537,17 +537,14 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             "sec-0".into(),
             SecondaryConnectionState::Operational(conn),
         );
-        primary.workers.push(RemoteWorkerState {
-            worker_id: 0,
-            secondary_id: "sec-0".into(),
-            resource_budgets: dynrunner_core::ResourceMap::from([(
+        primary.register_idle_worker_for_test(
+            "sec-0".into(),
+            0,
+            dynrunner_core::ResourceMap::from([(
                 dynrunner_core::ResourceKind::memory(),
                 1024 * 1024 * 1024u64,
             )]),
-            current_task: None,
-            estimated_resources: dynrunner_core::ResourceMap::new(),
-            is_idle: true,
-        });
+        );
 
         assert!(!primary.demoted, "fresh primary is not demoted");
 
@@ -571,8 +568,8 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
         let view_before = primary.pool().view_for_worker(0, None).len();
         assert_eq!(pool_len_before, 1);
         assert_eq!(view_before, 1);
-        assert!(primary.workers[0].is_idle);
-        assert!(primary.workers[0].current_task.is_none());
+        assert!(primary.workers[0].is_idle());
+        assert!(primary.workers[0].held_task().is_none());
 
         primary.dispatch_to_idle_workers().await.unwrap();
 
@@ -582,11 +579,11 @@ async fn promote_primary_demotes_local_and_disables_dispatch() {
             "dispatch_to_idle_workers must not take from pool when demoted"
         );
         assert!(
-            primary.workers[0].is_idle,
+            primary.workers[0].is_idle(),
             "worker must remain idle when local primary is demoted"
         );
         assert!(
-            primary.workers[0].current_task.is_none(),
+            primary.workers[0].held_task().is_none(),
             "worker must not be assigned a task when local primary is demoted"
         );
     }).await;

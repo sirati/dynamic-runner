@@ -114,9 +114,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         worker_id: global_worker_id,
                         secondary_id: meta.id.clone(),
                         resource_budgets: budget,
-                        current_task: None,
-                        estimated_resources: ResourceMap::new(),
-                        is_idle: true,
+                        state: super::SlotState::Idle,
                     });
                     global_worker_id += 1;
                 }
@@ -169,7 +167,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             } = decision
             {
                 let binary = self.pool_mut().take_from_view(view, binary_index);
-                self.reserve_type_slot(&binary.type_id);
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();
@@ -180,9 +177,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     .count() as u32
                     - 1;
 
-                self.workers[worker_idx].current_task = Some(binary.clone());
-                self.workers[worker_idx].estimated_resources = estimated_usage.clone();
-                self.workers[worker_idx].is_idle = false;
+                // Type-slot reserve + slot `Idle -> Assigned{task_hash}`
+                // + ledger insert, committed together at the moment of
+                // initial dispatch. The wire `InitialAssignment` is
+                // built+sent below in the per-secondary fan-out loop; the
+                // ledger/slot must already reflect the assignment so a
+                // completion that races back is attributed by hash.
+                let task_hash = compute_task_hash(&binary);
+                self.commit_assignment(
+                    worker_idx,
+                    binary.clone(),
+                    task_hash,
+                    estimated_usage.clone(),
+                );
 
                 assignments_per_secondary
                     .entry(secondary_id)

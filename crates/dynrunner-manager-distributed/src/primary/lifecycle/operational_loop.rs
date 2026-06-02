@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use dynrunner_core::{ErrorType, Identifier, ResourceMap};
+use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_primary_secondary::{
     PeerTransport,
     SecondaryTransport,
@@ -55,7 +55,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // Pairing the counter check with `active_workers == 0`
         // guarantees we only exit when every dispatched
         // assignment has been reconciled.
-        let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+        let active_workers = self.workers.iter().filter(|w| !w.is_idle()).count();
         // Counter-based exit: every task accounted for (completed or
         // failed) and no worker mid-dispatch. Re-read every iteration
         // so lazy `spawn_tasks` / `TasksSpawned` growth is absorbed.
@@ -573,7 +573,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     // `try_run_phase_retry_bucket` is its sole
                     // writer. Outside the OOM bucket the arm runs
                     // unchanged.
-                    let active = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+                    let active = self.workers.iter().filter(|w| !w.is_idle()).count();
                     if active > 0 {
                         let outcome = self.outcome_summary();
                         tracing::warn!(
@@ -589,18 +589,51 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         // are workers that didn't ack progress for the
                         // operational-loop timeout window — typically
                         // a stuck worker or wedged transport. Classify
-                        // as Recoverable so `run_retry_passes` gets a
-                        // chance to re-dispatch them; if they wedge
-                        // the same way on retry, the retry-budget
-                        // exhaustion path takes over.
-                        for worker in &mut self.workers {
-                            if let Some(binary) = worker.current_task.take() {
-                                let hash = compute_task_hash(&binary);
-                                self.failed_tasks
-                                    .insert(hash, ErrorType::Recoverable);
-                                worker.estimated_resources = ResourceMap::new();
-                                worker.is_idle = true;
+                        // as Recoverable so a later retry gets a chance
+                        // to re-dispatch them; if they wedge the same
+                        // way on retry, the retry-budget exhaustion path
+                        // takes over.
+                        //
+                        // Snapshot every held slot's
+                        // `(secondary, local_worker_id, hash)` first
+                        // (an immutable borrow), then free each through
+                        // the single `free_slot_on_terminal` helper so
+                        // the slot, the `in_flight` ledger entry, and
+                        // the per-type concurrency slot all release
+                        // together — the same terminal path TaskComplete
+                        // / TaskFailed use, keyed by the held hash. The
+                        // re-tag into `failed_tasks` preserves the
+                        // pre-existing "mark Recoverable, don't decrement
+                        // the phase counter at loop-exit" behaviour
+                        // (this arm only fires on the timeout-exit edge).
+                        let held: Vec<(String, u32, String)> = {
+                            let mut out = Vec::new();
+                            let mut local_idx: std::collections::HashMap<&str, u32> =
+                                std::collections::HashMap::new();
+                            for w in &self.workers {
+                                let lw = local_idx
+                                    .entry(w.secondary_id.as_str())
+                                    .or_insert(0);
+                                let this_lw = *lw;
+                                *lw += 1;
+                                if let Some(task) = w.held_task() {
+                                    out.push((
+                                        w.secondary_id.clone(),
+                                        this_lw,
+                                        compute_task_hash(task),
+                                    ));
+                                }
                             }
+                            out
+                        };
+                        for (secondary_id, local_worker_id, hash) in held {
+                            self.failed_tasks
+                                .insert(hash.clone(), ErrorType::Recoverable);
+                            self.free_slot_on_terminal(
+                                &secondary_id,
+                                local_worker_id,
+                                &hash,
+                            );
                         }
                     }
                 }
