@@ -122,7 +122,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     //      counter must drop from N+1 to N, not from
                     //      0 to 0.
                     //   3. Insert into the unified `in_flight` ledger
-                    //      keyed by file_hash with `worker_idx = None`,
+                    //      keyed by file_hash with `local_worker_id = None`,
                     //      so when the broadcast TaskComplete lands in
                     //      `handle_task_complete`, `free_slot_on_terminal`
                     //      resolves the entry BY HASH (no local slot
@@ -197,7 +197,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // Seed the unified `in_flight` ledger only after `extend`
         // succeeded — a failure on the items batch leaves
         // `pending = None` and any ledger entry we'd populated would be
-        // stranded. Each inherited task is seeded with `worker_idx =
+        // stranded. Each inherited task is seeded with `local_worker_id =
         // None` (no local slot holds it; the originating dispatcher
         // owns the work), so when its broadcast TaskComplete /
         // TaskFailed lands, `free_slot_on_terminal` attributes it BY

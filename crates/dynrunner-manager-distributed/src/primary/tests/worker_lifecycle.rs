@@ -251,6 +251,189 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
         .await;
 }
 
+/// Build a two-secondary primary (`sec-0`, `sec-1`), each with one
+/// idle worker (local id 0) carrying a generous memory budget, and a
+/// pool seeded from `tasks` in phase `work`. Returns the primary plus
+/// the live secondary endpoints (held so the transport channels stay
+/// open across the `handle_task_request` dispatches).
+#[allow(clippy::type_complexity)]
+fn primary_two_secondaries_with_pool(
+    tasks: Vec<TaskInfo<TestId>>,
+) -> (
+    PrimaryCoordinator<
+        ChannelSecondaryTransportEnd<TestId>,
+        NoPeers,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    Vec<(
+        String,
+        tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    )>,
+) {
+    let (transport, ends) = setup_test(2);
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        PrimaryConfig::default(),
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    let phase = PhaseId::from("work");
+    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+        [phase.clone()],
+        HashMap::new(),
+    )
+    .expect("work-phase pool");
+    primary.pending = Some(pool);
+    primary.phase_completed.insert(phase.clone(), 0);
+    primary.phase_failed.insert(phase, 0);
+    primary.pool_mut().extend(tasks).expect("valid extend");
+    let budget = ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]);
+    primary.register_idle_worker_for_test("sec-0".into(), 0, budget.clone());
+    primary.register_idle_worker_for_test("sec-1".into(), 0, budget);
+    (primary, ends)
+}
+
+/// Regression: a SURVIVING secondary's in-flight ledger entry must
+/// resolve its holding slot by STABLE `(secondary_id, local_worker_id)`
+/// identity, never by a cached positional `Vec` index. Two secondaries
+/// each hold an in-flight task: `A@sec-0` holds X, `B@sec-1` holds Y,
+/// with `B` at Vec index 1. When `sec-0` dies, `self.workers.retain`
+/// COMPACTS the Vec — `B` shifts down to index 0 — but no reindex of
+/// the ledger happens. A stale positional index for Y would then point
+/// at index 1 (now OUT OF BOUNDS → panic) or, on a larger fleet, at a
+/// DIFFERENT worker (held-hash mismatch → terminal silently dropped,
+/// the ledger/in-flight/type-slot leak class). Keyed by stable
+/// identity, Y's terminal resolves correctly post-compaction.
+#[tokio::test(flavor = "current_thread")]
+async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_identity() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let phase = PhaseId::from("work");
+            let x = phased("task-x", "work");
+            let y = phased("task-y", "work");
+            let hash_x = compute_task_hash(&x);
+            let hash_y = compute_task_hash(&y);
+            let (mut primary, _ends) = primary_two_secondaries_with_pool(vec![x, y]);
+
+            // Dispatch X to sec-0/w0 and Y to sec-1/w0 through the real
+            // request path so each pool `in_flight` counter and type
+            // slot is bumped exactly as production does. The scheduler
+            // picks the highest-priority eligible item per request;
+            // the two-task pool drains one per request.
+            primary
+                .handle_task_request(task_request("sec-0", 0))
+                .await
+                .unwrap();
+            primary
+                .handle_task_request(task_request("sec-1", 0))
+                .await
+                .unwrap();
+
+            // Determine which secondary took which task — the scheduler
+            // is free to order them. We need sec-0 to hold X and sec-1
+            // to hold Y for the named assertions; if it landed the other
+            // way the regression is identical (sec-0 dies, sec-1
+            // survives), so re-bind the survivor's hash from the slot.
+            let sec1_holds_y = primary.slot_holds_hash_for_test("sec-1", 0, &hash_y);
+            let (survivor_hash, dead_hash) = if sec1_holds_y {
+                (hash_y.clone(), hash_x.clone())
+            } else {
+                (hash_x.clone(), hash_y.clone())
+            };
+            assert!(
+                primary.slot_holds_hash_for_test("sec-1", 0, &survivor_hash),
+                "sec-1/w0 holds the survivor task"
+            );
+            assert!(
+                primary.slot_holds_hash_for_test("sec-0", 0, &dead_hash),
+                "sec-0/w0 holds the to-be-orphaned task"
+            );
+            assert_eq!(primary.in_flight_len_for_test(), 2, "both tasks in flight");
+            assert_eq!(primary.pool().in_flight(&phase), 2);
+            assert_eq!(
+                *primary.in_flight_per_type.get(&TypeId::from("default")).unwrap(),
+                2,
+                "both tasks hold a type-slot"
+            );
+            // sec-1's worker is at Vec index 1 BEFORE the death.
+            assert_eq!(primary.workers.len(), 2);
+            assert_eq!(primary.workers[1].secondary_id, "sec-1");
+
+            // sec-0 DIES: recover its in-flight task (requeue the dead
+            // one, decrement its phase counter, release its type slot,
+            // drop its ledger entry) then drop its workers. `retain`
+            // COMPACTS the Vec so sec-1's worker shifts from index 1 to
+            // index 0 — the exact desync a stored positional index hits.
+            let recovered = primary.recover_inflight_for_dead_secondary("sec-0");
+            assert_eq!(recovered, 1, "sec-0's one in-flight task recovered");
+            primary.workers.retain(|w| w.secondary_id != "sec-0");
+            assert_eq!(primary.workers.len(), 1, "only sec-1's worker remains");
+            assert_eq!(
+                primary.workers[0].secondary_id, "sec-1",
+                "sec-1's worker compacted to index 0"
+            );
+
+            // After recovery: survivor task still in flight, dead task
+            // requeued (pool in_flight 2 -> 1, type slot 2 -> 1).
+            assert_eq!(primary.in_flight_len_for_test(), 1, "survivor still in flight");
+            assert_eq!(primary.pool().in_flight(&phase), 1);
+            assert_eq!(
+                *primary.in_flight_per_type.get(&TypeId::from("default")).unwrap(),
+                1
+            );
+
+            // THE terminal: sec-1's survivor task completes. With a
+            // stale positional index this `handle_task_complete` would
+            // index `self.workers[1]` (out of bounds → PANIC). Keyed by
+            // stable identity it resolves the survivor at its new index
+            // 0 and frees cleanly.
+            primary
+                .handle_task_complete(
+                    task_complete("sec-1", 0, &survivor_hash),
+                    &mut None,
+                )
+                .await;
+
+            // No panic reached here. The survivor's slot is freed, its
+            // ledger entry drained, the phase in-flight counter and the
+            // type slot both released, and the completion credited once.
+            assert!(
+                primary.slot_is_idle_for_test("sec-1", 0),
+                "survivor slot freed to Idle on its terminal"
+            );
+            assert_eq!(
+                primary.in_flight_len_for_test(),
+                0,
+                "survivor's in-flight ledger entry drained"
+            );
+            assert_eq!(
+                primary.pool().in_flight(&phase),
+                0,
+                "phase in-flight counter decremented on the survivor terminal"
+            );
+            assert_eq!(
+                primary.in_flight_per_type.get(&TypeId::from("default")).copied().unwrap_or(0),
+                0,
+                "survivor's type slot released"
+            );
+            assert_eq!(
+                *primary.phase_completed.get(&phase).unwrap(),
+                1,
+                "exactly one completion credited to phase work"
+            );
+            assert!(
+                primary.completed_tasks.contains(&survivor_hash),
+                "survivor recorded completed"
+            );
+        })
+        .await;
+}
+
 /// (b-variant) A completion whose hash does NOT match the held slot —
 /// distinct from the dedup case — must be a pure no-op. Drives the
 /// `free_slot_on_terminal` "non-held hash" arm directly: the slot

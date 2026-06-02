@@ -26,18 +26,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let available_res: ResourceMap = available_resources.iter()
                 .map(|r| (r.kind.clone(), r.amount))
                 .collect();
-            // Find matching worker
-            let mut target_idx = None;
-            let mut local_idx: u32 = 0;
-            for (idx, w) in self.workers.iter().enumerate() {
-                if w.secondary_id == *secondary_id {
-                    if local_idx == worker_id {
-                        target_idx = Some(idx);
-                        break;
-                    }
-                    local_idx += 1;
-                }
-            }
+            // Find matching worker by its stable secondary-local id.
+            let target_idx = self.worker_idx_for(secondary_id, worker_id);
 
             let mut assigned = false;
 

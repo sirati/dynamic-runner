@@ -170,12 +170,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 total_assigned_resources.add(&estimated_usage);
 
                 let secondary_id = self.workers[worker_idx].secondary_id.clone();
-                // Compute local worker index within that secondary
-                let local_worker_id = self.workers[..worker_idx + 1]
-                    .iter()
-                    .filter(|w| w.secondary_id == secondary_id)
-                    .count() as u32
-                    - 1;
+                // Secondary-local worker id (the wire `worker_id`).
+                let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
 
                 // Type-slot reserve + slot `Idle -> Assigned{task_hash}`
                 // + ledger insert, committed together at the moment of

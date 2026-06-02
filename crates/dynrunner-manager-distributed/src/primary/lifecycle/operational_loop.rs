@@ -608,18 +608,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         // (this arm only fires on the timeout-exit edge).
                         let held: Vec<(String, u32, String)> = {
                             let mut out = Vec::new();
-                            let mut local_idx: std::collections::HashMap<&str, u32> =
-                                std::collections::HashMap::new();
-                            for w in &self.workers {
-                                let lw = local_idx
-                                    .entry(w.secondary_id.as_str())
-                                    .or_insert(0);
-                                let this_lw = *lw;
-                                *lw += 1;
+                            for idx in 0..self.workers.len() {
+                                let w = &self.workers[idx];
                                 if let Some(task) = w.held_task() {
                                     out.push((
                                         w.secondary_id.clone(),
-                                        this_lw,
+                                        self.local_worker_id_in_secondary(idx),
                                         compute_task_hash(task),
                                     ));
                                 }
