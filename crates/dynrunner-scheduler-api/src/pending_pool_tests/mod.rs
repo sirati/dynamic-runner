@@ -13,6 +13,7 @@ pub(super) use dynrunner_core::{AffinityId, PhaseId, SoftPreferredSecondaries, T
 mod bucket_dispatch;
 mod phase_graph;
 mod phase_lifecycle;
+mod ready_count;
 mod take_first_match;
 mod task_deps;
 mod worker_view;
