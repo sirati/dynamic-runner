@@ -42,20 +42,45 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// that also deferred discovery holds a genuinely partial CRDT
     /// mirror and must wait for the authoritative `RunComplete`.
     pub(crate) fn run_complete_check(&self) -> bool {
-        // Check termination: all tasks accounted for AND no
-        // worker is mid-dispatch. Both halves of the check are
-        // necessary — counting `completed + failed >= total`
-        // alone would orphan in-flight tasks if the bookkeeping
-        // ever inflates (e.g. a TaskComplete arriving for a task
-        // primary doesn't currently track as in-flight on a
-        // worker — the insert grows the set while the in-flight
-        // ledger stays as-is, so the counter check trips while a
-        // sibling worker is still mid-dispatch and primary tears
-        // down before that sibling's TaskComplete arrives).
-        // Pairing the counter check with `active_workers == 0`
-        // guarantees we only exit when every dispatched
-        // assignment has been reconciled.
-        let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+        // Check termination: all tasks accounted for AND no worker is
+        // mid-dispatch. Both halves of the check are necessary —
+        // counting `completed + failed >= total` alone would orphan
+        // in-flight tasks if the bookkeeping ever inflates (e.g. a
+        // TaskComplete arriving for a task primary doesn't currently
+        // track as in-flight on a worker — the insert grows the set
+        // while the in-flight ledger stays as-is, so the counter check
+        // trips while a sibling worker is still mid-dispatch and primary
+        // tears down before that sibling's TaskComplete arrives).
+        // Pairing the counter check with "no worker mid-dispatch"
+        // guarantees we only exit when every dispatched assignment has
+        // been reconciled.
+        //
+        // `workers_reconciled` is that "no worker is mid-dispatch" half.
+        // It is an AUTHORITATIVE-primary concern only: the live primary
+        // owns dispatch, so its `self.workers` table is the source of
+        // truth for in-flight assignments, and requiring every worker
+        // idle guarantees we never tear down while one of OUR dispatched
+        // assignments is still unreconciled.
+        //
+        // A DEMOTED primary never dispatches (`dispatch_to_idle_workers`
+        // returns immediately when `self.demoted`, see
+        // `lifecycle/dispatch.rs`), so its `self.workers` table is
+        // FROZEN at whatever the bootstrap `perform_initial_assignment`
+        // left it. Post-handoff, completions are driven by the
+        // authoritative (promoted) primary's dispatch, whose
+        // `(secondary_id, worker_id)` attribution need not line up with
+        // the demoted local's stale initial-assignment table — a
+        // completion can free the wrong worker (or none), stranding a
+        // worker whose `current_task` is never cleared. Gating the
+        // demoted's run-completion on its own stale `active_workers`
+        // therefore deadlocks the loop: the counter reaches
+        // `completed+failed >= total` but `active_workers` never returns
+        // to 0. For a demoted primary the authoritative completion
+        // signals are the counter (mirrored from the CRDT) and the
+        // replicated `RunComplete`, NOT its advisory worker table — so
+        // `workers_reconciled` is unconditionally true when demoted.
+        let workers_reconciled = self.demoted
+            || self.workers.iter().all(|w| w.current_task.is_none());
         // Counter-based exit. Gates:
         //
         //   (a) `!self.setup_pending` — the historical setup-defer
@@ -130,7 +155,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         if !partial_view
             && !self.setup_pending
             && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
-            && active_workers == 0
+            && workers_reconciled
         {
             tracing::info!("all tasks completed or failed");
             return true;
@@ -151,7 +176,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // the local pool — only the live primary's pool ingests
         // staged items). Legacy bootstrap's pool was seeded
         // pre-loop and drains normally.
-        if !partial_view && !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
+        if !partial_view && !self.setup_pending && self.pool().is_run_complete() && workers_reconciled {
             tracing::info!("pool drained and no active workers");
             return true;
         }
@@ -184,7 +209,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         //
         // Sticky monotonic flag, so this fires at most once
         // per run.
-        if self.cluster_state.run_complete() && active_workers == 0 {
+        if self.cluster_state.run_complete() && workers_reconciled {
             tracing::info!("RunComplete signal received from cluster; exiting");
             return true;
         }
