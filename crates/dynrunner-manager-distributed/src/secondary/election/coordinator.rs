@@ -101,48 +101,36 @@ where
             .config
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold);
+        // `primary_silent` is the SOLE liveness predicate for whoever
+        // currently holds the primary role — co-located OR a promoted
+        // peer. `primary_last_seen` is refreshed by
+        // `record_primary_message`, and post-A-M0a the recognition path
+        // in `handle_inbound`'s Keepalive arm routes EVERY keepalive
+        // whose originator IS the current primary (resolved via
+        // `cluster_state.current_primary()`, the single source of "who
+        // is primary now") through `record_primary_message`. So a
+        // promoted peer's keepalives refresh `primary_last_seen` exactly
+        // like the co-located primary's dispatch traffic once did, and a
+        // genuinely-dead promoted primary trips `primary_silent` once its
+        // keepalives stop — there is no longer a separate
+        // promoted-peer-primary liveness axis to track.
+        //
+        // This subsumes the former cascade trigger (`primary_peer_silent`,
+        // which read the promoted primary's `peer_keepalives` entry):
+        // that branch is both REDUNDANT (the recognition path now keeps
+        // `primary_last_seen` fresh for a promoted peer) and BROKEN (post-
+        // A-M0a the current primary's keepalives no longer populate
+        // `peer_keepalives`, so its `unwrap_or(true)` fired against a
+        // HEALTHY just-promoted primary and stormed `TimeoutQuery`,
+        // risking double-promotion). The cascade (promoted-peer-died)
+        // case Dataset's K=2 run hit is now covered by `primary_silent`
+        // via the A-M0a recognition path.
         let primary_silent = self
             .primary_last_seen
             .map(|t| Instant::now().duration_since(t) > deadline)
             .unwrap_or(false);
 
-        // Cascade election trigger: if a primary peer was promoted
-        // (current_primary names a peer, not ourselves) and that
-        // peer's keepalives have gone stale, we need to run a fresh
-        // election regardless of whether the local-machine primary
-        // is still alive. Pre-fix, the election only fired on
-        // local-primary silence — so when a promoted peer like
-        // sec-0 died but the local primary was still streaming
-        // keepalives to other secondaries, those secondaries
-        // observed the disconnect, dropped sec-0 from
-        // peer_keepalives, and then sat idle forever because
-        // primary_silent stayed false. Dataset's K=2 run hit
-        // exactly this: 4 surviving secondaries with no primary,
-        // no election attempt, no logged "primary assigned" lines
-        // on any of them.
-        //
-        // A peer is considered the silent primary when:
-        //   - the replicated `current_primary` is set (a promotion
-        //     happened) — read from `cluster_state`, the single source
-        //     of "who is primary now".
-        //   - the id is NOT ourselves (we'd be Promoted, handled above)
-        //   - its peer_keepalives entry is missing OR its
-        //     timestamp is older than `deadline`
-        // Clone the id out of the cluster_state borrow before the
-        // `peer_keepalives` read so the two borrows don't overlap.
-        let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
-        let primary_peer_silent = current_primary_id
-            .as_deref()
-            .filter(|id| *id != self.config.secondary_id.as_str())
-            .map(|id| {
-                self.peer_keepalives
-                    .get(id)
-                    .map(|t| (timestamp_now() - t) > deadline.as_secs_f64())
-                    .unwrap_or(true)
-            })
-            .unwrap_or(false);
-
-        let need_election = primary_silent || primary_peer_silent;
+        let need_election = primary_silent;
 
         match &self.election {
             ElectionState::Normal if need_election => {
@@ -158,19 +146,23 @@ where
                 // node to coordinate with, so the cluster is
                 // already unsalvageable. Bail with a clear reason
                 // instead of pretending the election succeeded.
+                // Diagnostic only: who the silent primary was (co-located
+                // or a promoted peer). Read inline from the single source
+                // of "who is primary now"; it drives no decision — the
+                // decision is `primary_silent` alone.
+                let current_primary_id = self.cluster_state.current_primary();
                 if self.peer_mesh_degraded {
                     let reason = format!(
                         "peer mesh required for failover but not \
-                         available: primary went silent (primary_silent={}, \
-                         primary_peer_silent={}) and no peers connected to \
-                         elect a new primary; exiting",
-                        primary_silent, primary_peer_silent,
+                         available: primary went silent (primary_silent={}) \
+                         and no peers connected to elect a new primary; \
+                         exiting",
+                        primary_silent,
                     );
                     tracing::error!(
                         secondary = %self.config.secondary_id,
                         primary_silent,
-                        primary_peer_silent,
-                        primary_peer = ?current_primary_id,
+                        primary = ?current_primary_id,
                         "{reason}"
                     );
                     self.fatal_exit = Some(reason);
@@ -180,10 +172,8 @@ where
                     secondary = %self.config.secondary_id,
                     miss_threshold = self.config.keepalive_miss_threshold,
                     primary_silent,
-                    primary_peer_silent,
-                    primary_peer = ?current_primary_id,
-                    "primary or primary peer missed keepalives; \
-                     entering Suspecting"
+                    primary = ?current_primary_id,
+                    "primary missed keepalives; entering Suspecting"
                 );
                 self.election = ElectionState::Suspecting {
                     since: Instant::now(),

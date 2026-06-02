@@ -506,3 +506,152 @@
             "PromotePrimary must broadcast even when no co-located primary exists",
         );
     }
+
+    // ── Post-failover regression (A-M0a election liveness) ──
+    //
+    // After A-M0a, a keepalive whose originator IS the current primary is
+    // recognized in `handle_inbound` and routed through
+    // `record_primary_message` → `primary_last_seen` (NOT `peer_keepalives`).
+    // A code audit found `run_election_tick`'s former `primary_peer_silent`
+    // branch read the promoted primary's `peer_keepalives` entry — which is
+    // never populated for the current primary post-A-M0a — so its
+    // `unwrap_or(true)` tripped a SPURIOUS election against a HEALTHY
+    // just-promoted peer-primary, risking double-promotion. These tests pin
+    // that a healthy promoted peer-primary drives NO election while its
+    // keepalives flow, and a genuinely-dead one still does.
+
+    /// Build a Keepalive whose originator is `from`. Fed through the real
+    /// `handle_inbound` recognition path: when `from` is the current
+    /// primary it refreshes `primary_last_seen` via `record_primary_message`;
+    /// otherwise it files a `peer_keepalives` entry — exactly the production
+    /// split this regression depends on.
+    fn keepalive_from(from: &str) -> DistributedMessage<super::super::test_helpers::TestId> {
+        DistributedMessage::Keepalive {
+            sender_id: from.to_string(),
+            timestamp: timestamp_now(),
+            secondary_id: from.to_string(),
+            active_workers: 0,
+        }
+    }
+
+    /// Drive a real `PromotePrimary` naming a PEER as the new primary, then
+    /// stream that peer's keepalives (recognized → `primary_last_seen` kept
+    /// fresh): `run_election_tick` MUST NOT enter Suspecting or broadcast a
+    /// `TimeoutQuery` while the promoted primary is healthy. Then simulate
+    /// the promoted primary dying (backdate `primary_last_seen` past the
+    /// death deadline with no further keepalive): the election MUST fire —
+    /// proving `primary_silent` ALONE covers the cascade (promoted-peer-
+    /// died) case the deleted `primary_peer_silent` branch used to chase,
+    /// with no spurious election while healthy.
+    ///
+    /// Deterministic time: the staleness predicate (`primary_silent`) reads
+    /// `std::time::Instant` (NOT a tokio timer), so death is simulated by an
+    /// explicit backdated `primary_last_seen`, mirroring
+    /// `pre_designated_primary_ignores_silent_local_primary` — no wall-clock
+    /// racing, no dependence on the tokio paused-time clock.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
+        let mut sec = make_secondary(election_config("sec-b"));
+        // A surviving mesh peer so the election path is non-degraded and
+        // can actually broadcast `TimeoutQuery` when the primary dies.
+        sec.peer_keepalives.insert("sec-c".into(), timestamp_now());
+
+        // A peer (sec-a) is promoted to primary via the real apply path.
+        let promote = DistributedMessage::PromotePrimary {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "sec-a".into(),
+            epoch: 1,
+            required_setup: false,
+        };
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
+            .await
+            .expect("PromotePrimary handler succeeds");
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
+
+        // Healthy: each beat the promoted primary's keepalive is recognized
+        // (refreshes `primary_last_seen`); the tick must stay Normal and
+        // originate no `TimeoutQuery`. Pre-fix this stormed `TimeoutQuery`
+        // immediately because `primary_peer_silent` read the (never-
+        // populated) `peer_keepalives["sec-a"]` and `unwrap_or(true)`.
+        for _ in 0..5 {
+            sec.handle_inbound(keepalive_from("sec-a"), &mut FakeWorkerFactory)
+                .await;
+            let actions = sec.run_election_tick();
+            assert!(
+                matches!(sec.election, ElectionState::Normal),
+                "healthy promoted primary must keep us Normal; got {:?}",
+                std::mem::discriminant(&sec.election),
+            );
+            assert!(
+                !actions
+                    .broadcast
+                    .iter()
+                    .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+                "no spurious TimeoutQuery against a healthy promoted primary",
+            );
+        }
+
+        // The promoted primary dies: NO further keepalive refreshes
+        // `primary_last_seen`. Backdate it well past the death deadline
+        // (keepalive_interval * miss_threshold) — the next tick must enter
+        // Suspecting and broadcast a `TimeoutQuery`. The genuinely-dead
+        // promoted primary IS detected, via `primary_silent`.
+        sec.primary_last_seen =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
+        let actions = sec.run_election_tick();
+        assert!(
+            matches!(sec.election, ElectionState::Suspecting { .. }),
+            "a dead promoted primary must trigger the election (Suspecting); got {:?}",
+            std::mem::discriminant(&sec.election),
+        );
+        assert!(
+            actions
+                .broadcast
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
+            "the election must broadcast a TimeoutQuery once the promoted primary is silent",
+        );
+    }
+
+    /// `check_peer_timeouts` must NOT prune the ALIVE promoted primary's
+    /// stale PRE-promotion `peer_keepalives` entry — the current primary is
+    /// not a peer for liveness purposes. A regular stale peer is still
+    /// pruned (control), proving the skip is scoped to the current primary,
+    /// not a blanket disable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn check_peer_timeouts_skips_alive_promoted_primary() {
+        let mut sec = make_secondary(election_config("sec-b"));
+        // Both entries are unconditionally stale (epoch timestamp ≪ the
+        // 120s peer_timeout), so the only thing that can spare one is the
+        // current-primary skip.
+        sec.peer_keepalives.insert("sec-a".into(), 0.0);
+        sec.peer_keepalives.insert("sec-z".into(), 0.0);
+
+        // sec-a is promoted to primary via the real apply path. Its
+        // pre-promotion `peer_keepalives` entry is now stale-but-alive.
+        let promote = DistributedMessage::PromotePrimary {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            new_primary_id: "sec-a".into(),
+            epoch: 1,
+            required_setup: false,
+        };
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
+            .await
+            .expect("PromotePrimary handler succeeds");
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
+
+        sec.check_peer_timeouts();
+
+        assert!(
+            sec.peer_keepalives.contains_key("sec-a"),
+            "the ALIVE promoted primary's entry must NOT be pruned — \
+             it is not a peer for liveness purposes",
+        );
+        assert!(
+            !sec.peer_keepalives.contains_key("sec-z"),
+            "a genuinely-stale regular peer is still pruned (skip is \
+             scoped to the current primary, not a blanket disable)",
+        );
+    }
