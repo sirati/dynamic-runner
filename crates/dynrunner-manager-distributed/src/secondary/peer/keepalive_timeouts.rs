@@ -48,7 +48,21 @@ where
         let timeout_secs = self.config.peer_timeout.as_secs_f64();
         let mut timed_out = Vec::new();
 
+        // The current primary is NOT a peer for liveness purposes. Its
+        // liveness is tracked SOLELY via `primary_last_seen` (refreshed by
+        // the A-M0a recognition path in `handle_inbound`, and judged by
+        // `run_election_tick`'s `primary_silent`). A just-promoted peer
+        // may still carry a stale PRE-promotion `peer_keepalives` entry
+        // (its mesh keepalives stopped feeding that map the moment it
+        // became `current_primary`); without this skip that stale entry
+        // would trip a spurious timeout WARN and prune the entry of an
+        // ALIVE primary — a peer-removal of the node we depend on. Reading
+        // `current_primary` is the single source of "who is primary now".
+        let current_primary = self.cluster_state.current_primary();
         for (peer_id, last_seen) in &self.peer_keepalives {
+            if Some(peer_id.as_str()) == current_primary {
+                continue;
+            }
             if now - last_seen > timeout_secs {
                 timed_out.push(peer_id.clone());
             }
