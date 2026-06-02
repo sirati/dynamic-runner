@@ -260,6 +260,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 uses_file_based_items: self.config.uses_file_based_items,
             };
             self.transport.send_to(secondary_id, msg).await?;
+
+            // Send succeeded: originate the CRDT `Pending → InFlight`
+            // transition for each task in this secondary's initial
+            // batch (the single origination point, shared with the live
+            // dispatch sites). After the send so a delivery failure —
+            // which `?`-aborts initial assignment — never leaves a
+            // replicated `InFlight` to compensate. Collect the
+            // (hash, worker) pairs owned BEFORE the mut-self call so the
+            // immutable borrow of `assignments_per_secondary` is dropped.
+            let assigned_inflight: Vec<(String, u32)> = assignments
+                .iter()
+                .map(|(worker_id, binary, _)| (compute_task_hash(binary), *worker_id))
+                .collect();
+            for (task_hash, worker_id) in assigned_inflight {
+                self.originate_task_assigned(task_hash, secondary_id.clone(), worker_id)
+                    .await;
+            }
         }
 
         // Transition all to Operational. At the same moment, reset

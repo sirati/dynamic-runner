@@ -196,7 +196,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // mirroring the reference dead-peer recovery. The held slots
         // are then removed below; the ledger is the source of truth for
         // the requeue so the two can't diverge.
-        let requeued = self.recover_inflight_for_dead_secondary(&secondary_id);
+        let requeue_mutations = self.recover_inflight_for_dead_secondary(&secondary_id);
+        let requeued = requeue_mutations.len();
         // Drop every worker hosted by the dead secondary — its host is
         // gone. The slot state is discarded with the worker; the task
         // it held (if any) was already requeued via the ledger above.
@@ -211,18 +212,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.secondaries.remove(&secondary_id);
         self.secondary_keepalives.remove(&secondary_id);
 
-        // Authoritative origination: the primary is the sole writer of
-        // `PeerRemoved` for a dead secondary. Goes through the canonical
-        // `apply_and_broadcast_cluster_mutations` helper so the local
-        // CRDT mirror flips in the same call as the wire fan-out and
-        // the apply+filter semantics stay consistent with every other
-        // primary-originated mutation. Secondaries do NOT broadcast
-        // `PeerRemoved`; they observe and apply ours.
-        self.apply_and_broadcast_cluster_mutations(vec![ClusterMutation::PeerRemoved {
+        // Authoritative origination, one batch: the dead secondary's
+        // in-flight tasks transition `InFlight → Pending` in the CRDT
+        // (the `TaskRequeued` mutations the recovery just produced, in
+        // lockstep with the local pool requeue above so a stale
+        // `InFlight` can't survive and strand the task on failover) and
+        // the secondary itself is marked removed (`PeerRemoved`). Both
+        // go through the canonical `apply_and_broadcast_cluster_mutations`
+        // helper so the local CRDT mirror flips in the same call as the
+        // wire fan-out and the apply+filter semantics stay consistent
+        // with every other primary-originated mutation. The primary is
+        // the sole writer of both; secondaries observe and apply ours.
+        let mut recovery_mutations = requeue_mutations;
+        recovery_mutations.push(ClusterMutation::PeerRemoved {
             id: secondary_id.clone(),
             cause,
-        }])
-        .await;
+        });
+        self.apply_and_broadcast_cluster_mutations(recovery_mutations)
+            .await;
 
         if self
             .primary_id
