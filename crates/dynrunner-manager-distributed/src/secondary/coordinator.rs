@@ -87,6 +87,7 @@ where
             peer_dial_count: 0,
             mesh_ready_sent: false,
             pre_staged_mode: false,
+            setup_discovery_done: false,
             uses_file_based_items: true,
             fatal_exit: None,
             peer_mesh_degraded: false,
@@ -103,6 +104,7 @@ where
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
+            promote_activation_tx: None,
             on_phase_end: None,
             on_phase_start: None,
             command_rx: Some(command_rx),
@@ -194,6 +196,64 @@ where
         self.panik_signal_rx = Some(rx);
     }
 
+    /// Register the promotion-activation gate sender for the co-located
+    /// parked [`crate::primary::PrimaryCoordinator`].
+    ///
+    /// The composed runtime builds both coordinators on one `LocalSet`,
+    /// parks the primary behind `PrimaryCoordinator::run_parked`'s
+    /// oneshot gate, and hands the matching sender here. When this
+    /// node's election reaches its terminal `Promoted` transition,
+    /// [`Self::fire_local_promotion`] fires the gate to wake the parked
+    /// primary into its seeded resume. Pre-`run_until_setup_or_done`
+    /// contract, same single-shot shape as the other `register_*`
+    /// setters. Absent registration (Rust-only tests / legacy single-
+    /// `run()` callers) leaves the gate `None`; the terminal action then
+    /// only broadcasts `PromotePrimary { new = self }`. The gate carries
+    /// a [`crate::cluster_state::ClusterStateSnapshot`] — the seed for
+    /// the parked primary's `restore` + `hydrate_from_cluster_state`.
+    pub fn register_promote_activation(
+        &mut self,
+        tx: tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>,
+    ) {
+        self.promote_activation_tx = Some(tx);
+    }
+
+    /// Extract the composed-primary wiring — the lifecycle/command
+    /// channels the PyO3 wrapper minted on this `SecondaryCoordinator`
+    /// so its `PrimaryHandle` clone stays a stable type — for transfer
+    /// onto the co-located [`crate::primary::PrimaryCoordinator`], the
+    /// real consumer.
+    ///
+    /// Returns `(command_tx, command_rx, on_phase_start, on_phase_end)`,
+    /// taking each out of `self`. The composed runtime hands the command
+    /// pair to the primary via `replace_command_channel` and the phase
+    /// callbacks via `register_lifecycle_*`/`register_phase_*` — the
+    /// authority owns the phase machine and the externally-issued
+    /// `PrimaryCommand` ingress, NOT the follower secondary. This is the
+    /// site that makes these fields live (consumed in-crate), so the
+    /// fields carry no `#[allow(dead_code)]`.
+    ///
+    /// One-shot: a second call yields `(_, None, None, None)` because
+    /// the receiver/closures were already taken. The `command_tx` clone
+    /// is `Clone`, so the secondary retains its own copy for any handle
+    /// minted off it; only the receiver is uniquely transferred.
+    #[allow(clippy::type_complexity)]
+    pub fn take_composed_primary_wiring(
+        &mut self,
+    ) -> (
+        tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
+        Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
+        Option<crate::primary::OnPhaseStart>,
+        Option<crate::primary::OnPhaseEnd>,
+    ) {
+        (
+            self.command_tx.clone(),
+            self.command_rx.take(),
+            self.on_phase_start.take(),
+            self.on_phase_end.take(),
+        )
+    }
+
     /// Register a [`crate::task_completed::TaskCompletedListener`].
     /// Same single-shot, pre-`run_until_setup_or_done`-only contract
     /// as [`Self::register_lifecycle_listener`].
@@ -204,22 +264,26 @@ where
         self.task_completed_listeners.push(listener);
     }
 
-    /// Install per-phase lifecycle hooks fired on this secondary when
-    /// it owns the primary pool (post-promotion). Mirrors the same
-    /// shape `PrimaryCoordinator::run_pipeline` accepts:
+    /// Accept the per-phase lifecycle hooks for the post-promotion path.
+    /// Mirrors the shape `PrimaryCoordinator::run` accepts:
     /// `on_phase_start(&PhaseId)` fires when a phase flips Blocked →
     /// Active; `on_phase_end(&PhaseId, completed, failed)` fires when
     /// the phase reaches `Drained`.
     ///
     /// Must be called before `run_until_setup_or_done` enters.
-    /// Secondaries that never get promoted never invoke either hook,
-    /// so the absence of a registration is the no-op case (the
-    /// fire-sites guard on the `Option`).
     ///
-    /// Single concern: ownership transfer of the boxed closures from
-    /// the PyO3 wrapper (which constructs the GIL-reacquiring
-    /// closures) onto the coordinator that will fire them. The
-    /// invocation semantics live in `secondary/primary/lifecycle.rs`.
+    /// The secondary holds NO phase machine and never fires these
+    /// itself. It is a registration ANCHOR: under the unified
+    /// composition the runtime moves the closures onto the co-located
+    /// parked `PrimaryCoordinator` (the authority that owns the phase
+    /// machine) via [`Self::take_composed_primary_wiring`]; that primary
+    /// fires them once activated. On a node that composes no co-located
+    /// primary (in-process distributed secondaries on a `NoPeerTransport`
+    /// mesh) the closures stay dormant and are never invoked.
+    ///
+    /// Single concern: accept ownership of the boxed GIL-reacquiring
+    /// closures from the PyO3 wrapper and hold them until the
+    /// composition transfers them to the authority.
     pub fn register_phase_lifecycle_callbacks(
         &mut self,
         on_phase_start: crate::primary::OnPhaseStart,
@@ -313,6 +377,32 @@ where
     /// site (`expected_content_hash` selection); no getter is needed.
     pub(in crate::secondary) fn set_pre_staged_mode(&mut self, on: bool) {
         self.pre_staged_mode = on;
+    }
+
+    /// Single source of truth for the setup-discovery `SetupPending`
+    /// yield discriminator.
+    ///
+    /// `true` iff (a) the authority deferred discovery
+    /// (`pre_staged_mode`, set from the empty `InitialAssignment` the
+    /// submitter sends when it has no local corpus view), (b) the
+    /// replicated ledger is still empty (`cluster_state.task_count()
+    /// == 0` — no node has seeded it yet), and (c) this node hasn't
+    /// already run its own discovery pass ([`Self::setup_discovery_done`]).
+    ///
+    /// `process_tasks` consults this once per tick and yields
+    /// `RunOutcome::SetupPending` when true so the PyO3 wrapper can run
+    /// Python's `task.discover_items` against the locally bind-mounted
+    /// corpus and feed the result back via
+    /// [`Self::ingest_setup_discovery`]. The predicate is self-clearing
+    /// on every axis: a non-empty ledger (this node's own ingest or a
+    /// peer's broadcast) flips (b) false, and `ingest_setup_discovery`
+    /// flips (c) true — so the yield FIRES AT MOST ONCE per node and an
+    /// empty discovery never re-yields. Legacy / failover runs leave
+    /// `pre_staged_mode` false, so the predicate is always false there.
+    pub(in crate::secondary) fn setup_discovery_pending(&self) -> bool {
+        self.pre_staged_mode
+            && !self.setup_discovery_done
+            && self.cluster_state.task_count() == 0
     }
 
     /// Whether dispatched task items back to real files (default true).

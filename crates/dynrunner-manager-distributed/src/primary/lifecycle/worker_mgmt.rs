@@ -158,12 +158,23 @@ impl<
     ///
     /// Single concern: the recovery-feasibility predicate. The
     /// per-secondary cap and cooldown are deliberately NOT consulted
-    /// here — they gate an individual respawn DECISION (in
-    /// `dispatch_respawn_request`), whereas this is a coarse "could the
-    /// fleet still come back at all" question keyed only on the total
-    /// budget and in-flight work. (Tracked 3B refinement: tighten to
-    /// the full `should_respawn` predicate once a dead-secondary id is
-    /// available at this site.)
+    /// here — they gate an individual respawn DECISION (the
+    /// `RespawnBudget::should_respawn(original_id, ..)` family-chain
+    /// check), which is keyed on a SPECIFIC dead family. This predicate's
+    /// caller, the phase-floor liveness check
+    /// ([`Self::handle_phase_started_needs_workers`]), is family-AGNOSTIC:
+    /// it fires on "a phase started but zero workers are alive anywhere"
+    /// and has no dead-secondary id in scope — there is no single family
+    /// to consult `should_respawn` against. Failover surfaces a dead-id
+    /// at the death-detection / requeue site (`process_heartbeat_tick`),
+    /// NOT here, so the 3B "tighten to the full `should_respawn`
+    /// predicate" refinement does not apply at this site; the coarse
+    /// total-budget question ("could the fleet come back at all") is the
+    /// correct shape here. It is conservative-by-design — it never
+    /// spuriously escalates (it errs toward "recovery possible", so a
+    /// per-family-exhausted-but-total-budget-remaining cluster defers to
+    /// the respawn pipeline rather than failing the run), which is the
+    /// safe direction for a liveness floor.
     fn fleet_recovery_in_progress_or_possible(&self) -> bool {
         if !self.respawn_tasks.is_empty() {
             return true;

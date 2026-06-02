@@ -13,15 +13,22 @@ use std::time::Duration;
 /// value to decide whether to run Python-side setup discovery before
 /// re-entering, or to break out and shut down. The Rust-only callers
 /// (tests, the existing `run` entry point) only ever observe `Done` —
-/// `SetupPending` requires a `required_setup: true` wire promotion,
-/// which never happens in those contexts.
+/// `SetupPending` requires pre-staged mode with an empty ledger (see
+/// below), which those contexts never enter.
 ///
-/// - `SetupPending`: the secondary was promoted with `required_setup =
-///   true` and the process-tasks loop yielded so the caller can run
-///   Python's `task.discover_items` against the locally-mounted staged
-///   source and feed the result back via `ingest_setup_discovery`. The
-///   worker pool is left running; re-entering `run_until_setup_or_done`
-///   resumes the loop.
+/// - `SetupPending`: the secondary observed pre-staged mode with an
+///   empty replicated ledger — the authority deferred task discovery to
+///   the corpus-mounting secondaries (it sent an empty `InitialAssignment
+///   { pre_staged_mode: true }` rather than seeding the ledger). The
+///   process-tasks loop yielded (via `SecondaryCoordinator::
+///   setup_discovery_pending`) so the caller can run Python's
+///   `task.discover_items` against the locally-mounted staged source and
+///   feed the result back via `ingest_setup_discovery` — which broadcasts
+///   `PhaseDepsSet + TaskAdded` onto the mesh for the co-located
+///   authoritative primary to pick up. The worker pool is left running;
+///   re-entering `run_until_setup_or_done` resumes the loop, and the
+///   fire-once latch (set by `ingest_setup_discovery`) prevents a
+///   re-yield.
 /// - `Done`: the loop reached one of its normal terminations
 ///   (RunComplete observed, drain-down after primary disconnect, or
 ///   single-secondary clean exit). The worker pool has been stopped
@@ -70,33 +77,29 @@ pub struct SecondaryConfig {
     /// suspects primary death and starts the failover election (default 3,
     /// matching the primary's `keepalive_miss_threshold`).
     pub keepalive_miss_threshold: u32,
-    /// Maximum number of retry passes the primary runs after the
-    /// main pass drains. Mirrors `PrimaryConfig::retry_max_passes` —
-    /// pre-demotion the local primary owned this; post-demotion the
-    /// promoted secondary owns retry for tasks IT dispatched, so the
-    /// same knob has to live on this side too. Default 1 (so total
-    /// attempts per task = main pass + 1 retry pass = 2). 0 disables
-    /// retry entirely on the primary side.
+    /// Maximum number of retry passes the AUTHORITY runs after the main
+    /// pass drains. Mirrors `PrimaryConfig::retry_max_passes`. Default 1
+    /// (total attempts per task = main pass + 1 retry pass = 2); 0
+    /// disables retry.
     ///
-    /// Only consulted when this secondary is acting as primary
-    /// (`is_primary == true`). On non-promoted secondaries the
-    /// field is inert — the live primary's `retry_max_passes` is what
-    /// drives retry while the live primary is still authoritative.
+    /// INERT on the `SecondaryCoordinator`: the secondary holds no
+    /// dispatch authority and runs no retry machine. The retry concern is
+    /// owned entirely by the co-located `PrimaryCoordinator` via its OWN
+    /// `PrimaryConfig::retry_max_passes`. This field rides on
+    /// `SecondaryConfig` only so the PyO3 wrapper can carry the operator
+    /// knob through a single config struct; the unified composition
+    /// threads the value into the co-located primary's config.
     pub retry_max_passes: u32,
 
-    /// Number of retry passes for the per-phase OOM-retry bucket on
-    /// the promoted-secondary's primary path. Mirrors
-    /// `PrimaryConfig::oom_retry_max_passes` so the same per-phase
-    /// (Recoverable + OOM) partition the live primary drives also
-    /// applies on this node once it acts as primary. Default 1.
-    /// `oom_retry_max_passes = 0` disables the OOM bucket entirely
-    /// — `ResourceExhausted(memory)` failures stay in
-    /// `primary_failed` and are surfaced via the outcome summary
-    /// without a second-chance dispatch.
+    /// Number of retry passes for the per-phase OOM-retry bucket the
+    /// AUTHORITY runs. Mirrors `PrimaryConfig::oom_retry_max_passes`.
+    /// Default 1; `oom_retry_max_passes = 0` disables the OOM bucket so
+    /// `ResourceExhausted(memory)` failures stay terminal.
     ///
-    /// Only consulted when this secondary is acting as primary
-    /// (`is_primary == true`). Inert on non-promoted secondaries
-    /// for the same reason `retry_max_passes` is.
+    /// INERT on the `SecondaryCoordinator`, same disposition as
+    /// `retry_max_passes`: the OOM-retry partition is the co-located
+    /// `PrimaryCoordinator`'s concern, driven by its own
+    /// `PrimaryConfig::oom_retry_max_passes`.
     pub oom_retry_max_passes: u32,
 
     /// Number of consecutive primary-link recv-None probes after
@@ -192,54 +195,43 @@ pub struct SecondaryConfig {
     /// setup-loop comment warns about does not arise.
     pub setup_deadline: Duration,
 
-    /// Minimum wall-clock time the promoted-primary natural-quiesce
-    /// `RunComplete`-broadcast branch waits after a `is_primary: false →
-    /// true` transition before considering itself eligible to fire.
+    /// Legacy post-promotion quiesce grace (default 2 s).
     ///
-    /// The alive-demoted natural-quiesce branch (in `process_tasks`)
-    /// declares the cluster done based on a CRDT-derived predicate
-    /// (`task_count() > 0 && pending == 0 && in_flight == 0`), which
-    /// is **incomplete-mirror-prone** in the immediate post-promotion
-    /// window: a freshly promoted secondary may hold only the
-    /// fraction of `TaskAdded` broadcasts the demoted primary had
-    /// already flushed. Firing on the partial view (e.g. "5 of 10
-    /// tasks added + all 5 already terminal") strands the in-flight
-    /// remainder once the loopback `RunComplete` reaches the demoted
-    /// primary and tears down its operational loop
-    /// (asm-dataset-nix T11: 5/10 phase_build tasks unassigned).
-    ///
-    /// Default 2 s. Sized to bracket worst-case loopback latency
-    /// (single-digit ms typical, hundreds of ms under network stress)
-    /// with three orders of magnitude headroom, while still finite
-    /// enough that an actually-quiesced cluster fires inside any
-    /// reasonable SLURM time budget. Operators can shorten this for
-    /// fast-feedback test environments or lengthen it for tunnelled
-    /// production clusters with higher latency.
-    ///
-    /// This is a documented bandage: the structurally clean fix is
-    /// a wire signal from the demoted primary saying "I'm done
-    /// publishing", which the protocol does not have today.
+    /// INERT on the `SecondaryCoordinator` post-unification: the
+    /// alive-demoted natural-quiesce `RunComplete`-broadcast branch this
+    /// gated lived on the secondary's deleted authority mirror. In the
+    /// unified model a promoted node runs its co-located
+    /// `PrimaryCoordinator`, which owns run-completion (`run_complete_check`
+    /// reads the authoritative pool + CRDT directly), and the demoted
+    /// node becomes a pure observer that exits solely on
+    /// `cluster_state.run_complete()`. No secondary-side code reads this
+    /// field; it is retained on `SecondaryConfig` for wire/config-shape
+    /// stability with the PyO3 surface and may be removed once that
+    /// surface is reshaped.
     pub promoted_primary_quiesce_grace: Duration,
 
     /// Per-task cap for externally-controlled `ReinjectTask`
-    /// re-injections (i.e. the `PrimaryHandle::reinject_task` Python
-    /// surface, dispatched through the secondary-side command
-    /// channel). Mirrors `PrimaryConfig::unfulfillable_reinject_max_per_task`
-    /// — same semantics, same operator knob — only this copy is
-    /// consulted when this node is acting as the promoted primary
-    /// (when external reinject commands arrive on the secondary's
-    /// command channel rather than the live primary's).
+    /// re-injections (the `PrimaryHandle::reinject_task` Python surface).
+    /// Mirrors `PrimaryConfig::unfulfillable_reinject_max_per_task` —
+    /// same semantics, same operator knob.
+    ///
+    /// INERT on the `SecondaryCoordinator`: the secondary drains no
+    /// command channel and applies no reinject (those are authority
+    /// mutations). The cap is enforced by the co-located
+    /// `PrimaryCoordinator` via its own
+    /// `PrimaryConfig::unfulfillable_reinject_max_per_task`; this field
+    /// rides on `SecondaryConfig` only so the PyO3 wrapper carries the
+    /// knob through a single config struct.
     ///
     /// `None` (default) means unbounded: the operator can re-inject
     /// the same Unfulfillable hash indefinitely. `Some(N)` caps the
     /// per-task budget; once a task hash has been re-injected `N`
     /// times via this surface, subsequent calls fail with the
     /// `unfulfillable_reinject_budget_exhausted` structured-log
-    /// event and the entry stays in `TaskState::Unfulfillable`.
-    ///
-    /// Independent of the primary's counter — see
-    /// `secondary/primary/reinject_task.rs` for the budget-reset-at-
-    /// promotion semantics.
+    /// event and the entry stays in `TaskState::Unfulfillable`. The
+    /// budget is owned and enforced by the authority (the co-located
+    /// `PrimaryCoordinator` once this node is promoted), per its own
+    /// `PrimaryConfig` copy of the same knob.
     pub unfulfillable_reinject_max_per_task: Option<u32>,
 
     /// Bytes to reserve for the secondary process itself when nesting

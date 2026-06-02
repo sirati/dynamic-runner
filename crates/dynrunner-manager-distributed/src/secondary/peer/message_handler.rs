@@ -181,7 +181,20 @@ where
                 vote_round,
                 ..
             } => {
-                self.record_promotion_confirm(sender_id, new_primary_id, vote_round);
+                // `record_promotion_confirm` returns `true` the instant
+                // this node's candidate tally crosses quorum and the
+                // election transitions to its terminal `Promoted` state.
+                // That `true` is the TERMINAL ACTION cue: fire the
+                // co-located parked primary's activation gate (seeded
+                // resume from the replicated CRDT) and broadcast
+                // `PromotePrimary { new = self }` so surviving
+                // secondaries re-point `Role::Primary` onto this winner.
+                // Pre-fix this return was discarded, so a surviving
+                // secondary that won its election could never actually
+                // become primary — the failover path dead-ended here.
+                if self.record_promotion_confirm(sender_id, new_primary_id, vote_round) {
+                    self.fire_local_promotion().await;
+                }
             }
             // Post-promotion TaskAssignment: when the new primary IS a
             // Peer-mesh CRDT replication: any node may originate a

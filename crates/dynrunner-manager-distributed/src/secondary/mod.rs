@@ -173,7 +173,35 @@ where
     /// and trusts `src_network/<local_path>` directly. Off until
     /// the InitialAssignment lands, which is fine: no TaskAssignment
     /// can arrive before InitialAssignment.
+    ///
+    /// Also the FIRST half of the setup-discovery yield discriminator:
+    /// `pre_staged_mode == true` means the authority deferred task
+    /// discovery to the corpus-mounting secondaries (the submitter has
+    /// no local corpus view, so it sent an empty `InitialAssignment`
+    /// with this flag set rather than seeding the ledger). See
+    /// [`Self::setup_discovery_done`].
     pre_staged_mode: bool,
+
+    /// One-shot latch for the setup-discovery `SetupPending` yield.
+    ///
+    /// In pre-staged mode the cluster ledger starts empty (the authority
+    /// deferred discovery). The `process_tasks` loop yields
+    /// `RunOutcome::SetupPending` so the PyO3 wrapper can run Python's
+    /// `task.discover_items` against the locally bind-mounted corpus and
+    /// feed the result back via [`Self::ingest_setup_discovery`], which
+    /// broadcasts `PhaseDepsSet + TaskAdded` onto the mesh and sets this
+    /// latch.
+    ///
+    /// The latch is what makes the yield FIRE-ONCE: the natural
+    /// "ledger non-empty" self-clear (`cluster_state.task_count() > 0`)
+    /// covers the common case, but an *empty* discovery (every item
+    /// already complete under a `--skip-existing` filter) leaves the
+    /// ledger empty forever — without the latch the loop would re-yield
+    /// on every re-entry. `ingest_setup_discovery` sets the latch
+    /// unconditionally (including the empty-discovery path, which also
+    /// broadcasts `RunComplete`), so re-entry never re-yields. Always
+    /// false outside pre-staged mode (no yield is ever produced there).
+    setup_discovery_done: bool,
 
     /// Whether dispatched task items are backed by real files (the
     /// historical contract). Set from
@@ -277,23 +305,27 @@ where
     pub(super) peer_mesh_degraded: bool,
 
     /// Replicated mirror of the cluster ledger. Maintained by applying
-    /// every `DistributedMessage::ClusterMutation` the primary
-    /// broadcasts. Read-only on this node — only the originator may
-    /// produce mutations (Phase L will move the originator-side logic
-    /// onto whichever node currently holds the primary role).
+    /// every `DistributedMessage::ClusterMutation` observed on the mesh.
+    /// Read-only authority-wise on this node — the secondary never
+    /// originates a terminal mutation. The authority (the live primary,
+    /// or this node's co-located primary once promoted) owns
+    /// origination. The secondary DOES originate the two non-authority
+    /// mutations the unified model keeps on this side: the
+    /// `ingest_setup_discovery` `PhaseDepsSet + TaskAdded` batch and the
+    /// panik self-departure `PeerRemoved` (both via
+    /// `origination::apply_and_broadcast_mutations`).
     pub(super) cluster_state: ClusterState<I>,
 
     /// Worker IDs queued for respawn at the next `process_tasks`
-    /// tick. Populated by code paths that observe a worker
-    /// subprocess as dead WITHOUT a corresponding
-    /// `WorkerEvent::Disconnected` arriving on the pool's event
-    /// channel:
-    ///
-    ///   - `handle_primary_task_request`'s self-assign Err arm
-    ///     (the local worker's pipe is broken when we try to write
-    ///     the next task to it),
-    ///   - `dispatch_message`'s peer-assign Err arm (same shape on
-    ///     the peer-assigned path).
+    /// tick. Populated by the assignment-dispatch path
+    /// (`dispatch/router.rs`'s `TaskAssignment` arm) when an
+    /// `assign_task` write fails on a broken pipe — i.e. the worker
+    /// subprocess is observed dead WITHOUT a corresponding
+    /// `WorkerEvent::Disconnected` arriving on the pool's event channel.
+    /// (The pre-unification self-assign-vs-wire split — a separate
+    /// `handle_primary_task_request` Err arm — is gone: the unified
+    /// transport delivers a self-addressed assignment via the same
+    /// loopback path as any wire frame, so there is ONE dispatch site.)
     ///
     /// In both cases the worker subprocess has voluntarily exited
     /// — typically because `NonRecoverableError` in the task
@@ -439,26 +471,66 @@ where
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
+    /// Promotion-activation gate sender for the co-located parked
+    /// `PrimaryCoordinator`.
+    ///
+    /// The composed runtime (`PySecondaryCoordinator::run`) builds both
+    /// coordinators on one `LocalSet` and parks the primary behind
+    /// `PrimaryCoordinator::run_parked`'s oneshot gate; the matching
+    /// sender is registered here via
+    /// [`Self::register_promote_activation`]. When THIS node's election
+    /// reaches its terminal `Promoted` transition — either by winning
+    /// its own election ([`election::coordinator`]'s
+    /// `record_promotion_confirm` returning `true`) or by a peer's
+    /// `PromotePrimary` naming this node (the `dispatch/router`
+    /// `PromotePrimary` arm) — [`Self::fire_local_promotion`] fires this
+    /// gate (waking the parked primary into its seeded resume) and
+    /// broadcasts `PromotePrimary { new = self }` so surviving
+    /// secondaries' `PrimaryChanged` role-change hook re-points
+    /// `Role::Primary` off the dead uplink onto this winner's mesh peer.
+    ///
+    /// The gate carries a [`crate::cluster_state::ClusterStateSnapshot`]
+    /// — NOT a bare `()`. A parked co-located primary's `cluster_state`
+    /// is empty (it never ran the bootstrap pool-build and the role-aware
+    /// inbound tap deliberately does NOT feed it CRDT mirror frames —
+    /// those stay with this secondary, which mirrors the ledger for the
+    /// node). At promotion the secondary snapshots its continuously-
+    /// mirrored `cluster_state` and sends it through this gate; the
+    /// parked primary `restore`s it before `hydrate_from_cluster_state`,
+    /// so the seeded resume rebuilds its pool from the full replicated
+    /// ledger (the brief's "restore cluster_state snapshot + hydrate").
+    ///
+    /// `Option<oneshot::Sender>` makes the activation FIRE-ONCE: the
+    /// terminal action `take()`s it, so the two promotion paths reaching
+    /// `Promoted` (own-election win + peer-named) never double-activate.
+    /// `None` when no co-located primary was composed (Rust-only tests,
+    /// the legacy single-`run()` callers) — the terminal action is then
+    /// a no-op on the gate (the broadcast still fires) and the secondary
+    /// runs without a local authority to promote.
+    pub(super) promote_activation_tx: Option<
+        tokio::sync::oneshot::Sender<crate::cluster_state::ClusterStateSnapshot<I>>,
+    >,
+
     /// Lifecycle hook the PyO3 wrapper registers (a GIL-reacquiring
     /// closure calling Python's `task.on_phase_end(phase_id, completed,
     /// failed)`).
     ///
     /// The secondary holds NO authority and runs no phase machine — the
     /// fire site is the co-located authoritative `PrimaryCoordinator`,
-    /// which owns `on_phase_end` and the phase machine. This field is
-    /// the registration ANCHOR: the PyO3 secondary wrapper still accepts
-    /// the closure (keeping the `register_phase_lifecycle_callbacks`
-    /// pre-run contract stable for callers minting a handle from a
-    /// secondary), but it is consumed only once the composed-primary
-    /// runtime hands it to the co-located primary at activation. Until
-    /// that runtime wiring lands the field is write-only on this side.
-    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
+    /// which owns `on_phase_end` and the phase machine. This field is a
+    /// registration ANCHOR: the PyO3 secondary wrapper accepts the
+    /// closure (keeping the `register_phase_lifecycle_callbacks` pre-run
+    /// contract stable for callers minting a handle from a secondary),
+    /// and the composed runtime transfers it to the co-located primary
+    /// via [`SecondaryCoordinator::take_composed_primary_wiring`] before
+    /// the primary's `run_parked` enters. That extraction is the in-crate
+    /// consumer, so this field carries no `#[allow(dead_code)]`.
     pub(super) on_phase_end:
         Option<crate::primary::OnPhaseEnd>,
 
     /// Phase-start sibling of `on_phase_end`; same registration-anchor
-    /// disposition (fired by the co-located primary, not the secondary).
-    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
+    /// disposition (transferred to the co-located primary via
+    /// `take_composed_primary_wiring`, fired by it, not the secondary).
     pub(super) on_phase_start:
         Option<crate::primary::OnPhaseStart>,
 
@@ -468,18 +540,17 @@ where
     ///
     /// Externally-issued `PrimaryCommand`s are authority mutations whose
     /// only correct owner is the co-located `PrimaryCoordinator`; the
-    /// secondary never drains this channel. The field is the
-    /// registration ANCHOR keeping the PyO3 `command_sender()` clone a
-    /// stable type — the composed-primary runtime hands the receiver to
-    /// the primary's command loop. Write-only on this side until then.
-    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
+    /// secondary never drains this channel. The field is a registration
+    /// ANCHOR keeping the PyO3 `command_sender()` clone a stable type;
+    /// the composed runtime hands the receiver to the primary's command
+    /// loop via [`SecondaryCoordinator::take_composed_primary_wiring`].
     pub(super) command_rx:
         Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Sender side of the secondary's command channel, cloned to
     /// consumers via `command_sender()`. Same registration-anchor
-    /// disposition as `command_rx`.
-    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
+    /// disposition as `command_rx` — a clone crosses to the co-located
+    /// primary via `take_composed_primary_wiring`.
     pub(super) command_tx:
         tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
 

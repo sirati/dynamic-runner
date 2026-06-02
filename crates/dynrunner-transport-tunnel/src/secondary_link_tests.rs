@@ -421,3 +421,120 @@ async fn peer_count_is_mesh_cardinality() {
     let fx = fixture("sec-A", &["sec-B", "sec-C"]);
     assert_eq!(fx.transport.peer_count(), 2);
 }
+
+// ── Role-aware inbound demux to the co-located parked primary ──
+
+fn task_request(sender: &str) -> DistributedMessage<TestId> {
+    DistributedMessage::TaskRequest {
+        sender_id: sender.into(),
+        timestamp: 1.0,
+        secondary_id: sender.into(),
+        worker_id: 0,
+        available_resources: vec![],
+    }
+}
+
+/// `is_primary_facing` classifies the worker-lifecycle / setup frames
+/// the authority owns as primary-facing, and the both-roles / follower
+/// frames (Keepalive, ClusterMutation) as NOT. This is the demux key.
+#[test]
+fn is_primary_facing_classification() {
+    assert!(task_request("sec-B").is_primary_facing());
+    assert!(DistributedMessage::<TestId>::MeshReady {
+        sender_id: "sec-B".into(),
+        timestamp: 1.0,
+        secondary_id: "sec-B".into(),
+        peer_count: 0,
+    }
+    .is_primary_facing());
+    // Keepalive is consumed by both roles → NOT primary-facing (it
+    // stays with the follower secondary, which mirrors for every node).
+    assert!(!keepalive("sec-B").is_primary_facing());
+    // CRDT mutation is mirrored by every node → NOT primary-facing.
+    assert!(!DistributedMessage::<TestId>::ClusterMutation {
+        sender_id: "sec-B".into(),
+        timestamp: 1.0,
+        mutations: vec![],
+    }
+    .is_primary_facing());
+}
+
+/// With a co-located-primary tap attached AND this node holding
+/// Role::Primary, a remote secondary's primary-facing frame
+/// (TaskRequest) is DIVERTED to the co-located primary's inbound queue
+/// and does NOT surface on the secondary's `recv_peer`.
+#[tokio::test]
+async fn primary_facing_frame_diverts_to_colocated_primary_when_self_is_primary() {
+    let mut fx = fixture("sec-A", &["sec-B"]);
+    let mut primary_inbound = fx.transport.attach_colocated_primary_tap();
+    // This node was promoted (holds Role::Primary).
+    promote(&fx.registrar, "sec-A");
+
+    // A remote secondary's TaskRequest arrives on the mesh AND a
+    // non-primary-facing Keepalive. The Keepalive must reach the
+    // secondary; the TaskRequest must be diverted to the primary.
+    fx.mesh_inbound_tx.send(task_request("sec-B")).unwrap();
+    fx.mesh_inbound_tx.send(keepalive("sec-B")).unwrap();
+
+    // recv_peer (the SECONDARY's view) yields the Keepalive, NOT the
+    // TaskRequest — the demux diverted it.
+    let got = fx
+        .transport
+        .recv_peer()
+        .await
+        .expect("secondary recv_peer yields the non-primary-facing frame");
+    assert!(
+        matches!(got, DistributedMessage::Keepalive { .. }),
+        "secondary must see the Keepalive, not the diverted TaskRequest",
+    );
+
+    // The co-located primary's inbound queue holds the TaskRequest.
+    let diverted = primary_inbound
+        .try_recv()
+        .expect("co-located primary inbound must hold the diverted TaskRequest");
+    assert!(matches!(diverted, DistributedMessage::TaskRequest { .. }));
+}
+
+/// As a FOLLOWER (this node does NOT hold Role::Primary), the demux is
+/// inert: every frame — including primary-facing ones — flows to the
+/// secondary's `recv_peer`, and the co-located primary's queue stays
+/// empty. The tap only diverts once promoted.
+#[tokio::test]
+async fn follower_does_not_divert_even_with_tap_attached() {
+    let mut fx = fixture("sec-A", &["sec-B"]);
+    let mut primary_inbound = fx.transport.attach_colocated_primary_tap();
+    // No promote(): this node is a follower; the original primary is
+    // some other node (cache cold / not self).
+
+    fx.mesh_inbound_tx.send(task_request("sec-B")).unwrap();
+
+    // The primary-facing frame surfaces on the SECONDARY (no divert).
+    let got = fx
+        .transport
+        .recv_peer()
+        .await
+        .expect("follower secondary receives every frame");
+    assert!(matches!(got, DistributedMessage::TaskRequest { .. }));
+    // The co-located primary queue is empty — nothing diverted.
+    assert!(
+        primary_inbound.try_recv().is_err(),
+        "a follower must not divert any frame to the parked primary",
+    );
+}
+
+/// No tap attached (the default for every follower-only / in-process /
+/// test secondary): the demux short-circuits and the audited recv path
+/// is unchanged — a primary-facing frame surfaces on `recv_peer` even
+/// when this node holds Role::Primary.
+#[tokio::test]
+async fn no_tap_means_no_divert() {
+    let mut fx = fixture("sec-A", &["sec-B"]);
+    promote(&fx.registrar, "sec-A"); // self holds primary, but no tap
+    fx.mesh_inbound_tx.send(task_request("sec-B")).unwrap();
+    let got = fx
+        .transport
+        .recv_peer()
+        .await
+        .expect("without a tap, recv_peer yields the frame unchanged");
+    assert!(matches!(got, DistributedMessage::TaskRequest { .. }));
+}

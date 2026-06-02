@@ -142,6 +142,32 @@ where
     /// source of "who is primary now"; the promotion re-route is a
     /// hook-driven update of this cache.
     role_cache: RoleCache,
+
+    /// Optional ROLE-AWARE inbound tap to a co-located parked
+    /// `PrimaryCoordinator` sharing this node's `LocalSet`.
+    ///
+    /// `Some` only when this node composed a co-located primary (the
+    /// SLURM-secondary-node failover composition); `None` for every
+    /// follower-only secondary, an in-process secondary, and all tests
+    /// that don't exercise composition — so the existing audited
+    /// [`PeerTransport::recv_peer`] path is structurally unchanged for
+    /// them (the demux check short-circuits on `None`).
+    ///
+    /// DEMUX RULE (transport-layer, role-aware, manager-opaque): when
+    /// this tap is present AND the role cache says this node holds
+    /// `Role::Primary` (it was promoted) AND the inbound frame is
+    /// [`DistributedMessage::is_primary_facing`] (a remote secondary's
+    /// worker-lifecycle / setup report), the frame is routed to the
+    /// co-located PRIMARY's inbound queue INSTEAD of being yielded to
+    /// the secondary's `recv_peer` caller. Everything else (peer
+    /// keepalive, CRDT mirror, election, role/relay envelopes — and ALL
+    /// frames while this node is a follower) continues to the secondary
+    /// exactly as before. Neither manager sees the demux: the
+    /// `PrimaryCoordinator` reads its frames via its own
+    /// `SecondaryTransport::recv` (fed by this queue's receiver), the
+    /// `SecondaryCoordinator` reads the rest via `recv_peer`.
+    colocated_primary_inbound_tx:
+        Option<mpsc::UnboundedSender<DistributedMessage<I>>>,
 }
 
 impl<U, P, I> UnifiedSecondaryTransport<U, P, I>
@@ -169,7 +195,73 @@ where
             loopback_tx,
             loopback_rx,
             role_cache,
+            colocated_primary_inbound_tx: None,
         }
+    }
+
+    /// Attach a ROLE-AWARE inbound tap to a co-located parked
+    /// `PrimaryCoordinator` and return the matching receiver for the
+    /// primary's `SecondaryTransport::recv`.
+    ///
+    /// ADDITIVE: this does NOT change the audited send/recv routing for
+    /// any frame the secondary still consumes. It only adds the demux
+    /// chokepoint described on [`Self::colocated_primary_inbound_tx`] —
+    /// while this node holds `Role::Primary`, primary-facing frames are
+    /// diverted to the returned receiver instead of being yielded to
+    /// `recv_peer`. The promotion re-route into this state is the SAME
+    /// `RoleCache` flip the rest of the transport already keys off, so
+    /// no new role machinery is introduced.
+    ///
+    /// One tap per transport; calling twice replaces the sender (the old
+    /// receiver then sees the channel close). The pyo3 composition calls
+    /// this exactly once at construction.
+    pub fn attach_colocated_primary_tap(
+        &mut self,
+    ) -> mpsc::UnboundedReceiver<DistributedMessage<I>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.colocated_primary_inbound_tx = Some(tx);
+        rx
+    }
+
+    /// A cloneable injector into this secondary's own inbound loopback
+    /// queue — the channel a co-located parked primary's
+    /// `SecondaryTransport::send_to(own_secondary_id, ..)` writes to so
+    /// its dispatch (e.g. a `TaskAssignment` for the node's own workers)
+    /// reaches this secondary's `recv_peer` exactly as a wire frame
+    /// would. This is the loopback leg of the parked primary's hybrid
+    /// `SecondaryTransport` (own-sec → loopback, remote → mesh handle),
+    /// symmetric with the inbound demux.
+    ///
+    /// Returns a clone of the loopback sender; the receiver stays owned
+    /// here, so the injected frames surface through the secondary's
+    /// normal inbound fan-in. Sends are synchronous (`UnboundedSender`).
+    pub fn loopback_injector(
+        &self,
+    ) -> mpsc::UnboundedSender<DistributedMessage<I>> {
+        self.loopback_tx.clone()
+    }
+
+    /// Whether an inbound frame must be diverted to the co-located
+    /// primary rather than yielded to the secondary's `recv_peer`.
+    ///
+    /// The single role-aware demux predicate (see
+    /// [`Self::colocated_primary_inbound_tx`]). True iff a tap is
+    /// attached AND this node currently holds `Role::Primary` (cache
+    /// holder == `local_id`) AND the frame is primary-facing. Kept as a
+    /// pure helper so `recv_peer`'s hot path stays readable and the
+    /// borrow of the role cache is a bounded synchronous read with no
+    /// await in scope.
+    fn diverts_to_colocated_primary(&self, frame: &DistributedMessage<I>) -> bool {
+        if self.colocated_primary_inbound_tx.is_none() {
+            return false;
+        }
+        if !frame.is_primary_facing() {
+            return false;
+        }
+        matches!(
+            read_role_cache(&self.role_cache, &Role::Primary),
+            Some(holder) if holder == self.local_id
+        )
     }
 
     /// Narrow mutable accessor to the uplink handle for the pre-mesh
@@ -412,7 +504,38 @@ where
                 }
             };
             match self.handle_role_layer(raw).await {
-                Some(payload) => return Some(payload),
+                Some(payload) => {
+                    // ROLE-AWARE inbound demux (manager-opaque). While
+                    // this node holds Role::Primary, a remote secondary's
+                    // primary-facing frame is diverted to the co-located
+                    // PRIMARY's inbound queue and we `continue` so the
+                    // secondary's `recv_peer` caller never sees it. The
+                    // co-located primary reads it via its own
+                    // `SecondaryTransport::recv`. As a follower (or with
+                    // no tap attached) the predicate is false and the
+                    // frame is yielded to the secondary as before.
+                    if self.diverts_to_colocated_primary(&payload) {
+                        // `diverts_to_colocated_primary` already asserted
+                        // the tap is `Some`; the let-chain re-binds it for
+                        // the send without a second nested `if`.
+                        if let Some(tx) = self.colocated_primary_inbound_tx.as_ref()
+                            && tx.send(payload).is_err()
+                        {
+                            // The co-located primary's receiver was
+                            // dropped (its run_parked future ended). Drop
+                            // the tap so subsequent frames flow to the
+                            // secondary again rather than hitting a dead
+                            // channel every iteration.
+                            tracing::debug!(
+                                "co-located primary inbound tap closed; \
+                                 reverting to secondary-only delivery"
+                            );
+                            self.colocated_primary_inbound_tx = None;
+                        }
+                        continue;
+                    }
+                    return Some(payload);
+                }
                 None => continue,
             }
         }

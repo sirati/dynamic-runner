@@ -8,10 +8,11 @@
 //! resumes operational dispatch seeded from the cluster view instead
 //! of an empty pool.
 //!
-//! Faithful port of the secondary's
-//! `populate_primary_from_cluster_state`
-//! (`crate::secondary::primary::hydrate`); the two paths share the
-//! `cascade_drain_done` pool-cascade primitive. One deviation: the
+//! Faithful port of the now-removed secondary-side
+//! `populate_primary_from_cluster_state` (lived in the deleted
+//! `secondary/primary/` authority mirror); this is its single surviving
+//! home. It shares the relocated `cascade_drain_done` pool-cascade
+//! primitive (now in `secondary::origination`). One deviation: the
 //! `PrimaryCoordinator` owns no local worker pool (workers are remote
 //! `RemoteWorkerState` entries; there is no `active_tasks` set), so
 //! the source's "Pending-in-cluster-state but locally-active" arm has

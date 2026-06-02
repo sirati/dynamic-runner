@@ -230,10 +230,11 @@ where
         kind: BucketKind,
         _command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) -> Result<bool, String> {
-        // OOM-bucket dispatch shape (live-primary only — the secondary
-        // wrapper at `secondary/primary/lifecycle.rs` does NOT touch
-        // single_worker_mode because the field lives on
-        // PrimaryCoordinator). Entry-side: flip the coordinator into
+        // OOM-bucket dispatch shape. `single_worker_mode` lives on
+        // `PrimaryCoordinator`, so this is the only machine that drives
+        // it — there is no parallel secondary-side retry mirror in the
+        // unified model (a promoted node runs its co-located primary,
+        // which is THIS machine). Entry-side: flip the coordinator into
         // single-worker mode for the duration of the bucket so the
         // dispatch pipeline masks workers != local-id-0 and promotes
         // `preferred_secondaries` to a strict filter. Exit-side: every
@@ -248,11 +249,12 @@ where
 
         // Build candidates from `all_binaries` (the run-start snapshot)
         // cross-referenced against `failed_tasks` (the hash-keyed
-        // ErrorType ledger). The secondary's mirror at
-        // `secondary/primary/lifecycle.rs` stores the binary inside
-        // its FailedTaskEntry instead, so the two sides have different
-        // candidate-build code paths but share the core via
-        // `try_phase_retry_bucket_core`.
+        // ErrorType ledger). On a parked primary that activated via the
+        // seeded resume, `all_binaries` is empty (the pool was hydrated
+        // from the CRDT, not a run-start binary list); `failed_tasks` is
+        // seeded from the restored ledger, and the candidate set is
+        // built from the hydrated pool's view. Both paths share the core
+        // via `try_phase_retry_bucket_core`.
         let candidates: Vec<TaskInfo<I>> = self
             .all_binaries
             .iter()

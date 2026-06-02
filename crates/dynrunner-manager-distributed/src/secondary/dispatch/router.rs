@@ -443,6 +443,16 @@ where
                 // to `Normal` (this node is a settled follower).
                 if new_primary_id == self.config.secondary_id {
                     self.election = super::super::election::ElectionState::Promoted;
+                    // Wake the co-located parked primary: this node is
+                    // now the authority. Gate-only (no re-broadcast) —
+                    // this PromotePrimary IS the broadcast that named
+                    // us, so re-emitting it would loop. Fire-once via
+                    // `take()`, so the own-election-win path
+                    // (`fire_local_promotion`) and this peer-named path
+                    // converge on a single activation. Idempotent when
+                    // this is our OWN echoed broadcast (the gate is
+                    // already consumed) or when no primary was composed.
+                    self.activate_co_located_primary();
                 }
                 tracing::info!(
                     new_primary = %new_primary_id,

@@ -253,16 +253,14 @@ mod tests {
         assert_eq!(assembled.get("A"), Some(&a_outputs));
     }
 
-    /// Cross-call-site identity: the three primary-side dispatch
-    /// invocations
-    /// (`primary/lifecycle/dispatch.rs`, `primary/task/request.rs`,
-    /// `secondary/primary/task_request.rs`) all funnel through this
-    /// wrapper with the same `(&ClusterState, &TaskInfo)` argument
-    /// shape. The plan calls for parity across those sites; once
-    /// they're all routed through this single helper, the parity
-    /// invariant collapses to "the helper is a pure function of its
-    /// inputs". This test pins that purity — repeated invocation on
-    /// the same `(state, task)` pair yields byte-identical output
+    /// Cross-call-site identity: the primary-side dispatch invocations
+    /// (`primary/lifecycle/dispatch.rs`, `primary/task/request.rs`) all
+    /// funnel through this wrapper with the same `(&ClusterState,
+    /// &TaskInfo)` argument shape. The plan calls for parity across
+    /// those sites; once they're all routed through this single helper,
+    /// the parity invariant collapses to "the helper is a pure function
+    /// of its inputs". This test pins that purity — repeated invocation
+    /// on the same `(state, task)` pair yields byte-identical output
     /// (no internal mutation, no hidden hash-iteration bleed via
     /// `iter_all` — `BTreeMap`'s ordered iteration in the assembled
     /// map already guarantees stable ordering).
