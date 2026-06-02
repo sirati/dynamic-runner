@@ -140,6 +140,7 @@ mod tests {
             task_hash: "h1".into(),
             success: true,
             error_kind: None,
+            last_error: None,
         })
         .unwrap();
         tx.send(TaskCompletedEvent {
@@ -147,6 +148,7 @@ mod tests {
             task_hash: "h2".into(),
             success: false,
             error_kind: Some("non_recoverable".into()),
+            last_error: Some("worker exited with code 2".into()),
         })
         .unwrap();
 
@@ -160,6 +162,10 @@ mod tests {
         assert_eq!(observed[1].task_hash, "h2");
         assert!(!observed[1].success);
         assert_eq!(observed[1].error_kind.as_deref(), Some("non_recoverable"));
+        assert_eq!(
+            observed[1].last_error.as_deref(),
+            Some("worker exited with code 2")
+        );
     }
 
     /// Pins the panic-isolation contract: a panicking listener must
@@ -185,6 +191,7 @@ mod tests {
             task_hash: "h1".into(),
             success: true,
             error_kind: None,
+            last_error: None,
         })
         .unwrap();
         tx.send(TaskCompletedEvent {
@@ -192,6 +199,7 @@ mod tests {
             task_hash: "h2".into(),
             success: false,
             error_kind: Some("oom".into()),
+            last_error: Some("oom-killed".into()),
         })
         .unwrap();
 

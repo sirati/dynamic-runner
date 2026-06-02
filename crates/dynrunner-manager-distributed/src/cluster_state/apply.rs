@@ -195,6 +195,7 @@ impl<I: Identifier> ClusterState<I> {
                     task_hash: hash,
                     success: true,
                     error_kind: None,
+                    last_error: None,
                 });
                 ApplyOutcome::Applied
             }
@@ -202,16 +203,18 @@ impl<I: Identifier> ClusterState<I> {
                 let Some(state) = self.tasks.get_mut(&hash) else {
                     return ApplyOutcome::NoOp;
                 };
-                // Capture task_id + wire-stable error_kind for the
-                // dispatcher event. The id snapshot lives outside the
-                // arms below so the emit at the bottom of the match
-                // sees a uniform binding regardless of which arm
-                // applied. The arms that NoOp return early and never
-                // reach the emit; the two "Applied" arms set this to
-                // `Some(...)` before exiting via the bottom emit.
+                // Capture task_id + wire-stable error_kind + the error
+                // message for the dispatcher event. The snapshot lives
+                // outside the arms below so the emit at the bottom of
+                // the match sees a uniform binding regardless of which
+                // arm applied. The arms that NoOp return early and
+                // never reach the emit; the two "Applied" arms set this
+                // to `Some(...)` BEFORE `error` is moved into the
+                // ledger entry, so the carried message is the same body
+                // that lands on the entry's `last_error`.
                 // `task.task_id` is non-optional per the framework's
                 // boundary contract; the captured payload is `String`.
-                let mut emit_payload: Option<(String, String)> = None;
+                let mut emit_payload: Option<(String, String, String)> = None;
                 let outcome = match state {
                     // Strongest terminals lock out incoming TaskFailed.
                     // `Completed` never regresses; `Unfulfillable` is a
@@ -225,7 +228,8 @@ impl<I: Identifier> ClusterState<I> {
                         last_error,
                         attempts,
                     } => {
-                        emit_payload = Some((task.task_id.clone(), kind.wire_value()));
+                        emit_payload =
+                            Some((task.task_id.clone(), kind.wire_value(), error.clone()));
                         *attempts += 1;
                         *k = kind;
                         *last_error = error;
@@ -242,7 +246,8 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::InFlight { task, .. }
                     | TaskState::Blocked { task, .. } => {
                         let task = task.clone();
-                        emit_payload = Some((task.task_id.clone(), kind.wire_value()));
+                        emit_payload =
+                            Some((task.task_id.clone(), kind.wire_value(), error.clone()));
                         *state = match kind {
                             ErrorType::Unfulfillable { reason } => {
                                 TaskState::Unfulfillable {
@@ -266,12 +271,13 @@ impl<I: Identifier> ClusterState<I> {
                 // `emit_payload = None`). See
                 // [`Self::emit_task_completed_event`] for the CCD-9
                 // contract.
-                if let Some((task_id, error_kind)) = emit_payload {
+                if let Some((task_id, error_kind, last_error)) = emit_payload {
                     self.emit_task_completed_event(TaskCompletedEvent {
                         task_id,
                         task_hash: hash,
                         success: false,
                         error_kind: Some(error_kind),
+                        last_error: Some(last_error),
                     });
                 }
                 outcome

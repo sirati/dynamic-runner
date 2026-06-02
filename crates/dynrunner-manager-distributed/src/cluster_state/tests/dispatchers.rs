@@ -111,8 +111,10 @@ async fn task_completed_listener_fires_on_task_completed_apply() {
 
 /// A `TaskFailed` apply MUST emit
 /// `TaskCompletedEvent { success: false, error_kind:
-/// Some(<wire_value>), ... }` so consumers can dispatch on the
-/// wire-stable error tag without re-deriving it from `Debug`.
+/// Some(<wire_value>), last_error: Some(<message>), ... }` so
+/// consumers can dispatch on the wire-stable error tag AND dedup
+/// on the carried message without re-deriving either from `Debug`
+/// or re-reading the ledger out of band.
 #[tokio::test]
 async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
@@ -138,6 +140,10 @@ async fn task_completed_listener_fires_on_task_failed_with_error_kind() {
             assert_eq!(event.task_id, "beta");
             assert!(!event.success);
             assert_eq!(event.error_kind.as_deref(), Some("non_recoverable"));
+            // The carried message is the same body that lands on the
+            // ledger entry's `last_error` (captured before `error` is
+            // moved into the entry).
+            assert_eq!(event.last_error.as_deref(), Some("disk full"));
         }
         other => panic!("expected TaskFailed event, got {other:?}"),
     }
