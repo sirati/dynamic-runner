@@ -11,6 +11,9 @@ pub mod primary;
 pub mod secondary;
 pub mod zip_extract;
 
+#[cfg(test)]
+mod test_capture;
+
 pub use primary::{PrimaryCoordinator, PrimaryConfig, RunError};
 pub use primary::staging::{compute_initial_staging_entries, StagingEntry, StagingError};
 pub use primary::wire::compute_task_hash;

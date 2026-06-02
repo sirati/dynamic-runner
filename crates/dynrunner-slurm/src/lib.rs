@@ -1,3 +1,15 @@
+/// Tracing target marking an event as "important" (LLM-wake-worthy).
+///
+/// Fixed cross-crate contract: equal to `dynrunner-pyo3`'s
+/// `logging::IMPORTANT_TARGET`, `dynrunner-manager-distributed`'s
+/// crate-local `IMPORTANT_TARGET`, and the Python child logger
+/// `dynamic_runner.important`. The `dynrunner-pyo3` dual-sink routes
+/// this target to stdio under `--important-stdio-only` while the full
+/// log keeps everything. Emitting at this target is the only thing a
+/// SLURM-pipeline call site needs to know — the stdio gate is one
+/// filter, never a per-call-site `if`.
+pub(crate) const IMPORTANT_TARGET: &str = "dynrunner_important";
+
 pub mod config;
 pub mod job_manager;
 pub mod packaging;

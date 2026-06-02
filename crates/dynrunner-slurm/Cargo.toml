@@ -26,6 +26,11 @@ async-trait = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# Target-filtering capture layer for the importance-marker emission
+# test (`job_manager::tests::important_events`): asserts the image
+# build/transfer events land on `crate::IMPORTANT_TARGET`, which
+# `tracing-test`'s untargeted `logs_contain` cannot verify.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true
