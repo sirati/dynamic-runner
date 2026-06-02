@@ -133,10 +133,11 @@ impl<I: Identifier> ClusterState<I> {
     /// emit path in its operational `select!` loop; the bus is the only
     /// synchronization crossing.
     ///
-    /// No production call sites yet — the emit call sites (phase/task
-    /// management) land in a later subtask. Until then the only callers
-    /// are the bus's own unit tests.
-    #[allow(dead_code)]
+    /// Emitted from the phase layer (`fire_initial_phase_starts` →
+    /// `PhaseStartedNeedsWorkers`; the per-phase proceed-or-fail decision
+    /// → `RunShouldFail`) and from the dispatch-decoupling call sites; the
+    /// consuming `select!` arm in the operational loop reacts off this
+    /// path.
     pub(crate) fn emit_worker_mgmt(&self, signal: WorkerMgmtSignal) {
         if let Some(tx) = &self.worker_mgmt_tx {
             let _ = tx.send(signal);

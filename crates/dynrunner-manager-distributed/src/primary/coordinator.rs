@@ -25,6 +25,7 @@ use super::respawn::{
 
 use crate::cluster_state::{ClusterState, OutcomeSummary};
 use crate::state::SecondaryConnectionState;
+use crate::worker_signal::WorkerMgmtSignal;
 
 
 /// Per-secondary state for a deferred mass-death event. Recorded
@@ -1838,12 +1839,99 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     pub(super) fn fire_initial_phase_starts(&mut self) {
         let active: Vec<PhaseId> = self.pool().active_phases();
         for p in active {
-            if self.phase_started_emitted.insert(p.clone())
-                && let Some(cb) = self.on_phase_start.as_mut()
-            {
-                cb(&p);
+            if self.phase_started_emitted.insert(p.clone()) {
+                // Tell worker management a phase started and how many
+                // workers it minimally needs to make progress. This is a
+                // pure EMIT onto the decoupled worker-management bus — the
+                // phase layer states demand and knows nothing of how (or
+                // whether) worker management scales up; the consuming arm
+                // counts alive workers and drives respawn / RunShouldFail.
+                // An empty phase (one that will cascade-drain with no
+                // items) makes no worker demand, so we skip the emit.
+                let min = self.phase_min_workers(&p);
+                if min > 0 {
+                    self.cluster_state.emit_worker_mgmt(
+                        WorkerMgmtSignal::PhaseStartedNeedsWorkers {
+                            phase: p.clone(),
+                            min,
+                        },
+                    );
+                }
+                if let Some(cb) = self.on_phase_start.as_mut() {
+                    cb(&p);
+                }
             }
         }
+    }
+
+    /// Minimum worker count a phase needs to make progress: `1` if the
+    /// phase has any pending or in-flight work, else `0`. A pure query on
+    /// the pool — the floor is "at least one worker to dispatch the
+    /// phase's work"; additional workers are throughput, not correctness,
+    /// and that scale-up policy is worker management's concern. Used by
+    /// [`Self::fire_initial_phase_starts`] to populate
+    /// [`WorkerMgmtSignal::PhaseStartedNeedsWorkers`].
+    fn phase_min_workers(&self, phase: &PhaseId) -> usize {
+        // Consult the optional pool directly: before the pool is built
+        // (pre-run) no phase owns work, so the floor is 0. Once built, a
+        // phase needs a worker iff it has pending or in-flight items.
+        let Some(pool) = self.pending.as_ref() else {
+            return 0;
+        };
+        let pending = pool.iter().any(|t| &t.phase_id == phase);
+        let in_flight = pool.in_flight(phase) > 0;
+        usize::from(pending || in_flight)
+    }
+
+    /// Per-phase proceed-or-fail policy, evaluated once a phase has
+    /// drained AND its retry buckets are exhausted, immediately before
+    /// `mark_phase_done`. A pure, synchronous predicate on the phase's
+    /// terminal counters — no I/O, no mutation, no worker-management call
+    /// (the caller routes a FAIL through the decoupled signal bus).
+    ///
+    /// Default policy:
+    /// - PROCEED when `completed > 0` — the phase produced output its
+    ///   dependents can consume.
+    /// - PROCEED when the phase produced zero items (`completed == 0 &&
+    ///   failed == 0`) — an empty / cascade-through phase makes no demand
+    ///   and blocks nothing.
+    /// - PROCEED when the phase's items reached a terminal FAILED outcome
+    ///   (`failed > 0`). This is load-bearing and is NOT a "fail the run"
+    ///   case: by the time control reaches this point the per-phase retry
+    ///   buckets (Recoverable then OOM) have already run and exhausted
+    ///   every reinjection path, so any surviving failure is PERMANENT and
+    ///   already recorded. The canonical contract for an exhausted bucket
+    ///   is "the phase advances; the fail_* count in the run's outcome
+    ///   summary surfaces these to the operator" (see
+    ///   [`crate::primary::retry_bucket`] — the budget-exhausted branch).
+    ///   Aborting the whole run on a permanently-failed task would defeat
+    ///   the retry-bucket machinery and regress
+    ///   `sequential_phase_advance_after_oom_bucket_exhausts`.
+    ///
+    /// The FAIL branch is therefore reserved for a phase that reached the
+    /// drain having owned items yet recorded NO terminal outcome of any
+    /// kind for them — a genuine wedge where advancing would silently run
+    /// dependents on absent, never-resolved inputs. `phase_min_workers`
+    /// observing residual work for an otherwise-drained phase is exactly
+    /// that signal. The phase-layer veto here is the structural backstop;
+    /// the live no-progress decision (a phase that started, needs workers,
+    /// and has none) is the worker arm's, reached via
+    /// `PhaseStartedNeedsWorkers`.
+    ///
+    /// `phase` is consulted only to confirm no residual work survives for
+    /// a phase that produced no terminal accounting; the policy is
+    /// otherwise phase-agnostic.
+    pub(super) fn phase_can_proceed(&self, phase: &PhaseId, completed: u32, failed: u32) -> bool {
+        // Any terminal accounting (success OR recorded permanent failure)
+        // means the phase resolved its work — advance per the canonical
+        // retry-bucket-exhaustion contract.
+        if completed > 0 || failed > 0 {
+            return true;
+        }
+        // No terminal accounting: proceed only if the phase genuinely had
+        // no work. If residual items remain for a phase the drain logic
+        // surfaced, advancing would strand dependents — veto.
+        self.phase_min_workers(phase) == 0
     }
 
     /// Drive `Drained` phases through `on_phase_end` → `mark_phase_done`
@@ -1995,7 +2083,36 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     )
                     .await;
                 }
-                self.pool_mut().mark_phase_done(p);
+                // Per-phase proceed-or-fail decision, evaluated AFTER the
+                // retry-bucket cascade has exhausted every reinjection
+                // path (both buckets above returned `false`) and BEFORE
+                // the phase is marked done. On PROCEED the phase advances
+                // exactly as before (mark_phase_done flips dependents
+                // Blocked → Active) — this is the path taken by every
+                // phase that produced a completion OR whose failures are
+                // permanent-and-recorded (the canonical retry-bucket-
+                // exhaustion contract: advance, surface fail_* in the
+                // outcome summary). On FAIL — the genuine wedge where a
+                // phase reached this drain with NO terminal accounting yet
+                // still owns residual work — we EMIT RunShouldFail onto
+                // the decoupled worker-management bus (which owns the
+                // clean-shutdown drive) and leave the phase un-done. The
+                // emit is a pure signal; the phase layer never drives
+                // shutdown directly (decoupling law). See
+                // `phase_can_proceed` for the exact policy.
+                if self.phase_can_proceed(p, completed, failed) {
+                    self.pool_mut().mark_phase_done(p);
+                } else {
+                    self.cluster_state.emit_worker_mgmt(
+                        WorkerMgmtSignal::RunShouldFail {
+                            reason: format!(
+                                "phase {p} reached drain with no terminal \
+                                 outcome ({completed} completed, {failed} \
+                                 failed) yet still owns residual work"
+                            ),
+                        },
+                    );
+                }
             }
             // mark_phase_done may have flipped Blocked → Active for
             // dependents; emit on_phase_start for them.
