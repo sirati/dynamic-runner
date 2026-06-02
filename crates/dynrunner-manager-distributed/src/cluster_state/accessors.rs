@@ -99,7 +99,8 @@ impl<I: Identifier> ClusterState<I> {
                     // entry the count still partitions correctly.
                     ErrorType::ResourceExhausted(_)
                     | ErrorType::NonRecoverable
-                    | ErrorType::Unfulfillable { .. } => o.fail_final += 1,
+                    | ErrorType::Unfulfillable { .. }
+                    | ErrorType::InvalidTask { .. } => o.fail_final += 1,
                 },
                 // Discrete `Unfulfillable` state: reinjectable resource-
                 // availability failure. Tallied as `fail_final` for the

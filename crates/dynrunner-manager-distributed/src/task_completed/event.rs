@@ -41,11 +41,22 @@
 ///   wire-stable string keeps consumers stable across future variant
 ///   additions (a new `ErrorType` variant gets a new `wire_value()`
 ///   prefix; consumers that match on the string surface get the new
-///   tag automatically without a re-build).
+///   tag automatically without a re-build). This is the carried error
+///   *type* identity.
+/// - `last_error`: `None` on success; on failure the operator-facing
+///   error *message* (the `last_error` body the apply rule stored on
+///   the ledger entry). Carried ALONGSIDE `error_kind` because a
+///   failure with more than one possible cause is only fully
+///   identified by type AND message: a downstream aggregator dedups
+///   distinct failures on this message string (two `non_recoverable`
+///   failures with different messages are distinct events), so the
+///   event must carry the message — not force every consumer to
+///   re-read `cluster_state.task_state(hash).last_error` out of band.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskCompletedEvent {
     pub task_id: String,
     pub task_hash: String,
     pub success: bool,
     pub error_kind: Option<String>,
+    pub last_error: Option<String>,
 }

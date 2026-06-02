@@ -23,6 +23,16 @@ pub enum ErrorType {
     /// `reason` is a free-form diagnostic capped at 2 KiB so a buggy or
     /// malicious peer cannot inflate per-message memory cost.
     Unfulfillable { reason: BoundedString<2048> },
+    /// A task is structurally invalid and can NEVER run — e.g. it names
+    /// a dependency that does not exist in the run, or a duplicate
+    /// `(phase_id, task_id)` was submitted. Unlike `Unfulfillable`
+    /// (which is *reinjectable* once a resource reappears) this is a
+    /// terminal, NON-reinjectable failure: no future cluster state makes
+    /// the task runnable. `reason` is a free-form diagnostic capped at
+    /// 2 KiB (same bound + same no-newline framing contract as
+    /// `Unfulfillable`, see `wire_value` below) so a buggy or malicious
+    /// peer cannot inflate per-message memory cost.
+    InvalidTask { reason: BoundedString<2048> },
 }
 
 impl ErrorType {
@@ -30,13 +40,16 @@ impl ErrorType {
     /// task-defined kind name we have to interpolate). The legacy `oom`
     /// shorthand is preserved for the conventional `"memory"` kind.
     ///
-    /// `Unfulfillable` uses an `unfulfillable:<reason>` tag. The reason
-    /// is already capped at 2 KiB by `BoundedString<2048>`; no further
+    /// `Unfulfillable` uses an `unfulfillable:<reason>` tag and
+    /// `InvalidTask` an `invalid_task:<reason>` tag. The reason is
+    /// already capped at 2 KiB by `BoundedString<2048>`; no further
     /// escaping is applied because the text codec terminates frames on
     /// `\n` and the reason is the last field — newlines in `reason`
     /// would break framing. Callers must ensure reasons contain no
     /// newlines (the text codec is line-oriented; the richer JSON codec
-    /// in `protocol-primary-secondary` has no such restriction).
+    /// in `protocol-primary-secondary` has no such restriction). A colon
+    /// inside `reason` is safe: `from_wire` strips only the tag prefix
+    /// and keeps the remainder verbatim.
     pub fn wire_value(&self) -> String {
         match self {
             ErrorType::ResourceExhausted(kind) if kind.as_str() == "memory" => "oom".into(),
@@ -44,6 +57,7 @@ impl ErrorType {
             ErrorType::NonRecoverable => "non_recoverable".into(),
             ErrorType::Recoverable => "recoverable".into(),
             ErrorType::Unfulfillable { reason } => format!("unfulfillable:{reason}"),
+            ErrorType::InvalidTask { reason } => format!("invalid_task:{reason}"),
         }
     }
 
@@ -56,6 +70,11 @@ impl ErrorType {
         }
         if let Some(reason) = s.strip_prefix("unfulfillable:") {
             return Some(ErrorType::Unfulfillable {
+                reason: reason.to_owned().into(),
+            });
+        }
+        if let Some(reason) = s.strip_prefix("invalid_task:") {
+            return Some(ErrorType::InvalidTask {
                 reason: reason.to_owned().into(),
             });
         }
