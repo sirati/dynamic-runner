@@ -444,24 +444,13 @@ where
         };
         if promoted {
             tracing::info!(round, "won election — taking over as primary");
+            // The election state machine only records the terminal
+            // `Promoted` state transition. Activating the co-located
+            // primary (seeding its pool from the replicated CRDT and
+            // entering its operational loop) is R4's terminal action,
+            // wired through the unified composition — the secondary
+            // carries no self-promotion mirror to flip on here.
             self.election = ElectionState::Promoted;
-            self.is_primary = true;
-            // Stamp the promotion instant so the alive-demoted
-            // natural-quiesce branch in `process_tasks` can enforce
-            // its minimum-elapsed-time gate. See the `promoted_at`
-            // field doc on `SecondaryCoordinator` for the rationale.
-            // Mirror the dispatch-path stamp site
-            // (`router.rs::dispatch_message` PromotePrimary arm) so
-            // both promotion paths produce the same gate semantics.
-            self.promoted_at = Some(Instant::now());
-            // Hydrate `primary_pending` from the continuously-replicated
-            // `cluster_state`. Pre-Phase-B promotion drained a cached
-            // `FullTaskList` snapshot — a consume-once data path with
-            // its own race conditions (no broadcast observed yet ⇒
-            // empty new primary). Post-Phase-B every node has been
-            // mirroring the ledger from run start, so the new primary
-            // simply reads its own already-current state.
-            self.populate_primary_from_cluster_state();
         }
         promoted
     }

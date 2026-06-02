@@ -25,7 +25,6 @@
 
 mod assignment;
 mod command_channel;
-mod compose;
 mod connect;
 mod coordinator;
 mod config;

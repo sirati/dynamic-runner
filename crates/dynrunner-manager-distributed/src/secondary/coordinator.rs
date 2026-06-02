@@ -35,8 +35,6 @@ where
 {
     pub fn new(
         config: SecondaryConfig,
-        primary_transport: PT,
-        peer_transport: P,
         scheduler: S,
         estimator: E,
     ) -> Self {
@@ -45,19 +43,8 @@ where
         });
         let extraction_cache = ExtractionCache::new(tmp_dir, config.src_network.clone());
         let primary_link = PrimaryLink::with_failover_threshold(
-            config.secondary_id.clone(),
             config.primary_link_failure_threshold,
             config.primary_link_failure_window,
-        );
-        // RetryBudget consumes `config.retry_max_passes` as the
-        // attempt-count cap and reads `$SLURM_JOB_END_TIME` ONCE
-        // here (startup) for the wallclock deadline. The
-        // env-var is documented as Unix-epoch seconds; absence is
-        // the legacy non-SLURM path (silent), parse failure logs WARN.
-        // See `retry_budget.rs` for the dual-axis design.
-        let primary_retry_budget = super::retry_budget::RetryBudget::from_env_and_legacy(
-            config.retry_max_passes,
-            super::retry_budget::DEFAULT_SAFETY_MARGIN,
         );
         // Peer-lifecycle dispatcher channel. Built at construction so
         // the `cluster_state` apply path has an installed sender
@@ -82,8 +69,6 @@ where
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
         let mut this = Self {
             config,
-            primary_transport,
-            peer_transport,
             scheduler,
             estimator,
             peer_cert_info: None,
@@ -93,8 +78,6 @@ where
             #[cfg(test)]
             local_tasks_run: 0,
             transfer_complete: false,
-            is_primary: false,
-            promoted_at: None,
             extraction_cache,
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,
@@ -105,21 +88,12 @@ where
             peer_mesh_check_at: None,
             peer_dial_count: 0,
             mesh_ready_sent: false,
-            primary_pending: None,
-            primary_completed: HashSet::new(),
-            primary_in_flight: HashMap::new(),
-            primary_failed: HashMap::new(),
-            primary_retry_passes_used: HashMap::new(),
-            primary_retry_budget,
-            backpressured_secondaries: HashMap::new(),
             pre_staged_mode: false,
             uses_file_based_items: true,
             fatal_exit: None,
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
             pending_worker_restarts: HashSet::new(),
-            pending_first_bind: HashMap::new(),
-            setup_pending: false,
             setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
@@ -405,17 +379,6 @@ where
         };
         self.extraction_cache
             .resolve_binary(zip_ref, local_path, file_hash, expected_content_hash)
-    }
-
-    /// True iff `secondary_id` is currently in the primary's
-    /// backpressure backoff window (recently returned "No idle worker
-    /// available"). Used by `handle_primary_task_request` to skip
-    /// re-dispatching to an unresponsive peer. Mirrors
-    /// `PrimaryCoordinator::is_backpressured`.
-    pub(in crate::secondary) fn is_primary_peer_backpressured(&self, secondary_id: &str) -> bool {
-        self.backpressured_secondaries
-            .get(secondary_id)
-            .is_some_and(|t| Instant::now() < *t)
     }
 
     /// Set certificate info for peer connections. Must be called before `run()`

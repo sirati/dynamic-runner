@@ -39,12 +39,7 @@ where
     /// short-circuits on `first_failure_at.is_none()`), and harmless
     /// when failover is already armed (`primary_disconnected` short-
     /// circuits the body so we don't re-backdate `primary_last_seen`).
-    /// `is_primary` short-circuits as well — a promoted secondary has
-    /// no use for failover.
     pub(in crate::secondary) fn check_primary_link_threshold(&mut self) {
-        if self.is_primary {
-            return;
-        }
         if !self.primary_link.is_link_failing() {
             return;
         }

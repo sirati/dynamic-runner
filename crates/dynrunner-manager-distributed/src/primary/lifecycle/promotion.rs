@@ -184,28 +184,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 }
             }
 
-            // Hand-off complete: the local primary stops being
-            // authoritative the moment `PromotePrimary` is on the
-            // wire. We stay alive (transport open, message loop
-            // still runs) so completion forwards keep
-            // `completed_tasks` accurate for the run-done counter
-            // check in `operational_loop`, but we no longer
-            // dispatch, kickstart, or drive heartbeat-based
-            // requeue — the promoted secondary owns all of that.
-            // Without this, the local primary and the promoted
-            // secondary both act as primaries simultaneously and
-            // their parallel dispatch paths race for the same
-            // workers. See `demoted` doc on `PrimaryCoordinator`.
-            self.demoted = true;
-            // The demoted local primary is NOT an observer — observers
-            // are first-class members of `RoleTable.observers` (Step 7,
-            // Decision G) with `is_observer=true` set at startup. A
-            // demoted primary stays a regular member; it just no
-            // longer drives dispatch. Prior log wording conflated the
-            // two concepts.
+            // Hand-off complete: the `PrimaryChanged` apply + the
+            // `PromotePrimary` broadcast moved authority to the chosen
+            // secondary. The local node's transition to a pure-observer
+            // posture (snapshot-at-demotion + the passive observe loop)
+            // is R3's concern, wired through the unified composition;
+            // there is no `demoted` self-flag to set here.
             tracing::info!(
                 primary = %first_id,
-                "local primary demoted; promoted secondary is sole authoritative primary"
+                "promoted secondary is sole authoritative primary"
             );
         }
         Ok(())

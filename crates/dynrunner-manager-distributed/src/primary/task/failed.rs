@@ -70,21 +70,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             let task_hash = task_hash.clone();
             let error_type = error_type.clone();
             let error_message = error_message.clone();
-            // Find the specific worker and recover the binary if it's a
-            // recoverable error so it can be re-assigned to another worker.
-            let mut recovered_binary: Option<TaskInfo<I>> = None;
-            let mut local_idx: u32 = 0;
-            for w in &mut self.workers {
-                if w.secondary_id == secondary_id {
-                    if local_idx == worker_id {
-                        recovered_binary = w.current_task.take();
-                        w.estimated_resources = ResourceMap::new();
-                        w.is_idle = true;
-                        break;
-                    }
-                    local_idx += 1;
-                }
-            }
+            // TODO(R1): resolve the held binary BY HASH from the single
+            // hash-keyed `in_flight` ledger and free the holding slot
+            // through `free_slot_on_terminal(secondary, worker,
+            // task_hash)` on every terminal path (terminal TaskFailed,
+            // backpressure-requeue, stuck-worker timeout). The removed
+            // code did a blind `(secondary_id, worker_id)` slot scan
+            // with NO hash check and consulted the separate
+            // `pre_owned_in_flight` fallback — the P1 mis-attribution
+            // bug. `recovered_binary` must come from the ledger entry.
+            let recovered_binary: Option<TaskInfo<I>> = None;
 
             // Backpressure detection: secondary's dispatch.rs sends
             // this exact error_message when its `is_idle_state()`
@@ -217,17 +212,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             if let Some(binary) = recovered_binary {
                 self.release_type_slot(&binary.type_id);
                 self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
-            } else if let Some((phase, _secondary, binary)) =
-                self.pre_owned_in_flight.remove(&task_hash)
-            {
-                // Pre-owned in-flight task (hydrated from cluster_state)
-                // failing on the originating node: no local worker held
-                // it, so no local type-slot was taken — hence no
-                // `release_type_slot`. We still decrement the correct
-                // phase's in-flight counter via `note_item_failed` so
-                // the phase machine drains from N+1 to N. Symmetric with
-                // the pre-owned fallback in `handle_task_complete`.
-                self.note_item_failed(&phase, Some(binary.task_id.as_str()), command_rx).await;
             }
 
             // Same kickstart rationale as `handle_task_complete`:

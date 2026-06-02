@@ -65,84 +65,6 @@ mod tests;
 
 pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig};
 
-pub(super) struct PrimaryInFlightItem<I: Identifier> {
-    pub(super) phase_id: PhaseId,
-    pub(super) target_secondary_id: String,
-    pub(super) binary: TaskInfo<I>,
-}
-
-/// Source of a task that's currently waiting on a worker's first-bind
-/// (or true type-shift) respawn to reach `Response::Ready`. Drives the
-/// `WorkerEvent::Disconnected` recovery path: which ledger the binary
-/// needs to be returned to if the worker dies before Ready arrives.
-///
-/// See [`PendingFirstBind`] and `SecondaryCoordinator.pending_first_bind`.
-#[derive(Debug, Clone)]
-pub(super) enum BindSource {
-    /// Inbound TaskAssignment from a peer (or the original primary).
-    /// Disconnect recovery: send TaskFailed-as-backpressure
-    /// (`"worker pipe broken; respawning"`) to the current primary so
-    /// the primary's `handle_primary_peer_rejection` requeues the
-    /// binary for re-dispatch.
-    PeerAssigned,
-    /// Local self-assign from `handle_primary_task_request` while this
-    /// secondary holds primary authority. Disconnect recovery:
-    /// `recover_in_flight_to_pool` (the binary is already tracked in
-    /// `primary_in_flight` because the self-assign path inserts there
-    /// BEFORE attempting the respawn).
-    PrimarySelfAssign,
-}
-
-/// One pending first-bind entry: the inbound binary the dispatch arm
-/// could not assign immediately because the target worker's
-/// `loaded_type_id` did not match the task's `type_id` (first-bind
-/// `None → Some(T)` OR true type-shift `Some(T1) → Some(T2)`). The
-/// pool's [`crate::pool::WorkerPool::ensure_worker_for_type_async`]
-/// kicked off the kill+spawn on a background `wait_ready` task; this
-/// entry is the dispatch-arm side, keyed by the `WorkerId` so the
-/// `WorkerEvent::Ready` handler can pick it up and call `assign_task`
-/// once the slot is observably Idle with the new type bound.
-///
-/// Carries everything `assign_task` + cleanup needs: the resolved
-/// `TaskInfo`, the wire-side `file_hash` (used by `active_tasks` and
-/// the disconnect-recovery wire messages), the scheduler's estimated
-/// resource usage, and the [`BindSource`] discriminator that drives
-/// the disconnect-recovery branch.
-#[derive(Debug, Clone)]
-pub(super) struct PendingFirstBind<I: Identifier> {
-    pub(super) binary: TaskInfo<I>,
-    pub(super) file_hash: String,
-    pub(super) estimated: dynrunner_core::ResourceMap,
-    pub(super) source: BindSource,
-    /// Predecessor-output map preserved across the
-    /// stash-until-Ready bounce. The router destructured this off
-    /// the `TaskAssignment` wire message; the post-Ready first-bind
-    /// dispatch (`processing/worker_event.rs`) forwards it verbatim
-    /// to `WorkerHandle::assign_task` so the dependent worker
-    /// observes the same `predecessor_outputs` shape it would have
-    /// seen on a same-type fast-path assignment.
-    pub(super) predecessor_outputs:
-        std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
-}
-
-/// One entry in the secondary's `primary_failed` ledger. Carries
-/// both the original `TaskInfo` (so the secondary can re-inject the
-/// binary on a retry pass without re-fetching it from the cluster
-/// state) and the last-observed `ErrorType` (so the per-class
-/// outcome breakdown — fail_retry/fail_oom/fail_final — can be
-/// computed locally at log time).
-///
-/// On retry, the entry is overwritten with the new pass's
-/// `ErrorType`; the binary is unchanged.
-#[derive(Debug, Clone)]
-pub(super) struct FailedTaskEntry<I: Identifier> {
-    pub(super) binary: TaskInfo<I>,
-    // Kept for diagnostic / future routing; not currently read by the
-    // retry path which surfaces it via the FailedTask wire message.
-    #[allow(dead_code)]
-    pub(super) error_type: ErrorType,
-}
-
 /// The secondary coordinator: connects to primary, manages local workers.
 ///
 /// Unlike `LocalManager` which runs a 5-phase pipeline, the secondary receives
@@ -166,8 +88,6 @@ where
     I: Identifier,
 {
     config: SecondaryConfig,
-    primary_transport: PT,
-    peer_transport: P,
     scheduler: S,
     estimator: E,
 
@@ -198,42 +118,6 @@ where
 
     // State
     transfer_complete: bool,
-    is_primary: bool,
-
-    /// Wall-clock instant of the most recent `is_primary: false → true`
-    /// transition. `None` while this secondary has never been promoted;
-    /// set whenever a `PromotePrimary` (dispatch path) or a failover
-    /// election (election path) flips `is_primary` to true.
-    ///
-    /// Read by the **alive-demoted natural-quiesce** branch in
-    /// `process_tasks` to enforce a minimum-elapsed-time gate
-    /// (`PROMOTED_PRIMARY_QUIESCE_GRACE`) before declaring the cluster
-    /// done. Rationale: that branch fires on a CRDT-derived predicate
-    /// (`task_count() > 0 && pending == 0 && in_flight == 0`) that is
-    /// **incomplete-mirror-prone** in the immediate post-promotion
-    /// window — a freshly promoted secondary may hold only the
-    /// fraction of `TaskAdded` broadcasts the demoted primary had
-    /// flushed at promotion time. Without a settle period the local
-    /// view "5 of 10 tasks added, all 5 already terminal" satisfies
-    /// the predicate and the branch broadcasts `RunComplete` while
-    /// the demoted primary is still publishing the other 5
-    /// (asm-dataset-nix T11: 5/10 phase_build tasks stranded).
-    ///
-    /// This is a **time-based bandage**, documented as such: the
-    /// structurally clean fix (a wire signal from the demoted primary
-    /// that it has finished publishing) does not exist in the
-    /// protocol today. The grace is small enough not to defeat the
-    /// branch's original asm-tokenizer LMU 2-of-235 deadlock-break
-    /// purpose (loopback round-trips on a healthy cluster complete
-    /// in single-digit ms; 2 s gives orders-of-magnitude headroom)
-    /// while still finite so the branch eventually fires in the
-    /// LMU scenario it was added to fix.
-    ///
-    /// Not reset on a subsequent re-hydration (the post-bootstrap
-    /// `ClusterSnapshot` arm in `dispatch_message`): later snapshot
-    /// arrivals are exactly the events the grace exists to wait for,
-    /// resetting would defeat the purpose.
-    pub(in crate::secondary) promoted_at: Option<Instant>,
 
     // ZIP extraction cache
     extraction_cache: ExtractionCache,
@@ -321,94 +205,6 @@ where
     /// (mesh formed, watchdog elapsed, or no peers to dial).
     mesh_ready_sent: bool,
 
-    // primary state (populated on promotion).
-    // `primary_pending` is `None` until this secondary is promoted; on
-    // the became-primary transition `populate_primary_from_cluster_state`
-    // rebuilds it from the continuously-replicated `cluster_state` mirror.
-    // No wire round-trip: the cluster ledger has been kept in sync via
-    // `ClusterMutation` broadcasts since the run started.
-    primary_pending: Option<PendingPool<I>>,
-    primary_completed: HashSet<String>,
-    /// Per-item ledger for every primary dispatch that hasn't
-    /// terminated yet. Keyed by the same task hash used in
-    /// `completed_tasks` / `active_tasks`. Stores `phase_id` (drives
-    /// the pool's `on_item_finished` counter), `target_secondary_id`
-    /// (used by the backpressure path to mark the right peer), and
-    /// the full `binary` (used to `pool.requeue` on a rejection so
-    /// the task isn't silently dropped from the pool).
-    primary_in_flight: HashMap<String, PrimaryInFlightItem<I>>,
-
-    /// Per-task ledger of Recoverable failures observed on the
-    /// primary path. Mirrors the live primary's `failed_tasks` set, but
-    /// keyed to the secondary that's currently acting as primary.
-    /// Populated by `note_primary_item_failed` whenever a Recoverable
-    /// failure terminates a dispatch slot for a task this node
-    /// dispatched; drained by `primary_drain_check_and_retry`
-    /// when the main pass quiesces (pool empty + no in-flight + no
-    /// active local tasks) and re-injected into `primary_pending` via
-    /// `pool.reinject(item)` for one more attempt.
-    ///
-    /// Stores the binary alongside the hash so the re-injection step
-    /// has the full `TaskInfo` to put back into the pool — `primary_in_flight`
-    /// already kept this shape for rejection-recovery; the failed
-    /// ledger keeps the same shape for retry-injection.
-    ///
-    /// Each entry now also carries the last-observed `ErrorType` so
-    /// the post-restructure `succeeded/fail_retry/fail_oom/fail_final`
-    /// log surface can partition failures by class. Pre-restructure
-    /// the secondary lost OOM-vs-final classification at this
-    /// boundary (the binary was carried, the failure class was not).
-    ///
-    /// Closes the gap demotion introduced: post-demotion the local
-    /// primary's `run_retry_passes` is a no-op, so without this
-    /// primary-side ledger every Recoverable failure became
-    /// terminal at the cluster level.
-    primary_failed: HashMap<String, FailedTaskEntry<I>>,
-
-    /// Per-(phase, retry-bucket) pass counter for the
-    /// promoted-secondary's primary path. Mirrors
-    /// `PrimaryCoordinator::retry_passes_used` 1:1 — the same
-    /// per-phase Recoverable + OOM partition the live primary
-    /// runs at each phase drain edge also runs on this node when
-    /// it acts as primary. The shared core lives in
-    /// [`crate::primary::retry_bucket::try_phase_retry_bucket_core`];
-    /// the candidate-build is per-side (the secondary's
-    /// `primary_failed` stores the binary on the entry, the
-    /// primary's `failed_tasks` cross-references `all_binaries`).
-    ///
-    /// Initialised empty on construction; entries appear when a
-    /// bucket runs for the first time on a given (phase, kind)
-    /// pair. The map keys include `PhaseId`, so phase A's counter
-    /// is structurally independent of phase B's.
-    primary_retry_passes_used: crate::primary::retry_bucket::RetryPassesUsed,
-
-    /// Retry budget for the primary-side re-injection loop. Owns
-    /// both the attempt counter (originally `retry_max_passes`) and
-    /// the optional SLURM-wallclock deadline (read once at
-    /// construction from `$SLURM_JOB_END_TIME`). Consulted by the
-    /// two drain-down exit predicates in `processing.rs` to bound
-    /// the post-disconnect wait-for-quiesce window. Per-phase
-    /// retry-bucket admission is now driven by
-    /// `primary_retry_passes_used` + `config.retry_max_passes` /
-    /// `config.oom_retry_max_passes` (mirroring the live primary);
-    /// this field's `should_retry()` axis acts purely as a SLURM-
-    /// wallclock guard so the secondary doesn't sit on a stale
-    /// `primary_failed` ledger forever after the job hits its
-    /// wall-clock deadline. See `retry_budget.rs` for the dual-
-    /// axis design.
-    primary_retry_budget: retry_budget::RetryBudget,
-
-    /// Per-peer backpressure backoff for the primary path.
-    /// Mirrors `PrimaryCoordinator::backpressured_secondaries` — when
-    /// a peer rejects a `TaskAssignment` with the wire signal
-    /// "No idle worker available", record the peer with an expiry
-    /// timestamp; until expiry, `handle_primary_task_request` skips
-    /// re-dispatching to that peer (binary stays in the pool for
-    /// another candidate). Cleared when the peer reports an actual
-    /// `TaskComplete` (proves it's healthy) or when the backoff
-    /// window expires naturally.
-    backpressured_secondaries: HashMap<String, Instant>,
-
     /// Set by handlers that detect an unrecoverable local fault.
     /// The main `process_tasks` loop checks this once per iteration
     /// AFTER the deferred-message flush; if `Some`, the loop returns
@@ -484,98 +280,6 @@ where
     /// last drain (set was emptied) or is still queued (no-op
     /// already in flight).
     pub(super) pending_worker_restarts: HashSet<WorkerId>,
-
-    /// Pending task assignments waiting on a freshly-spawned worker
-    /// to reach `Response::Ready`. Keyed by `WorkerId`; consumed by
-    /// the `WorkerEvent::Ready` arm in
-    /// [`crate::secondary::processing::worker_event`].
-    ///
-    /// # Single concern
-    ///
-    /// The select!-arm bodies in `dispatch/router.rs` (TaskAssignment
-    /// from primary) and `primary/task_request.rs`
-    /// (`handle_primary_task_request`) historically held an inline
-    /// `ensure_worker_for_type(...).await` on the FIRST-BIND path
-    /// (`loaded_type_id == None`). The await drove
-    /// [`crate::worker::WorkerHandle::poll_ready`] in a loop until
-    /// the freshly-spawned worker subprocess sent `Response::Ready`
-    /// — and BLOCKED the select! for the full duration. Production
-    /// observed 300+s of tokio-runtime silence on the asm-tokenizer
-    /// LMU dispatch when the worker took longer than the keepalive
-    /// interval to import its Python task module.
-    ///
-    /// The async-event fix routes type-bind through
-    /// [`crate::pool::WorkerPool::ensure_worker_for_type_async`]
-    /// (returns `RespawnInProgress` immediately, drives
-    /// `wait_ready` on a background `spawn_local` task that emits
-    /// `WorkerEvent::Ready` on the pool's channel when done). The
-    /// caller stores the inbound binary HERE keyed by the worker
-    /// it dispatched to, returns from the select! arm, and the
-    /// Ready handler picks the binary back up and calls
-    /// `assign_task` once the slot is observably Idle with the
-    /// correct `loaded_type_id`.
-    ///
-    /// # Why HERE rather than bouncing as backpressure
-    ///
-    /// The first cut of this fix bounced the binary back to the
-    /// primary as a `TaskFailed` carrying the
-    /// `"worker pipe broken; respawning"` marker, mirroring the
-    /// existing type-shift respawn path. That path works
-    /// architecturally — the primary's
-    /// `handle_primary_peer_rejection` requeues and re-dispatches
-    /// — but introduces distribution bias: the promoted-primary's
-    /// own self-assigns reach the same-type fast path within
-    /// sub-millisecond after the Ready event fires (no wire
-    /// round-trip), while peer secondaries pay one full primary
-    /// round-trip per first-bind. On small workloads (e.g. the
-    /// 20-binary asm-tokenizer Tier-2 recipe) the promoted-primary
-    /// burns through every task before the peer cycle catches up,
-    /// regressing the
-    /// `setup_promote_multi_secondary_distributes_to_idle_peers_on_promote`
-    /// test which pins per-secondary distribution fairness.
-    ///
-    /// Storing the binary on the secondary preserves fairness:
-    /// each worker stays bound to its initial assignment for the
-    /// duration of the respawn, no round-trip needed.
-    ///
-    /// # Loss handling
-    ///
-    /// If the worker dies before reaching Ready, the
-    /// `WorkerEvent::Disconnected` arm drains the entry and
-    /// recovers it per `source`:
-    ///
-    ///   * `BindSource::PrimarySelfAssign` →
-    ///     [`Self::recover_in_flight_to_pool`] (the binary is
-    ///     already in `primary_in_flight`; pushes it back to the
-    ///     pool front).
-    ///   * `BindSource::PeerAssigned` → send TaskFailed-as-
-    ///     backpressure to the current primary so the primary's
-    ///     `handle_primary_peer_rejection` requeues it for
-    ///     another peer (or self-assign).
-    pub(super) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
-
-    /// Set true by the `PromotePrimary { required_setup: true }` arm
-    /// in `dispatch.rs` when this secondary is promoted into the
-    /// setup-secondary role (the submitter deferred all run-setup work
-    /// to us — no `TaskAdded` batch was pre-seeded on the cluster
-    /// ledger). The outer process-tasks loop yields back to the PyO3
-    /// wrapper when this is true so Python's `task.discover_items` can
-    /// run on this node (which has the staged source filesystem
-    /// bind-mounted locally). The wrapper then calls
-    /// `ingest_setup_discovery`, which seeds the ledger with
-    /// `PhaseDepsSet` + `TaskAdded` mutations, broadcasts them to
-    /// every peer, clears this flag, and hydrates the primary pool
-    /// from the now-populated `cluster_state`.
-    ///
-    /// Never set on the pre-seeded promotion path (`required_setup:
-    /// false` from the local submitter — local did discovery and the
-    /// ledger is pre-seeded) nor on the failover-election path (the
-    /// ledger has content from the CRDT broadcasts that ran during
-    /// the live-primary phase). The wire-level `required_setup` flag
-    /// is the only discriminator; "ledger empty" is NOT a proxy
-    /// because failover-at-startup can legitimately observe an
-    /// empty ledger.
-    pub(super) setup_pending: bool,
 
     /// Re-entry guard for `run_until_setup_or_done`. The first call
     /// runs `initialize_workers`, the setup-handshake (`send_welcome`,

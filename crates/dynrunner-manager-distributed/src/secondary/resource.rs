@@ -134,23 +134,6 @@ where
         worker_id: WorkerId,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
-        // When primary, handle task requests locally
-        if self.is_primary && !self.primary_pending_is_empty() {
-            let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-                self.pool.workers[worker_id as usize].reserved_budgets.get(&dynrunner_core::ResourceKind::memory())
-            } else {
-                self.config.max_resources.get(&dynrunner_core::ResourceKind::memory()) / self.config.num_workers as u64
-            };
-            return self
-                .handle_primary_task_request(
-                    self.config.secondary_id.clone(),
-                    worker_id,
-                    available_memory,
-                    factory,
-                )
-                .await;
-        }
-
         if !self.primary_link.should_request_now(worker_id) {
             return Ok(());
         }
@@ -174,69 +157,6 @@ where
         self.primary_link.note_request_sent(worker_id);
 
         self.send_to_current_primary(msg).await
-    }
-
-    /// Send `msg` to the node currently holding primary authority,
-    /// whichever it is.
-    ///
-    /// One concern: hide the routing decision behind a single boundary
-    /// so every "send to primary" call site (TaskComplete, TaskFailed,
-    /// Keepalive, TaskRequest, OOM report) follows the same rule. The
-    /// rule is dynamic: at run start the local node is primary and we
-    /// route via `primary_transport`; after `PromotePrimary` (and
-    /// after election) `primary_link.current_primary()` names the current
-    /// primary and we route via `peer_transport.send_to_peer` instead.
-    ///
-    /// Pre-extraction this routing logic existed inline in exactly one
-    /// place (`request_task_for_worker`); every other operational
-    /// "send to primary" went directly to `primary_transport.send`,
-    /// which after promotion points at a peer that is no longer the
-    /// authoritative primary. That mismatch is the
-    /// `primary_connection-points-at-local` class of bug — completion
-    /// reports, failure reports, and keepalives all routed to the
-    /// wrong endpoint after promotion. Centralising the decision
-    /// makes the right routing automatic at every call site.
-    ///
-    /// Setup-phase messages (welcome, cert exchange) deliberately
-    /// keep using `primary_transport` directly: at that point there
-    /// IS no other primary candidate, and the original transport is
-    /// the only path that exists. Once setup completes and a
-    /// secondary may be promoted, all operational messages route
-    /// through here.
-    pub(super) async fn send_to_current_primary(
-        &mut self,
-        msg: DistributedMessage<I>,
-    ) -> Result<(), String> {
-        if let Some(current_primary) = self.primary_link.current_primary() {
-            if current_primary != self.config.secondary_id.as_str() {
-                let peer = current_primary.to_string();
-                return self.peer_transport.send_to_peer(&peer, msg).await;
-            }
-            // Self-addressed (we ARE the primary). Keep the loopback
-            // through `primary_transport` so the demoted observer can
-            // still tick its completion counter and run the
-            // run-done-termination check (see lifecycle.rs's
-            // observer-mode contract: forwarded outcomes still drive
-            // the local primary's terminal counters, only re-injection
-            // is suppressed).
-            //
-            // Tolerate transport errors on this loopback. Post-
-            // promotion the demoted primary process is allowed to
-            // exit cleanly — when it does, its transport-writer task
-            // closes and subsequent sends fail (QUIC: "transport
-            // writer task exited"; channel test fixture: "channel
-            // closed"). That failure is benign here: every
-            // operational call site has already done the local
-            // bookkeeping directly before invoking this helper, and
-            // we ARE the authoritative primary. Without the swallow,
-            // lone-promoted-primary runs (no peer to relay through,
-            // local primary exited) propagated the error fatally
-            // through `?` operators at processing.rs / dispatch.rs
-            // and crashed the secondary.
-            let _ = self.primary_transport.send(msg).await;
-            return Ok(());
-        }
-        self.primary_transport.send(msg).await
     }
 
     /// Periodic safety-net wakeup: walk every idle worker and call
