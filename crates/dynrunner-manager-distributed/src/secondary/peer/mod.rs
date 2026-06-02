@@ -8,8 +8,7 @@
 //!   idempotent `MeshReady`-to-primary reporter
 //!   (`check_peer_mesh_watchdog`, `report_mesh_ready_if_needed`).
 //! - [`keepalive_timeouts`] — periodic keepalive-timeout sweep that
-//!   also recovers `primary_in_flight` tasks targeting the timed-out
-//!   peer (`check_peer_timeouts`).
+//!   keeps this node's peer-liveness view current (`check_peer_timeouts`).
 //!
 //! Each submodule defines its methods as `impl<...> SecondaryCoordinator`
 //! blocks; the parent `secondary` module just declares this `peer`

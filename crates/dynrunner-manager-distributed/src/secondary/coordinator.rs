@@ -74,7 +74,6 @@ where
             peer_cert_info: None,
             pool: WorkerPool::new(),
             active_tasks: HashMap::new(),
-            completed_tasks: HashSet::new(),
             #[cfg(test)]
             local_tasks_run: 0,
             transfer_complete: false,
@@ -93,6 +92,7 @@ where
             peer_mesh_degraded: false,
             cluster_state: ClusterState::new(),
             pending_worker_restarts: HashSet::new(),
+            pending_first_bind: HashMap::new(),
             setup_phase_completed: false,
             lifecycle_rx: Some(lifecycle_rx),
             peer_lifecycle_listeners: Vec::new(),
@@ -105,12 +105,8 @@ where
             panik_signal_rx: None,
             on_phase_end: None,
             on_phase_start: None,
-            primary_phase_completed: HashMap::new(),
-            primary_phase_failed: HashMap::new(),
-            primary_phase_started_emitted: HashSet::new(),
             command_rx: Some(command_rx),
             command_tx,
-            unfulfillable_reinject_remaining: HashMap::new(),
             // Lazily constructed in `run_until_setup_or_done_inner`
             // post-`initialize_workers` — see the doc on the
             // `sampler` field for the runtime-context rationale.
@@ -312,13 +308,9 @@ where
         (handle, sender)
     }
 
-    /// Whether the run is in pre-staged-source mode (set from the
-    /// primary's `InitialAssignment`). Exposed within the secondary
-    /// module so dispatch / setup can pick the right resolution path.
-    pub(in crate::secondary) fn pre_staged_mode(&self) -> bool {
-        self.pre_staged_mode
-    }
-
+    /// Set pre-staged-source mode from the primary's
+    /// `InitialAssignment`. The flag is read directly at the resolution
+    /// site (`expected_content_hash` selection); no getter is needed.
     pub(in crate::secondary) fn set_pre_staged_mode(&mut self, on: bool) {
         self.pre_staged_mode = on;
     }
@@ -474,42 +466,20 @@ where
         self.setup_phase_completed = true;
     }
 
-    pub fn completed_count(&self) -> usize {
-        self.completed_tasks.len()
-    }
-
-    /// Test-only inspector for the primary retry-pass budget
-    /// usage. Returns the SUM of consumed passes across all
-    /// `(phase, bucket)` keys in `primary_retry_passes_used`.
-    /// Lets tests assert that the per-phase retry-bucket cascade
-    /// actually drove re-injection (vs. e.g. the success arriving
-    /// without re-injection because the test fixture fixed the
-    /// worker behaviour before the bucket fired).
+    /// Cluster-wide count of successfully-completed tasks, read off the
+    /// replicated CRDT (`cluster_state.outcome_counts().succeeded`).
     ///
-    /// Post-refactor (2026-05-17): the counter shape moved from a
-    /// single `RetryBudget::attempts_used` (run-wide) to a per-
-    /// (phase, bucket) HashMap mirroring
-    /// `PrimaryCoordinator::retry_passes_used`. The aggregate
-    /// surfaced through this helper matches the legacy run-wide
-    /// shape so existing test assertions (`passes_used == 1`)
-    /// keep their meaning on single-phase fixtures.
-    #[cfg(test)]
-    pub fn primary_retry_passes_used_for_test(&self) -> u32 {
-        self.primary_retry_passes_used.values().sum()
+    /// A pure observer (and every non-authority secondary) keeps NO
+    /// per-node completed/failed/total counter: terminal state is read
+    /// ONLY from the CRDT, which every replica converges to. This is
+    /// what the late-joiner observer's `completed` getter surfaces — it
+    /// reflects every completion visible in the restored snapshot plus
+    /// any the observer ingested live, regardless of which node ran the
+    /// task.
+    pub fn completed_count(&self) -> usize {
+        self.cluster_state.outcome_counts().succeeded
     }
 
-    /// Test-only inspector for the primary's residual
-    /// failed-task ledger after the retry budget is exhausted. Used
-    /// by the multi-pass-exhaustion regression test to assert that a
-    /// task which fails Recoverably across all permitted passes ends
-    /// up permanently in `primary_failed`. Counts only
-    /// primary-dispatched failures (tasks that went through
-    /// `handle_primary_task_request`); initial-assignment failures
-    /// observed by the local worker bypass this ledger by design.
-    #[cfg(test)]
-    pub fn primary_failed_count_for_test(&self) -> usize {
-        self.primary_failed.len()
-    }
 
     /// Test-only inspector for the replicated cluster ledger this
     /// secondary maintains by applying primary-broadcast
@@ -858,7 +828,7 @@ where
                 self.stop_all_workers().await;
                 tracing::info!(
                     secondary = %self.config.secondary_id,
-                    completed = self.completed_tasks.len(),
+                    completed = self.completed_count(),
                     "secondary finished"
                 );
             }

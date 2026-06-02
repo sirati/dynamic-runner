@@ -109,6 +109,7 @@ fn roundtrip_all_message_types() {
         DistributedMessage::RequestClusterSnapshot {
             sender_id: "s".into(),
             timestamp: 0.0,
+            is_observer: false,
         },
         DistributedMessage::ClusterSnapshot {
             sender_id: "p".into(),

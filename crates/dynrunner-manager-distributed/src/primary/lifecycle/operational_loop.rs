@@ -33,14 +33,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// are a DIFFERENT concern (the run did not complete normally) and
     /// stay inline in the loop — they are not run-completion decisions.
     ///
-    /// `partial_view` (see the extensive rationale below) keys off
-    /// `self.demoted`, NOT off `required_setup_on_promote` alone and
-    /// NOT off a sticky latch: a composed AUTHORITATIVE primary is by
-    /// definition `!self.demoted`, so it evaluates `partial_view =
-    /// false` and uses the real counter / pool-drain exits even when
-    /// `required_setup_on_promote = true`. Only a DEMOTED submitter
-    /// that also deferred discovery holds a genuinely partial CRDT
-    /// mirror and must wait for the authoritative `RunComplete`.
+    /// All three exits are evaluated against live CRDT / pool / counter
+    /// state, so there is no demoted-vs-authoritative `partial_view`
+    /// special-case: a node running this loop is the authoritative
+    /// primary by construction (the demoted node is a pure observer
+    /// running the secondary observe loop, NOT this loop). The
+    /// replicated-ledger `RunComplete` arm is a uniform fallback that
+    /// is redundant on the fully-seeded path (the counter arm trips
+    /// first) and load-bearing only when an external authority's
+    /// `RunComplete` broadcast is the first complete signal this node
+    /// observes.
     pub(crate) fn run_complete_check(&self) -> bool {
         // Check termination: all tasks accounted for AND no
         // worker is mid-dispatch. Both halves of the check are
@@ -77,34 +79,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             return true;
         }
 
-        // Replicated-ledger run-complete signal. The promoted
-        // primary broadcasts `ClusterMutation::RunComplete` as the
-        // last act before its own `run()` returns; `handle_cluster_mutation`
-        // applies it to our `cluster_state` mirror.
+        // Replicated-ledger run-complete signal. Whichever node holds
+        // authority broadcasts `ClusterMutation::RunComplete` as the
+        // last act before its own `run()` returns; `dispatch_message`
+        // applies it to this node's `cluster_state` mirror.
         //
-        // For a setup-promoted demoted primary (`partial_view`
-        // = true above) this is the SOLE exit cue — the local
-        // counter / pool views are partial and unreliable until
-        // RunComplete proves the authoritative primary has
-        // accounted for every task. RunComplete is causally
-        // ordered after every TaskCompleted / TaskFailed in the
-        // run, so by the time we apply it to our mirror those
-        // mutations have already updated `completed_tasks` /
-        // `failed_tasks` — the "primary finished succeeded=X
-        // fail_retry=X ..." log line at the demoted exit reflects
-        // the true final state.
-        //
-        // Pre-seeded demoted primary (`required_setup_on_promote
-        // = false`): RunComplete is a redundant exit (the
-        // counter check above trips first, since the local was
-        // fully seeded by `seed_cluster_state` and TaskCompleteds
-        // from every peer's worker arrive on the per-peer
-        // SecondaryTransport / peer transport before the promoted
-        // primary itself decides RunComplete). Keeping this arm
-        // unguarded is harmless and serves as a uniform fallback.
-        //
-        // Sticky monotonic flag, so this fires at most once
-        // per run.
+        // On the fully-seeded path this is a redundant exit — the
+        // counter check above trips first (the local ledger was seeded
+        // by `seed_cluster_state` and every peer's TaskCompleted arrives
+        // before the authority itself decides RunComplete). Keeping this
+        // arm unguarded is harmless and serves as a uniform fallback for
+        // any path where an external `RunComplete` is the first complete
+        // signal observed. `cluster_state.run_complete()` is a sticky
+        // monotonic flag, so this fires at most once per run.
         if self.cluster_state.run_complete() && active_workers == 0 {
             tracing::info!("RunComplete signal received from cluster; exiting");
             return true;
@@ -251,13 +238,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
 
             // Both inbound paths closed: no further mutations can
-            // arrive on either source, so the demoted-primary view is
-            // frozen. The pre-Step-6 behaviour (transport-closed →
-            // immediate break) is preserved structurally for the
-            // pathological "every channel died" case. The
-            // `cluster_state.run_complete()` check above is the
-            // happy-path exit; this guard is only reached when the
-            // mesh itself has collapsed.
+            // arrive on either source, so this node's view is frozen.
+            // The pre-Step-6 behaviour (transport-closed → immediate
+            // break) is preserved structurally for the pathological
+            // "every channel died" case. The `cluster_state.run_complete()`
+            // check above is the happy-path exit; this guard is only
+            // reached when the mesh itself has collapsed.
             if transport_closed && peer_transport_closed {
                 tracing::info!(
                     "both transport and peer_transport closed; exiting operational loop"
@@ -291,14 +277,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                             //    historical "transport close = end of
                             //    run" semantics apply; exit cleanly.
                             //
-                            // 2. Post-demotion (`self.demoted == true`)
-                            //    with a live peer mesh: the legacy
-                            //    transport's writer task to the promoted
-                            //    secondary has shut down per the
-                            //    PromotePrimary contract, but the demoted
-                            //    local is still a real mesh member (Step
-                            //    5b `TunneledPeerTransport`). The new
-                            //    primary's ClusterMutation /
+                            // 2. Live peer mesh still present: the
+                            //    legacy uplink writer task has shut down
+                            //    but this node is still a real mesh
+                            //    member (`TunneledPeerTransport`). An
+                            //    external authority's ClusterMutation /
                             //    Keepalive / TaskCompleted broadcasts
                             //    arrive on the peer_transport arm below;
                             //    the loop's exit cues (counter check,

@@ -140,6 +140,18 @@ impl PrimaryLink {
         self.last_request_time.remove(&worker_id);
     }
 
+    /// Clear EVERY worker's request backoff. Used when the primary
+    /// identity changes (PromotePrimary): backoff accrued against the
+    /// prior primary is stale the moment the role flips, so every idle
+    /// worker must be free to re-issue its `TaskRequest` immediately at
+    /// the new primary. Keyed off the backoff maps themselves (not the
+    /// worker pool) so it works regardless of whether the pool has been
+    /// initialised yet.
+    pub(super) fn reset_all_backoff(&mut self) {
+        self.request_backoff.clear();
+        self.last_request_time.clear();
+    }
+
     /// Record one observation of "the primary's transport recv()
     /// returned None" (or, equivalently, one failed reconnect probe).
     /// Anchors the failure window on the first call; subsequent calls

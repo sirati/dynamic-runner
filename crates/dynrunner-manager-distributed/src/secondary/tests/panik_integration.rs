@@ -45,7 +45,7 @@ use dynrunner_protocol_primary_secondary::{
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use super::super::test_helpers::{FakeWorkerFactory, TestId};
+use super::super::test_helpers::{make_transport, FakeWorkerFactory, RecordingPeer, TestId};
 use super::super::*;
 
 /// File source: run a secondary against a fake primary, register a
@@ -69,10 +69,15 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
 
-            let transport = ChannelPrimaryTransportEnd {
+            let uplink = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
             };
+            // The self-departure announcement is a MESH broadcast
+            // (`apply_and_broadcast_mutations` → Address::Broadcast(Mesh)),
+            // so observe it on a RecordingPeer mesh stub, not the uplink.
+            let mesh_recorder = RecordingPeer::<TestId>::new(1);
+            let mesh_log = mesh_recorder.log_handle();
 
             let config = SecondaryConfig {
                 secondary_id: "sec-panik".into(),
@@ -102,11 +107,10 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 memuse_log_path: None,
             };
 
-            let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =
+            let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> =
                 SecondaryCoordinator::new(
                     config,
-                    transport,
-                    super::super::test_helpers::NoPeers,
+                    make_transport("sec-panik", uplink, mesh_recorder),
                     dynrunner_scheduler::ResourceStealingScheduler::memory(),
                     super::super::test_helpers::FixedEstimator(100),
                 );
@@ -150,13 +154,11 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             // Fake primary task. Drives the setup handshake but
             // never sends any TaskAssignment — the secondary sits
             // in process_tasks until the panik signal lands. The
-            // fake primary also watches for the self-authored
-            // `ClusterMutation::PeerRemoved { SelfDeparture }`
-            // message and signals its arrival through a channel so
-            // the test can assert the wire fan-out happened.
+            // The self-departure now rides the MESH (recorded on
+            // `mesh_log`), not the uplink — so the primary task only
+            // drives the setup handshake and then drains the uplink
+            // silently.
             let sec_id = "sec-panik".to_string();
-            let (saw_panik_tx, mut saw_panik_rx) =
-                tokio_mpsc::unbounded_channel::<ClusterMutation<TestId>>();
             let to_sec_clone = pri_to_sec_tx.clone();
             let primary_task = tokio::task::spawn_local(async move {
                 let mut from_secondary = sec_to_pri_rx;
@@ -210,27 +212,10 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                     })
                     .unwrap();
 
-                // From here on, watch for the panik broadcast. The
-                // secondary may emit Keepalives and TaskRequests in
-                // the interim; we just drain those silently.
-                while let Some(msg) = from_secondary.recv().await {
-                    if let DistributedMessage::ClusterMutation {
-                        mutations, ..
-                    } = &msg
-                    {
-                        for mutation in mutations {
-                            if matches!(
-                                mutation,
-                                ClusterMutation::PeerRemoved {
-                                    cause: RemovalCause::SelfDeparture(_),
-                                    ..
-                                }
-                            ) {
-                                let _ = saw_panik_tx.send(mutation.clone());
-                            }
-                        }
-                    }
-                }
+                // Drain the uplink silently (keepalives / task
+                // requests). The self-departure does NOT arrive here —
+                // it's a mesh broadcast recorded on `mesh_log`.
+                while from_secondary.recv().await.is_some() {}
             });
 
             let mut factory = FakeWorkerFactory;
@@ -264,51 +249,44 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 ),
             }
 
-            // Confirm the departure announcement reached the primary
-            // wire. The primary task above filtered for self-authored
-            // `PeerRemoved { SelfDeparture }` mutations; we should see
-            // at least one whose `id` is the departing secondary and
-            // whose `SelfDeparture` reason references the matched path.
-            // Drop the primary task first so its
-            // `from_secondary.recv()` returns None and the loop exits
-            // cleanly.
+            // Confirm the departure announcement reached the MESH (the
+            // unified transport routes the self-departure broadcast to
+            // the mesh handle, recorded here). Drop the primary task
+            // first so its setup-handshake loop terminates cleanly.
             drop(pri_to_sec_tx);
             primary_task.abort();
             let _ = primary_task.await;
-            // The mutation may or may not have reached us depending
-            // on race with the abort — but if it did, the id +
-            // reason must match. The wire emission is the load-bearing
-            // assertion that drove this test in the first place;
-            // sealing it with `try_recv` matches the production
-            // contract (apply-and-broadcast logs a warning on send
-            // failure but never blocks the panik-react path).
+            // Scan the recorded mesh broadcasts for the self-authored
+            // PeerRemoved { SelfDeparture }. The wire emission is the
+            // load-bearing assertion that drove this test.
             let mut saw_departure = false;
-            while let Ok(mutation) = saw_panik_rx.try_recv() {
-                if let ClusterMutation::PeerRemoved {
-                    id,
-                    cause: RemovalCause::SelfDeparture(reason),
-                } = mutation
-                {
-                    assert_eq!(
-                        id, "sec-panik",
-                        "self-departure must carry the departing node's \
-                         own id",
-                    );
-                    assert!(
-                        reason.as_str().contains("synthetic-panik-test"),
-                        "departure reason must reference the matched \
-                         path; got: {}",
-                        reason.as_str()
-                    );
-                    saw_departure = true;
+            for msg in mesh_log.borrow().iter() {
+                if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                    for mutation in mutations {
+                        if let ClusterMutation::PeerRemoved {
+                            id,
+                            cause: RemovalCause::SelfDeparture(reason),
+                        } = mutation
+                        {
+                            assert_eq!(
+                                id, "sec-panik",
+                                "self-departure must carry the departing node's own id",
+                            );
+                            assert!(
+                                reason.as_str().contains("synthetic-panik-test"),
+                                "departure reason must reference the matched path; got: {}",
+                                reason.as_str()
+                            );
+                            saw_departure = true;
+                        }
+                    }
                 }
             }
             assert!(
                 saw_departure,
-                "primary wire never observed a self-authored \
-                 ClusterMutation::PeerRemoved {{ SelfDeparture }} within \
-                 the test's bounded run window — the secondary's panik \
-                 arm did not announce its departure"
+                "mesh never observed a self-authored \
+                 ClusterMutation::PeerRemoved {{ SelfDeparture }} — the \
+                 secondary's panik arm did not announce its departure"
             );
         })
         .await;
@@ -344,10 +322,14 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
 
-            let transport = ChannelPrimaryTransportEnd {
+            let uplink = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
             };
+            // RecordingPeer mesh stub so the test can assert the SIGTERM
+            // branch broadcasts NOTHING on the mesh.
+            let mesh_recorder = RecordingPeer::<TestId>::new(1);
+            let mesh_log = mesh_recorder.log_handle();
 
             let config = SecondaryConfig {
                 secondary_id: "sec-panik-sigterm".into(),
@@ -377,11 +359,10 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 memuse_log_path: None,
             };
 
-            let mut secondary: SecondaryCoordinator<_, _, _, _, _, TestId> =
+            let mut secondary: SecondaryCoordinator<_, _, _, _, TestId> =
                 SecondaryCoordinator::new(
                     config,
-                    transport,
-                    super::super::test_helpers::NoPeers,
+                    make_transport("sec-panik-sigterm", uplink, mesh_recorder),
                     dynrunner_scheduler::ResourceStealingScheduler::memory(),
                     super::super::test_helpers::FixedEstimator(100),
                 );
@@ -411,17 +392,14 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 });
             });
 
-            // Fake primary task: drive the setup handshake, then
-            // record every `ClusterMutation` observed from the
-            // secondary. The SIGTERM branch must not emit any
-            // self-departure announcement — we assert on the recorded log
-            // after the coordinator returns, when any broadcast
-            // would necessarily already have been issued
-            // (`handle_panik_signal` returns synchronously after
-            // the apply+broadcast call on the file-source branch).
+            // Fake primary task: drive the setup handshake, then drain
+            // the uplink silently. The SIGTERM branch must not emit any
+            // self-departure announcement — we assert that on the mesh
+            // recorder after the coordinator returns (the mesh broadcast
+            // would necessarily already have been issued, since
+            // `handle_panik_signal` returns synchronously after the
+            // apply+broadcast call on the file-source branch).
             let sec_id = "sec-panik-sigterm".to_string();
-            let (recorded_mutations_tx, mut recorded_mutations_rx) =
-                tokio_mpsc::unbounded_channel::<ClusterMutation<TestId>>();
             let to_sec_clone = pri_to_sec_tx.clone();
             let primary_task = tokio::task::spawn_local(async move {
                 let mut from_secondary = sec_to_pri_rx;
@@ -467,25 +445,9 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                     })
                     .unwrap();
 
-                while let Some(msg) = from_secondary.recv().await {
-                    if let DistributedMessage::ClusterMutation {
-                        mutations, ..
-                    } = &msg
-                    {
-                        for mutation in mutations {
-                            // Record EVERY mutation (not just the
-                            // self-departure) so the test's assertion
-                            // can distinguish "no ClusterMutation
-                            // observed at all" (expected) from "some
-                            // other ClusterMutation observed but no
-                            // self-departure" (still acceptable — the
-                            // invariant is the absence of a
-                            // self-authored PeerRemoved) without
-                            // changing the log shape between tests.
-                            let _ = recorded_mutations_tx.send(mutation.clone());
-                        }
-                    }
-                }
+                // Drain the uplink silently. The self-departure (if any)
+                // would ride the mesh, not the uplink.
+                while from_secondary.recv().await.is_some() {}
             });
 
             let mut factory = FakeWorkerFactory;
@@ -519,27 +481,30 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                 ),
             }
 
-            // Drain the primary-side recorder and assert NO
-            // self-authored `PeerRemoved { SelfDeparture }` mutation
-            // appeared. This is the load-bearing invariant: the
-            // SIGTERM branch of `handle_panik_signal` must skip
-            // `apply_and_broadcast_mutations` entirely, so a per-host
-            // SIGTERM never announces a mesh departure.
+            // Assert NO self-authored `PeerRemoved { SelfDeparture }`
+            // mutation appeared on the mesh. This is the load-bearing
+            // invariant: the SIGTERM branch of `handle_panik_signal`
+            // must skip `apply_and_broadcast_mutations` entirely, so a
+            // per-host SIGTERM never announces a mesh departure.
             drop(pri_to_sec_tx);
             primary_task.abort();
             let _ = primary_task.await;
-            while let Ok(mutation) = recorded_mutations_rx.try_recv() {
-                if let ClusterMutation::PeerRemoved {
-                    cause: RemovalCause::SelfDeparture(reason),
-                    ..
-                } = &mutation
-                {
-                    panic!(
-                        "SIGTERM panik leaked a self-departure PeerRemoved \
-                         onto the primary wire (reason: {}); SIGTERM-source \
-                         signals must be local-only",
-                        reason.as_str()
-                    );
+            for msg in mesh_log.borrow().iter() {
+                if let DistributedMessage::ClusterMutation { mutations, .. } = msg {
+                    for mutation in mutations {
+                        if let ClusterMutation::PeerRemoved {
+                            cause: RemovalCause::SelfDeparture(reason),
+                            ..
+                        } = mutation
+                        {
+                            panic!(
+                                "SIGTERM panik leaked a self-departure PeerRemoved \
+                                 onto the mesh (reason: {}); SIGTERM-source \
+                                 signals must be local-only",
+                                reason.as_str()
+                            );
+                        }
+                    }
                 }
             }
         })

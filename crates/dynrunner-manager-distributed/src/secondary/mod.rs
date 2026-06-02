@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, WorkerId};
+use dynrunner_core::{Identifier, TaskInfo, WorkerId};
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
@@ -35,7 +35,6 @@ use crate::zip_extract::ExtractionCache;
 
 use self::primary_link::PrimaryLink;
 
-mod command_channel;
 mod coordinator;
 mod dispatch;
 mod election;
@@ -48,7 +47,6 @@ mod peer;
 mod primary_link;
 mod processing;
 pub(crate) mod resource;
-mod retry_budget;
 mod sampler_hooks;
 mod setup;
 mod staging;
@@ -62,6 +60,42 @@ mod test_helpers;
 mod tests;
 
 pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig};
+
+/// A task DEFERRED on this secondary because the target worker's
+/// per-type subprocess is mid-respawn (the dispatch arm observed
+/// [`dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress`]).
+///
+/// Respawn-HOLD (#58): instead of dropping the task or busy-re-bouncing
+/// it to the authority while the only worker for that type is
+/// respawning, the dispatch arm stashes the resolved task here keyed by
+/// `WorkerId`. The `WorkerEvent::Ready` handler picks it up and calls
+/// `assign_task` once the slot is observably Idle with the new type
+/// bound — no drop, no tight retry loop. If the worker dies before
+/// Ready (`WorkerEvent::Disconnected`), the task never ran and the
+/// secondary reports it back to the authority as a backpressure-shaped
+/// `TaskFailed` so the authority requeues + re-dispatches it.
+///
+/// Carries everything `assign_task` needs: the resolved [`TaskInfo`],
+/// the wire-side `file_hash` (the `active_tasks` key + the recovery
+/// wire message's `task_hash`), the scheduler's estimated resource
+/// usage, and the `predecessor_outputs` the dispatch arm destructured
+/// off the inbound `TaskAssignment` (forwarded verbatim so the
+/// dependent worker observes the same shape a same-type fast-path
+/// assignment would have produced).
+///
+/// Unlike the pre-demolition `PendingFirstBind`, there is no
+/// `BindSource` discriminator: the secondary is never the authority, so
+/// the loss-recovery path is unconditionally "report to the primary
+/// role". The authority-self-assign recovery leg the discriminator
+/// selected is gone with the authority mirror.
+#[derive(Debug, Clone)]
+pub(super) struct PendingFirstBind<I: Identifier> {
+    pub(super) binary: TaskInfo<I>,
+    pub(super) file_hash: String,
+    pub(super) estimated: dynrunner_core::ResourceMap,
+    pub(super) predecessor_outputs:
+        std::collections::BTreeMap<String, dynrunner_core::TaskOutputs>,
+}
 
 /// The secondary coordinator: connects to primary, manages local workers.
 ///
@@ -107,19 +141,20 @@ where
     // Workers
     pool: WorkerPool<M, I>,
 
-    // Task tracking: file_hash -> worker_id
+    // Task tracking: file_hash -> worker_id (this node's OWN in-flight
+    // worker assignments — own-worker management, not authority).
     active_tasks: HashMap<String, WorkerId>,
-    completed_tasks: HashSet<String>,
 
     /// Test-only counter: number of `WorkerEvent::TaskCompleted` events
     /// this secondary's OWN workers fired (i.e. tasks actually
     /// dispatched to and executed by this node's worker pool). Distinct
-    /// from `completed_tasks` (which is the cluster-wide set of all
-    /// task hashes any secondary observed terminal). Pinned by the
-    /// peer-repoll-on-primary-changed regression test to assert
-    /// post-fix distribution across secondaries: pre-fix the promoted
-    /// secondary's pool burns through small workloads before any peer
-    /// re-polls (production keepalive default = 5s), so peer
+    /// from the cluster-wide terminal set, which is read off the
+    /// replicated CRDT (`cluster_state.outcome_counts()`) — the
+    /// secondary holds NO per-node completed/failed/total counter.
+    /// Pinned by the peer-repoll-on-primary-changed regression test to
+    /// assert post-fix distribution across secondaries: pre-fix the
+    /// promoted secondary's pool burns through small workloads before
+    /// any peer re-polls (production keepalive default = 5s), so peer
     /// `local_tasks_run` stays 0; post-fix every secondary's idle
     /// workers retry against the freshly-identified primary inside
     /// the PromotePrimary dispatch tick and pick up work.
@@ -277,6 +312,13 @@ where
     /// already in flight).
     pub(super) pending_worker_restarts: HashSet<WorkerId>,
 
+    /// Tasks DEFERRED because the target worker's per-type subprocess
+    /// is mid-respawn (respawn-HOLD, #58). Keyed by `WorkerId`; the
+    /// `WorkerEvent::Ready` handler picks the entry up and assigns it
+    /// once the slot is Idle with the new type bound. See
+    /// [`PendingFirstBind`] for the full contract.
+    pub(super) pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
+
     /// Re-entry guard for `run_until_setup_or_done`. The first call
     /// runs `initialize_workers`, the setup-handshake (`send_welcome`,
     /// `send_cert_exchange`, `wait_for_setup`) and then enters
@@ -397,91 +439,49 @@ where
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
-    /// Lifecycle hook invoked when this secondary owns the primary
-    /// pool (post-promotion) and a phase reaches `Drained`. Mirrors
-    /// `PrimaryCoordinator::on_phase_end` exactly; the PyO3 wrapper
+    /// Lifecycle hook invoked when this node owns the authoritative
+    /// primary pool and a phase reaches `Drained`. The PyO3 wrapper
     /// installs a GIL-reacquiring closure that calls Python's
-    /// `task.on_phase_end(phase_id, completed, failed)`. `None` when
-    /// the caller did not supply a hook OR when this secondary never
-    /// gets promoted — in both cases the fire-site silently no-ops, so
-    /// non-promoted secondaries are unaffected by the field's
-    /// existence.
+    /// `task.on_phase_end(phase_id, completed, failed)`.
+    ///
+    /// R4 SEAM: the secondary holds NO authority, so it has no
+    /// phase-machine to fire this from — the fire site (and the
+    /// per-phase counters it consumed) were the deleted authority
+    /// mirror. Under P4 composition the co-located `PrimaryCoordinator`
+    /// (which already owns `on_phase_end` + the phase machine) fires
+    /// this; pyo3 registers the lifecycle hook on the PRIMARY, not the
+    /// secondary. Kept here only as the wiring anchor R4 re-homes.
+    #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
     pub(super) on_phase_end:
         Option<crate::primary::OnPhaseEnd>,
 
-    /// Per-phase completion counters fed to `on_phase_end`. Incremented
-    /// inside `note_primary_item_completed` (the single chokepoint
-    /// where a primary-dispatched item terminates successfully on this
-    /// secondary's pool); mirrors the same field on
-    /// `PrimaryCoordinator`. Stays empty when this secondary is never
-    /// promoted (the increment site is also the only writer).
-    pub(super) primary_phase_completed:
-        std::collections::HashMap<dynrunner_core::PhaseId, u32>,
-
-    /// Per-phase failure counters fed to `on_phase_end`. Sibling of
-    /// `primary_phase_completed` for the failure path.
-    pub(super) primary_phase_failed:
-        std::collections::HashMap<dynrunner_core::PhaseId, u32>,
-
-    /// Phases that have already had `on_phase_start` fired through this
-    /// secondary's lifecycle bridge. Mirrors
-    /// `PrimaryCoordinator::phase_started_emitted` — the pool's state
-    /// machine doesn't track "did we observe this transition", so the
-    /// coordinator does the bookkeeping. Stays empty when no lifecycle
-    /// callback is installed.
-    pub(super) primary_phase_started_emitted:
-        std::collections::HashSet<dynrunner_core::PhaseId>,
-
-    /// Lifecycle hook invoked when this secondary owns the primary
-    /// pool (post-promotion) and a phase flips Blocked → Active.
-    /// Mirrors `PrimaryCoordinator::on_phase_start`. Same `None`
-    /// semantics as `on_phase_end`.
+    /// Lifecycle hook invoked when this node owns the authoritative
+    /// primary pool and a phase flips Blocked → Active. Sibling of
+    /// `on_phase_end`; same R4-seam disposition.
+    #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
     pub(super) on_phase_start:
         Option<crate::primary::OnPhaseStart>,
 
-    /// Cross-thread / cross-runtime ingress for the
-    /// `PrimaryHandle` PyO3 surface (when the handle was minted from
-    /// a `PySecondaryCoordinator`). Each handler is co-located with
-    /// the coordinator's per-mutation semantics under
-    /// `secondary/primary/{fail_permanent,reinject_task,
-    /// update_preferred_secondaries,spawn_tasks}.rs`; the receiver is
-    /// read inside `process_tasks`' `select!` arm and the sender is
-    /// cloned out via `command_sender()` before
-    /// `run_until_setup_or_done` enters.
+    /// Cross-thread / cross-runtime ingress for the `PrimaryHandle`
+    /// PyO3 surface (when the handle was minted from a
+    /// `PySecondaryCoordinator`).
     ///
-    /// Mirrors the `command_rx` / `command_tx` pair on
-    /// `PrimaryCoordinator`. Held as `Option` so the operational loop
-    /// can take the receiver out for the duration of the
-    /// select-driven phase (Rust's borrow checker won't let us hold a
-    /// `&mut Receiver` inside the same `&mut self` that the per-arm
-    /// handlers need) and put it back when the loop exits. Outside
-    /// the loop, the option is `Some` so cloned senders keep working
-    /// across `SetupPending` re-entries.
+    /// R4 SEAM: the secondary no longer drains this channel — the
+    /// externally-issued `PrimaryCommand`s are authority mutations whose
+    /// only correct owner is the co-located `PrimaryCoordinator`. Under
+    /// P4 composition the command channel is registered on the PRIMARY.
+    /// Kept here only as the wiring anchor R4 re-homes (so the PyO3
+    /// `command_sender()` clone keeps a stable type until then).
+    #[allow(dead_code)] // TODO(R4): re-home the command channel to PrimaryCoordinator
     pub(super) command_rx:
         Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Sender side of the secondary's command channel, cloned to
-    /// consumers via `command_sender()`. Stored on `Self` so the
-    /// lifetime is tied to the coordinator — when the coordinator is
-    /// dropped, all cloned senders return `SendError` on subsequent
-    /// `send()` calls and the PyO3 side surfaces that as a Python
-    /// exception.
+    /// consumers via `command_sender()`. Same R4-seam disposition as
+    /// `command_rx`.
+    #[allow(dead_code)] // TODO(R4): re-home the command channel to PrimaryCoordinator
     pub(super) command_tx:
         tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
-
-    /// Per-task reinject counter, paired with
-    /// `SecondaryConfig::unfulfillable_reinject_max_per_task`. Lazily
-    /// initialised on first reinject for a hash; counts DOWN from the
-    /// configured cap (so 0 means "exhausted, refuse"). The map is
-    /// keyed by task hash, not task_id, because external-control
-    /// callers use the hash as the canonical identifier (mirroring the
-    /// rest of the wire protocol).
-    ///
-    /// Independent of the primary's same-name counter: at promotion
-    /// the freshly-promoted secondary starts with a fresh `HashMap`,
-    /// so the budget effectively resets across the demotion boundary.
-    /// Documented in `secondary/primary/reinject_task.rs`.
-    pub(super) unfulfillable_reinject_remaining: HashMap<String, u32>,
 
     /// Per-task memory-profile sampler. `Some` iff
     /// [`SecondaryConfig::output_dir`] was set when the secondary's

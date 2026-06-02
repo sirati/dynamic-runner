@@ -596,7 +596,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
             // The critical call: route via the single inbound handler.
             // The TaskAssignment falls to the catch-all, which delegates
             // to `dispatch_message` (the wire-frame dispatcher).
-            secondary.handle_inbound(assignment, &mut None, &mut FakeWorkerFactory).await;
+            secondary.handle_inbound(assignment, &mut FakeWorkerFactory).await;
 
             // Worker received the assignment → `active_tasks` records it.
             // (The `dispatch_message` body inserts on the assign_task

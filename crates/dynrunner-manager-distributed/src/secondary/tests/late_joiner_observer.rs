@@ -1,6 +1,8 @@
 #![cfg(test)]
 
-    use super::super::test_helpers::{election_config, FixedEstimator, NoPeers, TestId};
+    use super::super::test_helpers::{
+        election_config, make_transport, FixedEstimator, NoPeers, TestId, TestTransport,
+    };
     use super::super::*;
     use dynrunner_core::TaskInfo;
     use dynrunner_protocol_primary_secondary::DistributedMessage;
@@ -14,16 +16,15 @@
     /// `SecondaryCoordinator` configured as observer
     /// (`is_observer=true`, `num_workers=0`). The "rest of the cluster"
     /// shows up purely as the snapshot the test hands it. The
-    /// `NoPeers` peer transport (peer_count=0) is what
-    /// `make_secondary` uses elsewhere; the late-joiner code path
-    /// the test cares about (restore + skip-setup) runs to
-    /// completion regardless of peer reachability — peer membership
-    /// is asserted on the role-table side, not the transport side.
+    /// `NoPeers` mesh stub (peer_count=0) is what `make_secondary`
+    /// uses elsewhere; the late-joiner code path the test cares about
+    /// (restore + skip-setup) runs to completion regardless of peer
+    /// reachability — peer membership is asserted on the role-table
+    /// side, not the transport side.
     fn make_observer_secondary(
         observer_id: &str,
     ) -> SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        NoPeers,
+        TestTransport<NoPeers>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
@@ -32,7 +33,7 @@
         let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
         let (_pri_to_sec_tx, pri_to_sec_rx) =
             tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-        let transport = ChannelPrimaryTransportEnd {
+        let uplink = ChannelPrimaryTransportEnd {
             tx: sec_to_pri_tx,
             rx: pri_to_sec_rx,
         };
@@ -41,8 +42,7 @@
         config.num_workers = 0;
         SecondaryCoordinator::new(
             config,
-            transport,
-            NoPeers,
+            make_transport(observer_id, uplink, NoPeers),
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         )
@@ -183,75 +183,51 @@
         );
     }
 
-    /// After restore, the coordinator's `run_until_setup_or_done`
-    /// MUST NOT touch `primary_transport` (no welcome /
-    /// cert-exchange / wait-for-setup), and MUST NOT spawn workers
-    /// via the factory. The cleanest pin is: drive the run loop
-    /// briefly under a short tokio::time::timeout — the call must
-    /// return `Ok(Done)` only when the cluster reports RunComplete;
-    /// for this test we just need to assert it ENTERS the
-    /// processing branch (the welcome handshake would have errored
-    /// out on the disconnected primary channel within milliseconds).
+    /// After restore, `run_until_setup_or_done` skips the entire setup
+    /// handshake (the setup-skip latch took effect) and the observe
+    /// loop exits ONLY when the cluster's `run_complete()` flag is set
+    /// — deterministically, no wall-clock race.
     ///
-    /// We assert the easier shape: with `setup_phase_completed=true`
-    /// pre-set, a `run_until_setup_or_done` future advances past
-    /// the setup block. The `FakeWorkerFactory` is wired in case
-    /// some future code path under processing_loop pulls on it; with
-    /// num_workers=0 nothing pulls on the factory today, but the
-    /// wiring keeps the test resilient.
+    /// Construction: restore the snapshot AND apply
+    /// `ClusterMutation::RunComplete` BEFORE driving the loop. With
+    /// `run_complete()` true and `active_tasks` empty (num_workers=0),
+    /// `process_tasks`' top-of-loop exit fires on the first iteration
+    /// and returns `Done`. If the setup-skip latch had NOT taken
+    /// effect, the welcome handshake would error on the disconnected
+    /// uplink and return `Err` instead — so an `Ok(Done)` proves BOTH
+    /// the setup-skip AND the run-complete exit cue.
     #[tokio::test(flavor = "current_thread")]
-    async fn run_after_restore_skips_setup_handshake() {
+    async fn observer_skips_setup_and_exits_on_run_complete() {
         let _ = tracing_subscriber::fmt::try_init();
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
                 let mut sec = make_observer_secondary("observer-1");
                 sec.restore_from_snapshot_and_skip_setup(make_synthetic_snapshot());
+                // Deterministic exit cue: the cluster has declared the
+                // run finished. The observer's SOLE exit cue is
+                // `run_complete()`.
+                sec.cluster_state.apply(
+                    dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
+                );
+                assert!(
+                    sec.cluster_state.run_complete(),
+                    "precondition: RunComplete applied",
+                );
 
                 let mut factory = super::super::test_helpers::FakeWorkerFactory;
-                // The run loop polls peer/primary/timers; without
-                // any RunComplete broadcast it would block forever
-                // in `process_tasks`. Wrap in a short timeout: a
-                // timeout (not an Err) is the success signal here —
-                // it means we entered `process_tasks` (the setup
-                // block would have errored on the disconnected
-                // primary channel and returned an Err well within
-                // 100ms). If `Err` comes back, the setup-skip
-                // latch failed and the welcome attempted to send /
-                // recv on the dead primary transport.
-                let outcome = tokio::time::timeout(
-                    std::time::Duration::from_millis(100),
-                    sec.run_until_setup_or_done(&mut factory),
-                )
-                .await;
-                match outcome {
-                    Err(_elapsed) => {
-                        // Expected: we're in the processing loop,
-                        // waiting on peer / primary / timer events.
-                    }
-                    Ok(Err(e)) => panic!(
-                        "run_until_setup_or_done returned Err — setup-skip \
-                         latch did not take effect (welcome attempted on \
-                         a dead primary): {e}"
-                    ),
-                    Ok(Ok(RunOutcome::Done)) => {
-                        // Acceptable but unusual: processing-loop's
-                        // run-complete exit may fire if the snapshot
-                        // carried RunComplete mutation, which it
-                        // doesn't in `make_synthetic_snapshot`. If
-                        // a future fixture toggles it, this branch
-                        // still asserts the right behaviour.
-                    }
-                    Ok(Ok(RunOutcome::SetupPending)) => panic!(
-                        "observer must never see SetupPending — only \
-                         PromotePrimary{{required_setup=true}} causes it, \
-                         which an observer rejects"
-                    ),
-                    Ok(Ok(RunOutcome::PanikShutdown { matched_path, .. })) => panic!(
-                        "observer unexpectedly panik-shutdown on test path: {}",
-                        matched_path.display()
-                    ),
-                }
+                let outcome = sec
+                    .run_until_setup_or_done(&mut factory)
+                    .await
+                    .expect(
+                        "run_until_setup_or_done must NOT Err — an Err means the \
+                         setup-skip latch failed and the welcome handshake ran \
+                         against the dead uplink",
+                    );
+                assert!(
+                    matches!(outcome, RunOutcome::Done),
+                    "observer must reach Done on run_complete(); got {outcome:?}",
+                );
             })
             .await;
     }

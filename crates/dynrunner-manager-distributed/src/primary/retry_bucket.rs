@@ -81,22 +81,6 @@ impl BucketKind {
             BucketKind::Oom => config.oom_retry_max_passes,
         }
     }
-
-    /// Per-bucket budget from the promoted-secondary's config.
-    /// Mirrors `max_passes` exactly — the secondary surfaces the
-    /// same two knobs (`retry_max_passes` /
-    /// `oom_retry_max_passes`) so the cap-resolution semantics
-    /// don't drift across the live-primary / promoted-secondary
-    /// boundary.
-    pub(crate) fn max_passes_secondary(
-        self,
-        config: &crate::secondary::SecondaryConfig,
-    ) -> u32 {
-        match self {
-            BucketKind::Recoverable => config.retry_max_passes,
-            BucketKind::Oom => config.oom_retry_max_passes,
-        }
-    }
 }
 
 /// Per-(phase, bucket) pass counter. Initialised empty; entries are

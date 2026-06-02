@@ -116,17 +116,17 @@ where
         const PANIK_KILL_GRACE: std::time::Duration =
             std::time::Duration::from_secs(5);
 
-        // Cross-thread command-channel receiver. Owned locally for the
-        // duration of the loop so the `&mut self.command_rx` borrow
-        // doesn't conflict with the per-arm handlers' `&mut self`. Put
-        // back on `self` at loop exit so subsequent `process_tasks`
-        // re-entries (`SetupPending` yield path) re-attach to the same
-        // channel — the PyO3 `PrimaryHandle` only clones the sender
-        // once before `run_until_setup_or_done()` starts and expects
-        // its commands to keep being serviced across the
-        // `SetupPending`-driven re-entry boundary. Mirrors the
-        // `command_rx` discipline on `PrimaryCoordinator::operational_loop`.
-        let mut command_rx = self.command_rx.take();
+        // The secondary holds NO authority and processes NO command
+        // channel: the externally-issued `PrimaryCommand`s
+        // (FailPermanent / ReinjectTask / UpdatePreferredSecondaries /
+        // SpawnTasks) are authority mutations whose only correct owner
+        // is the co-located `PrimaryCoordinator`. The `command_tx` /
+        // `command_rx` fields stay on the struct purely as a wiring
+        // anchor for the PyO3 `PrimaryHandle`; R4's composition re-homes
+        // that handle onto the authoritative `PrimaryCoordinator` over
+        // the loopback, so this loop never drains the channel.
+        // TODO(R4): re-home the command channel to the co-located
+        //   `PrimaryCoordinator` (P4 composition).
 
         loop {
             // Workers that need restart after disconnect
@@ -144,7 +144,7 @@ where
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
-                        let restart = self.handle_worker_event(event, &mut command_rx, factory, &oom_watcher).await?;
+                        let restart = self.handle_worker_event(event, factory, &oom_watcher).await?;
                         if let Some(wid) = restart {
                             workers_to_restart.push(wid);
                         }
@@ -165,7 +165,7 @@ where
                 msg = self.transport.recv_peer() => {
                     match msg {
                         Some(m) => {
-                            self.handle_inbound(m, &mut command_rx, factory).await;
+                            self.handle_inbound(m, factory).await;
                         }
                         None => {
                             tracing::info!(
@@ -349,62 +349,6 @@ where
                     // the take-to-None above this would resolve
                     // Err immediately on every subsequent poll.
                 }
-                // Cross-thread command-channel arm. Mirrors the
-                // `command_rx` arm on
-                // `PrimaryCoordinator::operational_loop`. Drained
-                // unconditionally regardless of `is_primary` — the
-                // wire boundary cannot tell whether the recipient has
-                // been promoted yet. Pre-promotion the per-variant
-                // handlers either short-circuit (Err on unknown hash
-                // / wrong state) or silently skip pool-side mirror
-                // steps that require `primary_pending`; the
-                // originator's CRDT broadcast still fires so the
-                // ledger converges. Documented per-handler at
-                // `secondary/primary/{fail_permanent,reinject_task,
-                // update_preferred_secondaries}.rs`. The production
-                // caller (`PySecondaryCoordinator`'s `on_run_start`
-                // captured handle) only issues commands from
-                // `on_phase_end`, which fires exclusively
-                // post-promotion.
-                cmd = async {
-                    match command_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        // No command channel attached — park forever
-                        // so this arm never fires. A `None` from the
-                        // `recv()` future would otherwise hot-loop
-                        // the select! the same way a closed mpsc
-                        // would.
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match cmd {
-                        Some(command) => {
-                            // Delegate to the per-variant handler.
-                            // Each handler owns its CRDT broadcast
-                            // and its oneshot reply, so the call site
-                            // stays a single line and the arm shape
-                            // stays transport-shape-pure.
-                            crate::secondary::command_channel::handle_secondary_command(
-                                self,
-                                command,
-                                &mut command_rx,
-                            )
-                            .await;
-                        }
-                        None => {
-                            // All senders dropped. Drop the receiver
-                            // locally; the loop's other arms keep
-                            // driving exit conditions. Same shape as
-                            // the primary's same-case arm.
-                            command_rx = None;
-                            tracing::debug!(
-                                "secondary command channel closed; disabling \
-                                 PrimaryCommand arm for the remainder \
-                                 of the loop"
-                            );
-                        }
-                    }
-                }
             }
 
             // Flush any deferred peer messages
@@ -489,19 +433,6 @@ where
                 let _ = self.request_task_for_worker(wid, factory).await;
             }
         }
-
-        // Put the command-channel receiver back on `self` so a
-        // hypothetical post-`Done` inspection (test fixtures, future
-        // re-entry paths) finds it intact. The wrapper's terminal
-        // cleanup (`stop_all_workers` + dispatcher abort) does not
-        // depend on the field's state, and the natural Done exit
-        // here cannot be followed by another `process_tasks` invocation
-        // on the same coordinator instance in production — but the
-        // round-trip discipline keeps the field's lifecycle
-        // structurally identical to the SetupPending yield path
-        // (single source of truth: the take-at-entry happens once
-        // per loop entry, the put-back happens at every loop exit).
-        self.command_rx = command_rx;
 
         // All `break` statements above represent terminal exits
         // (RunComplete observed, drain-down complete after primary

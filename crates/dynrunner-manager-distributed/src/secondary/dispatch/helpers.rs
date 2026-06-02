@@ -9,7 +9,7 @@
 //! the router and its setup-time counterpart share, so each rule has
 //! exactly one writer.
 
-use dynrunner_core::{ErrorType, Identifier, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
@@ -28,71 +28,29 @@ where
     I: Identifier,
 {
 
-    /// Apply a batch of `ClusterMutation`s against the local mirror.
-    /// Shared between the operational `dispatch_message` arm and
-    /// `wait_for_setup`'s receive loop — both sites observe the same
-    /// wire variant and must apply with identical semantics. CRDT
-    /// idempotency makes repeated apply safe (duplicates and
-    /// late-after-terminal arrivals NoOp by precondition).
+    /// Mirror a batch of `ClusterMutation`s into the local replicated
+    /// CRDT. Shared between the operational `dispatch_message` /
+    /// `handle_inbound` arms and `wait_for_setup`'s receive loop — every
+    /// site observes the same wire variant and must apply with identical
+    /// semantics. CRDT idempotency makes repeated apply safe (duplicates
+    /// and late-after-terminal arrivals NoOp by precondition).
     ///
-    /// Receive-side pool growth: when the apply rule classifies one
-    /// or more entries of a `TasksSpawned` mutation as freshly
-    /// `Pending` (no deps, or all deps already `Completed`), each
-    /// surfaced `TaskInfo<I>` is reinjected into `primary_pending` so
-    /// the promoted secondary's dispatch pool stays coherent with the
-    /// CRDT ledger. Without this step a wire-received TasksSpawned
-    /// grows the ledger but the pool never sees the new tasks — the
-    /// in-process distributed bug where Python-callback-issued
-    /// `spawn_tasks` from a phase-end handler runs on the demoted
-    /// primary's command channel, applies the mutation on the
-    /// promoted secondary via wire broadcast, but the secondary's
-    /// pool sat at zero and nothing dispatched.
-    ///
-    /// The extension fires unconditionally when `primary_pending`
-    /// exists — the field is the boundary, not a per-call guard. On a
-    /// non-promoted secondary `primary_pending` is `None` and the
-    /// reinject step is silently skipped; the pool-owning state field
-    /// tells the truth about whether this node owns dispatch.
-    ///
-    /// `resumed` (Blocked → Pending from a wire-received
-    /// `TaskCompleted`) is intentionally not consumed here. The
-    /// promoted-secondary's originator path (see
-    /// `apply_and_broadcast_mutations`) discards it for the same
-    /// reason: the pool was seeded from CRDT at promotion time and
-    /// Blocked entries ride along as `task_depends_on`-tracked items
-    /// whose dispatch fires through the pool's own dep machinery on
-    /// the prereq's `on_item_finished` event. The receive-side parity
-    /// is consistent with the originator-side discard.
+    /// This is a PURE CRDT mirror: the secondary holds no authority and
+    /// no dispatch pool, so there is no pool-growth side effect. The
+    /// authoritative dispatch-pool coherence (re-injecting freshly-
+    /// `Pending` tasks surfaced by a `TasksSpawned` apply) is the
+    /// `PrimaryCoordinator`'s concern, driven on the authority's own
+    /// pool. A non-authority node simply converges its CRDT mirror; it
+    /// never decides what to dispatch from it.
     pub(in crate::secondary) fn apply_cluster_mutations(&mut self, mutations: Vec<ClusterMutation<I>>) {
         let count = mutations.len();
-        let mut resumed: Vec<TaskInfo<I>> = Vec::new();
-        let mut newly_pending: Vec<TaskInfo<I>> = Vec::new();
         for m in mutations {
-            self.cluster_state.apply_with_resumed_blocked(
-                m,
-                &mut resumed,
-                &mut newly_pending,
-            );
-        }
-        let newly_pending_count = newly_pending.len();
-        if let Some(pool) = self.primary_pending.as_mut() {
-            for task in newly_pending {
-                tracing::debug!(
-                    secondary = %self.config.secondary_id,
-                    phase = %task.phase_id,
-                    task_id = ?task.task_id,
-                    "primary_pending: reinject freshly-Pending task from \
-                     wire-received TasksSpawned"
-                );
-                pool.reinject(task);
-            }
+            self.cluster_state.apply(m);
         }
         tracing::debug!(
             secondary = %self.config.secondary_id,
             applied = count,
-            newly_pending = newly_pending_count,
-            primary_pending_owned = self.primary_pending.is_some(),
-            "applied cluster mutations"
+            "mirrored cluster mutations into local CRDT"
         );
     }
 

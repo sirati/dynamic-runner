@@ -15,9 +15,6 @@ use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
-
-use crate::primary::PrimaryCommand;
 
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
@@ -45,27 +42,25 @@ where
     /// catch-all, which delegates to [`Self::dispatch_message`] — the
     /// wire-frame dispatcher, still directly callable by tests.
     ///
-    /// # Error handling (TODO(R3))
+    /// # Per-frame error fatality
     ///
-    /// This entry SWALLOWS+WARNS dispatch errors (the canonical base's
-    /// contract): post-unification the secondary is non-authoritative,
-    /// so a transient dispatch error must not kill the run (the old
+    /// Most frames are non-fatal: a transient dispatch error on a
+    /// non-authoritative secondary must not kill the run (the old
     /// `.await?` that propagated was a transport-ORIGIN artifact — it
     /// fired because the frame arrived on the uplink, not because the
-    /// frame is semantically fatal; that per-origin key is gone). R3
-    /// must make GENUINELY-fatal frames (e.g. a `ClusterSnapshot`
-    /// restore failure on a bootstrapping observer, setup failures)
-    /// EXPLICITLY fatal per-frame so nothing genuinely-fatal is
-    /// silently swallowed.
+    /// frame is semantically fatal; that per-origin key is gone). Those
+    /// are SWALLOWED+WARNED in the catch-all.
     ///
-    /// `command_rx` threads the operational-loop's command-channel
-    /// receiver into the TaskComplete / TaskFailed cascade (see
-    /// `process_primary_phase_lifecycle` doc). Off-loop callers pass
-    /// `&mut None`.
+    /// The genuinely-fatal frames are made EXPLICITLY fatal per-frame:
+    /// a `ClusterSnapshot` whose `restore` fails on a bootstrapping
+    /// observer / late-joiner would leave the node observing a partial
+    /// or empty CRDT (a P3 replication-invariant violation), so its
+    /// failure is latched into `fatal_exit` and the loop aborts the run
+    /// rather than silently observing a lie. See the `ClusterSnapshot`
+    /// arm in `dispatch_message`.
     pub(in crate::secondary) async fn handle_inbound(
         &mut self,
         msg: DistributedMessage<I>,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
         factory: &mut impl WorkerFactory<M>,
     ) {
         match msg {
@@ -84,130 +79,55 @@ where
             }
             DistributedMessage::TaskComplete {
                 secondary_id,
-                worker_id,
                 task_hash,
-                result_data,
                 ..
             } => {
-                // LIVE non-authoritative behavior — KEPT:
-                //   - `completed_tasks` dedup so a duplicate observed
-                //     completion isn't re-processed.
-                self.completed_tasks.insert(task_hash.clone());
-                //
-                // STRIPPED (R0-deleted secondary primary_* authority
-                // mirror — methods no longer exist): the per-peer
-                // backpressure clear, the apply-task-completed-locally
-                // race fix, and the `note_primary_item_completed`
-                // phase-machine drive. The secondary is NEVER the
-                // authority now; authoritative completion accounting +
-                // phase-machine advance live in `PrimaryCoordinator`.
-                //
-                // TODO(R4): re-home the authoritative completion
-                //   accounting (the old `note_primary_item_completed` /
-                //   apply-locally) to the co-located `PrimaryCoordinator`
-                //   reached over the loopback transport (P4 composition).
-                // TODO(R3): under the pure-observer model, decide the
-                //   `completed_tasks` dedup-vs-CRDT-counter semantics —
-                //   an observer reads `cluster_state.outcome_counts()`,
-                //   not its own set.
-                tracing::debug!(
+                // A peer's own-worker TaskComplete REPORT, observed on
+                // the mesh. The secondary is NEVER the authority: it
+                // keeps no per-node terminal set and originates no CRDT
+                // mutation. The authoritative completion (accounting +
+                // keyed-outputs apply + phase-machine advance) is owned
+                // by the `PrimaryCoordinator`, which is itself a mesh
+                // member and receives the originator's broadcast
+                // directly — so the old secondary→primary FORWARD (the
+                // #50 redundant-delivery backstop) is no longer needed
+                // and is dropped: a non-authority must not re-emit
+                // another node's terminal report. Pure observation.
+                tracing::trace!(
                     peer = %secondary_id,
                     task_hash,
-                    "peer task complete"
+                    "observed peer TaskComplete"
                 );
-                // LIVE — KEPT: forward the observed completion to the
-                // primary role. Redundant-delivery backstop for the #50
-                // wire-loss symptom (the direct originator→primary
-                // TaskComplete sometimes drops; every observer forwards
-                // so the authority has N-1 alternate paths; its
-                // handle_task_complete is dedup-gated).
-                //
-                // TODO(R3): is this forward still needed now the primary
-                //   is a mesh member that receives the broadcast
-                //   directly? Likely NO (the authority observes the
-                //   originator's mesh broadcast), but that's an observer
-                //   / role-model decision R3 owns. Kept verbatim for now
-                //   to preserve current LIVE behavior.
-                let forward = DistributedMessage::TaskComplete {
-                    sender_id: self.config.secondary_id.clone(),
-                    timestamp: timestamp_now(),
-                    secondary_id,
-                    worker_id,
-                    task_hash,
-                    result_data,
-                };
-                let _ = self.send_to_primary(forward).await;
             }
             DistributedMessage::TaskFailed {
                 secondary_id,
-                worker_id,
                 task_hash,
                 error_type,
-                error_message,
                 ..
             } => {
-                // Backpressure-shape classification (LIVE — pure logic,
-                // KEPT): a `Recoverable` failure carrying one of the
-                // backpressure markers means the task never ran and must
-                // be requeued at the authority, not counted as failed.
-                let is_backpressure = matches!(error_type, ErrorType::Recoverable)
-                    && (error_message == "No idle worker available"
-                        || error_message == "worker pipe broken; respawning");
+                // A peer's own-worker TaskFailed REPORT, observed on the
+                // mesh. As with TaskComplete, the authoritative failure
+                // accounting + backpressure requeue + retry cascade are
+                // the `PrimaryCoordinator`'s, reached directly as a mesh
+                // member — so the secondary→primary forward is dropped.
                 //
-                // STRIPPED (R0-deleted secondary primary_* authority
-                // mirror — methods no longer exist):
-                //   - `handle_primary_peer_rejection` (backpressure
-                //     re-queue + per-peer backoff on the primary pool),
-                //   - `note_primary_item_failed` (failure-aware in-flight
-                //     decrement + per-phase retry-bucket cascade).
-                // The secondary is NEVER the authority now; the
-                // authoritative failure accounting + requeue + retry
-                // cascade live in `PrimaryCoordinator`.
-                //
-                // TODO(R4): re-home the authoritative TaskFailed
-                //   handling (backpressure requeue + note_item_failed +
-                //   retry-bucket cascade) to the co-located
-                //   `PrimaryCoordinator` over the loopback (P4). The
-                //   `is_backpressure` classification + marker strings
-                //   are the wire contract the authority's
-                //   `handle_task_failed` already recognises, so the
-                //   re-homed authority sees the same shape via the
-                //   forward below.
-                if !is_backpressure {
-                    // LIVE — KEPT: re-poll OUR own idle workers (own
-                    // worker management — not authority). A retry the
-                    // authority reinjects reaches our idle worker on the
-                    // next tick rather than waiting a keepalive interval.
+                // The one own-worker side effect KEPT: on a real
+                // terminal failure (NOT a `Recoverable` backpressure
+                // marker — those mean "never ran, will be requeued"),
+                // re-poll OUR OWN idle workers so an authority-reinjected
+                // retry dispatched back to this node reaches an idle
+                // worker on the next tick rather than waiting a full
+                // keepalive interval. Own-worker management, not
+                // authority.
+                if !matches!(error_type, ErrorType::Recoverable) {
                     self.repoll_idle_workers(factory).await;
                 }
-                tracing::debug!(
+                tracing::trace!(
                     peer = %secondary_id,
                     task_hash,
                     error_type = ?error_type,
-                    is_backpressure,
-                    "peer task failed (observed)"
+                    "observed peer TaskFailed"
                 );
-                // LIVE — KEPT: forward the observed failure to the
-                // primary role (the #50 redundant-delivery backstop;
-                // the authority's handle_task_failed is dedup-gated and
-                // recognises the backpressure markers, so a single
-                // forward covers both the backpressure-requeue and the
-                // terminal-failure cases at the authority).
-                //
-                // TODO(R3): is this forward still needed now the primary
-                //   is a mesh member receiving the broadcast directly?
-                //   (Same observer/role question as the TaskComplete
-                //   forward.) Kept verbatim to preserve LIVE behavior.
-                let forward = DistributedMessage::TaskFailed {
-                    sender_id: self.config.secondary_id.clone(),
-                    timestamp: timestamp_now(),
-                    secondary_id,
-                    worker_id,
-                    task_hash,
-                    error_type,
-                    error_message,
-                };
-                let _ = self.send_to_primary(forward).await;
             }
             DistributedMessage::TimeoutDetected {
                 timed_out_secondary_id,
@@ -278,16 +198,21 @@ where
             // does not own (TaskAssignment, StageFile, PromotePrimary,
             // RequestClusterSnapshot, ClusterSnapshot, PeerInfo) delegate
             // to the wire-frame dispatcher. ONE delegation path — no
-            // physical-origin key. Errors are SWALLOWED+WARN'd (see the
-            // method doc's TODO(R3) on per-frame fatality): a transient
-            // dispatch error must not kill a non-authoritative
-            // secondary's run.
+            // physical-origin key.
+            //
+            // Per-frame fatality: most frames are non-fatal and their
+            // dispatch errors are SWALLOWED+WARNED here. The genuinely-
+            // fatal ones latch `self.fatal_exit` from inside their own
+            // arm (the `ClusterSnapshot` restore-failure on a
+            // bootstrapping observer is the P3-critical one) — the
+            // operational loop reads `fatal_exit` once per iteration and
+            // aborts the run, so a fatal frame is NOT masked by this
+            // swallow.
             other => {
-                if let Err(e) = self.dispatch_message(other, command_rx, factory).await {
+                if let Err(e) = self.dispatch_message(other, factory).await {
                     tracing::warn!(
                         error = %e,
-                        "inbound frame dispatch failed (swallowed; \
-                         TODO(R3): per-frame fatality)"
+                        "inbound frame dispatch failed (non-fatal; swallowed)"
                     );
                 }
             }

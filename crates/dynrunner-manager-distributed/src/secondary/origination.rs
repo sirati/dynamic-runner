@@ -67,6 +67,9 @@ pub(super) fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
 /// "drain a freshly-seeded pool to quiescence".
 ///
 /// Relocated faithfully from the removed `secondary/primary/mod.rs`.
+// R4 SEAM: the only caller is the primary-side `hydrate_from_cluster_state`
+// (itself reached only from the composed primary's seeded resume).
+#[allow(dead_code)] // TODO(R4): reached via hydrate_from_cluster_state (P4 composition)
 pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
     loop {
         pool.drain_empty_active_phases();
@@ -125,21 +128,13 @@ where
             return Ok(());
         }
         // `apply_locally_for_broadcast` also surfaces auto-resumed
-        // Blocked dependents (see the live primary's mirror site).
-        // The promoted secondary's `primary_pending` pool was seeded
-        // from CRDT at promotion time (`populate_primary_from_cluster_state`)
-        // so any Blocked entries already exist in the pool as
-        // `task_depends_on`-tracked items — the pool's own dep
-        // machinery will dispatch them when the prereq's
-        // `on_item_finished` fires through the normal task-event
-        // path. Re-injecting the resumed clones here would
-        // duplicate them in the pool's buckets, so we deliberately
-        // discard the list on this path. (Unfulfillable-cascade
-        // sequences originated post-promotion would also leave the
-        // dependents in the pool's `blocked` map for the same
-        // dep-machinery to unblock; the live primary's mirror site
-        // is the only one whose pool actually loses the items via
-        // `on_item_failed_permanent`.)
+        // Blocked dependents. The secondary holds NO dispatch pool —
+        // it is never the authority — so the resumed list has no local
+        // consumer: dispatch of resumed dependents is the
+        // `PrimaryCoordinator`'s concern, driven on the authority's own
+        // pool when it applies the same mutation. We deliberately
+        // discard the list here; the CRDT mirror is the only local
+        // effect.
         let batch = apply_locally_for_broadcast(&mut self.cluster_state, mutations);
         let crate::cluster_state::AppliedBatch {
             applied,
@@ -153,8 +148,8 @@ where
             timestamp: timestamp_now(),
             mutations: applied,
         };
-        // ONE authoritative mesh broadcast — the demoted node and any
-        // observer receive it as mesh members. Errors are logged, not
+        // ONE mesh broadcast — every mesh member (peers, the co-located
+        // authority, any observer) receives it. Errors are logged, not
         // propagated (see method doc).
         if let Err(e) = self
             .transport
@@ -285,12 +280,10 @@ where
     /// Ingest the result of Python's `task.discover_items` after a
     /// `PromotePrimary { required_setup: true }` promotion.
     ///
-    /// Pre-condition: `setup_pending == true` (set by the
-    /// `PromotePrimary` handler in `dispatch.rs` for the setup-promote
-    /// reason). The outer process-tasks loop yielded back to the PyO3
-    /// wrapper, which ran `task.discover_items` against the locally
-    /// bind-mounted staged source filesystem and is now feeding the
-    /// result back into the Rust core.
+    /// The outer process-tasks loop yielded back to the PyO3 wrapper,
+    /// which ran `task.discover_items` against the locally bind-mounted
+    /// staged source filesystem and is now feeding the result back into
+    /// the Rust core.
     ///
     /// Sequence:
     ///   1. Build the mutation batch: one `PhaseDepsSet` carrying the
@@ -299,20 +292,12 @@ where
     ///      before any post-promotion hydration consults it), then one
     ///      `TaskAdded` per discovered binary.
     ///   2. Originate the batch via `apply_and_broadcast_mutations` —
-    ///      applies locally to `cluster_state` and fans out to peers +
-    ///      the demoted submitter. The submitter's
-    ///      `mirror_mutation_to_accounting` updates its `total_tasks`
-    ///      counter as the `TaskAdded` mutations arrive, so its
-    ///      exit-counter check sees a non-zero target instead of
-    ///      tripping at 0+0>=0.
-    ///   3. Clear `setup_pending` so the outer loop's next iteration
-    ///      doesn't yield again.
-    ///   4. Hydrate `primary_pending` from the now-populated
-    ///      `cluster_state`. This is the same call the pre-seeded
-    ///      (`required_setup_on_promote = false`) path makes in the
-    ///      `PromotePrimary` handler; here it runs after
-    ///      `setup_pending` clears so operational dispatch can begin
-    ///      on the next tick.
+    ///      applies locally to `cluster_state` and fans out to the mesh
+    ///      (every member, including the co-located authority, receives
+    ///      it). This is legitimate originator-side cluster-state
+    ///      production from the node that ran discovery; the secondary
+    ///      is the producer of the discovery result, not an authority
+    ///      over dispatch.
     ///
     /// Idempotency: `ClusterMutation::TaskAdded` is no-op-on-duplicate
     /// (the CRDT silently drops it via the `apply` filter), and
@@ -320,6 +305,14 @@ where
     /// broadcast, so a duplicate `ingest_setup_discovery` call (e.g.
     /// from a wrapper retry on transport hiccup) doesn't re-broadcast
     /// the same batch.
+    ///
+    /// TODO(R4): feed the composed authoritative `PrimaryCoordinator`
+    ///   over the loopback so its dispatch pool is hydrated from the
+    ///   now-populated `cluster_state` and the setup-defer gate is
+    ///   cleared. The pre-demolition `setup_pending = false` +
+    ///   `populate_primary_from_cluster_state()` steps lived on the
+    ///   secondary's deleted authority mirror; under P4 composition the
+    ///   co-located primary owns that hydration + gate.
     pub async fn ingest_setup_discovery(
         &mut self,
         binaries: Vec<TaskInfo<I>>,
@@ -335,11 +328,9 @@ where
         }
         let task_count = binaries.len();
         self.apply_and_broadcast_mutations(mutations).await?;
-        self.setup_pending = false;
-        self.populate_primary_from_cluster_state();
         tracing::info!(
             tasks = task_count,
-            "ingested setup-discovery; primary pool hydrated"
+            "ingested setup-discovery; broadcast PhaseDepsSet + TaskAdded batch"
         );
         // Empty-discovery happy path: when discovery surfaces zero
         // items (e.g. every binary's output already exists under a

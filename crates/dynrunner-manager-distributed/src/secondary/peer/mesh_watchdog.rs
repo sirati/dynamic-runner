@@ -131,6 +131,15 @@ where
     /// anything to report". This keeps the modular boundary clean
     /// (peer.rs owns peer-mesh status; processing.rs just calls).
     pub(in crate::secondary) async fn report_mesh_ready_if_needed(&mut self) {
+        // Strict-observer suppression: MeshReady is a worker-secondary
+        // signal — the primary defers `PromotePrimary` until every
+        // worker secondary's mesh has settled. An observer has no
+        // workers and is never a promotion candidate, so it must
+        // originate NOTHING here (the mesh-ready concern's own role-gate,
+        // matching `send_keepalive` / `run_election_tick`).
+        if self.config.is_observer {
+            return;
+        }
         if self.mesh_ready_sent {
             return;
         }

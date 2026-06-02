@@ -21,10 +21,8 @@ use dynrunner_protocol_primary_secondary::{
     Address, ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
-use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::ClusterStateSnapshot;
-use crate::primary::PrimaryCommand;
 use super::super::wire::{distributed_to_binary, timestamp_now};
 use super::super::SecondaryCoordinator;
 
@@ -36,14 +34,16 @@ where
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// `command_rx` threads the operational-loop's command-channel
-    /// receiver into the TaskComplete / TaskFailed arms so a callback-
-    /// issued `spawn_tasks` applies inline. Off-loop callers pass
-    /// `&mut None`.
+    /// Wire-frame dispatcher for the frame types the role-aware
+    /// `handle_inbound` base does not own directly (TaskAssignment,
+    /// StageFile, PromotePrimary, RequestClusterSnapshot,
+    /// ClusterSnapshot, PeerInfo, plus the test-reachable
+    /// TaskComplete/TaskFailed arms). The secondary holds NO authority:
+    /// every arm here is either own-worker management, a CRDT mirror
+    /// apply, or a CLASS-1 report to the primary role.
     pub(in crate::secondary) async fn dispatch_message(
         &mut self,
         msg: DistributedMessage<I>,
-        command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
         factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         // Any message from the primary side resets the election state and
@@ -185,51 +185,37 @@ where
                     {
                         Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
                         Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
-                            // R0 deleted the `pending_first_bind`
-                            // stash-until-Ready machinery (both its
-                            // transport-fairness leg — mooted by the
-                            // uniform transport — AND, by over-deletion,
-                            // its correctness "hold the task until the
-                            // respawning worker is Ready" leg).
-                            //
-                            // Interim NO-DROP (TODO(R3/R4)): bounce the
-                            // not-yet-run task back to the AUTHORITY as a
-                            // backpressure-shaped TaskFailed (the
-                            // "worker pipe broken; respawning" marker the
-                            // authority's recovery path recognises), so
-                            // it re-queues + re-dispatches once a worker
-                            // (here or elsewhere) has capacity. No task
-                            // is dropped, no local primary pool is
-                            // needed.
-                            //
-                            // TODO(R3/R4): rebuild the respawn-HOLD
-                            // correctness — defer dispatch for a
-                            // respawning type until `WorkerEvent::Ready`
-                            // and re-dispatch then (avoiding the
-                            // re-bounce busy-loop a respawning type can
-                            // cause meanwhile). Tracked as an R3/R4 task
-                            // (closed before the R4 green milestone);
-                            // this interim is harmless until the crate
-                            // runs at R4.
+                            // Respawn-HOLD (#58): the per-type subprocess
+                            // for `target_wid` is mid-kill+spawn (the
+                            // pool kicked off a background `wait_ready`
+                            // task). DEFER this task rather than drop it
+                            // or busy-bounce it to the authority: stash
+                            // the resolved binary in `pending_first_bind`
+                            // keyed by the worker; the
+                            // `WorkerEvent::Ready` handler picks it up and
+                            // calls `assign_task` once the slot is
+                            // observably Idle with the new type bound. No
+                            // drop, no tight retry loop. The loss path
+                            // (`WorkerEvent::Disconnected` before Ready)
+                            // reports the deferred task back to the
+                            // authority as backpressure via
+                            // `report_deferred_task_lost`.
                             tracing::debug!(
                                 worker_id = target_wid,
                                 type_id = %binary.type_id,
                                 file_hash = %file_hash,
-                                "type-bind respawn in progress; bouncing task back to \
-                                 the authority as backpressure (no-drop; respawn-HOLD \
-                                 rebuild is TODO(R3/R4))"
+                                "type-bind respawn in progress; deferring task until \
+                                 worker Ready (respawn-HOLD)"
                             );
-                            let _ = (binary, estimated, predecessor_outputs);
-                            let task_failed = DistributedMessage::TaskFailed {
-                                sender_id: self.config.secondary_id.clone(),
-                                timestamp: timestamp_now(),
-                                secondary_id: self.config.secondary_id.clone(),
-                                worker_id: target_wid,
-                                task_hash: file_hash,
-                                error_type: ErrorType::Recoverable,
-                                error_message: "worker pipe broken; respawning".into(),
-                            };
-                            self.send_to_primary(task_failed).await?;
+                            self.pending_first_bind.insert(
+                                target_wid,
+                                super::super::PendingFirstBind {
+                                    binary,
+                                    file_hash,
+                                    estimated,
+                                    predecessor_outputs,
+                                },
+                            );
                             return Ok(());
                         }
                         Err(e) => Err(e),
@@ -445,68 +431,72 @@ where
                 // self-promotion machinery: there is no separate
                 // promoted-secondary-as-primary mirror to activate.
                 let _ = required_setup;
+                // Sync the FAILOVER ELECTION state with the role
+                // identity when this node is the one named primary: its
+                // election goes terminal `Promoted` so a subsequently-
+                // silent (now-demoted) local primary does NOT drive THIS
+                // node into Suspecting → Candidate and a self-re-promote
+                // cascade (the early-return in `run_election_tick` keys
+                // off `Promoted`). The peer-named case needs nothing
+                // extra: the `record_primary_message` pre-amble at the
+                // top of `dispatch_message` already reset the election
+                // to `Normal` (this node is a settled follower).
+                if new_primary_id == self.config.secondary_id {
+                    self.election = super::super::election::ElectionState::Promoted;
+                }
                 tracing::info!(
                     new_primary = %new_primary_id,
                     epoch,
                     "primary role changed"
                 );
+                // Clear every worker's per-request backoff: it accrued
+                // against the PRIOR primary identity, so it is stale the
+                // moment the role changes. Without this the repoll below
+                // is suppressed by `should_request_now` and idle workers
+                // sit through a stale backoff window before re-issuing
+                // at the new primary (the dispatch-silence symptom).
+                // Mirrors the pre-unification `on_primary_changed` reset
+                // — the rule is "any observable primary-identity change
+                // revives the slot's pull semantic and resets the
+                // rate-limiter". Keyed off the backoff maps (not the
+                // pool) so it fires even before `initialize_workers`.
+                self.primary_link.reset_all_backoff();
                 // Immediate repoll: every idle worker re-issues its
-                // pending TaskRequest at the freshly-identified
-                // primary instead of waiting up to a keepalive
-                // interval for the periodic `repoll_idle_workers`
-                // tick. Every idle worker re-issues its pending
-                // `TaskRequest` against the freshly-identified
+                // pending `TaskRequest` against the freshly-identified
                 // primary (resolved through the transport's RoleCache,
-                // now updated by the `PrimaryChanged` apply above).
+                // now updated by the `PrimaryChanged` apply above)
+                // instead of waiting up to a keepalive interval.
                 self.repoll_idle_workers(factory).await;
                 Ok(())
             }
-            DistributedMessage::TaskComplete {
-                task_hash,
-                ..
-            } => {
-                // LIVE — KEPT: keep `completed_tasks` current so a
-                // later failover-rebuild (`populate_primary_from_cluster_state`
-                // consulting `self.completed_tasks`) sees observed
-                // completions. Idempotent re-insert.
+            DistributedMessage::TaskComplete { task_hash, .. } => {
+                // A `TaskComplete` REPORT frame is a peer's own-worker
+                // terminal report to the authority — not a CRDT
+                // mutation. A non-authority node has nothing to do with
+                // it: the authoritative terminal state arrives as a
+                // separate `ClusterMutation::TaskCompleted` broadcast
+                // that the `ClusterMutation` arm mirrors idempotently.
+                // The secondary keeps NO per-node terminal set, so this
+                // arm is a pure observation no-op.
                 //
-                // STRIPPED (R0-deleted authority mirror): the
-                // `note_primary_item_completed` phase-machine drive.
-                // The secondary is never the authority now.
-                // TODO(R4): authoritative completion accounting +
-                //   phase-machine advance re-home to PrimaryCoordinator
-                //   over the loopback.
-                //
-                // NOTE: post-unification this arm is reachable only via
-                // a direct `dispatch_message` call (tests); the merged
-                // inbound stream handles TaskComplete in the role-aware
-                // `handle_inbound` arm.
-                self.completed_tasks.insert(task_hash.clone());
+                // Reachable only via a direct `dispatch_message` call
+                // (tests); the operational inbound stream routes
+                // TaskComplete through the role-aware `handle_inbound`
+                // arm (own-worker reporter path).
+                tracing::trace!(task_hash, "observed TaskComplete report (no-op)");
                 Ok(())
             }
-            DistributedMessage::TaskFailed {
-                task_hash,
-                error_type,
-                ..
-            } => {
-                // LIVE — KEPT: dedup terminal failures into
-                // `completed_tasks` for the same failover-rebuild
-                // rationale as TaskComplete.
-                //
-                // STRIPPED (R0-deleted authority mirror): the
-                // `note_primary_item_failed` decrement + retry cascade.
-                // TODO(R4): authoritative failure accounting re-homes to
-                //   PrimaryCoordinator over the loopback.
-                //
-                // NOTE: reachable only via direct `dispatch_message`
-                // (tests); the merged stream handles TaskFailed in the
-                // role-aware `handle_inbound` arm.
-                if !matches!(error_type, ErrorType::Recoverable) {
-                    self.completed_tasks.insert(task_hash.clone());
-                }
+            DistributedMessage::TaskFailed { task_hash, .. } => {
+                // Same as the TaskComplete arm: a `TaskFailed` REPORT
+                // frame carries no authority for a non-authority node.
+                // The authoritative terminal state (and any retry
+                // cascade) is owned by the primary and mirrored to this
+                // node's `cluster_state` via a `ClusterMutation`
+                // broadcast. Pure observation no-op.
+                tracing::trace!(task_hash, "observed TaskFailed report (no-op)");
                 Ok(())
             }
-            DistributedMessage::RequestClusterSnapshot { sender_id, .. } => {
+            DistributedMessage::RequestClusterSnapshot { sender_id, is_observer, .. } => {
                 // Any peer can answer — `cluster_state` is replicated,
                 // so any responder's snapshot is a valid bootstrap
                 // payload. The merge semantics on the receiver
@@ -545,25 +535,26 @@ where
                 // `RequestClusterSnapshot`; the responder is the first
                 // existing member to observe the joiner. Apply locally
                 // and broadcast over the canonical origination path so
-                // receivers learn about the joiner via the widened
+                // receivers learn about the joiner via the
                 // `apply_peer_joined` rule, idempotent under duplicate
                 // broadcasts from concurrent responders.
                 //
-                // TODO(R3): carry the joiner's ACTUAL role here. The
-                // old code hardcoded `is_observer: true`, conflating
-                // every late-joiner with the observer role; the joiner
-                // may be a worker. R3 must thread the real role through
-                // `RequestClusterSnapshot` (or have the responder read
-                // it from the joiner's announced PeerInfo) instead of
-                // assuming observer.
+                // The joiner's ACTUAL role rides the request frame's
+                // `is_observer` field — the joiner declares its own role
+                // when it calls `join_running_cluster`. A worker joins
+                // with `false`, an observer with `true`. This carries
+                // the truth into `apply_peer_joined`, whose observer
+                // flag is an upward-only ratchet: a `false` for a
+                // re-bootstrapping worker is a NoOp against an existing
+                // `false` entry (no mis-upgrade), and a `true` for an
+                // observer correctly populates `RoleTable.observers`.
+                // Only `PeerRemoved` ever clears the observer flag, so
+                // the ratchet never regresses a genuine observer.
                 let _ = self
                     .apply_and_broadcast_mutations(vec![
                         ClusterMutation::PeerJoined {
                             peer_id: sender_id,
-                            is_observer: todo!(
-                                "R3: carry the joiner's actual role; \
-                                 do not hardcode observer"
-                            ),
+                            is_observer,
                         },
                     ])
                     .await;
@@ -576,15 +567,28 @@ where
                 // may have already applied mutations the snapshot also
                 // contains; the merge keeps the strictly stronger of
                 // each).
+                //
+                // Per-frame FATALITY (P3 replication invariant): a
+                // ClusterSnapshot whose payload fails to deserialize is
+                // a hard error, NOT a swallow. A bootstrapping observer
+                // / late-joiner requested this snapshot precisely to
+                // populate its CRDT from a partial/empty starting state;
+                // continuing to "observe" an un-restored (partial/empty)
+                // CRDT would silently report a lie (a premature
+                // run-complete, wrong outcome counts). Latch
+                // `fatal_exit` so the operational loop aborts the run
+                // with a clear error instead of observing corruption.
                 match serde_json::from_str::<ClusterStateSnapshot<I>>(&snapshot_json) {
                     Ok(snap) => {
                         self.cluster_state.restore(snap);
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "failed to deserialize ClusterSnapshot payload"
+                        let reason = format!(
+                            "ClusterSnapshot restore failed (malformed snapshot \
+                             payload); refusing to observe a partial/empty CRDT: {e}"
                         );
+                        tracing::error!(error = %e, "{reason}");
+                        self.fatal_exit = Some(reason);
                     }
                 }
                 Ok(())
