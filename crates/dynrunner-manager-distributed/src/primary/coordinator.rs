@@ -49,14 +49,18 @@ pub(crate) struct PendingMassDeath {
 }
 
 /// Virtual worker tracked by the authoritative primary for each remote worker.
+///
+/// R1 replaces the removed `(current_task, is_idle)` pair with a
+/// `SlotState<I>` typestate: assignment reachable ONLY from `Idle`,
+/// the held task carried inside the `Assigned` variant. The pair is
+/// removed here so the slot-keyed attribution it enabled cannot
+/// survive the rebuild.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteWorkerState<I: Identifier> {
     pub(super) worker_id: u32,
     pub(super) secondary_id: String,
     pub(super) resource_budgets: ResourceMap,
-    pub(super) current_task: Option<TaskInfo<I>>,
     pub(super) estimated_resources: ResourceMap,
-    pub(super) is_idle: bool,
 }
 
 impl<I: Identifier> RemoteWorkerState<I> {
@@ -128,26 +132,6 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// between runs.
     pub(super) phase_deps: HashMap<PhaseId, Vec<PhaseId>>,
     pub(super) completed_tasks: HashSet<String>,
-    /// Pre-owned in-flight ledger seeded at hydration, keyed by task
-    /// hash. Each value is the `(phase_id, target_secondary_id, binary)`
-    /// of an `InFlight` task this coordinator inherited from the
-    /// replicated `cluster_state` rather than dispatching itself.
-    ///
-    /// Why it exists: the normal `TaskComplete` / `TaskFailed`
-    /// counter-decrement path keys off the local `RemoteWorkerState`
-    /// holding the task (`workers[*].current_task`). A pre-owned
-    /// in-flight task was dispatched by a different node before this
-    /// coordinator became authoritative, so no local worker holds it;
-    /// when its broadcast completion lands, the worker scan finds
-    /// nothing and the phase in-flight counter would never drop from
-    /// N+1 to N. The handlers consult this map as a fallback so the
-    /// CORRECT phase's `note_item_completed` / `note_item_failed`
-    /// fires. Entries are removed on first terminal observation
-    /// (idempotent with the `completed_tasks` / `failed_tasks` dedup
-    /// gate). Empty for a coordinator that built its pool from a
-    /// local task list rather than hydrating.
-    pub(super) pre_owned_in_flight:
-        HashMap<String, (PhaseId, String, TaskInfo<I>)>,
     /// Failed-task ledger keyed by task hash. The value carries the
     /// most-recent ErrorType so the dispatcher can report per-class
     /// failure counts (Recoverable → fail_retry, ResourceExhausted
@@ -242,15 +226,6 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     // primary promotion
     pub(super) primary_id: Option<String>,
 
-    /// True after this primary has handed off authority via
-    /// `PromotePrimary`. While demoted, the operational loop runs in
-    /// observer mode: it still receives messages (so completion
-    /// forwards keep `completed_tasks` accurate for the run-done
-    /// counter check), but stops dispatching, stops kickstarting,
-    /// and stops running heartbeat-driven requeue. The promoted
-    /// secondary is the sole authoritative primary thereafter.
-    pub(super) demoted: bool,
-
     // Stage-file notifications queued before `run()` (or during init,
     // before secondary connections are up). Flushed once the welcome
     // + peer-connect handshake completes — at that point `send_to`
@@ -268,33 +243,6 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// (idempotent under repetition + reorder within the per-task
     /// happens-before constraint) live in `cluster_state.rs`.
     pub(super) cluster_state: ClusterState<I>,
-
-    /// Gate the operational-loop counter-based exit check while a
-    /// setup-promoted secondary is still discovering items and seeding
-    /// the cluster ledger. Initialised from
-    /// `config.required_setup_on_promote` at `run()` start; cleared the
-    /// moment either (1) the first `ClusterMutation::TaskAdded` arrives
-    /// via the mirror path (proves discovery happened and seeded at
-    /// least one task) or (2) `ClusterMutation::RunComplete` arrives
-    /// (proves the chosen secondary legitimately discovered zero items
-    /// and finished the run cleanly).
-    ///
-    /// Without this gate, the setup-promote path's
-    /// `emit_setup_defer_handshake` leaves `total_tasks = 0` on the
-    /// demoted submitter; the operational loop's exit-check
-    /// (`completed + failed >= total_tasks && active_workers == 0`)
-    /// trips at `0 + 0 >= 0` the moment the demoted primary enters the
-    /// loop — BEFORE the chosen secondary has had a chance to run
-    /// `discover_items` and broadcast its first `TaskAdded`. Step 3's
-    /// reactive `total_tasks` refresh in
-    /// `task::mirror_mutation_to_accounting` only fires WHEN a
-    /// `TaskAdded` arrives; this gate covers the window before that
-    /// first arrival. Legacy bootstrap (`required_setup_on_promote =
-    /// false`) starts with `setup_pending = false`, so the gate is a
-    /// strict superset of the historical exit semantics — no
-    /// regression on the path where `seed_cluster_state` ran locally
-    /// and `total_tasks` is non-zero at startup.
-    pub(super) setup_pending: bool,
 
     /// Cross-thread / cross-runtime ingress for the
     /// `PrimaryHandle` PyO3 surface. Each handler is co-located
@@ -595,7 +543,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         scheduler: S,
         estimator: E,
     ) -> Self {
-        let setup_pending = config.required_setup_on_promote;
         let (command_tx, command_rx) = tokio_mpsc::channel(COMMAND_CHANNEL_CAPACITY);
         // Peer-lifecycle dispatcher channel: built at construction so
         // the apply path on `cluster_state` has a sender to enqueue
@@ -641,7 +588,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             pending: None,
             phase_deps: HashMap::new(),
             completed_tasks: HashSet::new(),
-            pre_owned_in_flight: HashMap::new(),
             failed_tasks: HashMap::new(),
             phase_completed: HashMap::new(),
             phase_failed: HashMap::new(),
@@ -656,10 +602,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             mesh_ready_secondaries: HashSet::new(),
             pending_mass_death: HashMap::new(),
             primary_id: None,
-            demoted: false,
             pending_stage_files: Vec::new(),
             cluster_state: ClusterState::new(),
-            setup_pending,
             command_rx: Some(command_rx),
             command_tx,
             unfulfillable_reinject_remaining: HashMap::new(),
@@ -1308,13 +1252,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         &mut self,
     ) -> &mut crate::cluster_state::ClusterState<I> {
         &mut self.cluster_state
-    }
-
-    /// Test-only inspector for the pre-owned in-flight ledger seeded by
-    /// hydration. Returns the count of inherited in-flight entries.
-    #[cfg(test)]
-    pub fn pre_owned_in_flight_len_for_test(&self) -> usize {
-        self.pre_owned_in_flight.len()
     }
 
     /// Test-only mutable borrow of the per-secondary `SecondaryTransport`

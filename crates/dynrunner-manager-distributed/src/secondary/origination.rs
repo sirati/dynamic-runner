@@ -1,14 +1,23 @@
-//! Originator-side cluster-mutation broadcast and setup-discovery
-//! ingest.
+//! Originator-side cluster-mutation broadcast, panik self-departure,
+//! and setup-discovery ingest.
 //!
-//! Single concern: produce a batch of `ClusterMutation`s on this
-//! (promoted-secondary or natural-quiesce) node, run the
-//! `apply_locally_for_broadcast` apply-first filter, and fan out the
-//! `Applied` subset over both the peer mesh and the
-//! demoted-submitter link. `ingest_setup_discovery` is the wrapper
-//! entry-point that turns the wrapper-driven discovery result into
-//! the canonical `PhaseDepsSet + N×TaskAdded` batch through the same
-//! broadcast helper.
+//! Single concern: originate cluster-state changes from THIS node —
+//! produce a batch of `ClusterMutation`s, run the
+//! `apply_locally_for_broadcast` apply-first filter, and fan the
+//! `Applied` subset out to the mesh. `ingest_setup_discovery` is the
+//! wrapper entry-point that turns the wrapper-driven discovery result
+//! into the canonical `PhaseDepsSet + N×TaskAdded` batch through the
+//! same broadcast helper; `handle_panik_signal` originates the
+//! self-departure announcement (file source) and tears down local
+//! workers on the Phase-0B emergency-stop path.
+//!
+//! Relocated here from the removed `secondary/primary/*` mirror: these
+//! three functions are NOT mirror logic (they originate cluster state
+//! on the live-secondary side and serve the pyo3 + panik surfaces), so
+//! they survive the mirror demolition. The two free pool helpers
+//! `task_file_hash` and `cascade_drain_done` also relocate here (they
+//! were free functions in the removed `secondary/primary/mod.rs`); the
+//! symmetric primary-side hydration re-uses `cascade_drain_done`.
 
 use std::collections::HashMap;
 
@@ -17,12 +26,59 @@ use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport, RemovalCause,
 };
-use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
-use super::super::SecondaryCoordinator;
-use super::task_file_hash;
+use super::wire::timestamp_now;
+use super::SecondaryCoordinator;
 use crate::cluster_state::apply_locally_for_broadcast;
+
+/// Stable hash of a `TaskInfo`'s path+identifier, matching the wire
+/// `file_hash` shape used elsewhere in the secondary. Pulled out as a
+/// free function so the originating paths agree on the key space
+/// without duplicating the hashing recipe.
+///
+/// Relocated faithfully from the removed `secondary/primary/mod.rs`.
+pub(super) fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    item.path.hash(&mut h);
+    item.identifier.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// Run the phase-lifecycle drain cascade on a pool until quiescent.
+/// Each iteration:
+///   1. `drain_empty_active_phases` — moves any Active phase whose
+///      `(queued, in_flight) == (0, 0)` to Drained, queues it for
+///      `poll_drain_transitions`.
+///   2. `poll_drain_transitions` — returns and clears the
+///      drained-pending list.
+///   3. `mark_phase_done` — flips Drained → Done, may unblock
+///      dependent phases (Blocked → Active).
+///
+/// The loop terminates when no new drains surface (the next
+/// `drain_empty_active_phases` finds nothing to transition AND
+/// `poll_drain_transitions` returns empty).
+///
+/// `pub(crate)` so the symmetric primary-side hydration
+/// (`crate::primary::hydrate`) reuses the identical drain cascade
+/// rather than re-deriving the loop — single source of truth for
+/// "drain a freshly-seeded pool to quiescence".
+///
+/// Relocated faithfully from the removed `secondary/primary/mod.rs`.
+pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
+    loop {
+        pool.drain_empty_active_phases();
+        let drained = pool.poll_drain_transitions();
+        if drained.is_empty() {
+            break;
+        }
+        for p in &drained {
+            pool.mark_phase_done(p);
+        }
+    }
+}
 
 impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
 where
@@ -117,64 +173,6 @@ where
             );
         }
         Ok(())
-    }
-
-    /// Apply a `ClusterMutation::TaskCompleted` LOCALLY on this
-    /// secondary's `cluster_state` without broadcasting.
-    ///
-    /// Single concern: synchronise the local CRDT mirror for a
-    /// completion this node is about to act on in the SAME await frame
-    /// (the `note_primary_item_completed` → `on_item_finished` cascade
-    /// releases a dependent in `primary_pending`, and the immediate
-    /// follow-up `request_task_for_worker(...).await` on a still-idle
-    /// worker dispatches into `handle_primary_task_request`, which
-    /// reads `predecessor_outputs` from `self.cluster_state` via
-    /// [`crate::primary::task::predecessor_outputs::gather_predecessor_outputs`]).
-    ///
-    /// Without this synchronisation, the dispatch reads an empty
-    /// `task_outputs` for the just-completed prerequisite: the
-    /// canonical `ClusterMutation::TaskCompleted` originator on this
-    /// completion path is the demoted-local primary, which only
-    /// applies + broadcasts after the loopback
-    /// `DistributedMessage::TaskComplete` arrives over its
-    /// `primary_transport` channel and is dequeued by its own
-    /// operational loop — strictly later than the same-frame self-
-    /// assign on this node.
-    ///
-    /// Broadcast is intentionally NOT performed here: the
-    /// demoted-local primary remains the single broadcast originator
-    /// for completion mutations on the live-primary path, and the
-    /// wire-side fan-out continues to flow through its
-    /// `apply_and_broadcast_cluster_mutations`. The CRDT's idempotent
-    /// `TaskCompleted` arm makes the demoted primary's later apply +
-    /// broadcast → receive-side apply on this node a NoOp; the
-    /// invariant "one originator per mutation" is preserved.
-    ///
-    /// Gated on `is_primary`: off the primary path this node forwards
-    /// the completion via `send_to_current_primary` and does NOT
-    /// dispatch in the same await frame, so the same-frame race does
-    /// not exist and the local apply is unnecessary (and would
-    /// duplicate the receive-side apply that the inbound broadcast
-    /// triggers).
-    ///
-    /// Called from the two completion-receive sites that may dispatch
-    /// in the same await frame on the promoted-secondary side:
-    ///   - own-worker completion in
-    ///     `secondary/processing/worker_event.rs`'s `TaskCompleted` arm
-    ///   - peer-observed completion in
-    ///     `secondary/peer/message_handler.rs`'s `TaskComplete` arm
-    pub(in crate::secondary) fn apply_task_completed_locally_if_primary(
-        &mut self,
-        task_hash: String,
-        result_data: Option<Vec<u8>>,
-    ) {
-        if !self.is_primary {
-            return;
-        }
-        self.cluster_state.apply(ClusterMutation::TaskCompleted {
-            hash: task_hash,
-            result_data,
-        });
     }
 
     /// React to a panik-watcher signal on this secondary.

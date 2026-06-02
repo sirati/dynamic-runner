@@ -87,36 +87,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // is still active.
             self.backpressured_secondaries.remove(&secondary_id);
 
-            // Mark the specific worker idle using secondary_id + local worker_id.
-            // Capture the phase + type of the just-finished item so we
-            // can fold it into per-phase counters, release the
-            // per-type concurrency slot, and run the phase lifecycle
-            // cascade.
-            // `task_id` is non-optional per the framework's boundary
-            // contract; the snapshot tuple stores it as `String`.
-            let mut completed_meta: Option<(
+            // TODO(R1): resolve the just-finished item BY HASH from the
+            // single hash-keyed `in_flight` ledger and free the holding
+            // slot through `free_slot_on_terminal(secondary, worker,
+            // task_hash)` (frees ONLY if `held_hash == task_hash`). The
+            // removed code here did a blind `(secondary_id, worker_id)`
+            // slot scan with NO hash check and consulted the separate
+            // `pre_owned_in_flight` fallback — the P1 mis-attribution
+            // bug. `completed_meta` must come from the ledger entry
+            // (its phase / type / task_id), not from a worker scan.
+            let completed_meta: Option<(
                 dynrunner_core::PhaseId,
                 dynrunner_core::TypeId,
                 String,
             )> = None;
-            let mut local_idx: u32 = 0;
-            for w in &mut self.workers {
-                if w.secondary_id == secondary_id {
-                    if local_idx == worker_id {
-                        if let Some(task) = w.current_task.take() {
-                            completed_meta = Some((
-                                task.phase_id.clone(),
-                                task.type_id.clone(),
-                                task.task_id.clone(),
-                            ));
-                        }
-                        w.estimated_resources = ResourceMap::new();
-                        w.is_idle = true;
-                        break;
-                    }
-                    local_idx += 1;
-                }
-            }
 
             // Operator-facing INFO: enough to grep "did task X
             // complete and how are aggregate counts moving?". The
@@ -148,19 +132,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             if let Some((phase, type_id, task_id)) = completed_meta {
                 self.release_type_slot(&type_id);
                 self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
-            } else if let Some((phase, _secondary, binary)) =
-                self.pre_owned_in_flight.remove(task_hash)
-            {
-                // Pre-owned in-flight task (hydrated from cluster_state,
-                // dispatched by another node before this coordinator
-                // became authoritative): no local worker held it, so the
-                // worker scan above found nothing and no local type-slot
-                // was ever taken — hence no `release_type_slot`. We still
-                // must decrement the correct phase's in-flight counter so
-                // `note_item_completed` drains it from N+1 to N. The
-                // `binary.task_id` resolves the same `task_depends_on`
-                // edges a locally-dispatched completion would.
-                self.note_item_completed(&phase, Some(binary.task_id.as_str()), command_rx).await;
             }
 
             // Kickstart dispatch to every idle worker. After

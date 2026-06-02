@@ -324,27 +324,6 @@ where
             } => {
                 self.record_promotion_confirm(sender_id, new_primary_id, vote_round);
             }
-            DistributedMessage::TaskRequest {
-                secondary_id,
-                worker_id,
-                available_resources,
-                ..
-            } if self.is_primary => {
-                // Peer routed this to us because we won the election. Same
-                // dispatch path that the live-primary case uses, just
-                // arriving over peer_transport instead of primary_transport.
-                let available_memory = available_resources
-                    .iter()
-                    .find(|r| r.kind == dynrunner_core::ResourceKind::memory())
-                    .map(|r| r.amount)
-                    .unwrap_or(0);
-                if let Err(e) = self
-                    .handle_primary_task_request(secondary_id, worker_id, available_memory, factory)
-                    .await
-                {
-                    tracing::warn!(error = %e, "post-promotion peer TaskRequest dispatch failed");
-                }
-            }
             // Post-promotion TaskAssignment: when the new primary IS a
             // peer, its TaskAssignment to this secondary arrives over
             // peer_transport, not primary_transport. The dispatch body

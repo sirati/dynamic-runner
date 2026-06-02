@@ -41,56 +41,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
             let mut assigned = false;
 
-            // Demoted observer mode: the promoted primary is
-            // the sole authority for assignment. Skip the local-
-            // assign branch entirely so the request always falls
-            // through to the primary relay below — that way
-            // only one primary's pool ever decides what runs where.
-            // Without this skip, the local primary would race the
-            // primary by assigning from its own (post-handoff
-            // stale) pool view. See `demoted` doc on
-            // `PrimaryCoordinator`.
-            if let Some(idx) = target_idx
-                && !self.demoted
-            {
-                // Stale TaskRequest guard: if primary's view says this
-                // worker is already mid-dispatch (current_task =
-                // Some(_)), the kickstart in `handle_task_complete` /
-                // `handle_task_failed` has just sent a TaskAssignment
-                // to the same worker. The TaskRequest in our hand was
-                // sent by the secondary BEFORE that kickstart-
-                // assignment arrived. Honouring it would dispatch a
-                // SECOND assignment to a worker that's about to be
-                // busy with the first, secondary then bounces the
-                // second with "No idle worker available" — every such
-                // bounce becomes a Recoverable failure that consumes
-                // a retry budget. Skip silently; the worker will
-                // process the kickstart-assignment and send a fresh
-                // TaskRequest after that one terminates.
-                if self.workers[idx].current_task.is_some() {
-                    tracing::trace!(
-                        secondary = %secondary_id,
-                        worker_id,
-                        "stale TaskRequest after kickstart-dispatch; skipping"
-                    );
-                    return Ok(());
-                }
+            // R1: `TaskRequest` is a pure capacity hint that never
+            // frees a slot. The removed free-on-request block
+            // (`current_task = None; is_idle = true`) and the removed
+            // stale-request guard let a bare request mutate slot state;
+            // R1's `SlotState` typestate makes assignment reachable
+            // ONLY from `Idle` and frees a slot ONLY on a terminal
+            // outcome via `free_slot_on_terminal`. The `demoted`
+            // short-circuit is gone too — there is no demoted-primary
+            // self-assign race to guard against.
+            if let Some(idx) = target_idx {
                 // Composed dispatch-shape gate: backpressure backoff
                 // + OOM-bucket single-worker masking. See
                 // `should_skip_worker_for_dispatch` for the
-                // per-reason documentation. Replaces the historical
-                // bare backpressure check so the OOM bucket's "only
-                // worker 0 of each secondary may serve a retry"
-                // shape applies here too; without that the
-                // TaskRequest path would happily hand a memory-
-                // pressed retry to worker N>0 and defeat the bucket.
+                // per-reason documentation.
                 if self.should_skip_worker_for_dispatch(idx) {
                     return Ok(());
                 }
-                // Mark worker idle
-                self.workers[idx].current_task = None;
-                self.workers[idx].estimated_resources = ResourceMap::new();
-                self.workers[idx].is_idle = true;
                 if !available_res.is_empty() {
                     self.workers[idx].resource_budgets = available_res.clone();
                 }

@@ -25,15 +25,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// primary relay (which is irrelevant for the
     /// non-promoted-primary at this stage).
     pub(crate) async fn dispatch_to_idle_workers(&mut self) -> Result<(), String> {
-        // Demoted observer mode: the promoted primary is the
-        // sole authority for dispatch. Returning here covers every
-        // call site (kickstart from handle_task_complete /
-        // handle_task_failed, plus the retry-pass kickstart) without
-        // sprinkling `if !self.demoted` across the message-handling
-        // code. See `demoted` doc on `PrimaryCoordinator`.
-        if self.demoted {
-            return Ok(());
-        }
         // Visit idle workers in load-aware order so a secondary with
         // many in-flight tasks doesn't keep winning tail-of-phase
         // dispatches against an idler peer. `dispatch_order` filters
