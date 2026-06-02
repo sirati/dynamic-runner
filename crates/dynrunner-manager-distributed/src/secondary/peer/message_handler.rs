@@ -70,12 +70,37 @@ where
                 active_workers,
                 ..
             } => {
-                self.peer_keepalives.insert(secondary_id.clone(), timestamp);
-                tracing::trace!(
-                    peer = %secondary_id,
-                    active_workers,
-                    "peer keepalive received"
-                );
+                // Recognition by ROLE, resolved through the one
+                // authoritative cluster view (`current_primary`, kept by
+                // the `PrimaryChanged` apply — the single source of "who
+                // is primary now"). A keepalive whose originator IS the
+                // current primary is a PRIMARY-liveness assertion, so it
+                // refreshes `primary_last_seen` via the same
+                // `record_primary_message` the dispatch path uses;
+                // otherwise it is a peer's mesh keepalive and feeds
+                // `peer_keepalives` (which drives this node's failover
+                // timing for its peers). Without this split, primary
+                // liveness was parasitic on workload dispatch and
+                // `primary_silent` tripped the instant dispatch quiesced.
+                //
+                // The co-located primary's OWN keepalive is excluded
+                // naturally: `is_primary_facing()` does NOT mark
+                // Keepalive, so a primary never receives its own here.
+                if self.cluster_state.current_primary() == Some(secondary_id.as_str()) {
+                    self.record_primary_message();
+                    tracing::trace!(
+                        primary = %secondary_id,
+                        active_workers,
+                        "primary keepalive received"
+                    );
+                } else {
+                    self.peer_keepalives.insert(secondary_id.clone(), timestamp);
+                    tracing::trace!(
+                        peer = %secondary_id,
+                        active_workers,
+                        "peer keepalive received"
+                    );
+                }
             }
             DistributedMessage::TaskComplete {
                 secondary_id,
