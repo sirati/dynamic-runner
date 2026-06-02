@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use dynrunner_core::ErrorType;
+use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::PendingPool;
 use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
@@ -12,10 +13,11 @@ use crate::primary::command_channel::{
     handle_primary_command, PrimaryCommand,
 };
 use crate::primary::test_helpers::{
-    make_binary, setup_test, FixedEstimator, NoPeers, TestId,
+    make_binary, setup_test, FixedEstimator, NoPeers, RecordingPeer, TestId,
 };
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
+use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 /// Stand-alone fixture matching the shape used by
 /// `command_channel::tests::make_coordinator`: a `PrimaryCoordinator`
@@ -87,6 +89,190 @@ fn install_pool_for_phase(
     coordinator
         .phase_failed
         .insert(binary.phase_id.clone(), 0);
+}
+
+/// Build a `PrimaryCoordinator` whose peer transport is a
+/// [`RecordingPeer`], returning the coordinator, the shared broadcast
+/// log, and the secondary-end handles from `setup_test`. The caller
+/// keeps the secondary ends alive so the primary's `transport.recv()`
+/// future stays pending (a dropped sender would close the recv arm).
+///
+/// `keepalive_interval` is short and `mesh_ready_timeout` is a few
+/// keepalive intervals so the pre-operational keepalive arm has room to
+/// tick at least once before the wait times out — the emission-lifetime
+/// invariant under test. Both tests drive `tokio::time` paused.
+#[allow(clippy::type_complexity)]
+fn make_recording_coordinator(
+    num_secondaries: u32,
+    keepalive_interval: Duration,
+    mesh_ready_timeout: Duration,
+) -> (
+    PrimaryCoordinator<
+        ChannelSecondaryTransportEnd<TestId>,
+        RecordingPeer<TestId>,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>,
+    Vec<(
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        tokio::sync::mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    )>,
+) {
+    let (transport, secondary_ends) = setup_test(num_secondaries);
+    let config = PrimaryConfig {
+        node_id: "primary".into(),
+        num_secondaries,
+        connect_timeout: Duration::from_secs(1),
+        peer_timeout: Duration::from_secs(1),
+        keepalive_interval,
+        keepalive_miss_threshold: 3,
+        source_pre_staged_root: None,
+        uses_file_based_items: false,
+        required_setup_on_promote: false,
+        max_concurrent_per_type: HashMap::new(),
+        retry_max_passes: 0,
+        oom_retry_max_passes: 0,
+        fleet_dead_timeout: Duration::from_secs(1),
+        mesh_ready_timeout,
+        mass_death_grace: Duration::from_secs(1),
+        mass_death_min_count: 2,
+        source_dir: None,
+        unfulfillable_reinject_max_per_task: None,
+        setup_promote_deadline: Duration::from_secs(600),
+    };
+    let recorder = RecordingPeer::<TestId>::new();
+    let log = recorder.log_handle();
+    let coordinator = PrimaryCoordinator::new(
+        config,
+        transport,
+        recorder,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    (coordinator, log, secondary_ends)
+}
+
+/// Register a secondary in the primary's routable set so the keepalive
+/// emitter does not early-return on an empty fleet. The pre-welcome
+/// `AwaitingWelcome` state is enough for the emission assertion: the
+/// emitter only checks `secondaries.is_empty()` and reads
+/// `self.config.node_id` + `self.workers` — it does not depend on the
+/// connection's typestate.
+fn seed_secondary(
+    coordinator: &mut PrimaryCoordinator<
+        ChannelSecondaryTransportEnd<TestId>,
+        RecordingPeer<TestId>,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    secondary_id: &str,
+) {
+    coordinator.secondaries.insert(
+        secondary_id.into(),
+        SecondaryConnectionState::AwaitingWelcome(SecondaryConnection::new(
+            secondary_id.into(),
+        )),
+    );
+}
+
+/// Count the `Keepalive` messages in a recorded broadcast log.
+fn count_keepalives(log: &std::rc::Rc<std::cell::RefCell<Vec<DistributedMessage<TestId>>>>) -> usize {
+    log.borrow()
+        .iter()
+        .filter(|m| matches!(m, DistributedMessage::Keepalive { .. }))
+        .count()
+}
+
+/// Emission-lifetime invariant (sub-fix A), convergence point:
+/// `activate_local_primary` is the single point both bootstrap and
+/// failover reach when this node asserts primary authority. It MUST emit
+/// one keepalive so a just-promoted/just-bootstrapped primary is not
+/// silent over the authority↔worker link until the operational loop's
+/// first `heartbeat_tick` fires. Asserts the emission CALL was issued
+/// over the peer transport (delivery is not asserted — for the parked
+/// failover primary the transport is a no-op until A-M2 swaps it).
+#[tokio::test(flavor = "current_thread")]
+async fn activate_local_primary_emits_a_keepalive() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, log, _ends) = make_recording_coordinator(
+                1,
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            );
+            seed_secondary(&mut coordinator, "sec-0");
+
+            assert_eq!(
+                count_keepalives(&log),
+                0,
+                "no keepalive should have been emitted before activation"
+            );
+
+            coordinator
+                .activate_local_primary()
+                .await
+                .expect("activation succeeds");
+
+            assert_eq!(
+                count_keepalives(&log),
+                1,
+                "activate_local_primary must emit exactly one keepalive at the \
+                 authority convergence point"
+            );
+        })
+        .await;
+}
+
+/// Emission-lifetime invariant (sub-fix A), pre-operational window: the
+/// bootstrap region (`perform_initial_assignment → wait_for_mesh_ready →
+/// activate_local_primary → operational_loop`) can outlast the
+/// secondary's primary-silence deadline while the mesh forms, yet only
+/// the operational loop used to tick keepalives. `wait_for_mesh_ready`
+/// must tick the SAME emitter so liveness is asserted across the wait.
+///
+/// Driven with paused time: one secondary is in the routable set but NOT
+/// in `mesh_ready_secondaries`, so the wait enters its loop and blocks
+/// until the mesh-ready timeout. Holding the secondary-end senders keeps
+/// `transport.recv()` pending, so the heartbeat-tick arm is what fires.
+/// Asserts at least one keepalive was emitted before the timeout returns.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn wait_for_mesh_ready_ticks_keepalive() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // keepalive every 100ms, mesh-ready timeout at 350ms → at
+            // least three keepalive ticks fit before the wait gives up.
+            let (mut coordinator, log, _ends) = make_recording_coordinator(
+                1,
+                Duration::from_millis(100),
+                Duration::from_millis(350),
+            );
+            seed_secondary(&mut coordinator, "sec-0");
+
+            // `sec-0` never reports MeshReady → the wait blocks on its
+            // select! until the mesh-ready deadline elapses, ticking the
+            // pre-operational keepalive arm in the meantime.
+            let mut no_cmd_rx: Option<
+                tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>,
+            > = None;
+            coordinator
+                .wait_for_mesh_ready(&mut no_cmd_rx)
+                .await
+                .expect("wait returns on the mesh-ready timeout");
+
+            assert!(
+                count_keepalives(&log) >= 1,
+                "wait_for_mesh_ready must tick the keepalive emitter across the \
+                 pre-operational window; got {}",
+                count_keepalives(&log)
+            );
+        })
+        .await;
 }
 
 /// The per-phase retry bucket primitive must NOT reinject entries
