@@ -74,6 +74,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
              promoting primary"
         );
 
+        // Pre-operational keepalive cadence. The bootstrap region
+        // (`perform_initial_assignment` → here → `activate_local_primary`
+        // → `operational_loop`) can outlast the secondary's
+        // primary-silence deadline (`keepalive_interval *
+        // keepalive_miss_threshold`) while waiting for the mesh to form,
+        // yet the operational loop — the only place keepalives ticked —
+        // hasn't started. Tick the SAME emitter here so liveness is
+        // asserted across the whole pre-operational window. Same shape
+        // as `operational_loop`'s `heartbeat_tick`: the immediate first
+        // tick is skipped (secondaries may not have sent their own first
+        // keepalive yet), the cadence is `keepalive_interval`.
+        let mut heartbeat_tick = tokio::time::interval(self.config.keepalive_interval);
+        heartbeat_tick.tick().await;
+
         loop {
             if expected.is_subset(&self.mesh_ready_secondaries) {
                 tracing::info!(
@@ -98,6 +112,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         Some(m) => self.dispatch_message(m, command_rx).await?,
                         None => return Err("transport closed during wait_for_mesh_ready".into()),
                     }
+                }
+                _ = heartbeat_tick.tick() => {
+                    // Reuse the heartbeat module's sole emitter so the
+                    // pre-operational window asserts liveness on the
+                    // same cadence the operational loop uses. No
+                    // spawned task, no second send path — one keepalive
+                    // origination point shared across the lifecycle.
+                    self.broadcast_primary_keepalive().await;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let missing: Vec<String> = expected
@@ -205,6 +227,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             "co-located primary activated as sole authority; secondaries route \
              Role::Primary to their uplink (this node) — no remote PromotePrimary"
         );
+
+        // Liveness spans authority, not the operational phase. This is
+        // the single bootstrap+failover convergence point (the brief's
+        // `activate_local_primary`), so emit one keepalive here the
+        // moment authority is asserted — before `operational_loop`'s
+        // `heartbeat_tick` is even constructed. Without this a just-
+        // promoted/just-bootstrapped primary is silent over the
+        // authority↔worker link until the first operational tick fires,
+        // and a secondary that stopped seeing keepalives during the
+        // handoff window would trip `primary_silent` and re-elect.
+        // Reuses the heartbeat module's sole emitter (no spawned task,
+        // no second send path) so there remains exactly one keepalive
+        // origination point.
+        self.broadcast_primary_keepalive().await;
+
         Ok(())
     }
 
