@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo};
-use dynrunner_protocol_primary_secondary::{PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 

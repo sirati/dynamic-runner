@@ -23,7 +23,7 @@ use super::types::{
 // the end-to-end pipeline without cross-file hopping.
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 impl<Tr, S, E, I> crate::primary::PrimaryCoordinator<Tr, S, E, I>

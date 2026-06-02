@@ -24,7 +24,7 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
-use dynrunner_protocol_primary_secondary::{PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;

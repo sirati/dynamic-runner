@@ -44,7 +44,7 @@
 use std::panic::AssertUnwindSafe;
 
 use dynrunner_core::Identifier;
-use dynrunner_protocol_primary_secondary::{PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
