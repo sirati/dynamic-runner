@@ -47,6 +47,21 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         action="store_true",
         help="Use raw log formatting (no level, timestamp - only prefix and message)",
     )
+    parser.add_argument(
+        "--important-stdio-only",
+        action="store_true",
+        help=(
+            "LLM-wake stdio mode: send only important (wake-worthy) events to "
+            "stdout while the FULL log keeps everything in a file. Drives the "
+            "native runner's dual-sink subscriber via DYNRUNNER_IMPORTANT_STDIO_ONLY "
+            "and DYNRUNNER_FULL_LOG_FILE (scanned from argv before the first "
+            "_native import) and suppresses Python's own console handler, "
+            "redirecting Python logs to the same full-log file. The full-log "
+            "path defaults to ./dynrunner-full.log; pre-export "
+            "DYNRUNNER_FULL_LOG_FILE to override. Off by default (today's "
+            "console logging)."
+        ),
+    )
 
     add_selection_arguments(parser)
 
