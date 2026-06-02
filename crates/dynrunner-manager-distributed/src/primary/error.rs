@@ -37,21 +37,18 @@ pub enum RunError {
     },
     /// Operator-initiated emergency stop via the panik-watcher.
     /// The primary observed its panik file (any of the configured
-    /// `--panik-file` paths), broadcast
-    /// `ClusterMutation::PanikRequested` to every secondary on
-    /// the peer mesh, and is returning so the PyO3 wrapper can
-    /// call `std::process::exit(137)`. The SLURM wrapper sees
-    /// exit 137 and reaps the podman container; secondaries on
-    /// other nodes have either already observed their own panik
-    /// file or learn about the cluster-wide stop through the
-    /// broadcast and follow suit.
+    /// `--panik-file` paths), announced its own departure via a
+    /// self-authored `ClusterMutation::PeerRemoved { SelfDeparture }`
+    /// (membership/observability only — peers LOG it and mark this
+    /// node Dead, the run is NOT terminated on peers), and is
+    /// returning so the PyO3 wrapper can call `std::process::exit(137)`.
+    /// The SLURM wrapper sees exit 137 and reaps the podman container;
+    /// peers continue / re-elect as appropriate.
     ///
     /// `matched_path` is the first panik file that existed on
     /// this node (input-order priority — see
     /// `PanikWatcherConfig.paths` doc). `reason` is the shape
-    /// `"panik file: <path>"` carried in the broadcast
-    /// `ClusterMutation::PanikRequested.reason` so terminal logs
-    /// across the cluster all surface the same sentinel.
+    /// `"panik file: <path>"` carried in the `SelfDeparture` payload.
     ///
     /// Why a separate variant rather than `Other(String)`: the
     /// PyO3 boundary needs to translate panik into

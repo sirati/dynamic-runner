@@ -1,23 +1,21 @@
-//! Tests for the `ClusterMutation::PanikRequested` apply rule and the
-//! `TaskState::Cancelled` variant introduced by the operator-initiated
-//! emergency-shutdown feature.
+//! Tests for the panik → self-departure CRDT contract.
 //!
-//! Single concern: pin the load-bearing properties downstream code
-//! relies on:
-//!   - non-terminal entries (`Pending`, `InFlight`, `Blocked`) sweep
-//!     to `Cancelled`;
-//!   - terminal entries (`Completed`, `Failed`, `Unfulfillable`)
-//!     preserve;
-//!   - sticky-first-wins under repeated `PanikRequested`;
-//!   - late `TaskCompleted` against `Cancelled` succeeds (success is
-//!     the strongest terminal);
-//!   - late `TaskFailed` / `TaskBlocked` against `Cancelled` are
-//!     silent NoOps (operator-stopped state is preserved);
-//!   - `StateCounts.cancelled` and `OutcomeSummary.cancelled` partition
-//!     correctly;
-//!   - snapshot/restore round-trips the panik latch + reason.
+//! Single concern: a node observing its OWN panik signal announces its
+//! departure from the mesh via a self-authored
+//! `ClusterMutation::PeerRemoved { id: <self>, cause:
+//! SelfDeparture(reason) }`. The apply rule for that mutation is
+//! observability-only — it marks the peer `Dead`, fires
+//! `PeerLifecycleEvent::Removed`, and leaves the task ledger UNTOUCHED.
+//! It does NOT cancel cluster work or move any task to a terminal
+//! state on a peer.
+//!
+//! These pin the post-`PanikRequested` contract: there is no longer a
+//! cluster-wide cancel-sweep, no `panik_active` latch, and no
+//! `TaskState::Cancelled`. A peer's departure never touches another
+//! node's task accounting.
 
 use super::*;
+use dynrunner_core::BoundedString;
 
 fn seed_with_one_pending() -> (ClusterState<RunnerIdentifier>, String) {
     let mut s = ClusterState::<RunnerIdentifier>::new();
@@ -28,62 +26,63 @@ fn seed_with_one_pending() -> (ClusterState<RunnerIdentifier>, String) {
     (s, "h".to_string())
 }
 
-#[test]
-fn panik_sets_sticky_flag_and_records_reason() {
-    let (mut s, _) = seed_with_one_pending();
-    assert!(!s.panik_active());
-    assert_eq!(s.panik_reason(), None);
-    assert_eq!(s.panik_source(), None);
+/// A self-authored `PeerRemoved { SelfDeparture(reason) }` for the
+/// node's OWN id is accepted and applied: the peer is marked Dead and
+/// a `PeerLifecycleEvent::Removed` carrying the cause is emitted. This
+/// is the membership-layer rule that a node may author its own
+/// departure (vs. the historically primary-authored-only removal).
+#[tokio::test]
+async fn self_authored_departure_marks_peer_dead_and_emits_removed_event() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    s.install_lifecycle_sender(tx);
+    // The node is alive in the mesh.
+    s.apply(ClusterMutation::PeerJoined {
+        peer_id: "self-node".into(),
+        is_observer: false,
+    });
+    // Drain the Added event.
+    let _ = rx.try_recv();
 
-    let outcome = s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "file: /tmp/asm-tokenizer.panik".into(),
+    let reason = "panik file: /tmp/asm.panik".to_string();
+    let outcome = s.apply(ClusterMutation::PeerRemoved {
+        id: "self-node".into(),
+        cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
     });
     assert_eq!(outcome, ApplyOutcome::Applied);
-    assert!(s.panik_active());
-    assert_eq!(s.panik_reason(), Some("file: /tmp/asm-tokenizer.panik"));
-    assert_eq!(s.panik_source(), Some("primary"));
+
+    match rx.try_recv() {
+        Ok(crate::peer_lifecycle::PeerLifecycleEvent::Removed { id, cause }) => {
+            assert_eq!(id, "self-node");
+            assert_eq!(
+                cause,
+                RemovalCause::SelfDeparture(BoundedString::from(reason)),
+            );
+        }
+        other => panic!("expected Removed event with SelfDeparture cause, got {other:?}"),
+    }
 }
 
-#[test]
-fn second_panik_is_noop_first_wins() {
-    // Two distinct nodes detecting the file independently and
-    // broadcasting in parallel must converge: the second-applying
-    // broadcast finds the latch set and exits silently, leaving the
-    // first-applying source/reason as canonical.
-    let (mut s, _) = seed_with_one_pending();
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "first".into(),
-    });
-    let outcome = s.apply(ClusterMutation::PanikRequested {
-        source_peer: "secondary-3".into(),
-        reason: "second".into(),
-    });
-    assert_eq!(outcome, ApplyOutcome::NoOp);
-    assert_eq!(s.panik_source(), Some("primary"));
-    assert_eq!(s.panik_reason(), Some("first"));
-}
-
-#[test]
-fn panik_sweeps_pending_in_flight_and_blocked_to_cancelled() {
+/// Negative control: a peer applying another node's self-departure
+/// `PeerRemoved` must NOT move any task to a terminal / cancelled
+/// state. The task ledger is observably unchanged by the departure.
+#[tokio::test]
+async fn peer_departure_does_not_touch_task_ledger() {
     let mut s = ClusterState::<RunnerIdentifier>::new();
-    // Pending
+    // Seed a mix of non-terminal task states.
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-pending".into(),
         task: mk_task("a"),
     });
-    // InFlight
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-inflight".into(),
         task: mk_task("b"),
     });
     s.apply(ClusterMutation::TaskAssigned {
         hash: "h-inflight".into(),
-        secondary: "s1".into(),
+        secondary: "departing".into(),
         worker: 0,
     });
-    // Blocked: seed a prereq Unfulfillable then a dependent TaskBlocked
     s.apply(ClusterMutation::TaskAdded {
         hash: "h-blocked".into(),
         task: mk_task("c"),
@@ -93,211 +92,59 @@ fn panik_sweeps_pending_in_flight_and_blocked_to_cancelled() {
         on: "h-prereq".into(),
     });
 
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
-    });
+    let counts_before = s.counts();
 
-    for h in ["h-pending", "h-inflight", "h-blocked"] {
-        assert!(
-            matches!(s.task_state(h), Some(TaskState::Cancelled { reason, .. }) if reason == "stop"),
-            "{h} must be Cancelled after panik"
-        );
-    }
-}
-
-#[test]
-fn panik_preserves_completed_failed_unfulfillable() {
-    let mut s = ClusterState::<RunnerIdentifier>::new();
-    // Completed
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h-comp".into(),
-        task: mk_task("a"),
+    let outcome = s.apply(ClusterMutation::PeerRemoved {
+        id: "departing".into(),
+        cause: RemovalCause::SelfDeparture(BoundedString::from("panik SIGTERM (per-host)")),
     });
-    s.apply(ClusterMutation::TaskCompleted {
-        hash: "h-comp".into(),
-        result_data: None,
-    });
-    // Failed
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h-fail".into(),
-        task: mk_task("b"),
-    });
-    s.apply(ClusterMutation::TaskFailed {
-        hash: "h-fail".into(),
-        kind: ErrorType::NonRecoverable,
-        error: "boom".into(),
-    });
-    // Unfulfillable
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h-unf".into(),
-        task: mk_task("c"),
-    });
-    s.apply(ClusterMutation::TaskFailed {
-        hash: "h-unf".into(),
-        kind: ErrorType::Unfulfillable {
-            reason: "no holder".into(),
-        },
-        error: "n/a".into(),
-    });
-
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
-    });
-
-    assert!(matches!(
-        s.task_state("h-comp"),
-        Some(TaskState::Completed { .. })
-    ));
-    assert!(matches!(
-        s.task_state("h-fail"),
-        Some(TaskState::Failed { .. })
-    ));
-    assert!(matches!(
-        s.task_state("h-unf"),
-        Some(TaskState::Unfulfillable { .. })
-    ));
-}
-
-#[test]
-fn late_task_completed_against_cancelled_supersedes_to_completed() {
-    // Worker finished a task milliseconds before the panik kill
-    // reached it; the TaskCompleted broadcast lands after
-    // PanikRequested. Success is the strongest terminal regardless
-    // of arrival order — the entry transitions Cancelled → Completed.
-    let (mut s, hash) = seed_with_one_pending();
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
-    });
-    assert!(matches!(
-        s.task_state(&hash),
-        Some(TaskState::Cancelled { .. })
-    ));
-    let outcome = s.apply(ClusterMutation::TaskCompleted { hash: hash.clone(), result_data: None });
     assert_eq!(outcome, ApplyOutcome::Applied);
+
+    // Negative control: NOTHING in the task ledger moved. The
+    // departure is membership-only.
+    let counts_after = s.counts();
+    assert_eq!(
+        counts_before, counts_after,
+        "a peer's self-departure must not change any task's state",
+    );
     assert!(matches!(
-        s.task_state(&hash),
-        Some(TaskState::Completed { .. })
+        s.task_state("h-pending"),
+        Some(TaskState::Pending { .. })
+    ));
+    assert!(matches!(
+        s.task_state("h-inflight"),
+        Some(TaskState::InFlight { .. })
+    ));
+    assert!(matches!(
+        s.task_state("h-blocked"),
+        Some(TaskState::Blocked { .. })
     ));
 }
 
+/// `SelfDeparture` round-trips through the `PeerRemoved` apply on a
+/// previously-unseen id (the departing node need not have a prior
+/// `PeerJoined` in this replica's view): an absent id is inserted as
+/// Dead so a late `PeerJoined` for the same id is blocked.
 #[test]
-fn late_task_failed_against_cancelled_is_noop() {
-    // Operator-stopped state is preserved against a late
-    // worker-surfaced failure (the panik kill happened, the worker's
-    // outgoing TaskFailed message races and arrives after the
-    // cancellation). Cancelled wins for non-success terminals.
+fn self_departure_for_unseen_id_inserts_dead_and_preserves_ledger() {
     let (mut s, hash) = seed_with_one_pending();
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
+    let outcome = s.apply(ClusterMutation::PeerRemoved {
+        id: "never-joined".into(),
+        cause: RemovalCause::SelfDeparture(BoundedString::from("panik file: /x")),
     });
-    let outcome = s.apply(ClusterMutation::TaskFailed {
-        hash: hash.clone(),
-        kind: ErrorType::NonRecoverable,
-        error: "boom".into(),
-    });
-    assert_eq!(outcome, ApplyOutcome::NoOp);
+    assert_eq!(outcome, ApplyOutcome::Applied);
+    // Ledger untouched.
     assert!(matches!(
         s.task_state(&hash),
-        Some(TaskState::Cancelled { .. })
+        Some(TaskState::Pending { .. })
     ));
-}
-
-#[test]
-fn late_task_blocked_against_cancelled_is_noop() {
-    let (mut s, hash) = seed_with_one_pending();
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
-    });
-    let outcome = s.apply(ClusterMutation::TaskBlocked {
-        hash: hash.clone(),
-        on: "other".into(),
-    });
-    assert_eq!(outcome, ApplyOutcome::NoOp);
-    assert!(matches!(
-        s.task_state(&hash),
-        Some(TaskState::Cancelled { .. })
-    ));
-}
-
-#[test]
-fn counts_and_outcome_summary_include_cancelled_bucket() {
-    let mut s = ClusterState::<RunnerIdentifier>::new();
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h-a".into(),
-        task: mk_task("a"),
-    });
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h-b".into(),
-        task: mk_task("b"),
-    });
-    s.apply(ClusterMutation::TaskAdded {
-        hash: "h-c".into(),
-        task: mk_task("c"),
-    });
-    s.apply(ClusterMutation::TaskCompleted {
-        hash: "h-a".into(),
-        result_data: None,
-    });
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
-    });
-
-    let c = s.counts();
-    assert_eq!(c.completed, 1);
-    assert_eq!(c.cancelled, 2);
-    assert_eq!(c.pending, 0);
-
-    let o = s.outcome_counts();
-    assert_eq!(o.succeeded, 1);
-    assert_eq!(o.cancelled, 2);
-    assert_eq!(o.fail_retry, 0);
-    assert_eq!(o.fail_oom, 0);
-    assert_eq!(o.fail_final, 0);
-    assert_eq!(o.total_terminal(), 3);
-}
-
-#[test]
-fn snapshot_round_trips_panik_latch_and_cancelled_state() {
-    // Source replica observes the panik; its snapshot must carry
-    // the latch + reason so a late-joiner restoring from this
-    // snapshot inherits the same operator-stop state.
-    let (mut source, _) = seed_with_one_pending();
-    source.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "file: /tmp/asm.panik".into(),
-    });
-    let snap = source.snapshot();
-
-    let mut sink = ClusterState::<RunnerIdentifier>::new();
-    sink.restore(snap);
-    assert!(sink.panik_active());
-    assert_eq!(sink.panik_reason(), Some("file: /tmp/asm.panik"));
-    assert_eq!(sink.panik_source(), Some("primary"));
-    assert!(matches!(
-        sink.task_state("h"),
-        Some(TaskState::Cancelled { .. })
-    ));
-}
-
-#[test]
-fn snapshot_with_panik_false_does_not_clear_local_latch() {
-    // Monotonic-true: a snapshot from a peer who hasn't yet seen the
-    // panik mutation (`panik_active = false`) must NOT regress a
-    // local replica that already latched. The restore's lattice-
-    // merge contract for sticky flags is "true wins".
-    let (mut s, _) = seed_with_one_pending();
-    s.apply(ClusterMutation::PanikRequested {
-        source_peer: "primary".into(),
-        reason: "stop".into(),
-    });
-    let pre = ClusterState::<RunnerIdentifier>::new();
-    s.restore(pre.snapshot());
-    assert!(s.panik_active());
-    assert_eq!(s.panik_reason(), Some("stop"));
+    // Sticky-per-id still holds: a late PeerJoined for the same id is
+    // a NoOp.
+    assert_eq!(
+        s.apply(ClusterMutation::PeerJoined {
+            peer_id: "never-joined".into(),
+            is_observer: false,
+        }),
+        ApplyOutcome::NoOp,
+    );
 }

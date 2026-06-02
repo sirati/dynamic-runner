@@ -579,8 +579,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // exactly once: with `Ok(signal)` on first-matching
                 // panik file, or with `Err(_)` if the watcher's
                 // sender was dropped (empty paths config or task
-                // abort on coordinator drop). On `Ok` we broadcast
-                // `ClusterMutation::PanikRequested` and stash the
+                // abort on coordinator drop). On `Ok` we announce a
+                // self-authored `ClusterMutation::PeerRemoved
+                // { SelfDeparture }` (observability only) and stash the
                 // (matched_path, reason) on `self.panik_outcome` so
                 // the outer `run_pipeline` can translate it into
                 // `RunError::PanikShutdown`. Breaking out of the

@@ -92,8 +92,7 @@ where
                         | crate::cluster_state::TaskState::Completed { task }
                         | crate::cluster_state::TaskState::Failed { task, .. }
                         | crate::cluster_state::TaskState::Unfulfillable { task, .. }
-                        | crate::cluster_state::TaskState::Blocked { task, .. }
-                        | crate::cluster_state::TaskState::Cancelled { task, .. } => task,
+                        | crate::cluster_state::TaskState::Blocked { task, .. } => task,
                     };
                     task.task_id == task_id
                 })

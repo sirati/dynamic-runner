@@ -81,31 +81,6 @@ pub enum TaskState<I> {
         task: TaskInfo<I>,
         on: String,
     },
-    /// Operator-initiated emergency cancellation. The
-    /// `ClusterMutation::PanikRequested` apply rule transitions every
-    /// non-terminal entry (`Pending` / `InFlight` / `Blocked`) to this
-    /// variant in one sweep, latching the `panik_active` ClusterState
-    /// flag at the same time. `reason` mirrors the originator's
-    /// broadcast payload (e.g. the path of the panik file that
-    /// triggered the broadcast).
-    ///
-    /// Discrete variant rather than `Failed { kind: NonRecoverable,
-    /// last_error: "panik" }` for the same reason `Unfulfillable` is
-    /// discrete: downstream matcher / state-filter / metrics logic
-    /// can dispatch on the discriminant without parsing a free-form
-    /// `last_error` string. `OutcomeSummary.cancelled` partitions on
-    /// this variant; a real `Failed { NonRecoverable, .. }` (worker-
-    /// surfaced terminal failure) is counted under `fail_final`
-    /// independently.
-    ///
-    /// Late-arriving `TaskCompleted` for a hash in this state still
-    /// transitions to `Completed` (success is the strongest terminal
-    /// across all non-`Completed` predecessors, including
-    /// `Cancelled`). Late `TaskFailed` against `Cancelled` is a NoOp.
-    Cancelled {
-        task: TaskInfo<I>,
-        reason: String,
-    },
 }
 
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge
@@ -130,10 +105,6 @@ pub struct StateCounts {
     /// of an unfulfillable prerequisite, dormant until the prereq
     /// completes via the reinject + re-run path.
     pub blocked: usize,
-    /// Tasks in `TaskState::Cancelled { .. }` — operator-initiated
-    /// emergency-stop transitions originated by a
-    /// `ClusterMutation::PanikRequested` broadcast.
-    pub cancelled: usize,
 }
 
 /// Per-class outcome breakdown the primary emits on every
@@ -173,26 +144,16 @@ pub struct OutcomeSummary {
     pub fail_retry: usize,
     pub fail_oom: usize,
     pub fail_final: usize,
-    /// Operator-initiated panik-shutdown transitions
-    /// (`TaskState::Cancelled`). Independent of every `fail_*` bucket:
-    /// a cancelled task is neither a real success nor a real failure
-    /// — it's an "operator stopped the run" terminal. Surfaces in
-    /// operator logs so an emergency-stopped run's terminal report
-    /// reads `succeeded=A fail_retry=B fail_oom=C fail_final=D
-    /// cancelled=E` rather than burying the panik count inside
-    /// `fail_final`.
-    pub cancelled: usize,
 }
 
 impl OutcomeSummary {
     /// Sum across all buckets — the total tasks that reached a
-    /// terminal state (success, any failure, or cancellation).
-    /// Distinct from `total_tasks` on the coordinator, which counts
-    /// the input batch; `total_terminal()` reaches `total_tasks`
-    /// exactly when the run is fully accounted for (including
-    /// panik-cancelled tasks).
+    /// terminal state (success or any failure). Distinct from
+    /// `total_tasks` on the coordinator, which counts the input
+    /// batch; `total_terminal()` reaches `total_tasks` exactly when
+    /// the run is fully accounted for.
     pub fn total_terminal(&self) -> usize {
-        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final + self.cancelled
+        self.succeeded + self.fail_retry + self.fail_oom + self.fail_final
     }
 }
 

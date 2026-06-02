@@ -12,10 +12,10 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo};
+use dynrunner_core::{BoundedString, Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
+    ClusterMutation, DistributedMessage, PeerTransport, RemovalCause,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -188,18 +188,20 @@ where
     ///
     /// **File source** (`matched_path` is a real filesystem path,
     /// matched by [`crate::panik_watcher::PanikWatcherConfig::paths`]):
-    /// operator-initiated cluster-wide stop. All three steps fire:
-    ///   1. Originate `ClusterMutation::PanikRequested` carrying the
-    ///      matched-path-derived reason — applied locally (so this
-    ///      node's own `cluster_state.panik_active` flips immediately)
-    ///      and fanned out to every peer via
-    ///      [`Self::apply_and_broadcast_mutations`]. Peers that have
-    ///      not seen their own panik file yet learn about the
-    ///      cluster-wide stop here.
+    /// this node is leaving the mesh. All three steps fire:
+    ///   1. Announce departure: originate a self-authored
+    ///      `ClusterMutation::PeerRemoved { id: <self>, cause:
+    ///      SelfDeparture(reason) }` — applied locally and fanned out
+    ///      to every peer via [`Self::apply_and_broadcast_mutations`].
+    ///      Peers LOG the departure and mark this node Dead. This is
+    ///      observability only: it does NOT cancel cluster work or
+    ///      terminate the run on peers, and the mesh stays free to
+    ///      continue / re-elect.
     ///   2. Take down every worker pgid this secondary owns via
     ///      [`dynrunner_manager_local::pool::WorkerPool::kill_all_workers_with_grace`].
     ///   3. Surface the matched path + reason to the caller for
-    ///      [`crate::secondary::RunOutcome::PanikShutdown`].
+    ///      [`crate::secondary::RunOutcome::PanikShutdown`] (this
+    ///      node's own local exit).
     ///
     /// **SIGTERM source** (`matched_path` is the documented sentinel
     /// [`crate::panik_watcher::SIGTERM_SENTINEL_PATH`], fired by the
@@ -207,13 +209,10 @@ where
     /// [`crate::panik_watcher::PanikWatcherConfig::listen_for_sigterm`]
     /// is enabled): per-host SIGTERM (e.g. SLURM time-limit /
     /// `scancel` forwarded as `podman exec <c> kill -TERM <pid>`).
-    /// This host's SIGTERM does NOT carry cluster-wide operator
-    /// intent — a delayed/missed-SIGTERM peer should remain free to
-    /// re-elect and continue the run. The cluster broadcast is
-    /// SKIPPED; only steps 2 and 3 fire (local-only teardown). The
-    /// CRDT's sticky-monotonic `PanikRequested` apply rule would
-    /// otherwise force every peer to exit — that is the cascade-
-    /// shutdown bug this branching prevents.
+    /// This host's SIGTERM is a purely local event — no mesh
+    /// announcement is broadcast; only steps 2 and 3 fire (local-only
+    /// teardown + exit). A delayed/missed-SIGTERM peer remains free to
+    /// re-elect and continue the run.
     ///
     /// Kill primitive uses negative-pgid `kill(-pgid, ...)` so worker
     /// descendants (subprocess pools, container exec children, etc.)
@@ -254,18 +253,22 @@ where
             tracing::warn!(
                 secondary = %self.config.secondary_id,
                 matched_path = %matched_path.display(),
-                "panik file observed; broadcasting PanikRequested and \
+                "panik file observed; announcing self-departure and \
                  tearing down workers"
             );
-            let source_peer = self.config.secondary_id.clone();
-            let mutation = ClusterMutation::PanikRequested {
-                source_peer,
-                reason: reason.clone(),
+            // Self-authored departure announcement: peers LOG it and
+            // mark this node Dead (observability only). It does NOT
+            // cancel cluster work or terminate the run on peers — the
+            // mesh stays free to continue / re-elect. `BoundedString::from`
+            // truncates at the 1 KiB cap `SelfDeparture` carries.
+            let mutation = ClusterMutation::PeerRemoved {
+                id: self.config.secondary_id.clone(),
+                cause: RemovalCause::SelfDeparture(BoundedString::from(reason.clone())),
             };
             if let Err(e) = self.apply_and_broadcast_mutations(vec![mutation]).await {
                 tracing::warn!(
                     error = %e,
-                    "panik PanikRequested apply+broadcast failed; \
+                    "panik self-departure apply+broadcast failed; \
                      proceeding with local worker teardown anyway"
                 );
             }

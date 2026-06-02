@@ -26,16 +26,17 @@ use std::time::Duration;
 ///   (RunComplete observed, drain-down after primary disconnect, or
 ///   single-secondary clean exit). The worker pool has been stopped
 ///   and the secondary is finished.
-/// - `PanikShutdown`: the operator-initiated panik watcher observed
-///   its sentinel file. The coordinator broadcast
-///   `ClusterMutation::PanikRequested`, took down every worker AND
-///   its child tree with `pool.kill_all_workers_with_grace`, and is
-///   returning so the PyO3 wrapper can call `std::process::exit(137)`
-///   for the SLURM wrapper to reap. `matched_path` is the first
-///   panik file that existed (used by the PyO3 wrapper for the
-///   shutdown-cause log); `reason` is the human-readable shape
-///   `"panik file: <path>"` carried in the broadcast
-///   `ClusterMutation::PanikRequested.reason` field.
+/// - `PanikShutdown`: the panik watcher observed its sentinel file (or
+///   SIGTERM). The coordinator announced its own departure (file
+///   source: a self-authored `ClusterMutation::PeerRemoved
+///   { SelfDeparture }` — observability only, peers are NOT terminated),
+///   took down every worker AND its child tree with
+///   `pool.kill_all_workers_with_grace`, and is returning so the PyO3
+///   wrapper can call `std::process::exit(137)` for the SLURM wrapper
+///   to reap. `matched_path` is the first panik file that existed
+///   (used by the PyO3 wrapper for the shutdown-cause log); `reason`
+///   is the human-readable shape `"panik file: <path>"` carried in the
+///   `SelfDeparture` payload.
 ///
 /// Note: `RunOutcome` is no longer `Copy`/`Eq` — the `PanikShutdown`
 /// variant carries a `PathBuf` + `String` payload. Existing call

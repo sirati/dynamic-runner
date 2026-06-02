@@ -97,8 +97,7 @@ where
             | TaskState::Completed { task }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
-            | TaskState::Blocked { task, .. }
-            | TaskState::Cancelled { task, .. } => task,
+            | TaskState::Blocked { task, .. } => task,
         };
         Some((task.phase_id.clone(), task.task_id.clone()))
     }
@@ -371,8 +370,7 @@ where
                         | crate::cluster_state::TaskState::Completed { task }
                         | crate::cluster_state::TaskState::Failed { task, .. }
                         | crate::cluster_state::TaskState::Unfulfillable { task, .. }
-                        | crate::cluster_state::TaskState::Blocked { task, .. }
-                        | crate::cluster_state::TaskState::Cancelled { task, .. } => task,
+                        | crate::cluster_state::TaskState::Blocked { task, .. } => task,
                     };
                     task.task_id == task_id
                 })

@@ -1,23 +1,31 @@
-//! Integration tests for the panik (operator-initiated emergency
-//! stop) end-to-end wire path on the secondary.
+//! Integration tests for the panik → self-departure end-to-end wire
+//! path on the secondary.
 //!
 //! Single concern of this file: pin the pipeline
-//! "watcher signal arrives → coordinator reacts (broadcast or not
-//! per source) → coordinator returns `RunOutcome::PanikShutdown`".
+//! "watcher signal arrives → coordinator reacts (announce departure or
+//! not, per source) → coordinator returns `RunOutcome::PanikShutdown`".
+//!
+//! A node observing its OWN panik signal announces its departure from
+//! the mesh via a self-authored
+//! `ClusterMutation::PeerRemoved { id: <self>, cause:
+//! SelfDeparture(reason) }`. That announcement is observability-only —
+//! peers LOG it and mark the node Dead; it does NOT cancel cluster work
+//! or terminate the run on peers. The departing node tears down its own
+//! workers and exits locally with `RunOutcome::PanikShutdown`.
 //!
 //! Two source-paths are covered, mirroring the watcher's two trigger
 //! sources (`panik_watcher::PanikWatcherConfig::paths` and
 //! `::listen_for_sigterm`):
 //!   - **File source** — `panik_file_source_broadcasts_and_returns_panik_shutdown`
-//!     pins "matched filesystem path → `ClusterMutation::PanikRequested`
-//!     reaches the primary wire, `RunOutcome::PanikShutdown` returned".
+//!     pins "matched filesystem path → self-authored
+//!     `ClusterMutation::PeerRemoved { SelfDeparture }` reaches the
+//!     primary wire, `RunOutcome::PanikShutdown` returned".
 //!   - **SIGTERM source** — `panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown`
-//!     pins "SIGTERM sentinel path → NO `PanikRequested` on the wire,
-//!     local-only teardown, `RunOutcome::PanikShutdown` still returned
-//!     with the SIGTERM sentinel path and per-host reason". This is the
-//!     load-bearing assertion against the cascade-shutdown bug: a single
-//!     host's SIGTERM must not force every peer to exit via the sticky-
-//!     monotonic CRDT.
+//!     pins "SIGTERM sentinel path → NO departure announcement on the
+//!     wire, local-only teardown, `RunOutcome::PanikShutdown` still
+//!     returned with the SIGTERM sentinel path and per-host reason".
+//!     A single host's SIGTERM is a purely local event and the mesh
+//!     stays free to continue / re-elect.
 //!
 //! The CRDT apply rule's tests live in
 //! `cluster_state/tests/panik.rs`; the watcher's standalone tests
@@ -32,7 +40,7 @@
 use std::time::Duration;
 
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, MessageType,
+    ClusterMutation, DistributedMessage, MessageType, RemovalCause,
 };
 use dynrunner_transport_channel::ChannelPrimaryTransportEnd;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -44,13 +52,14 @@ use super::super::*;
 /// panik oneshot receiver, fire the panik signal (carrying a real
 /// filesystem-style path, not the SIGTERM sentinel) once the loop is
 /// in `process_tasks`, and assert:
-///   1. the secondary emits a `ClusterMutation` carrying
-///      `PanikRequested` on the primary transport,
+///   1. the secondary emits a `ClusterMutation` carrying a
+///      self-authored `PeerRemoved { SelfDeparture }` on the primary
+///      transport,
 ///   2. `run_until_setup_or_done` returns `RunOutcome::PanikShutdown`
 ///      with the matched path the watcher carried.
 ///
-/// SIGTERM source has the inverted assertion shape (NO broadcast) and
-/// is covered by the sibling test below.
+/// SIGTERM source has the inverted assertion shape (NO announcement)
+/// and is covered by the sibling test below.
 #[tokio::test(flavor = "current_thread")]
 async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -141,10 +150,10 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
             // Fake primary task. Drives the setup handshake but
             // never sends any TaskAssignment — the secondary sits
             // in process_tasks until the panik signal lands. The
-            // fake primary also watches for the
-            // `ClusterMutation::PanikRequested` message and signals
-            // its arrival through a channel so the test can assert
-            // the wire fan-out happened.
+            // fake primary also watches for the self-authored
+            // `ClusterMutation::PeerRemoved { SelfDeparture }`
+            // message and signals its arrival through a channel so
+            // the test can assert the wire fan-out happened.
             let sec_id = "sec-panik".to_string();
             let (saw_panik_tx, mut saw_panik_rx) =
                 tokio_mpsc::unbounded_channel::<ClusterMutation<TestId>>();
@@ -212,7 +221,10 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                         for mutation in mutations {
                             if matches!(
                                 mutation,
-                                ClusterMutation::PanikRequested { .. }
+                                ClusterMutation::PeerRemoved {
+                                    cause: RemovalCause::SelfDeparture(_),
+                                    ..
+                                }
                             ) {
                                 let _ = saw_panik_tx.send(mutation.clone());
                             }
@@ -252,39 +264,51 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
                 ),
             }
 
-            // Confirm the broadcast reached the primary wire. The
-            // primary task above filtered for `PanikRequested`
-            // mutations; we should see at least one with a `reason`
-            // that matches the matched-path. Drop the primary task
-            // first so its `from_secondary.recv()` returns None
-            // and the loop exits cleanly.
+            // Confirm the departure announcement reached the primary
+            // wire. The primary task above filtered for self-authored
+            // `PeerRemoved { SelfDeparture }` mutations; we should see
+            // at least one whose `id` is the departing secondary and
+            // whose `SelfDeparture` reason references the matched path.
+            // Drop the primary task first so its
+            // `from_secondary.recv()` returns None and the loop exits
+            // cleanly.
             drop(pri_to_sec_tx);
             primary_task.abort();
             let _ = primary_task.await;
             // The mutation may or may not have reached us depending
-            // on race with the abort — but if it did, the reason
-            // must match. The wire emission is the load-bearing
+            // on race with the abort — but if it did, the id +
+            // reason must match. The wire emission is the load-bearing
             // assertion that drove this test in the first place;
             // sealing it with `try_recv` matches the production
             // contract (apply-and-broadcast logs a warning on send
             // failure but never blocks the panik-react path).
-            let mut saw_panik_broadcast = false;
+            let mut saw_departure = false;
             while let Ok(mutation) = saw_panik_rx.try_recv() {
-                if let ClusterMutation::PanikRequested { reason, .. } = mutation
+                if let ClusterMutation::PeerRemoved {
+                    id,
+                    cause: RemovalCause::SelfDeparture(reason),
+                } = mutation
                 {
-                    assert!(
-                        reason.contains("synthetic-panik-test"),
-                        "broadcast mutation's reason must reference the \
-                         matched path; got: {reason}"
+                    assert_eq!(
+                        id, "sec-panik",
+                        "self-departure must carry the departing node's \
+                         own id",
                     );
-                    saw_panik_broadcast = true;
+                    assert!(
+                        reason.as_str().contains("synthetic-panik-test"),
+                        "departure reason must reference the matched \
+                         path; got: {}",
+                        reason.as_str()
+                    );
+                    saw_departure = true;
                 }
             }
             assert!(
-                saw_panik_broadcast,
-                "primary wire never observed ClusterMutation::PanikRequested \
-                 within the test's bounded run window — the secondary's \
-                 panik arm did not broadcast"
+                saw_departure,
+                "primary wire never observed a self-authored \
+                 ClusterMutation::PeerRemoved {{ SelfDeparture }} within \
+                 the test's bounded run window — the secondary's panik \
+                 arm did not announce its departure"
             );
         })
         .await;
@@ -299,13 +323,12 @@ async fn panik_file_source_broadcasts_and_returns_panik_shutdown() {
 ///      `RunOutcome::PanikShutdown` (the local-teardown side of the
 ///      panik contract is unchanged), with `matched_path == <SIGTERM>`
 ///      and the per-host reason string `"panik SIGTERM (per-host)"`.
-///   2. NO `ClusterMutation::PanikRequested` appears on the primary
-///      wire — `handle_panik_signal` skips
-///      `apply_and_broadcast_mutations` on the SIGTERM branch. This
-///      is the load-bearing assertion against the cascade-shutdown
-///      bug: a single host's SIGTERM (e.g. SLURM time-limit hitting
-///      one node early) must not force every peer to exit via the
-///      sticky-monotonic `PanikRequested` CRDT.
+///   2. NO self-authored `ClusterMutation::PeerRemoved { SelfDeparture }`
+///      appears on the primary wire — `handle_panik_signal` skips
+///      `apply_and_broadcast_mutations` on the SIGTERM branch. A
+///      single host's SIGTERM (e.g. SLURM time-limit hitting one
+///      node early) is a purely local event; the mesh stays free to
+///      continue / re-elect.
 ///
 /// The wire-emission seam asserted here is the same one the sibling
 /// file-source test pins: `apply_and_broadcast_mutations` sends the
@@ -391,7 +414,7 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
             // Fake primary task: drive the setup handshake, then
             // record every `ClusterMutation` observed from the
             // secondary. The SIGTERM branch must not emit any
-            // `PanikRequested` — we assert on the recorded log
+            // self-departure announcement — we assert on the recorded log
             // after the coordinator returns, when any broadcast
             // would necessarily already have been issued
             // (`handle_panik_signal` returns synchronously after
@@ -450,15 +473,14 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
                     } = &msg
                     {
                         for mutation in mutations {
-                            // Record EVERY mutation (not just
-                            // PanikRequested) so the test's
-                            // assertion can distinguish "no
-                            // ClusterMutation observed at all"
-                            // (expected) from "some other
-                            // ClusterMutation observed but no
-                            // PanikRequested" (still acceptable —
-                            // the bug-relevant invariant is the
-                            // absence of PanikRequested) without
+                            // Record EVERY mutation (not just the
+                            // self-departure) so the test's assertion
+                            // can distinguish "no ClusterMutation
+                            // observed at all" (expected) from "some
+                            // other ClusterMutation observed but no
+                            // self-departure" (still acceptable — the
+                            // invariant is the absence of a
+                            // self-authored PeerRemoved) without
                             // changing the log shape between tests.
                             let _ = recorded_mutations_tx.send(mutation.clone());
                         }
@@ -498,23 +520,25 @@ async fn panik_sigterm_source_does_not_broadcast_and_returns_panik_shutdown() {
             }
 
             // Drain the primary-side recorder and assert NO
-            // `PanikRequested` mutation appeared. This is the
-            // load-bearing invariant: the SIGTERM branch of
-            // `handle_panik_signal` must skip
-            // `apply_and_broadcast_mutations` entirely, so the
-            // sticky-monotonic CRDT never cascades the per-host
-            // SIGTERM into a forced cluster-wide exit.
+            // self-authored `PeerRemoved { SelfDeparture }` mutation
+            // appeared. This is the load-bearing invariant: the
+            // SIGTERM branch of `handle_panik_signal` must skip
+            // `apply_and_broadcast_mutations` entirely, so a per-host
+            // SIGTERM never announces a mesh departure.
             drop(pri_to_sec_tx);
             primary_task.abort();
             let _ = primary_task.await;
             while let Ok(mutation) = recorded_mutations_rx.try_recv() {
-                if let ClusterMutation::PanikRequested { reason, .. } = &mutation
+                if let ClusterMutation::PeerRemoved {
+                    cause: RemovalCause::SelfDeparture(reason),
+                    ..
+                } = &mutation
                 {
                     panic!(
-                        "SIGTERM panik leaked a PanikRequested mutation \
-                         onto the primary wire (reason: {reason}); this \
-                         is the cascade-shutdown bug — SIGTERM-source \
-                         signals must be local-only"
+                        "SIGTERM panik leaked a self-departure PeerRemoved \
+                         onto the primary wire (reason: {}); SIGTERM-source \
+                         signals must be local-only",
+                        reason.as_str()
                     );
                 }
             }

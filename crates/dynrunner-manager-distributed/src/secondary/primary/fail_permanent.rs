@@ -71,8 +71,7 @@ where
             | TaskState::Completed { task }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
-            | TaskState::Blocked { task, .. }
-            | TaskState::Cancelled { task, .. } => task,
+            | TaskState::Blocked { task, .. } => task,
         };
         Some((task.phase_id.clone(), task.task_id.clone(), task.clone()))
     }
