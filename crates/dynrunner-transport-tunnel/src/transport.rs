@@ -35,20 +35,40 @@ use tokio::sync::mpsc;
 pub type SharedOutgoing<I> =
     Rc<RefCell<HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>>>;
 
-/// Inbound tap: a sender the legacy [`SecondaryTransport`] writes a
-/// clone of every inbound message into, AFTER it has yielded the
-/// original to its own `recv()` caller. The peer view's `recv_peer()`
-/// pulls from the matching receiver.
-///
-/// Step 5b leaves the legacy transport as the primary inbound
-/// consumer; nothing reads the peer view's queue in production until
-/// Step 6 lands the demoted-primary's `select! { peer_transport.recv_peer() }`
-/// arm. The peer queue accumulates harmlessly until then; if Step 6 is
-/// delayed beyond expected, the queue grows unbounded — but that's
-/// the same shape as any unbounded mpsc on the inbound side, and the
-/// rate is bounded by per-secondary keepalive cadence (5s) +
-/// task-completion rate.
+/// Inbound sink: the sender the accept loops (QUIC/WSS per-connection
+/// reader tasks) and the in-process per-secondary forwarder write
+/// every inbound frame into. It feeds the transport's OWN
+/// `incoming_rx` — the single, canonical inbound stream the unified
+/// [`TunneledPeerTransport::recv_peer`] drains and demuxes. This is
+/// the inbound half of the `NetworkServer` ownership move: the real
+/// inbound channel is owned here, not in a separate legacy transport
+/// behind a fan-out tap.
 pub type InboundTap<I> = mpsc::UnboundedSender<DistributedMessage<I>>;
+
+/// A newly-accepted peer's writer registration. The accept loops mint
+/// one per handshaked secondary (after reading its first frame to
+/// learn the id) and push it through the [`RegistrationSink`]; the
+/// transport's `recv_peer` demux drains the matching receiver and
+/// inserts the writer into the shared [`SharedOutgoing`] table.
+///
+/// Tunnel-crate-local (carries only `String` + a `DistributedMessage`
+/// sender) so the inbound-ownership move keeps the dependency edge
+/// (`transport-quic` → `transport-tunnel`) intact: the quic accept
+/// loops produce this generic shape rather than the transport owning
+/// a quic-specific connection type.
+pub struct PeerRegistration<I: Identifier> {
+    /// The peer-id read from the connection's first frame
+    /// (`SecondaryWelcome.sender_id`).
+    pub peer_id: String,
+    /// The per-connection writer the accept loop's writer task drains.
+    pub outgoing_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
+}
+
+/// The registration half of the `NetworkServer` ownership move: the
+/// sender the accept loops push each [`PeerRegistration`] through. Its
+/// matching receiver is owned by [`TunneledPeerTransport`] and drained
+/// inside `recv_peer`'s demux.
+pub type RegistrationSink<I> = mpsc::UnboundedSender<PeerRegistration<I>>;
 
 /// Mesh-level [`PeerTransport`] over the primary's per-secondary
 /// tunnel connections.
@@ -65,10 +85,38 @@ pub struct TunneledPeerTransport<I: Identifier> {
     /// `RoleAddressed` envelopes.
     local_id: String,
     /// Shared writer table. See [`SharedOutgoing`].
+    ///
+    /// Populated from TWO sources that both insert here: the
+    /// `recv_peer` demux drains [`PeerRegistration`]s minted by the
+    /// QUIC/WSS accept loops; the in-process / test paths register
+    /// writers directly through their [`SharedOutgoing`] handle. Both
+    /// converge on the same map, so `send_to_peer` / `broadcast` /
+    /// role-resolved dispatch reach every connected peer regardless of
+    /// how it registered.
     outgoing: SharedOutgoing<I>,
-    /// Inbound queue — owned exclusively here. Fed by the legacy
-    /// transport's `recv()` tap (see [`InboundTap`]).
+    /// THE canonical inbound stream — owned exclusively here. Fed by
+    /// the accept loops' per-connection reader tasks (QUIC/WSS) and the
+    /// in-process per-secondary forwarder via the [`InboundTap`]. This
+    /// is the `NetworkServer` inbound ownership move: there is no
+    /// separate legacy `recv()` consumer + fan-out tap; this receiver
+    /// is the single source, drained by `recv_peer`.
     incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
+    /// New-connection registrations from the accept loops. `recv_peer`
+    /// demuxes this alongside `incoming_rx` (the relocated
+    /// `NetworkServer::recv` `select!`), inserting each handshaked
+    /// secondary's writer into `outgoing`. The in-process / test paths
+    /// leave this idle — they register writers directly into the
+    /// shared `outgoing` table — so its sender is simply dropped.
+    new_conn_rx: mpsc::UnboundedReceiver<PeerRegistration<I>>,
+    /// `false` once `new_conn_rx.recv()` has returned `None` (every
+    /// registration sink dropped — the accept loops exited, or the
+    /// in-process / test path never held the sink). The `recv_peer`
+    /// select! gates the registration arm off after that so its
+    /// perpetually-ready closed-channel future can't be selected and
+    /// stall the demux (a closed mpsc `recv()` resolves immediately,
+    /// so an ungated arm would starve `incoming_rx`). Mirrors the
+    /// `uplink_open` latch in `UnifiedSecondaryTransport::recv_peer`.
+    registrations_open: bool,
     /// Write-through cache of `Role → peer_id` populated by the hook
     /// registered via [`PeerTransport::register_with_cluster_state`].
     /// Same shape as `PeerNetwork.role_cache` and
@@ -79,33 +127,65 @@ pub struct TunneledPeerTransport<I: Identifier> {
 impl<I: Identifier> TunneledPeerTransport<I> {
     /// Build a new tunneled peer transport and return:
     /// 1. the transport itself (held by `PrimaryCoordinator` as its
-    ///    `peer_transport: P` field),
-    /// 2. a shared-outgoing handle the legacy [`SecondaryTransport`]
-    ///    is configured to use as its writer table,
-    /// 3. an inbound-tap sender the legacy transport clones each
-    ///    `recv()`-yielded message into so the peer view's
-    ///    `recv_peer()` can observe it.
+    ///    sole `Tr: PeerTransport` field),
+    /// 2. a shared-outgoing handle for callers that register writers
+    ///    directly (the in-process per-secondary path + tests); the
+    ///    QUIC accept loops instead register via the registration
+    ///    sink below, but both insert into the SAME table,
+    /// 3. an inbound sink the accept loops' reader tasks (and the
+    ///    in-process forwarder) push every inbound frame into — it
+    ///    feeds this transport's owned `incoming_rx`, the single
+    ///    canonical inbound stream,
+    /// 4. a registration sink the QUIC/WSS accept loops push each
+    ///    handshaked secondary's [`PeerRegistration`] through; the
+    ///    `recv_peer` demux drains it and populates `outgoing`.
+    ///
+    /// This is the `NetworkServer` inbound ownership move: the real
+    /// `incoming_rx` + `new_conn_rx` that the legacy `NetworkServer`
+    /// used to own (and demux inside its `recv()`) now live here, so
+    /// `recv_peer` is the SOLE driver of the inbound demux. The naive
+    /// "route the recv sites to recv_peer while NetworkServer keeps the
+    /// channels" deadlocks (recv_peer would have nothing to drive); by
+    /// owning the channels here the unified transport drives its own
+    /// inbound.
     ///
     /// `local_id` is the primary's stable id — must match
     /// `PrimaryConfig::node_id` so cluster-state mutations the primary
     /// emits are accepted by other peers as originating from itself.
     /// `Role::Self_` is seeded immediately into the role-cache so the
-    /// Step-4 receiver-side handling treats a hypothetical inbound
+    /// receiver-side handling treats a hypothetical inbound
     /// `RoleAddressed { intended_role: Self_ }` envelope as Case A
-    /// (unwrap) rather than Case C (drop). The Step-2 write-through
-    /// hook covers `Role::Primary` once registered.
-    pub fn new(local_id: String) -> (Self, SharedOutgoing<I>, InboundTap<I>) {
+    /// (unwrap) rather than Case C (drop). The write-through hook
+    /// covers `Role::Primary` once registered.
+    pub fn new(
+        local_id: String,
+    ) -> (Self, SharedOutgoing<I>, InboundTap<I>, RegistrationSink<I>) {
         let outgoing: SharedOutgoing<I> = Rc::new(RefCell::new(HashMap::new()));
         let (inbound_tap, incoming_rx) = mpsc::unbounded_channel();
+        let (new_conn_tx, new_conn_rx) = mpsc::unbounded_channel();
         let role_cache = new_role_cache();
         seed_self_role(&role_cache, &local_id);
         let transport = Self {
             local_id,
             outgoing: Rc::clone(&outgoing),
             incoming_rx,
+            new_conn_rx,
+            registrations_open: true,
             role_cache,
         };
-        (transport, outgoing, inbound_tap)
+        (transport, outgoing, inbound_tap, new_conn_tx)
+    }
+
+    /// Register a newly-accepted peer's writer into the shared
+    /// `outgoing` table. The single place the demux applies an accept-
+    /// loop registration; kept as a bounded synchronous helper so the
+    /// `recv_peer` hot path stays readable and the `RefCell` borrow
+    /// never spans an await.
+    fn register_peer(&self, reg: PeerRegistration<I>) {
+        tracing::info!(secondary = %reg.peer_id, "secondary registered");
+        self.outgoing
+            .borrow_mut()
+            .insert(reg.peer_id, reg.outgoing_tx);
     }
 
     /// Role-layer interceptor — mirrors
@@ -240,9 +320,64 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
     }
 
     async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        // The relocated `NetworkServer::recv` demux: drive both the
+        // canonical inbound stream AND the accept-loop registration
+        // stream from this single consumer. A registration carries no
+        // application payload, so it is applied (writer inserted into
+        // `outgoing`) and the loop continues; an inbound frame goes
+        // through the role layer and is yielded (or consumed
+        // internally) exactly as before.
+        //
+        // FIFO: `SecondaryWelcome` and `CertExchange` for one secondary
+        // both ride `incoming_rx` (a single mpsc), so their relative
+        // order is preserved automatically. The registration on
+        // `new_conn_rx` is interleaved by the `select!`, but the accept
+        // loop emits it immediately after the welcome and before any
+        // further frames, and a registration only mutates the writer
+        // table — it never reorders the application stream. Both arms'
+        // `recv` are cancel-safe (mpsc), so the loser re-builds cleanly
+        // on the next iteration.
         loop {
-            let msg = self.incoming_rx.recv().await?;
-            match self.handle_role_layer(msg) {
+            let raw = tokio::select! {
+                msg = self.incoming_rx.recv() => {
+                    // Eagerly apply any registrations already queued
+                    // before surfacing this frame. The accept loop emits
+                    // a secondary's `SecondaryWelcome` (on `incoming_rx`)
+                    // immediately followed by its writer registration (on
+                    // `new_conn_rx`); the `select!` can pick the welcome
+                    // first, so without this drain the writer might not
+                    // be in `outgoing` yet when the welcome surfaces and
+                    // a same-tick reply would find no route. Mirrors the
+                    // legacy `NetworkServer::recv`, which called
+                    // `drain_new_connections()` on every inbound yield.
+                    while let Ok(reg) = self.new_conn_rx.try_recv() {
+                        self.register_peer(reg);
+                    }
+                    msg?
+                }
+                reg = self.new_conn_rx.recv(), if self.registrations_open => {
+                    match reg {
+                        Some(reg) => {
+                            self.register_peer(reg);
+                            continue;
+                        }
+                        // Every registration sink dropped (the accept
+                        // loops exited, or the in-process / test path
+                        // never held the sink). Latch the arm off so the
+                        // closed-channel future — which resolves to
+                        // `None` immediately and forever — can't be
+                        // re-selected and starve `incoming_rx`. The
+                        // `if self.registrations_open` guard then
+                        // disables this arm for the rest of the loop;
+                        // `incoming_rx` drives inbound alone.
+                        None => {
+                            self.registrations_open = false;
+                            continue;
+                        }
+                    }
+                }
+            };
+            match self.handle_role_layer(raw) {
                 Some(payload) => return Some(payload),
                 None => continue,
             }
@@ -250,6 +385,12 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
     }
 
     fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        // Non-blocking drain. Apply any pending registrations first
+        // (so the writer table is current before a synchronous peek of
+        // the inbound stream), then surface the next inbound frame.
+        while let Ok(reg) = self.new_conn_rx.try_recv() {
+            self.register_peer(reg);
+        }
         loop {
             let msg = self.incoming_rx.try_recv().ok()?;
             match self.handle_role_layer(msg) {
