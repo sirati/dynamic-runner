@@ -55,8 +55,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // Composed dispatch-shape gate: backpressure backoff
                 // + OOM-bucket single-worker masking. See
                 // `should_skip_worker_for_dispatch` for the
-                // per-reason documentation.
-                if self.should_skip_worker_for_dispatch(idx) {
+                // per-reason documentation. `false`: a secondary's own
+                // `TaskRequest` does NOT bypass its backoff — the
+                // backoff exists precisely to stop a secondary that
+                // just said "no idle worker" from re-hammering us on
+                // its request-retry tick.
+                if self.should_skip_worker_for_dispatch(idx, false) {
                     return Ok(());
                 }
                 if !available_res.is_empty() {

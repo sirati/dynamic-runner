@@ -43,6 +43,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
+use crate::worker_signal::WorkerMgmtSignal;
 
 /// Which retry channel a `failed_tasks` entry belongs to.
 ///
@@ -292,13 +293,18 @@ where
             )
         };
         if reinjected {
-            // Kickstart dispatch: the workers won't request a new task
-            // on their own (they already sent their last `TaskRequest`
-            // which got `nothing-to-do` because the failure hadn't been
-            // reinjected yet). Same rationale as the legacy
-            // `run_retry_passes` body — without the kickstart,
-            // reinjected binaries sit in the pool forever.
-            self.dispatch_to_idle_workers().await?;
+            // Reinjection is a pool-entry edge: the workers won't
+            // request a new task on their own (they already sent their
+            // last `TaskRequest` which got `nothing-to-do` because the
+            // failure hadn't been reinjected yet). EMIT a `TasksAdded`
+            // onto the decoupled worker-management bus rather than
+            // calling dispatch directly (the dispatch-decoupling law);
+            // the operational loop's worker-management arm coalesces it
+            // into one batched recheck. Without this emit the reinjected
+            // binaries sit in the pool forever (the negative control
+            // test pins it load-bearing).
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         } else if matches!(kind, BucketKind::Oom) {
             // No reinjection happened — either empty candidates or
             // budget exhausted. Lift the single-worker dispatch-shape

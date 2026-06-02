@@ -662,6 +662,29 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// `Result<(), String>` signature of the inner loop.
     pub(super) setup_deadline_outcome: Option<std::time::Duration>,
 
+    /// Worker-management signal receiver, paired with the
+    /// `worker_mgmt_tx` installed on `cluster_state` at construction.
+    /// Taken out at the operational loop's start so its `select!` arm
+    /// can `drain_worker_signal_batch` against it; put back at loop
+    /// exit so retry-pass re-entries keep draining the same channel.
+    /// Same `take()`/restore lifecycle as `matcher_trigger_rx`. `None`
+    /// once a previous loop entry already consumed it AND the local was
+    /// dropped (closed-channel gate) — single-shot per channel.
+    pub(super) worker_mgmt_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<crate::worker_signal::WorkerMgmtSignal>,
+    >,
+
+    /// Set by the operational `select!` loop's worker-management arm
+    /// when it drains a [`WorkerMgmtSignal::RunShouldFail`]. Carries the
+    /// emit-time reason so the outer `run_pipeline` can surface the run
+    /// failure. Same write-only/read-only discipline as `panik_outcome`
+    /// / `setup_deadline_outcome`: the arm WRITES, the outer wrapper
+    /// READS — keeping the inner loop's `Result<(), String>` signature
+    /// untouched. The worker arm OWNS the clean-shutdown drive; the
+    /// phase layer that emitted the signal never breaks the loop
+    /// directly (decoupling law).
+    pub(super) worker_mgmt_fail_outcome: Option<String>,
+
     /// OOM-bucket dispatch-shape gate. `true` only while a per-phase
     /// OOM retry bucket is actively reinjecting and draining; `false`
     /// otherwise. The retry-bucket primitive
@@ -715,6 +738,18 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `select!` and drains it via
         // `crate::fulfillability_matcher::drain_matcher_batch`.
         let (matcher_trigger_tx, matcher_trigger_rx) =
+            tokio::sync::mpsc::unbounded_channel();
+        // Worker-management signal bus. Built at construction for the
+        // same reason as `matcher_trigger_tx`: the phase/task layer's
+        // emit calls (`fire_initial_phase_starts` →
+        // `PhaseStartedNeedsWorkers`; the per-phase proceed-or-fail
+        // decision → `RunShouldFail`; every pool-entry / worker-free
+        // edge → `TasksAdded`) need a sender ready from the very first
+        // mutation. The receiver waits on `self` until the operational
+        // loop takes it and drains coalesced batches via
+        // `crate::worker_signal::drain_worker_signal_batch`. No longer
+        // test-only: this is the PRODUCTION sender wire-up.
+        let (worker_mgmt_tx, worker_mgmt_rx) =
             tokio::sync::mpsc::unbounded_channel();
         // Task-completion dispatcher channel. Same construction-time
         // motivation as `lifecycle_tx`: the apply path on
@@ -786,6 +821,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             panik_signal_rx: None,
             panik_outcome: None,
             setup_deadline_outcome: None,
+            worker_mgmt_rx: Some(worker_mgmt_rx),
+            worker_mgmt_fail_outcome: None,
             single_worker_mode: false,
         };
         // Install the peer-lifecycle sender on `cluster_state` so the
@@ -802,6 +839,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // receiver from `run()` onward.
         this.cluster_state
             .install_matcher_trigger_sender(matcher_trigger_tx);
+        // Same shape as the matcher-trigger sender install: the
+        // phase/task apply + emit path on `cluster_state` now has a
+        // worker-management bus sender to enqueue signals through; the
+        // operational `select!` loop owns the receiver from this point
+        // onward and reacts off the emit path.
+        this.cluster_state
+            .install_worker_mgmt_sender(worker_mgmt_tx);
         // Same shape: install the task-completion sender so the
         // `TaskCompleted` / `TaskFailed` apply rules' emit calls route
         // through the dispatcher channel from this point onward.
@@ -1140,12 +1184,28 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     ///
     /// Single concern: the dispatch-pipeline's "skip this worker"
     /// decision. Adding another reason-to-skip lands here, not as a
-    /// parallel `if` at every call site. The two call sites
+    /// parallel `if` at every call site. The call sites
     /// (`dispatch_to_idle_workers` + `handle_task_request`) stay
     /// agnostic to either policy.
-    pub(super) fn should_skip_worker_for_dispatch(&self, worker_idx: usize) -> bool {
+    ///
+    /// `bypass_backpressure` lifts ONLY the per-secondary backoff
+    /// reason — never the OOM single-worker mask (that one is
+    /// correctness for memory-pressed retries, not a transient
+    /// rate-limit). A recheck driven by a genuine
+    /// [`crate::worker_signal::WorkerMgmtSignal::TasksAdded`] passes
+    /// `true`: circumstances changed (new work entered the pool, or a
+    /// worker freed elsewhere), so a freed slot on a recently-
+    /// backpressured secondary is a legitimate dispatch target again.
+    /// The per-`TaskRequest` path and the periodic/non-signal kickstart
+    /// pass `false` so a secondary that just said "no idle worker"
+    /// isn't immediately re-hammered by its own request retry.
+    pub(super) fn should_skip_worker_for_dispatch(
+        &self,
+        worker_idx: usize,
+        bypass_backpressure: bool,
+    ) -> bool {
         let sec_id = self.workers[worker_idx].secondary_id.as_str();
-        if self.is_backpressured(sec_id) {
+        if !bypass_backpressure && self.is_backpressured(sec_id) {
             return true;
         }
         if self.single_worker_mode && self.local_worker_id_in_secondary(worker_idx) != 0 {
@@ -1869,6 +1929,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // arm fires; a clean run leaves it untouched, but a coordinator
         // re-used across runs must not inherit a stale outcome).
         self.setup_deadline_outcome = None;
+        // Same per-run reset for the worker-management run-should-fail
+        // outcome: only written when the worker-management arm drains a
+        // `RunShouldFail`; a coordinator re-used across runs must not
+        // inherit a stale outcome.
+        self.worker_mgmt_fail_outcome = None;
 
         // The setup-pending gate is a CRDT-derived predicate
         // (`Self::setup_pending`) rather than a stateful latch field: in
@@ -2180,6 +2245,23 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 matched_path,
                 reason,
             });
+        }
+
+        // Worker-management run-should-fail check: if the operational
+        // loop's worker-management arm recorded a break outcome (a
+        // `RunShouldFail` signal — emitted by the phase layer's
+        // proceed-or-fail decision OR the phase-floor liveness check),
+        // surface it as a typed failure and skip the retry-pass / drain
+        // / accounting tail. The worker arm OWNS the clean-shutdown
+        // drive; the phase/task layer that emitted the signal never
+        // broke the loop directly (decoupling law). Same write-by-arm /
+        // read-by-pipeline discipline as `panik_outcome`.
+        if let Some(reason) = self.worker_mgmt_fail_outcome.take() {
+            tracing::error!(
+                reason = %reason,
+                "primary run aborted by worker-management run-should-fail signal"
+            );
+            return Err(RunError::Other(reason));
         }
 
         // Setup-promote-deadline check: if the operational loop's

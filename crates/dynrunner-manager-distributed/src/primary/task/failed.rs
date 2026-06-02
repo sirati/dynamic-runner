@@ -12,6 +12,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
+use crate::worker_signal::WorkerMgmtSignal;
 
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -163,6 +164,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // `release_type_slot` here — the helper already did it.
                 if let Some(binary) = recovered_binary {
                     self.pool_mut().requeue(binary);
+                    // The requeued binary is a pool-entry edge AND the
+                    // backpressured worker's slot just freed. EMIT a
+                    // `TasksAdded` so the worker-management recheck picks
+                    // it up (the recheck bypasses the per-secondary
+                    // backoff: the slot is genuinely free now — that's
+                    // what the terminal freed — so the freed worker, on
+                    // this OR any other secondary, is a valid target).
+                    // Decoupled emit, never a direct dispatch call.
+                    self.cluster_state
+                        .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
                 }
                 return;
             }
@@ -233,12 +244,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
             }
 
-            // Same kickstart rationale as `handle_task_complete`:
-            // `note_item_failed` may have just cascaded a phase
-            // through Drained → Done and activated a dependent
-            // phase; idle workers across other secondaries won't
-            // re-poll on their own. Idempotent.
-            self.dispatch_to_idle_workers().await.ok();
+            // Same rationale as `handle_task_complete`: this terminal
+            // freed a worker AND `note_item_failed` may have cascaded a
+            // phase Drained → Done and activated a dependent phase; free
+            // workers across other secondaries won't re-poll on their
+            // own. EMIT a `TasksAdded` onto the decoupled bus rather
+            // than calling dispatch directly (the dispatch-decoupling
+            // law); the worker-management arm coalesces it into one
+            // batched recheck.
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
 
             // Forward task-terminal outcomes to peer secondaries so
             // their `failed_tasks` / `completed_tasks` caches stay

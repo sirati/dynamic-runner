@@ -17,18 +17,33 @@ use super::dispatch_order;
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
 
-    /// Iterate every idle worker and dispatch a task from the pool
-    /// if one fits. Used by `run_retry_passes` to kickstart dispatch
-    /// after re-injection (workers won't send a fresh TaskRequest on
-    /// their own — see the run_retry_passes comment). Mirrors the
-    /// per-worker logic in `handle_task_request` minus the
-    /// primary relay (which is irrelevant for the
-    /// non-promoted-primary at this stage).
-    pub(crate) async fn dispatch_to_idle_workers(&mut self) -> Result<(), String> {
-        // Visit idle workers in load-aware order so a secondary with
+    /// Iterate every free worker and dispatch a task from the pool if
+    /// one fits. This is worker management's dispatch RECHECK: the
+    /// operational loop's worker-management `select!` arm calls it on a
+    /// drained [`crate::worker_signal::WorkerSignalBatch`] carrying a
+    /// `TasksAdded` (decoupled from the phase/task code that emitted
+    /// the signal — see the dispatch-decoupling law). Workers won't
+    /// send a fresh `TaskRequest` on their own after a phase boundary
+    /// or a re-injection, so the recheck re-evaluates EVERY free worker
+    /// and dispatches what now fits. Mirrors the per-worker logic in
+    /// `handle_task_request` minus the primary relay (which is
+    /// irrelevant for the non-promoted-primary at this stage).
+    ///
+    /// `bypass_backpressure` lifts the per-secondary backoff for this
+    /// recheck (NOT the OOM single-worker mask). The worker-management
+    /// arm passes `true` when reacting to a genuine `TasksAdded`:
+    /// circumstances changed, so a freed slot on a recently-
+    /// backpressured secondary is a valid target again. See
+    /// [`PrimaryCoordinator::should_skip_worker_for_dispatch`].
+    pub(crate) async fn dispatch_to_idle_workers(
+        &mut self,
+        bypass_backpressure: bool,
+    ) -> Result<(), String> {
+        // Visit free workers in load-aware order so a secondary with
         // many in-flight tasks doesn't keep winning tail-of-phase
-        // dispatches against an idler peer. `dispatch_order` filters
-        // to idle and sorts by (busy-workers-on-secondary, worker_id).
+        // dispatches against an idler peer. `dispatch_order` selects on
+        // the authoritative free predicate (`held_task().is_none()`)
+        // and sorts by the advisory busy-load count.
         let order = dispatch_order(&self.workers);
         for worker_idx in order {
             // Composed dispatch-shape gate: backpressure backoff +
@@ -40,7 +55,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // `dispatch_order`) so a backpressure window or
             // single-worker-mode flip mid-tick takes effect
             // immediately.
-            if self.should_skip_worker_for_dispatch(worker_idx) {
+            if self.should_skip_worker_for_dispatch(worker_idx, bypass_backpressure) {
                 continue;
             }
             // Dispatch-shape view pipeline: pool view → soft

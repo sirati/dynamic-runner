@@ -11,6 +11,7 @@ use dynrunner_scheduler_api::{
 use crate::cluster_state::apply_locally_for_broadcast;
 use crate::primary::PrimaryCoordinator;
 use crate::primary::wire::{compute_task_hash, timestamp_now};
+use crate::worker_signal::WorkerMgmtSignal;
 
 
 
@@ -61,6 +62,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             applied,
             resumed_for_dispatch,
         } = batch;
+        let resumed_any = !resumed_for_dispatch.is_empty();
         for binary in resumed_for_dispatch {
             tracing::debug!(
                 phase = %binary.phase_id,
@@ -68,6 +70,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 "pool: re-inject auto-resumed Blocked dependent"
             );
             self.pool_mut().reinject(binary);
+        }
+        // Auto-resumed Blocked dependents are a pool-entry edge: their
+        // prereq just completed and they became dispatchable, but the
+        // free worker that would run them won't re-poll on its own. EMIT
+        // a `TasksAdded` so the worker-management recheck dispatches
+        // them (decoupled emit, never a direct dispatch call — the
+        // dispatch-decoupling law).
+        if resumed_any {
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         }
         if applied.is_empty() {
             return;
