@@ -116,6 +116,13 @@ where
         const PANIK_KILL_GRACE: std::time::Duration =
             std::time::Duration::from_secs(5);
 
+        // Externally-armed fatal-exit signal (the observer's invalid_task
+        // monitor; see `register_fatal_exit_signal_rx`). Taken out for the
+        // loop duration so the arm's `await` owns the receiver across
+        // iterations, identical discipline to `panik_signal_rx`. `None`
+        // when no such policy was attached → the arm parks on `pending()`.
+        let mut fatal_exit_signal_rx = self.fatal_exit_signal_rx.take();
+
         // The secondary holds NO authority and processes NO command
         // channel: the externally-issued `PrimaryCommand`s
         // (FailPermanent / ReinjectTask / UpdatePreferredSecondaries /
@@ -346,6 +353,39 @@ where
                     // continues as if the arm hadn't fired. Without
                     // the take-to-None above this would resolve
                     // Err immediately on every subsequent poll.
+                }
+                // Externally-armed fatal-exit arm. A run-loop-external
+                // policy (the observer's invalid_task monitor) sends a
+                // reason string when its collection window elapses; we
+                // latch it into `self.fatal_exit` and let the loop's own
+                // exit check (below) propagate it as a non-zero `Err`
+                // exit. Single-concern wiring identical to every other
+                // fatal-exit setter: the arm only WRITES the flag, the
+                // loop owns its exit. `None`/`Some` parking mirrors the
+                // panik arm; `mpsc::Receiver::recv` is cancel-safe.
+                signal = async {
+                    match fatal_exit_signal_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match signal {
+                        Some(reason) => {
+                            // First (and only consumed) signal: latch it.
+                            // Drop the rx so a later iteration re-parks on
+                            // `pending()` — the loop is about to exit on
+                            // the `fatal_exit.take()` check anyway.
+                            self.fatal_exit = Some(reason);
+                            fatal_exit_signal_rx = None;
+                        }
+                        None => {
+                            // All senders dropped (the policy / driver was
+                            // torn down without firing). Benign — re-park
+                            // by dropping the rx, exactly like the panik
+                            // Err arm.
+                            fatal_exit_signal_rx = None;
+                        }
+                    }
                 }
             }
 

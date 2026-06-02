@@ -36,16 +36,27 @@ pub struct StatsSnapshot {
     pub fail_retry: usize,
     /// `OutcomeSummary::fail_oom` — last-observed memory `ResourceExhausted`.
     pub fail_oom: usize,
-    /// `NonRecoverable` / non-memory `ResourceExhausted` / `InvalidTask`,
-    /// with the discrete `Unfulfillable` set NETTED OUT — see the trap
-    /// note at the assignment in `from_cluster_state`. Reported as a
-    /// line disjoint from `unfulfillable`.
+    /// `NonRecoverable` / non-memory `ResourceExhausted`, with BOTH the
+    /// discrete `Unfulfillable` AND the discrete `InvalidTask` sets
+    /// NETTED OUT — see the trap note at the assignment in
+    /// `from_cluster_state`. Reported as a line disjoint from both
+    /// `unfulfillable` and `invalid_task`.
     pub fail_final: usize,
     /// `StateCounts::unfulfillable` — the DISCRETE `TaskState::Unfulfillable`
     /// count. Read from `counts()`, NOT `outcome_counts()`: the latter
     /// folds Unfulfillable into `fail_final`, which would double-count
     /// it here. This is its OWN reported line.
     pub unfulfillable: usize,
+    /// `StateCounts::invalid_task` — the DISCRETE `TaskState::InvalidTask`
+    /// count (terminal, non-reinjectable structural failures: missing
+    /// dep / duplicate id). Read from `counts()`, NOT `outcome_counts()`,
+    /// for exactly the same reason as `unfulfillable`: `outcome_counts()`
+    /// folds `InvalidTask` into `fail_final` (see the accessor's
+    /// `InvalidTask => fail_final += 1` arm), so reading it from the
+    /// outcome bucket and then reporting a discrete line would
+    /// double-count. This is its OWN reported line, disjoint from
+    /// `fail_final`.
+    pub invalid_task: usize,
     /// Tasks in `TaskState::InFlight` — currently executing somewhere.
     pub in_flight: usize,
     /// `Pending` tasks with at least one UNsatisfied `task_depends_on`
@@ -154,17 +165,24 @@ impl StatsSnapshot {
             succeeded: outcome.succeeded,
             fail_retry: outcome.fail_retry,
             fail_oom: outcome.fail_oom,
-            // `outcome_counts().fail_final` FOLDS the discrete
-            // `TaskState::Unfulfillable` set into itself (see the
-            // accessor: `Unfulfillable => fail_final += 1`). Since
-            // `unfulfillable` is reported as its OWN line, subtract it
-            // here so the two lines are disjoint and a single failed
-            // task is not double-counted across two metrics. This is
-            // the complement of the documented `counts()`-vs-
-            // `outcome_counts()` trap: read `counts().unfulfillable`
-            // for the discrete line AND net it back out of `fail_final`.
-            fail_final: outcome.fail_final.saturating_sub(counts.unfulfillable),
+            // `outcome_counts().fail_final` FOLDS BOTH the discrete
+            // `TaskState::Unfulfillable` AND the discrete
+            // `TaskState::InvalidTask` sets into itself (see the
+            // accessor: `Unfulfillable => fail_final += 1` and
+            // `InvalidTask => fail_final += 1`). Since `unfulfillable`
+            // and `invalid_task` are each reported as their OWN line,
+            // subtract BOTH here so the three lines are disjoint and a
+            // single failed task is not double-counted across two
+            // metrics. This is the complement of the documented
+            // `counts()`-vs-`outcome_counts()` trap: read
+            // `counts().{unfulfillable,invalid_task}` for the discrete
+            // lines AND net them back out of `fail_final`.
+            fail_final: outcome
+                .fail_final
+                .saturating_sub(counts.unfulfillable)
+                .saturating_sub(counts.invalid_task),
             unfulfillable: counts.unfulfillable,
+            invalid_task: counts.invalid_task,
             in_flight: counts.in_flight,
             waiting_on_deps,
             blocked: counts.blocked,

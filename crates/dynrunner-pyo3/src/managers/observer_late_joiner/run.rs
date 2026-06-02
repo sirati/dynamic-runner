@@ -20,7 +20,10 @@ use crate::identifier::RunnerIdentifier;
 use crate::network::{detect_ipv4, detect_ipv6, gethostname};
 use crate::subprocess_factory::SubprocessWorkerFactory;
 
+use dynrunner_manager_distributed::task_completed::{run_collector, windowed_failure_collector};
+
 use super::PyObserverLateJoiner;
+use super::failure_policies::{ErrorAggregationPolicy, InvalidTaskMonitorPolicy};
 use super::helpers::{map_read_dir_error, records_to_seed};
 use super::reporter::{run_reporter, SharedSnapshotSource, StatsSnapshot, TokioClock};
 
@@ -439,6 +442,65 @@ impl PyObserverLateJoiner {
                     },
                 ));
 
+                // 5.7. Wire the two observer terminal-failure policies
+                //      over the shared windowed-failure-collector. Each
+                //      policy is built as a (listener, driver) pair: the
+                //      listener is registered on the coordinator's
+                //      task-completed fabric (so it fires off the apply
+                //      path's terminal-failure events, on the dispatcher
+                //      task) and the driver is spawned to own the policy's
+                //      window timer. Both registrations happen BEFORE the
+                //      run loop's first `run_until_setup_or_done` (which
+                //      `mem::take`-s the listener vector into the
+                //      dispatcher), same pre-run contract as the
+                //      peer-lifecycle listener above.
+                //
+                //      Policy B (invalid_task monitor): arms a 1-minute
+                //      window on the first `invalid_task` failure, then
+                //      signals fatal-exit. Per owner decision only the
+                //      OBSERVER exits on invalid_task — the cluster keeps
+                //      running. The signal rides a dedicated mpsc consumed
+                //      by the operational loop's fatal-exit arm (mirrors
+                //      `register_panik_signal_rx`); the policy never calls
+                //      `std::process::exit`.
+                //
+                //      Policy C (error aggregation): rolling-10-minute
+                //      window, collects `min(1min, remainder)`, emits the
+                //      deduped detail on the importance channel once per
+                //      distinct message per rolling window, never exits.
+                let (fatal_exit_tx, fatal_exit_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<String>();
+                secondary.register_fatal_exit_signal_rx(fatal_exit_rx);
+                let (invalid_task_listener, invalid_task_driver) =
+                    windowed_failure_collector(InvalidTaskMonitorPolicy::new(fatal_exit_tx));
+                secondary.register_task_completed_listener(invalid_task_listener);
+
+                let (aggregation_listener, aggregation_driver) =
+                    windowed_failure_collector(ErrorAggregationPolicy::new());
+                secondary.register_task_completed_listener(aggregation_listener);
+
+                // Drive each policy's window timer. Same cancel-then-abort
+                // teardown discipline as the announcer / reporter tasks
+                // below (a graceful cancel lets the driver's select! break,
+                // abort is the backstop, await synchronises termination so
+                // a follow-on dispatcher run starts quiesced).
+                let (invalid_task_cancel_tx, invalid_task_cancel_rx) =
+                    tokio::sync::oneshot::channel::<()>();
+                let invalid_task_driver_task = tokio::task::spawn_local(run_collector(
+                    invalid_task_driver,
+                    async move {
+                        let _ = invalid_task_cancel_rx.await;
+                    },
+                ));
+                let (aggregation_cancel_tx, aggregation_cancel_rx) =
+                    tokio::sync::oneshot::channel::<()>();
+                let aggregation_driver_task = tokio::task::spawn_local(run_collector(
+                    aggregation_driver,
+                    async move {
+                        let _ = aggregation_cancel_rx.await;
+                    },
+                ));
+
                 // 6. Drive the run loop. The first iteration's
                 //    setup-skip guard fires immediately; subsequent
                 //    iterations are `RunOutcome::Done` once the
@@ -557,6 +619,18 @@ impl PyObserverLateJoiner {
                 let _ = reporter_cancel_tx.send(());
                 reporter_task.abort();
                 let _ = reporter_task.await;
+
+                // Failure-policy driver cleanup. Same cancel-then-abort
+                // discipline as the reporter: cancel each driver gracefully
+                // (its select! cancel arm breaks the loop), abort as a
+                // backstop, await termination so a follow-on dispatcher run
+                // starts quiesced.
+                let _ = invalid_task_cancel_tx.send(());
+                invalid_task_driver_task.abort();
+                let _ = invalid_task_driver_task.await;
+                let _ = aggregation_cancel_tx.send(());
+                aggregation_driver_task.abort();
+                let _ = aggregation_driver_task.await;
 
                 loop_result
             }))

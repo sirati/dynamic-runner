@@ -104,6 +104,7 @@ where
             announcer_outbox_tx: None,
             announcer_outbox_rx: None,
             panik_signal_rx: None,
+            fatal_exit_signal_rx: None,
             promote_activation_tx: None,
             on_phase_end: None,
             on_phase_start: None,
@@ -194,6 +195,22 @@ where
         rx: tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>,
     ) {
         self.panik_signal_rx = Some(rx);
+    }
+
+    /// Register an externally-armed fatal-exit signal receiver. The
+    /// matching sender is handed to a run-loop-external policy (the
+    /// observer's invalid_task monitor) that cannot reach `self.fatal_exit`
+    /// directly because it runs on the task-completed dispatcher task. On
+    /// the first message, the `process_tasks` select! arm latches
+    /// `self.fatal_exit` with the carried reason and the run exits
+    /// non-zero. Pre-`run_until_setup_or_done` contract, same single-shot
+    /// shape as [`Self::register_panik_signal_rx`]; absent registration
+    /// leaves the arm parked on `pending()`.
+    pub fn register_fatal_exit_signal_rx(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        self.fatal_exit_signal_rx = Some(rx);
     }
 
     /// Register the promotion-activation gate sender for the co-located

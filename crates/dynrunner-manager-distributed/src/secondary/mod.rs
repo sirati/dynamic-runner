@@ -471,6 +471,26 @@ where
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
+    /// Externally-armed fatal-exit signal. Installed via
+    /// [`Self::register_fatal_exit_signal_rx`] before
+    /// `run_until_setup_or_done`. A run-loop-external policy (the
+    /// observer's invalid_task monitor — a windowed-failure-collector
+    /// action running on the task-completed dispatcher task, which holds
+    /// no `&mut self` to write `fatal_exit` directly) sends a reason
+    /// string here; the `process_tasks` select! arm receives it and
+    /// latches `self.fatal_exit`, exiting the run non-zero. Mirrors
+    /// `panik_signal_rx` exactly: `None` when no such policy was attached
+    /// (regular secondaries, Rust-only tests) and the arm parks on
+    /// `pending().await`.
+    ///
+    /// An mpsc (not a oneshot) receiver because the sender side is a
+    /// `CollectorPolicy` action that fires best-effort `send`; the
+    /// receiver consumes the first message and the run exits, so only the
+    /// first send is ever observed. Taken out for the duration of
+    /// `process_tasks` so the arm's `await` owns it across iterations,
+    /// same discipline as `panik_signal_rx`.
+    pub(super) fatal_exit_signal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+
     /// Promotion-activation gate sender for the co-located parked
     /// `PrimaryCoordinator`.
     ///
