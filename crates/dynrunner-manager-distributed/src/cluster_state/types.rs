@@ -81,6 +81,30 @@ pub enum TaskState<I> {
         task: TaskInfo<I>,
         on: String,
     },
+    /// The task hit `ErrorType::InvalidTask` — it is structurally
+    /// invalid (e.g. a `task_depends_on` reference to a literally-
+    /// absent id, or a duplicate `(phase_id, task_id)`), so it can
+    /// never legitimately execute. Discrete variant (rather than
+    /// `Failed { kind: InvalidTask, .. }`) for the same reason as
+    /// `Unfulfillable`: downstream matcher / state-filter logic can
+    /// dispatch on the discriminant. `reason` mirrors the
+    /// `BoundedString<2048>` body from the wire mutation (stored
+    /// here as `String`; the cap is the wire-codec's concern).
+    ///
+    /// **Terminal and NON-reinjectable** — this is the load-bearing
+    /// divergence from `Unfulfillable`. An unfulfillable task awaits
+    /// a cluster resource that may later appear, so `ReinjectTask`
+    /// transitions it back to `Pending`; an invalid task is wrong by
+    /// construction and no external action can make it valid, so the
+    /// `ReinjectTask` gate rejects it and the terminal-lockout NoOp
+    /// guards (the strongest-terminal arms in `TaskCompleted` /
+    /// `TaskFailed` / `TaskBlocked`) refuse to overwrite it. Folded
+    /// into `fail_final` by `outcome_counts` for operator-readable
+    /// buckets, sibling to `Unfulfillable`.
+    InvalidTask {
+        task: TaskInfo<I>,
+        reason: String,
+    },
 }
 
 /// Outcome of `ClusterState::apply`. `NoOp` is the normal silent-merge
@@ -105,6 +129,9 @@ pub struct StateCounts {
     /// of an unfulfillable prerequisite, dormant until the prereq
     /// completes via the reinject + re-run path.
     pub blocked: usize,
+    /// Tasks in `TaskState::InvalidTask { .. }` — terminal, non-
+    /// reinjectable structural failures (missing dep / duplicate id).
+    pub invalid_task: usize,
 }
 
 /// Per-class outcome breakdown the primary emits on every

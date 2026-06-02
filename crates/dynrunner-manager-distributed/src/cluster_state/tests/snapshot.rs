@@ -62,6 +62,51 @@ fn snapshot_round_trip_preserves_state() {
     ));
 }
 
+/// A terminal `InvalidTask` entry survives a snapshot → restore cycle
+/// onto a fresh joiner: it ranks as a strongest terminal (so a stale
+/// peer's Pending observation cannot overwrite it on merge) and its
+/// `reason` body is preserved verbatim.
+#[test]
+fn snapshot_round_trip_preserves_invalid_task() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "bad".into(),
+        task: mk_task("bad"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "bad".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "duplicate (phase,task_id)".to_string().into(),
+        },
+        error: "invalid_task:duplicate (phase,task_id)".into(),
+    });
+
+    let snap = s.snapshot();
+    let mut joiner = ClusterState::<RunnerIdentifier>::new();
+    joiner.restore(snap);
+
+    match joiner.task_state("bad") {
+        Some(TaskState::InvalidTask { reason, .. }) => {
+            assert_eq!(reason, "duplicate (phase,task_id)");
+        }
+        other => panic!("expected InvalidTask after restore, got {other:?}"),
+    }
+    assert_eq!(joiner.counts(), s.counts());
+
+    // Lattice rank: a stale peer's later Pending snapshot must NOT
+    // overwrite the terminal InvalidTask on the joiner.
+    let mut stale = ClusterState::<RunnerIdentifier>::new();
+    stale.apply(ClusterMutation::TaskAdded {
+        hash: "bad".into(),
+        task: mk_task("bad"),
+    });
+    joiner.restore(stale.snapshot());
+    assert!(
+        matches!(joiner.task_state("bad"), Some(TaskState::InvalidTask { .. })),
+        "terminal InvalidTask must win over a stale Pending snapshot"
+    );
+}
+
 /// Pins the Step 8 contract that `ClusterStateSnapshot` carries
 /// the replicated observer set so a late-joiner's first restore
 /// populates `RoleTable.observers` before any `PeerJoined`

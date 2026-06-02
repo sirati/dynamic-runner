@@ -55,6 +55,7 @@ impl<I: Identifier> ClusterState<I> {
                 TaskState::Failed { .. } => c.failed += 1,
                 TaskState::Unfulfillable { .. } => c.unfulfillable += 1,
                 TaskState::Blocked { .. } => c.blocked += 1,
+                TaskState::InvalidTask { .. } => c.invalid_task += 1,
             }
         }
         c
@@ -109,6 +110,12 @@ impl<I: Identifier> ClusterState<I> {
                 // legacy `Failed { Unfulfillable, .. }` arm above so the
                 // total partition stays stable across the variant cutover.
                 TaskState::Unfulfillable { .. } => o.fail_final += 1,
+                // Discrete `InvalidTask` state: terminal, non-
+                // reinjectable structural failure. Tallied as
+                // `fail_final` (sibling to `Unfulfillable`) until the
+                // dedicated invalid_task stat line lands in Part C; the
+                // mapping keeps the operator-readable partition stable.
+                TaskState::InvalidTask { .. } => o.fail_final += 1,
                 // Non-terminal: Pending, InFlight, and Blocked all
                 // contribute to neither bucket. Blocked tasks are
                 // cascade-paused dependents that will auto-resume to
@@ -136,6 +143,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
+                | TaskState::InvalidTask { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             (h, t)
@@ -143,14 +151,15 @@ impl<I: Identifier> ClusterState<I> {
     }
 
     /// Iterator over `(task_hash, &TaskInfo)` for terminal entries
-    /// (`Completed`, `Failed`, `Unfulfillable`). `Blocked` is non-
-    /// terminal (auto-resumes to `Pending` when its prereq completes)
-    /// and is excluded.
+    /// (`Completed`, `Failed`, `Unfulfillable`, `InvalidTask`).
+    /// `Blocked` is non-terminal (auto-resumes to `Pending` when its
+    /// prereq completes) and is excluded.
     pub fn iter_terminal(&self) -> impl Iterator<Item = (&String, &TaskInfo<I>)> {
         self.tasks.iter().filter_map(|(h, s)| match s {
             TaskState::Completed { task }
             | TaskState::Failed { task, .. }
-            | TaskState::Unfulfillable { task, .. } => Some((h, task)),
+            | TaskState::Unfulfillable { task, .. }
+            | TaskState::InvalidTask { task, .. } => Some((h, task)),
             _ => None,
         })
     }
@@ -221,6 +230,7 @@ impl<I: Identifier> ClusterState<I> {
                 | TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
                 | TaskState::Unfulfillable { task, .. }
+                | TaskState::InvalidTask { task, .. }
                 | TaskState::Blocked { task, .. } => task,
             };
             (task.task_id == task_id).then_some(h.as_str())

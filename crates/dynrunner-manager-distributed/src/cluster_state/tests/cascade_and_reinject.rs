@@ -302,3 +302,108 @@ fn reinject_task_command_filters_to_unfulfillable_only() {
         Some(TaskState::Failed { .. })
     ));
 }
+
+// ── Discrete InvalidTask state pins ──
+
+/// `TaskFailed { kind: ErrorType::InvalidTask, .. }` lands in the
+/// discrete `TaskState::InvalidTask { reason, task }` variant, NOT in
+/// `TaskState::Failed { kind: InvalidTask, .. }`. Mirrors the
+/// `Unfulfillable` routing pin; the `reason` carries the inner
+/// `BoundedString` body verbatim.
+#[test]
+fn task_failed_with_invalid_task_lands_in_invalid_task_variant() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::InvalidTask {
+                reason: "missing dep nope".to_string().into(),
+            },
+            error: "invalid_task:missing dep nope".into(),
+        }),
+        ApplyOutcome::Applied
+    );
+    match s.task_state("h") {
+        Some(TaskState::InvalidTask { reason, .. }) => {
+            assert_eq!(reason, "missing dep nope");
+        }
+        other => panic!("expected InvalidTask, got {other:?}"),
+    }
+}
+
+/// `InvalidTask` is a TERMINAL, NON-reinjectable lockout. Unlike
+/// `Unfulfillable` (which `TaskReinjected` lifts back to `Pending`),
+/// a `TaskReinjected` against an `InvalidTask` entry is a NoOp and the
+/// state stays `InvalidTask` — there is no external action that makes
+/// a structurally-invalid task valid.
+#[test]
+fn reinject_against_invalid_task_is_noop_non_reinjectable() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "h".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "dup id".to_string().into(),
+        },
+        error: "invalid_task:dup id".into(),
+    });
+    assert_eq!(
+        s.apply(ClusterMutation::TaskReinjected { hash: "h".into() }),
+        ApplyOutcome::NoOp,
+        "InvalidTask is non-reinjectable; ReinjectTask must NoOp"
+    );
+    assert!(
+        matches!(s.task_state("h"), Some(TaskState::InvalidTask { .. })),
+        "state must stay InvalidTask after a rejected reinject"
+    );
+}
+
+/// Terminal lockout: a late generic `TaskFailed` and a spurious
+/// `TaskCompleted` must NOT overwrite a terminal `InvalidTask` entry.
+/// The discrete reason stays accurate across out-of-order delivery.
+#[test]
+fn invalid_task_terminal_lockout_blocks_late_failed_and_completed() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "h".into(),
+        task: mk_task("h"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "h".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "missing dep".to_string().into(),
+        },
+        error: "invalid_task:missing dep".into(),
+    });
+    // A late generic worker-originated TaskFailed must NoOp.
+    assert_eq!(
+        s.apply(ClusterMutation::TaskFailed {
+            hash: "h".into(),
+            kind: ErrorType::NonRecoverable,
+            error: "panic".into(),
+        }),
+        ApplyOutcome::NoOp
+    );
+    // A spurious TaskCompleted must NoOp (an invalid task is never
+    // dispatched, so success is impossible by construction).
+    assert_eq!(
+        s.apply(ClusterMutation::TaskCompleted {
+            hash: "h".into(),
+            result_data: None,
+        }),
+        ApplyOutcome::NoOp
+    );
+    match s.task_state("h") {
+        Some(TaskState::InvalidTask { reason, .. }) => {
+            assert_eq!(reason, "missing dep");
+        }
+        other => panic!("expected InvalidTask preserved, got {other:?}"),
+    }
+}
