@@ -38,10 +38,9 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> 
 #[test]
 fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -111,10 +110,9 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
 #[test]
 fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -177,10 +175,9 @@ fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
 #[test]
 fn hydrate_inflight_task_not_reoffered_and_counter_one() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -250,11 +247,10 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     PrimaryConfig::default(),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -321,11 +317,10 @@ async fn activate_local_primary_hydrates_on_seeded_resume() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     PrimaryConfig::default(),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -409,11 +404,10 @@ async fn activate_local_primary_does_not_hydrate_on_bootstrap() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     PrimaryConfig::default(),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -479,11 +473,10 @@ async fn run_parked_activates_on_gate_and_finalizes_from_crdt() {
             // combined with all-terminal CRDT the operational loop's
             // top-of-iteration `run_complete_check` exits at once.
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     PrimaryConfig::default(),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -565,11 +558,10 @@ async fn run_parked_exits_clean_when_gate_dropped() {
     local
         .run_until(async {
             let (transport, _ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     PrimaryConfig::default(),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );

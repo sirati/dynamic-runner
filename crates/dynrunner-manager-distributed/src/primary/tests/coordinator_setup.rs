@@ -52,10 +52,9 @@ fn make_test_primary_config(num_secondaries: u32) -> PrimaryConfig {
 #[test]
 fn mint_secondary_id_returns_sequential() {
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         make_test_primary_config(1),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -71,10 +70,9 @@ fn mint_secondary_id_returns_sequential() {
 #[test]
 fn mint_secondary_id_starts_at_num_secondaries() {
     let (transport, _ends) = setup_test(4);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         make_test_primary_config(4),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -89,10 +87,9 @@ fn set_slurm_job_manager_stores_arc() {
     use std::sync::Arc;
 
     let (transport, _ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         make_test_primary_config(1),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -204,11 +201,10 @@ async fn handle_welcome_emits_secondary_capacity_with_advertised_worker_count() 
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let (transport, mut secondary_ends) = setup_test(1);
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
             PrimaryCoordinator::new(
                 make_test_primary_config(1),
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -270,11 +266,10 @@ async fn handle_welcome_emits_peer_joined_for_accepted_secondary() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let (transport, mut secondary_ends) = setup_test(1);
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
             PrimaryCoordinator::new(
                 make_test_primary_config(1),
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -307,11 +302,10 @@ async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
         // `role_table.observers` locally.
         {
             let (transport, mut secondary_ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     make_test_primary_config(1),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -344,11 +338,10 @@ async fn handle_welcome_emits_peer_joined_with_is_observer_flag_from_welcome() {
         // observer projection must stay empty.
         {
             let (transport, mut secondary_ends) = setup_test(1);
-            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: PrimaryCoordinator<_, _, _, TestId> =
                 PrimaryCoordinator::new(
                     make_test_primary_config(1),
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -420,7 +413,6 @@ async fn lifecycle_dispatcher_joinhandle_aborted_on_run_exit() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

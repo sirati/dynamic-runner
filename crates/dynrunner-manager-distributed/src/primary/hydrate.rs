@@ -24,14 +24,14 @@
 use std::collections::HashSet;
 
 use dynrunner_core::{Identifier, PhaseId, TaskInfo};
-use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::{PeerTransport};
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
 use crate::secondary::origination::cascade_drain_done;
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
     /// Build a fresh `PendingPool` for the authoritative primary view
     /// from the replicated `cluster_state` ledger.
     ///

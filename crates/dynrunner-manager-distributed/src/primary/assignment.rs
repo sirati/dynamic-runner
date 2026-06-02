@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use dynrunner_core::{TaskInfo, Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport,
-    SecondaryTransport, StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
+    Address, DistributedMessage, PeerTransport,
+    StagedFileRecord, WorkerReadyInfo, ZipBinaryEntry,
     ZipFileAssignment,
 };
 use dynrunner_scheduler_api::{
@@ -15,7 +15,7 @@ use crate::state::SecondaryConnectionState;
 use super::{PrimaryCoordinator, RemoteWorkerState};
 use super::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
     pub(super) async fn perform_initial_assignment(&mut self) -> Result<(), String> {
         tracing::info!("performing initial assignment");
 
@@ -259,7 +259,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 pre_staged_mode: self.config.source_pre_staged_root.is_some(),
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.transport.send_to(secondary_id, msg).await?;
+            self.transport
+                .send(Address::Peer(secondary_id.clone()), msg)
+                .await?;
 
             // Send succeeded: originate the CRDT `Pending → InFlight`
             // transition for each task in this secondary's initial
@@ -357,7 +359,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 pre_staged_mode: true,
                 uses_file_based_items: self.config.uses_file_based_items,
             };
-            self.transport.send_to(secondary_id, msg).await?;
+            self.transport
+                .send(Address::Peer(secondary_id.clone()), msg)
+                .await?;
         }
 
         // InitialAssigning → Operational + seed keepalive, identical to

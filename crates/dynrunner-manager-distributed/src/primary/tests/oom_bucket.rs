@@ -78,8 +78,7 @@ fn phased_task(name: &str, phase: &str, size: u64) -> TaskInfo<TestId> {
 /// [`RemoteWorkerState`] entries the dispatch pipeline iterates.
 fn register_secondary_with_workers(
     primary: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         SizeEqualsMemoryEstimator,
         TestId,
@@ -149,20 +148,18 @@ fn oom_bucket_test_config(oom_retry_max_passes: u32) -> PrimaryConfig {
 /// state); the OOM-bucket reinject is what populates it for each
 /// of these tests.
 fn make_primed_primary(
-    transport: ChannelSecondaryTransportEnd<TestId>,
+    transport: ChannelPeerTransport<TestId>,
     oom_retry_max_passes: u32,
     tasks: Vec<TaskInfo<TestId>>,
 ) -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     SizeEqualsMemoryEstimator,
     TestId,
 > {
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         oom_bucket_test_config(oom_retry_max_passes),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         SizeEqualsMemoryEstimator,
     );
@@ -184,8 +181,7 @@ fn make_primed_primary(
 /// — the failure class the OOM bucket pulls from.
 fn mark_all_failed_oom(
     primary: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         SizeEqualsMemoryEstimator,
         TestId,
@@ -243,10 +239,8 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 outgoing.insert(sec_id.into(), tx);
                 sec_receivers.insert(sec_id.into(), rx);
             }
-            let transport = ChannelSecondaryTransportEnd {
-                outgoing,
-                incoming_rx,
-            };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
             let tasks = vec![
                 phased_task("t_small", "default", 40),

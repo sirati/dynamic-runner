@@ -116,11 +116,11 @@ fn respawn_event_ringbuffer_drops_oldest_at_1024_cap() {
 // transitively (a spawn future that resolves before assertions
 // lands its outcome on the JoinSet; the test reads the
 // resolved entry to confirm the new id).
-use crate::primary::test_helpers::{setup_test, FixedEstimator, NoPeers, TestId};
+use crate::primary::test_helpers::{setup_test, FixedEstimator, TestId};
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -174,8 +174,7 @@ impl SecondarySpawner for MockSpawner {
 /// monotonic test pins this contract directly.
 fn make_coordinator(
 ) -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -205,7 +204,6 @@ fn make_coordinator(
     PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )

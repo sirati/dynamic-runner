@@ -36,8 +36,7 @@ use crate::worker_signal::{
 };
 
 type TestPrimary = PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -103,7 +102,6 @@ fn primary_two_phase_one_worker() -> (
     let mut primary: TestPrimary = PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -295,7 +293,6 @@ async fn dispatch_selects_on_authoritative_free_predicate_not_advisory_is_idle()
             let mut primary: TestPrimary = PrimaryCoordinator::new(
                 PrimaryConfig::default(),
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );

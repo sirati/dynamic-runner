@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
     Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
-    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
@@ -35,8 +34,8 @@ pub(super) struct DeadSecondary {
     pub(super) last_keepalive: Instant,
 }
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
-    PrimaryCoordinator<T, P, S, E, I>
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier>
+    PrimaryCoordinator<Tr, S, E, I>
 {
     /// Update the keepalive timestamp for a known secondary. No-op if the
     /// secondary id isn't registered (e.g. a stray message after death).
@@ -132,7 +131,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             active_workers: self.workers.iter().filter(|w| !w.is_idle()).count() as u32,
         };
         if let Err(error) = self
-            .peer_transport
+            .transport
             .send(Address::Broadcast(Scope::AllSecondaries), msg)
             .await
         {
@@ -263,7 +262,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         for peer_id in surviving {
             if let Err(e) = self
                 .transport
-                .send_to(&peer_id, timeout_msg.clone())
+                .send(Address::Peer(peer_id.clone()), timeout_msg.clone())
                 .await
             {
                 tracing::warn!(peer = %peer_id, error = %e, "TimeoutDetected delivery failed");

@@ -8,13 +8,13 @@ use dynrunner_scheduler::ResourceStealingScheduler;
 use tokio::sync::oneshot;
 
 use crate::primary::test_helpers::{
-    make_binary, setup_test, FixedEstimator, NoPeers, TestId,
+    make_binary, setup_test, FixedEstimator, TestId,
 };
 use crate::primary::wire::compute_task_hash;
 use crate::primary::PrimaryConfig;
 use crate::primary::PrimaryCoordinator;
 use crate::cluster_state::TaskState;
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 
 /// Build a `PrimaryCoordinator` against the in-process channel
 /// transport stub used by the rest of the primary tests. We
@@ -22,8 +22,7 @@ use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
 /// channel handlers directly to assert per-command semantics
 /// without coupling to the operational loop's exit conditions.
 fn make_coordinator() -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -53,7 +52,6 @@ fn make_coordinator() -> PrimaryCoordinator<
     PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -866,8 +864,7 @@ async fn update_preferred_secondaries_propagates_to_live_pool() {
 /// production operational loop uses.
 fn seed_pool(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -893,8 +890,7 @@ fn seed_pool(
 /// uses the same call sequence.
 async fn spawn_via_handler(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,

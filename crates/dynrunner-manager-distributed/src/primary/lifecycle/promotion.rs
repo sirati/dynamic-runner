@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    PeerTransport, SecondaryTransport,
+    PeerTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -14,7 +14,7 @@ use crate::primary::command_channel::PrimaryCommand;
 
 
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
 
     /// Block on every connected secondary reporting `MeshReady`
     /// before letting `promote_primary` fire. The 750µs gap
@@ -34,8 +34,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// dispatch pipeline; the post-promotion paths are all
     /// already failure-tolerant against an absent peer.
     ///
-    /// Cancellation safety: `transport.recv` is the cancel-safe
-    /// mpsc bridge; `sleep_until` is one-shot cancel-safe per
+    /// Cancellation safety: `transport.recv_peer` is the cancel-safe
+    /// unified inbound demux; `sleep_until` is one-shot cancel-safe per
     /// tokio docs. The `select!` here mirrors the same shape
     /// `wait_for_connections` uses one phase up.
     pub(crate) async fn wait_for_mesh_ready(
@@ -98,7 +98,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
 
             tokio::select! {
-                msg = self.transport.recv() => {
+                msg = self.transport.recv_peer() => {
                     match msg {
                         // Pre-operational-loop site. See
                         // `wait_for_connections` for the matching

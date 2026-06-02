@@ -35,7 +35,6 @@ async fn single_secondary_processes_all_tasks() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -94,7 +93,6 @@ async fn two_secondaries_distribute_work() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -164,7 +162,8 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
         }
         drop(incoming_tx);
 
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
         let config = PrimaryConfig {
             node_id: "primary".into(),
             num_secondaries: 2,
@@ -190,7 +189,6 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -279,7 +277,6 @@ async fn live_distribution_continues_past_initial_batch() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

@@ -35,8 +35,7 @@ fn dep_binary(name: &str, phase: &str, depends_on: &[&str]) -> TaskInfo<TestId> 
 }
 
 fn make_primary() -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -47,7 +46,6 @@ fn make_primary() -> PrimaryCoordinator<
     PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )

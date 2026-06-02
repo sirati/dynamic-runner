@@ -2,7 +2,6 @@
 use dynrunner_core::{Identifier, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -12,7 +11,7 @@ use crate::primary::PrimaryCoordinator;
 use crate::worker_signal::WorkerMgmtSignal;
 
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
 
     /// Apply a replicated `DistributedMessage::ClusterMutation` batch.
     ///

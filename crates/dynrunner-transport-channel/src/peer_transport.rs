@@ -166,6 +166,37 @@ impl<I: Identifier + Clone> PeerTransport<I> for ChannelPeerTransport<I> {
 }
 
 impl<I: Identifier> ChannelPeerTransport<I> {
+    /// Build a transport from a raw inbox receiver + per-peer outbox
+    /// table, rather than the all-to-all [`crate::peer_mesh`] wiring.
+    ///
+    /// This is the channel-transport analogue of the public
+    /// [`crate::ChannelSecondaryTransportEnd`] `{ outgoing, incoming_rx }`
+    /// shape: a fixture that already owns hand-rolled per-peer channels
+    /// (e.g. a primary whose `outgoing[sec-i]` reaches a fake secondary,
+    /// fed inbound by every fake writing to one aggregated `incoming_rx`)
+    /// wraps them in a real [`PeerTransport`] without standing up a full
+    /// mesh of `ChannelPeerTransport`s. The `Router` + role cache are
+    /// constructed the same way [`crate::peer_mesh_with_adjacency`] does
+    /// (own id seeded for `Role::Self_`), so role-addressed dispatch and
+    /// relay behave identically — the only difference is who supplied
+    /// the channels.
+    pub fn from_raw_channels(
+        local_id: String,
+        outgoing: HashMap<String, mpsc::UnboundedSender<DistributedMessage<I>>>,
+        incoming_rx: mpsc::UnboundedReceiver<DistributedMessage<I>>,
+    ) -> Self {
+        let role_cache = dynrunner_protocol_primary_secondary::new_role_cache();
+        dynrunner_protocol_primary_secondary::seed_self_role(&role_cache, &local_id);
+        Self {
+            router: Router::new(local_id.clone()),
+            local_id,
+            incoming_rx,
+            outgoing,
+            last_outcome: None,
+            role_cache,
+        }
+    }
+
     /// Role-layer interceptor: handle [`DistributedMessage::RoleAddressed`]
     /// (Case A unwrap / Case B relay-and-hint / Cases C, D drop) and
     /// [`DistributedMessage::RoleMisaddressHint`] (silent cache-warm).

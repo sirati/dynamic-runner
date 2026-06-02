@@ -43,7 +43,6 @@ async fn stranded_count_is_zero_on_clean_run() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -240,7 +239,6 @@ async fn stranded_on_cluster_collapse_returns_err_with_counts() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -355,10 +353,9 @@ async fn fleet_dead_timeout_pending_become_stranded_not_failed() {
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: std::time::Duration::from_secs(600),
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -473,10 +470,9 @@ async fn drain_pending_messages_updates_completed_set() {
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: std::time::Duration::from_secs(600),
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -582,7 +578,6 @@ async fn clean_run_does_not_false_positive_stranded() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

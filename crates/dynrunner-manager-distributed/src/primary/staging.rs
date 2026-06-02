@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use dynrunner_core::{Identifier, TaskInfo, TypeId};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::wire::{compute_task_hash, timestamp_now};
@@ -157,10 +157,9 @@ pub fn compute_initial_staging_entries<I: Identifier>(
     Ok(entries)
 }
 
-impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
+impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
 where
-    T: SecondaryTransport<I>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
@@ -298,7 +297,9 @@ where
             src_path,
             dest_path,
         };
-        self.transport.send_to(secondary_id, msg).await
+        self.transport
+            .send(Address::Peer(secondary_id.to_string()), msg)
+            .await
     }
 
 }

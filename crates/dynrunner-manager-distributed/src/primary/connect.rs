@@ -2,7 +2,6 @@
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, MessageType, PeerTransport,
-    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -14,7 +13,7 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 
 use super::PrimaryCoordinator;
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
     pub(super) async fn wait_for_connections(
         &mut self,
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
@@ -33,15 +32,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 break;
             }
 
-            // Cancellation safety: `transport.recv` goes through the
-            // mpsc bridge in `NetworkServer` (its inner select! is over
-            // two cancel-safe mpsc receivers). `sleep_until` is
-            // one-shot and cancel-safe. If `sleep_until` wins it's
-            // because the deadline expired and we error out anyway —
-            // even on a hypothetical not-cancel-safe transport, the
-            // connection is torn down on the error path.
+            // Cancellation safety: `transport.recv_peer` is the unified
+            // inbound demux — the relocated `NetworkServer` `select!`
+            // over the cancel-safe inbound + registration mpscs.
+            // `sleep_until` is one-shot and cancel-safe. If
+            // `sleep_until` wins it's because the deadline expired and
+            // we error out anyway. The demux applies any pending writer
+            // registration before surfacing a frame, so the welcome
+            // this loop counts arrives with its secondary already
+            // registered (FIFO welcome → registration → cert-exchange).
             tokio::select! {
-                msg = self.transport.recv() => {
+                msg = self.transport.recv_peer() => {
                     match msg {
                         // Pre-operational-loop site. Threading
                         // `command_rx` through so an `on_phase_end`

@@ -2,7 +2,7 @@
 use dynrunner_core::{BoundedString, Identifier};
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
-    RemovalCause, SecondaryTransport,
+    RemovalCause,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -15,7 +15,7 @@ use crate::worker_signal::WorkerMgmtSignal;
 
 
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
 
     /// Apply each mutation locally and broadcast the same batch so every
     /// secondary mirrors the change. Per-secondary delivery failures are
@@ -90,14 +90,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             timestamp: timestamp_now(),
             mutations: applied,
         };
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            for (secondary_id, error) in &failures {
-                tracing::warn!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "ClusterMutation broadcast delivery failed"
-                );
-            }
+        // The single mesh transport collapses per-secondary delivery
+        // failures into one `String` (the per-secondary signal is the
+        // heartbeat monitor, not this log line). The CRDT is
+        // idempotent, so a missed mutation is recoverable from the next
+        // snapshot RPC; we never block dispatch on universal delivery.
+        if let Err(error) = self.transport.broadcast(msg).await {
+            tracing::warn!(
+                error = %error,
+                "ClusterMutation broadcast delivery failed"
+            );
         }
     }
 
@@ -247,18 +249,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             total_files: 0,
             total_bytes: 0,
         };
-        if let Err(failures) = self.transport.broadcast(msg).await {
-            for (secondary_id, error) in &failures {
-                tracing::warn!(
-                    secondary = %secondary_id,
-                    error = %error,
-                    "TransferComplete delivery failed"
-                );
-            }
-            return Err(format!(
-                "TransferComplete broadcast failed for {} secondaries",
-                failures.len()
-            ));
+        if let Err(error) = self.transport.broadcast(msg).await {
+            tracing::warn!(
+                error = %error,
+                "TransferComplete delivery failed"
+            );
+            return Err(format!("TransferComplete broadcast failed: {error}"));
         }
         tracing::info!("transfer complete sent to all secondaries");
         Ok(())

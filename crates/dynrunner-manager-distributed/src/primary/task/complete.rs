@@ -1,8 +1,7 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
+    Address, ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -14,7 +13,7 @@ use crate::primary::PrimaryCoordinator;
 use crate::worker_signal::WorkerMgmtSignal;
 
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
 
     /// `command_rx` threads the operational-loop's command-channel
     /// receiver into the cascade so a callback-issued `spawn_tasks`
@@ -211,7 +210,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         for secondary_id in &recipients {
             if let Err(e) = self
                 .transport
-                .send_to(secondary_id, msg.clone())
+                .send(Address::Peer(secondary_id.clone()), msg.clone())
                 .await
             {
                 tracing::debug!(

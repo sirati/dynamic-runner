@@ -78,7 +78,6 @@ async fn promote_primary_held_until_every_secondary_reports_mesh_ready() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -362,7 +361,6 @@ async fn peer_info_broadcast_carries_both_ipv4_and_ipv6() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
