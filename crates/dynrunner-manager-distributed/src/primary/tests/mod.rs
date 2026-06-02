@@ -7,12 +7,12 @@
 //! - [`setup_promote`] — setup-promote / pre-seeded-counter pathways.
 //! - [`e2e`] — end-to-end primary + real secondary scenarios.
 //! - [`promotion`] — primary-promotion + mesh-ready gates.
-//! - [`demoted`] — demoted-primary observer-mode behaviour.
 //! - [`stranded`] — stranded-task / cluster-collapse accounting.
 //! - [`initial_assignment`] — initial round-robin + dispatch ordering.
 //! - [`coordinator_setup`] — mint id, slurm-mgr stash, welcome handling.
 //! - [`preferred_secondaries`] — preferred-secondary validation.
 //! - [`wire`] — `wire_local_path` pre-staged-prefix stripping.
+//! - [`worker_lifecycle`] — P1 slot-typestate / no-reassign-before-terminal.
 
 mod basic;
 mod coordinator_setup;
@@ -29,6 +29,7 @@ mod retry;
 mod setup_promote;
 mod stranded;
 mod wire;
+mod worker_lifecycle;
 
 // Shared imports re-exported with `pub(super)` so each test sub-module
 // can `use super::*` and pick them up without restating the full list.

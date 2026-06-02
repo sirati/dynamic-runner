@@ -41,16 +41,27 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
             let mut assigned = false;
 
-            // R1: `TaskRequest` is a pure capacity hint that never
+            // R1: `TaskRequest` is a pure capacity hint that NEVER
             // frees a slot. The removed free-on-request block
             // (`current_task = None; is_idle = true`) and the removed
             // stale-request guard let a bare request mutate slot state;
             // R1's `SlotState` typestate makes assignment reachable
-            // ONLY from `Idle` and frees a slot ONLY on a terminal
-            // outcome via `free_slot_on_terminal`. The `demoted`
-            // short-circuit is gone too — there is no demoted-primary
-            // self-assign race to guard against.
-            if let Some(idx) = target_idx {
+            // ONLY from `Idle` (via `commit_assignment`'s
+            // `assign`/`debug_assert`) and frees a slot ONLY on a
+            // terminal outcome via `free_slot_on_terminal`. The
+            // `demoted` short-circuit is gone too — there is no
+            // demoted-primary self-assign race to guard against.
+            //
+            // Capacity-hint contract: if the addressed slot is already
+            // `Assigned`, the request is a no-op on slot state (a
+            // delayed/duplicate request for a worker that's still
+            // running the task it last took) — we fall through to the
+            // primary-relay arm without touching the slot or the
+            // ledger. Only an `Idle` slot refreshes its budget and
+            // attempts one assignment.
+            if let Some(idx) = target_idx
+                && self.workers[idx].is_idle()
+            {
                 // Composed dispatch-shape gate: backpressure backoff
                 // + OOM-bucket single-worker masking. See
                 // `should_skip_worker_for_dispatch` for the
@@ -90,13 +101,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     } = decision
                     {
                         let binary = self.pool_mut().take_from_view(view, binary_index);
-                        self.reserve_type_slot(&binary.type_id);
                         let sec_id = self.workers[idx].secondary_id.clone();
-                        self.workers[idx].current_task = Some(binary.clone());
-                        self.workers[idx].estimated_resources = estimated_usage.clone();
-                        self.workers[idx].is_idle = false;
 
                         let task_hash = compute_task_hash(&binary);
+                        // Type-slot reserve + slot `Idle ->
+                        // Assigned{task_hash}` + ledger insert, committed
+                        // together. The slot is idle here: the outer arm
+                        // gated on `is_idle()`, so assignment is reachable
+                        // only from an idle slot.
+                        self.commit_assignment(
+                            idx,
+                            binary.clone(),
+                            task_hash.clone(),
+                            estimated_usage.clone(),
+                        );
                         // Resolve the per-edge predecessor-output map from the
                         // replicated `cluster_state.task_outputs` cache. The
                         // helper handles both the direct-dep present-but-empty
@@ -121,9 +139,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
                         // Same partial-commit-leak rollback as
                         // `dispatch_to_idle_workers`: a send_to
-                        // failure here pre-fix left the worker's
-                        // current_task set + is_idle=false + pool
-                        // in_flight bumped. dispatch_order then
+                        // failure here pre-fix left the slot Assigned +
+                        // pool in_flight bumped. dispatch_order then
                         // skipped the slot forever; the leaked
                         // in_flight never decremented because no
                         // TaskComplete/TaskFailed could arrive for
@@ -141,11 +158,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                                 error = %send_err,
                                 "task-assignment send failed; rolling back worker state and requeuing binary"
                             );
-                            self.workers[idx].current_task = None;
-                            self.workers[idx].estimated_resources =
-                                ResourceMap::new();
-                            self.workers[idx].is_idle = true;
-                            self.release_type_slot(&binary.type_id);
+                            // Undo the `commit_assignment` triple (type
+                            // slot + slot state + ledger) for the unsent
+                            // task, then requeue the binary.
+                            self.rollback_assignment(idx, &task_hash, &binary.type_id);
                             self.pool_mut().requeue(binary);
                             // Return early without setting
                             // `assigned`: the binary is back in

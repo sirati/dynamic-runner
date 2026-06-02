@@ -47,7 +47,7 @@ mod tests;
 pub(crate) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) -> Vec<usize> {
     let mut load_per_secondary: HashMap<&str, usize> = HashMap::new();
     for w in workers {
-        if w.current_task.is_some() {
+        if !w.is_idle() {
             *load_per_secondary
                 .entry(w.secondary_id.as_str())
                 .or_default() += 1;
@@ -56,7 +56,7 @@ pub(crate) fn dispatch_order<I: Identifier>(workers: &[RemoteWorkerState<I>]) ->
     let mut idle: Vec<usize> = workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_idle)
+        .filter(|(_, w)| w.is_idle())
         .map(|(i, _)| i)
         .collect();
     idle.sort_by_key(|&i| {

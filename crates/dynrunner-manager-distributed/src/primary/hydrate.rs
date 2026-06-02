@@ -2,11 +2,11 @@
 //! `cluster_state` ledger.
 //!
 //! Single concern: `hydrate_from_cluster_state` — turn the in-memory
-//! CRDT into a fresh `PendingPool` (plus the matching
-//! `pre_owned_in_flight` ledger and `completed_tasks` set) so a
-//! freshly-composed authoritative `PrimaryCoordinator` resumes
-//! operational dispatch seeded from the cluster view instead of an
-//! empty pool.
+//! CRDT into a fresh `PendingPool` (plus matching entries in the
+//! unified hash-keyed `in_flight` ledger and the `completed_tasks`
+//! set) so a freshly-composed authoritative `PrimaryCoordinator`
+//! resumes operational dispatch seeded from the cluster view instead
+//! of an empty pool.
 //!
 //! Faithful port of the secondary's
 //! `populate_primary_from_cluster_state`
@@ -40,9 +40,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// Blocked) is iterated once; only `Pending` / `Blocked`
     /// entries enter the pool, terminal entries contribute their
     /// `task_id` to the dep-resolution seed, and `InFlight` entries are
-    /// recorded as pre-owned in-flight (the originating dispatcher owns
-    /// the work; this coordinator picks up completion only via the
-    /// broadcast path).
+    /// recorded in the unified `in_flight` ledger with no holding slot
+    /// (the originating dispatcher owns the work; this coordinator
+    /// picks up completion only via the broadcast path).
     ///
     /// The pool is rebuilt on every call: the cluster ledger is the
     /// authoritative source, and a partial patch would risk
@@ -121,15 +121,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                     //      correctly when completion arrives — the
                     //      counter must drop from N+1 to N, not from
                     //      0 to 0.
-                    //   3. Insert into `pre_owned_in_flight` keyed by
-                    //      file_hash so when the broadcast TaskComplete
-                    //      lands in `handle_task_complete` (which finds
-                    //      no local worker holding the hash), the
-                    //      fallback lookup finds the (phase_id,
-                    //      secondary, binary) and forwards to
-                    //      `note_item_completed`.
+                    //   3. Insert into the unified `in_flight` ledger
+                    //      keyed by file_hash with `worker_idx = None`,
+                    //      so when the broadcast TaskComplete lands in
+                    //      `handle_task_complete`, `free_slot_on_terminal`
+                    //      resolves the entry BY HASH (no local slot
+                    //      needed), yields the (phase_id, secondary,
+                    //      task), and forwards to `note_item_completed`.
                     // (1) and (2) are owned by the pool via
-                    // `mark_tasks_in_flight` below; (3) is local state.
+                    // `mark_tasks_in_flight` below; (3) is the ledger
+                    // seed performed after `extend` succeeds.
                     in_flight_pairs.push((task.task_id.clone(), task.phase_id.clone()));
                     in_flight_seed.push((
                         hash.clone(),
@@ -193,12 +194,18 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
         };
 
-        // Seed `pre_owned_in_flight` only after `extend` succeeded — a
-        // failure on the items batch leaves `pending = None` and any
-        // in_flight ledger we'd populated would be stranded.
+        // Seed the unified `in_flight` ledger only after `extend`
+        // succeeded — a failure on the items batch leaves
+        // `pending = None` and any ledger entry we'd populated would be
+        // stranded. Each inherited task is seeded with `worker_idx =
+        // None` (no local slot holds it; the originating dispatcher
+        // owns the work), so when its broadcast TaskComplete /
+        // TaskFailed lands, `free_slot_on_terminal` attributes it BY
+        // HASH and runs the correct phase's `note_item_*`. This folds
+        // in the deleted `pre_owned_in_flight` ledger — there is now
+        // ONE ledger, populated identically at dispatch and hydration.
         for (hash, phase_id, secondary, binary) in in_flight_seed {
-            self.pre_owned_in_flight
-                .insert(hash, (phase_id, secondary, binary));
+            self.seed_inflight(hash, phase_id, secondary, binary);
         }
 
         // Single source of truth for the run-completion accounting:
@@ -207,7 +214,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.total_tasks = self.cluster_state.task_count();
 
         let pending_count = pool.len();
-        let in_flight_count = self.pre_owned_in_flight.len();
+        let in_flight_count = self.in_flight.len();
         self.pending = Some(pool);
 
         tracing::info!(

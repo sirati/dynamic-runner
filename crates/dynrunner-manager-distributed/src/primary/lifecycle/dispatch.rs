@@ -1,5 +1,5 @@
 
-use dynrunner_core::{Identifier, ResourceMap};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
     DistributedMessage, PeerTransport,
     SecondaryTransport,
@@ -73,14 +73,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             } = decision
             {
                 let binary = self.pool_mut().take_from_view(view, binary_index);
-                self.reserve_type_slot(&binary.type_id);
                 let sec_id = self.workers[worker_idx].secondary_id.clone();
                 let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
-                self.workers[worker_idx].current_task = Some(binary.clone());
-                self.workers[worker_idx].estimated_resources = estimated_usage.clone();
-                self.workers[worker_idx].is_idle = false;
 
                 let task_hash = compute_task_hash(&binary);
+                // Type-slot reserve + slot `Idle -> Assigned{task_hash}`
+                // + ledger insert, committed together so the three
+                // pieces of in-flight bookkeeping can never diverge. The
+                // slot is idle by construction here (`dispatch_order`
+                // filters to idle workers).
+                self.commit_assignment(
+                    worker_idx,
+                    binary.clone(),
+                    task_hash.clone(),
+                    estimated_usage.clone(),
+                );
                 // Resolve the per-edge predecessor-output map from the
                 // replicated `cluster_state.task_outputs` cache. The
                 // helper handles both the direct-dep present-but-empty
@@ -134,11 +141,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         error = %send_err,
                         "task-assignment send failed; rolling back worker state and requeuing binary"
                     );
-                    self.workers[worker_idx].current_task = None;
-                    self.workers[worker_idx].estimated_resources =
-                        ResourceMap::new();
-                    self.workers[worker_idx].is_idle = true;
-                    self.release_type_slot(&binary.type_id);
+                    // Undo the `commit_assignment` triple (type slot +
+                    // slot state + ledger) for the task whose send never
+                    // made it real — no terminal will ever arrive for
+                    // this hash — then requeue the binary.
+                    self.rollback_assignment(worker_idx, &task_hash, &binary.type_id);
                     self.pool_mut().requeue(binary);
                     continue;
                 }
