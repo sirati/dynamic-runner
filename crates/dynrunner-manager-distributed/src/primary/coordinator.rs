@@ -1317,6 +1317,52 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.pre_owned_in_flight.len()
     }
 
+    /// Test-only mutable borrow of the per-secondary `SecondaryTransport`
+    /// aggregator. Lets the composition routing hazard test drive a
+    /// `send_to(local_secondary_id, ..)` directly and assert it reaches
+    /// the loopback secondary's inbound without echoing back to the
+    /// primary.
+    #[cfg(test)]
+    pub fn transport_mut_for_test(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    /// Test-only count of workers the primary currently tracks as
+    /// mid-dispatch (`current_task.is_some()`). Used by the composition
+    /// hazard tests to assert a hydrated remote-in-flight task is NOT
+    /// also counted as a local-active worker (the double-count hazard).
+    #[cfg(test)]
+    pub fn active_workers_for_test(&self) -> usize {
+        self.workers
+            .iter()
+            .filter(|w| w.current_task.is_some())
+            .count()
+    }
+
+    /// Test-only seam: register one idle remote worker owned by
+    /// `secondary_id`. The composition flow's worker registration runs
+    /// through the welcome / initial-assignment handshake the composed
+    /// primary deliberately skips (it picks up a cluster that already
+    /// handshaked pre-promotion); the dispatch hazard test seeds a
+    /// worker directly so it can drive `dispatch_to_idle_workers` and
+    /// assert the resulting `TaskAssignment` routes over the loopback.
+    #[cfg(test)]
+    pub fn register_idle_worker_for_test(
+        &mut self,
+        secondary_id: String,
+        worker_id: u32,
+        resource_budgets: ResourceMap,
+    ) {
+        self.workers.push(RemoteWorkerState {
+            worker_id,
+            secondary_id,
+            resource_budgets,
+            current_task: None,
+            estimated_resources: ResourceMap::new(),
+            is_idle: true,
+        });
+    }
+
     /// Test-only inspector for whether the peer-lifecycle dispatcher
     /// handle is still held by the coordinator. After a clean `run()`
     /// exit (Ok OR Err), [`Self::cleanup_lifecycle_dispatcher`] must

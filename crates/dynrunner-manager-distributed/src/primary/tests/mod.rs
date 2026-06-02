@@ -15,6 +15,7 @@
 //! - [`wire`] — `wire_local_path` pre-staged-prefix stripping.
 
 mod basic;
+mod compose;
 mod coordinator_setup;
 mod demoted;
 mod e2e;

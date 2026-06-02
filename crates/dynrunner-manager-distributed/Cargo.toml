@@ -19,6 +19,11 @@ dynrunner-scheduler-api = { workspace = true }
 dynrunner-scheduler = { workspace = true }
 dynrunner-manager-local = { workspace = true }
 dynrunner-transport-quic = { workspace = true }
+# Channel (in-process mpsc) primary↔secondary transport. The composed
+# authoritative primary (`primary::compose`) reaches its co-located
+# secondary over a `ChannelSecondaryTransportEnd` loopback, so this is a
+# runtime dependency of the composition path — not test-only.
+dynrunner-transport-channel = { workspace = true }
 # `signal` feature: `panik_watcher::wait_for_sigterm_if_enabled` uses
 # `tokio::signal::unix::signal(SignalKind::terminate())` so the
 # secondary path can react to host-driven SIGTERM (SLURM time-limit /
@@ -35,7 +40,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-dynrunner-transport-channel = { workspace = true }
 dynrunner-transport-tunnel = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
