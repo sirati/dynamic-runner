@@ -79,10 +79,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // references must still resolve so `extend()` accepts
                 // them. The Unfulfillable entry itself stays in the
                 // CRDT and is reinjectable via the command channel; no
-                // pool work is needed for it.
+                // pool work is needed for it. `InvalidTask` is likewise
+                // terminal: it stays in the CRDT (non-reinjectable) and
+                // its task_id seeds the dep-resolution set so dependents
+                // resolve their reference — those dependents cascade
+                // through the pool's dep machine exactly as they would
+                // against any other terminal prereq.
                 TaskState::Completed { task }
                 | TaskState::Failed { task, .. }
-                | TaskState::Unfulfillable { task, .. } => {
+                | TaskState::Unfulfillable { task, .. }
+                | TaskState::InvalidTask { task, .. } => {
                     primary_completed.insert(hash.clone());
                     completed_task_ids.insert(task.task_id.clone());
                 }

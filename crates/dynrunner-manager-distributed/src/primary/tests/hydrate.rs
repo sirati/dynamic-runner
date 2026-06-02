@@ -102,6 +102,73 @@ fn hydrate_seeds_completed_deps_so_dependents_enter_pool() {
     assert_eq!(primary.total_tasks, 3);
 }
 
+/// (1b) An `InvalidTask` terminal prereq plus a `Pending` dependent
+/// whose `task_depends_on` references it. `InvalidTask` is treated as
+/// terminal by hydration: its `task_id` seeds `mark_tasks_completed`
+/// (so the dependent's dep resolves and it enters the pool) and its
+/// hash is recorded in the primary-side completed ledger (so it is not
+/// re-queued). The non-reinjectable terminal entry stays in the CRDT.
+#[test]
+fn hydrate_treats_invalid_task_as_terminal_dep_seed() {
+    let (transport, _ends) = setup_test(1);
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        PrimaryConfig::default(),
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let toolchain = dep_binary("toolchain", "build", &[]);
+    let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
+
+    {
+        let cs = primary.cluster_state_mut_for_test();
+        cs.apply(ClusterMutation::PhaseDepsSet {
+            deps: HashMap::from([(
+                PhaseId::from("compile"),
+                vec![PhaseId::from("build")],
+            )]),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "toolchain".into(),
+            task: toolchain.clone(),
+        });
+        // Drive `toolchain` to terminal InvalidTask.
+        cs.apply(ClusterMutation::TaskFailed {
+            hash: "toolchain".into(),
+            kind: dynrunner_core::ErrorType::InvalidTask {
+                reason: "missing upstream".to_string().into(),
+            },
+            error: "invalid_task:missing upstream".into(),
+        });
+        cs.apply(ClusterMutation::TaskAdded {
+            hash: "dep-a".into(),
+            task: dep_a.clone(),
+        });
+    }
+
+    primary.hydrate_from_cluster_state();
+
+    // The dependent entered the pool — the InvalidTask prereq seeded
+    // `completed_task_ids`, so `extend()` accepted it without an
+    // `UnknownTaskDep` rejection.
+    let pool = primary.pool();
+    let ids: std::collections::HashSet<&str> =
+        pool.iter().map(|t| t.task_id.as_str()).collect();
+    assert!(ids.contains("dep-a"), "dependent of an InvalidTask prereq must enter the pool");
+    assert!(!ids.contains("toolchain"), "the terminal InvalidTask prereq is not re-queued");
+    // The terminal InvalidTask hash is recorded in the primary-side
+    // completed ledger.
+    assert!(primary.completed_tasks.contains("toolchain"));
+    // The InvalidTask entry itself stays in the CRDT (non-reinjectable).
+    assert!(matches!(
+        primary.cluster_state_for_test().task_state("toolchain"),
+        Some(crate::cluster_state::TaskState::InvalidTask { .. })
+    ));
+    assert_eq!(primary.total_tasks, 2);
+}
+
 /// (2) A single `InFlight` task. After hydration the dispatch/recheck
 /// view must NOT re-offer that hash (it was never queued — it is
 /// in-flight), the phase in-flight counter must read 1, and the

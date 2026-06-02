@@ -126,11 +126,12 @@ fn task_state_rank<I>(s: &TaskState<I>) -> u8 {
         TaskState::InFlight { .. } => 2,
         // All terminals share the strongest rank. Convergence among
         // terminals follows the per-arm rules in `apply` (Completed
-        // never regresses; Failed/Unfulfillable lock out incoming
-        // TaskFailed for their own hash).
+        // never regresses; Failed/Unfulfillable/InvalidTask lock out
+        // incoming TaskFailed for their own hash).
         TaskState::Completed { .. }
         | TaskState::Failed { .. }
-        | TaskState::Unfulfillable { .. } => 3,
+        | TaskState::Unfulfillable { .. }
+        | TaskState::InvalidTask { .. } => 3,
     }
 }
 

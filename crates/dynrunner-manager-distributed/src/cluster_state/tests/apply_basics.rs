@@ -205,6 +205,63 @@ fn outcome_counts_partitions_terminal_states_by_error_class() {
     assert_eq!(o.total_terminal(), 6, "sum across all four buckets");
 }
 
+/// The discrete `TaskState::InvalidTask` entry is bucketed as
+/// `fail_final` by `outcome_counts` (sibling to `Unfulfillable`),
+/// tallied by `counts().invalid_task`, and surfaced by `iter_terminal`
+/// (it IS a terminal). Pins all three CRDT read surfaces for the new
+/// variant in one population.
+#[test]
+fn invalid_task_counts_as_fail_final_and_is_terminal() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    // One succeeded, one InvalidTask, one Pending (uncounted terminal).
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "ok".into(),
+        task: mk_task("ok"),
+    });
+    s.apply(ClusterMutation::TaskCompleted {
+        hash: "ok".into(),
+        result_data: None,
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "bad".into(),
+        task: mk_task("bad"),
+    });
+    s.apply(ClusterMutation::TaskFailed {
+        hash: "bad".into(),
+        kind: ErrorType::InvalidTask {
+            reason: "missing dep".to_string().into(),
+        },
+        error: "invalid_task:missing dep".into(),
+    });
+    s.apply(ClusterMutation::TaskAdded {
+        hash: "pend".into(),
+        task: mk_task("pend"),
+    });
+
+    // outcome_counts: the InvalidTask folds into fail_final.
+    let o = s.outcome_counts();
+    assert_eq!(o.succeeded, 1);
+    assert_eq!(o.fail_retry, 0);
+    assert_eq!(o.fail_oom, 0);
+    assert_eq!(o.fail_final, 1, "InvalidTask → fail_final");
+    assert_eq!(o.total_terminal(), 2);
+
+    // counts: dedicated per-discriminant tally.
+    let c = s.counts();
+    assert_eq!(c.invalid_task, 1, "counts().invalid_task tallies the entry");
+    assert_eq!(c.completed, 1);
+    assert_eq!(c.pending, 1);
+    assert_eq!(c.failed, 0, "InvalidTask is NOT folded into the generic failed count");
+
+    // iter_terminal includes the InvalidTask entry (it is terminal);
+    // the Pending entry is excluded.
+    let terminal_ids: std::collections::HashSet<&str> =
+        s.iter_terminal().map(|(_, t)| t.task_id.as_str()).collect();
+    assert!(terminal_ids.contains("bad"), "InvalidTask is terminal");
+    assert!(terminal_ids.contains("ok"));
+    assert!(!terminal_ids.contains("pend"), "Pending is not terminal");
+}
+
 #[test]
 fn failed_attempts_counter_increments() {
     let mut s = ClusterState::<RunnerIdentifier>::new();

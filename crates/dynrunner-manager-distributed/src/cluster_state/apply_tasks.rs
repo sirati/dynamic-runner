@@ -125,6 +125,7 @@ impl<I: Identifier> ClusterState<I> {
             | TaskState::Completed { task }
             | TaskState::Failed { task, .. }
             | TaskState::Unfulfillable { task, .. }
+            | TaskState::InvalidTask { task, .. }
             | TaskState::Blocked { task, .. } => task,
         };
         Some(task.task_id.clone())
@@ -266,6 +267,18 @@ impl<I: Identifier> ClusterState<I> {
                         kind: ErrorType::NonRecoverable,
                         ..
                     }) => {
+                        cascade_fail = true;
+                        break;
+                    }
+                    // A dep that is itself structurally invalid is a
+                    // non-recoverable upstream terminal: the dependent
+                    // can never run, so it cascade-fails through the
+                    // same `Failed { NonRecoverable }` shape (the
+                    // "upstream-invalid" case). Keeping it out of the
+                    // `invalid_task` reason space — only literally-
+                    // absent deps mint a fresh `InvalidTask`; an
+                    // existing-but-invalid dep cascades.
+                    Some(TaskState::InvalidTask { .. }) => {
                         cascade_fail = true;
                         break;
                     }

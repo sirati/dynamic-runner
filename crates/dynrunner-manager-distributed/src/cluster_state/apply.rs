@@ -119,6 +119,15 @@ impl<I: Identifier> ClusterState<I> {
                     // same hash arrives twice via peer-forwarding
                     // redundancy or snapshot replay).
                     TaskState::Completed { .. } => return ApplyOutcome::NoOp,
+                    // `InvalidTask` is a terminal, non-reinjectable
+                    // lockout: a structurally-invalid task is never
+                    // dispatched, so a `TaskCompleted` for its hash is
+                    // spurious and must NOT regress the terminal. This
+                    // diverges from the `Unfulfillable`/`Blocked` arm
+                    // below, which IS superseded by a genuine success
+                    // (those tasks can legitimately run once the
+                    // resource appears).
+                    TaskState::InvalidTask { .. } => return ApplyOutcome::NoOp,
                     // Retry-success supersedes a prior Recoverable
                     // failure: the retry pass re-injects the binary,
                     // a worker picks it up, and the next TaskCompleted
@@ -219,9 +228,15 @@ impl<I: Identifier> ClusterState<I> {
                     // Strongest terminals lock out incoming TaskFailed.
                     // `Completed` never regresses; `Unfulfillable` is a
                     // stable reinjectable terminal — a late generic
-                    // worker-originated TaskFailed must not regress it.
+                    // worker-originated TaskFailed must not regress it;
+                    // `InvalidTask` is a stable non-reinjectable
+                    // terminal — once a task is structurally invalid a
+                    // later generic TaskFailed must not overwrite the
+                    // discrete reason (the lockout keeps the invalid-
+                    // task reason accurate).
                     TaskState::Completed { .. }
-                    | TaskState::Unfulfillable { .. } => ApplyOutcome::NoOp,
+                    | TaskState::Unfulfillable { .. }
+                    | TaskState::InvalidTask { .. } => ApplyOutcome::NoOp,
                     TaskState::Failed {
                         task,
                         kind: k,
@@ -236,12 +251,12 @@ impl<I: Identifier> ClusterState<I> {
                         ApplyOutcome::Applied
                     }
                     // Non-terminal states transition based on the
-                    // error class: `Unfulfillable` routes to the
-                    // discrete state so downstream matcher / reinject
-                    // logic can dispatch on the discriminant; every
-                    // other `ErrorType` lands in the generic `Failed`
-                    // bucket preserving the legacy attempts/last_error
-                    // shape.
+                    // error class: `Unfulfillable` and `InvalidTask`
+                    // each route to their discrete state so downstream
+                    // matcher / reinject logic can dispatch on the
+                    // discriminant; every other `ErrorType` lands in
+                    // the generic `Failed` bucket preserving the legacy
+                    // attempts/last_error shape.
                     TaskState::Pending { task }
                     | TaskState::InFlight { task, .. }
                     | TaskState::Blocked { task, .. } => {
@@ -251,6 +266,12 @@ impl<I: Identifier> ClusterState<I> {
                         *state = match kind {
                             ErrorType::Unfulfillable { reason } => {
                                 TaskState::Unfulfillable {
+                                    task,
+                                    reason: reason.to_string(),
+                                }
+                            }
+                            ErrorType::InvalidTask { reason } => {
+                                TaskState::InvalidTask {
                                     task,
                                     reason: reason.to_string(),
                                 }
@@ -366,6 +387,7 @@ impl<I: Identifier> ClusterState<I> {
                     TaskState::Completed { .. }
                     | TaskState::Failed { .. }
                     | TaskState::Unfulfillable { .. }
+                    | TaskState::InvalidTask { .. }
                     | TaskState::InFlight { .. } => ApplyOutcome::NoOp,
                     TaskState::Blocked { on: existing_on, .. } => {
                         if existing_on == &on {
@@ -394,6 +416,7 @@ impl<I: Identifier> ClusterState<I> {
                     | TaskState::Completed { task }
                     | TaskState::Failed { task, .. }
                     | TaskState::Unfulfillable { task, .. }
+                    | TaskState::InvalidTask { task, .. }
                     | TaskState::Blocked { task, .. } => task,
                 };
                 task.preferred_secondaries = SoftPreferredSecondaries::new(secondaries);
