@@ -187,22 +187,36 @@ impl<I: Identifier> RemoteWorkerState<I> {
 /// Records every task the authoritative primary believes is currently
 /// executing somewhere in the cluster — whether this coordinator
 /// dispatched it (a local `RemoteWorkerState` slot holds it,
-/// `worker_idx = Some`) or inherited it from the replicated
-/// `cluster_state` at hydration (no local slot, `worker_idx = None`).
-/// Folds in and replaces the deleted `pre_owned_in_flight` two-tier
-/// fallback: there is now ONE ledger, consulted BY HASH on every
-/// terminal, so attribution is unambiguous regardless of dispatch
+/// `local_worker_id = Some`) or inherited it from the replicated
+/// `cluster_state` at hydration (no local slot, `local_worker_id =
+/// None`). Folds in and replaces the deleted `pre_owned_in_flight`
+/// two-tier fallback: there is now ONE ledger, consulted BY HASH on
+/// every terminal, so attribution is unambiguous regardless of dispatch
 /// origin.
+///
+/// The holding slot is keyed by STABLE identity `(secondary_id,
+/// local_worker_id)`, never by a positional `Vec` index. A positional
+/// index desyncs the instant `self.workers.retain(..)` compacts the Vec
+/// on a sibling secondary's death, shifting every survivor after the
+/// removed group; the stable id survives compaction because a worker's
+/// `local_worker_id` (its position WITHIN its own secondary's
+/// contiguous group) is unaffected by removing a DIFFERENT secondary's
+/// group. `free_slot_on_terminal` re-resolves the id to a live index
+/// via [`PrimaryCoordinator::worker_idx_for`] on every terminal.
 #[derive(Debug, Clone)]
 pub(crate) struct InFlightEntry<I: Identifier> {
     /// Phase whose in-flight counter this entry holds open; the
     /// terminal cascade decrements it via `note_item_*`.
     pub(super) phase: PhaseId,
     /// Secondary the task was dispatched to (or inherited as targeting).
+    /// Half of the stable `(secondary_id, local_worker_id)` holder key.
     pub(super) secondary_id: String,
-    /// Index into `self.workers` of the holding slot, or `None` for an
-    /// inherited (pre-owned) task no local slot holds.
-    pub(super) worker_idx: Option<usize>,
+    /// Secondary-local worker id of the holding slot (the wire
+    /// `worker_id`, stable under Vec compaction), or `None` for an
+    /// inherited (pre-owned) task no local slot holds. The other half
+    /// of the stable holder key; resolved to a live `self.workers` index
+    /// through [`PrimaryCoordinator::worker_idx_for`].
+    pub(super) local_worker_id: Option<u32>,
     /// The full task — its `task_id` resolves dep edges, its `type_id`
     /// releases the per-type concurrency slot.
     pub(super) task: TaskInfo<I>,
@@ -265,8 +279,8 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     /// THE single hash-keyed in-flight ledger. Records every task the
     /// primary believes is executing in the cluster, keyed by its
     /// canonical `compute_task_hash`. Populated identically at dispatch
-    /// (locally-assigned, `worker_idx = Some`) AND at hydration
-    /// (inherited from `cluster_state`, `worker_idx = None`); drained
+    /// (locally-assigned, `local_worker_id = Some`) AND at hydration
+    /// (inherited from `cluster_state`, `local_worker_id = None`); drained
     /// BY HASH on every terminal outcome through
     /// [`Self::free_slot_on_terminal`]. Folds in and replaces the
     /// deleted `pre_owned_in_flight` two-tier fallback — there is one
@@ -1085,6 +1099,36 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             - 1
     }
 
+    /// Inverse of [`Self::local_worker_id_in_secondary`]: resolve the
+    /// stable `(secondary_id, local_worker_id)` identity to the worker's
+    /// CURRENT Vec index, or `None` if no such slot exists (the secondary
+    /// died, or the local id is out of range). This is THE single
+    /// identity-to-position resolution path: every consumer that holds a
+    /// stable `(secondary_id, local_worker_id)` and needs to touch the
+    /// live `self.workers[..]` entry routes through here rather than
+    /// re-deriving the per-secondary running count inline.
+    ///
+    /// Single concern: identity translation. Critically, the result is
+    /// recomputed against the LIVE Vec on every call, so a positional
+    /// index can never be cached past a `self.workers.retain(..)` death
+    /// compaction — the desync that a stored `Vec` index suffered.
+    pub(super) fn worker_idx_for(
+        &self,
+        secondary_id: &str,
+        local_worker_id: u32,
+    ) -> Option<usize> {
+        let mut local_idx: u32 = 0;
+        for (idx, w) in self.workers.iter().enumerate() {
+            if w.secondary_id == secondary_id {
+                if local_idx == local_worker_id {
+                    return Some(idx);
+                }
+                local_idx += 1;
+            }
+        }
+        None
+    }
+
     /// True iff the worker at `worker_idx` must be skipped this
     /// dispatch tick. Composes the two reasons-to-skip the dispatch
     /// pipeline knows about today:
@@ -1242,6 +1286,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         estimated: ResourceMap,
     ) {
         let secondary_id = self.workers[worker_idx].secondary_id.clone();
+        // Record the STABLE secondary-local id (retain-immune), NOT the
+        // positional Vec index — the terminal path re-resolves it via
+        // `worker_idx_for` against the live Vec.
+        let local_worker_id = self.local_worker_id_in_secondary(worker_idx);
         let phase = task.phase_id.clone();
         self.reserve_type_slot(&task.type_id);
         self.workers[worker_idx].assign(task_hash.clone(), task.clone(), estimated);
@@ -1250,7 +1298,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             InFlightEntry {
                 phase,
                 secondary_id,
-                worker_idx: Some(worker_idx),
+                local_worker_id: Some(local_worker_id),
                 task,
             },
         );
@@ -1276,7 +1324,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
 
     /// Seed an inherited (pre-owned) in-flight task into the SAME
     /// hash-keyed ledger at hydration. No local slot holds it
-    /// (`worker_idx = None`) — the originating dispatcher owns the
+    /// (`local_worker_id = None`) — the originating dispatcher owns the
     /// work; this coordinator observes completion via the broadcast
     /// path. Folds in the deleted `pre_owned_in_flight` concept: the
     /// terminal cascade reads this entry BY HASH exactly like a
@@ -1293,7 +1341,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             InFlightEntry {
                 phase,
                 secondary_id,
-                worker_idx: None,
+                local_worker_id: None,
                 task,
             },
         );
@@ -1315,7 +1363,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     ///   - the hash is absent from the ledger entirely (already
     ///     terminal / never tracked).
     ///
-    /// An inherited (pre-owned, `worker_idx = None`) entry has no
+    /// An inherited (pre-owned, `local_worker_id = None`) entry has no
     /// holding slot and no reserved type slot: it is removed from the
     /// ledger and returned without a slot vacate or a type-slot
     /// release — exactly the deleted `pre_owned_in_flight` branch's
@@ -1325,6 +1373,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// Because the slot's `task_hash` IS the held-task identity (the
     /// ledger key), a reassigned slot can NEVER be freed by a prior
     /// task's terminal: reassignment-before-terminal is unreachable.
+    ///
+    /// The holding slot is found by re-resolving the ledger entry's
+    /// STABLE `(secondary_id, local_worker_id)` to a live Vec index via
+    /// [`Self::worker_idx_for`] — recomputed on every call, so a
+    /// sibling secondary's death (`self.workers.retain(..)` compacts the
+    /// Vec) can never leave this pointing at the wrong worker or out of
+    /// bounds. The inbound wire `worker_id` is retained for diagnostics;
+    /// the ledger entry is the authoritative holder record.
     pub(super) fn free_slot_on_terminal(
         &mut self,
         secondary_id: &str,
@@ -1334,8 +1390,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // The ledger is the single source of truth. If the hash isn't
         // tracked, the task is not (or no longer) in flight — nothing
         // to free.
-        let worker_idx = match self.in_flight.get(task_hash) {
-            Some(e) => e.worker_idx,
+        let holder = match self.in_flight.get(task_hash) {
+            Some(e) => e
+                .local_worker_id
+                .map(|lw| (e.secondary_id.clone(), lw)),
             None => {
                 tracing::trace!(
                     secondary = %secondary_id,
@@ -1347,12 +1405,33 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
         };
 
-        match worker_idx {
-            // Locally-dispatched entry: a slot holds it. Verify the
+        match holder {
+            // Locally-dispatched entry: a slot holds it. Resolve the
+            // STABLE holder identity to a live index, then verify the
             // addressed slot still holds THIS hash before freeing — a
             // slot that has moved on to a later task must not be
             // vacated by a stale terminal.
-            Some(idx) => {
+            Some((holder_secondary, holder_local_id)) => {
+                let idx = match self
+                    .worker_idx_for(&holder_secondary, holder_local_id)
+                {
+                    Some(idx) => idx,
+                    // The holding worker is gone (its secondary died and
+                    // the slot was dropped by the requeue path) yet a
+                    // ledger entry survived. This is not the routine
+                    // recovery path (which removes the entry), so treat
+                    // it as a stale terminal for a slot that no longer
+                    // exists: leave the ledger untouched and no-op.
+                    None => {
+                        tracing::trace!(
+                            secondary = %secondary_id,
+                            worker_id,
+                            task_hash = %task_hash,
+                            "terminal for hash whose holding slot no longer exists; ignoring"
+                        );
+                        return None;
+                    }
+                };
                 let held_matches = matches!(
                     &self.workers[idx].state,
                     SlotState::Assigned { task_hash: h, .. } if h == task_hash
@@ -1632,19 +1711,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         worker_id: u32,
         task_hash: &str,
     ) -> bool {
-        let mut local_idx: u32 = 0;
-        for w in &self.workers {
-            if w.secondary_id == secondary_id {
-                if local_idx == worker_id {
-                    return matches!(
-                        &w.state,
-                        SlotState::Assigned { task_hash: h, .. } if h == task_hash
-                    );
-                }
-                local_idx += 1;
-            }
-        }
-        false
+        self.worker_idx_for(secondary_id, worker_id)
+            .map(|idx| {
+                matches!(
+                    &self.workers[idx].state,
+                    SlotState::Assigned { task_hash: h, .. } if h == task_hash
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Test-only inspector: is the `(secondary_id, worker_id)` slot
@@ -1652,16 +1726,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// assertion (a stale terminal must NOT free a reassigned slot).
     #[cfg(test)]
     pub fn slot_is_idle_for_test(&self, secondary_id: &str, worker_id: u32) -> bool {
-        let mut local_idx: u32 = 0;
-        for w in &self.workers {
-            if w.secondary_id == secondary_id {
-                if local_idx == worker_id {
-                    return w.is_idle();
-                }
-                local_idx += 1;
-            }
-        }
-        false
+        self.worker_idx_for(secondary_id, worker_id)
+            .map(|idx| self.workers[idx].is_idle())
+            .unwrap_or(false)
     }
 
     /// Test-only seam: register one idle remote worker owned by

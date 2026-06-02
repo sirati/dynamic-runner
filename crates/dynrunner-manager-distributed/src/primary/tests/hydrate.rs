@@ -214,7 +214,7 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
             // A broadcast TaskComplete lands for the inherited hash. No
             // local `RemoteWorkerState` holds it (none were registered),
             // so `free_slot_on_terminal` resolves the ledger entry BY
-            // HASH (worker_idx = None) and carries the phase decrement.
+            // HASH (local_worker_id = None) and carries the phase decrement.
             let msg = DistributedMessage::TaskComplete {
                 sender_id: "secondary-0".into(),
                 timestamp: 0.0,
