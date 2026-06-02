@@ -14,10 +14,9 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::SecondaryCoordinator;
 use super::wire::{distributed_to_binary, timestamp_now};
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -62,15 +61,15 @@ where
     }
 
     pub(super) async fn send_welcome(&mut self) -> Result<(), String> {
-        // Step 10: route the setup-phase frame through the narrow
-        // `SetupBootstrap` surface. The underlying wire stays the
-        // same `primary_transport`; the call-site type is what
-        // changed — `SetupBootstrapMessage` accepts only the three
-        // setup variants, so a refactor that accidentally adds a
-        // runtime frame here fails at compile time. The adapter is
-        // built fresh for this single send + dropped, releasing the
-        // borrow before the next phase's call site claims
-        // `&mut self.primary_transport` again.
+        // Setup-phase frame. Construction stays narrow-typed
+        // (`SetupBootstrapMessage` accepts only the three setup
+        // variants, so a runtime frame here fails at compile time),
+        // but routing is OPAQUE: the frame ships via the unified
+        // transport addressed to `Role::Primary`. The role cache is
+        // cold this early (no `PromotePrimary` observed), so it
+        // resolves to the bootstrap uplink — exactly the original
+        // primary this welcome is for. Wire bytes are identical (the
+        // `From<SetupBootstrapMessage>` conversion is lossless).
         let msg = SetupBootstrapMessage::SecondaryWelcome {
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
@@ -86,8 +85,7 @@ where
             // `lowest_alive` candidate selection in election.
             is_observer: self.config.is_observer,
         };
-        let mut bootstrap = SecondarySetupBootstrap::new(&mut self.primary_transport);
-        SetupBootstrap::<I>::send(&mut bootstrap, msg).await
+        self.send_setup_frame(msg).await
     }
 
     pub(super) async fn send_cert_exchange(&mut self) -> Result<(), String> {
@@ -110,8 +108,35 @@ where
             ipv6_address: ipv6,
             quic_port: port,
         };
-        let mut bootstrap = SecondarySetupBootstrap::new(&mut self.primary_transport);
-        SetupBootstrap::<I>::send(&mut bootstrap, msg).await
+        self.send_setup_frame(msg).await
+    }
+
+    /// Ship one setup-phase frame to the primary role, opaquely.
+    ///
+    /// Single chokepoint for the two setup-phase sends. Keeps the
+    /// narrow-typed `SetupBootstrapMessage` construction at the call
+    /// sites (the compile-time "no runtime frames during setup"
+    /// guard) while routing through the unified transport: convert to
+    /// the wire shape via the lossless `From<SetupBootstrapMessage>`
+    /// and `transport.send(Address::Role(Role::Primary), ..)`. The
+    /// role cache is cold during setup (no `PromotePrimary` yet) so the
+    /// transport resolves `Role::Primary` to the bootstrap uplink — the
+    /// original primary these frames address. No locality branching
+    /// leaks to the manager; setup is just another opaque
+    /// role-addressed send.
+    async fn send_setup_frame(
+        &mut self,
+        msg: SetupBootstrapMessage,
+    ) -> Result<(), String> {
+        let wire: DistributedMessage<I> = msg.into();
+        self.transport
+            .send(
+                dynrunner_protocol_primary_secondary::Address::Role(
+                    dynrunner_protocol_primary_secondary::Role::Primary,
+                ),
+                wire,
+            )
+            .await
     }
 
     /// Wait for PeerInfo + InitialAssignment + TransferComplete from primary.
@@ -146,7 +171,12 @@ where
         let mut got_transfer = false;
 
         while !got_peer_info || !got_assignment || !got_transfer {
-            match self.primary_transport.recv().await {
+            // Opaque inbound: the unified transport merges the uplink
+            // and (not-yet-formed) mesh streams. During setup the mesh
+            // hasn't formed, so this yields the original primary's
+            // setup frames over the uplink. The role-layer passes
+            // non-`RoleAddressed` setup frames through untouched.
+            match self.transport.recv_peer().await {
                 Some(msg) => match msg.msg_type() {
                     MessageType::PeerInfo => {
                         got_peer_info = true;
@@ -174,7 +204,10 @@ where
                             // `RoleTable.observers`.
                             // Non-blocking: per-peer dials run as
                             // spawn_local tasks; returns immediately.
-                            self.peer_transport.connect_to_peers(peers).await;
+                            // `connect_to_peers` on the unified transport
+                            // dials the mesh overlay (the uplink is
+                            // already connected).
+                            self.transport.connect_to_peers(peers).await;
                             // Arm the peer-mesh watchdog. 30s = 10s
                             // QUIC timeout + 10s WSS fallback timeout
                             // + 10s slack for the accept side to

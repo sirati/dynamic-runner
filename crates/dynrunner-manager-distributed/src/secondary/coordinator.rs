@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
@@ -24,10 +24,9 @@ use super::{PeerCertInfo, RunOutcome, SecondaryConfig, SecondaryCoordinator};
 use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -35,6 +34,7 @@ where
 {
     pub fn new(
         config: SecondaryConfig,
+        transport: Tr,
         scheduler: S,
         estimator: E,
     ) -> Self {
@@ -69,6 +69,7 @@ where
             tokio::sync::mpsc::channel(crate::primary::COMMAND_CHANNEL_CAPACITY);
         let mut this = Self {
             config,
+            transport,
             scheduler,
             estimator,
             peer_cert_info: None,
@@ -81,7 +82,6 @@ where
             extraction_cache,
             peer_keepalives: HashMap::new(),
             primary_last_seen: None,
-            primary_disconnected: false,
             election: super::election::ElectionState::Normal,
             pending_peer_messages: Vec::new(),
             primary_link,
@@ -134,12 +134,13 @@ where
             .install_task_completed_sender(task_completed_tx);
         // Attach the transport's write-through role cache to our
         // authoritative `cluster_state.role_table`. The hook fires
-        // on every applied `PrimaryChanged` mutation; the cache
-        // serves Step 3's `Address::Role(_)` dispatch on the send
-        // hot path. Transports that don't override
-        // `register_with_cluster_state` (e.g. `NoPeerTransport`,
-        // test stubs) get the default no-op — safe by construction.
-        this.peer_transport
+        // on every applied `PrimaryChanged` mutation; the cache is
+        // THE single source of "who is primary now" and serves the
+        // unified transport's `Address::Role(Role::Primary)` routing
+        // (including the promotion re-route — the role-change hook IS
+        // the re-route). Transports that don't override
+        // `register_with_cluster_state` get the default no-op.
+        this.transport
             .register_with_cluster_state(&mut this.cluster_state);
         this
     }
@@ -794,7 +795,7 @@ where
                     return Err(e);
                 }
                 Err(_elapsed) => {
-                    let peers = self.peer_transport.peer_count();
+                    let peers = self.transport.peer_count();
                     self.shutdown_sampler_if_present().await;
                     self.stop_all_workers().await;
                     if peers == 0 {

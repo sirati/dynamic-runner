@@ -15,7 +15,7 @@
 //!   4. The canonical `ClusterMutation::TaskCompleted` originator on
 //!      this path is the demoted-local primary's
 //!      `handle_task_complete` (in `primary/task/complete.rs`), reached
-//!      via the `send_to_current_primary` loopback. That apply +
+//!      via the `send_to_primary` loopback. That apply +
 //!      broadcast runs in another await frame after the mpsc dequeue —
 //!      strictly later than step 3.
 //!   5. dep_graph dispatches with `predecessor_outputs: {}` and the

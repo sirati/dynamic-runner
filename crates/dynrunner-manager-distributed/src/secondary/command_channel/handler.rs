@@ -30,13 +30,12 @@ use crate::secondary::SecondaryCoordinator;
 /// fired by an `on_phase_end` running inside `apply_fail_permanent`'s
 /// recursive `note_primary_item_failed` step applies inline. Mirrors
 /// the primary-side `handle_primary_command` threading 1:1.
-pub(in crate::secondary) async fn handle_secondary_command<PT, P, M, S, E, I>(
-    coordinator: &mut SecondaryCoordinator<PT, P, M, S, E, I>,
+pub(in crate::secondary) async fn handle_secondary_command<Tr, M, S, E, I>(
+    coordinator: &mut SecondaryCoordinator<Tr, M, S, E, I>,
     command: PrimaryCommand<I>,
     command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
 ) where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,

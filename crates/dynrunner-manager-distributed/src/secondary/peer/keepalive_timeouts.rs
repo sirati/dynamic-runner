@@ -7,7 +7,7 @@
 //! flight is a `TaskComplete` / `TaskFailed` from a peer that's now
 //! gone). Degraded-mesh short-circuit is documented inline.
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -15,10 +15,9 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,

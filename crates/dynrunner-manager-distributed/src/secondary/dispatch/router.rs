@@ -14,11 +14,11 @@
 //! through a method signature for no behavioural gain. Documented in
 //! `secondary/dispatch/mod.rs`.
 
-use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::{ErrorType, Identifier};
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
+    Address, ClusterMutation, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -29,10 +29,9 @@ use super::super::election::ElectionState;
 use super::super::wire::{distributed_to_binary, timestamp_now};
 use super::super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -187,29 +186,51 @@ where
                     {
                         Ok(dynrunner_manager_local::EnsureWorkerOutcome::AlreadyLoaded) => Ok(()),
                         Ok(dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress) => {
+                            // R0 deleted the `pending_first_bind`
+                            // stash-until-Ready machinery (both its
+                            // transport-fairness leg — mooted by the
+                            // uniform transport — AND, by over-deletion,
+                            // its correctness "hold the task until the
+                            // respawning worker is Ready" leg).
+                            //
+                            // Interim NO-DROP (TODO(R3/R4)): bounce the
+                            // not-yet-run task back to the AUTHORITY as a
+                            // backpressure-shaped TaskFailed (the
+                            // "worker pipe broken; respawning" marker the
+                            // authority's recovery path recognises), so
+                            // it re-queues + re-dispatches once a worker
+                            // (here or elsewhere) has capacity. No task
+                            // is dropped, no local primary pool is
+                            // needed.
+                            //
+                            // TODO(R3/R4): rebuild the respawn-HOLD
+                            // correctness — defer dispatch for a
+                            // respawning type until `WorkerEvent::Ready`
+                            // and re-dispatch then (avoiding the
+                            // re-bounce busy-loop a respawning type can
+                            // cause meanwhile). Tracked as an R3/R4 task
+                            // (closed before the R4 green milestone);
+                            // this interim is harmless until the crate
+                            // runs at R4.
                             tracing::debug!(
                                 worker_id = target_wid,
                                 type_id = %binary.type_id,
                                 file_hash = %file_hash,
-                                "type-bind respawn issued; stashing task in pending_first_bind \
-                                 until WorkerEvent::Ready arrives on the event channel"
+                                "type-bind respawn in progress; bouncing task back to \
+                                 the authority as backpressure (no-drop; respawn-HOLD \
+                                 rebuild is TODO(R3/R4))"
                             );
-                            // The slot is occupied by a Transitioning
-                            // worker with the new type bound; do NOT
-                            // queue another restart through
-                            // `pending_worker_restarts` — that would
-                            // SIGKILL the just-spawned subprocess and
-                            // start a third respawn cycle.
-                            self.pending_first_bind.insert(
-                                target_wid,
-                                super::super::PendingFirstBind {
-                                    binary,
-                                    file_hash,
-                                    estimated,
-                                    source: super::super::BindSource::PeerAssigned,
-                                    predecessor_outputs,
-                                },
-                            );
+                            let _ = (binary, estimated, predecessor_outputs);
+                            let task_failed = DistributedMessage::TaskFailed {
+                                sender_id: self.config.secondary_id.clone(),
+                                timestamp: timestamp_now(),
+                                secondary_id: self.config.secondary_id.clone(),
+                                worker_id: target_wid,
+                                task_hash: file_hash,
+                                error_type: ErrorType::Recoverable,
+                                error_message: "worker pipe broken; respawning".into(),
+                            };
+                            self.send_to_primary(task_failed).await?;
                             return Ok(());
                         }
                         Err(e) => Err(e),
@@ -233,12 +254,12 @@ where
                                 "No idle worker available (respawn failed): {e}"
                             ),
                         };
-                        // Mirror the "no idle worker available" arm:
-                        // unicast to the current primary, broadcast to
-                        // peers (belt-and-suspenders for primary
-                        // changeover mid-flight).
-                        self.send_to_current_primary(task_failed.clone()).await?;
-                        let _ = self.peer_transport.broadcast(task_failed).await;
+                        // Report to the primary role only; the authority
+                        // owns mesh propagation (it originates the CRDT
+                        // mutation and broadcasts it). A reporting
+                        // secondary that also broadcast would be a second
+                        // CRDT originator.
+                        self.send_to_primary(task_failed).await?;
                         return Ok(());
                     }
                     // Snapshot the assigned binary for the sampler
@@ -313,7 +334,7 @@ where
                                 error_message:
                                     "worker pipe broken; respawning".into(),
                             };
-                            self.send_to_current_primary(msg).await?;
+                            self.send_to_primary(msg).await?;
                         }
                     }
                 } else {
@@ -330,16 +351,14 @@ where
                         error_type: ErrorType::Recoverable,
                         error_message: "No idle worker available".into(),
                     };
-                    // Route to whoever currently holds primary
-                    // authority; broadcast to peers as belt-and-
-                    // suspenders so the promoted peer's
-                    // `handle_primary_peer_rejection` always sees the
-                    // bounce even if the unicast loses to a primary
-                    // changeover mid-flight. Idempotent — the
-                    // primary's recovery path is hash-keyed and
-                    // no-ops on the second call.
-                    self.send_to_current_primary(msg.clone()).await?;
-                    let _ = self.peer_transport.broadcast(msg).await;
+                    // Report to the primary role only — the authority
+                    // owns mesh propagation. Routing across a primary
+                    // changeover is opaque: `Address::Role(Role::Primary)`
+                    // resolves to whichever node currently holds the
+                    // role. The promoted peer's
+                    // `handle_primary_peer_rejection` recovery is
+                    // hash-keyed, so the single report suffices.
+                    self.send_to_primary(msg).await?;
                 }
                 Ok(())
             }
@@ -447,19 +466,23 @@ where
                 task_hash,
                 ..
             } => {
-                // The local primary forwards observed TaskCompletes
-                // to every secondary so each one's `completed_tasks`
-                // set stays current — matters on local-death-then-
-                // failover, where the elected secondary's
-                // `populate_primary_from_cluster_state` consults
-                // `self.completed_tasks` to rebuild the primary view.
-                // (Peer broadcast covers the common case but is
-                // best-effort; this primary-side forward is the
-                // reliable backstop.) Idempotent: a forward of our
-                // own completion just re-inserts the hash that's
-                // already there.
+                // LIVE — KEPT: keep `completed_tasks` current so a
+                // later failover-rebuild (`populate_primary_from_cluster_state`
+                // consulting `self.completed_tasks`) sees observed
+                // completions. Idempotent re-insert.
+                //
+                // STRIPPED (R0-deleted authority mirror): the
+                // `note_primary_item_completed` phase-machine drive.
+                // The secondary is never the authority now.
+                // TODO(R4): authoritative completion accounting +
+                //   phase-machine advance re-home to PrimaryCoordinator
+                //   over the loopback.
+                //
+                // NOTE: post-unification this arm is reachable only via
+                // a direct `dispatch_message` call (tests); the merged
+                // inbound stream handles TaskComplete in the role-aware
+                // `handle_inbound` arm.
                 self.completed_tasks.insert(task_hash.clone());
-                self.note_primary_item_completed(&task_hash, command_rx).await;
                 Ok(())
             }
             DistributedMessage::TaskFailed {
@@ -467,27 +490,20 @@ where
                 error_type,
                 ..
             } => {
-                // Same forwarding rationale as TaskComplete; only
-                // act on terminal (non-Recoverable) failures since
-                // Recoverable retry is owned by the primary
-                // (see `note_primary_item_failed`) and a future
-                // TaskComplete or terminal TaskFailed will arrive.
+                // LIVE — KEPT: dedup terminal failures into
+                // `completed_tasks` for the same failover-rebuild
+                // rationale as TaskComplete.
+                //
+                // STRIPPED (R0-deleted authority mirror): the
+                // `note_primary_item_failed` decrement + retry cascade.
+                // TODO(R4): authoritative failure accounting re-homes to
+                //   PrimaryCoordinator over the loopback.
+                //
+                // NOTE: reachable only via direct `dispatch_message`
+                // (tests); the merged stream handles TaskFailed in the
+                // role-aware `handle_inbound` arm.
                 if !matches!(error_type, ErrorType::Recoverable) {
                     self.completed_tasks.insert(task_hash.clone());
-                    // Use the failure-aware variant for symmetry
-                    // with the other TaskFailed sites (peer.rs,
-                    // processing.rs); for non-Recoverable inputs
-                    // this is identical to `note_primary_item_completed`
-                    // (no entry added to `primary_failed`).
-                    self.note_primary_item_failed(&task_hash, &error_type, command_rx).await;
-                    // Kickstart our own idle workers so any
-                    // reinjected items the per-phase retry-bucket
-                    // cascade (inside `note_primary_item_failed`)
-                    // produced reach a worker on this tick. Same
-                    // shape and rationale as the other TaskFailed
-                    // sites — peer workers self-recover on their
-                    // own keepalive tick.
-                    self.repoll_idle_workers(factory).await;
                 }
                 Ok(())
             }
@@ -514,8 +530,8 @@ where
                     snapshot_json,
                 };
                 if let Err(e) = self
-                    .peer_transport
-                    .send_to_peer(&sender_id, response)
+                    .transport
+                    .send(Address::Peer(sender_id.clone()), response)
                     .await
                 {
                     tracing::warn!(

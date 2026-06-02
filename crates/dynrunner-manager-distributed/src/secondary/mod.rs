@@ -24,13 +24,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use dynrunner_core::{
-    ErrorType, Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo, WorkerId,
-};
+use dynrunner_core::{Identifier, WorkerId};
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
-use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
+use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use crate::cluster_state::ClusterState;
 use crate::zip_extract::ExtractionCache;
@@ -72,22 +70,34 @@ pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig};
 /// workers. It reports completions back and requests more work.
 ///
 /// Generic over:
-/// - `PT`: primary transport (e.g. WSS connection or channel)
-/// - `P`: peer transport (e.g. `PeerNetwork` or `NoPeerTransport`)
+/// - `Tr`: the unified transport (a `PeerTransport<I>`). One opaque
+///   handle: the manager addresses by [`Address`] and never branches
+///   on transport locality. Routing (local-vs-remote primary AND the
+///   promotion re-route) lives entirely inside the transport — see
+///   `dynrunner_transport_tunnel::UnifiedSecondaryTransport`.
 /// - `M`: manager endpoint for worker communication
 /// - `S`: scheduler
 /// - `E`: memory estimator
 /// - `I`: identifier type
-pub struct SecondaryCoordinator<PT, P, M, S, E, I>
+pub struct SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,
 {
     config: SecondaryConfig,
+
+    /// The single opaque transport handle. Every operational send is
+    /// an [`Address`]-addressed `transport.send(..)`; every inbound
+    /// frame arrives via `transport.recv_peer()` (which merges the
+    /// uplink + mesh streams internally). The manager never names a
+    /// `primary_transport`/`peer_transport`, never reads
+    /// `peer_count()` for routing, and never branches on
+    /// transport-locality — the unified transport owns all of that.
+    transport: Tr,
+
     scheduler: S,
     estimator: E,
 
@@ -148,20 +158,6 @@ where
     // not just `Keepalive`, so an actively-routing primary doesn't get
     // falsely declared dead.
     primary_last_seen: Option<Instant>,
-
-    /// Sticky flag for "the primary's transport returned None on
-    /// `recv()`". Used as the `if` guard on the `primary_transport.recv`
-    /// arm of `process_tasks`'s `select!` so the persistently-None
-    /// future doesn't hot-loop. Once true, we drive failover via the
-    /// election state machine and route work via
-    /// `primary_link.current_primary()` once a peer wins the election.
-    ///
-    /// Pre-fix the recv arm bare-broke the loop on `None` and the
-    /// secondary exited cleanly with `completed=0` — losing every
-    /// task the primary peer was about to dispatch. Dataset
-    /// reported this on the dev-box-primary scenario where the local
-    /// transport closed at the phase boundary.
-    primary_disconnected: bool,
 
     // Failover election state (F2). Defaults to Normal until the primary
     // misses keepalives.
@@ -356,7 +352,7 @@ where
     /// by the spawned announcer task. The matching receiver is
     /// drained by the operational `select!` arm in `process_tasks`,
     /// which dequeues each [`crate::observer::announcer::AnnouncerOutboxItem`]
-    /// and forwards it onto `peer_transport.send(Address::Role(Role::Primary),
+    /// and forwards it onto `transport.send(Address::Role(Role::Primary),
     /// msg)`, returning the outcome through the item's `reply`
     /// oneshot.
     ///

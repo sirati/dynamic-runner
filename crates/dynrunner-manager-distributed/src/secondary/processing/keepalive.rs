@@ -9,36 +9,44 @@
 
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{Address, DistributedMessage, PeerTransport, Scope};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
-    /// Tick-driven re-check of the primary-link failover threshold.
-    /// Called once per keepalive tick from `process_tasks`. The
-    /// recv-None branch only triggers on a NEW recv-None event;
-    /// since the bridge architecture turns the recv future permanently
-    /// pending after a single None, a single dropped-bridge event would
-    /// otherwise never re-evaluate the time axis. This method bridges
-    /// the gap by polling `primary_link.should_arm_failover()` on
-    /// every tick and arming once the time window elapses.
+    /// Tick-driven re-check of the primary-link failover threshold —
+    /// the TIME axis of the failover-health window.
     ///
-    /// Idempotent: harmless when the link is healthy (the predicate
-    /// short-circuits on `first_failure_at.is_none()`), and harmless
-    /// when failover is already armed (`primary_disconnected` short-
-    /// circuits the body so we don't re-backdate `primary_last_seen`).
+    /// The failover-health window is opened by the send-side no-route
+    /// probe in [`Self::send_to_primary`]: when a primary-bound send
+    /// returns a no-route `Err` (uplink closed AND no peer holds the
+    /// role), `record_recv_failure` anchors the window and bumps the
+    /// count axis. The COUNT axis can saturate (e.g. an idle worker's
+    /// backoff suppresses further `TaskRequest` sends, so no further
+    /// probes accrue); this method covers the TIME axis by polling
+    /// `should_arm_failover()` on every keepalive tick and backdating
+    /// `primary_last_seen` once the window has elapsed, so the next
+    /// `run_election_tick` enters Suspecting.
+    ///
+    /// Transport-agnostic: it reads only the primary-link health
+    /// predicate — never `peer_count()`, never an uplink-close branch.
+    /// The degraded-mesh guard lives in `run_election_tick`
+    /// (`peer_mesh_degraded`), so this method need not duplicate it.
+    ///
+    /// Idempotent: short-circuits when the link is healthy
+    /// (`first_failure_at.is_none()`); backdating to a fixed past
+    /// instant is a no-op on repeat (same value re-stored).
     pub(in crate::secondary) fn check_primary_link_threshold(&mut self) {
         if !self.primary_link.is_link_failing() {
             return;
@@ -46,33 +54,11 @@ where
         if !self.primary_link.should_arm_failover() {
             return;
         }
-        // Already-armed: nothing to do — election is in flight.
-        // We still want to gate the recv arm if it hasn't been
-        // gated yet (first iteration of the time-elapsed branch
-        // before any recv-None observation).
-        if self.primary_disconnected {
-            return;
-        }
-        let peers = self.peer_transport.peer_count();
-        if peers == 0 {
-            // The recv-arm None branch handles the no-mesh case via
-            // `break`; we shouldn't be reachable here without at
-            // least one peer (since the time-axis arming requires
-            // a prior recv-None which would have taken the no-peer
-            // exit). Defensive: exit cleanly if we somehow are.
-            tracing::info!(
-                "primary-link threshold breached and no peer mesh; \
-                 deferring exit to natural termination path"
-            );
-            self.primary_disconnected = true;
-            return;
-        }
         tracing::warn!(
-            connected_peers = peers,
             "primary-link failure-window elapsed; arming failover \
-             (election will run via peer mesh)"
+             (election runs via the peer mesh — see run_election_tick's \
+             degraded-mesh guard)"
         );
-        self.primary_disconnected = true;
         let backdate = self
             .config
             .keepalive_interval
@@ -101,14 +87,17 @@ where
             secondary_id: self.config.secondary_id.clone(),
             active_workers: active_count,
         };
-        // Send to whoever is currently primary (local at run start;
-        // the promoted peer after PromotePrimary).
-        let _ = self.send_to_current_primary(msg.clone()).await;
+        // Two DISTINCT liveness targets (not a redundant fan-out):
+        //   1. the primary role — primary-link liveness, opaque routing.
+        //   2. the peer mesh — so other secondaries refresh this node's
+        //      `peer_keepalives` entry (drives their election timing).
+        let _ = self.send_to_primary(msg.clone()).await;
         if self.peer_mesh_degraded {
             return;
         }
-        // Broadcast to peers (including the primary if it's a peer —
-        // duplicate but idempotent).
-        let _ = self.peer_transport.broadcast(msg).await;
+        let _ = self
+            .transport
+            .send(Address::Broadcast(Scope::Mesh), msg)
+            .await;
     }
 }
