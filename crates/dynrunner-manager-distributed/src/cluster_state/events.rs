@@ -18,6 +18,7 @@ use super::ClusterState;
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::worker_signal::WorkerMgmtSignal;
 
 impl<I: Identifier> ClusterState<I> {
     /// Fire every registered hook against the current [`RoleTable`].
@@ -117,6 +118,45 @@ impl<I: Identifier> ClusterState<I> {
         tx: tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>,
     ) {
         self.matcher_trigger_tx = Some(tx);
+    }
+
+    /// Enqueue a [`WorkerMgmtSignal`] onto the worker-management bus.
+    ///
+    /// Same best-effort / non-blocking / non-panicking contract as
+    /// [`Self::emit_matcher_trigger`] — no installed sender or a closed
+    /// receiver is a silent drop; the worker-management bus is a
+    /// strictly-decoupled signal layer, so the emit side (phase/task
+    /// management) MUST NOT panic, block, or surface an error on emit.
+    ///
+    /// Decoupling invariant: this method must never invoke worker
+    /// management directly. Worker management's reaction happens off the
+    /// emit path in its operational `select!` loop; the bus is the only
+    /// synchronization crossing.
+    ///
+    /// No production call sites yet — the emit call sites (phase/task
+    /// management) land in a later subtask. Until then the only callers
+    /// are the bus's own unit tests.
+    #[allow(dead_code)]
+    pub(crate) fn emit_worker_mgmt(&self, signal: WorkerMgmtSignal) {
+        if let Some(tx) = &self.worker_mgmt_tx {
+            let _ = tx.send(signal);
+        }
+    }
+
+    /// Attach the worker-management bus sender end so subsequent
+    /// `emit_worker_mgmt` calls route signals through worker
+    /// management's operational-loop drain.
+    ///
+    /// Called by worker management at wire-up time after building the
+    /// (sender, receiver) pair; the receiver is then consumed by
+    /// [`crate::worker_signal::drain_worker_signal_batch`] from inside
+    /// the `select!` loop. Same re-installation semantics as
+    /// [`Self::install_lifecycle_sender`].
+    pub fn install_worker_mgmt_sender(
+        &mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<WorkerMgmtSignal>,
+    ) {
+        self.worker_mgmt_tx = Some(tx);
     }
 
     /// Enqueue a [`TaskCompletedEvent`] onto the dispatcher channel.

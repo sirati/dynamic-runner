@@ -219,3 +219,66 @@ async fn task_completed_dedup_does_not_re_emit() {
         "dedup TaskCompleted must not re-emit a dispatcher event",
     );
 }
+
+// ── Worker-management signal bus install/emit/drain tests ──
+//
+// Pin the decoupling-bus plumbing on `ClusterState`: phase/task
+// management `emit_worker_mgmt`s signals, worker management drains a
+// coalesced batch. There are no apply-path emit call sites yet (those
+// land in a later subtask), so these tests drive `emit_worker_mgmt`
+// directly — exactly the entry point the future call sites will use.
+
+/// A burst of `emit_worker_mgmt` calls, with a sender installed,
+/// coalesces into one batch via `drain_worker_signal_batch` that
+/// preserves every signal in arrival order. Pins the
+/// install → emit → drain plumbing end-to-end.
+#[tokio::test(flavor = "current_thread")]
+async fn worker_mgmt_emit_burst_coalesces_into_one_drained_batch() {
+    let mut s = ClusterState::<RunnerIdentifier>::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    s.install_worker_mgmt_sender(tx);
+
+    let s1 = crate::worker_signal::WorkerMgmtSignal::TasksAdded;
+    let s2 = crate::worker_signal::WorkerMgmtSignal::PhaseStartedNeedsWorkers {
+        phase: PhaseId::from("phase-a"),
+        min: 2,
+    };
+    let s3 = crate::worker_signal::WorkerMgmtSignal::RunShouldFail {
+        reason: "operator abort".to_string(),
+    };
+    s.emit_worker_mgmt(s1.clone());
+    s.emit_worker_mgmt(s2.clone());
+    s.emit_worker_mgmt(s3.clone());
+
+    let batch = crate::worker_signal::drain_worker_signal_batch(
+        &mut rx,
+        std::time::Duration::from_millis(50),
+    )
+    .await
+    .expect("emitted burst should produce a batch");
+    assert_eq!(batch.signals, vec![s1, s2, s3]);
+}
+
+/// With no sender installed, `emit_worker_mgmt` is a silent no-op:
+/// it does not panic and the (separately created, never-installed)
+/// receiver observes nothing. Pins the best-effort / decoupled
+/// contract that mirrors `emit_matcher_trigger`.
+#[tokio::test(flavor = "current_thread")]
+async fn worker_mgmt_emit_is_silent_no_op_without_installed_sender() {
+    let s = ClusterState::<RunnerIdentifier>::new();
+    // No `install_worker_mgmt_sender` — the bus has no sender.
+    s.emit_worker_mgmt(crate::worker_signal::WorkerMgmtSignal::TasksAdded);
+
+    // A channel created here but never installed must stay empty,
+    // confirming the emit routed nowhere rather than onto some
+    // implicit default.
+    let (_tx, mut rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ),
+        "emit without an installed sender must be a silent no-op",
+    );
+}

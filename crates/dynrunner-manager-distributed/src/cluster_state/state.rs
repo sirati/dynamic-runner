@@ -17,6 +17,7 @@ use dynrunner_protocol_primary_secondary::RoleTable;
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
 use crate::task_completed::TaskCompletedEvent;
+use crate::worker_signal::WorkerMgmtSignal;
 
 use super::types::{PeerEntry, RoleChangeHook, TaskState};
 
@@ -107,6 +108,14 @@ pub struct ClusterState<I> {
     /// inside the operational `select!` loop. Skipped from Clone /
     /// snapshot / restore for the same reason as `lifecycle_tx`.
     pub(super) matcher_trigger_tx: Option<tokio::sync::mpsc::UnboundedSender<MatcherTriggerEvent>>,
+    /// Sender end of the worker-management signal bus mpsc. Installed
+    /// via [`Self::install_worker_mgmt_sender`] when worker management
+    /// wires its operational loop; `None` while nothing has attached.
+    /// Receiver is consumed by
+    /// [`crate::worker_signal::drain_worker_signal_batch`] from inside
+    /// worker management's operational `select!` loop. Skipped from
+    /// Clone / snapshot / restore for the same reason as `lifecycle_tx`.
+    pub(super) worker_mgmt_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkerMgmtSignal>>,
     /// Sender end of the task-completion dispatcher mpsc. Installed
     /// via [`Self::install_task_completed_sender`] when the
     /// coordinator wires its dispatcher task; `None` while no
@@ -207,6 +216,8 @@ where
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
             matcher_trigger_tx: None,
             // Deliberately not cloned — same rationale as `lifecycle_tx`.
+            worker_mgmt_tx: None,
+            // Deliberately not cloned — same rationale as `lifecycle_tx`.
             task_completed_tx: None,
             // Replicated CRDT data — clone preserves it.
             peer_holdings: self.peer_holdings.clone(),
@@ -236,6 +247,7 @@ where
             .field("peer_state", &self.peer_state)
             .field("lifecycle_tx", &self.lifecycle_tx.is_some())
             .field("matcher_trigger_tx", &self.matcher_trigger_tx.is_some())
+            .field("worker_mgmt_tx", &self.worker_mgmt_tx.is_some())
             .field("task_completed_tx", &self.task_completed_tx.is_some())
             .field("peer_holdings", &self.peer_holdings)
             .field("panik_active", &self.panik_active)
@@ -260,6 +272,7 @@ impl<I> Default for ClusterState<I> {
             peer_state: HashMap::new(),
             lifecycle_tx: None,
             matcher_trigger_tx: None,
+            worker_mgmt_tx: None,
             task_completed_tx: None,
             peer_holdings: HashMap::new(),
             panik_active: false,

@@ -4,6 +4,7 @@ pub mod observer;
 pub mod panik_watcher;
 pub mod peer_lifecycle;
 pub mod task_completed;
+pub mod worker_signal;
 pub mod state;
 pub mod message_router;
 pub mod primary;
