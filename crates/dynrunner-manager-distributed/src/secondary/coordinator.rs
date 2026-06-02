@@ -10,13 +10,12 @@
 //! file is the entry-point catch-all.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use dynrunner_core::Identifier;
 use dynrunner_manager_local::pool::WorkerPool;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::primary_link::PrimaryLink;

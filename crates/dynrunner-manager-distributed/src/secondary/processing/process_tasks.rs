@@ -13,7 +13,6 @@
 //! in `secondary/processing/mod.rs`.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 
 use dynrunner_core::{Identifier, WorkerId};
 use dynrunner_manager_local::oom::{
@@ -21,12 +20,9 @@ use dynrunner_manager_local::oom::{
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{
-    Address, ClusterMutation, DistributedMessage, PeerTransport, Scope,
-};
+use dynrunner_protocol_primary_secondary::{Address, PeerTransport, Scope};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::{RunOutcome, SecondaryCoordinator};
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>

@@ -25,7 +25,6 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::ClusterStateSnapshot;
 use crate::primary::PrimaryCommand;
-use super::super::election::ElectionState;
 use super::super::wire::{distributed_to_binary, timestamp_now};
 use super::super::SecondaryCoordinator;
 

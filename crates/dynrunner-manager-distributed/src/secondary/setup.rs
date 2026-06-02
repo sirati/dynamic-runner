@@ -1,12 +1,12 @@
 
 use std::time::Instant;
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_primary_secondary::{
     DistributedBinaryInfo, DistributedMessage, MessageType, PeerTransport,
-    SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapMessage,
+    SetupBootstrapMessage,
 };
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
