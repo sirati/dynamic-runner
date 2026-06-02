@@ -7,6 +7,7 @@ mod estimator;
 mod fulfillability_matcher_bridge;
 mod gateway;
 mod identifier;
+mod logging;
 mod managers;
 mod network;
 mod peer_lifecycle_bridge;
@@ -54,12 +55,7 @@ use slurm::PyRustSlurmJobManager;
 /// `_native` and adds the pure-Python `comm` subpackage.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    logging::init();
 
     m.add_class::<PyBinaryIdentifier>()?;
     m.add_class::<PyTaskInfo>()?;
