@@ -4,7 +4,9 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
+use super::super::test_helpers::{
+    make_transport, FakeWorkerFactory, FixedEstimator, NoPeers, TestId,
+};
 use super::super::*;
 use std::time::Duration;
 use dynrunner_core::TaskInfo;
@@ -93,7 +95,23 @@ pub(super) async fn fake_primary(
         }
     }
 
-    // Drop channel to signal secondary to stop
+    // Production-faithful shutdown: the primary broadcasts
+    // `ClusterMutation::RunComplete` as its last act before exiting, so
+    // every secondary's `process_tasks` exits on the
+    // `cluster_state.run_complete()` cue. The unified transport's
+    // `recv_peer()` only yields `None` when EVERY inbound source closes
+    // (uplink AND mesh); with a `NoPeers` mesh stub that never happens,
+    // so RunComplete is the real exit cue (matching production, where
+    // dropping the uplink alone is NOT the run-over signal).
+    to_secondary
+        .send(DistributedMessage::ClusterMutation {
+            sender_id: "primary".into(),
+            timestamp: 0.0,
+            mutations: vec![dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete],
+        })
+        .unwrap();
+
+    // Then drop the channel.
     drop(to_secondary);
 }
 
@@ -202,10 +220,10 @@ async fn secondary_with_real_workers_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -213,7 +231,12 @@ async fn secondary_with_real_workers_processes_tasks() {
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
 
-            assert_eq!(secondary.completed_count(), 3);
+            // The secondary keeps no per-node completed counter; assert
+            // the OWN-worker run count (the CRDT-backed `completed_count`
+            // is 0 here because the fake primary reports terminal state
+            // back but does not broadcast `ClusterMutation::TaskCompleted`
+            // into this node's mirror — that's the authority's job).
+            assert_eq!(secondary.local_tasks_run_for_test(), 3);
 
             primary_handle.await.unwrap();
         })
@@ -271,10 +294,10 @@ async fn secondary_multi_worker_processes_tasks() {
                 pri_to_sec_tx,
             ));
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -282,7 +305,7 @@ async fn secondary_multi_worker_processes_tasks() {
             let mut factory = FakeWorkerFactory;
             secondary.run(&mut factory).await.unwrap();
 
-            assert_eq!(secondary.completed_count(), 6);
+            assert_eq!(secondary.local_tasks_run_for_test(), 6);
 
             primary_handle.await.unwrap();
         })
@@ -348,10 +371,10 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
                 pri_to_sec_tx,
             ));
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -362,7 +385,7 @@ async fn live_distribution_continues_past_initial_batch_15_binaries_1_worker() {
             // All 15 must complete; the operational loop is responsible
             // for >= 14 of them since one worker can hold at most one
             // initial assignment.
-            assert_eq!(secondary.completed_count(), 15);
+            assert_eq!(secondary.local_tasks_run_for_test(), 15);
 
             primary_handle.await.unwrap();
         })
@@ -538,13 +561,25 @@ async fn stage_file_then_assign_task_succeeds() {
                         break;
                     }
                 }
+                // Production-faithful exit cue (see `fake_primary`):
+                // broadcast RunComplete before dropping the uplink so
+                // the secondary's `process_tasks` exits on
+                // `cluster_state.run_complete()` (the unified transport's
+                // `recv_peer()` never yields None with a `NoPeers` mesh).
+                let _ = pri_to_sec_tx.send(DistributedMessage::ClusterMutation {
+                    sender_id: "primary".into(),
+                    timestamp: 0.0,
+                    mutations: vec![
+                        dynrunner_protocol_primary_secondary::ClusterMutation::RunComplete,
+                    ],
+                });
                 drop(pri_to_sec_tx);
             });
 
+            let unified = make_transport(&config.secondary_id.clone(), transport, NoPeers);
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -553,7 +588,7 @@ async fn stage_file_then_assign_task_succeeds() {
             secondary.run(&mut factory).await.unwrap();
 
             assert_eq!(
-                secondary.completed_count(),
+                secondary.local_tasks_run_for_test(),
                 1,
                 "expected the staged-then-assigned task to complete"
             );

@@ -94,7 +94,7 @@
             epoch: 1,
             required_setup: false,
         };
-        let result = sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory).await;
+        let result = sec.dispatch_message(promote, &mut FakeWorkerFactory).await;
 
         // Handler returns Ok(()) (silently rejects) — we don't
         // upgrade to Err because Err propagates to the processing
@@ -103,23 +103,14 @@
         // logged as error-level, which suffices.
         assert!(result.is_ok());
 
-        // Routing target NOT installed; cluster_state primary
-        // unchanged.
-        assert!(
-            sec.primary_link.current_primary().map(|s| s != "obs-a").unwrap_or(true),
-            "primary_link.current_primary should NOT be obs-a after \
-             rejected PromotePrimary"
-        );
+        // The replicated CRDT — the single source of "who is primary"
+        // post-unification — must NOT install the observer as primary.
         assert!(
             sec.cluster_state
                 .current_primary()
                 .map(|s| s != "obs-a")
                 .unwrap_or(true),
             "cluster_state should NOT install obs-a as primary"
-        );
-        assert!(
-            !sec.is_primary,
-            "sec-b should NOT have flipped to primary role"
         );
     }
 
@@ -200,7 +191,7 @@
             epoch: 99,
             required_setup: false,
         };
-        sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
             .await
             .expect("PromotePrimary handler returns Ok even when rejecting");
         assert!(

@@ -304,7 +304,9 @@ pub trait PeerTransport<I: Identifier> {
     ///    abort vs. retry-with-a-different-seed.
     /// 3. Construct a [`DistributedMessage::RequestClusterSnapshot`]
     ///    envelope tagged with [`Self::local_id`] as the responder's
-    ///    return address.
+    ///    return address and `is_observer` declaring the joiner's own
+    ///    role (so the responder's `PeerJoined` broadcast carries the
+    ///    truth instead of assuming observer).
     /// 4. Send it via [`Self::send`] with `Address::Peer(<first
     ///    reachable seed id>)`. The receiver-side handler in
     ///    `secondary/dispatch.rs` accepts the request from any peer
@@ -356,6 +358,7 @@ pub trait PeerTransport<I: Identifier> {
         &mut self,
         seed: &[crate::PeerConnectionInfo],
         timeout: Duration,
+        is_observer: bool,
     ) -> impl std::future::Future<Output = Result<String, JoinError>>
     where
         I: 'static,
@@ -417,6 +420,10 @@ pub trait PeerTransport<I: Identifier> {
                 let request = DistributedMessage::RequestClusterSnapshot {
                     sender_id: local_id.clone(),
                     timestamp: timestamp_now(),
+                    // The joiner declares its own role so the responder
+                    // broadcasts a truthful `PeerJoined` rather than
+                    // assuming observer.
+                    is_observer,
                 };
                 match self
                     .send(Address::Peer(peer.secondary_id.clone()), request)

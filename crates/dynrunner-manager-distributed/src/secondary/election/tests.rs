@@ -98,84 +98,21 @@
         assert!(matches!(sec.election, ElectionState::Promoted));
     }
 
-    /// Once promoted, a secondary's `primary_pending` pool is hydrated
-    /// from its replicated `cluster_state` mirror. Validates the
-    /// post-promotion takeover wiring (originally #34, post-Phase-B
-    /// re-grounded onto the CRDT-replicated ledger).
+    /// `record_primary_message` resets the failover election state to
+    /// Normal — the live primary is alive again, so the secondary stops
+    /// suspecting / voting. (Post-unification "who is primary" is the
+    /// transport RoleCache, not a PrimaryLink locality field; a live
+    /// keepalive resets the ELECTION, never the replicated primary
+    /// identity.)
     #[tokio::test(flavor = "current_thread")]
-    async fn promotion_hydrates_primary_tasks_from_cluster_state() {
-        use dynrunner_core::{PhaseId, SoftPreferredSecondaries, TaskInfo, TypeId};
-        use dynrunner_protocol_primary_secondary::ClusterMutation;
-        use std::collections::HashSet;
-        use std::path::PathBuf;
-
+    async fn primary_recovery_resets_election_state() {
         let mut sec = make_secondary(election_config("sec-a"));
-        sec.peer_keepalives.insert("sec-b".into(), 0.0);
-
-        // Pre-seed cluster_state as if the live primary's
-        // `seed_cluster_state` broadcast had already arrived: one
-        // `TaskAdded` plus an empty phase_deps map so the
-        // (synthesised) "default" phase has zero parents and the pool
-        // is immediately Active.
-        let task: TaskInfo<super::super::test_helpers::TestId> = TaskInfo {
-            path: PathBuf::from("/tmp/bin1"),
-            size: 100,
-            identifier: super::super::test_helpers::TestId("bin1".into()),
-            phase_id: PhaseId::from("default"),
-            type_id: TypeId::from("default"),
-            affinity_id: None,
-            payload: serde_json::Value::Null,
-            task_id: "bin1".into(),
-            task_depends_on: vec![],
-            preferred_secondaries: SoftPreferredSecondaries::default(),
-            resolved_path: None,
-        };
-        sec.cluster_state.apply(ClusterMutation::PhaseDepsSet {
-            deps: std::collections::HashMap::new(),
-        });
-        sec.cluster_state.apply(ClusterMutation::TaskAdded {
-            hash: "hash_bin1".into(),
-            task,
-        });
-
-        // Simulate the candidate path: become candidate, then receive
-        // confirm to flip to Promoted. peer_count=1, quorum=2, so we need
-        // confirms from {self, sec-b} to promote.
-        sec.election = ElectionState::Candidate {
-            round: 1,
-            confirms: HashSet::from(["sec-a".to_string()]),
-            started: std::time::Instant::now(),
-        };
-        sec.is_primary = false; // not yet
-        let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
-        assert!(promoted, "majority confirm should promote");
-
-        assert!(matches!(sec.election, ElectionState::Promoted));
-        assert!(sec.is_primary, "promotion sets is_primary");
-        assert_eq!(
-            sec.primary_pending_len(),
-            1,
-            "cluster_state should have hydrated one pending binary into the pool"
-        );
-    }
-
-    /// `record_primary_message` resets election state and clears any
-    /// remembered new-primary-peer routing target — the live primary is
-    /// alive again, so TaskRequest routes back to primary_transport.
-    #[tokio::test(flavor = "current_thread")]
-    async fn primary_recovery_clears_routing_target() {
-        let mut sec = make_secondary(election_config("sec-a"));
-        sec.primary_link.set_current_primary(Some("sec-c".into()));
         sec.election = ElectionState::Voting {
             round: 1,
             candidate: "sec-c".into(),
         };
         sec.record_primary_message();
         assert!(matches!(sec.election, ElectionState::Normal));
-        assert!(
-            sec.primary_link.current_primary().is_none(),
-            "live primary message should clear the routing target"
-        );
     }
 
     /// `Promoted` state survives a `record_primary_message`: once we've
@@ -185,12 +122,9 @@
     async fn promoted_state_survives_late_primary_message() {
         let mut sec = make_secondary(election_config("sec-a"));
         sec.election = ElectionState::Promoted;
-        sec.is_primary = true;
-        sec.primary_link.set_current_primary(Some("sec-a".into()));
 
         sec.record_primary_message();
         assert!(matches!(sec.election, ElectionState::Promoted));
-        assert!(sec.is_primary);
     }
 
     /// Regression: PromotePrimary's routing target survives
@@ -221,17 +155,17 @@
             epoch: 1,
             required_setup: false,
         };
-        sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
             .await
             .expect("PromotePrimary handler succeeds");
-        assert_eq!(sec.primary_link.current_primary(), Some("sec-a"));
-        assert!(!sec.is_primary);
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
         // The (still-alive, now-demoted) local primary keeps sending
-        // keepalives. Pre-fix this would have flipped the routing
-        // target back to None.
+        // keepalives. A live-primary keepalive resets the election but
+        // must NOT clobber the replicated primary identity (the
+        // PrimaryChanged apply is last-writer-wins on epoch).
         sec.record_primary_message();
         assert_eq!(
-            sec.primary_link.current_primary(),
+            sec.cluster_state.current_primary(),
             Some("sec-a"),
             "live-primary keepalive must not clobber the explicit handoff target",
         );
@@ -254,12 +188,14 @@
     #[tokio::test(flavor = "current_thread")]
     async fn pre_designated_primary_ignores_silent_local_primary() {
         let mut sec = make_secondary(election_config("sec-a"));
-        // Pre-promotion: Normal state, is_primary defaults false.
+        // Pre-promotion: Normal state, this node is not yet primary.
         assert!(matches!(sec.election, ElectionState::Normal));
-        assert!(!sec.is_primary);
+        assert!(sec.cluster_state.current_primary().is_none());
 
         // Receive PromotePrimary naming this node — exercises the
-        // dispatch.rs handler that must set both fields in lockstep.
+        // dispatch.rs handler that installs the role into the CRDT
+        // (which drives the transport RoleCache write-through hook) AND
+        // flips the election state to Promoted in lockstep.
         let promote = DistributedMessage::PromotePrimary {
             sender_id: "primary".into(),
             timestamp: 0.0,
@@ -267,10 +203,10 @@
             epoch: 1,
             required_setup: false,
         };
-        sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
             .await
             .expect("PromotePrimary handler succeeds");
-        assert!(sec.is_primary);
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
         assert!(matches!(sec.election, ElectionState::Promoted));
 
         // Local primary stops sending keepalives — its observer-mode
@@ -284,7 +220,7 @@
         let actions = sec.run_election_tick();
         assert!(actions.broadcast.is_empty());
         assert!(matches!(sec.election, ElectionState::Promoted));
-        assert!(sec.is_primary);
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
     }
 
     /// Phase P: PromotePrimary clears any per-worker backoff accrued
@@ -308,7 +244,7 @@
             epoch: 1,
             required_setup: false,
         };
-        sec.dispatch_message(promote, &mut None, &mut FakeWorkerFactory)
+        sec.dispatch_message(promote, &mut FakeWorkerFactory)
             .await
             .expect("PromotePrimary handler succeeds");
 
@@ -333,10 +269,10 @@
             epoch: 5,
             required_setup: false,
         };
-        sec.dispatch_message(high, &mut None, &mut FakeWorkerFactory).await.unwrap();
+        sec.dispatch_message(high, &mut FakeWorkerFactory).await.unwrap();
         assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
         assert_eq!(sec.cluster_state.primary_epoch(), 5);
-        assert_eq!(sec.primary_link.current_primary(), Some("sec-c"));
+        assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
 
         // A late lower-epoch broadcast must not clobber the higher
         // epoch already installed.
@@ -347,7 +283,7 @@
             epoch: 2,
             required_setup: false,
         };
-        sec.dispatch_message(stale, &mut None, &mut FakeWorkerFactory).await.unwrap();
+        sec.dispatch_message(stale, &mut FakeWorkerFactory).await.unwrap();
         assert_eq!(
             sec.cluster_state.current_primary(),
             Some("sec-c"),
@@ -410,79 +346,47 @@
         );
     }
 
-    /// Observer self-exclusion (#35): a secondary with
-    /// `is_observer = true` MUST NOT self-promote even when its id
-    /// is lex-lowest in the alive set. Setup: "obs-a" (observer)
-    /// and "sec-b" (regular), obs-a is lex-lowest. Primary goes
-    /// silent. obs-a's election tick should defer to sec-b
-    /// (next-lowest) instead of entering Candidate state.
-    ///
-    /// This is the load-bearing observer guard until the peer-side
-    /// `lowest_alive` filter lands (which requires extending
-    /// PeerConnectionInfo with is_observer and broadcasting via
-    /// PeerInfo — tracked as a follow-up). Without this guard, an
-    /// observer in the alive set with a lex-low id would
-    /// self-promote despite having no workers and no dispatch
-    /// authority — the cluster would then stall because the
-    /// "promoted" node can't actually do anything.
+    /// Observer non-participation (pure-observer role): a secondary
+    /// with `is_observer = true` is a passive bystander with ZERO
+    /// authority/responsibility — it does NOT participate in failover
+    /// at all. Even when its id is lex-lowest in the alive set and the
+    /// primary goes silent, its election tick is a complete no-op: it
+    /// never suspects, never broadcasts a TimeoutQuery / PromotionVote,
+    /// never enters Candidate or Voting. The cluster's failover is
+    /// driven entirely by the NON-observer peers (sec-b self-elects on
+    /// its own tick); the observer just observes the resulting
+    /// `PrimaryChanged`. This is the "observer originates NOTHING"
+    /// invariant applied to the failover concern.
     #[tokio::test(flavor = "current_thread")]
-    async fn observer_never_self_promotes_even_when_lowest_id() {
+    async fn observer_election_tick_is_a_no_op_even_when_lowest_id() {
         use super::super::test_helpers::{election_config, make_secondary};
 
         let mut cfg = election_config("obs-a");
         cfg.is_observer = true;
         let mut sec = make_secondary(cfg);
 
-        // sec-b is the next-lowest. obs-a is lex-lowest in the alive
-        // set (obs-a < sec-b lexicographically). Pre-fix this would
-        // make obs-a self-promote on its election tick.
+        // obs-a is lex-lowest in the alive set (obs-a < sec-b). Under
+        // the OLD model this would drive an election; under the
+        // pure-observer model it originates nothing.
         sec.peer_keepalives.insert("sec-b".into(), timestamp_now());
         sec.record_primary_message();
 
-        // Primary goes silent.
+        // Primary goes silent — a worker secondary would suspect here.
         tokio::time::sleep(PAST_DEATH).await;
-        sec.run_election_tick();
+        let actions_1 = sec.run_election_tick();
         tokio::time::sleep(ONE_INTERVAL).await;
-
-        // sec-b's TimeoutResponse so obs-a's Suspecting tick has
-        // peer agreement to reach quorum.
         sec.record_timeout_response("sec-b".into(), None);
+        let actions_2 = sec.run_election_tick();
 
-        let actions = sec.run_election_tick();
-
-        // Observer MUST NOT enter Candidate state.
+        // The observer stayed Normal across both ticks and originated
+        // NOTHING.
         assert!(
-            !matches!(sec.election, ElectionState::Candidate { .. }),
-            "observer entered Candidate state despite is_observer=true — \
-             observer self-exclusion guard regressed. Election state: \
-             {:?}",
+            matches!(sec.election, ElectionState::Normal),
+            "observer must stay Normal (no failover participation); got {:?}",
             std::mem::discriminant(&sec.election),
         );
-
-        // No PromotionVote broadcast either — observers must not
-        // even campaign.
         assert!(
-            !actions
-                .broadcast
-                .iter()
-                .any(|m| matches!(m, DistributedMessage::PromotionVote { .. })),
-            "observer broadcast a PromotionVote — must not campaign"
+            actions_1.broadcast.is_empty() && actions_2.broadcast.is_empty(),
+            "observer election tick must originate no broadcast",
         );
-
-        // Routing target should point at sec-b (the next-lowest
-        // non-observer peer), so the observer's send_to_primary
-        // routes correctly once sec-b self-promotes on its own tick.
-        match &sec.election {
-            ElectionState::Voting { candidate, .. } => {
-                assert_eq!(
-                    candidate, "sec-b",
-                    "observer must defer to next-lowest non-observer peer"
-                );
-            }
-            other => panic!(
-                "observer should be in Voting state pointing at sec-b, got \
-                 discriminant={:?}",
-                std::mem::discriminant(other)
-            ),
-        }
     }

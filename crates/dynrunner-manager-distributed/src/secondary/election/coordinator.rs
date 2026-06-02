@@ -81,6 +81,18 @@ where
     /// Returns the broadcast/self-send messages the loop should flush.
     pub(in crate::secondary) fn run_election_tick(&mut self) -> ElectionTickActions<I> {
         let mut actions = ElectionTickActions::default();
+        // Strict-observer suppression: an observer is a passive bystander
+        // with ZERO authority/responsibility. It never participates in
+        // failover — it doesn't suspect a silent primary, doesn't
+        // broadcast TimeoutQuery / PromotionVote, and can never become a
+        // candidate. Its only cue is the replicated `run_complete()`.
+        // This is the failover concern's own role-gate (the election
+        // module OWNS failover), matching `send_keepalive`'s and
+        // `report_mesh_ready_if_needed`'s self-gates — not a scattered
+        // cross-concern branch.
+        if self.config.is_observer {
+            return actions;
+        }
         if matches!(self.election, ElectionState::Promoted) {
             return actions;
         }

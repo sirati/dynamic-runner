@@ -56,6 +56,8 @@ pub(super) use dynrunner_transport_channel::{
 #[allow(unused_imports)]
 pub(super) use crate::secondary::{SecondaryConfig, SecondaryCoordinator};
 #[allow(unused_imports)]
+pub(super) use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
+#[allow(unused_imports)]
 pub(super) use std::collections::HashMap;
 #[allow(unused_imports)]
 pub(super) use std::time::Duration;
@@ -133,16 +135,20 @@ pub(super) fn spawn_real_secondary_with_src_network(
             output_dir: None,
             memuse_log_path: None,
         };
-        let mut secondary = SecondaryCoordinator::new(
-            config,
+        let unified = UnifiedSecondaryTransport::new(
+            config.secondary_id.clone(),
             transport,
             NoPeers,
+        );
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            unified,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
         let mut factory = FakeWorkerFactory;
         secondary.run(&mut factory).await.unwrap();
-        secondary.completed_count()
+        secondary.local_tasks_run_for_test()
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)
@@ -195,16 +201,20 @@ pub(super) fn spawn_real_secondary_slow(
             output_dir: None,
             memuse_log_path: None,
         };
-        let mut secondary = SecondaryCoordinator::new(
-            config,
+        let unified = UnifiedSecondaryTransport::new(
+            config.secondary_id.clone(),
             transport,
             NoPeers,
+        );
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            unified,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
         let mut factory = SlowFakeWorkerFactory::with_markers(slow_markers);
         secondary.run(&mut factory).await.unwrap();
-        secondary.completed_count()
+        secondary.local_tasks_run_for_test()
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)
@@ -220,7 +230,12 @@ pub(super) fn spawn_real_secondary_flaky(
 ) -> (
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
-    tokio::task::JoinHandle<(usize, usize, u32)>,
+    // Returns the secondary's OWN-worker run count. The authoritative
+    // retry-cascade counters (completed / failed-residual / passes-used)
+    // live on the PRIMARY now — retry tests read them via the primary's
+    // `completed_count()` / `failed_count()` / `retry_passes_used_for_test()`
+    // before dropping the primary, not from this secondary handle.
+    tokio::task::JoinHandle<usize>,
 ) {
     let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
@@ -263,20 +278,20 @@ pub(super) fn spawn_real_secondary_flaky(
             output_dir: None,
             memuse_log_path: None,
         };
-        let mut secondary = SecondaryCoordinator::new(
-            config,
+        let unified = UnifiedSecondaryTransport::new(
+            config.secondary_id.clone(),
             transport,
             NoPeers,
+        );
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            unified,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
         let mut factory = flaky;
         secondary.run(&mut factory).await.unwrap();
-        (
-            secondary.completed_count(),
-            secondary.primary_failed_count_for_test(),
-            secondary.primary_retry_passes_used_for_test(),
-        )
+        secondary.local_tasks_run_for_test()
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)

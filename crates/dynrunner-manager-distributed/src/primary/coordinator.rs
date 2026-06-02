@@ -1329,6 +1329,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// path. Folds in the deleted `pre_owned_in_flight` concept: the
     /// terminal cascade reads this entry BY HASH exactly like a
     /// locally-dispatched one.
+    // R4 SEAM: only reached from `hydrate_from_cluster_state`, itself an
+    // R4 seam (the composed primary's seeded resume).
+    #[allow(dead_code)] // TODO(R4): reachable via hydrate_from_cluster_state (P4 composition)
     pub(super) fn seed_inflight(
         &mut self,
         task_hash: String,
@@ -1546,37 +1549,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     ///
     /// Reads through `cluster_state.outcome_counts().succeeded` so the
     /// count is the CRDT-authoritative tally rather than the per-node
-    /// `completed_tasks` HashSet — analogous to the existing
-    /// [`Self::outcome_summary`] which routes through the same CRDT
-    /// reader for cosmetic #88. The `completed_tasks` HashSet stays
-    /// authoritative for per-task identity decisions (dedup on a
-    /// re-applied `TaskComplete`, the operational-loop exit gate, the
-    /// kickstart-suppression check); cross-class *counts* live one
-    /// layer up, on the replicated ledger every replica converges to.
-    ///
-    /// Without this routing the demoted primary's PyO3-facing
-    /// `succeeded=N` stdout undercounted whenever a cross-secondary
-    /// completion's mirror hop (`mirror_mutation_to_accounting`) was
-    /// bypassed — the same divergence class #88 fixed at the
-    /// terminal-log site but missed at the dispatcher's PyO3
-    /// `completed_count()` read site. Concrete symptom: setup-promote
-    /// single-task phases (e.g. asm-tokenizer's unify-vocab) reporting
-    /// `succeeded=0` while the promoted secondary's count is the
-    /// real value (which is also what `cluster_state` records on every
-    /// replica, including this one).
-    ///
-    /// Residual concern: the mirror divergence itself is documented at
-    /// `mirror_mutation_to_accounting`'s call sites but not yet
-    /// root-caused. In-process tests cover the mirror path end-to-end
-    /// (see `demoted_primary_applies_cluster_mutation_taskcompleted`
-    /// and the `setup_promote_*` integration suite — both observe
-    /// `completed_count()` == CRDT succeeded in test fixtures). The
-    /// production bypass is likely a real-QUIC writer-task race on the
-    /// loopback path that the in-process channel fixture doesn't
-    /// exercise. Until the bypass is root-caused, the CRDT read is
-    /// the authoritative source for cross-class count reporting on
-    /// the demoted observer. See the demoted-observer divergence
-    /// trace in `lifecycle/operational_loop.rs`.
+    /// `completed_tasks` HashSet — analogous to [`Self::outcome_summary`]
+    /// which routes through the same CRDT reader. The `completed_tasks`
+    /// HashSet stays authoritative for per-task identity decisions
+    /// (dedup on a re-applied `TaskComplete`, the operational-loop exit
+    /// gate, the kickstart-suppression check); cross-class *counts* live
+    /// one layer up, on the replicated ledger every replica converges
+    /// to. This is the same CRDT read every node (authority, peer, or
+    /// observer) uses for cross-class count reporting — the per-node
+    /// counter mirror that used to diverge from it is gone.
     pub fn completed_count(&self) -> usize {
         self.cluster_state.outcome_counts().succeeded
     }
@@ -1608,15 +1589,40 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// re-applied TaskComplete, the operational-loop exit gate, the
     /// kickstart-suppression check); cross-class *counts* live one
     /// layer up, on the replicated ledger every replica converges
-    /// to. Without this routing the demoted primary's terminal log
-    /// undercounted whenever a cross-secondary completion's mirror
-    /// hop (`mirror_mutation_to_accounting`) was bypassed (#88).
+    /// to.
     ///
     /// O(n) over the cluster_state task ledger — same bound as the
     /// older `failed_tasks`-only walk; the additional Completed/
     /// Pending/InFlight inspections are constant-time per entry.
     pub fn outcome_summary(&self) -> OutcomeSummary {
         self.cluster_state.outcome_counts()
+    }
+
+    /// Setup-defer gate (CRDT-derived).
+    ///
+    /// True while this primary deferred discovery (`config.
+    /// required_setup_on_promote`) AND the chosen secondary has not yet
+    /// broadcast its first task into the replicated ledger
+    /// (`cluster_state.task_count() == 0`). While true, `total_tasks`
+    /// is 0 and every declared phase is `Active` with zero items — not
+    /// because the run is empty but because discovery hasn't seeded the
+    /// ledger yet. The counter-based run-complete exit and the
+    /// per-phase `on_phase_end` drain must NOT fire in this window
+    /// (a `0+0 >= 0` counter trip or a spurious empty-phase drain would
+    /// declare the run done before any task exists). The gate clears the
+    /// moment the first `TaskAdded` lands — exactly the flip condition
+    /// the pre-demolition `setup_pending` latch used, now read off the
+    /// CRDT every replica converges to.
+    ///
+    /// On the legacy bootstrap path (`required_setup_on_promote =
+    /// false`) this is always `false`, so the gate is permanently
+    /// satisfied and the normal exit/drain logic runs.
+    ///
+    /// TODO(R4): the authoritative co-located primary owns this gate
+    ///   under P4 composition; the setup-deferred discovery feed
+    ///   hydrates its pool over the loopback.
+    pub(super) fn setup_pending(&self) -> bool {
+        self.config.required_setup_on_promote && self.cluster_state.task_count() == 0
     }
 
     /// Tasks the run loop never accounted for (neither completed nor
@@ -1644,6 +1650,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     #[cfg(test)]
     pub fn cluster_state_counts_for_test(&self) -> crate::cluster_state::StateCounts {
         self.cluster_state.counts()
+    }
+
+    /// Test-only inspector for the total retry passes consumed across
+    /// all `(phase, bucket)` keys. The authoritative retry cascade
+    /// lives here on the primary (the secondary is a pure reporter), so
+    /// retry tests assert on this counter rather than a secondary-side
+    /// mirror (which no longer exists).
+    #[cfg(test)]
+    pub fn retry_passes_used_for_test(&self) -> u32 {
+        self.retry_passes_used.values().sum()
     }
 
     /// Test-only borrow of the primary's replicated cluster ledger.
@@ -1852,14 +1868,20 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // re-used across runs must not inherit a stale outcome).
         self.setup_deadline_outcome = None;
 
-        // Refresh the setup-pending gate from the current config so a
-        // reused coordinator (or one whose config was mutated between
-        // runs) starts each run with the correct exit-gate state. In
-        // setup-promote mode this defers the counter-based exit-check
-        // until the chosen secondary has either broadcast its first
-        // `TaskAdded` (discovery succeeded) or `RunComplete` (no items
-        // to discover) — see the `setup_pending` field doc.
-        self.setup_pending = self.config.required_setup_on_promote;
+        // The setup-pending gate is now a CRDT-derived predicate
+        // (`Self::setup_pending`) rather than a stateful latch field: in
+        // setup-promote mode (`config.required_setup_on_promote`) it
+        // stays true until the chosen secondary broadcasts its first
+        // task into the replicated ledger (`cluster_state.task_count() >
+        // 0`) — the same flip condition the old latch used, derived from
+        // the CRDT every replica converges to. No per-run reset is
+        // needed because the predicate reads live state.
+        //
+        // TODO(R4): under P4 composition the co-located authoritative
+        //   primary owns this gate; the setup-deferred discovery feed
+        //   (`ingest_setup_discovery`) hydrates its pool over the
+        //   loopback. This predicate is the interim gate until that
+        //   wiring lands.
 
         // Spawn the peer-lifecycle dispatcher BEFORE any wire mutation
         // can land. The (sender, receiver) pair was built in `new()`
@@ -2038,7 +2060,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // on; no concurrent producer exists pre-loop.
         let mut command_rx = self.command_rx.take();
 
-        if !self.setup_pending {
+        if !self.setup_pending() {
             self.pool_mut().drain_empty_active_phases();
             self.process_phase_lifecycle(&mut command_rx).await;
         }
@@ -2427,23 +2449,21 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         command_rx: &mut Option<tokio_mpsc::Receiver<PrimaryCommand<I>>>,
     ) {
         // Pre-discovery transient state in setup-defer mode. While
-        // `setup_pending == true` the local primary has `total_tasks = 0`
-        // and every declared phase is `Active` with zero items — not
-        // because they're truly empty, but because the
+        // `setup_pending()` is true the local primary has `total_tasks
+        // = 0` and every declared phase is `Active` with zero items —
+        // not because they're truly empty, but because the
         // setup-promoted secondary has not yet broadcast its first
         // `TaskAdded` / `TasksSpawned`. Firing `on_phase_end(.., 0, 0)`
         // now would surface a spurious "empty drain" for every phase
         // before the chosen secondary has had a chance to populate them
         // (a consumer callback walking just-discovered outputs would
-        // OSError on missing paths). The `setup_pending` latch flips
-        // false the moment a `TaskAdded`, `TasksSpawned`, or
-        // `RunComplete` mutation lands via the mirror path; subsequent
-        // cascade calls resume normal operation. See the
-        // `setup_pending` field doc on `PrimaryCoordinator`.
+        // OSError on missing paths). The gate clears the moment the
+        // first task lands in the replicated ledger; subsequent cascade
+        // calls resume normal operation. See `Self::setup_pending`.
         //
-        // Idempotent on the legacy bootstrap path: `setup_pending`
-        // starts `false` there, so the gate is always satisfied.
-        if self.setup_pending {
+        // Idempotent on the legacy bootstrap path: `setup_pending()`
+        // is always false there, so the gate is always satisfied.
+        if self.setup_pending() {
             return;
         }
         loop {

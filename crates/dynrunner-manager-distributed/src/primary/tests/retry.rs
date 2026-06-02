@@ -118,23 +118,21 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
         let (deps, ops, ope) = noop_phase_args();
         primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        // Drop primary to close the secondary's primary_transport;
-        // the primary's `process_tasks` exits on transport
-        // close + zero peers (single-secondary case). By the time
-        // `primary.run()` returns the primary has already
-        // observed the retry-success TaskComplete on its own
-        // worker-event channel and incremented its
-        // `completed_tasks` count to 2 — the local primary's exit
-        // happens AFTER the primary's bookkeeping is final.
+        // The authoritative retry cascade lives on the PRIMARY (the
+        // secondary is a pure flaky-worker driver / reporter). Read the
+        // primary's final counters BEFORE dropping it.
+        let completed = primary.completed_count();
+        let failed_residual = primary.failed_count();
+        let passes_used = primary.retry_passes_used_for_test();
+
+        // Drop primary to close the secondary's uplink; the secondary
+        // drains down and the join handle resolves.
         drop(primary);
+        let _ = sec_handle.await;
 
-        let (completed, failed_residual, passes_used) =
-            sec_handle.await.unwrap();
-
-        // Both binaries reached terminal success on the
-        // primary's view: "ok" succeeded first attempt, "flaky"
-        // succeeded on retry. No residual permanent failures.
-        // Exactly one retry pass was consumed.
+        // Both binaries reached terminal success: "ok" succeeded first
+        // attempt, "flaky" succeeded on retry. No residual permanent
+        // failures. Exactly one retry pass was consumed.
         assert_eq!(completed, 2, "primary should report 2 completions");
         assert_eq!(
             failed_residual, 0,
@@ -244,35 +242,29 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         let (deps, ops, ope) = noop_phase_args();
         primary.run(binaries, deps, ops, ope).await.unwrap();
 
-        // Drop primary so the primary's transport closes and
-        // its `process_tasks` exits. By that point the
-        // primary has fully consumed its retry budget on
+        // Read the PRIMARY's authoritative counters before drop: by
+        // this point the primary has fully consumed its retry budget on
         // "doomed".
+        let succeeded = primary.completed_count();
+        let failed_residual = primary.failed_count();
+        let passes_used = primary.retry_passes_used_for_test();
+
         drop(primary);
+        let _ = sec_handle.await;
 
-        let (succeeded, failed_residual, passes_used) =
-            sec_handle.await.unwrap();
-
-        // `secondary.completed_count()` is the size of the
-        // `completed_tasks` set, which after the latest fix only
-        // tracks tasks that reached non-Recoverable termination
-        // (success or terminal failure). Recoverable failures —
-        // whether retried-to-success, retried-to-Recoverable-again,
-        // or budget-exhausted-still-Recoverable — stay out of the
-        // set so the primary's dispatch retain doesn't filter
-        // them out from a future re-injection. Here "ok" succeeded
-        // and is in the set; "doomed" was Recoverable on every
-        // attempt and isn't.
+        // "ok" succeeded; "doomed" was Recoverable on every attempt and
+        // ends up in the primary's terminal failure ledger after the
+        // budget was consumed.
         assert_eq!(
             succeeded, 1,
-            "only the unconditionally-succeeding binary should land in completed_tasks"
+            "only the unconditionally-succeeding binary should be counted complete"
         );
-        // The retry-specific bookkeeping is the assertion that
-        // matters for this regression: "doomed" still sits in the
+        // The retry-specific bookkeeping is the assertion that matters
+        // for this regression: "doomed" still sits in the
         // permanent-failure ledger after the budget was consumed.
         assert_eq!(
             failed_residual, 1,
-            "exhausted retry budget should leave 1 entry in primary_failed"
+            "exhausted retry budget should leave 1 terminal failure on the primary"
         );
         assert_eq!(
             passes_used, 1,

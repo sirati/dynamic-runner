@@ -104,6 +104,36 @@ where
         result
     }
 
+    /// Report a respawn-HOLD-deferred task whose worker died before it
+    /// could run (the worker disconnected between `RespawnInProgress`
+    /// and the expected `Ready`, or `assign_task` failed at the
+    /// post-Ready dispatch). The task NEVER ran, so it must be requeued
+    /// at the authority — not counted as a failure. A backpressure-
+    /// shaped `TaskFailed` (`Recoverable` + the `"worker pipe broken;
+    /// respawning"` marker the authority's `is_backpressure` predicate
+    /// recognises) is the wire contract that drives the requeue +
+    /// re-dispatch.
+    ///
+    /// CLASS-1 own-worker report: the secondary is never the authority,
+    /// so this is the SOLE recovery for a lost deferred task — there is
+    /// no local pool to requeue into.
+    pub(in crate::secondary) async fn report_deferred_task_lost(
+        &mut self,
+        worker_id: WorkerId,
+        file_hash: &str,
+    ) -> Result<(), String> {
+        let msg = DistributedMessage::TaskFailed {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            secondary_id: self.config.secondary_id.clone(),
+            worker_id,
+            task_hash: file_hash.to_string(),
+            error_type: ErrorType::Recoverable,
+            error_message: "worker pipe broken; respawning".into(),
+        };
+        self.send_to_primary(msg).await
+    }
+
     /// Route the resource-pressure decision tick through the OOM
     /// watcher (mirrors `LocalManager::check_resource_pressure_via_watcher`).
     /// The watcher invokes `WorkerPool::check_resource_pressure`
@@ -209,7 +239,12 @@ where
     pub(super) async fn request_task_for_worker(
         &mut self,
         worker_id: WorkerId,
-        factory: &mut impl WorkerFactory<M>,
+        // Unused since the P2 transport collapse (the request is a pure
+        // `Address::Role(Role::Primary)` send now); kept in the
+        // signature so the many call sites stay uniform with the
+        // worker-event paths that DO need a factory. Prefixed to mark
+        // intentionally-unused.
+        _factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         if !self.primary_link.should_request_now(worker_id) {
             return Ok(());

@@ -12,7 +12,7 @@ use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd};
 use dynrunner_transport_quic::{NetworkClient, NetworkServer, NoPeerTransport};
-use dynrunner_transport_tunnel::TunneledPeerTransport;
+use dynrunner_transport_tunnel::{TunneledPeerTransport, UnifiedSecondaryTransport};
 use serde::{Deserialize, Serialize};
 
 /// Test identifier that can be flattened by serde (must be a struct with named
@@ -150,11 +150,15 @@ async fn e2e_primary_secondary_over_wss() {
                 memuse_log_path: None,
             };
 
-            let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
+            let unified = UnifiedSecondaryTransport::new(
+                config.secondary_id.clone(),
+                client,
+                NoPeerTransport,
+            );
+            let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
                 SecondaryCoordinator::new(
                     config,
-                    client,
-                    NoPeerTransport,
+                    unified,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
@@ -290,11 +294,15 @@ async fn e2e_primary_secondary_over_quic() {
                 memuse_log_path: None,
             };
 
-            let mut secondary: SecondaryCoordinator<_, _, ChannelManagerEnd, _, _, TestId> =
+            let unified = UnifiedSecondaryTransport::new(
+                config.secondary_id.clone(),
+                client,
+                NoPeerTransport,
+            );
+            let mut secondary: SecondaryCoordinator<_, ChannelManagerEnd, _, _, TestId> =
                 SecondaryCoordinator::new(
                     config,
-                    client,
-                    NoPeerTransport,
+                    unified,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );

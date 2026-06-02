@@ -5,7 +5,9 @@
 
 #![cfg(test)]
 
-use super::super::test_helpers::{FakeWorkerFactory, FixedEstimator, NoPeers, TestId};
+use super::super::test_helpers::{
+    make_transport, FakeWorkerFactory, FixedEstimator, NoPeers, TestId, TestTransport,
+};
 use super::super::*;
 use super::processing::{fake_primary, make_binary};
 use std::time::Duration;
@@ -28,8 +30,7 @@ fn arm_watchdog_no_peers(
     dial_count: u32,
 ) -> (
     SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        NoPeers,
+        TestTransport<NoPeers>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
@@ -41,7 +42,7 @@ fn arm_watchdog_no_peers(
     let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let transport = ChannelPrimaryTransportEnd {
+    let uplink = ChannelPrimaryTransportEnd {
         tx: sec_to_pri_tx,
         rx: pri_to_sec_rx,
     };
@@ -73,16 +74,14 @@ fn arm_watchdog_no_peers(
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        NoPeers,
+        TestTransport<NoPeers>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        transport,
-        NoPeers,
+        make_transport(secondary_id, uplink, NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -289,7 +288,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
         .run_until(async {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
             let (pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-            let transport = ChannelPrimaryTransportEnd {
+            let uplink = ChannelPrimaryTransportEnd {
                 tx: sec_to_pri_tx,
                 rx: pri_to_sec_rx,
             };
@@ -328,14 +327,13 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
             let secondary_id = config.secondary_id.clone();
             let primary_handle = tokio::task::spawn_local(fake_primary(
                 binaries,
-                secondary_id,
+                secondary_id.clone(),
                 sec_to_pri_rx,
                 pri_to_sec_tx,
             ));
             let mut secondary = SecondaryCoordinator::new(
                 config,
-                transport,
-                NoPeers,
+                make_transport(&secondary_id, uplink, NoPeers),
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -352,7 +350,7 @@ async fn degraded_secondary_continues_dispatching_over_wss() {
                 .expect("degraded run must complete cleanly over WSS");
 
             assert_eq!(
-                secondary.completed_count(),
+                secondary.local_tasks_run_for_test(),
                 3,
                 "WSS dispatch must keep flowing after peer-mesh degraded mode"
             );
@@ -425,7 +423,7 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
     let (sec_to_pri_tx, mut sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) =
         tokio_mpsc::unbounded_channel::<DistributedMessage<TestId>>();
-    let transport = ChannelPrimaryTransportEnd {
+    let uplink = ChannelPrimaryTransportEnd {
         tx: sec_to_pri_tx,
         rx: pri_to_sec_rx,
     };
@@ -457,16 +455,14 @@ async fn watchdog_healthy_mesh_path_unaffected_by_degrade_refactor() {
         memuse_log_path: None,
     };
     let mut secondary: SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        FixedPeerCount,
+        TestTransport<FixedPeerCount>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     > = SecondaryCoordinator::new(
         config,
-        transport,
-        FixedPeerCount(3),
+        make_transport("sec-quo", uplink, FixedPeerCount(3)),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

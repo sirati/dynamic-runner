@@ -289,7 +289,7 @@ async fn cluster_state_converges_on_primary_and_secondary() {
             let (sec_to_pri_tx, sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
 
             let sec_handle = tokio::task::spawn_local(async move {
-                let transport = ChannelPrimaryTransportEnd {
+                let uplink = ChannelPrimaryTransportEnd {
                     tx: sec_to_pri_tx,
                     rx: pri_to_sec_rx,
                 };
@@ -317,16 +317,22 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                     output_dir: None,
                     memuse_log_path: None,
                 };
+                let unified = UnifiedSecondaryTransport::new(
+                    config.secondary_id.clone(),
+                    uplink,
+                    NoPeers,
+                );
                 let mut secondary = SecondaryCoordinator::new(
                     config,
-                    transport,
-                    NoPeers,
+                    unified,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );
                 let mut factory = FakeWorkerFactory;
                 secondary.run(&mut factory).await.unwrap();
                 (
+                    // CRDT-backed: the secondary's mirror converges from
+                    // the primary's terminal broadcasts.
                     secondary.completed_count(),
                     secondary.cluster_state_counts_for_test(),
                 )
