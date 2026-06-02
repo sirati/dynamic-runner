@@ -26,6 +26,9 @@
 //!   (degraded-mode + healthy-mesh non-regression).
 //! - [`r1`] — R1 promotion-threshold tests + cold-start no-primary
 //!   tests + post-promotion peer-message dispatch test.
+//! - [`keepalive_recognition`] — primary-vs-peer keepalive routing: a
+//!   current-primary keepalive refreshes `primary_last_seen`; any other
+//!   peer's keepalive feeds `peer_keepalives`.
 //! - [`late_joiner_observer`] — late-joiner observer-mode scenario.
 //! - [`late_joiner_accept_emits_peer_joined`] — receive-side
 //!   PeerJoined emission contract for the late-joiner accept path,
@@ -45,6 +48,7 @@
 
 #![cfg(test)]
 
+mod keepalive_recognition;
 mod late_joiner_accept_emits_peer_joined;
 mod late_joiner_observer;
 mod memprofile_hook;
