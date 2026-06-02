@@ -417,21 +417,52 @@ impl PyObserverLateJoiner {
                 //      Cadence note: a late-joiner restores a snapshot of
                 //      an already-running cluster, so the initial publish
                 //      below delivers REAL, typically-non-zero stats that
-                //      the first 10-minute tick reports. Refreshing the
-                //      cell on every live mid-run task transition (so the
-                //      reporter's deltas track completions that land
-                //      *during* this observer's window) is a strictly-
-                //      additive future step: it needs an apply-path
-                //      publish hook inside `cluster_state`, which is out
-                //      of this wiring's file scope. The reporter logic
-                //      needs no change when that lands — only an extra
-                //      `publish` call site.
+                //      the first 10-minute tick reports.
+                //
+                //      # Live mid-run refresh
+                //
+                //      The restore-time and post-`run_until_setup_or_done`
+                //      publishes alone would leave the cell STATIC for the
+                //      whole run (the observer holds `&mut secondary` across
+                //      the entire run and `run_until_setup_or_done` returns
+                //      only on Done), so the 10-minute stats would report
+                //      the restore-time view until the run finished. The
+                //      live refresh closes that gap WITHOUT `Arc`-sharing
+                //      the CRDT or touching the apply path: the coordinator's
+                //      `process_tasks` loop invokes a registered
+                //      `on_cluster_state_refresh` callback on a modest
+                //      periodic tick (it owns `&self.cluster_state` between
+                //      applies), and the callback below projects + publishes
+                //      the live CRDT into the SAME cell. The reporter task
+                //      then reads the freshening cell on its own
+                //      10-min/1-min cadence — no reporter change needed. See
+                //      `register_cluster_state_refresh` and the periodic arm
+                //      in `secondary/processing/process_tasks.rs`.
                 let snapshot_source = SharedSnapshotSource::new(
                     StatsSnapshot::from_cluster_state(secondary.cluster_state()),
                 );
                 // Clone the publish handle for THIS loop; the reporter
                 // task consumes the other end. Both clones share one cell.
                 let snapshot_publisher = snapshot_source.clone();
+
+                // Live mid-run refresh: register the periodic publish
+                // callback the coordinator's `process_tasks` loop invokes
+                // between applies (see the live-refresh doc above). The
+                // callback owns ANOTHER clone of the same cell and projects
+                // the live CRDT into it on each tick, so the reporter sees
+                // progress that lands DURING this observer's window — not
+                // just the restore-time snapshot. Registered BEFORE the run
+                // loop's first `run_until_setup_or_done` per the
+                // `register_cluster_state_refresh` pre-run contract (the
+                // slot is taken into the loop's local state on first entry).
+                // The `StatsSnapshot` / projection concern stays entirely
+                // on this side of the boundary; the coordinator only knows
+                // it hands `&ClusterState` to a registered closure.
+                let refresh_publisher = snapshot_source.clone();
+                secondary.register_cluster_state_refresh(Box::new(move |cs| {
+                    refresh_publisher.publish(StatsSnapshot::from_cluster_state(cs));
+                }));
+
                 let (reporter_cancel_tx, reporter_cancel_rx) =
                     tokio::sync::oneshot::channel::<()>();
                 let reporter_task = tokio::task::spawn_local(run_reporter(

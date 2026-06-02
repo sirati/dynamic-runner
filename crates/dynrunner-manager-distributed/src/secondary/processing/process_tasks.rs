@@ -25,6 +25,17 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::{RunOutcome, SecondaryCoordinator};
 
+/// Cadence for the externally-registered cluster-state refresh callback
+/// (see [`SecondaryCoordinator::register_cluster_state_refresh`]). A
+/// modest 30s tick: the only consumer is the observer's live-snapshot
+/// feed, whose downstream reporter runs on a 10-minute / 1-minute
+/// cadence, so 30s keeps the published projection comfortably fresh
+/// between reporter reads while the per-tick `O(ledger)` projection cost
+/// stays negligible. Deliberately NOT per-`ClusterMutation` (which would
+/// make the projection `O(ledger × mutations)`).
+const CLUSTER_STATE_REFRESH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
     Tr: PeerTransport<I>,
@@ -122,6 +133,27 @@ where
         // iterations, identical discipline to `panik_signal_rx`. `None`
         // when no such policy was attached → the arm parks on `pending()`.
         let mut fatal_exit_signal_rx = self.fatal_exit_signal_rx.take();
+
+        // Externally-registered cluster-state refresh callback (the
+        // observer's live-snapshot feed; see
+        // `register_cluster_state_refresh`). Taken out for the loop
+        // duration so its periodic-tick arm owns the closure across
+        // iterations, identical discipline to `fatal_exit_signal_rx`.
+        // `None` when no consumer registered → the tick fires but the
+        // arm's body has no closure to invoke. The matching
+        // `tokio::time::interval` is built here so the first tick lands
+        // one full period in (the just-restored snapshot is already
+        // published by the integration site before the loop starts, so
+        // re-publishing it at t=0 would be redundant); `MissedTickBehavior::Skip`
+        // keeps a stalled loop from bursting catch-up ticks.
+        let on_cluster_state_refresh = self.on_cluster_state_refresh.take();
+        let mut cluster_state_refresh_interval =
+            tokio::time::interval(CLUSTER_STATE_REFRESH_INTERVAL);
+        cluster_state_refresh_interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick so the refresh lands one full
+        // period in rather than firing on entry.
+        cluster_state_refresh_interval.reset();
 
         // The secondary holds NO authority and processes NO command
         // channel: the externally-issued `PrimaryCommand`s
@@ -385,6 +417,28 @@ where
                             // Err arm.
                             fatal_exit_signal_rx = None;
                         }
+                    }
+                }
+                // Cluster-state refresh tick. The one in-loop moment a
+                // concurrently-running consumer (the observer's
+                // live-snapshot feed) can observe the freshening,
+                // post-apply CRDT: every other arm has just finished its
+                // apply (an inbound `ClusterMutation` routes through
+                // `handle_inbound` → the apply path), so `self.cluster_state`
+                // here reflects the latest converged ledger. Invoke the
+                // registered callback with a read-only borrow; the consumer
+                // PROJECTS it and publishes to its own cell. Periodic (not
+                // per-mutation) so the projection cost is O(ledger) per
+                // tick. When no consumer registered the closure is `None`
+                // and the tick is a no-op.
+                //
+                // Cancel-safety: `interval.tick` is cancel-safe (tokio
+                // docs); a sibling arm winning the race abandons the
+                // in-flight tick future, rebuilt next iteration against
+                // the same interval.
+                _ = cluster_state_refresh_interval.tick() => {
+                    if let Some(callback) = on_cluster_state_refresh.as_ref() {
+                        callback(&self.cluster_state);
                     }
                 }
             }

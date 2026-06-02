@@ -61,6 +61,14 @@ mod tests;
 
 pub use types::{PeerCertInfo, RunOutcome, SecondaryConfig};
 
+/// The shape of the cluster-state refresh callback registered via
+/// [`SecondaryCoordinator::register_cluster_state_refresh`]: invoked from
+/// the `process_tasks` periodic tick with a read-only borrow of the live,
+/// post-apply `cluster_state`. See the field doc on
+/// [`SecondaryCoordinator::on_cluster_state_refresh`] for why it carries
+/// no `Send` bound (invoked inline on the coordinator's own task).
+pub type ClusterStateRefreshFn<I> = Box<dyn Fn(&ClusterState<I>)>;
+
 /// A task DEFERRED on this secondary because the target worker's
 /// per-type subprocess is mid-respawn (the dispatch arm observed
 /// [`dynrunner_manager_local::EnsureWorkerOutcome::RespawnInProgress`]).
@@ -490,6 +498,43 @@ where
     /// `process_tasks` so the arm's `await` owns it across iterations,
     /// same discipline as `panik_signal_rx`.
     pub(super) fatal_exit_signal_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+
+    /// Externally-registered cluster-state refresh callback. Installed
+    /// via [`Self::register_cluster_state_refresh`] before
+    /// `run_until_setup_or_done`. Invoked on a modest periodic tick from
+    /// the `process_tasks` select! loop with a read-only borrow of the
+    /// live, post-apply `cluster_state` — the single in-loop moment a
+    /// concurrently-running consumer can observe the freshening CRDT
+    /// (the loop owns the `&mut cluster_state` for its whole lifetime,
+    /// so the consumer cannot borrow it directly).
+    ///
+    /// Single concern, dependency-inverted: this crate defines the
+    /// `Fn(&ClusterState<I>)` slot and invokes it on the tick; the
+    /// consumer (the PyO3 observer's live-snapshot feed) supplies the
+    /// closure that PROJECTS the CRDT into its own shape and publishes
+    /// it. The slot mirrors `fatal_exit_signal_rx`'s registration shape
+    /// (a registered slot, `Option::take`-n into the loop's local state
+    /// on first entry), differing only in DIRECTION: fatal-exit flows a
+    /// value INTO the loop, so it is a receiver; this flows a borrow of
+    /// loop-owned state OUT to the consumer, so it is a callback the loop
+    /// calls with `&self.cluster_state`.
+    ///
+    /// `None` when no consumer registered (regular secondaries,
+    /// Rust-only tests) — the periodic tick fires but invokes nothing.
+    /// `Box<dyn Fn>` (not `FnMut`) because the consumer's closure only
+    /// reads the borrow and forwards a projection to a shared cell; it
+    /// holds no per-invocation mutable state of its own.
+    ///
+    /// No `Send` bound (unlike the `LifecycleListener` / `OnPhaseEnd`
+    /// hooks, which require it because they are `mem::take`-n INTO a
+    /// `spawn_local` dispatcher task or moved onto the co-located
+    /// primary): this callback is invoked INLINE from the `process_tasks`
+    /// select! loop on the same current-thread task that owns the
+    /// coordinator, so it never crosses a thread/task boundary. Adding
+    /// `Send` would needlessly bar a single-threaded consumer (the
+    /// observer's `LocalSet`-bound feed) from capturing `Rc`-shaped
+    /// state.
+    pub(super) on_cluster_state_refresh: Option<ClusterStateRefreshFn<I>>,
 
     /// Promotion-activation gate sender for the co-located parked
     /// `PrimaryCoordinator`.
