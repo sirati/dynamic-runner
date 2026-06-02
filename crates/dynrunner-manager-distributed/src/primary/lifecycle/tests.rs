@@ -228,6 +228,54 @@ async fn activate_local_primary_emits_a_keepalive() {
         .await;
 }
 
+/// Initial-setup-done / first-operational important event: the single
+/// bootstrap+failover convergence point (`activate_local_primary`) emits
+/// exactly one "co-located primary activated" line on the importance
+/// marker target so the dual-sink can surface it on stdio under
+/// `--important-stdio-only`.
+#[tokio::test(flavor = "current_thread")]
+async fn activate_local_primary_emits_initial_setup_done_important_event() {
+    use crate::test_capture::{important_only, ImportantCapture};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{Layer, Registry};
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut coordinator, _log, _ends) = make_recording_coordinator(
+                1,
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            );
+            seed_secondary(&mut coordinator, "sec-0");
+
+            let capture = ImportantCapture::default();
+            let subscriber =
+                Registry::default().with(capture.clone().with_filter(important_only()));
+            // `set_default` holds the subscriber across the `.await`
+            // inside `activate_local_primary` (current-thread runtime).
+            let _guard = set_default(subscriber);
+
+            coordinator
+                .activate_local_primary()
+                .await
+                .expect("activation succeeds");
+
+            let msgs = capture.messages();
+            assert_eq!(
+                msgs.len(),
+                1,
+                "exactly one initial-setup-done important event: {msgs:?}"
+            );
+            assert!(
+                msgs[0].contains("activated as sole authority"),
+                "{msgs:?}"
+            );
+        })
+        .await;
+}
+
 /// Emission-lifetime invariant (sub-fix A), pre-operational window: the
 /// bootstrap region (`perform_initial_assignment → wait_for_mesh_ready →
 /// activate_local_primary → operational_loop`) can outlast the

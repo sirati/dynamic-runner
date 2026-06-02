@@ -32,6 +32,7 @@ mod error;
 mod fulfillability_matcher;
 mod heartbeat;
 mod hydrate;
+mod important_events;
 mod lifecycle;
 mod peer_setup;
 pub mod preferred_secondaries;

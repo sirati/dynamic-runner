@@ -222,7 +222,14 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             self.hydrate_from_cluster_state();
         }
 
+        // Initial-setup-done / first-operational milestone (LLM-wake
+        // important event): the single bootstrap+failover convergence
+        // point at which this node asserts primary authority, reached
+        // immediately before the operational loop. Emitted at the
+        // importance target so the dual-sink surfaces it on stdio under
+        // `--important-stdio-only`.
         tracing::info!(
+            target: crate::primary::important_events::IMPORTANT_TARGET,
             node = %self.config.node_id,
             "co-located primary activated as sole authority; secondaries route \
              Role::Primary to their uplink (this node) — no remote PromotePrimary"

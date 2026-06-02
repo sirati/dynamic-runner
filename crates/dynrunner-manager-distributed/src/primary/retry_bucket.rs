@@ -173,7 +173,16 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     // does not burn a second pass on the same set of failures.
     retry_passes_used.insert(key, used + 1);
 
+    // Phase-transition important event: the start of a retry pass.
+    // ONE emit site shared by both retry channels — `bucket = ?kind`
+    // discriminates error-retry (`Recoverable`) from OOM-retry (`Oom`),
+    // never a per-kind branch. Emitted at the importance target so the
+    // dual-sink surfaces it on stdio under `--important-stdio-only`;
+    // only the budget-available reinject path (this point) is the
+    // "start of a retry" — the empty / budget-exhausted returns above
+    // are not.
     tracing::info!(
+        target: crate::primary::important_events::IMPORTANT_TARGET,
         phase = %phase,
         bucket = ?kind,
         pass = used + 1,
@@ -362,5 +371,126 @@ where
             task.preferred_secondaries = SoftPreferredSecondaries::new(vec![target]);
         }
         tasks
+    }
+}
+
+#[cfg(test)]
+mod important_event_tests {
+    //! Pins the phase-transition "start of retry" important event on
+    //! the shared retry-bucket emit site: it fires exactly once on the
+    //! budget-available reinject, never on the empty-candidate or
+    //! budget-exhausted paths, and the SINGLE site discriminates
+    //! error-retry (`Recoverable`) from OOM-retry (`Oom`) purely via
+    //! the `bucket` field — no per-kind branch.
+
+    use std::collections::HashMap;
+
+    use dynrunner_core::{PhaseId, RunnerIdentifier, SoftPreferredSecondaries, TaskInfo, TypeId};
+    use dynrunner_scheduler_api::PendingPool;
+    use tracing::subscriber::with_default;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::{Layer, Registry};
+
+    use super::{try_phase_retry_bucket_core, BucketKind, RetryPassesUsed};
+    use crate::test_capture::{important_only, ImportantCapture};
+
+    fn task(name: &str, phase: &PhaseId) -> TaskInfo<RunnerIdentifier> {
+        TaskInfo {
+            path: std::path::PathBuf::from(format!("/tmp/{name}")),
+            size: 1,
+            identifier: RunnerIdentifier::from(name),
+            phase_id: phase.clone(),
+            type_id: TypeId::from("default"),
+            affinity_id: None,
+            payload: serde_json::Value::Null,
+            task_id: name.into(),
+            task_depends_on: vec![],
+            preferred_secondaries: SoftPreferredSecondaries::default(),
+            resolved_path: None,
+        }
+    }
+
+    fn pool(phase: &PhaseId) -> PendingPool<RunnerIdentifier> {
+        PendingPool::new([phase.clone()], HashMap::new()).expect("single-phase pool")
+    }
+
+    /// Drive the core with the given bucket over a capture and return
+    /// (reinjected?, captured events). The phase has budget for one pass.
+    fn run_with_capture(
+        kind: BucketKind,
+        candidates: Vec<TaskInfo<RunnerIdentifier>>,
+        max_passes: u32,
+        used_seed: u32,
+    ) -> (bool, Vec<crate::test_capture::CapturedEvent>) {
+        let phase = PhaseId::from("phase-a");
+        let mut pool = pool(&phase);
+        let mut used: RetryPassesUsed = HashMap::new();
+        if used_seed > 0 {
+            used.insert((phase.clone(), kind), used_seed);
+        }
+        let capture = ImportantCapture::default();
+        let subscriber =
+            Registry::default().with(capture.clone().with_filter(important_only()));
+        let reinjected = with_default(subscriber, || {
+            try_phase_retry_bucket_core(
+                &phase,
+                kind,
+                candidates,
+                &mut pool,
+                &mut used,
+                max_passes,
+                |_h| {},
+            )
+        });
+        (reinjected, capture.events())
+    }
+
+    #[test]
+    fn error_retry_emits_one_event_tagged_recoverable() {
+        let phase = PhaseId::from("phase-a");
+        let (reinjected, events) =
+            run_with_capture(BucketKind::Recoverable, vec![task("t0", &phase)], 1, 0);
+        assert!(reinjected);
+        assert_eq!(events.len(), 1, "exactly one important event: {events:?}");
+        assert!(events[0].message.contains("re-injecting failed tasks"));
+        assert_eq!(
+            events[0].fields.get("bucket").map(String::as_str),
+            Some("Recoverable"),
+            "error-retry must be tagged Recoverable: {events:?}"
+        );
+    }
+
+    #[test]
+    fn oom_retry_emits_one_event_tagged_oom() {
+        let phase = PhaseId::from("phase-a");
+        let (reinjected, events) =
+            run_with_capture(BucketKind::Oom, vec![task("t0", &phase)], 1, 0);
+        assert!(reinjected);
+        assert_eq!(events.len(), 1, "exactly one important event: {events:?}");
+        assert_eq!(
+            events[0].fields.get("bucket").map(String::as_str),
+            Some("Oom"),
+            "OOM-retry must be tagged Oom: {events:?}"
+        );
+    }
+
+    #[test]
+    fn empty_candidates_emit_no_event() {
+        let (reinjected, events) = run_with_capture(BucketKind::Recoverable, vec![], 1, 0);
+        assert!(!reinjected);
+        assert!(events.is_empty(), "no important event on empty bucket: {events:?}");
+    }
+
+    #[test]
+    fn exhausted_budget_emits_no_event() {
+        let phase = PhaseId::from("phase-a");
+        // Seed the counter at the cap so this pass is over budget.
+        let (reinjected, events) =
+            run_with_capture(BucketKind::Recoverable, vec![task("t0", &phase)], 1, 1);
+        assert!(!reinjected);
+        assert!(
+            events.is_empty(),
+            "no important event when the budget is exhausted: {events:?}"
+        );
     }
 }
