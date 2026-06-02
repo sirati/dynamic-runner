@@ -163,6 +163,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // gates above.
         let mut matcher_arm_closed = false;
 
+        // Worker-management signal receiver. Same shape + lifetime as
+        // `matcher_trigger_rx`: taken out for the loop's duration so the
+        // `drain_worker_signal_batch` await can borrow it without
+        // conflicting with the per-arm `&mut self` borrows, then put
+        // back at loop exit so retry-pass re-entries keep draining the
+        // same channel. `None` when a previous run already consumed it
+        // (single-shot lifecycle — same handling as `matcher_trigger_rx`).
+        let mut worker_mgmt_rx = self.worker_mgmt_rx.take();
+        // One-shot gate on the worker-management arm. Flips true on
+        // `rx.recv() == None` (every sender dropped); mirrors
+        // `matcher_arm_closed`.
+        let mut worker_mgmt_arm_closed = false;
+
         // Respawn-request receiver. Same shape + lifetime as
         // `command_rx`: taken out for the duration of the loop so the
         // arm's `recv().await` can borrow it without conflicting with
@@ -223,6 +236,25 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // setup-promote deadline, stuck-worker watchdog) are a
             // different concern and stay in the loop.
             if self.run_complete_check() {
+                break;
+            }
+
+            // Worker-management run-should-fail exit. The
+            // worker-management `select!` arm records a break outcome on
+            // `worker_mgmt_fail_outcome` when it drains a
+            // `RunShouldFail` (emitted by the phase layer onto the
+            // decoupled bus, OR by the phase-floor liveness check). The
+            // worker arm OWNS the clean-shutdown drive; breaking here —
+            // not from the emit path — keeps phase/task management fully
+            // decoupled from worker management (the dispatch-decoupling
+            // law). `run_pipeline` consumes the outcome after the loop
+            // returns Ok and surfaces the failure. Same write-by-arm /
+            // read-by-loop discipline as `panik_outcome`.
+            if self.worker_mgmt_fail_outcome.is_some() {
+                tracing::warn!(
+                    "primary operational loop exiting via worker-management \
+                     run-should-fail signal"
+                );
                 break;
             }
 
@@ -427,6 +459,48 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                                 "matcher-trigger channel closed; disabling \
                                  the fulfillability-matcher arm for the \
                                  remainder of the loop"
+                            );
+                        }
+                    }
+                }
+                wm_batch = async {
+                    match worker_mgmt_rx.as_mut() {
+                        Some(rx) => {
+                            crate::worker_signal::drain_worker_signal_batch(
+                                rx,
+                                crate::worker_signal::WORKER_SIGNAL_BATCH_IDLE_WINDOW,
+                            ).await
+                        }
+                        // No receiver attached — park forever so the
+                        // arm never fires. Mirrors the matcher arm's
+                        // `pending().await` for the same closed-channel
+                        // hot-loop reason.
+                        None => std::future::pending().await,
+                    }
+                }, if !worker_mgmt_arm_closed => {
+                    match wm_batch {
+                        Some(batch) => {
+                            // Worker management's PARKED RECHECK: a batch
+                            // of decoupled signals arrived. The reaction
+                            // (dispatch recheck over every free worker,
+                            // phase-floor liveness check, run-should-fail
+                            // break) lives in `lifecycle::worker_mgmt`;
+                            // this arm's only concern is "a batch
+                            // arrived; hand it off". The phase/task code
+                            // that emitted the signals never touched
+                            // worker management directly (the
+                            // dispatch-decoupling law).
+                            self.react_to_worker_signal_batch(batch).await;
+                        }
+                        None => {
+                            // Every sender dropped. Same as the matcher
+                            // channel's None arm: disable this arm and
+                            // let the timer / counter exit cues take over.
+                            worker_mgmt_arm_closed = true;
+                            tracing::debug!(
+                                "worker-management signal channel closed; disabling \
+                                 the worker-management arm for the remainder of \
+                                 the loop"
                             );
                         }
                     }
@@ -713,6 +787,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // the same channel so holdings-update bursts during retry
         // passes still drive the matcher.
         self.matcher_trigger_rx = matcher_trigger_rx;
+        // Same rationale for the worker-management signal receiver:
+        // retry passes re-enter the operational loop and must keep
+        // draining the same bus so a `TasksAdded` emitted during a
+        // retry pass still drives the dispatch recheck.
+        self.worker_mgmt_rx = worker_mgmt_rx;
         // Same rationale for the respawn-request receiver: retry
         // passes re-enter the operational loop and a death observed
         // during a retry pass should still drive the dispatcher.

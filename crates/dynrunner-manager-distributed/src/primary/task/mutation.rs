@@ -9,6 +9,7 @@ use dynrunner_scheduler_api::{
 };
 
 use crate::primary::PrimaryCoordinator;
+use crate::worker_signal::WorkerMgmtSignal;
 
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -104,6 +105,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 );
             }
             if self.pending.is_some() {
+                let reinjected_any = !newly_pending.is_empty();
                 for task in newly_pending {
                     tracing::debug!(
                         phase = %task.phase_id,
@@ -112,6 +114,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                          wire-received TasksSpawned"
                     );
                     self.pool_mut().reinject(task);
+                }
+                // Wire-received `TasksSpawned` that grew the live pool is
+                // a pool-entry edge — EMIT a `TasksAdded` so the
+                // worker-management recheck dispatches the new work.
+                // Decoupled emit, never a direct dispatch call (the
+                // dispatch-decoupling law).
+                if reinjected_any {
+                    self.cluster_state
+                        .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
                 }
             }
             if !joined_peer_ids.is_empty() {

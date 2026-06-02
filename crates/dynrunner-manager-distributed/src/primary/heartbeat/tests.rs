@@ -728,20 +728,19 @@ fn first_task_assignment(
 
 /// Regression for the dispatch-stall after keepalive-driven recovery:
 /// when the primary requeues an in-flight task from a dead secondary,
-/// surviving idle workers do NOT auto-poll. Without an explicit
-/// `dispatch_to_idle_workers` kickstart at the end of the requeue
-/// path the recovered task sits in the pool forever — observed in the
-/// 2026-05-17 cohort run where the primary logged
+/// surviving idle workers do NOT auto-poll. Without re-dispatch at the
+/// end of the requeue path the recovered task sits in the pool forever
+/// — observed in the 2026-05-17 cohort run where the primary logged
 /// `recovered_in_flight=1` after a 300 s keepalive timeout but never
 /// re-emitted `task_request` to any idle peer, so the entire dispatch
 /// chain stalled until the SLURM time-limit killed the wrapper.
 ///
-/// Mirrors the existing kickstart pattern in
-/// `run_retry_passes` / `handle_task_complete` / `handle_task_failed`:
-/// every other path that re-injects into the pool calls
-/// `dispatch_to_idle_workers().await` before yielding to the
-/// operational loop, because secondaries only send `TaskRequest`
-/// after they finish a task.
+/// Post dispatch-decoupling the requeue path no longer calls dispatch
+/// directly: it EMITS a `WorkerMgmtSignal::TasksAdded` onto the
+/// worker-management bus, and the operational loop's worker-management
+/// `select!` arm runs the recheck that re-dispatches. This test drives
+/// that recheck synchronously (drain the batch + call the reaction) —
+/// the dispatch still happens, just via the batched recheck.
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
@@ -783,6 +782,14 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
         )]),
     );
 
+    // Install the worker-management bus so the requeue path's
+    // `TasksAdded` emit lands on a receiver we drive the recheck from.
+    let (wm_tx, mut wm_rx) =
+        tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
+    primary
+        .cluster_state_mut_for_test()
+        .install_worker_mgmt_sender(wm_tx);
+
     // Sleep past the keepalive deadline so sec-a is dead. Refresh
     // sec-b's keepalive immediately before the tick so only sec-a
     // ends up in the dead list (we want the legacy single-death
@@ -806,10 +813,29 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
         "survivor must remain"
     );
 
+    // Deferred-recheck contract: the requeue path emitted a
+    // `TasksAdded` rather than dispatching inline. Drain the coalesced
+    // batch and run the worker-management reaction synchronously —
+    // exactly what the operational loop's worker-management arm does.
+    let batch = crate::worker_signal::drain_worker_signal_batch(
+        &mut wm_rx,
+        Duration::from_millis(50),
+    )
+    .await
+    .expect("dead-secondary requeue must emit a TasksAdded batch");
+    assert!(
+        batch
+            .signals
+            .contains(&crate::worker_signal::WorkerMgmtSignal::TasksAdded),
+        "requeue path must emit TasksAdded; got {:?}",
+        batch.signals
+    );
+    primary.react_to_worker_signal_batch(batch).await;
+
     // The load-bearing assertion: sec-b's outgoing channel saw a
-    // `TaskAssignment` — i.e. the requeue path kickstarted dispatch
-    // to the surviving idle worker, the very signal the production
-    // run was missing.
+    // `TaskAssignment` — i.e. the recheck re-dispatched to the
+    // surviving idle worker, the very signal the production run was
+    // missing.
     let assignment = first_task_assignment(&mut sec_rxs[1]);
     assert!(
         assignment.is_some(),

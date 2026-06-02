@@ -131,10 +131,10 @@ async fn retry_bucket_skips_unfulfillable_failures() {
             .failed_tasks
             .insert(recoverable_hash.clone(), ErrorType::Recoverable);
 
-        // Drive the Recoverable bucket directly. With no connected
-        // secondaries the `dispatch_to_idle_workers` kickstart inside
-        // the bucket is a no-op, but the partition + reinject step
-        // happens unconditionally.
+        // Drive the Recoverable bucket directly. The bucket now EMITS a
+        // `TasksAdded` instead of dispatching inline; with no worker-
+        // management receiver installed the emit is a silent no-op, but
+        // the partition + reinject step happens unconditionally.
         let phase = unfulfillable_bin.phase_id.clone();
         let mut no_cmd_rx: Option<tokio::sync::mpsc::Receiver<PrimaryCommand<TestId>>> =
             None;

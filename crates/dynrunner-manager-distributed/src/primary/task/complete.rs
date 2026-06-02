@@ -11,6 +11,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::command_channel::PrimaryCommand;
 use crate::primary::PrimaryCoordinator;
+use crate::worker_signal::WorkerMgmtSignal;
 
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
@@ -154,32 +155,26 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 self.note_item_completed(&phase, Some(task_id.as_str()), command_rx).await;
             }
 
-            // Kickstart dispatch to every idle worker. After
-            // `note_item_completed` runs the phase-lifecycle cascade,
-            // a previously-Blocked phase may have just transitioned
-            // to Active. Workers that have been idle since startup
-            // (because their initial TaskRequest got "no work" when
-            // the new phase wasn't yet active) won't re-poll on their
-            // own — they sent their last TaskRequest already, got
-            // nothing, and are waiting for an unsolicited
-            // TaskAssignment. Without this kickstart, a 2-phase task
-            // graph where phase-N has 1 item and phase-(N+1) has the
-            // rest would stall after the phase-N item finishes —
-            // the originating secondary's worker DOES re-request via
-            // its `request_task_for_worker(0)` in
-            // `processing.rs:193`, but every OTHER secondary's
-            // workers don't. Same kickstart pattern as
-            // `run_retry_passes` uses after re-injection.
-            //
-            // Idempotent: if no phase advanced (the common case for
-            // mid-phase completions where the phase still has queued
-            // work), `dispatch_to_idle_workers` finds the soft-pin
-            // soft-pin order returns the originating worker first and
-            // the kickstart no-ops by definition. If multiple phases
-            // cascaded done in one tick (chain of empty phases →
-            // first populated phase), every newly-active phase's
-            // items are seen.
-            self.dispatch_to_idle_workers().await.ok();
+            // A task completed: its worker freed AND a previously-
+            // Blocked phase may have just transitioned to Active in the
+            // `note_item_completed` cascade. Either way, work may now be
+            // dispatchable to a worker that won't re-poll on its own
+            // (it sent its last TaskRequest already, got "no work", and
+            // is waiting for an unsolicited TaskAssignment). EMIT a
+            // `TasksAdded` onto the decoupled worker-management bus
+            // rather than calling dispatch directly: phase/task
+            // management states "work may be available" and knows
+            // nothing of dispatch (the dispatch-decoupling law). The
+            // operational loop's worker-management arm coalesces the
+            // signal into one batched recheck over every free worker.
+            // Without this emit, a 2-phase graph where phase-N has 1
+            // item and phase-(N+1) has the rest would stall after the
+            // phase-N item finishes (the originating secondary re-
+            // requests via `request_task_for_worker(0)`, but every
+            // OTHER secondary's workers don't). The negative control
+            // test pins this emit as load-bearing.
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
 
             // Belt-and-suspenders: forward to every other secondary
             // so each one's `completed_tasks` cache stays current.

@@ -166,12 +166,13 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
                 "Y must stay queued — the held worker cannot take a second task"
             );
 
-            // Drain Y from the pool before X's completion so the
-            // terminal's kickstart-dispatch (the correct post-completion
-            // re-fill of a now-idle worker) has nothing to immediately
-            // re-assign onto the freed slot — keeping THIS assertion
-            // focused on the X-terminal freeing the slot, not on the
-            // orthogonal (and correct) re-dispatch of queued work.
+            // Drain Y from the pool before X's completion. The terminal
+            // now EMITS a `TasksAdded` (no inline dispatch); no
+            // worker-management receiver is installed in this test, so
+            // the emit is a silent no-op and nothing re-fills the freed
+            // slot — keeping THIS assertion focused on the X-terminal
+            // freeing the slot, not on the orthogonal (and correct,
+            // separately covered) deferred re-dispatch of queued work.
             let _drained = primary.pool_mut().drain_queued();
             assert_eq!(primary.pool().iter().count(), 0, "Y drained out");
 
@@ -226,6 +227,18 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             let (mut primary, _ends) =
                 primary_with_pool_and_idle_worker(vec![x.clone(), y]);
 
+            // Install the worker-management bus: the completion path
+            // EMITS a `TasksAdded` (deferred dispatch) instead of
+            // re-filling the freed slot inline. We drain that signal and
+            // drive the recheck synchronously below to reach the
+            // "worker reassigned to the OTHER task" precondition this
+            // stale-terminal test depends on.
+            let (wm_tx, mut wm_rx) =
+                tokio_mpsc::unbounded_channel::<crate::worker_signal::WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
+
             // Assign X to the worker. With two items queued the
             // scheduler picks one deterministically (size-equal →
             // insertion order → X first); pin the assertion to whichever
@@ -246,21 +259,30 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
                 };
 
             // The held task completes — slot frees, its ledger entry
-            // drains, and the terminal's kickstart re-dispatch re-fills
-            // the now-idle worker with the still-queued OTHER task (phase
-            // `work` stays Active because a second item remains). The
-            // slot now holds `other`; `first` is long gone from the
-            // ledger. This reproduces the "worker reassigned" state the
-            // stale terminal below must NOT disturb.
+            // drains, and the terminal EMITS a `TasksAdded` (deferred
+            // dispatch). Draining the batch and running the recheck
+            // re-fills the now-idle worker with the still-queued OTHER
+            // task (phase `work` stays Active because a second item
+            // remains). The slot then holds `other`; `first` is long
+            // gone from the ledger. This reproduces the "worker
+            // reassigned" state the stale terminal below must NOT
+            // disturb.
             primary
                 .handle_task_complete(
                     task_complete("sec-0", 0, &first_hash),
                     &mut None,
                 )
                 .await;
+            let batch = crate::worker_signal::drain_worker_signal_batch(
+                &mut wm_rx,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("completion must emit a TasksAdded batch");
+            primary.react_to_worker_signal_batch(batch).await;
             assert!(
                 primary.slot_holds_hash_for_test("sec-0", 0, &other_hash),
-                "worker reassigned to the other task by the completion kickstart"
+                "worker reassigned to the other task by the deferred recheck"
             );
             // Bind the reassignment-aware aliases the rest of the test
             // reads (`hash_x` plays the stale-terminal role; `hash_y`

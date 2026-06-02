@@ -36,6 +36,7 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 use super::*;
 use crate::primary::retry_bucket::BucketKind;
 use crate::state::{SecondaryConnection, SecondaryConnectionState};
+use crate::worker_signal::WorkerMgmtSignal;
 
 /// Estimator that returns `task.size` bytes as the memory cost. The
 /// OOM bucket sorts retries by estimator-memory DESC, so the size
@@ -266,6 +267,18 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
 
             mark_all_failed_oom(&mut primary);
 
+            // Install the worker-management bus so the OOM bucket's
+            // post-reinject `TasksAdded` emit lands on a receiver we can
+            // drain. Dispatch is now DEFERRED to the worker-management
+            // recheck (the dispatch-decoupling law) rather than fired
+            // synchronously inside `try_run_phase_retry_bucket`; this
+            // test drives the recheck explicitly below so it observes
+            // the same wire shape via the deferred path.
+            let (wm_tx, mut wm_rx) = tokio_mpsc::unbounded_channel::<WorkerMgmtSignal>();
+            primary
+                .cluster_state_mut_for_test()
+                .install_worker_mgmt_sender(wm_tx);
+
             // Pre-flight: `secondaries_sorted_by_memory_desc` returns
             // the canonical ordering the bucket uses to pair tasks.
             let ordered = primary.secondaries_sorted_by_memory_desc();
@@ -294,6 +307,25 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 primary.single_worker_mode(),
                 "single_worker_mode must be true while the OOM bucket is active"
             );
+
+            // Deferred-recheck contract: the bucket emitted a
+            // `TasksAdded` rather than dispatching inline. Drain the
+            // coalesced batch and run the worker-management reaction
+            // synchronously — this is exactly what the operational
+            // loop's worker-management `select!` arm does, minus the
+            // 50ms idle window (driven here directly for determinism).
+            let batch = crate::worker_signal::drain_worker_signal_batch(
+                &mut wm_rx,
+                std::time::Duration::from_millis(50),
+            )
+            .await
+            .expect("OOM-bucket reinject must emit a TasksAdded batch");
+            assert!(
+                batch.signals.contains(&WorkerMgmtSignal::TasksAdded),
+                "the bucket's emit must carry a TasksAdded; got {:?}",
+                batch.signals
+            );
+            primary.react_to_worker_signal_batch(batch).await;
 
             // Drain each secondary's outgoing channel: every
             // `TaskAssignment` carries the worker id + task id, which
@@ -351,7 +383,7 @@ async fn oom_bucket_dispatches_tasks_to_secondaries_memory_desc() {
                 let local = primary.local_worker_id_in_secondary(worker_idx);
                 let expect_skip = local != 0;
                 assert_eq!(
-                    primary.should_skip_worker_for_dispatch(worker_idx),
+                    primary.should_skip_worker_for_dispatch(worker_idx, false),
                     expect_skip,
                     "worker idx {worker_idx} masking mismatch (expect_skip={expect_skip})"
                 );
@@ -404,7 +436,7 @@ async fn normal_pass_unmasked_when_oom_bucket_inactive() {
             );
             for worker_idx in 0..primary.workers.len() {
                 assert!(
-                    !primary.should_skip_worker_for_dispatch(worker_idx),
+                    !primary.should_skip_worker_for_dispatch(worker_idx, false),
                     "worker idx {worker_idx} must be dispatch-eligible \
                      outside the OOM bucket"
                 );

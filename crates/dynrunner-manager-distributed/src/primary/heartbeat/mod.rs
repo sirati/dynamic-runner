@@ -21,6 +21,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::{PendingMassDeath, PrimaryCoordinator};
 use super::wire::timestamp_now;
+use crate::worker_signal::WorkerMgmtSignal;
 
 /// Outcome of a single periodic heartbeat sweep.
 pub(super) struct SecondaryHeartbeatReport {
@@ -270,20 +271,22 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             "dead secondary cleaned up"
         );
 
-        // Kickstart dispatch to surviving idle workers. Secondaries
-        // only emit `TaskRequest` after they finish a task; the
-        // workers idle on survivors right now have nothing in flight
-        // to complete, so without an explicit nudge the just-
-        // requeued tasks would sit in the pool forever. Mirrors the
-        // identical kickstart at the end of `run_retry_passes`,
-        // `handle_task_complete`, and `handle_task_failed` — every
-        // path that puts a task back into the pool owns the
-        // re-dispatch step. Swallowed via `.ok()` like the task-
-        // outcome paths: a transient send failure to one survivor
-        // is logged + rolled back inside `dispatch_to_idle_workers`
-        // and must not abort the heartbeat-tick's outer requeue
-        // bookkeeping.
-        self.dispatch_to_idle_workers().await.ok();
+        // A dead secondary's in-flight tasks were just requeued into
+        // the pool — a pool-entry edge. Surviving free workers only
+        // emit `TaskRequest` after they finish a task; the workers free
+        // on survivors right now have nothing in flight to complete, so
+        // without a nudge the requeued tasks would sit in the pool
+        // forever. EMIT a `TasksAdded` onto the decoupled
+        // worker-management bus rather than calling dispatch directly
+        // (the dispatch-decoupling law) — mirroring the emit at every
+        // other pool-entry / worker-free edge (`handle_task_complete`,
+        // `handle_task_failed`, the retry bucket). The operational
+        // loop's worker-management arm coalesces it into one batched
+        // recheck (which, on a real `TasksAdded`, bypasses the
+        // per-secondary backoff so a survivor that was transiently
+        // backpressured is still a target).
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         Ok(())
     }
 

@@ -13,6 +13,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
+use crate::worker_signal::WorkerMgmtSignal;
 
 use super::types::{validate_spawn_tasks, PrimaryCommand, SpawnError};
 
@@ -267,6 +268,14 @@ where
             ClusterMutation::TaskReinjected { hash },
         ])
         .await;
+        // The reinjected binary is a pool-entry edge — EMIT a
+        // `TasksAdded` so the worker-management recheck picks it up. The
+        // matcher auto-fires this command, and a free worker that
+        // already got "no work" before the reinject won't re-poll on its
+        // own; the decoupled recheck closes that gap. Decoupled emit,
+        // never a direct dispatch call (the dispatch-decoupling law).
+        self.cluster_state
+            .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         Ok(())
     }
 
@@ -440,11 +449,13 @@ where
         //     accounting matches the wire-side state. Same shape
         //     `apply_fail_permanent` produces for the legacy
         //     cascade-fail path.
+        let mut pool_grew = false;
         for hash in valid_hashes {
             match self.cluster_state.task_state(&hash) {
                 Some(TaskState::Pending { task }) => {
                     let task = task.clone();
                     self.pool_mut().reinject(task);
+                    pool_grew = true;
                 }
                 Some(TaskState::Failed { kind, .. }) => {
                     self.failed_tasks.insert(hash, kind.clone());
@@ -453,6 +464,19 @@ where
                     // Blocked / other states: no pool-side action.
                 }
             }
+        }
+
+        // If any spawned task entered the pool as Pending, that's a
+        // pool-entry edge — EMIT a `TasksAdded` so the worker-management
+        // recheck dispatches it. A callback that issues `spawn_tasks`
+        // (e.g. an `on_phase_end` spawning the next phase's items) needs
+        // free workers nudged: they already got "no work" and won't
+        // re-poll. Decoupled emit, never a direct dispatch call (the
+        // dispatch-decoupling law). Blocked-only spawns make no demand
+        // until a prereq completes (which itself emits `TasksAdded`).
+        if pool_grew {
+            self.cluster_state
+                .emit_worker_mgmt(WorkerMgmtSignal::TasksAdded);
         }
 
         Ok(errors)

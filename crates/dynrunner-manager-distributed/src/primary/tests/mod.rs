@@ -13,9 +13,13 @@
 //! - [`preferred_secondaries`] — preferred-secondary validation.
 //! - [`wire`] — `wire_local_path` pre-staged-prefix stripping.
 //! - [`worker_lifecycle`] — P1 slot-typestate / no-reassign-before-terminal.
+//! - [`dispatch_decoupling`] — dispatch is a parked recheck woken by a
+//!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
+//!   is_idle-advisory + coalesce.
 
 mod basic;
 mod coordinator_setup;
+mod dispatch_decoupling;
 mod e2e;
 mod hydrate;
 mod initial_assignment;
