@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dynrunner_core::{Identifier, PhaseId, TaskOutputs};
-use dynrunner_protocol_primary_secondary::RoleTable;
+use dynrunner_protocol_primary_secondary::{RoleTable, SecondaryCapacityRecord};
 
 use crate::fulfillability_matcher::MatcherTriggerEvent;
 use crate::peer_lifecycle::PeerLifecycleEvent;
@@ -167,6 +167,23 @@ pub struct ClusterState<I> {
     /// view rather than racing the cache between "populated" and
     /// "absent".
     pub(super) task_outputs: HashMap<String, TaskOutputs>,
+    /// Per-secondary static capacity (worker-slot count + advertised
+    /// resource amounts). Set once per secondary by the
+    /// `SecondaryCapacity` apply rule (originated by the primary at the
+    /// `SecondaryWelcome` accept in `primary/connect.rs`) and never
+    /// overwritten — capacity is static for a secondary's lifetime in
+    /// the run.
+    ///
+    /// Replicated CRDT data — clone preserves it (matches `tasks`,
+    /// `peer_holdings`, and `task_outputs` semantics). Included in
+    /// `snapshot` / `restore` so a freshly-promoted primary and late-
+    /// joining observers hold the FULL per-secondary roster the moment
+    /// they restore a snapshot, before any live `SecondaryCapacity`
+    /// broadcast reaches them. This is the failover-correctness fix for
+    /// the worker roster being 100% primary-local: a promoted primary
+    /// reconstructs `alive_worker_count()` / `self.workers` from this
+    /// replicated source rather than starting empty.
+    pub(super) secondary_capacities: HashMap<String, SecondaryCapacityRecord>,
 }
 
 impl<I> Clone for ClusterState<I>
@@ -199,6 +216,8 @@ where
             peer_holdings: self.peer_holdings.clone(),
             // Replicated CRDT data — clone preserves it.
             task_outputs: self.task_outputs.clone(),
+            // Replicated CRDT data — clone preserves it.
+            secondary_capacities: self.secondary_capacities.clone(),
         }
     }
 }
@@ -223,6 +242,7 @@ where
             .field("task_completed_tx", &self.task_completed_tx.is_some())
             .field("peer_holdings", &self.peer_holdings)
             .field("task_outputs", &self.task_outputs.len())
+            .field("secondary_capacities", &self.secondary_capacities)
             .finish()
     }
 }
@@ -245,6 +265,7 @@ impl<I> Default for ClusterState<I> {
             task_completed_tx: None,
             peer_holdings: HashMap::new(),
             task_outputs: HashMap::new(),
+            secondary_capacities: HashMap::new(),
         }
     }
 }

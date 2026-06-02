@@ -41,6 +41,42 @@ fn legacy_task_completed_decodes_without_result_data() {
     }
 }
 
+/// `SecondaryCapacity` round-trips through serde with its
+/// `worker_count` + advertised `resources` preserved verbatim.
+#[test]
+fn roundtrip_secondary_capacity() {
+    let mutation: ClusterMutation<TestId> = ClusterMutation::SecondaryCapacity {
+        secondary: "sec-0".into(),
+        worker_count: 6,
+        resources: vec![dynrunner_core::ResourceAmount {
+            kind: ResourceKind::memory(),
+            amount: 8 * 1024 * 1024 * 1024,
+        }],
+    };
+
+    let json = serde_json::to_string(&mutation).unwrap();
+    let decoded: ClusterMutation<TestId> = serde_json::from_str(&json).unwrap();
+
+    match decoded {
+        ClusterMutation::SecondaryCapacity {
+            secondary,
+            worker_count,
+            resources,
+        } => {
+            assert_eq!(secondary, "sec-0");
+            assert_eq!(worker_count, 6);
+            assert_eq!(
+                resources,
+                vec![dynrunner_core::ResourceAmount {
+                    kind: ResourceKind::memory(),
+                    amount: 8 * 1024 * 1024 * 1024,
+                }]
+            );
+        }
+        _ => panic!("expected SecondaryCapacity"),
+    }
+}
+
 /// `skip_serializing_if = "Option::is_none"` means an absent `result_data`
 /// elides from the JSON output entirely — the wire bytes are identical to
 /// the legacy bare-hash form, so new senders sending `result_data: None`

@@ -122,6 +122,7 @@ fn snapshot_with(
         observers: observers.iter().map(|s| s.to_string()).collect(),
         peer_holdings: HashMap::new(),
         task_outputs: HashMap::new(),
+        secondary_capacities: HashMap::new(),
     }
 }
 
