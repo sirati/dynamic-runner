@@ -284,6 +284,7 @@ pub(super) fn make_secondary(
 /// terminal action (e.g. the `PromotePrimary { new = self }` re-point)
 /// fans out onto the mesh. `peer_count` configures the recorder's
 /// reported mesh cardinality.
+#[allow(clippy::type_complexity)]
 pub(super) fn make_secondary_recording(
     config: SecondaryConfig,
     peer_count: usize,

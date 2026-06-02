@@ -66,6 +66,7 @@ pub(crate) struct PendingMassDeath {
 /// architecturally impossible: the `task_hash` is the slot's held-task
 /// IDENTITY (the ledger key), not a reorder-detector.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SlotState<I: Identifier> {
     /// No task held; the only state from which assignment is legal.
     Idle,

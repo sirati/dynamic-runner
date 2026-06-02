@@ -551,10 +551,7 @@ where
         loop {
             let raw = match self.loopback_rx.try_recv() {
                 Ok(m) => m,
-                Err(_) => match self.mesh.try_recv_peer() {
-                    Some(m) => m,
-                    None => return None,
-                },
+                Err(_) => self.mesh.try_recv_peer()?,
             };
             // `try_recv_peer` is sync; the role layer's relay arm
             // awaits sends, so we cannot run the full interceptor

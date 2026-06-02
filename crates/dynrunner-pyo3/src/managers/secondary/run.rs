@@ -875,13 +875,13 @@ impl PySecondaryCoordinator {
                 // Then await the handle so the parked future is joined
                 // (never left leaked) before this LocalSet unwinds.
                 drop(secondary);
-                if let Some(handle) = parked_primary_handle {
-                    if let Err(e) = handle.await {
-                        tracing::warn!(
-                            error = %e,
-                            "co-located parked primary task did not join cleanly"
-                        );
-                    }
+                if let Some(handle) = parked_primary_handle
+                    && let Err(e) = handle.await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "co-located parked primary task did not join cleanly"
+                    );
                 }
 
                 // Tear down tracked worker subprocesses via the shared
