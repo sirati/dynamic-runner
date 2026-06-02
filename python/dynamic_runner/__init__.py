@@ -21,6 +21,20 @@ Public surface:
   form above; reach it as `dynamic_runner._native.TaskInfo` if needed.
 """
 
+import sys as _sys
+
+# `--important-stdio-only` drives a dual-sink tracing subscriber on the
+# Rust side that reads `DYNRUNNER_IMPORTANT_STDIO_ONLY` /
+# `DYNRUNNER_FULL_LOG_FILE` exactly ONCE — inside the `_native` pymodule
+# init below. The env export therefore has to win the race against that
+# import, so it runs here at the top of the package import (the eager
+# `_native` import is the earliest pull-in; consumers reach this module
+# via `import dynamic_runner`). `logging_setup` pulls in only stdlib +
+# `_shared.logging_utils`, never `_native`, so importing it here is safe.
+from .logging_setup import apply_important_stdio_env as _apply_important_stdio_env
+
+_apply_important_stdio_env(_sys.argv[1:])
+
 from ._shared import TaskDep
 from .deployment_spec import TaskDeploymentSpec
 from .run import run
