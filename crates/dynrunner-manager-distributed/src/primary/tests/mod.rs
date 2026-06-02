@@ -21,6 +21,7 @@ mod e2e;
 mod hydrate;
 mod initial_assignment;
 mod oom_bucket;
+mod phase_decision;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
