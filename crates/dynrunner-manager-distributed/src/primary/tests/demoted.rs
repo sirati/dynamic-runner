@@ -1269,3 +1269,232 @@ async fn demoted_primary_ignores_partial_crdt_view_waits_for_run_complete() {
         }
     }).await;
 }
+
+/// Shared fixture for the composed-AUTHORITATIVE-primary partial_view
+/// tests below. Builds a primary with `demoted = false` (it owns the
+/// run) and `required_setup_on_promote = true`. The `required_setup`
+/// flag is set TRUE on purpose: it is the load-bearing discriminator
+/// for whether `partial_view` keys off `demoted` (correct) or off
+/// `required_setup_on_promote` alone (the mis-key the guard must
+/// reject). `setup_pending` is cleared to false — an authoritative
+/// primary's counter view is live the moment it owns the run, so the
+/// historical setup-defer latch is not what gates its counter exit.
+///
+/// Returns the primary plus the held-open `incoming_tx` so callers can
+/// keep the transport arm from closing (which would let the loop exit
+/// via the transport-closed fallback and defeat the point of the test).
+fn make_authoritative_primary_with_open_transport(
+) -> (
+    PrimaryCoordinator<
+        ChannelSecondaryTransportEnd<TestId>,
+        NoPeers,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    tokio::sync::mpsc::UnboundedSender<DistributedMessage<TestId>>,
+) {
+    let (transport, secondary_ends) = setup_test(1);
+    let (_sec_id, _to_sec_rx, incoming_tx) =
+        secondary_ends.into_iter().next().unwrap();
+
+    let config = PrimaryConfig {
+        node_id: "primary".into(),
+        num_secondaries: 1,
+        connect_timeout: Duration::from_secs(5),
+        peer_timeout: Duration::from_secs(5),
+        keepalive_interval: Duration::from_millis(50),
+        keepalive_miss_threshold: 3,
+        source_pre_staged_root: None,
+        uses_file_based_items: true,
+        // TRUE on purpose — see fixture doc. A non-demoted primary
+        // with this flag set must STILL evaluate partial_view=false.
+        required_setup_on_promote: true,
+        max_concurrent_per_type: std::collections::HashMap::new(),
+        retry_max_passes: 1,
+        oom_retry_max_passes: 1,
+        fleet_dead_timeout: std::time::Duration::from_secs(30),
+        mesh_ready_timeout: std::time::Duration::from_secs(5),
+        mass_death_grace: std::time::Duration::ZERO,
+        mass_death_min_count: 2,
+        source_dir: None,
+        unfulfillable_reinject_max_per_task: None,
+        setup_promote_deadline: std::time::Duration::from_secs(600),
+    };
+    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        config,
+        transport,
+        NoPeers,
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+
+    let phase = dynrunner_core::PhaseId::from("default");
+    let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+        [phase.clone()],
+        std::collections::HashMap::new(),
+    )
+    .expect("default-phase pool");
+    primary.pending = Some(pool);
+    primary.phase_completed.insert(phase.clone(), 0);
+    primary.phase_failed.insert(phase, 0);
+    // Authoritative primary: owns the run, not demoted.
+    primary.demoted = false;
+    // Authoritative counter view is live — the setup-defer latch is a
+    // demoted-submitter concern and must NOT gate this primary's exit.
+    primary.setup_pending = false;
+
+    (primary, incoming_tx)
+}
+
+/// (a) A composed AUTHORITATIVE primary (`demoted = false`) holding a
+/// PARTIAL mirror — 5 of 10 tasks terminal, `total_tasks = 10` — must
+/// NOT declare run-complete. The real counter exit reads
+/// `completed + failed (5) >= total_tasks (10)` = false, and the
+/// pool-drain exit sees in-flight work, so neither exit fires. The loop
+/// would stay alive waiting for the remaining 5 outcomes.
+///
+/// This pins the no-premature-exit half of the guard for the
+/// authoritative path: even though `required_setup_on_promote = true`,
+/// the authoritative primary's `partial_view` is false, so it uses the
+/// real exits — and the real counter exit correctly refuses to fire on
+/// a 5/10 view.
+///
+/// Tests the DECISION directly (`run_complete_check`), not the loop:
+/// `operational_loop` calls this predicate at the top of every
+/// iteration and `break`s iff it returns true, so asserting the
+/// predicate is `false` is exactly asserting "the loop does not exit
+/// this iteration". Fully synchronous and deterministic — no wall-clock
+/// timeout, no spinning the unbounded loop, cannot hang.
+#[test]
+fn authoritative_primary_partial_mirror_does_not_exit() {
+    let (mut primary, _incoming_tx) =
+        make_authoritative_primary_with_open_transport();
+
+    // 10 total tasks; 5 terminal (completed); 5 still in flight in
+    // the pool. `mark_tasks_in_flight` bumps in_flight_per_phase so
+    // `pool.is_run_complete()` reads false — the pool-drain exit is
+    // structurally unavailable, isolating the counter exit.
+    let phase = dynrunner_core::PhaseId::from("default");
+    primary.total_tasks = 10;
+    for i in 0..5 {
+        primary.completed_tasks.insert(format!("task-{i}"));
+    }
+    primary.pool_mut().mark_tasks_in_flight(
+        (5..10).map(|i| (format!("task-{i}"), phase.clone())),
+    );
+
+    // Pre-conditions: the racy state must actually hold or the
+    // "does not exit" result is vacuous.
+    assert_eq!(primary.completed_tasks.len() + primary.failed_tasks.len(), 5);
+    assert_eq!(primary.total_tasks, 10);
+    assert!(
+        !primary.pool().is_run_complete(),
+        "5 in-flight tasks must keep the pool non-complete"
+    );
+    assert!(
+        !primary.cluster_state_for_test().run_complete(),
+        "no RunComplete injected — run_complete must be false"
+    );
+
+    assert!(
+        !primary.run_complete_check(),
+        "authoritative primary declared run-complete on a PARTIAL \
+         mirror (5/10 terminal, total=10). The counter exit \
+         (5 >= 10) is false and the pool is non-complete — a true \
+         here is the premature-completion bug. operational_loop \
+         calls run_complete_check at the top of each iteration and \
+         only breaks when it is true, so this is exactly \"the loop \
+         does not exit\"."
+    );
+}
+
+/// (b) NEGATIVE CONTROL + full-mirror exit. A composed AUTHORITATIVE
+/// primary (`demoted = false`) with a FULL mirror — all 10 tasks
+/// terminal, `total_tasks = 10`, no active workers — MUST exit via the
+/// real counter exit (`completed + failed >= total_tasks`).
+///
+/// This is the discriminator that fails if `partial_view` were
+/// mis-keyed. `required_setup_on_promote = true` here, so if the guard
+/// keyed off that flag alone (or off any sticky latch that stayed true
+/// for a non-demoted primary), `partial_view` would be true, the
+/// counter / pool-drain exits would be gated OFF, and the loop would
+/// hang waiting for a `RunComplete` that never comes — the predicate
+/// would return `false` and FAIL this test. With the correct
+/// `demoted`-keyed guard, `partial_view = false` and the counter exit
+/// fires.
+///
+/// Tests the DECISION directly (`run_complete_check`), not the loop —
+/// see test (a) for why asserting the predicate is exactly asserting
+/// the loop's exit behaviour. Synchronous and deterministic; a
+/// mis-keyed `partial_view` makes the predicate return `false` here,
+/// failing the assert instantly instead of wedging a real loop until a
+/// wall-clock timeout fires.
+#[test]
+fn authoritative_primary_full_mirror_exits_via_counter() {
+    let (mut primary, _incoming_tx) =
+        make_authoritative_primary_with_open_transport();
+
+    // 10 total, all 10 terminal, no in-flight, no active workers.
+    primary.total_tasks = 10;
+    for i in 0..10 {
+        primary.completed_tasks.insert(format!("task-{i}"));
+    }
+    assert_eq!(primary.completed_tasks.len(), 10);
+    assert!(
+        !primary.cluster_state_for_test().run_complete(),
+        "RunComplete must NOT be the exit cue here — this test pins \
+         the COUNTER exit specifically. If run_complete were true \
+         the test could pass even with partial_view mis-keyed."
+    );
+
+    assert!(
+        primary.run_complete_check(),
+        "authoritative primary with a FULL mirror (10/10 terminal, \
+         total=10) did NOT declare run-complete. This is the \
+         partial_view mis-key failure: with \
+         required_setup_on_promote=true, a guard keyed off that flag \
+         (or a sticky latch) instead of `demoted` would set \
+         partial_view=true, gate off the counter / pool-drain exits, \
+         and the loop would wedge waiting for a RunComplete that \
+         never arrives."
+    );
+}
+
+/// (c) Zero-discovery / zero-items case for the composed AUTHORITATIVE
+/// primary: `total_tasks == 0` legitimately (the run genuinely had no
+/// items), `demoted = false`, `setup_pending = false`, empty pool, no
+/// active workers. The counter exit reads `0 + 0 >= 0 && active == 0`
+/// = true and the loop exits cleanly without hanging.
+///
+/// The re-audit flagged this path was previously only exercised via the
+/// reimpl/setup-promote lineage (where the zero-items run exits on
+/// RunComplete with `setup_pending` still gating the counter). For a
+/// composed authoritative primary the counter exit must handle the
+/// zero-items case directly — covered here explicitly.
+///
+/// Tests the DECISION directly (`run_complete_check`), not the loop —
+/// see test (a). Synchronous and deterministic; cannot hang.
+#[test]
+fn authoritative_primary_zero_items_exits_cleanly() {
+    let (mut primary, _incoming_tx) =
+        make_authoritative_primary_with_open_transport();
+
+    // Genuine zero-discovery: no tasks at all.
+    primary.total_tasks = 0;
+    assert!(primary.completed_tasks.is_empty());
+    assert!(primary.failed_tasks.is_empty());
+    assert!(
+        !primary.setup_pending,
+        "authoritative primary's counter view is live; setup_pending \
+         must be false or the zero-items counter exit is gated off"
+    );
+
+    assert!(
+        primary.run_complete_check(),
+        "authoritative primary with zero items (total=0) did NOT \
+         declare run-complete — the zero-discovery counter exit \
+         (0 >= 0) is either gated off by a mis-keyed partial_view \
+         or wedged."
+    );
+}
