@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceKind, SoftPreferredSecondaries, TaskInfo};
-use dynrunner_protocol_primary_secondary::{PeerTransport, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::PeerTransport;
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -194,10 +194,9 @@ pub(crate) fn try_phase_retry_bucket_core<I: Identifier>(
     true
 }
 
-impl<T, P, S, E, I> PrimaryCoordinator<T, P, S, E, I>
+impl<Tr, S, E, I> PrimaryCoordinator<Tr, S, E, I>
 where
-    T: SecondaryTransport<I>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     S: Scheduler<I>,
     E: ResourceEstimator<I>,
     I: Identifier,

@@ -137,7 +137,6 @@ async fn initial_assignment_is_round_robin_and_name_sorted() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );

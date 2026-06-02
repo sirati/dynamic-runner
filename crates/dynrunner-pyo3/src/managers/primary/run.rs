@@ -293,11 +293,36 @@ impl PyPrimaryCoordinator {
 
             let local = tokio::task::LocalSet::new();
             rt.block_on(local.run_until(async {
-                // Bind the network server to the port we already picked.
+                // Build the unified `TunneledPeerTransport` FIRST so its
+                // inbound + registration sinks can be handed to the
+                // network server's accept loops. Post-collapse the
+                // transport OWNS the real inbound demux (the relocated
+                // `NetworkServer::recv` `select!`), so the accept loops
+                // feed it directly — there is no separate legacy
+                // inbound consumer and no fan-out tap. The
+                // `shared_outgoing` handle is unused here: the QUIC/WSS
+                // accept loops register each secondary's writer via the
+                // registration sink (drained in `recv_peer`), not by a
+                // direct insert. `NoPeerTransport` disappears from this
+                // call site (it stays valid on the SECONDARY side for
+                // the `disable_peer_overlay` firewalled-fabric path).
+                let (peer_transport, _shared_outgoing, inbound, registration) =
+                    dynrunner_transport_tunnel::TunneledPeerTransport::<
+                        RunnerIdentifier,
+                    >::new("primary".into());
+
+                // Bind the network server to the port we already picked,
+                // wiring its accept loops to the transport's sinks.
                 let bind_addr: std::net::SocketAddr =
                     format!("127.0.0.1:{}", port).parse().unwrap();
-                let mut server: NetworkServer<RunnerIdentifier> =
-                    match NetworkServer::bind(bind_addr).await {
+                let server: NetworkServer =
+                    match NetworkServer::bind::<RunnerIdentifier>(
+                        bind_addr,
+                        inbound,
+                        registration,
+                    )
+                    .await
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             tracing::error!(error = %e, "failed to start network server");
@@ -306,13 +331,15 @@ impl PyPrimaryCoordinator {
                     };
                 tracing::info!(port, "primary network server listening");
 
-                // Capture the primary's listen endpoint + cert PEM
-                // BEFORE moving `server` into the coordinator below.
-                // These are the trust anchors threaded through
-                // `enable_respawn` and surfaced to each respawned
-                // secondary via `SecondarySpawnSpec` (per-spawn, so
-                // a future cert rotation reaches downstream
-                // respawns).
+                // Capture the primary's listen endpoint + cert PEM from
+                // the server handle. These are the trust anchors threaded
+                // through `enable_respawn` and surfaced to each respawned
+                // secondary via `SecondarySpawnSpec` (per-spawn, so a
+                // future cert rotation reaches downstream respawns). The
+                // server handle is kept alive past these reads only to
+                // hold the cert/port; its accept loops were spawned
+                // (`spawn_local`) inside `bind` and run independently for
+                // the lifetime of the `LocalSet`.
                 //
                 // Endpoint format mirrors the QUIC-listen surface in
                 // `NetworkServer::bind`: `127.0.0.1:<port>`. In SLURM
@@ -326,26 +353,9 @@ impl PyPrimaryCoordinator {
                 let respawn_primary_endpoint = format!("127.0.0.1:{}", server.port());
                 let respawn_primary_pubkey_pem = server.cert_pem().to_string();
 
-                // Step 5b: pair the legacy `NetworkServer` (the
-                // submitter primary's per-secondary tunnel writers
-                // + demuxed inbound) with a `TunneledPeerTransport`
-                // so the primary participates in the peer mesh as
-                // a real member. Same wire — different trait
-                // surface. The PeerCoordinator gets the role-aware
-                // mesh view; the legacy `SecondaryTransport::send_to`
-                // path keeps working unchanged. `NoPeerTransport`
-                // disappears from this call site (it stays valid
-                // on the SECONDARY side for the
-                // `disable_peer_overlay` firewalled-fabric path).
-                let (peer_transport, shared_outgoing, inbound_tap) =
-                    dynrunner_transport_tunnel::TunneledPeerTransport::<
-                        RunnerIdentifier,
-                    >::new("primary".into());
-                server.attach_tunnel(shared_outgoing, inbound_tap);
-
-                // Secondaries retry-connect on their own; the accept loop in
-                // PrimaryCoordinator::run handles connections that arrive
-                // after we hand control to it.
+                // Secondaries retry-connect on their own; the accept loop
+                // (spawned in `bind`) handles connections that arrive
+                // after we hand control to the coordinator.
 
                 // Run the primary coordinator with the network server transport.
                 let config = PrimaryConfig {
@@ -380,10 +390,14 @@ impl PyPrimaryCoordinator {
                     setup_promote_deadline: dist_setup_promote_deadline,
                 };
 
-                let mut primary: PrimaryCoordinator<_, _, _, _, RunnerIdentifier> =
+                // The server handle has done its job (port/cert captured,
+                // accept loops spawned + feeding the transport). Keep it
+                // bound to the LocalSet's lifetime so the listeners stay
+                // up; the coordinator now holds the single `Tr` transport.
+                let _server = server;
+                let mut primary: PrimaryCoordinator<_, _, _, RunnerIdentifier> =
                     PrimaryCoordinator::new(
                         config,
-                        server,
                         peer_transport,
                         scheduler_config.build_memory_scheduler(),
                         estimator,

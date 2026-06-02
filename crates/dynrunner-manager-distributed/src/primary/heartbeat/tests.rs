@@ -6,7 +6,7 @@ use dynrunner_core::{
 };
 use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, RemovalCause};
 use dynrunner_scheduler::ResourceStealingScheduler;
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -19,11 +19,10 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator};
 /// production; tests that exercise post-initialisation paths
 /// (heartbeat re-queue, etc.) need this so `pool_mut()` doesn't
 /// panic.
-fn install_default_pool<T, P, S, E>(
-    primary: &mut PrimaryCoordinator<T, P, S, E, TestId>,
+fn install_default_pool<Tr, S, E>(
+    primary: &mut PrimaryCoordinator<Tr, S, E, TestId>,
 ) where
-    T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
-    P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
     S: dynrunner_scheduler_api::Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
 {
@@ -77,7 +76,7 @@ fn config(keepalive_interval: Duration, miss_threshold: u32) -> PrimaryConfig {
 }
 
 fn empty_transport() -> (
-    ChannelSecondaryTransportEnd<TestId>,
+    ChannelPeerTransport<TestId>,
     tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) {
@@ -86,10 +85,7 @@ fn empty_transport() -> (
     let mut outgoing = HashMap::new();
     outgoing.insert("dead-sec".into(), sec_tx);
     (
-        ChannelSecondaryTransportEnd {
-            outgoing,
-            incoming_rx,
-        },
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
         sec_rx,
         incoming_tx,
     )
@@ -102,10 +98,9 @@ fn empty_transport() -> (
 #[tokio::test(flavor = "current_thread")]
 async fn dead_secondary_requeues_in_flight_task() {
     let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config(Duration::from_millis(50), 2),
         transport,
-        dynrunner_transport_quic::NoPeerTransport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
     );
@@ -178,7 +173,7 @@ async fn dead_secondary_requeues_in_flight_task() {
 // structurally by the field types and isn't reused elsewhere.
 #[allow(clippy::type_complexity)]
 fn two_secondary_transport() -> (
-    ChannelSecondaryTransportEnd<TestId>,
+    ChannelPeerTransport<TestId>,
     Vec<tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>>,
     tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
 ) {
@@ -189,10 +184,7 @@ fn two_secondary_transport() -> (
     outgoing.insert("sec-a".into(), a_tx);
     outgoing.insert("sec-b".into(), b_tx);
     (
-        ChannelSecondaryTransportEnd {
-            outgoing,
-            incoming_rx,
-        },
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
         vec![a_rx, b_rx],
         incoming_tx,
     )
@@ -202,14 +194,13 @@ fn two_secondary_transport() -> (
 /// in-flight task. Mirrors the setup pattern of
 /// `dead_secondary_requeues_in_flight_task` but parametrised by id
 /// so the mass-death tests can stage two of them.
-fn register_operational_secondary<T, P, S, E>(
-    primary: &mut PrimaryCoordinator<T, P, S, E, TestId>,
+fn register_operational_secondary<Tr, S, E>(
+    primary: &mut PrimaryCoordinator<Tr, S, E, TestId>,
     secondary_id: &str,
     worker_id: u32,
     in_flight_label: &str,
 ) where
-    T: dynrunner_protocol_primary_secondary::SecondaryTransport<TestId>,
-    P: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
+    Tr: dynrunner_protocol_primary_secondary::PeerTransport<TestId>,
     S: dynrunner_scheduler_api::Scheduler<TestId>,
     E: ResourceEstimator<TestId>,
 {
@@ -267,7 +258,7 @@ fn config_with_mass_death(
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_defers_requeue_when_all_secondaries_silent() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -276,7 +267,6 @@ async fn mass_death_defers_requeue_when_all_secondaries_silent() {
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -307,7 +297,7 @@ async fn mass_death_defers_requeue_when_all_secondaries_silent() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_recovery_during_grace_undefers_secondary() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -316,7 +306,6 @@ async fn mass_death_recovery_during_grace_undefers_secondary() {
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -346,7 +335,7 @@ async fn mass_death_recovery_during_grace_undefers_secondary() {
 #[tokio::test(flavor = "current_thread")]
 async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -355,7 +344,6 @@ async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -384,7 +372,7 @@ async fn solo_death_with_live_peers_takes_legacy_requeue_path() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_disabled_when_grace_is_zero() {
     let (transport, _sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -393,7 +381,6 @@ async fn mass_death_disabled_when_grace_is_zero() {
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -442,7 +429,7 @@ fn collect_peer_removed(
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -451,7 +438,6 @@ async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -493,7 +479,7 @@ async fn requeue_dead_secondary_emits_peer_removed_with_keepalive_miss_cause() {
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -502,7 +488,6 @@ async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_ca
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -562,11 +547,10 @@ async fn requeue_dead_secondary_emits_peer_removed_with_mass_death_escalation_ca
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config(Duration::from_millis(50), 2),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -623,7 +607,7 @@ async fn requeue_dead_secondary_emits_peer_removed_with_fatal_error_cause() {
 #[tokio::test(flavor = "current_thread")]
 async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config_with_mass_death(
                 Duration::from_millis(50),
@@ -632,7 +616,6 @@ async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
                 2,
             ),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -678,10 +661,9 @@ async fn mass_death_grace_entry_deferral_does_not_fire_peer_removed() {
 #[tokio::test(flavor = "current_thread")]
 async fn live_secondary_is_not_falsely_declared_dead() {
     let (transport, _sec_rx, _kept_alive_for_outgoing_clone) = empty_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config(Duration::from_millis(50), 2),
         transport,
-        dynrunner_transport_quic::NoPeerTransport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
     );
@@ -744,11 +726,10 @@ fn first_task_assignment(
 #[tokio::test(flavor = "current_thread")]
 async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
     let (transport, mut sec_rxs, _incoming_tx) = two_secondary_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> =
         PrimaryCoordinator::new(
             config(Duration::from_millis(50), 2),
             transport,
-            dynrunner_transport_quic::NoPeerTransport,
             ResourceStealingScheduler::memory(),
             FixedEstimator,
         );
@@ -880,10 +861,9 @@ async fn requeue_dead_secondary_kickstarts_dispatch_to_idle_survivor() {
 #[tokio::test(flavor = "current_thread")]
 async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
     let (transport, _sec_rx, _kept_alive) = empty_transport();
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config(Duration::from_millis(50), 2),
         transport,
-        dynrunner_transport_quic::NoPeerTransport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
     );
@@ -970,10 +950,9 @@ async fn r1_dead_secondary_requeue_then_hydrate_redispatches_exactly_once() {
     let snapshot = primary.cluster_state_for_test().snapshot();
 
     let (transport2, _sec_rx2, _kept_alive2) = empty_transport();
-    let mut promoted: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut promoted: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config(Duration::from_millis(50), 2),
         transport2,
-        dynrunner_transport_quic::NoPeerTransport,
         ResourceStealingScheduler::memory(),
         FixedEstimator,
     );

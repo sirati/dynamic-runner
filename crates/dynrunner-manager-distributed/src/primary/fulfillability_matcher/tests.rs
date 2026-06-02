@@ -11,11 +11,11 @@ use crate::fulfillability_matcher::{
     FulfillabilityMatcher, MatcherBatch, MatcherTriggerEvent,
 };
 use crate::primary::test_helpers::{
-    make_binary, setup_test, FixedEstimator, NoPeers, TestId,
+    make_binary, setup_test, FixedEstimator, TestId,
 };
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryCommand, PrimaryConfig, PrimaryCoordinator};
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 
 /// Capturing matcher: records every `(hash, reason)` pair it is
 /// asked about so the tests can assert which tasks the pipeline
@@ -70,8 +70,7 @@ impl FulfillabilityMatcher<TestId> for PanickyOnHashMatcher {
 /// Same shape as command_channel::tests::make_coordinator — built
 /// in this file to avoid leaking the helper across modules.
 fn make_coordinator() -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -101,7 +100,6 @@ fn make_coordinator() -> PrimaryCoordinator<
     PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -113,8 +111,7 @@ fn make_coordinator() -> PrimaryCoordinator<
 /// production CRDT does.
 fn seed_tasks(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -172,8 +169,7 @@ fn seed_tasks(
 /// registered when an auto-fire lands.
 fn init_pool(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -191,8 +187,7 @@ fn init_pool(
 /// `(hash, _reply)` pairs of every `ReinjectTask` command seen.
 fn drain_reinject_commands(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,

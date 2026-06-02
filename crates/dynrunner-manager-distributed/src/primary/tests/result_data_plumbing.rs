@@ -39,11 +39,10 @@ async fn primary_handle_task_complete_forwards_result_data_to_cluster_mutation()
                 unfulfillable_reinject_max_per_task: None,
                 setup_promote_deadline: Duration::from_secs(600),
             };
-            let mut primary: crate::primary::PrimaryCoordinator<_, _, _, _, TestId> =
+            let mut primary: crate::primary::PrimaryCoordinator<_, _, _, TestId> =
                 crate::primary::PrimaryCoordinator::new(
                     config,
                     transport,
-                    NoPeers,
                     ResourceStealingScheduler::memory(),
                     FixedEstimator(100),
                 );

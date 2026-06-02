@@ -73,7 +73,8 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
                 }
             }
         });
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
         let config = PrimaryConfig {
             node_id: "primary".into(),
@@ -100,7 +101,6 @@ async fn recoverable_failure_succeeds_on_retry_pass() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -196,7 +196,8 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
                 }
             }
         });
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
         let config = PrimaryConfig {
             node_id: "primary".into(),
@@ -223,7 +224,6 @@ async fn recoverable_failure_exhausts_retry_budget_and_becomes_permanent() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -307,7 +307,6 @@ async fn recoverable_failure_twice_becomes_permanent() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -420,7 +419,6 @@ async fn retry_max_passes_zero_disables_retry() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -544,7 +542,6 @@ async fn oom_failure_with_zero_retries_still_advances_phase() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -702,7 +699,8 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
                 }
             }
         });
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
         let config = PrimaryConfig {
             node_id: "primary".into(),
@@ -729,7 +727,6 @@ async fn recoverable_bucket_runs_within_phase_drain_edge() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -795,7 +792,6 @@ async fn sequential_phase_advance_after_oom_bucket_exhausts() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

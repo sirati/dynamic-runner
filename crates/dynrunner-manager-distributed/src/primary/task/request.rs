@@ -2,7 +2,6 @@
 use dynrunner_core::{Identifier, ResourceMap};
 use dynrunner_protocol_primary_secondary::{
     Address, DistributedMessage, PeerTransport, Role,
-    SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
     AssignmentDecision, ResourceEstimator, Scheduler, WorkerBudgetInfo,
@@ -13,7 +12,7 @@ use crate::primary::task::predecessor_outputs::gather_predecessor_outputs;
 use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_now};
 
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
 
     pub(crate) async fn handle_task_request(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
         if let DistributedMessage::TaskRequest {
@@ -142,8 +141,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         // 33-in_flight/active=0 jam at 84f669c is
                         // the operator-facing symptom of cumulative
                         // leaks from this and the sibling path.
-                        if let Err(send_err) =
-                            self.transport.send_to(&sec_id, assignment_msg).await
+                        if let Err(send_err) = self
+                            .transport
+                            .send(Address::Peer(sec_id.clone()), assignment_msg)
+                            .await
                         {
                             tracing::warn!(
                                 secondary = %sec_id,
@@ -220,7 +221,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             //
             // Step 5 collapses the guard structurally: addressing by
             // role (`Address::Role(Role::Primary)`) resolves through
-            // the `peer_transport`'s write-through `RoleTable` cache,
+            // the single `transport`'s write-through `RoleTable` cache,
             // which `cluster_state` updates on every `PrimaryChanged`
             // apply (post-promotion the cache points at the promoted
             // peer's id; pre-promotion it's cold and `send` returns
@@ -238,7 +239,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             // regardless of who's authoritative.
             if !assigned
                 && let Err(e) = self
-                    .peer_transport
+                    .transport
                     .send(Address::Role(Role::Primary), msg)
                     .await
             {

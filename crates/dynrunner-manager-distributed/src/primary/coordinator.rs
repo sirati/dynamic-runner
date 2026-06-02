@@ -7,7 +7,7 @@ use tokio::task::JoinSet;
 
 use dynrunner_core::{ErrorType, Identifier, PhaseId, ResourceMap, TaskInfo};
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, PeerTransport, SecondaryTransport,
+    ClusterMutation, PeerTransport,
 };
 use dynrunner_scheduler_api::{
     PendingPool, ResourceEstimator, Scheduler, WorkerBudgetInfo,
@@ -225,24 +225,28 @@ pub(crate) struct InFlightEntry<I: Identifier> {
 
 /// The primary coordinator: orchestrates work across secondaries.
 ///
-/// Generic over `T: SecondaryTransport<I>` for the per-secondary
-/// writer-based path (handshake, initial assignment, task fan-out) AND
-/// over `P: PeerTransport<I>` for role-aware addressing that survives
-/// promotion (TaskRequest relay after demotion, keepalive fan-out as
-/// `Scope::AllSecondaries`). The two transports coexist for the
-/// duration of the unification refactor; `transport` retires in Step
-/// 11 once every call site has migrated through `peer_transport`.
-pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
+/// Generic over ONE `Tr: PeerTransport<I>`. Every primary send/recv
+/// crosses this single mesh-transport boundary — `Address::Peer(id)`
+/// for per-secondary writes (initial assignment, task fan-out),
+/// `Address::Broadcast(Scope::AllSecondaries)` for the keepalive +
+/// CRDT fan-out, `recv_peer()` for the unified inbound. The transport
+/// is real-by-construction in every primary construction path
+/// (`TunneledPeerTransport` for the submitter, `ChannelPeerTransport`
+/// in-process / tests, `ColocatedPrimaryTransport` for the parked
+/// failover authority) — there is no no-op send path and no per-site
+/// "which transport is real" hazard. This mirrors the secondary side's
+/// collapse onto a single `Tr: PeerTransport` (`UnifiedSecondaryTransport`).
+pub struct PrimaryCoordinator<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> {
     pub(super) config: PrimaryConfig,
-    pub(super) transport: T,
-    /// Role-aware mesh transport. Owns the write-through `RoleTable`
-    /// cache attached to `cluster_state` at construction. Used today
-    /// only for primary-bound sends after promotion (relay arm in
-    /// `task::handle_task_request`) and the operational-keepalive fan-
-    /// out via `Address::Broadcast(Scope::AllSecondaries)`; future
-    /// steps migrate the remaining per-secondary writers off
-    /// `transport`.
-    pub(super) peer_transport: P,
+    /// THE single mesh transport. Owns the write-through `RoleTable`
+    /// cache attached to `cluster_state` at construction; drives every
+    /// primary send (`Address`-routed) and the single `recv_peer()`
+    /// inbound surface. For the submitter primary its backend is the
+    /// per-secondary tunnel writers + the relocated `NetworkServer`
+    /// inbound demux; for the parked failover primary its backend is
+    /// the co-located loopback + shared mesh — in both cases a real
+    /// send path.
+    pub(super) transport: Tr,
     pub(super) scheduler: S,
     pub(super) estimator: E,
 
@@ -714,11 +718,10 @@ pub struct PrimaryCoordinator<T: SecondaryTransport<I>, P: PeerTransport<I>, S: 
     pub(super) single_worker_mode: bool,
 }
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
     pub fn new(
         config: PrimaryConfig,
-        transport: T,
-        peer_transport: P,
+        transport: Tr,
         scheduler: S,
         estimator: E,
     ) -> Self {
@@ -768,7 +771,6 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         let mut this = Self {
             config,
             transport,
-            peer_transport,
             scheduler,
             estimator,
             secondaries: HashMap::new(),
@@ -864,7 +866,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // `seed_self_role` for `ChannelPeerTransport` and
         // `PeerNetwork`), not here, because that's a strictly
         // transport-local fact.
-        this.peer_transport
+        this.transport
             .register_with_cluster_state(&mut this.cluster_state);
         // Subscribe the primary-side "important" (LLM-wake-worthy)
         // emission for `PrimaryChanged` to the same role-change hook
@@ -1790,13 +1792,13 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         &mut self.cluster_state
     }
 
-    /// Test-only mutable borrow of the per-secondary `SecondaryTransport`
-    /// aggregator. Lets the composition routing hazard test drive a
-    /// `send_to(local_secondary_id, ..)` directly and assert it reaches
-    /// the loopback secondary's inbound without echoing back to the
-    /// primary.
+    /// Test-only mutable borrow of the single mesh transport. Lets the
+    /// composition routing hazard test drive a
+    /// `send(Address::Peer(local_secondary_id), ..)` directly and assert
+    /// it reaches the loopback secondary's inbound without echoing back
+    /// to the primary.
     #[cfg(test)]
-    pub fn transport_mut_for_test(&mut self) -> &mut T {
+    pub fn transport_mut_for_test(&mut self) -> &mut Tr {
         &mut self.transport
     }
 

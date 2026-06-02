@@ -1,8 +1,7 @@
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    DistributedMessage, PeerTransport,
-    SecondaryTransport,
+    Address, DistributedMessage, PeerTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -15,7 +14,7 @@ use crate::primary::wire::{binary_to_distributed, compute_task_hash, timestamp_n
 use super::dispatch_order;
 
 
-impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
+impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<Tr, S, E, I> {
 
     /// Iterate every free worker and dispatch a task from the pool if
     /// one fits. This is worker management's dispatch RECHECK: the
@@ -146,8 +145,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                 // dispatch loop so other idle workers still get a
                 // chance this tick. WARN so an operator grepping
                 // for the jam symptom sees the proximate cause.
-                if let Err(send_err) =
-                    self.transport.send_to(&sec_id, assignment_msg).await
+                if let Err(send_err) = self
+                    .transport
+                    .send(Address::Peer(sec_id.clone()), assignment_msg)
+                    .await
                 {
                     tracing::warn!(
                         secondary = %sec_id,

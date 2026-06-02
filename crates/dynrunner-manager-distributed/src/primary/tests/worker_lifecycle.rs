@@ -40,8 +40,7 @@ fn primary_with_pool_and_idle_worker(
     tasks: Vec<TaskInfo<TestId>>,
 ) -> (
     PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -53,10 +52,9 @@ fn primary_with_pool_and_idle_worker(
     )>,
 ) {
     let (transport, ends) = setup_test(1);
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );
@@ -409,8 +407,7 @@ fn primary_two_secondaries_with_pool(
     tasks: Vec<TaskInfo<TestId>>,
 ) -> (
     PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -433,10 +430,9 @@ fn primary_two_secondaries_with_pool(
         max_concurrent_per_type: HashMap::from([(TypeId::from("default"), 100)]),
         ..PrimaryConfig::default()
     };
-    let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+    let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     );

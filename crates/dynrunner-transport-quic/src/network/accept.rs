@@ -11,14 +11,13 @@ use std::time::Duration;
 
 use dynrunner_core::{Identifier, MessageReceiver};
 use dynrunner_protocol_primary_secondary::{codec, DistributedMessage};
+use dynrunner_transport_tunnel::{InboundTap, PeerRegistration, RegistrationSink};
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::transport::{QuicConnection, QuicListener};
 use crate::wss::{WssConnection, WssListener};
-
-use super::AcceptedConnection;
 
 /// How long the per-connection handler waits for the peer's first
 /// frame (`SecondaryWelcome`) before dropping the connection as
@@ -40,8 +39,8 @@ const WELCOME_TIMEOUT: Duration = Duration::from_secs(60);
 /// QUIC accept loop.
 pub(super) async fn quic_accept_loop<I: Identifier>(
     listener: QuicListener,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
-    new_conn_tx: mpsc::UnboundedSender<AcceptedConnection<I>>,
+    incoming_tx: InboundTap<I>,
+    new_conn_tx: RegistrationSink<I>,
 ) {
     loop {
         match listener.accept().await {
@@ -63,8 +62,8 @@ pub(super) async fn quic_accept_loop<I: Identifier>(
 /// WSS accept loop.
 pub(super) async fn wss_accept_loop<I: Identifier>(
     listener: WssListener,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
-    new_conn_tx: mpsc::UnboundedSender<AcceptedConnection<I>>,
+    incoming_tx: InboundTap<I>,
+    new_conn_tx: RegistrationSink<I>,
 ) {
     loop {
         match listener.accept().await {
@@ -87,8 +86,8 @@ pub(super) async fn wss_accept_loop<I: Identifier>(
 /// then split into separate reader/writer tasks.
 async fn handle_new_quic_connection<I: Identifier>(
     mut conn: QuicConnection,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
-    new_conn_tx: mpsc::UnboundedSender<AcceptedConnection<I>>,
+    incoming_tx: InboundTap<I>,
+    new_conn_tx: RegistrationSink<I>,
 ) {
     // Read first message to identify the secondary. Bounded by
     // WELCOME_TIMEOUT so a non-conformant peer (handshake-completes
@@ -131,10 +130,15 @@ async fn handle_new_quic_connection<I: Identifier>(
     // Create per-connection write channel
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
-    // Register
+    // Register: hand the per-connection writer to the unified
+    // transport's `recv_peer` demux (it inserts into the shared
+    // writer table). Emitted immediately after the first frame
+    // (`SecondaryWelcome`) and before any further frame, so the
+    // demux registers the writer before the secondary's
+    // CertExchange / TaskRequest traffic needs a reply path.
     if new_conn_tx
-        .send(AcceptedConnection {
-            secondary_id: secondary_id.clone(),
+        .send(PeerRegistration {
+            peer_id: secondary_id.clone(),
             outgoing_tx,
         })
         .is_err()
@@ -203,8 +207,8 @@ async fn handle_new_quic_connection<I: Identifier>(
 /// then split the WebSocket stream into reader/writer halves.
 async fn handle_new_wss_connection<I: Identifier>(
     mut conn: WssConnection,
-    incoming_tx: mpsc::UnboundedSender<DistributedMessage<I>>,
-    new_conn_tx: mpsc::UnboundedSender<AcceptedConnection<I>>,
+    incoming_tx: InboundTap<I>,
+    new_conn_tx: RegistrationSink<I>,
 ) {
     // Read first message to identify the secondary. Bounded by
     // WELCOME_TIMEOUT — see `handle_new_quic_connection`'s matching
@@ -245,10 +249,15 @@ async fn handle_new_wss_connection<I: Identifier>(
     // Create per-connection write channel
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<DistributedMessage<I>>();
 
-    // Register
+    // Register: hand the per-connection writer to the unified
+    // transport's `recv_peer` demux (it inserts into the shared
+    // writer table). Emitted immediately after the first frame
+    // (`SecondaryWelcome`) and before any further frame, so the
+    // demux registers the writer before the secondary's
+    // CertExchange / TaskRequest traffic needs a reply path.
     if new_conn_tx
-        .send(AcceptedConnection {
-            secondary_id: secondary_id.clone(),
+        .send(PeerRegistration {
+            peer_id: secondary_id.clone(),
             outgoing_tx,
         })
         .is_err()

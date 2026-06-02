@@ -32,7 +32,8 @@ async fn e2e_primary_and_secondary_single_node() {
             }
         });
 
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
         let config = PrimaryConfig {
             node_id: "primary".into(),
             num_secondaries: 1,
@@ -58,7 +59,6 @@ async fn e2e_primary_and_secondary_single_node() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -115,7 +115,8 @@ async fn e2e_primary_and_two_secondaries() {
         }
         drop(incoming_tx); // Only forwarding tasks hold senders now
 
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
         let config = PrimaryConfig {
             node_id: "primary".into(),
             num_secondaries: 2,
@@ -141,7 +142,6 @@ async fn e2e_primary_and_two_secondaries() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -226,11 +226,10 @@ async fn notify_stage_file_emits_wire_message() {
             setup_promote_deadline: std::time::Duration::from_secs(600),
         };
 
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
             PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -360,7 +359,8 @@ async fn cluster_state_converges_on_primary_and_secondary() {
                 }
             });
 
-            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 node_id: "primary".into(),
                 num_secondaries: 1,
@@ -385,7 +385,6 @@ async fn cluster_state_converges_on_primary_and_secondary() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -513,7 +512,8 @@ async fn e2e_pre_staged_source_mode() {
                 }
             });
 
-            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 node_id: "primary".into(),
                 num_secondaries: 1,
@@ -538,7 +538,6 @@ async fn e2e_pre_staged_source_mode() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -598,7 +597,8 @@ async fn e2e_uses_file_based_items_false() {
                 }
             });
 
-            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 node_id: "primary".into(),
                 num_secondaries: 1,
@@ -623,7 +623,6 @@ async fn e2e_uses_file_based_items_false() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -701,7 +700,8 @@ async fn e2e_per_type_max_concurrent() {
             let mut caps = std::collections::HashMap::new();
             caps.insert(dynrunner_core::TypeId::from("compile"), 2);
 
-            let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+            let transport =
+                ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
             let config = PrimaryConfig {
                 node_id: "primary".into(),
                 num_secondaries: 1,
@@ -726,7 +726,6 @@ async fn e2e_per_type_max_concurrent() {
             let mut primary = PrimaryCoordinator::new(
                 config,
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -797,7 +796,8 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
                 }
             }
         });
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
         let config = PrimaryConfig {
             node_id: "primary".into(),
@@ -830,7 +830,6 @@ async fn run_without_stage_file_queue_fails_all_tasks() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -942,7 +941,8 @@ async fn run_with_initial_staging_succeeds() {
                 }
             }
         });
-        let transport = ChannelSecondaryTransportEnd { outgoing, incoming_rx };
+        let transport =
+            ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx);
 
         let config = PrimaryConfig {
             node_id: "primary".into(),
@@ -969,7 +969,6 @@ async fn run_with_initial_staging_succeeds() {
         let mut primary = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );

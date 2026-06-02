@@ -13,7 +13,7 @@ use dynrunner_protocol_primary_secondary::{
 };
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_transport_channel::{
-    channel_pair, ChannelManagerEnd, ChannelSecondaryTransportEnd,
+    channel_pair, ChannelManagerEnd, ChannelPeerTransport,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -560,18 +560,28 @@ pub(super) async fn fake_secondary_with_addrs(
 }
 
 /// Allocate the channel-pairs for `num_secondaries` and return the
-/// primary's `ChannelSecondaryTransportEnd` plus per-secondary
+/// primary's single `ChannelPeerTransport` plus per-secondary
 /// (id, secondary→primary inbox, secondary→primary outbox) tuples
 /// that the test plumbs into `fake_secondary` (or a real
 /// SecondaryCoordinator via `spawn_real_secondary` in the
 /// `e2e_helpers` companion).
+///
+/// Post-collapse the primary holds ONE `Tr: PeerTransport`. The fake
+/// secondaries still drive raw `DistributedMessage` channels (they are
+/// hand-rolled, not real `ChannelPeerTransport`s); the primary's
+/// transport is built from those raw channels via
+/// `ChannelPeerTransport::from_raw_channels` so its `send_to_peer(id)`
+/// reaches the matching fake's inbox and its `recv_peer()` drains the
+/// aggregated inbound the fakes write to. THIS is the migration the
+/// send-collapse needs: workload now flows over the peer transport, not
+/// the deleted `ChannelSecondaryTransportEnd` handle.
 // One-off test-helper return; the tuple shape is documented by the
 // per-element doc above and isn't reused elsewhere.
 #[allow(clippy::type_complexity)]
 pub(super) fn setup_test(
     num_secondaries: u32,
 ) -> (
-    ChannelSecondaryTransportEnd<TestId>,
+    ChannelPeerTransport<TestId>,
     Vec<(
         String,
         tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
@@ -590,10 +600,7 @@ pub(super) fn setup_test(
     }
 
     (
-        ChannelSecondaryTransportEnd {
-            outgoing,
-            incoming_rx,
-        },
+        ChannelPeerTransport::from_raw_channels("primary".into(), outgoing, incoming_rx),
         secondary_ends,
     )
 }

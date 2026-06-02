@@ -71,7 +71,10 @@ fn fixture() -> (
     mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
     InboundTap<TestId>,
 ) {
-    let (transport, outgoing, inbound_tap) =
+    // The registration sink is dropped: this fixture registers writers
+    // DIRECTLY into the shared `outgoing` table (the in-process / test
+    // path), so the `recv_peer` demux's `new_conn_rx` arm parks.
+    let (transport, outgoing, inbound_tap, _reg_sink) =
         TunneledPeerTransport::<TestId>::new("primary".into());
     let (sec_a_tx, sec_a_rx) = mpsc::unbounded_channel();
     let (sec_b_tx, sec_b_rx) = mpsc::unbounded_channel();
@@ -132,7 +135,7 @@ async fn try_recv_peer_empty_returns_none() {
 /// `peer_transport_role_cache_populates_via_hook`.
 #[tokio::test(flavor = "current_thread")]
 async fn role_cache_populates_via_hook() {
-    let (transport, _outgoing, _tap) =
+    let (transport, _outgoing, _tap, _reg_sink) =
         TunneledPeerTransport::<TestId>::new("primary".into());
     assert_eq!(
         transport.peer_for_role(&Role::Primary),
@@ -158,7 +161,7 @@ async fn role_cache_populates_via_hook() {
 /// envelope as "local" rather than dropping it.
 #[tokio::test(flavor = "current_thread")]
 async fn role_self_cache_populated_at_init() {
-    let (transport, _outgoing, _tap) =
+    let (transport, _outgoing, _tap, _reg_sink) =
         TunneledPeerTransport::<TestId>::new("primary".into());
     assert_eq!(
         transport.peer_for_role(&Role::Self_),
@@ -234,7 +237,7 @@ async fn send_broadcast_all_secondaries_fans_out() {
 /// populates.
 #[tokio::test(flavor = "current_thread")]
 async fn peer_count_reflects_outgoing_table() {
-    let (transport, outgoing, _tap) =
+    let (transport, outgoing, _tap, _reg_sink) =
         TunneledPeerTransport::<TestId>::new("primary".into());
     assert_eq!(transport.peer_count(), 0);
     let (a_tx, _a_rx) = mpsc::unbounded_channel::<DistributedMessage<TestId>>();
@@ -251,7 +254,7 @@ async fn peer_count_reflects_outgoing_table() {
 /// at the receiver matches against THIS id.
 #[test]
 fn local_id_reflects_constructor_arg() {
-    let (transport, _outgoing, _tap) =
+    let (transport, _outgoing, _tap, _reg_sink) =
         TunneledPeerTransport::<TestId>::new("primary".into());
     assert_eq!(transport.local_id(), "primary");
 }

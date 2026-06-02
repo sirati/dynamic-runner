@@ -5,7 +5,7 @@ use dynrunner_core::ErrorType;
 use dynrunner_protocol_primary_secondary::DistributedMessage;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_scheduler_api::PendingPool;
-use dynrunner_transport_channel::ChannelSecondaryTransportEnd;
+use dynrunner_transport_channel::ChannelPeerTransport;
 use tokio::sync::oneshot;
 
 use crate::cluster_state::TaskState;
@@ -13,7 +13,7 @@ use crate::primary::command_channel::{
     handle_primary_command, PrimaryCommand,
 };
 use crate::primary::test_helpers::{
-    make_binary, setup_test, FixedEstimator, NoPeers, RecordingPeer, TestId,
+    make_binary, setup_test, FixedEstimator, RecordingPeer, TestId,
 };
 use crate::primary::wire::compute_task_hash;
 use crate::primary::{PrimaryConfig, PrimaryCoordinator};
@@ -27,8 +27,7 @@ use crate::state::{SecondaryConnection, SecondaryConnectionState};
 fn make_coordinator(
     retry_max_passes: u32,
 ) -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
+    ChannelPeerTransport<TestId>,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
@@ -58,7 +57,6 @@ fn make_coordinator(
     PrimaryCoordinator::new(
         config,
         transport,
-        NoPeers,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )
@@ -69,8 +67,7 @@ fn make_coordinator(
 /// has a phase entry to flip back to Active.
 fn install_pool_for_phase(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -91,11 +88,16 @@ fn install_pool_for_phase(
         .insert(binary.phase_id.clone(), 0);
 }
 
-/// Build a `PrimaryCoordinator` whose peer transport is a
+/// Build a `PrimaryCoordinator` whose SINGLE transport is a
 /// [`RecordingPeer`], returning the coordinator, the shared broadcast
-/// log, and the secondary-end handles from `setup_test`. The caller
-/// keeps the secondary ends alive so the primary's `transport.recv()`
-/// future stays pending (a dropped sender would close the recv arm).
+/// log, and the secondary-end handles from `setup_test`. Post-collapse
+/// the keepalive emits over the one `Tr` transport, so the recorder IS
+/// that transport — every keepalive lands in the shared log. The
+/// `RecordingPeer`'s `recv_peer()` parks forever, so the
+/// `wait_for_mesh_ready` select's heartbeat-tick arm is what fires
+/// (the secondary-end handles are returned for callers that want to
+/// keep them, but the recorder's parked recv no longer depends on
+/// them). The `setup_test` channels stand in for those ends.
 ///
 /// `keepalive_interval` is short and `mesh_ready_timeout` is a few
 /// keepalive intervals so the pre-operational keepalive arm has room to
@@ -108,7 +110,6 @@ fn make_recording_coordinator(
     mesh_ready_timeout: Duration,
 ) -> (
     PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
         RecordingPeer<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
@@ -121,7 +122,7 @@ fn make_recording_coordinator(
         tokio::sync::mpsc::UnboundedSender<DistributedMessage<TestId>>,
     )>,
 ) {
-    let (transport, secondary_ends) = setup_test(num_secondaries);
+    let (_transport, secondary_ends) = setup_test(num_secondaries);
     let config = PrimaryConfig {
         node_id: "primary".into(),
         num_secondaries,
@@ -147,7 +148,6 @@ fn make_recording_coordinator(
     let log = recorder.log_handle();
     let coordinator = PrimaryCoordinator::new(
         config,
-        transport,
         recorder,
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
@@ -163,7 +163,6 @@ fn make_recording_coordinator(
 /// connection's typestate.
 fn seed_secondary(
     coordinator: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
         RecordingPeer<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,

@@ -27,7 +27,7 @@ pub use role_routing::{
     RoleAddressedAction, MAX_ROLE_RELAY_ATTEMPTS,
 };
 pub use setup_bootstrap::{
-    PrimarySetupBootstrap, SecondarySetupBootstrap, SetupBootstrap, SetupBootstrapBroadcast,
-    SetupBootstrapMessage,
+    PrimaryPeerSetupBootstrap, PrimarySetupBootstrap, SecondarySetupBootstrap, SetupBootstrap,
+    SetupBootstrapBroadcast, SetupBootstrapMessage,
 };
 pub use transport::{JoinError, PeerTransport, SecondaryTransport, DEFAULT_JOIN_TIMEOUT};

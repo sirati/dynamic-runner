@@ -38,8 +38,7 @@ fn preferred_secondaries_test_config() -> PrimaryConfig {
 /// senders, of which there are none).
 fn register_operational_secondary(
     primary: &mut PrimaryCoordinator<
-        ChannelSecondaryTransportEnd<TestId>,
-        NoPeers,
+        ChannelPeerTransport<TestId>,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
@@ -69,11 +68,10 @@ async fn seed_cluster_state_warns_on_unknown_preferred_secondary_id() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let (transport, _ends) = setup_test(0);
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
             PrimaryCoordinator::new(
                 preferred_secondaries_test_config(),
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -159,11 +157,10 @@ async fn peer_joined_revalidates_preferred_secondaries() {
     let local = tokio::task::LocalSet::new();
     local.run_until(async {
         let (transport, _ends) = setup_test(0);
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> =
             PrimaryCoordinator::new(
                 preferred_secondaries_test_config(),
                 transport,
-                NoPeers,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );

@@ -70,6 +70,8 @@ pub mod trait_defs;
 #[cfg(test)]
 mod tests;
 
-pub use adapters::{PrimarySetupBootstrap, SecondarySetupBootstrap};
+pub use adapters::{
+    PrimaryPeerSetupBootstrap, PrimarySetupBootstrap, SecondarySetupBootstrap,
+};
 pub use message::SetupBootstrapMessage;
 pub use trait_defs::{SetupBootstrap, SetupBootstrapBroadcast};

@@ -554,13 +554,14 @@ impl PySecondaryCoordinator {
                         p_on_phase_end,
                     ) = secondary.take_composed_primary_wiring();
 
-                    // The parked primary's hybrid `T: SecondaryTransport`:
-                    // own-secondary → loopback into this secondary's
-                    // inbound, remote → the shared mesh; recv = the
-                    // role-aware tap. `P: NoPeerTransport` — the primary
-                    // routes by `send_to(secondary_id)` (not by mesh
-                    // `Role` addressing) and reads inbound via `T`, so it
-                    // needs no peer-mesh view of its own.
+                    // The parked primary's SINGLE `Tr: PeerTransport`
+                    // (`ColocatedPrimaryTransport`): own-secondary →
+                    // loopback into this secondary's inbound, remote →
+                    // the shared mesh; `recv_peer` = the role-aware tap.
+                    // Real-by-construction — every send routes to a live
+                    // loopback or the live mesh, so the parked failover
+                    // primary's keepalive / dispatch reaches a real path
+                    // (the `NoPeerTransport` no-op-send hazard is gone).
                     let primary_transport =
                         dynrunner_transport_quic::ColocatedPrimaryTransport::new(
                             secondary_id.clone(),
@@ -592,7 +593,6 @@ impl PySecondaryCoordinator {
                         dynrunner_manager_distributed::PrimaryCoordinator::new(
                             primary_config,
                             primary_transport,
-                            dynrunner_transport_quic::NoPeerTransport,
                             scheduler_config.build_memory_scheduler(),
                             primary_estimator,
                         );

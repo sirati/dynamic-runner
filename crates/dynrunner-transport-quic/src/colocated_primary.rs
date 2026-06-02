@@ -1,14 +1,19 @@
-//! [`ColocatedPrimaryTransport`] — the `SecondaryTransport` a co-located
-//! parked `PrimaryCoordinator` uses to reach the cluster's secondaries
-//! once this node is promoted.
+//! [`ColocatedPrimaryTransport`] — the sole `Tr: PeerTransport` a
+//! co-located parked `PrimaryCoordinator` uses to reach the cluster's
+//! secondaries once this node is promoted.
 //!
 //! # Concern
 //!
 //! A SLURM secondary node that composes a parked primary runs both
-//! coordinators on one `LocalSet`. The `PrimaryCoordinator` addresses
-//! secondaries through its `T: SecondaryTransport` — `send_to(id, msg)`,
-//! `broadcast(msg)`, `recv()`. This type is that `T`, hybrid by the SAME
-//! key the inbound demux uses (own-secondary vs remote):
+//! coordinators on one `LocalSet`. Post-collapse the `PrimaryCoordinator`
+//! addresses secondaries through ONE `Tr: PeerTransport` —
+//! `send(Address::…)` / `send_to_peer(id, msg)` / `broadcast(msg)` /
+//! `recv_peer()`. This type is that `Tr`, real-by-construction (every
+//! send routes to a live loopback or the live mesh — no no-op path),
+//! hybrid by the SAME key the inbound demux uses (own-secondary vs
+//! remote). It also keeps its `SecondaryTransport` impl so the
+//! method mapping the `PeerTransport` impl delegates to stays in one
+//! place:
 //!
 //!   * `recv()` — drains the ROLE-AWARE inbound tap
 //!     (`UnifiedSecondaryTransport::attach_colocated_primary_tap`, in
@@ -42,7 +47,9 @@
 //! borrow is held across an await.
 
 use dynrunner_core::{Identifier, MessageReceiver};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, SecondaryTransport};
+use dynrunner_protocol_primary_secondary::{
+    DistributedMessage, PeerConnectionInfo, PeerTransport, SecondaryTransport,
+};
 use tokio::sync::mpsc;
 
 use crate::MeshSendHandle;
@@ -144,5 +151,85 @@ impl<I: Identifier> SecondaryTransport<I> for ColocatedPrimaryTransport<I> {
         } else {
             Err(errors)
         }
+    }
+}
+
+impl<I: Identifier> PeerTransport<I> for ColocatedPrimaryTransport<I> {
+    /// Faithful map of the `SecondaryTransport` send path: own-secondary
+    /// → loopback, remote → mesh. `send_to` already encodes that hybrid
+    /// routing; delegate so there is one routing decision, not two
+    /// copies. The parked primary addresses peers purely by id
+    /// (`Address::Peer`) and broadcasts (`Address::Broadcast`); the
+    /// trait's default `send` dispatch covers both over these.
+    async fn send_to_peer(
+        &mut self,
+        peer_id: &str,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        SecondaryTransport::send_to(self, peer_id, msg).await
+    }
+
+    /// Loopback (own secondary) + mesh fan-out (every remote
+    /// secondary). Delegates to the `SecondaryTransport::broadcast`
+    /// routing and collapses its per-leg `Vec<(id, err)>` into the
+    /// single `String` the `PeerTransport` broadcast contract uses —
+    /// the parked primary's keepalive / CRDT fan-out reads a single
+    /// error, and the per-secondary signal is the heartbeat monitor,
+    /// not this return value (same collapse the submitter primary's
+    /// keepalive emitter already relies on).
+    async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        SecondaryTransport::broadcast(self, msg).await.map_err(|failures| {
+            failures
+                .into_iter()
+                .map(|(id, err)| format!("{id}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+    }
+
+    /// Drain the role-aware inbound tap — the same stream
+    /// `MessageReceiver::recv` exposes. While this node holds
+    /// `Role::Primary`, the secondary's unified transport diverts every
+    /// remote secondary's primary-facing frame here; `None` only when
+    /// that transport has been torn down (its tap sender dropped),
+    /// which the operational loop treats as end-of-inbound exactly as
+    /// for the network/channel transports.
+    async fn recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        self.inbound_rx.recv().await
+    }
+
+    /// Non-blocking peek of the inbound tap. No role-layer interception
+    /// is needed: the secondary's unified transport already unwrapped /
+    /// relayed any `RoleAddressed` / `RoleMisaddressHint` envelope
+    /// before diverting a primary-facing frame here, so what arrives on
+    /// this tap is always an application frame.
+    fn try_recv_peer(&mut self) -> Option<DistributedMessage<I>> {
+        self.inbound_rx.try_recv().ok()
+    }
+
+    /// Mesh-health cardinality is owned by the secondary's unified
+    /// transport (which owns the real `PeerNetwork`); this co-located
+    /// view sends THROUGH the shared mesh-send handle but holds no peer
+    /// table of its own. Report 0 — the parked primary reads peer
+    /// health off `self.secondaries` / `cluster_state`, never off this
+    /// transport's `peer_count` (the failover/watchdog readers live on
+    /// the SECONDARY's transport).
+    fn peer_count(&self) -> usize {
+        0
+    }
+
+    /// No-op: the mesh this transport sends through is dialed and owned
+    /// by the co-located secondary's `UnifiedSecondaryTransport`; the
+    /// parked primary never originates peer dials.
+    async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
+
+    /// The parked primary's own id (its `PrimaryConfig::node_id` ==
+    /// this node's `own_secondary_id`). Stamped onto any `RoleAddressed`
+    /// envelope the default `send` would construct; in practice the
+    /// authority addresses by `Address::Peer` / `Address::Broadcast`
+    /// (never `Address::Role`), so this is belt-and-suspenders for the
+    /// trait contract.
+    fn local_id(&self) -> &str {
+        &self.own_secondary_id
     }
 }

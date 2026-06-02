@@ -44,10 +44,9 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: std::time::Duration::from_secs(600),
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -219,10 +218,9 @@ async fn pre_seeded_counter_exit_unchanged() {
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: std::time::Duration::from_secs(600),
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -361,10 +359,9 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: std::time::Duration::from_secs(600),
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -656,10 +653,9 @@ async fn setup_deadline_fires_when_promoted_secondary_silent() {
             // check below has room without flake-prone tight bounds.
             setup_promote_deadline: deadline,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
@@ -801,10 +797,9 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
             unfulfillable_reinject_max_per_task: None,
             setup_promote_deadline: deadline,
         };
-        let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
+        let mut primary: PrimaryCoordinator<_, _, _, TestId> = PrimaryCoordinator::new(
             config,
             transport,
-            NoPeers,
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         );
