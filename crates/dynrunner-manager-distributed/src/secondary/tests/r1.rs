@@ -31,32 +31,50 @@ mod r1_helpers {
     use super::*;
     use dynrunner_scheduler::ResourceStealingScheduler;
 
+    use crate::secondary::test_helpers::{make_transport, TestTransport};
+
     pub(super) type R1Secondary = SecondaryCoordinator<
-        ChannelPrimaryTransportEnd<TestId>,
-        FixedPeerCount,
+        TestTransport<FixedPeerCount>,
         dynrunner_transport_channel::ChannelManagerEnd,
         ResourceStealingScheduler,
         FixedEstimator,
         TestId,
     >;
 
-    /// Construct a SecondaryCoordinator with `FixedPeerCount(peers)`
-    /// for the peer transport so the processing-loop helper's
-    /// peer-count check observes the configured mesh size.
+    /// Construct a SecondaryCoordinator over the unified transport with
+    /// `FixedPeerCount(peers)` as the mesh stub so mesh-health reads
+    /// observe the configured size.
+    ///
+    /// The uplink end's receiver (`_sec_to_pri_rx`) is dropped here, so
+    /// `send_to_primary` (cache-cold → routes to the uplink) returns a
+    /// no-route `Err` — exactly the send-side failover-health probe
+    /// signal the R1 arming tests drive.
     pub(super) fn make_with_peers(secondary_id: &str, peers: usize) -> R1Secondary {
         let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
         let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-        let transport = ChannelPrimaryTransportEnd {
+        let uplink = ChannelPrimaryTransportEnd {
             tx: sec_to_pri_tx,
             rx: pri_to_sec_rx,
         };
         SecondaryCoordinator::new(
             election_config(secondary_id),
-            transport,
-            FixedPeerCount(peers),
+            make_transport(secondary_id, uplink, FixedPeerCount(peers)),
             ResourceStealingScheduler::memory(),
             FixedEstimator(100),
         )
+    }
+
+    /// A keepalive frame for driving `send_to_primary` in the probe
+    /// tests.
+    pub(super) fn probe_msg(
+        sender: &str,
+    ) -> dynrunner_protocol_primary_secondary::DistributedMessage<TestId> {
+        dynrunner_protocol_primary_secondary::DistributedMessage::Keepalive {
+            sender_id: sender.into(),
+            timestamp: timestamp_now(),
+            secondary_id: sender.into(),
+            active_workers: 0,
+        }
     }
 
     /// Inline `wire::timestamp_now()` (path is `pub(super)` to wire,
@@ -89,21 +107,20 @@ mod r1_helpers {
 // behaviour, and these tests would be flaky against the loop's
 // internal `tokio::select!` ordering.
 
-/// T-R1-promotion-on-disconnect (count axis): a non-promoted
-/// secondary with a healthy peer mesh observes the primary-link
-/// threshold breach via N consecutive recv-None probes, arms
-/// `primary_disconnected`, and the next election tick enters
-/// Suspecting (the count-axis half of the threshold). Pinning
-/// the count path here keeps the test deterministic — no
-/// wall-clock reliance.
+/// T-R1-promotion-on-no-route (count axis): a non-promoted secondary
+/// with a healthy peer mesh drives the send-side failover-health probe
+/// — `send_to_primary` returns a no-route `Err` (the uplink is closed
+/// and no peer holds the role), which arms the primary-link count axis
+/// and backdates `primary_last_seen`; the next election tick enters
+/// Suspecting. Replaces the deleted recv-None arming path; the count
+/// axis keeps the test deterministic (no wall-clock).
 #[tokio::test(flavor = "current_thread")]
-async fn r1_promotion_on_disconnect_count_axis() {
+async fn r1_promotion_on_no_route_count_axis() {
     use super::super::election::ElectionState;
     let _ = tracing_subscriber::fmt::try_init();
 
-    // Healthy peer mesh: 2 peers visible at the transport layer
-    // so the threshold path takes the elect-via-mesh branch
-    // (not the no-peer break-out).
+    // Healthy peer mesh: 2 peers visible so the election takes the
+    // elect-via-mesh branch (not the no-peer fatal bail).
     let mut sec = r1_helpers::make_with_peers("sec-a", 2);
     sec.peer_keepalives
         .insert("sec-b".into(), r1_helpers::timestamp_now());
@@ -111,37 +128,29 @@ async fn r1_promotion_on_disconnect_count_axis() {
         .insert("sec-c".into(), r1_helpers::timestamp_now());
     sec.record_primary_message();
 
-    // Drive the count-axis by feeding 3 probes (test_helpers sets
-    // failure_threshold=3). Each probe records a recv-None event;
-    // the third returns true and arms the link.
-    assert!(!sec.primary_link.record_recv_failure());
-    assert!(!sec.primary_link.record_recv_failure());
+    // Drive the count-axis via the SEND-SIDE probe: each
+    // `send_to_primary` routes to the (dropped-receiver) uplink,
+    // errors no-route, and records one failover-health probe.
+    // threshold=3 in election_config; the third breaches.
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(!sec.primary_link.should_arm_failover());
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(!sec.primary_link.should_arm_failover());
+    // Third no-route send breaches the threshold and backdates
+    // primary_last_seen (done inside send_to_primary on the breach).
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
     assert!(
-        sec.primary_link.record_recv_failure(),
-        "third probe must arm the link (threshold=3 in election_config)"
-    );
-    assert!(sec.primary_link.should_arm_failover());
-
-    // The processing-loop helper translates "should_arm" into the
-    // operational arming flags. Pre-arming, primary_disconnected
-    // should still be false (the count probes were direct
-    // record_recv_failure calls — they don't touch the operational
-    // flag; that's the processing-loop's job).
-    assert!(!sec.primary_disconnected);
-    sec.check_primary_link_threshold();
-    assert!(
-        sec.primary_disconnected,
-        "tick re-check must propagate the threshold breach to the operational flag"
+        sec.primary_link.should_arm_failover(),
+        "third no-route send must arm the failover-health probe (threshold=3)"
     );
 
-    // Election tick now sees the primary as silent (backdated
-    // past the keepalive miss threshold) and enters Suspecting.
-    // With healthy peers, the degraded-mesh guard does NOT fire.
+    // Election tick now sees the primary as silent (backdated by the
+    // probe) and enters Suspecting. With healthy peers, the
+    // degraded-mesh guard does NOT fire.
     let actions = sec.run_election_tick();
     assert!(
         matches!(sec.election, ElectionState::Suspecting { .. }),
-        "election must enter Suspecting on threshold-armed failover; \
-         got {:?}",
+        "election must enter Suspecting on probe-armed failover; got {:?}",
         std::mem::discriminant(&sec.election)
     );
     assert!(
@@ -151,10 +160,7 @@ async fn r1_promotion_on_disconnect_count_axis() {
             .any(|m| matches!(m, DistributedMessage::TimeoutQuery { .. })),
         "Suspecting transition must broadcast TimeoutQuery"
     );
-    assert!(
-        sec.fatal_exit.is_none(),
-        "healthy mesh must not fatal-exit"
-    );
+    assert!(sec.fatal_exit.is_none(), "healthy mesh must not fatal-exit");
 }
 
 /// T-R1-recover-on-primary-back: a transient flap (one probe, then
@@ -174,10 +180,11 @@ async fn r1_recover_on_primary_back() {
         .insert("sec-b".into(), r1_helpers::timestamp_now());
     sec.record_primary_message();
 
-    // One probe, then primary comes back — short flap.
-    sec.primary_link.record_recv_failure();
+    // One no-route send opens the health window — a short flap.
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
     assert!(sec.primary_link.is_link_failing());
 
+    // Primary comes back: `record_primary_message` resets the window.
     sec.record_primary_message();
     assert!(
         !sec.primary_link.is_link_failing(),
@@ -187,7 +194,7 @@ async fn r1_recover_on_primary_back() {
 
     // Tick re-check is a no-op now that the link is healthy.
     sec.check_primary_link_threshold();
-    assert!(!sec.primary_disconnected, "no arming on healthy link");
+    assert!(!sec.primary_link.should_arm_failover(), "no arming on healthy link");
 
     // Election stays in Normal — no Suspecting.
     let actions = sec.run_election_tick();
@@ -218,33 +225,12 @@ async fn r1_respects_degraded_guard() {
     sec.peer_dial_count = 4;
     sec.record_primary_message();
 
-    // Drive count-axis past threshold.
-    sec.primary_link.record_recv_failure();
-    sec.primary_link.record_recv_failure();
-    sec.primary_link.record_recv_failure();
+    // Drive the count-axis past threshold via the send-side probe;
+    // the third no-route send arms + backdates primary_last_seen.
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
     assert!(sec.primary_link.should_arm_failover());
-
-    // Tick re-check observes peer_count == 0 and takes the
-    // no-peer-mesh exit (sets primary_disconnected without
-    // backdating). The election tick then needs to fire on the
-    // primary_silent axis. We need to backdate primary_last_seen
-    // to past the deadline manually for the election tick to
-    // observe the silence — in production the keepalive-tick
-    // pathway would have backdated already if the primary was
-    // actually silent, but in this state-machine-isolated test
-    // we set it explicitly. This mirrors how
-    // `degraded_failover_fails_loud_instead_of_self_promoting`
-    // sets up its precondition.
-    sec.check_primary_link_threshold();
-    assert!(sec.primary_disconnected);
-
-    // Drive the elapsed-time precondition for run_election_tick by
-    // pre-aging the primary_last_seen by past the deadline.
-    sec.primary_last_seen = Some(
-        std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_millis(150))
-            .unwrap_or_else(std::time::Instant::now),
-    );
 
     // Election tick observes degraded mesh + primary-silent and
     // sets fatal_exit per the #15 contract.
@@ -286,30 +272,30 @@ async fn r1_no_mesh_rebuild_during_arming() {
     sec.record_primary_message();
 
     // Snapshot the peer-mesh view before arming so we can assert
-    // it's preserved across the threshold path.
+    // it's preserved across the probe path.
     let peers_before: std::collections::HashSet<String> =
         sec.peer_keepalives.keys().cloned().collect();
     assert_eq!(peers_before.len(), 2);
 
-    // Drive count-axis past threshold and arm.
-    sec.primary_link.record_recv_failure();
-    sec.primary_link.record_recv_failure();
-    sec.primary_link.record_recv_failure();
-    sec.check_primary_link_threshold();
-    assert!(sec.primary_disconnected);
+    // Drive the failover-health probe past threshold via no-route
+    // sends. The probe touches ONLY the primary-link health
+    // sub-state — never the mesh.
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(sec.send_to_primary(r1_helpers::probe_msg("sec-a")).await.is_err());
+    assert!(sec.primary_link.should_arm_failover());
 
     // Peer-mesh view unchanged.
     let peers_after: std::collections::HashSet<String> =
         sec.peer_keepalives.keys().cloned().collect();
     assert_eq!(peers_before, peers_after, "arming must not mutate peer keepalives");
 
-    // The primary_link's current_primary routing target stays
-    // unchanged at None (primary not yet promoted to a peer) —
-    // arming alone doesn't pick a candidate; that's the election's
-    // job.
+    // The replicated current_primary stays None (no PromotePrimary
+    // observed) — arming alone doesn't pick a candidate; that's the
+    // election's job.
     assert!(
-        sec.primary_link.current_primary().is_none(),
-        "arming alone must not set a routing target"
+        sec.cluster_state.current_primary().is_none(),
+        "arming alone must not commit a primary to the CRDT"
     );
 }
 
@@ -385,10 +371,14 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 memuse_log_path: None,
             };
 
-            let mut secondary = SecondaryCoordinator::new(
-                config,
+            let unified = super::super::test_helpers::make_transport(
+                &config.secondary_id,
                 transport,
                 NoPeers,
+            );
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -479,10 +469,14 @@ async fn cold_start_with_peers_emits_distinct_error() {
             // actually wiring messages; that's enough for the
             // `peer_count() == 0` check to fail and route to the
             // "peers reachable" branch.
-            let mut secondary = SecondaryCoordinator::new(
-                config,
+            let unified = super::super::test_helpers::make_transport(
+                &config.secondary_id,
                 transport,
                 FixedPeerCount(2),
+            );
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -555,10 +549,14 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 memuse_log_path: None,
             };
 
-            let mut secondary = SecondaryCoordinator::new(
-                config,
+            let unified = super::super::test_helpers::make_transport(
+                &config.secondary_id,
                 transport,
                 NoPeers,
+            );
+            let mut secondary = SecondaryCoordinator::new(
+                config,
+                unified,
                 ResourceStealingScheduler::memory(),
                 FixedEstimator(100),
             );
@@ -595,9 +593,10 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 predecessor_outputs: std::collections::BTreeMap::new(),
             };
 
-            // The critical call: route via peer_transport handler.
-            // Pre-fix this fell into the catch-all and was lost.
-            secondary.handle_peer_message(assignment, &mut None, &mut FakeWorkerFactory).await;
+            // The critical call: route via the single inbound handler.
+            // The TaskAssignment falls to the catch-all, which delegates
+            // to `dispatch_message` (the wire-frame dispatcher).
+            secondary.handle_inbound(assignment, &mut None, &mut FakeWorkerFactory).await;
 
             // Worker received the assignment → `active_tasks` records it.
             // (The `dispatch_message` body inserts on the assign_task

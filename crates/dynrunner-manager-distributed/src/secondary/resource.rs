@@ -1,11 +1,11 @@
-use dynrunner_core::{
-    ErrorType, Identifier, MessageReceiver, MessageSender, ResourceKind, WorkerId,
-};
+use dynrunner_core::{ErrorType, Identifier, ResourceKind, WorkerId};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_manager_local::oom::OomWatcher;
 use dynrunner_manager_local::pool::ResourcePressureResult;
 use dynrunner_manager_local::WorkerFactory;
-use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{
+    Address, DistributedMessage, PeerTransport, Role,
+};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 /// Wire marker used when a secondary's worker is killed by a no-fault
@@ -24,15 +24,86 @@ pub const NO_FAULT_PREEMPT_WIRE_MESSAGE: &str =
 use super::SecondaryCoordinator;
 use super::wire::timestamp_now;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
     I: Identifier,
 {
+    /// Send an operational frame to whoever currently holds the
+    /// primary role, feeding the failover-health probe on a no-route
+    /// result.
+    ///
+    /// This is the single chokepoint for every primary-bound
+    /// operational send (TaskRequest, terminal TaskComplete/TaskFailed,
+    /// Keepalive, MeshReady). Routing is fully opaque: the unified
+    /// transport resolves `Address::Role(Role::Primary)` to loopback /
+    /// uplink / a promoted peer; the manager never inspects which.
+    ///
+    /// # Failover-health probe (the fast path)
+    ///
+    /// A clean `Err` from `send` means "no route to the primary":
+    /// the bootstrap uplink has closed AND no peer holds `Role::Primary`
+    /// (cache cold). That is the fast-failover signal — it arms the
+    /// count-axis of `PrimaryLink` immediately, well before the
+    /// keepalive time-axis would. The probe is transport-AGNOSTIC: the
+    /// manager reacts only to a send RESULT, never to `peer_count()` or
+    /// a recv-None branch or any locality inspection. A successful send
+    /// (loopback, healthy uplink, or a reachable promoted peer) resets
+    /// the health window via the normal `record_primary_message`
+    /// path when the primary's reply / keepalive arrives.
+    ///
+    /// On a breach the same arming the deleted recv-None branch used is
+    /// applied: backdate `primary_last_seen` so the next
+    /// `run_election_tick` enters Suspecting.
+    ///
+    /// Note the deliberate name: this carries NO locality logic (unlike
+    /// the removed `send_to_current_primary` router, which branched
+    /// loopback-vs-wire on the old `PrimaryLink.current_primary`). It
+    /// just sends to the primary role opaquely and notes a
+    /// failover-health breach if the role is unreachable.
+    pub(in crate::secondary) async fn send_to_primary(
+        &mut self,
+        msg: DistributedMessage<I>,
+    ) -> Result<(), String> {
+        let result = self
+            .transport
+            .send(Address::Role(Role::Primary), msg)
+            .await;
+        if let Err(ref e) = result {
+            // No route to the primary — feed the failover-health
+            // probe. `record_recv_failure` anchors the failure window
+            // on the first breach and returns true once the count- or
+            // time-axis threshold is crossed.
+            let armed = self.primary_link.record_recv_failure();
+            if armed {
+                tracing::warn!(
+                    error = %e,
+                    "no route to primary (uplink closed, no promoted peer); \
+                     failover-health threshold breached — arming election"
+                );
+                let backdate = self
+                    .config
+                    .keepalive_interval
+                    .saturating_mul(self.config.keepalive_miss_threshold + 1);
+                self.primary_last_seen = Some(
+                    std::time::Instant::now()
+                        .checked_sub(backdate)
+                        .unwrap_or_else(std::time::Instant::now),
+                );
+            } else {
+                tracing::debug!(
+                    error = %e,
+                    "no route to primary; recording failover-health probe \
+                     (threshold not yet breached)"
+                );
+            }
+        }
+        result
+    }
+
     /// Route the resource-pressure decision tick through the OOM
     /// watcher (mirrors `LocalManager::check_resource_pressure_via_watcher`).
     /// The watcher invokes `WorkerPool::check_resource_pressure`
@@ -110,8 +181,14 @@ where
                         error_type,
                         error_message,
                     };
-                    let _ = self.send_to_current_primary(msg.clone()).await;
-                    let _ = self.peer_transport.broadcast(msg).await;
+                    // Report to the primary role only. The AUTHORITY
+                    // originates the terminal CRDT mutation and
+                    // broadcasts it to the mesh, so every peer/observer
+                    // mirror converges — the reporting secondary must
+                    // NOT broadcast itself (a second CRDT originator
+                    // would break the authority's apply-before-dispatch
+                    // ordering).
+                    let _ = self.send_to_primary(msg).await;
                 }
 
                 // Restart the worker and request a new task
@@ -156,7 +233,7 @@ where
         };
         self.primary_link.note_request_sent(worker_id);
 
-        self.send_to_current_primary(msg).await
+        self.send_to_primary(msg).await
     }
 
     /// Periodic safety-net wakeup: walk every idle worker and call

@@ -21,10 +21,10 @@
 
 use std::collections::HashMap;
 
-use dynrunner_core::{BoundedString, Identifier, MessageReceiver, MessageSender, PhaseId, TaskInfo};
+use dynrunner_core::{BoundedString, Identifier, PhaseId, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport, RemovalCause,
+    Address, ClusterMutation, DistributedMessage, PeerTransport, RemovalCause, Scope,
 };
 use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
@@ -80,10 +80,9 @@ pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
     }
 }
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -96,25 +95,23 @@ where
     /// `apply_and_broadcast_cluster_mutations` — local apply runs first
     /// via the shared `apply_locally_for_broadcast` helper (so the
     /// `Applied`-vs-`NoOp` filter semantics stay identical), then the
-    /// applied subset fans out over BOTH the peer mesh and the demoted-
-    /// submitter link.
+    /// applied subset fans out to the mesh.
     ///
-    /// Fan-out shape: `peer_transport.broadcast` reaches every
-    /// surviving secondary in the cluster; `primary_transport.send`
-    /// reaches the demoted local submitter (which sits on the other end
-    /// of this node's secondary→primary channel — not a peer, mute-
-    /// routing is asymmetric). Without the demoted-submitter loopback
-    /// the submitter's `mirror_mutation_to_accounting` never observes
-    /// our `TaskAdded` batch and its `total_tasks` accounting stays at
-    /// 0, tripping the exit-counter check the moment it sees 0+0>=0.
+    /// Fan-out shape: ONE `transport.send(Address::Broadcast(Scope::Mesh))`
+    /// reaches every mesh member. This node IS the authority here
+    /// (promoted-secondary originating its own mutations), so a single
+    /// mesh broadcast is the authoritative propagation — the demoted
+    /// node (and any observer) receives it because it is itself a mesh
+    /// member. There is no separate demoted-submitter uplink leg: the
+    /// old dual fan-out (`primary_transport.send` + `peer_transport.broadcast`)
+    /// was the pre-unification shape where the demoted submitter sat on
+    /// a non-peer channel; the unified mesh now carries it.
     ///
-    /// Errors are best-effort: per-peer `peer_transport` failure
-    /// surfaces as a single error string (the trait's contract); a
-    /// dropped `primary_transport.send` means the submitter already
-    /// exited and we're past the point where the loopback matters.
-    /// CRDT idempotency makes a missed mutation recoverable from the
-    /// next snapshot RPC; we never block the originator on universal
-    /// delivery.
+    /// Errors are best-effort: a broadcast failure surfaces as a single
+    /// error string (the trait's contract) and is logged, not
+    /// propagated. CRDT idempotency makes a missed mutation recoverable
+    /// from the next snapshot RPC; we never block the originator on
+    /// universal delivery.
     ///
     /// Single concern: "originate a batch on the promoted-secondary
     /// side". Receiver-side application of mutations OBSERVED on the
@@ -156,20 +153,17 @@ where
             timestamp: timestamp_now(),
             mutations: applied,
         };
-        // Fan out to both transports. Order matters only for symmetry
-        // with `processing.rs`'s RunComplete fan-out (peer-first there;
-        // mirror it here so future maintainers see one pattern). Errors
-        // are logged but not propagated — see method doc.
-        if let Err(e) = self.primary_transport.send(msg.clone()).await {
+        // ONE authoritative mesh broadcast — the demoted node and any
+        // observer receive it as mesh members. Errors are logged, not
+        // propagated (see method doc).
+        if let Err(e) = self
+            .transport
+            .send(Address::Broadcast(Scope::Mesh), msg)
+            .await
+        {
             tracing::warn!(
                 error = %e,
-                "ClusterMutation send to demoted submitter failed (submitter likely exited)"
-            );
-        }
-        if let Err(e) = self.peer_transport.broadcast(msg).await {
-            tracing::warn!(
-                error = %e,
-                "ClusterMutation peer broadcast failed"
+                "ClusterMutation mesh broadcast failed"
             );
         }
         Ok(())

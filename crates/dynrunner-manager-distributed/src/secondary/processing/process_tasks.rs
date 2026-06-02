@@ -13,24 +13,21 @@
 //! in `secondary/processing/mod.rs`.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant};
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender, WorkerId};
+use dynrunner_core::{Identifier, WorkerId};
 use dynrunner_manager_local::oom::{
     OomWatcher, OomWatcherConfig, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_SAMPLE_INTERVAL,
 };
 use dynrunner_manager_local::WorkerFactory;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
-use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, PeerTransport};
+use dynrunner_protocol_primary_secondary::{Address, PeerTransport, Scope};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
-use super::super::wire::timestamp_now;
 use super::super::{RunOutcome, SecondaryCoordinator};
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -139,11 +136,11 @@ where
             // cancel-safe because the periodic ticks (keepalive, oom)
             // will cancel the in-flight recv/event futures whenever
             // they fire. `pool.recv_event` is `mpsc::Receiver::recv`
-            // (documented cancel-safe). `primary_transport.recv` and
-            // `peer_transport.recv_peer` go through the per-connection
-            // bridge tasks (see `MessageReceiver` doc) which expose
-            // mpsc receivers underneath. `interval.tick` is itself
-            // cancel-safe per tokio docs.
+            // (documented cancel-safe). `transport.recv_peer` merges
+            // the uplink + mesh inbound streams internally, each backed
+            // by a per-connection bridge-task mpsc (cancel-safe; see
+            // `MessageReceiver` doc and `UnifiedSecondaryTransport`).
+            // `interval.tick` is itself cancel-safe per tokio docs.
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
@@ -153,109 +150,30 @@ where
                         }
                     }
                 }
-                msg = self.primary_transport.recv(), if !self.primary_disconnected => {
+                // Single opaque inbound arm. The unified transport
+                // merges the uplink and mesh streams; the manager never
+                // sees which delivered a frame, and uplink-close is an
+                // INTERNAL transport event (it latches inside the
+                // transport and re-routes `Role::Primary`) — there is no
+                // recv-None failover cascade here. Failover-health is
+                // driven by the send-side no-route probe in
+                // `send_to_primary` plus the keepalive time-axis in
+                // `check_primary_link_threshold`. A `None` here means
+                // EVERY inbound source closed (uplink AND mesh): no more
+                // frames can ever arrive, so exit cleanly — the
+                // historical "all inbound closed = end of run" contract.
+                msg = self.transport.recv_peer() => {
                     match msg {
                         Some(m) => {
-                            self.dispatch_message(m, &mut command_rx, factory).await?;
+                            self.handle_inbound(m, &mut command_rx, factory).await;
                         }
                         None => {
-                            // Primary's transport returned None — the
-                            // bridge writer or reader task exited. Two
-                            // structural cases live here:
-                            //
-                            // 1. Single-secondary / no-peer-mesh
-                            //    runs (the test fixture drops primary
-                            //    explicitly to signal shutdown;
-                            //    production single-jobs runs do the
-                            //    same when the local primary's run()
-                            //    returns). There's no failover
-                            //    candidate, so exit cleanly to
-                            //    preserve the historical "primary
-                            //    close = end of run" contract.
-                            //
-                            // 2. Multi-secondary failover. The peer
-                            //    mesh is alive, an election can pick
-                            //    a primary, and dispatch can keep
-                            //    flowing.
-                            //
-                            // Pre-R1 case 2 fired the failover-arm
-                            // logic IMMEDIATELY on the first recv-None
-                            // event: a single dropped TCP packet that
-                            // killed the WSS bridge writer would have
-                            // armed an election even though the primary
-                            // was perfectly alive (just briefly
-                            // unreachable). R1 introduces a primary-link
-                            // health sub-state in `primary_link.rs`
-                            // that requires N=5 probes OR 30s of sustained
-                            // failure before arming — so a one-off
-                            // glitch is benign, but a sustained outage
-                            // still arms within a bounded window. The
-                            // architectural invariant "transport-level
-                            // mesh state is independent of the
-                            // primary-vs-secondary role" is preserved:
-                            // recording a probe doesn't mutate the peer
-                            // mesh in any way.
-                            let peers = self.peer_transport.peer_count();
-
-                            if peers == 0 {
-                                tracing::info!(
-                                    "primary disconnected and no peer mesh; exiting cleanly \
-                                     (no failover candidate to take authority)"
-                                );
-                                break;
-                            }
-
-                            // Multi-secondary case: feed one probe
-                            // into the primary-link health sub-state.
-                            // It records the first-failure timestamp,
-                            // bumps the counter, and tells us whether
-                            // the threshold has breached. If yes, we
-                            // arm failover here (existing path:
-                            // backdate `primary_last_seen` so the
-                            // next keepalive tick's election fires).
-                            // If no, we just gate the recv arm so the
-                            // persistently-None future doesn't
-                            // hot-loop on the dead bridge — the
-                            // keepalive-tick path below will check
-                            // `should_arm_failover` again on the time
-                            // axis once the window elapses.
-                            let armed_now = self.primary_link.record_recv_failure();
-                            self.primary_disconnected = true;
-                            if armed_now {
-                                tracing::warn!(
-                                    connected_peers = peers,
-                                    "primary transport closed (threshold breached); \
-                                     switching to failover detection (election will run \
-                                     via peer mesh; further dispatch routes through \
-                                     primary_link.current_primary() once a peer is promoted)"
-                                );
-                                let backdate = self
-                                    .config
-                                    .keepalive_interval
-                                    .saturating_mul(self.config.keepalive_miss_threshold + 1);
-                                self.primary_last_seen = Some(
-                                    Instant::now()
-                                        .checked_sub(backdate)
-                                        .unwrap_or_else(Instant::now),
-                                );
-                            } else {
-                                tracing::info!(
-                                    connected_peers = peers,
-                                    "primary transport recv returned None; recording \
-                                     probe (failover threshold not yet breached, holding \
-                                     election)"
-                                );
-                                // Don't backdate yet — the keepalive
-                                // tick will re-check `should_arm_failover`
-                                // on each iteration and arm once the
-                                // time window elapses.
-                            }
+                            tracing::info!(
+                                "all inbound streams closed (uplink and mesh); \
+                                 exiting cleanly"
+                            );
+                            break;
                         }
-                    }
-                }
-                peer_msg = self.peer_transport.recv_peer() => {
-                    if let Some(m) = peer_msg {
-                        self.handle_peer_message(m, &mut command_rx, factory).await;
                     }
                 }
                 // Announcer-outbox drain. The observer-mode
@@ -299,7 +217,7 @@ where
                 } => {
                     if let Some(item) = outbox_item {
                         let send_result = self
-                            .peer_transport
+                            .transport
                             .send(
                                 dynrunner_protocol_primary_secondary::Address::Role(
                                     dynrunner_protocol_primary_secondary::Role::Primary,
@@ -366,7 +284,10 @@ where
                     self.repoll_idle_workers(factory).await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
-                        let _ = self.peer_transport.broadcast(msg).await;
+                        let _ = self
+                            .transport
+                            .send(Address::Broadcast(Scope::Mesh), msg)
+                            .await;
                     }
                 }
                 _ = oom_sample_interval.tick() => {
@@ -488,7 +409,10 @@ where
 
             // Flush any deferred peer messages
             for (peer_id, msg) in std::mem::take(&mut self.pending_peer_messages) {
-                let _ = self.peer_transport.send_to_peer(&peer_id, msg).await;
+                let _ = self
+                    .transport
+                    .send(Address::Peer(peer_id), msg)
+                    .await;
             }
 
             // Hard-error exit path: a sub-handler (e.g. the peer-mesh

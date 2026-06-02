@@ -14,10 +14,30 @@ use dynrunner_manager_local::WorkerFactory;
 use dynrunner_scheduler_api::ResourceEstimator;
 use dynrunner_scheduler::ResourceStealingScheduler;
 use dynrunner_transport_channel::{channel_pair, ChannelManagerEnd, ChannelPrimaryTransportEnd};
+use dynrunner_transport_tunnel::UnifiedSecondaryTransport;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::{SecondaryConfig, SecondaryCoordinator};
+
+/// The single opaque transport type secondary tests construct: the
+/// production `UnifiedSecondaryTransport` over a channel uplink + a
+/// peer-mesh stub. `P` lets a test pick the peer stub (`NoPeers`,
+/// `FixedPeerCount(n)`, `RecordingPeer`); the uplink is always the
+/// channel end so tests can inject inbound frames / observe sends.
+pub(super) type TestTransport<P> =
+    UnifiedSecondaryTransport<ChannelPrimaryTransportEnd<TestId>, P, TestId>;
+
+/// Build a [`TestTransport`] from a local id, a channel uplink end, and
+/// a peer-mesh stub. Mirrors the production composition (uplink picked
+/// by topology + mesh handle), but with test channel/stub handles.
+pub(super) fn make_transport<P: PeerTransport<TestId>>(
+    local_id: &str,
+    uplink: ChannelPrimaryTransportEnd<TestId>,
+    peer: P,
+) -> TestTransport<P> {
+    UnifiedSecondaryTransport::new(local_id.to_string(), uplink, peer)
+}
 
 /// Minimal serializable identifier used by every secondary test.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -230,29 +250,29 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
     }
 }
 
-/// Construct a SecondaryCoordinator with channel transports detached from
-/// any real primary or peer; used to drive the election state machine via
-/// direct method calls without needing a full multi-process harness.
+/// Construct a SecondaryCoordinator over the unified transport
+/// (channel uplink + `NoPeers` mesh stub) detached from any real
+/// primary or peer; used to drive the election state machine via direct
+/// method calls without a full multi-process harness.
 pub(super) fn make_secondary(
     config: SecondaryConfig,
 ) -> SecondaryCoordinator<
-    ChannelPrimaryTransportEnd<TestId>,
-    NoPeers,
+    TestTransport<NoPeers>,
     ChannelManagerEnd,
     ResourceStealingScheduler,
     FixedEstimator,
     TestId,
 > {
+    let secondary_id = config.secondary_id.clone();
     let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
     let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
-    let transport = ChannelPrimaryTransportEnd {
+    let uplink = ChannelPrimaryTransportEnd {
         tx: sec_to_pri_tx,
         rx: pri_to_sec_rx,
     };
     SecondaryCoordinator::new(
         config,
-        transport,
-        NoPeers,
+        make_transport(&secondary_id, uplink, NoPeers),
         ResourceStealingScheduler::memory(),
         FixedEstimator(100),
     )

@@ -9,7 +9,7 @@
 //! the router and its setup-time counterpart share, so each rule has
 //! exactly one writer.
 
-use dynrunner_core::{ErrorType, Identifier, MessageReceiver, MessageSender, TaskInfo};
+use dynrunner_core::{ErrorType, Identifier, TaskInfo};
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{
     ClusterMutation, DistributedMessage, PeerTransport,
@@ -19,10 +19,9 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -193,7 +192,7 @@ where
                      expected StageFile notification first"
                 ),
             };
-            self.send_to_current_primary(msg).await?;
+            self.send_to_primary(msg).await?;
             return Ok(true);
         }
         Ok(false)

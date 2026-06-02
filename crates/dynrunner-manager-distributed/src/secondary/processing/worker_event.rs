@@ -29,10 +29,9 @@ use crate::primary::PrimaryCommand;
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -149,7 +148,7 @@ where
                         // originator on the live-primary path is
                         // the demoted-local primary's
                         // `handle_task_complete`, reached via the
-                        // `send_to_current_primary` loopback below —
+                        // `send_to_primary` loopback below —
                         // that runs strictly later (its inbound is
                         // an mpsc enqueue, processed in another
                         // await frame). Without this synchronous
@@ -180,8 +179,16 @@ where
                             task_hash: hash.clone(),
                             result_data,
                         };
-                        self.send_to_current_primary(msg.clone()).await?;
-                        let _ = self.peer_transport.broadcast(msg).await;
+                        // Report to the primary role only. The AUTHORITY
+                        // originates the terminal CRDT mutation
+                        // (`apply_and_broadcast_cluster_mutations`) and
+                        // broadcasts it to the mesh, so every peer /
+                        // observer mirror converges and run-complete
+                        // cues stay intact — the reporting secondary
+                        // must NOT broadcast itself (a second CRDT
+                        // originator would break the authority's
+                        // apply-before-dispatch ordering).
+                        self.send_to_primary(msg).await?;
                     } else {
                         // Reuse the upstream classification from the
                         // worker protocol; default to NonRecoverable
@@ -222,8 +229,10 @@ where
                                 .error_message
                                 .unwrap_or_else(|| "Unknown error".into()),
                         };
-                        self.send_to_current_primary(msg.clone()).await?;
-                        let _ = self.peer_transport.broadcast(msg).await;
+                        // Report to the primary role only; the authority
+                        // originates + broadcasts the terminal CRDT
+                        // mutation (see the TaskComplete arm above).
+                        self.send_to_primary(msg).await?;
                     }
 
                     // Request next task for this worker
@@ -397,8 +406,9 @@ where
                         error_type: wire_error_type,
                         error_message: wire_error_message,
                     };
-                    let _ = self.send_to_current_primary(msg.clone()).await;
-                    let _ = self.peer_transport.broadcast(msg).await;
+                    // Report to the primary role only; the authority
+                    // originates + broadcasts the terminal CRDT mutation.
+                    let _ = self.send_to_primary(msg).await;
                 }
 
                 let _ = binary; // binary info already reported

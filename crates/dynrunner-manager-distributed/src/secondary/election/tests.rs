@@ -197,7 +197,7 @@
     /// subsequent live-primary keepalives. Pre-fix
     /// `record_primary_message` unconditionally cleared the
     /// current-primary identity whenever the live primary kept
-    /// sending keepalives, so `send_to_current_primary` on
+    /// sending keepalives, so `send_to_primary` on
     /// non-primary secondaries fell back to `primary_transport`
     /// (the demoted local primary) instead of unicasting to the
     /// SLURM-primary peer.
@@ -470,7 +470,7 @@
         );
 
         // Routing target should point at sec-b (the next-lowest
-        // non-observer peer), so the observer's send_to_current_primary
+        // non-observer peer), so the observer's send_to_primary
         // routes correctly once sec-b self-promotes on its own tick.
         match &sec.election {
             ElectionState::Voting { candidate, .. } => {

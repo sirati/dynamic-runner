@@ -210,7 +210,6 @@ mod tests {
     #[test]
     fn reconnect_threshold_arms_election_after_n_failures() {
         let mut link = PrimaryLink::with_failover_threshold(
-            "sec-a".into(),
             5,
             Duration::from_secs(3600), // huge window — count axis only
         );
@@ -233,7 +232,6 @@ mod tests {
     #[test]
     fn reconnect_threshold_arms_after_window_elapsed() {
         let mut link = PrimaryLink::with_failover_threshold(
-            "sec-a".into(),
             1000, // huge count threshold — time axis only
             Duration::from_millis(50),
         );
@@ -254,7 +252,6 @@ mod tests {
     #[test]
     fn record_recv_success_resets_failure_window() {
         let mut link = PrimaryLink::with_failover_threshold(
-            "sec-a".into(),
             3,
             Duration::from_secs(30),
         );
@@ -275,7 +272,6 @@ mod tests {
     #[test]
     fn should_arm_failover_is_pure() {
         let mut link = PrimaryLink::with_failover_threshold(
-            "sec-a".into(),
             5,
             Duration::from_secs(3600),
         );

@@ -7,7 +7,7 @@
 //! `SecondaryCoordinator::peer_mesh_degraded`; this module owns only
 //! the detection + first-report side.
 
-use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
+use dynrunner_core::Identifier;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
@@ -15,10 +15,9 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 use super::super::wire::timestamp_now;
 use super::super::SecondaryCoordinator;
 
-impl<PT, P, M, S, E, I> SecondaryCoordinator<PT, P, M, S, E, I>
+impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
-    PT: MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>,
-    P: PeerTransport<I>,
+    Tr: PeerTransport<I>,
     M: ManagerEndpoint + 'static,
     S: Scheduler<I> + Clone,
     E: ResourceEstimator<I> + Clone,
@@ -85,7 +84,7 @@ where
         // peer_count drains new connections internally; calling it
         // BEFORE the deadline check lets a fresh connection clear
         // the watchdog without firing the fault.
-        let connected = self.peer_transport.peer_count();
+        let connected = self.transport.peer_count();
         if connected > 0 {
             self.peer_mesh_check_at = None;
             // Mesh formed for the first time — tell the primary so
@@ -149,7 +148,7 @@ where
         //     or it elapsed with zero peers). The fully-failed case
         //     still reports so the primary doesn't wait the full
         //     mesh-ready timeout for nothing.
-        let connected = self.peer_transport.peer_count() as u32;
+        let connected = self.transport.peer_count() as u32;
         let no_peers_expected = self.peer_dial_count == 0;
         let mesh_formed = connected > 0;
         let watchdog_done =
@@ -163,7 +162,7 @@ where
             secondary_id: self.config.secondary_id.clone(),
             peer_count: connected,
         };
-        if let Err(e) = self.send_to_current_primary(msg).await {
+        if let Err(e) = self.send_to_primary(msg).await {
             // Best-effort: log and flip the flag anyway so we
             // don't busy-retry on every keepalive tick. The
             // primary's wait step will time out (warning, not a
