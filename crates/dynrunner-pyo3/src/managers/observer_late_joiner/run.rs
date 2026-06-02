@@ -22,6 +22,7 @@ use crate::subprocess_factory::SubprocessWorkerFactory;
 
 use super::PyObserverLateJoiner;
 use super::helpers::{map_read_dir_error, records_to_seed};
+use super::reporter::{run_reporter, SharedSnapshotSource, StatsSnapshot, TokioClock};
 
 #[pymethods]
 impl PyObserverLateJoiner {
@@ -377,6 +378,46 @@ impl PyObserverLateJoiner {
                     announcer_handle.primary_epoch_mirror,
                 ));
 
+                // 5.6. Spawn the observer-side periodic reporter
+                //      (owner-decision C-4): the 10-minute CRDT-derived
+                //      cluster-stats announcement + the 1-minute
+                //      idle-secondary detector, emitting only to the
+                //      importance channel. The reporter is a
+                //      self-contained concern — it holds its OWN
+                //      last-announcement delta baseline and per-secondary
+                //      idle gates; nothing about reporting lives on the
+                //      coordinator. It reads the CRDT through a
+                //      `SharedSnapshotSource` cell.
+                //
+                //      # Live-snapshot feed — integration seam
+                //
+                //      A zero-authority observer's `ClusterState` is
+                //      owned `&mut` by `run_until_setup_or_done` for the
+                //      whole run, so a concurrently-running reporter
+                //      cannot borrow it directly. The clean hand-off is:
+                //      the run loop publishes a fresh
+                //      `StatsSnapshot::from_cluster_state(&cluster_state)`
+                //      projection into this cell whenever it applies a
+                //      mesh broadcast — which requires a `&self` CRDT
+                //      read accessor on `SecondaryCoordinator` (the one
+                //      piece not in this subtask's file scope). Until
+                //      that producer is wired, the cell holds the
+                //      seeded default (all-zero ⇒ the reporter correctly
+                //      stays silent), and the cadence/emit/idle
+                //      machinery is exercised end-to-end. The reporter
+                //      logic itself needs no further change when the
+                //      live feed lands — only the `publish` call site.
+                let snapshot_source = SharedSnapshotSource::new(StatsSnapshot::default());
+                let (reporter_cancel_tx, reporter_cancel_rx) =
+                    tokio::sync::oneshot::channel::<()>();
+                let reporter_task = tokio::task::spawn_local(run_reporter(
+                    snapshot_source,
+                    TokioClock,
+                    async move {
+                        let _ = reporter_cancel_rx.await;
+                    },
+                ));
+
                 // 6. Drive the run loop. The first iteration's
                 //    setup-skip guard fires immediately; subsequent
                 //    iterations are `RunOutcome::Done` once the
@@ -473,6 +514,17 @@ impl PyObserverLateJoiner {
                 // this) starts with a quiesced runtime.
                 announcer_task.abort();
                 let _ = announcer_task.await;
+
+                // Reporter-task cleanup. Signal cancel (graceful: the
+                // driver's `select!` cancel arm wins and the loop
+                // breaks), then await termination. `abort()` as a
+                // backstop in case the cancel receiver was already
+                // dropped. Same abort+await synchronisation discipline
+                // as the announcer above so a follow-on dispatcher run
+                // starts with a quiesced runtime.
+                let _ = reporter_cancel_tx.send(());
+                reporter_task.abort();
+                let _ = reporter_task.await;
 
                 loop_result
             }))

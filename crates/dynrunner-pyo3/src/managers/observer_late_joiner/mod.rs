@@ -72,6 +72,7 @@ use crate::task_def::LoadedTopology;
 
 mod helpers;
 mod new;
+mod reporter;
 mod run;
 
 /// Late-joining observer dispatcher.
