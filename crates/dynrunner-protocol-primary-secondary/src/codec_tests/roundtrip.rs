@@ -250,7 +250,8 @@ fn legacy_task_assignment_without_predecessor_outputs_decodes_empty() {
                 "compiler": "gcc",
                 "version": "12.0",
                 "opt_level": "O2"
-            }
+            },
+            "task_id": "legacy-task"
         },
         "local_path": "x",
         "file_hash": "h"
