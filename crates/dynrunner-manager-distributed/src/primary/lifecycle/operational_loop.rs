@@ -16,6 +16,182 @@ use crate::primary::wire::compute_task_hash;
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
 
+    /// Run-completion exit decision for one operational-loop iteration.
+    ///
+    /// Returns `true` iff the loop should break this iteration on a
+    /// "the run is done" condition. This is a FAITHFUL extraction of
+    /// the three run-completion branches that previously lived inline
+    /// at the top of `operational_loop` — the counter exit, the
+    /// pool-drain exit, and the replicated-ledger `RunComplete` exit.
+    /// Their semantics are unchanged: each is re-evaluated against
+    /// live coordinator state (`total_tasks`, the pool, `cluster_state`)
+    /// every call, so lazy `spawn_tasks` / `TasksSpawned` growth is
+    /// naturally absorbed.
+    ///
+    /// The failure/abort exits (fleet-dead timeout, both-transports-
+    /// closed, panik, setup-promote deadline, stuck-worker watchdog)
+    /// are a DIFFERENT concern (the run did not complete normally) and
+    /// stay inline in the loop — they are not run-completion decisions.
+    ///
+    /// `partial_view` (see the extensive rationale below) keys off
+    /// `self.demoted`, NOT off `required_setup_on_promote` alone and
+    /// NOT off a sticky latch: a composed AUTHORITATIVE primary is by
+    /// definition `!self.demoted`, so it evaluates `partial_view =
+    /// false` and uses the real counter / pool-drain exits even when
+    /// `required_setup_on_promote = true`. Only a DEMOTED submitter
+    /// that also deferred discovery holds a genuinely partial CRDT
+    /// mirror and must wait for the authoritative `RunComplete`.
+    pub(crate) fn run_complete_check(&self) -> bool {
+        // Check termination: all tasks accounted for AND no
+        // worker is mid-dispatch. Both halves of the check are
+        // necessary — counting `completed + failed >= total`
+        // alone would orphan in-flight tasks if the bookkeeping
+        // ever inflates (e.g. a TaskComplete arriving for a task
+        // primary doesn't currently track as in-flight on a
+        // worker — the insert grows the set while the in-flight
+        // ledger stays as-is, so the counter check trips while a
+        // sibling worker is still mid-dispatch and primary tears
+        // down before that sibling's TaskComplete arrives).
+        // Pairing the counter check with `active_workers == 0`
+        // guarantees we only exit when every dispatched
+        // assignment has been reconciled.
+        let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
+        // Counter-based exit. Gates:
+        //
+        //   (a) `!self.setup_pending` — the historical setup-defer
+        //       guard: in setup-promote mode (`required_setup_on_promote
+        //       = true`) the local enters the loop with `total_tasks
+        //       = 0` and the chosen secondary still owes its first
+        //       TaskAdded broadcast; without this gate `0+0 >= 0`
+        //       trips immediately. Cleared by the first TaskAdded
+        //       or RunComplete mirror — see
+        //       `mirror_mutation_to_accounting`.
+        //
+        //   (b) `!(self.demoted && self.config.required_setup_on_promote)`
+        //       — the LMU CIP partial-CRDT-view guard. The local
+        //       submitter is always `demoted = true` post-bootstrap
+        //       (`promote_primary` unconditionally hands off to the
+        //       first secondary, see `lifecycle.rs:981`), so the
+        //       demoted-flag alone cannot gate the counter exit
+        //       without breaking every normal run. The bug only
+        //       manifests when the demoted's view is also PARTIAL
+        //       — i.e. `required_setup_on_promote = true` so
+        //       `seed_cluster_state` never ran locally and the
+        //       local learns task counts only from out-of-order
+        //       TaskAdded broadcasts. In that regime
+        //       `total_tasks` and `completed_tasks.len()` can
+        //       transiently align (e.g. 50 TaskAddeds arrive,
+        //       then 50 TaskCompleteds arrive before the next
+        //       TaskAdded batch — `50 + 0 >= 50` trips while
+        //       185 items are still unaccounted-for upstream).
+        //       For these setup-promoted demoted primaries the
+        //       ONLY safe exit is `cluster_state.run_complete()`
+        //       (the authoritative primary's terminal broadcast).
+        //
+        //       Pre-seeded mode (`required_setup_on_promote =
+        //       false` — local does discovery + seeds
+        //       `cluster_state` BEFORE handing off to the
+        //       promoted secondary; a fully production-supported
+        //       path, not a deprecated one) is unaffected: even
+        //       when demoted, the local's view was fully seeded
+        //       by `seed_cluster_state` before the operational
+        //       loop started, so `total_tasks = binaries.len()`
+        //       is set once at run start and never drifts under
+        //       partial CRDT updates. The counter exit is the
+        //       load-bearing happy-path exit for every
+        //       pre-seeded run; gating it on `!self.demoted`
+        //       would break every distributed run.
+        //
+        // Concrete bug this guard kills (asm-tokenizer LMU CIP
+        // `--jobs 15`, 50ms+ tunnel RTT, `--source-already-staged`):
+        // the setup-promoted secondary discovers 235 items,
+        // broadcasts batched TaskAdded + interleaved
+        // TaskCompleted; the demoted local's counter check
+        // momentarily aligns and the loop exits with `total=N,
+        // succeeded=N` before the upstream run is anywhere near
+        // done. The local dispatcher then chains to Phase 2 and
+        // tears down Phase 1's tunnels — killing Phase 1.
+        // `demoted` is the load-bearing key here, NOT a sticky
+        // "publishing complete" latch. A composed AUTHORITATIVE
+        // primary is by definition `!self.demoted` — it owns the
+        // run and its `total_tasks` / pool ARE authoritative, so it
+        // must evaluate `partial_view = false` and use the real
+        // counter exit (`:!partial_view ...`) and pool-drain exit
+        // below, both of which re-read `total_tasks` / the pool
+        // every iteration and naturally absorb lazy `spawn_tasks` /
+        // `TasksSpawned` growth. Only a DEMOTED submitter that also
+        // deferred discovery (`required_setup_on_promote`) holds a
+        // genuinely partial CRDT mirror, and only it must wait for
+        // the authoritative `RunComplete`. A sticky flag would
+        // freeze `partial_view = true` and the counter / pool-drain
+        // exits would never fire — re-creating the premature-/
+        // never-completion strand this guard exists to prevent.
+        let partial_view = self.demoted && self.config.required_setup_on_promote;
+        if !partial_view
+            && !self.setup_pending
+            && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
+            && active_workers == 0
+        {
+            tracing::info!("all tasks completed or failed");
+            return true;
+        }
+
+        // Drain check: pool's `is_run_complete` returns true iff
+        // queued + in-flight is zero AND no phase is Active or
+        // Draining. The active-workers guard catches the edge
+        // where in-flight is zero but a worker hasn't reported
+        // completion yet (mostly defensive — `on_item_finished`
+        // runs synchronously off the wire message).
+        //
+        // Same `partial_view` guard as the counter exit above:
+        // a setup-promoted demoted primary's pool is also a
+        // stale local view (the authoritative pool lives on the
+        // promoted secondary, and the local pool stays empty
+        // because TaskAdded mirrors into cluster_state, not into
+        // the local pool — only the live primary's pool ingests
+        // staged items). Legacy bootstrap's pool was seeded
+        // pre-loop and drains normally.
+        if !partial_view && !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
+            tracing::info!("pool drained and no active workers");
+            return true;
+        }
+
+        // Replicated-ledger run-complete signal. The promoted
+        // primary broadcasts `ClusterMutation::RunComplete` as the
+        // last act before its own `run()` returns; `handle_cluster_mutation`
+        // applies it to our `cluster_state` mirror.
+        //
+        // For a setup-promoted demoted primary (`partial_view`
+        // = true above) this is the SOLE exit cue — the local
+        // counter / pool views are partial and unreliable until
+        // RunComplete proves the authoritative primary has
+        // accounted for every task. RunComplete is causally
+        // ordered after every TaskCompleted / TaskFailed in the
+        // run, so by the time we apply it to our mirror those
+        // mutations have already updated `completed_tasks` /
+        // `failed_tasks` — the "primary finished succeeded=X
+        // fail_retry=X ..." log line at the demoted exit reflects
+        // the true final state.
+        //
+        // Pre-seeded demoted primary (`required_setup_on_promote
+        // = false`): RunComplete is a redundant exit (the
+        // counter check above trips first, since the local was
+        // fully seeded by `seed_cluster_state` and TaskCompleteds
+        // from every peer's worker arrive on the per-peer
+        // SecondaryTransport / peer transport before the promoted
+        // primary itself decides RunComplete). Keeping this arm
+        // unguarded is harmless and serves as a uniform fallback.
+        //
+        // Sticky monotonic flag, so this fires at most once
+        // per run.
+        if self.cluster_state.run_complete() && active_workers == 0 {
+            tracing::info!("RunComplete signal received from cluster; exiting");
+            return true;
+        }
+
+        false
+    }
+
     pub(crate) async fn operational_loop(&mut self) -> Result<(), String> {
         tracing::info!("entering operational loop");
 
@@ -114,135 +290,15 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         let mut panik_signal_rx = self.panik_signal_rx.take();
 
         loop {
-            // Check termination: all tasks accounted for AND no
-            // worker is mid-dispatch. Both halves of the check are
-            // necessary — counting `completed + failed >= total`
-            // alone would orphan in-flight tasks if the bookkeeping
-            // ever inflates (e.g. a TaskComplete arriving for a task
-            // primary doesn't currently track as in-flight on a
-            // worker — the insert grows the set while the in-flight
-            // ledger stays as-is, so the counter check trips while a
-            // sibling worker is still mid-dispatch and primary tears
-            // down before that sibling's TaskComplete arrives).
-            // Pairing the counter check with `active_workers == 0`
-            // guarantees we only exit when every dispatched
-            // assignment has been reconciled.
-            let active_workers = self.workers.iter().filter(|w| w.current_task.is_some()).count();
-            // Counter-based exit. Gates:
-            //
-            //   (a) `!self.setup_pending` — the historical setup-defer
-            //       guard: in setup-promote mode (`required_setup_on_promote
-            //       = true`) the local enters the loop with `total_tasks
-            //       = 0` and the chosen secondary still owes its first
-            //       TaskAdded broadcast; without this gate `0+0 >= 0`
-            //       trips immediately. Cleared by the first TaskAdded
-            //       or RunComplete mirror — see
-            //       `mirror_mutation_to_accounting`.
-            //
-            //   (b) `!(self.demoted && self.config.required_setup_on_promote)`
-            //       — the LMU CIP partial-CRDT-view guard. The local
-            //       submitter is always `demoted = true` post-bootstrap
-            //       (`promote_primary` unconditionally hands off to the
-            //       first secondary, see `lifecycle.rs:981`), so the
-            //       demoted-flag alone cannot gate the counter exit
-            //       without breaking every normal run. The bug only
-            //       manifests when the demoted's view is also PARTIAL
-            //       — i.e. `required_setup_on_promote = true` so
-            //       `seed_cluster_state` never ran locally and the
-            //       local learns task counts only from out-of-order
-            //       TaskAdded broadcasts. In that regime
-            //       `total_tasks` and `completed_tasks.len()` can
-            //       transiently align (e.g. 50 TaskAddeds arrive,
-            //       then 50 TaskCompleteds arrive before the next
-            //       TaskAdded batch — `50 + 0 >= 50` trips while
-            //       185 items are still unaccounted-for upstream).
-            //       For these setup-promoted demoted primaries the
-            //       ONLY safe exit is `cluster_state.run_complete()`
-            //       (the authoritative primary's terminal broadcast).
-            //
-            //       Pre-seeded mode (`required_setup_on_promote =
-            //       false` — local does discovery + seeds
-            //       `cluster_state` BEFORE handing off to the
-            //       promoted secondary; a fully production-supported
-            //       path, not a deprecated one) is unaffected: even
-            //       when demoted, the local's view was fully seeded
-            //       by `seed_cluster_state` before the operational
-            //       loop started, so `total_tasks = binaries.len()`
-            //       is set once at run start and never drifts under
-            //       partial CRDT updates. The counter exit is the
-            //       load-bearing happy-path exit for every
-            //       pre-seeded run; gating it on `!self.demoted`
-            //       would break every distributed run.
-            //
-            // Concrete bug this guard kills (asm-tokenizer LMU CIP
-            // `--jobs 15`, 50ms+ tunnel RTT, `--source-already-staged`):
-            // the setup-promoted secondary discovers 235 items,
-            // broadcasts batched TaskAdded + interleaved
-            // TaskCompleted; the demoted local's counter check
-            // momentarily aligns and the loop exits with `total=N,
-            // succeeded=N` before the upstream run is anywhere near
-            // done. The local dispatcher then chains to Phase 2 and
-            // tears down Phase 1's tunnels — killing Phase 1.
-            let partial_view = self.demoted && self.config.required_setup_on_promote;
-            if !partial_view
-                && !self.setup_pending
-                && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
-                && active_workers == 0
-            {
-                tracing::info!("all tasks completed or failed");
-                break;
-            }
-
-            // Drain check: pool's `is_run_complete` returns true iff
-            // queued + in-flight is zero AND no phase is Active or
-            // Draining. The active-workers guard catches the edge
-            // where in-flight is zero but a worker hasn't reported
-            // completion yet (mostly defensive — `on_item_finished`
-            // runs synchronously off the wire message).
-            //
-            // Same `partial_view` guard as the counter exit above:
-            // a setup-promoted demoted primary's pool is also a
-            // stale local view (the authoritative pool lives on the
-            // promoted secondary, and the local pool stays empty
-            // because TaskAdded mirrors into cluster_state, not into
-            // the local pool — only the live primary's pool ingests
-            // staged items). Legacy bootstrap's pool was seeded
-            // pre-loop and drains normally.
-            if !partial_view && !self.setup_pending && self.pool().is_run_complete() && active_workers == 0 {
-                tracing::info!("pool drained and no active workers");
-                break;
-            }
-
-            // Replicated-ledger run-complete signal. The promoted
-            // primary broadcasts `ClusterMutation::RunComplete` as the
-            // last act before its own `run()` returns; `handle_cluster_mutation`
-            // applies it to our `cluster_state` mirror.
-            //
-            // For a setup-promoted demoted primary (`partial_view`
-            // = true above) this is the SOLE exit cue — the local
-            // counter / pool views are partial and unreliable until
-            // RunComplete proves the authoritative primary has
-            // accounted for every task. RunComplete is causally
-            // ordered after every TaskCompleted / TaskFailed in the
-            // run, so by the time we apply it to our mirror those
-            // mutations have already updated `completed_tasks` /
-            // `failed_tasks` — the "primary finished succeeded=X
-            // fail_retry=X ..." log line at the demoted exit reflects
-            // the true final state.
-            //
-            // Pre-seeded demoted primary (`required_setup_on_promote
-            // = false`): RunComplete is a redundant exit (the
-            // counter check above trips first, since the local was
-            // fully seeded by `seed_cluster_state` and TaskCompleteds
-            // from every peer's worker arrive on the per-peer
-            // SecondaryTransport / peer transport before the promoted
-            // primary itself decides RunComplete). Keeping this arm
-            // unguarded is harmless and serves as a uniform fallback.
-            //
-            // Sticky monotonic flag, so this fires at most once
-            // per run.
-            if self.cluster_state.run_complete() && active_workers == 0 {
-                tracing::info!("RunComplete signal received from cluster; exiting");
+            // Run-completion exit decision. The counter exit, the
+            // pool-drain exit, and the replicated-ledger RunComplete
+            // exit are extracted into `run_complete_check` (a single-
+            // concern predicate, byte-for-byte the same conditions
+            // that previously lived inline here). The failure/abort
+            // exits below (fleet-dead, both-transports-closed, panik,
+            // setup-promote deadline, stuck-worker watchdog) are a
+            // different concern and stay in the loop.
+            if self.run_complete_check() {
                 break;
             }
 
