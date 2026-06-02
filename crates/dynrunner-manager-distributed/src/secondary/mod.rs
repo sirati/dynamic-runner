@@ -42,7 +42,11 @@ mod coordinator;
 mod dispatch;
 mod election;
 mod peer;
-mod primary;
+// `pub(crate)` only so the `cascade_drain_done` pool-cascade primitive
+// (the module's single `pub(crate)` item) is reachable by the
+// symmetric `crate::primary::hydrate` path. Every other item in the
+// submodule stays `pub(in crate::secondary)`.
+pub(crate) mod primary;
 mod primary_link;
 mod processing;
 pub(crate) mod resource;

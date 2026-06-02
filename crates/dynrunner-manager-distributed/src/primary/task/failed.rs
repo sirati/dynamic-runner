@@ -217,6 +217,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             if let Some(binary) = recovered_binary {
                 self.release_type_slot(&binary.type_id);
                 self.note_item_failed(&binary.phase_id, Some(binary.task_id.as_str()), command_rx).await;
+            } else if let Some((phase, _secondary, binary)) =
+                self.pre_owned_in_flight.remove(&task_hash)
+            {
+                // Pre-owned in-flight task (hydrated from cluster_state)
+                // failing on the originating node: no local worker held
+                // it, so no local type-slot was taken — hence no
+                // `release_type_slot`. We still decrement the correct
+                // phase's in-flight counter via `note_item_failed` so
+                // the phase machine drains from N+1 to N. Symmetric with
+                // the pre-owned fallback in `handle_task_complete`.
+                self.note_item_failed(&phase, Some(binary.task_id.as_str()), command_rx).await;
             }
 
             // Same kickstart rationale as `handle_task_complete`:
