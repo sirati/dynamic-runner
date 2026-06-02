@@ -570,6 +570,31 @@ where
         self.cluster_state.outcome_counts().succeeded
     }
 
+    /// Read-only borrow of the replicated cluster ledger.
+    ///
+    /// # Single concern
+    ///
+    /// A shared, non-mutating view of the CRDT for callers that
+    /// PROJECT it (e.g. the observer's CRDT-derived periodic stats
+    /// reporter, which reads the ledger through
+    /// `StatsSnapshot::from_cluster_state`). It exposes exactly the
+    /// `&ClusterState<I>` the public projection accessors
+    /// (`tasks_iter`/`counts`/`outcome_counts`/`phase_deps`) already
+    /// hang off — no authority, no mutation, no pool.
+    ///
+    /// # Why a borrow and not an owned/shared handle
+    ///
+    /// The coordinator owns its `cluster_state` field by value; the
+    /// CRDT is deliberately NOT `Arc`-shared (that would ripple into
+    /// every apply site). A `&self` borrow keeps that ownership intact
+    /// and is the correct shape for a synchronous, in-loop projection
+    /// at a point where the caller already holds `&SecondaryCoordinator`
+    /// (the late-joiner observer publishes its projection right after
+    /// `restore_from_snapshot_and_skip_setup` and on each run-loop
+    /// return — both `&self`-reachable moments).
+    pub fn cluster_state(&self) -> &ClusterState<I> {
+        &self.cluster_state
+    }
 
     /// Test-only inspector for the replicated cluster ledger this
     /// secondary maintains by applying primary-broadcast

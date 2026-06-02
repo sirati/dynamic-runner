@@ -389,25 +389,46 @@ impl PyObserverLateJoiner {
                 //      coordinator. It reads the CRDT through a
                 //      `SharedSnapshotSource` cell.
                 //
-                //      # Live-snapshot feed — integration seam
+                //      # Live-snapshot feed
                 //
                 //      A zero-authority observer's `ClusterState` is
                 //      owned `&mut` by `run_until_setup_or_done` for the
-                //      whole run, so a concurrently-running reporter
-                //      cannot borrow it directly. The clean hand-off is:
-                //      the run loop publishes a fresh
-                //      `StatsSnapshot::from_cluster_state(&cluster_state)`
-                //      projection into this cell whenever it applies a
-                //      mesh broadcast — which requires a `&self` CRDT
-                //      read accessor on `SecondaryCoordinator` (the one
-                //      piece not in this subtask's file scope). Until
-                //      that producer is wired, the cell holds the
-                //      seeded default (all-zero ⇒ the reporter correctly
-                //      stays silent), and the cadence/emit/idle
-                //      machinery is exercised end-to-end. The reporter
-                //      logic itself needs no further change when the
-                //      live feed lands — only the `publish` call site.
-                let snapshot_source = SharedSnapshotSource::new(StatsSnapshot::default());
+                //      whole run, so a concurrently-running reporter task
+                //      cannot borrow it directly. The hand-off is the
+                //      `SharedSnapshotSource` cell: the reporter task
+                //      owns one clone and reads the most-recently
+                //      published projection on each tick; THIS loop owns
+                //      the other clone (`snapshot_publisher`) and pushes a
+                //      fresh `StatsSnapshot::from_cluster_state(...)`
+                //      projection at every point it legitimately holds
+                //      `&secondary` — i.e. immediately below (the
+                //      just-restored snapshot, the late-joiner's real
+                //      starting view) and after each
+                //      `run_until_setup_or_done` return (the SetupPending
+                //      re-entry boundary). The projection is taken through
+                //      the read-only `secondary.cluster_state()` accessor;
+                //      the CRDT is never `Arc`-shared, so nothing about
+                //      this feed touches the apply path or the operational
+                //      loop.
+                //
+                //      Cadence note: a late-joiner restores a snapshot of
+                //      an already-running cluster, so the initial publish
+                //      below delivers REAL, typically-non-zero stats that
+                //      the first 10-minute tick reports. Refreshing the
+                //      cell on every live mid-run task transition (so the
+                //      reporter's deltas track completions that land
+                //      *during* this observer's window) is a strictly-
+                //      additive future step: it needs an apply-path
+                //      publish hook inside `cluster_state`, which is out
+                //      of this wiring's file scope. The reporter logic
+                //      needs no change when that lands — only an extra
+                //      `publish` call site.
+                let snapshot_source = SharedSnapshotSource::new(
+                    StatsSnapshot::from_cluster_state(secondary.cluster_state()),
+                );
+                // Clone the publish handle for THIS loop; the reporter
+                // task consumes the other end. Both clones share one cell.
+                let snapshot_publisher = snapshot_source.clone();
                 let (reporter_cancel_tx, reporter_cancel_rx) =
                     tokio::sync::oneshot::channel::<()>();
                 let reporter_task = tokio::task::spawn_local(run_reporter(
@@ -456,6 +477,17 @@ impl PyObserverLateJoiner {
                                     "observer late-joiner: secondary run loop failed: {e}"
                                 ))
                             })?;
+                        // The run loop just returned `&secondary` to us;
+                        // refresh the reporter's cell with the current
+                        // CRDT projection. On `Done` this is the terminal
+                        // view (the reporter's final pre-cancel tick can
+                        // still report a last delta); on the `SetupPending`
+                        // re-entry boundary it keeps the cell current
+                        // across the GIL round-trip.
+                        snapshot_publisher
+                            .publish(StatsSnapshot::from_cluster_state(
+                                secondary.cluster_state(),
+                            ));
                         match outcome {
                             RunOutcome::Done => break,
                             RunOutcome::PanikShutdown {

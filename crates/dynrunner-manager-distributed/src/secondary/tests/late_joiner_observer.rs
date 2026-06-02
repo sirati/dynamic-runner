@@ -143,6 +143,37 @@
         assert_eq!(observers.len(), 1);
     }
 
+    /// The read-only `cluster_state()` accessor returns a borrow of the
+    /// replicated ledger that reflects the restored snapshot's REAL
+    /// state — this is the exact view the late-joiner observer's run
+    /// loop projects (`StatsSnapshot::from_cluster_state`) and publishes
+    /// to its periodic reporter after `restore_from_snapshot_and_skip_setup`.
+    /// Pins that the accessor is a faithful, non-mutating window onto the
+    /// CRDT (the same `counts()` the loop would project), so the reporter
+    /// receives real data and not a placeholder.
+    #[test]
+    fn cluster_state_accessor_reflects_restored_snapshot() {
+        let mut sec = make_observer_secondary("observer-1");
+        // Pre-restore: a fresh coordinator's CRDT is empty, so a
+        // projection here is the all-zero default (reporter stays silent).
+        assert_eq!(sec.cluster_state().task_count(), 0);
+
+        sec.restore_from_snapshot_and_skip_setup(make_synthetic_snapshot());
+
+        // Post-restore the accessor surfaces the snapshot's two pending
+        // tasks — the same window the run loop hands `from_cluster_state`.
+        let view = sec.cluster_state();
+        assert_eq!(view.task_count(), 2, "two tasks visible through the accessor");
+        assert_eq!(
+            view.counts().pending,
+            2,
+            "both restored tasks are Pending in the projected view"
+        );
+        // The accessor is a faithful read-only borrow: it agrees with the
+        // crate-internal field it exposes (no lossy copy / divergence).
+        assert_eq!(view.task_count(), sec.cluster_state.task_count());
+    }
+
     /// The same `restore` call applied twice is a no-op the second
     /// time — `ClusterState::restore` is documented as idempotent /
     /// CRDT-merge. Pins that the wrapper preserves the underlying

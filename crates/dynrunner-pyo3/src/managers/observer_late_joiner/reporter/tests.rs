@@ -385,6 +385,63 @@ fn shared_source_publishes_latest() {
     assert_eq!(clone.snapshot().succeeded, 11);
 }
 
+// ── live-feed wiring: CRDT projection → publish → reporter observes ──
+
+#[test]
+fn live_feed_publishes_real_crdt_projection_to_reporter() {
+    // This is the production hand-off the observer run loop performs:
+    // project the live `ClusterState` into a `StatsSnapshot` and
+    // `publish` it into the shared cell the reporter task reads on its
+    // next tick. The reporter is seeded all-zero (a fresh observer); the
+    // first publish must make the reporter observe the REAL counts so
+    // its cadence has wake-worthy data — not the seeded zero snapshot.
+    use super::run::CrdtSnapshotSource;
+
+    // Seed a cluster with a spread of states — the same view a late-
+    // joiner observer restores from a running cluster.
+    let state = seed_state(
+        &[],
+        &[
+            (task("c1", "P", &[]), Seed::Completed),
+            (task("c2", "P", &[]), Seed::Completed),
+            (task("r", "P", &[]), Seed::Failed(ErrorType::Recoverable)),
+            (
+                task("if1", "P", &[]),
+                Seed::InFlight { secondary: "sec-a", worker: 0 },
+            ),
+            (task("ready1", "P", &[]), Seed::Pending),
+        ],
+    );
+
+    // The reporter starts on the seeded default — every metric zero, so
+    // a tick at this instant would correctly stay silent.
+    let source = SharedSnapshotSource::new(StatsSnapshot::default());
+    assert_eq!(source.snapshot(), StatsSnapshot::default());
+
+    // Drive ONE publish through the seam, exactly as the run loop does
+    // after `restore_from_snapshot_and_skip_setup`: project the live
+    // CRDT and publish it. A second handle (the reporter's clone) must
+    // now observe the real, NON-zero projection.
+    let reporter_view = source.clone();
+    source.publish(StatsSnapshot::from_cluster_state(&state));
+
+    let observed = reporter_view.snapshot();
+    assert_ne!(
+        observed,
+        StatsSnapshot::default(),
+        "reporter must observe a NON-zero snapshot after the live publish"
+    );
+    // The observed counts must reflect the real CRDT, not a placeholder.
+    assert_eq!(observed.succeeded, 2);
+    assert_eq!(observed.fail_retry, 1);
+    assert_eq!(observed.in_flight, 1);
+    assert_eq!(observed.per_secondary_in_flight.get("sec-a"), Some(&1));
+    assert_eq!(observed.ready_in_queue, 1);
+    // And it equals the direct projection — the cell is a faithful
+    // pass-through, no lossy copy.
+    assert_eq!(observed, StatsSnapshot::from_cluster_state(&state));
+}
+
 // ── cadence driver (paused virtual clock) ──
 
 /// A clock that reads the paused `tokio::time` virtual instant. Under
