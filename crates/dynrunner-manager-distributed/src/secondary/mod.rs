@@ -439,26 +439,26 @@ where
     pub(super) panik_signal_rx:
         Option<tokio::sync::oneshot::Receiver<crate::panik_watcher::PanikSignal>>,
 
-    /// Lifecycle hook invoked when this node owns the authoritative
-    /// primary pool and a phase reaches `Drained`. The PyO3 wrapper
-    /// installs a GIL-reacquiring closure that calls Python's
-    /// `task.on_phase_end(phase_id, completed, failed)`.
+    /// Lifecycle hook the PyO3 wrapper registers (a GIL-reacquiring
+    /// closure calling Python's `task.on_phase_end(phase_id, completed,
+    /// failed)`).
     ///
-    /// R4 SEAM: the secondary holds NO authority, so it has no
-    /// phase-machine to fire this from — the fire site (and the
-    /// per-phase counters it consumed) were the deleted authority
-    /// mirror. Under P4 composition the co-located `PrimaryCoordinator`
-    /// (which already owns `on_phase_end` + the phase machine) fires
-    /// this; pyo3 registers the lifecycle hook on the PRIMARY, not the
-    /// secondary. Kept here only as the wiring anchor R4 re-homes.
-    #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
+    /// The secondary holds NO authority and runs no phase machine — the
+    /// fire site is the co-located authoritative `PrimaryCoordinator`,
+    /// which owns `on_phase_end` and the phase machine. This field is
+    /// the registration ANCHOR: the PyO3 secondary wrapper still accepts
+    /// the closure (keeping the `register_phase_lifecycle_callbacks`
+    /// pre-run contract stable for callers minting a handle from a
+    /// secondary), but it is consumed only once the composed-primary
+    /// runtime hands it to the co-located primary at activation. Until
+    /// that runtime wiring lands the field is write-only on this side.
+    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
     pub(super) on_phase_end:
         Option<crate::primary::OnPhaseEnd>,
 
-    /// Lifecycle hook invoked when this node owns the authoritative
-    /// primary pool and a phase flips Blocked → Active. Sibling of
-    /// `on_phase_end`; same R4-seam disposition.
-    #[allow(dead_code)] // TODO(R4): re-home lifecycle registration to PrimaryCoordinator
+    /// Phase-start sibling of `on_phase_end`; same registration-anchor
+    /// disposition (fired by the co-located primary, not the secondary).
+    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
     pub(super) on_phase_start:
         Option<crate::primary::OnPhaseStart>,
 
@@ -466,20 +466,20 @@ where
     /// PyO3 surface (when the handle was minted from a
     /// `PySecondaryCoordinator`).
     ///
-    /// R4 SEAM: the secondary no longer drains this channel — the
-    /// externally-issued `PrimaryCommand`s are authority mutations whose
-    /// only correct owner is the co-located `PrimaryCoordinator`. Under
-    /// P4 composition the command channel is registered on the PRIMARY.
-    /// Kept here only as the wiring anchor R4 re-homes (so the PyO3
-    /// `command_sender()` clone keeps a stable type until then).
-    #[allow(dead_code)] // TODO(R4): re-home the command channel to PrimaryCoordinator
+    /// Externally-issued `PrimaryCommand`s are authority mutations whose
+    /// only correct owner is the co-located `PrimaryCoordinator`; the
+    /// secondary never drains this channel. The field is the
+    /// registration ANCHOR keeping the PyO3 `command_sender()` clone a
+    /// stable type — the composed-primary runtime hands the receiver to
+    /// the primary's command loop. Write-only on this side until then.
+    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
     pub(super) command_rx:
         Option<tokio::sync::mpsc::Receiver<crate::primary::PrimaryCommand<I>>>,
 
     /// Sender side of the secondary's command channel, cloned to
-    /// consumers via `command_sender()`. Same R4-seam disposition as
-    /// `command_rx`.
-    #[allow(dead_code)] // TODO(R4): re-home the command channel to PrimaryCoordinator
+    /// consumers via `command_sender()`. Same registration-anchor
+    /// disposition as `command_rx`.
+    #[allow(dead_code)] // consumed by the co-located PrimaryCoordinator under composition
     pub(super) command_tx:
         tokio::sync::mpsc::Sender<crate::primary::PrimaryCommand<I>>,
 

@@ -78,7 +78,7 @@ where
         // Request tasks only for workers that didn't get initial assignments
         for i in 0..self.pool.workers.len() {
             if self.pool.workers[i].is_idle_state() {
-                self.request_task_for_worker(i as WorkerId, factory).await?;
+                self.request_task_for_worker(i as WorkerId).await?;
             }
         }
 
@@ -120,13 +120,12 @@ where
         // channel: the externally-issued `PrimaryCommand`s
         // (FailPermanent / ReinjectTask / UpdatePreferredSecondaries /
         // SpawnTasks) are authority mutations whose only correct owner
-        // is the co-located `PrimaryCoordinator`. The `command_tx` /
-        // `command_rx` fields stay on the struct purely as a wiring
-        // anchor for the PyO3 `PrimaryHandle`; R4's composition re-homes
-        // that handle onto the authoritative `PrimaryCoordinator` over
-        // the loopback, so this loop never drains the channel.
-        // TODO(R4): re-home the command channel to the co-located
-        //   `PrimaryCoordinator` (P4 composition).
+        // is the co-located `PrimaryCoordinator` (which runs the command
+        // arm in its own operational loop). The `command_tx` /
+        // `command_rx` fields stay on the struct as the registration
+        // anchor keeping the PyO3 `PrimaryHandle` clone a stable type;
+        // the composed-primary runtime hands the receiver to the
+        // primary's command loop. This secondary loop never drains it.
 
         loop {
             // Workers that need restart after disconnect
@@ -144,7 +143,7 @@ where
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
-                        let restart = self.handle_worker_event(event, factory, &oom_watcher).await?;
+                        let restart = self.handle_worker_event(event, &oom_watcher).await?;
                         if let Some(wid) = restart {
                             workers_to_restart.push(wid);
                         }
@@ -281,7 +280,7 @@ where
                     // primary path doesn't track per-peer worker
                     // idleness, so the periodic re-poll is the
                     // failover-safe wakeup.
-                    self.repoll_idle_workers(factory).await;
+                    self.repoll_idle_workers().await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
                         let _ = self
@@ -430,7 +429,7 @@ where
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
                 }
-                let _ = self.request_task_for_worker(wid, factory).await;
+                let _ = self.request_task_for_worker(wid).await;
             }
         }
 

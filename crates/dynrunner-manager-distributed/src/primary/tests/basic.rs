@@ -202,13 +202,14 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
         // wait_for_setup.
         let binaries = vec![make_binary("only", 50)];
 
-        // The pre-fix bug doesn't prevent primary.run() from
-        // returning — secondary 0 completes the binary, pool drains,
-        // primary exits. But secondary 1 is wedged in
-        // wait_for_setup and never reaches process_tasks, so its
-        // `completed_count()` would never observe the cluster-wide
-        // forward (the value stays at 0 instead of 1). That
-        // discrepancy is the test signal.
+        // The empty-batch secondary (the one the single task did NOT
+        // land on) must still escape `wait_for_setup` into
+        // `process_tasks` and exit cleanly when the run completes —
+        // pre-fix it wedged in `wait_for_setup` forever (no
+        // InitialAssignment), and its `handle.await` below would hang
+        // the test rather than return. The handles returning at all is
+        // the "both secondaries reached process_tasks and observed the
+        // run-complete cue" signal under the composed semantics.
         let (deps, ops, ope) = noop_phase_args();
         primary.run(binaries, deps, ops, ope).await.unwrap();
 
@@ -223,18 +224,22 @@ async fn empty_batch_secondary_still_reaches_process_tasks() {
 
         assert_eq!(completed, 1);
         assert_eq!(failed, 0);
-        // Both secondaries must have reached process_tasks; the
-        // cluster-wide TaskComplete forward registers in each
-        // secondary's `completed_tasks` set. Pre-fix the
-        // empty-batch secondary is stuck in wait_for_setup and its
-        // count stays at 0.
-        for (i, count) in per_sec_completed.iter().enumerate() {
-            assert!(
-                *count >= 1,
-                "secondary {i} should have observed the cluster's 1 \
-                 completion (entered process_tasks); saw {count}"
-            );
-        }
+        // `spawn_real_secondary`'s handle returns each secondary's
+        // OWN-worker run count. In the unified model a secondary runs
+        // only its own assigned work and keeps no cluster-wide
+        // `completed_tasks` mirror (that was the demolished
+        // demoted-primary authority mirror). The one task runs on
+        // exactly one secondary's worker, so the own-work counts
+        // partition it: their SUM is 1, and the OTHER secondary ran 0
+        // — yet still returned cleanly (reached `process_tasks` and saw
+        // the run-complete cue), which is exactly the
+        // escaped-wait_for_setup invariant this test guards.
+        let total_own: usize = per_sec_completed.iter().sum();
+        assert_eq!(
+            total_own, 1,
+            "the single task must run on exactly one secondary's worker; \
+             own-work counts {per_sec_completed:?} must sum to 1"
+        );
     }).await;
 }
 

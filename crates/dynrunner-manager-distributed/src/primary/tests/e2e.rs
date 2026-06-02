@@ -165,20 +165,29 @@ async fn e2e_primary_and_two_secondaries() {
 
         assert_eq!(completed, 10);
         assert_eq!(failed, 0);
-        // After the failover-survivability fix, every secondary's
-        // `completed_tasks` reflects the CLUSTER view (own work +
-        // peer broadcasts + primary-side forwards) so it can serve
-        // as a promoted-primary on local-death without
-        // re-dispatching done items. Each secondary therefore sees
-        // all 10 completions, not just its own ~5. Asserting the
-        // cluster-wide invariant directly: every secondary's set
-        // has at least the total — anything less is a missed
-        // forward that would cause a re-dispatch on failover.
+        // `spawn_real_secondary`'s handle returns each secondary's
+        // OWN-worker run count (`local_tasks_run_for_test`). In the
+        // unified model a secondary is a worker host, not an authority
+        // mirror — it does NOT keep a cluster-wide `completed_tasks`
+        // set (that was the demolished demoted-primary mirror). Every
+        // task runs on exactly one secondary's worker, so the per-
+        // secondary own-work counts partition the 10 tasks: their SUM
+        // is the total and each secondary ran at least one (the fleet
+        // genuinely shared the load, not all on one node). The
+        // cluster-wide convergence invariant (every node's replicated
+        // CRDT observes all 10 terminals) is asserted at the CRDT layer
+        // in `cluster_state_converges_on_primary_and_secondary`.
+        let total_own: usize = per_sec_completed.iter().sum();
+        assert_eq!(
+            total_own, 10,
+            "every task must run on exactly one secondary's worker; the \
+             own-work counts {per_sec_completed:?} must partition all 10 tasks"
+        );
         for (i, count) in per_sec_completed.iter().enumerate() {
             assert!(
-                *count >= 10,
-                "secondary {i} should have observed all 10 completions \
-                 (cluster-wide view for failover survivability), got {count}"
+                *count >= 1,
+                "secondary {i} should have run at least one task (load shared \
+                 across the fleet), got {count}"
             );
         }
     }).await;

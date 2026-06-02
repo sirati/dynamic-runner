@@ -449,10 +449,22 @@ impl PyDistributedManager {
                             child_processes: Vec::new(),
                         };
 
+                        // Compose the opaque secondary transport: the
+                        // co-located channel end is the uplink to the
+                        // in-process primary, `NoPeerTransport` is the
+                        // (absent) mesh. `Address::Role(Role::Primary)`
+                        // resolves to the loopback channel while the role
+                        // cache is cold — exactly the in-process
+                        // primary. See `UnifiedSecondaryTransport`.
+                        let unified =
+                            dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
+                                config.secondary_id.clone(),
+                                transport,
+                                dynrunner_transport_quic::NoPeerTransport,
+                            );
                         let mut secondary = SecondaryCoordinator::new(
                             config,
-                            transport,
-                            dynrunner_transport_quic::NoPeerTransport,
+                            unified,
                             sec_scheduler_config.build_memory_scheduler(),
                             estimator,
                         );

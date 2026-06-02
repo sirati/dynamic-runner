@@ -466,7 +466,7 @@ where
                 // primary (resolved through the transport's RoleCache,
                 // now updated by the `PrimaryChanged` apply above)
                 // instead of waiting up to a keepalive interval.
-                self.repoll_idle_workers(factory).await;
+                self.repoll_idle_workers().await;
                 Ok(())
             }
             DistributedMessage::TaskComplete { task_hash, .. } => {

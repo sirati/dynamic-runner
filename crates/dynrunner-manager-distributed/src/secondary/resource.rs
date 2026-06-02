@@ -226,25 +226,26 @@ where
                     tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
                     return;
                 }
-                let _ = self.request_task_for_worker(worker_id, factory).await;
+                let _ = self.request_task_for_worker(worker_id).await;
             }
             ResourcePressureResult::NoAction => {}
         }
     }
 
-    /// Handle a worker event (completion, disconnection, etc.)
+    /// Send a `TaskRequest` for one idle worker to the current primary
+    /// role.
     ///
-    /// Returns `Some(worker_id)` if the worker needs to be restarted (e.g.
-    /// after disconnect). The caller is responsible for calling
+    /// A pure capacity hint: rate-limited per worker by `primary_link.
+    /// should_request_now`, then dispatched as a single
+    /// `Address::Role(Role::Primary)` send through the opaque transport
+    /// (the request routes to the uplink, a promoted peer, or loopback
+    /// depending on the role cache — the manager never branches on
+    /// locality). Since the P2 transport collapse this no longer needs a
+    /// `WorkerFactory`: the request never spawns or restarts a worker, it
+    /// only advertises the worker's available capacity to the authority.
     pub(super) async fn request_task_for_worker(
         &mut self,
         worker_id: WorkerId,
-        // Unused since the P2 transport collapse (the request is a pure
-        // `Address::Role(Role::Primary)` send now); kept in the
-        // signature so the many call sites stay uniform with the
-        // worker-event paths that DO need a factory. Prefixed to mark
-        // intentionally-unused.
-        _factory: &mut impl WorkerFactory<M>,
     ) -> Result<(), String> {
         if !self.primary_link.should_request_now(worker_id) {
             return Ok(());
@@ -285,14 +286,11 @@ where
     /// completions and the primary's kickstart targeted only one of
     /// them). Regular live-primary runs see most polls suppressed by
     /// the backoff because the kickstart already covers the path.
-    pub(super) async fn repoll_idle_workers(
-        &mut self,
-        factory: &mut impl WorkerFactory<M>,
-    ) {
+    pub(super) async fn repoll_idle_workers(&mut self) {
         let n = self.pool.workers.len();
         for wid in 0..n {
             if self.pool.workers[wid].is_idle_state() {
-                let _ = self.request_task_for_worker(wid as WorkerId, factory).await;
+                let _ = self.request_task_for_worker(wid as WorkerId).await;
             }
         }
     }

@@ -28,17 +28,31 @@ fn phased(name: &str, phase: &str) -> TaskInfo<TestId> {
 /// One-secondary primary with a pool seeded from `tasks` (phase
 /// `work`) and one idle worker (`sec-0`, local worker 0) carrying a
 /// generous memory budget so the scheduler always fits a 100-byte
-/// task. Returns the primary ready to receive handler calls.
+/// task. Returns the primary AND the live secondary channel ends — the
+/// caller MUST hold the ends for the duration of the test so the
+/// `TaskAssignment` wire send inside `handle_task_request` /
+/// `dispatch_to_idle_workers` reaches a live receiver; dropping them
+/// closes `sec-0`'s channel and every assignment send fails into the
+/// rollback arm (slot stays idle), which is a transport artefact, not
+/// the slot-lifecycle behaviour under test.
+#[allow(clippy::type_complexity)]
 fn primary_with_pool_and_idle_worker(
     tasks: Vec<TaskInfo<TestId>>,
-) -> PrimaryCoordinator<
-    ChannelSecondaryTransportEnd<TestId>,
-    NoPeers,
-    ResourceStealingScheduler,
-    FixedEstimator,
-    TestId,
-> {
-    let (transport, _ends) = setup_test(1);
+) -> (
+    PrimaryCoordinator<
+        ChannelSecondaryTransportEnd<TestId>,
+        NoPeers,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    Vec<(
+        String,
+        tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+        tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>,
+    )>,
+) {
+    let (transport, ends) = setup_test(1);
     let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
         PrimaryConfig::default(),
         transport,
@@ -61,7 +75,7 @@ fn primary_with_pool_and_idle_worker(
         0,
         ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024u64)]),
     );
-    primary
+    (primary, ends)
 }
 
 fn task_request(secondary_id: &str, worker_id: u32) -> DistributedMessage<TestId> {
@@ -105,8 +119,12 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
             let hash_x = compute_task_hash(&x);
             // Seed ONLY X first so the initial assignment deterministically
             // takes X; inject Y afterwards so the reordered bare request
-            // has a second task it could (wrongly) double-assign.
-            let mut primary = primary_with_pool_and_idle_worker(vec![x]);
+            // has a second task it could (wrongly) double-assign. The
+            // secondary channel ends are held live (`_ends`) so the
+            // `TaskAssignment` wire send inside `handle_task_request`
+            // succeeds — dropping them would fail the send and trip the
+            // rollback arm, leaving the slot idle.
+            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![x]);
 
             // Initial request assigns X to (sec-0, w0).
             primary
@@ -148,9 +166,19 @@ async fn reordered_request_then_complete_credits_correct_phase_no_double_assign(
                 "Y must stay queued — the held worker cannot take a second task"
             );
 
+            // Drain Y from the pool before X's completion so the
+            // terminal's kickstart-dispatch (the correct post-completion
+            // re-fill of a now-idle worker) has nothing to immediately
+            // re-assign onto the freed slot — keeping THIS assertion
+            // focused on the X-terminal freeing the slot, not on the
+            // orthogonal (and correct) re-dispatch of queued work.
+            let _drained = primary.pool_mut().drain_queued();
+            assert_eq!(primary.pool().iter().count(), 0, "Y drained out");
+
             // Now the completion for X lands. X is credited to phase
-            // `work` (counter drops to 0 for the now-finished X — Y is
-            // queued, not in-flight) and the slot frees to Idle.
+            // `work` (counter drops to 0 for the now-finished X) and the
+            // slot frees to Idle (nothing queued for the kickstart to
+            // re-fill it with).
             primary
                 .handle_task_complete(task_complete("sec-0", 0, &hash_x), &mut None)
                 .await;
@@ -190,34 +218,54 @@ async fn stale_complete_after_reassignment_is_noop_on_slot() {
             let y = phased("task-y", "work");
             let hash_x = compute_task_hash(&x);
             let hash_y = compute_task_hash(&y);
-            // Seed only X; Y is injected after X completes so each
-            // assignment is deterministic.
-            let mut primary = primary_with_pool_and_idle_worker(vec![x]);
+            // Seed BOTH X and Y so phase `work` carries two items and
+            // stays Active after X completes — its single-item drain
+            // would otherwise mark the phase Done, hiding Y from
+            // `view_for_worker` (Active-only) and blocking the
+            // reassignment this test depends on.
+            let (mut primary, _ends) =
+                primary_with_pool_and_idle_worker(vec![x.clone(), y]);
 
-            // Assign X to the worker.
+            // Assign X to the worker. With two items queued the
+            // scheduler picks one deterministically (size-equal →
+            // insertion order → X first); pin the assertion to whichever
+            // landed so the reassignment logic below is what's tested.
             primary
                 .handle_task_request(task_request("sec-0", 0))
                 .await
                 .unwrap();
-            assert!(primary.slot_holds_hash_for_test("sec-0", 0, &hash_x));
+            // Re-derive which task the slot took, so the "complete the
+            // held task, get reassigned to the other" flow is order-
+            // independent. We want the slot to end holding the OTHER
+            // task after completing the first.
+            let (first_hash, other_hash) =
+                if primary.slot_holds_hash_for_test("sec-0", 0, &hash_x) {
+                    (hash_x.clone(), hash_y.clone())
+                } else {
+                    (hash_y.clone(), hash_x.clone())
+                };
 
-            // X completes — slot frees, X drained from the ledger.
+            // The held task completes — slot frees, its ledger entry
+            // drains, and the terminal's kickstart re-dispatch re-fills
+            // the now-idle worker with the still-queued OTHER task (phase
+            // `work` stays Active because a second item remains). The
+            // slot now holds `other`; `first` is long gone from the
+            // ledger. This reproduces the "worker reassigned" state the
+            // stale terminal below must NOT disturb.
             primary
-                .handle_task_complete(task_complete("sec-0", 0, &hash_x), &mut None)
+                .handle_task_complete(
+                    task_complete("sec-0", 0, &first_hash),
+                    &mut None,
+                )
                 .await;
-            assert!(primary.slot_is_idle_for_test("sec-0", 0));
-
-            // Y enters the pool; the worker requests again → reassigned
-            // to Y. The slot now holds Y; X is long gone from the ledger.
-            primary.pool_mut().extend(vec![y]).expect("valid extend");
-            primary
-                .handle_task_request(task_request("sec-0", 0))
-                .await
-                .unwrap();
             assert!(
-                primary.slot_holds_hash_for_test("sec-0", 0, &hash_y),
-                "worker reassigned to Y"
+                primary.slot_holds_hash_for_test("sec-0", 0, &other_hash),
+                "worker reassigned to the other task by the completion kickstart"
             );
+            // Bind the reassignment-aware aliases the rest of the test
+            // reads (`hash_x` plays the stale-terminal role; `hash_y`
+            // the now-held role) without renaming downstream asserts.
+            let (hash_x, hash_y) = (first_hash, other_hash);
             assert_eq!(primary.in_flight_len_for_test(), 1, "only Y in flight");
             let work_completed_before = *primary
                 .phase_completed
@@ -274,8 +322,19 @@ fn primary_two_secondaries_with_pool(
     )>,
 ) {
     let (transport, ends) = setup_test(2);
+    // Configure a generous per-type cap for `default` so the
+    // `in_flight_per_type` ledger is actually populated on dispatch —
+    // `reserve_type_slot` is a no-op for types absent from
+    // `max_concurrent_per_type`. The cap (100) is far above the two
+    // tasks this fixture dispatches, so `cap_filter_view` never trims
+    // the view; the only observable effect is that the type-slot
+    // accounting this test asserts on is exercised.
+    let config = PrimaryConfig {
+        max_concurrent_per_type: HashMap::from([(TypeId::from("default"), 100)]),
+        ..PrimaryConfig::default()
+    };
     let mut primary: PrimaryCoordinator<_, _, _, _, TestId> = PrimaryCoordinator::new(
-        PrimaryConfig::default(),
+        config,
         transport,
         NoPeers,
         ResourceStealingScheduler::memory(),
@@ -387,6 +446,14 @@ async fn survivor_terminal_after_sibling_secondary_death_resolves_by_stable_iden
                 1
             );
 
+            // Drain the requeued dead task out of the pool before the
+            // survivor's completion so the terminal's kickstart re-fill
+            // (a now-idle worker legitimately picking up queued work)
+            // has nothing to re-assign — keeping the assertion below
+            // focused on the stable-identity slot-free, not on the
+            // orthogonal re-dispatch.
+            let _drained = primary.pool_mut().drain_queued();
+
             // THE terminal: sec-1's survivor task completes. With a
             // stale positional index this `handle_task_complete` would
             // index `self.workers[1]` (out of bounds → PANIC). Keyed by
@@ -445,7 +512,7 @@ async fn complete_for_untracked_hash_is_noop() {
         .run_until(async {
             let y = phased("task-y", "work");
             let hash_y = compute_task_hash(&y);
-            let mut primary = primary_with_pool_and_idle_worker(vec![y]);
+            let (mut primary, _ends) = primary_with_pool_and_idle_worker(vec![y]);
 
             primary
                 .handle_task_request(task_request("sec-0", 0))

@@ -56,11 +56,10 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// the new pool's `completed_tasks` with those task_ids,
     /// `extend()`'s validation rejects every variant whose toolchain
     /// finished pre-composition as `UnknownTaskDep`.
-    // R4 SEAM: the faithful CRDT→pool hydration the composed primary
-    // runs on its seeded resume (bootstrap + failover). No caller until
-    // P4 composition wires `activate_local_primary`; exercised by the
-    // hydrate tests meanwhile.
-    #[allow(dead_code)] // TODO(R4): called from activate_local_primary (P4 composition)
+    /// Called from [`PrimaryCoordinator::activate_local_primary`] on the
+    /// seeded-resume path (a parked co-located primary activating into an
+    /// already-replicated cluster ledger after failover), and exercised
+    /// directly by the hydrate tests.
     pub(crate) fn hydrate_from_cluster_state(&mut self) {
         let mut completed_task_ids: HashSet<String> = HashSet::new();
         let mut primary_completed: HashSet<String> = HashSet::new();

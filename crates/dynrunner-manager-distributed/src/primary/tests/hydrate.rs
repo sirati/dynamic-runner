@@ -239,3 +239,155 @@ async fn inherited_in_flight_completion_decrements_phase_counter() {
         })
         .await;
 }
+
+/// `activate_local_primary` is the single composition mechanism both
+/// handoff sides converge on. On the FAILOVER-resume shape — a parked
+/// co-located primary that never ran `run_pipeline`'s pool-build
+/// (`total_tasks == 0`) activating into an ALREADY-replicated ledger
+/// (`cluster_state.task_count() > 0`) — it must hydrate the pool +
+/// in-flight ledger + completed set from the CRDT, BYPASSING the connect
+/// / mesh-ready handshake. This pins that the production entry point
+/// (not just `hydrate_from_cluster_state` in isolation) seeds the resume.
+#[tokio::test(flavor = "current_thread")]
+async fn activate_local_primary_hydrates_on_seeded_resume() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+                PrimaryCoordinator::new(
+                    PrimaryConfig::default(),
+                    transport,
+                    NoPeers,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+
+            // Replicated ledger as a failover-resuming node would have
+            // it: one completed prereq + two pending dependents, with the
+            // pool still UNSEEDED (`total_tasks == 0`, `pending == None`)
+            // — the parked-primary signature.
+            let toolchain = dep_binary("toolchain", "build", &[]);
+            let dep_a = dep_binary("dep-a", "compile", &["toolchain"]);
+            let dep_b = dep_binary("dep-b", "compile", &["toolchain"]);
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::PhaseDepsSet {
+                    deps: HashMap::from([(
+                        PhaseId::from("compile"),
+                        vec![PhaseId::from("build")],
+                    )]),
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "toolchain".into(),
+                    task: toolchain,
+                });
+                cs.apply(ClusterMutation::TaskCompleted {
+                    hash: "toolchain".into(),
+                    result_data: None,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "dep-a".into(),
+                    task: dep_a,
+                });
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "dep-b".into(),
+                    task: dep_b,
+                });
+            }
+
+            // Precondition: parked — no pool, no counted tasks.
+            assert!(
+                primary.pending.is_none(),
+                "parked primary starts with no pool"
+            );
+            assert_eq!(primary.total_tasks, 0, "parked primary counts no tasks yet");
+
+            // THE production entry point. The seeded-resume discriminator
+            // (`total_tasks == 0 && cluster_state.task_count() > 0`) is
+            // true, so this hydrates.
+            primary
+                .activate_local_primary()
+                .await
+                .expect("activation must succeed");
+
+            // Hydration ran: the pool holds the two dependents, the
+            // completed prereq is recorded, and total_tasks tracks the
+            // full ledger.
+            let pool = primary.pool();
+            assert_eq!(pool.len(), 2, "both dependents hydrated into the pool");
+            let ids: std::collections::HashSet<&str> =
+                pool.iter().map(|t| t.task_id.as_str()).collect();
+            assert!(ids.contains("dep-a") && ids.contains("dep-b"));
+            assert!(
+                primary.completed_tasks.contains("toolchain"),
+                "completed prereq recorded on the primary-side ledger"
+            );
+            assert_eq!(
+                primary.total_tasks, 3,
+                "total_tasks refreshed from the replicated ledger"
+            );
+        })
+        .await;
+}
+
+/// Negative control for the seeded-resume discriminator: the BOOTSTRAP
+/// shape — `run_pipeline` already set `total_tasks` from `binaries`
+/// before calling `activate_local_primary` — must NOT re-hydrate (it
+/// would clobber the freshly-built pool with a CRDT rebuild). Activation
+/// is a no-op on the pool when `total_tasks > 0`.
+#[tokio::test(flavor = "current_thread")]
+async fn activate_local_primary_does_not_hydrate_on_bootstrap() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (transport, _ends) = setup_test(1);
+            let mut primary: PrimaryCoordinator<_, _, _, _, TestId> =
+                PrimaryCoordinator::new(
+                    PrimaryConfig::default(),
+                    transport,
+                    NoPeers,
+                    ResourceStealingScheduler::memory(),
+                    FixedEstimator(100),
+                );
+
+            // Bootstrap shape: a pool already built and `total_tasks`
+            // set, with the CRDT also holding a (mirrored) ledger. The
+            // discriminator must read `total_tasks > 0` and skip
+            // hydration so the bootstrap pool is left intact.
+            let phase = PhaseId::from("work");
+            let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
+                [phase.clone()],
+                HashMap::new(),
+            )
+            .expect("work-phase pool");
+            primary.pending = Some(pool);
+            primary.total_tasks = 5;
+            {
+                let cs = primary.cluster_state_mut_for_test();
+                cs.apply(ClusterMutation::TaskAdded {
+                    hash: "crdt-task".into(),
+                    task: dep_binary("crdt-task", "work", &[]),
+                });
+            }
+
+            primary
+                .activate_local_primary()
+                .await
+                .expect("activation must succeed");
+
+            // No re-hydration: total_tasks unchanged (a hydrate would
+            // have refreshed it to cluster_state.task_count() == 1), and
+            // the bootstrap pool is still the empty one we installed.
+            assert_eq!(
+                primary.total_tasks, 5,
+                "bootstrap activation must NOT refresh total_tasks from the CRDT"
+            );
+            assert_eq!(
+                primary.pool().iter().count(),
+                0,
+                "bootstrap pool left intact (no CRDT rebuild)"
+            );
+        })
+        .await;
+}

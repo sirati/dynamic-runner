@@ -314,10 +314,13 @@ where
                     };
                     // No transitional self-as-primary routing target —
                     // authority is committed only once this candidate
-                    // wins quorum and broadcasts `PromotePrimary`
-                    // (R4's `activate_local_primary`), whose
-                    // `PrimaryChanged` apply re-points every node's
-                    // RoleCache.
+                    // wins quorum (`record_promotion_confirm` reaches
+                    // `Promoted`). The failover re-point — broadcasting
+                    // `PromotePrimary { new = self }` so surviving
+                    // secondaries' role cache moves off the dead uplink
+                    // onto this winner's mesh peer — is the composed
+                    // runtime's terminal action on that transition, not a
+                    // transitional Voting-time hint.
                     actions.broadcast.push(DistributedMessage::PromotionVote {
                         sender_id: self.config.secondary_id.clone(),
                         timestamp: timestamp_now(),
@@ -450,10 +453,12 @@ where
             tracing::info!(round, "won election — taking over as primary");
             // The election state machine only records the terminal
             // `Promoted` state transition. Activating the co-located
-            // primary (seeding its pool from the replicated CRDT and
-            // entering its operational loop) is R4's terminal action,
-            // wired through the unified composition — the secondary
-            // carries no self-promotion mirror to flip on here.
+            // primary — `PrimaryCoordinator::activate_local_primary`,
+            // which on this seeded-resume path hydrates the pool from the
+            // replicated CRDT and enters the operational loop — is the
+            // terminal action the composed runtime drives off this
+            // transition; the secondary carries no self-promotion mirror
+            // to flip on here.
             self.election = ElectionState::Promoted;
         }
         promoted

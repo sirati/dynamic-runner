@@ -120,7 +120,7 @@ where
                 // keepalive interval. Own-worker management, not
                 // authority.
                 if !matches!(error_type, ErrorType::Recoverable) {
-                    self.repoll_idle_workers(factory).await;
+                    self.repoll_idle_workers().await;
                 }
                 tracing::trace!(
                     peer = %secondary_id,
