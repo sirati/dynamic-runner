@@ -8,6 +8,10 @@
 //!   its two documented branches (missing source → error; present
 //!   source → transfer_file + chmod 755 + remote path recorded on
 //!   the manager) plus the manager → wrapper-renderer wiring.
+//! - [`important_events`] — pins that the image build/transfer step
+//!   emits its building-image + uploading-image events on the
+//!   `crate::IMPORTANT_TARGET` tracing marker.
 
+mod important_events;
 mod legacy;
 mod shutdown_binary;

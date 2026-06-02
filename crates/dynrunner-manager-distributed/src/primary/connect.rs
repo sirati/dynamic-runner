@@ -137,7 +137,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
             }
         }
 
-        tracing::info!("all {} secondaries connected", self.secondaries.len());
+        // Whole-cluster-ready milestone (the LLM-wake "connected to
+        // gateway" event): every connected secondary has completed
+        // cert-exchange, so the mesh is formed and the run can proceed.
+        // Emitted at the importance target so the dual-sink routes it
+        // to stdio under `--important-stdio-only` while the full log
+        // keeps it too.
+        tracing::info!(
+            target: super::important_events::IMPORTANT_TARGET,
+            secondaries = self.secondaries.len(),
+            "all secondaries connected",
+        );
         Ok(())
     }
 

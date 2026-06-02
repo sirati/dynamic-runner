@@ -866,6 +866,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // transport-local fact.
         this.peer_transport
             .register_with_cluster_state(&mut this.cluster_state);
+        // Subscribe the primary-side "important" (LLM-wake-worthy)
+        // emission for `PrimaryChanged` to the same role-change hook
+        // fabric. Self-contained observability concern: it reads only
+        // the post-mutation `RoleTable` the hook is handed and emits at
+        // `target: dynrunner_important`, so the CRDT apply path stays
+        // free of any logging coupling. A promoted secondary runs its
+        // co-located primary coordinator, so the hook rides promotion.
+        super::important_events::register_primary_changed_important_hook(
+            &mut this.cluster_state,
+        );
         this
     }
 
@@ -2578,6 +2588,19 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         let active: Vec<PhaseId> = self.pool().active_phases();
         for p in active {
             if self.phase_started_emitted.insert(p.clone()) {
+                // Starting-job-phase / phase-transition (phase start)
+                // important event. This `insert` guard is the single
+                // once-per-phase edge for both the initial-active phases
+                // and the runtime activations cascaded by
+                // `mark_phase_done`, so it is the canonical phase-start
+                // occurrence point. Emitted at the importance target;
+                // task spawning the consumer drives off `on_phase_start`
+                // below rides the same transition.
+                tracing::info!(
+                    target: super::important_events::IMPORTANT_TARGET,
+                    phase = %p,
+                    "starting job phase",
+                );
                 // Tell worker management a phase started and how many
                 // workers it minimally needs to make progress. This is a
                 // pure EMIT onto the decoupled worker-management bus — the
