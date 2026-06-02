@@ -464,6 +464,112 @@ where
         promoted
     }
 
+    /// Fire the promotion-activation gate for the co-located parked
+    /// primary (fire-once). Wakes `PrimaryCoordinator::run_parked` into
+    /// its seeded resume (`activate_local_primary` → hydrate-from-CRDT →
+    /// operational loop).
+    ///
+    /// `take()` makes this idempotent across the TWO paths that reach
+    /// the terminal `Promoted` state: winning this node's OWN election
+    /// (`record_promotion_confirm` → true, via `fire_local_promotion`)
+    /// and being NAMED primary by a `PromotePrimary` broadcast (the
+    /// `dispatch/router` arm). Only the first consumes the sender; the
+    /// second is a no-op on the gate. No-op entirely when no co-located
+    /// primary was composed (`promote_activation_tx` is `None`).
+    pub(in crate::secondary) fn activate_co_located_primary(&mut self) {
+        if let Some(tx) = self.promote_activation_tx.take() {
+            // Hand the parked primary a SNAPSHOT of this secondary's
+            // continuously-mirrored cluster_state — the seed it
+            // `restore`s before `hydrate_from_cluster_state`. The parked
+            // primary's own cluster_state is empty (the role-aware tap
+            // does not feed it CRDT mirror frames), so this snapshot IS
+            // the ledger it resumes from.
+            let snapshot = self.cluster_state.snapshot();
+            if tx.send(snapshot).is_err() {
+                tracing::warn!(
+                    secondary = %self.config.secondary_id,
+                    "promotion-activation gate receiver dropped before firing \
+                     — the parked co-located primary is gone"
+                );
+            } else {
+                tracing::info!(
+                    secondary = %self.config.secondary_id,
+                    "fired promotion-activation gate with cluster_state snapshot; \
+                     co-located primary will restore + hydrate and take authority"
+                );
+            }
+        }
+    }
+
+    /// Terminal action for THIS node reaching the `Promoted` state: wake
+    /// the co-located parked primary into its seeded resume and re-point
+    /// every surviving secondary's `Role::Primary` onto this winner.
+    ///
+    /// Two side effects, both idempotent on a second call:
+    ///   1. Fire the promotion-activation gate (`promote_activation_tx`,
+    ///      registered by the composed runtime). The parked
+    ///      `PrimaryCoordinator::run_parked` is waiting on the matching
+    ///      oneshot; firing it triggers `activate_local_primary`
+    ///      (hydrate-from-CRDT seeded resume) + the operational loop.
+    ///      `take()` makes this fire-once: the own-election-win path
+    ///      (`record_promotion_confirm` → true) and the peer-named path
+    ///      (the `PromotePrimary { new = self }` router arm) both call
+    ///      here, but only the first consumes the sender.
+    ///   2. Broadcast `PromotePrimary { new = self, epoch =
+    ///      primary_epoch + 1 }` onto the mesh. Surviving secondaries
+    ///      apply it as `ClusterMutation::PrimaryChanged`, whose
+    ///      write-through role-change hook re-points their transport's
+    ///      `Role::Primary` cache off the dead original-primary uplink
+    ///      onto this winner's mesh peer-id — the entire failover
+    ///      re-route, owned by the transport layer. `epoch + 1` strictly
+    ///      supersedes the prior identity (last-writer-wins on epoch),
+    ///      so a delayed lower-epoch broadcast cannot un-elect this
+    ///      winner.
+    ///
+    /// The OLD primary, observing this `PrimaryChanged`, becomes a pure
+    /// observer (it no longer holds `Role::Primary`) — R3's observe path.
+    ///
+    /// No-op on the gate when no co-located primary was composed
+    /// (Rust-only tests / legacy callers): `promote_activation_tx` is
+    /// `None`; the broadcast still fires so the mesh learns the new
+    /// authority.
+    pub(in crate::secondary) async fn fire_local_promotion(&mut self) {
+        // (1) Wake the parked co-located primary (fire-once).
+        self.activate_co_located_primary();
+
+        // (2) Broadcast the failover re-point. epoch+1 strictly
+        // supersedes the prior primary identity.
+        let epoch = self.cluster_state.primary_epoch() + 1;
+        let msg = DistributedMessage::PromotePrimary {
+            sender_id: self.config.secondary_id.clone(),
+            timestamp: timestamp_now(),
+            new_primary_id: self.config.secondary_id.clone(),
+            epoch,
+            // Failover after primary loss: the ledger is CRDT-merged
+            // from the in-flight broadcasts, NOT a fresh setup-defer
+            // discovery. `required_setup = false`.
+            required_setup: false,
+        };
+        if let Err(e) = self
+            .transport
+            .send(
+                dynrunner_protocol_primary_secondary::Address::Broadcast(
+                    dynrunner_protocol_primary_secondary::Scope::Mesh,
+                ),
+                msg,
+            )
+            .await
+        {
+            tracing::warn!(
+                secondary = %self.config.secondary_id,
+                error = %e,
+                "PromotePrimary(new=self) failover broadcast failed; \
+                 surviving secondaries will re-point on the next election \
+                 round or via CRDT snapshot reconciliation"
+            );
+        }
+    }
+
     /// Whether the secondary has been elected primary in this run.
     #[allow(dead_code)]
     pub(in crate::secondary) fn is_promoted(&self) -> bool {

@@ -41,10 +41,11 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // state transition regardless of how many peer-forward
         // paths converge on us. The apply+filter primitive lives in
         // `cluster_state::apply_locally_for_broadcast` so this
-        // originator path and the promoted-secondary's mirror
-        // (`secondary::primary::apply_and_broadcast_mutations`) share
-        // one canonical filter; the broadcast step stays at each call
-        // site because the two transports have different error shapes.
+        // originator path and the secondary-side originator
+        // (`secondary::origination::apply_and_broadcast_mutations`, used
+        // by `ingest_setup_discovery` + panik self-departure) share one
+        // canonical filter; the broadcast step stays at each call site
+        // because the two transports have different error shapes.
         //
         // `apply_locally_for_broadcast` also surfaces any `TaskInfo`s
         // the apply pass auto-resumed from `Blocked → Pending` (a

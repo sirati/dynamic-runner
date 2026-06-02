@@ -147,19 +147,18 @@ impl PySecondaryCoordinator {
         // here under the GIL (the `make_on_phase_*` constructors
         // capture a `Py<PyAny>` clone of `task_definition_py` that the
         // closure body re-binds via `Python::attach` at each fire).
-        // Threaded into the inner `SecondaryCoordinator` via
-        // `register_phase_lifecycle_callbacks` BEFORE
-        // `run_until_setup_or_done` enters so the closures are visible
-        // to `note_primary_item_completed` from the first cascade.
-        //
-        // The secondary's `on_phase_end` invocation fires ONLY when
-        // this secondary owns the promoted-primary's `primary_pending`
-        // pool — i.e. after `PromotePrimary` (setup-promote or
-        // failover) flips `is_primary` true. Non-promoted secondaries
-        // hold the closures dormant and never call into Python, so the
-        // GIL-reacquiring cost is paid only on the post-promotion
-        // path. See
-        // `dynrunner-manager-distributed/src/secondary/primary/lifecycle.rs`.
+        // Registered on the `SecondaryCoordinator` BEFORE
+        // `run_until_setup_or_done` enters, then TRANSFERRED to the
+        // co-located parked `PrimaryCoordinator` via
+        // `take_composed_primary_wiring` (the real authority owns the
+        // phase machine). The closures fire ONLY when this node is
+        // promoted: the parked primary activates on the election's
+        // terminal `Promoted` transition, hydrates from the replicated
+        // ledger, and its operational-loop phase cascade drives
+        // `on_phase_start` / `on_phase_end`. A node that is never
+        // promoted holds the closures dormant on the parked primary and
+        // never calls into Python, so the GIL-reacquiring cost is paid
+        // only on the post-promotion path.
         let sec_on_phase_start: crate::managers::lifecycle::OnPhaseStart = Box::new(
             crate::managers::lifecycle::make_on_phase_start(
                 self.task_definition_py.clone_ref(py),
@@ -378,6 +377,14 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
+                // Cloneable mesh-send capability for the co-located
+                // parked primary's send-proxy (`Some` only when a real
+                // peer mesh exists — `Disabled` overlays have no remote
+                // secondaries and thus no failover, so no co-located
+                // primary is composed). Taken BEFORE `peer_network` moves
+                // into the unified transport. See `MeshSendHandle`.
+                let mesh_send_handle = peer_network.mesh_send_handle();
+
                 // Compose the opaque secondary transport: the WSS/QUIC
                 // `NetworkClient` is the uplink to the node this
                 // secondary dialled (the original primary), the
@@ -387,11 +394,26 @@ impl PySecondaryCoordinator {
                 // while the role cache is cold and re-points to a mesh
                 // peer once a `PromotePrimary` (failover) lands. See the
                 // crate docs on `UnifiedSecondaryTransport`.
-                let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
+                let mut unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
                     secondary_id.clone(),
                     client,
                     peer_network,
                 );
+
+                // Co-located-primary composition handles (the two-coords-
+                // on-one-LocalSet wiring). The ROLE-AWARE inbound tap
+                // diverts primary-facing frames to the parked primary
+                // once this node holds Role::Primary; the loopback
+                // injector is the own-secondary leg of the parked
+                // primary's hybrid SecondaryTransport. Both are inert
+                // until a real mesh + activation exist.
+                let colocated_primary_tap = unified.attach_colocated_primary_tap();
+                let colocated_loopback_tx = unified.loopback_injector();
+                // Clone the estimator for the co-located primary BEFORE
+                // the secondary consumes it; the primary's seeded-resume
+                // dispatch needs its own resource estimator.
+                let primary_estimator = estimator.clone();
+
                 let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(
                     config,
                     unified,
@@ -484,16 +506,145 @@ impl PySecondaryCoordinator {
                     sec_on_phase_end,
                 );
 
+                // ── Two-coordinators-on-one-LocalSet composition ──
+                //
+                // Build a PARKED co-located `PrimaryCoordinator` and
+                // spawn it on the SAME `LocalSet` as this secondary,
+                // behind `run_parked`'s promotion gate. This is the
+                // failover headline: a surviving SLURM secondary becomes
+                // primary in-place (no destroy-and-recompose) by waking
+                // its parked primary on the election's terminal
+                // `Promoted` transition — the secondary's
+                // `record_promotion_confirm` → `fire_local_promotion`
+                // fires the gate (handing over a cluster_state snapshot)
+                // and broadcasts `PromotePrimary { new = self }` so
+                // surviving peers re-point onto this winner.
+                //
+                // Only composed when a REAL mesh exists
+                // (`mesh_send_handle.is_some()`): a `Disabled` peer
+                // overlay has no remote secondaries to fail over among,
+                // so no co-located primary is built and the parked-primary
+                // join below is a no-op. Runtime behaviour (the actual
+                // mid-run failover) is e2e-validated in R5c — pyo3
+                // coordinator runtimes cannot be unit-tested (libpython
+                // linking). The composition's CONSTITUENTS (the parked
+                // `run_parked` seeded resume, the role-aware inbound tap,
+                // the mesh-send proxy, the activation terminal action) are
+                // each unit-tested at the manager / transport layer.
+                let parked_primary_handle: Option<
+                    tokio::task::JoinHandle<()>,
+                > = if let Some(mesh) = mesh_send_handle {
+                    // Promotion-activation gate: the secondary fires it
+                    // (with a cluster_state snapshot) on reaching
+                    // `Promoted`; the parked primary `restore`s + hydrates
+                    // and takes authority.
+                    let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
+                    secondary.register_promote_activation(promote_tx);
+
+                    // Transfer the lifecycle/command wiring the PyO3
+                    // surface minted on the secondary onto the co-located
+                    // PRIMARY — the real authority that owns the phase
+                    // machine and the externally-issued `PrimaryCommand`
+                    // ingress. The secondary keeps its own `command_tx`
+                    // clone for any handle minted off it.
+                    let (
+                        p_command_tx,
+                        p_command_rx,
+                        p_on_phase_start,
+                        p_on_phase_end,
+                    ) = secondary.take_composed_primary_wiring();
+
+                    // The parked primary's hybrid `T: SecondaryTransport`:
+                    // own-secondary → loopback into this secondary's
+                    // inbound, remote → the shared mesh; recv = the
+                    // role-aware tap. `P: NoPeerTransport` — the primary
+                    // routes by `send_to(secondary_id)` (not by mesh
+                    // `Role` addressing) and reads inbound via `T`, so it
+                    // needs no peer-mesh view of its own.
+                    let primary_transport =
+                        dynrunner_transport_quic::ColocatedPrimaryTransport::new(
+                            secondary_id.clone(),
+                            colocated_loopback_tx,
+                            mesh,
+                            colocated_primary_tap,
+                        );
+
+                    // `PrimaryConfig` for the parked failover authority.
+                    // Most fields are bootstrap-phase concerns the seeded
+                    // resume bypasses; the load-bearing ones are
+                    // `node_id` (own id, so `Role::Primary` resolves to
+                    // self) and the retry knobs (mirrored from the
+                    // secondary's config). The CRDT snapshot the gate
+                    // delivers seeds `phase_deps` / `total_tasks` at
+                    // activation, so the config's task-graph fields stay
+                    // at their defaults.
+                    let primary_config = dynrunner_manager_distributed::PrimaryConfig {
+                        node_id: secondary_id.clone(),
+                        keepalive_interval: dist_keepalive,
+                        peer_timeout: dist_peer_timeout,
+                        keepalive_miss_threshold: dist_keepalive_miss_threshold,
+                        retry_max_passes: dist_retry_max_passes,
+                        oom_retry_max_passes: dist_oom_retry_max_passes,
+                        ..dynrunner_manager_distributed::PrimaryConfig::default()
+                    };
+
+                    let mut parked_primary =
+                        dynrunner_manager_distributed::PrimaryCoordinator::new(
+                            primary_config,
+                            primary_transport,
+                            dynrunner_transport_quic::NoPeerTransport,
+                            scheduler_config.build_memory_scheduler(),
+                            primary_estimator,
+                        );
+                    // Transfer the command channel onto the primary so a
+                    // Python-minted `PrimaryHandle` (cloned off the
+                    // secondary's `command_sender()`) reaches the
+                    // authority's command loop. `p_command_rx` is `Some`
+                    // on the first (only) `take_composed_primary_wiring`
+                    // call; if it were `None` (defensive — a double
+                    // take), the primary keeps the receiver its own
+                    // `new()` minted and the transferred `tx` simply
+                    // feeds a different receiver, so we skip the swap.
+                    if let Some(rx) = p_command_rx {
+                        parked_primary.replace_command_channel(p_command_tx, rx);
+                    }
+                    if let (Some(on_start), Some(on_end)) =
+                        (p_on_phase_start, p_on_phase_end)
+                    {
+                        parked_primary.register_phase_lifecycle_callbacks(
+                            on_start, on_end,
+                        );
+                    }
+
+                    Some(tokio::task::spawn_local(async move {
+                        if let Err(e) = parked_primary.run_parked(promote_rx).await {
+                            tracing::error!(
+                                error = %e,
+                                "co-located parked primary failed after \
+                                 promotion"
+                            );
+                        }
+                    }))
+                } else {
+                    // No real mesh → no failover → no co-located primary.
+                    // The secondary keeps its own command/lifecycle wiring
+                    // (never transferred) and runs as a pure follower.
+                    None
+                };
+
                 // Setup-promote outer loop: drive
                 // `run_until_setup_or_done` to a terminal state,
                 // bouncing back through Python's `discover_items` on
-                // every `SetupPending` yield. The Rust core enforces
-                // that `SetupPending` only ever arises from a
-                // `PromotePrimary { required_setup: true }` wire
-                // arrival, which only the submitter's pre-staged-mode
-                // configuration emits — so legacy / failover runs
-                // observe `Done` on the first iteration and the loop
-                // exits cleanly without re-entering Python.
+                // every `SetupPending` yield. The Rust core yields
+                // `SetupPending` only in pre-staged mode with an empty
+                // replicated ledger (the authority deferred discovery —
+                // it sent an empty `InitialAssignment { pre_staged_mode:
+                // true }` rather than seeding the ledger; see
+                // `SecondaryCoordinator::setup_discovery_pending`), and
+                // at most ONCE per node (the fire-once latch in
+                // `ingest_setup_discovery`). Legacy / failover / non-
+                // pre-staged runs observe `Done` on the first iteration
+                // and the loop exits cleanly without re-entering Python.
                 //
                 // GIL discipline: this entire async block runs inside
                 // `py.detach` (GIL released). Each Python excursion
@@ -709,6 +860,29 @@ impl PySecondaryCoordinator {
                 };
 
                 let completed = secondary.completed_count() as u32;
+
+                // Wind down the co-located parked primary (if composed).
+                // Drop the secondary first so its `promote_activation_tx`
+                // (the gate sender) and the tap/loopback channels close:
+                //   - never-promoted node: `run_parked` is parked on the
+                //     gate; the closed sender resolves its `Err` arm and
+                //     it returns Ok immediately.
+                //   - promoted node: the primary already finished its
+                //     operational loop (it observed/broadcast RunComplete
+                //     the same way the secondary did) and `run_parked`
+                //     has returned or is about to. Closing the tap just
+                //     ends any residual inbound.
+                // Then await the handle so the parked future is joined
+                // (never left leaked) before this LocalSet unwinds.
+                drop(secondary);
+                if let Some(handle) = parked_primary_handle {
+                    if let Err(e) = handle.await {
+                        tracing::warn!(
+                            error = %e,
+                            "co-located parked primary task did not join cleanly"
+                        );
+                    }
+                }
 
                 // Tear down tracked worker subprocesses via the shared
                 // SIGTERM → grace → SIGKILL primitive. See

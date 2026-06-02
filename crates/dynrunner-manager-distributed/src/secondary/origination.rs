@@ -333,6 +333,12 @@ where
         }
         let task_count = binaries.len();
         self.apply_and_broadcast_mutations(mutations).await?;
+        // Latch the one-shot so `setup_discovery_pending()` (the
+        // `process_tasks` yield discriminator) never fires again on this
+        // node — set unconditionally so the empty-discovery path (which
+        // leaves the ledger empty) does not re-yield on re-entry. See
+        // the `setup_discovery_done` field doc.
+        self.setup_discovery_done = true;
         tracing::info!(
             tasks = task_count,
             "ingested setup-discovery; broadcast PhaseDepsSet + TaskAdded batch"

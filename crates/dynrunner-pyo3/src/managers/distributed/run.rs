@@ -168,17 +168,15 @@ impl PyDistributedManager {
         );
 
         // Clone the task_definition once per secondary so the in-process
-        // setup-promote path can fire `on_phase_end` through the
-        // promoted-secondary's pool-drain transitions on the SAME
-        // Python `TaskDefinition` instance the primary's callback
-        // already targets. Pre-fix the promoted secondary's
-        // `note_primary_item_completed` walked the cascade silently
-        // (see `manager-distributed/src/secondary/primary/lifecycle.rs`),
-        // so a multi-phase Python task hosting `on_phase_end` in
-        // single-process mode never observed the phase boundary on the
-        // post-promotion path. Each per-secondary closure pair is
-        // pushed in the order the secondaries are spawned below; the
-        // spawn loop pops one pair off this vec per iteration so each
+        // composition can fire `on_phase_end` through a promoted
+        // secondary's co-located primary on the SAME Python
+        // `TaskDefinition` instance the live primary's callback already
+        // targets. Each spawned in-process secondary registers these
+        // callbacks and, under composition, transfers them to its
+        // co-located parked primary (which owns the phase machine and
+        // fires the cascade once activated). Each per-secondary closure
+        // pair is pushed in the order the secondaries are spawned below;
+        // the spawn loop pops one pair off this vec per iteration so each
         // closure captures its own `Py<PyAny>` ref-bump.
         let mut sec_phase_lifecycle_callbacks: Vec<(
             crate::managers::lifecycle::OnPhaseStart,
@@ -396,15 +394,15 @@ impl PyDistributedManager {
                             resource_check_interval: dist_resource_check_interval,
                             log_oom_watcher: dist_log_oom_watcher,
                             promoted_primary_quiesce_grace: std::time::Duration::from_secs(2),
-                            // In-process distributed manager: see
-                            // `secondary/primary/reinject_task.rs` for the
-                            // budget-reset-at-promotion semantics. The
-                            // in-process primary holds the same cap on
-                            // the shared `control_plane`; the spawned
-                            // in-process secondaries inherit the same
-                            // configured value so an externally-issued
-                            // `reinject_task` post-promotion honours the
-                            // operator's knob symmetrically.
+                            // In-process distributed manager: the
+                            // `ReinjectTask` per-task budget cap, mirrored
+                            // from the in-process primary's
+                            // `PrimaryConfig` so an externally-issued
+                            // `reinject_task` honours the operator's knob
+                            // symmetrically regardless of which authority
+                            // (live or co-located) services it. Inert on
+                            // a secondary until it holds the primary role
+                            // via its co-located primary.
                             unfulfillable_reinject_max_per_task,
                             // In-process distributed manager runs primary
                             // and secondaries in the same process, so
@@ -524,24 +522,23 @@ impl PyDistributedManager {
                         }
 
                         // Install the per-secondary phase-lifecycle
-                        // callbacks BEFORE `run()` enters — the
-                        // coordinator's `register_phase_lifecycle_callbacks`
-                        // contract requires pre-run registration, same
-                        // shape as `register_lifecycle_listener` /
-                        // `register_panik_signal_rx`. The callbacks fire
-                        // ONLY when this secondary is promoted into the
-                        // primary role and observes a phase-drain
-                        // transition through `note_primary_item_completed`
-                        // / `note_primary_item_failed` (see
-                        // `manager-distributed/src/secondary/primary/lifecycle.rs`).
-                        // Non-promoted secondaries hold the registration
-                        // dormant and never invoke either closure; the
-                        // closures themselves are GIL-reacquiring and
-                        // call into the SAME Python `TaskDefinition`
-                        // instance the primary's `on_phase_*` callbacks
-                        // target — there's one `task_definition` in the
-                        // process and a multi-phase task hosts its hook
-                        // logic on that single instance.
+                        // callbacks BEFORE `run()` enters — same pre-run
+                        // registration contract as
+                        // `register_lifecycle_listener` /
+                        // `register_panik_signal_rx`. In the IN-PROCESS
+                        // distributed manager the authority is the
+                        // in-process `PrimaryCoordinator` (built below),
+                        // which fires `on_phase_*` directly; these
+                        // in-process secondaries use a `NoPeerTransport`
+                        // mesh and therefore compose NO co-located parked
+                        // primary, so their registered callbacks stay
+                        // dormant (no transfer, no promotion in-process)
+                        // and never call into Python. They are registered
+                        // for shape-parity with the SLURM secondary path
+                        // (which DOES transfer them to a co-located parked
+                        // primary); the closures target the SAME single
+                        // process-wide Python `TaskDefinition` instance
+                        // the in-process primary's callbacks already use.
                         secondary.register_phase_lifecycle_callbacks(
                             sec_on_phase_start,
                             sec_on_phase_end,

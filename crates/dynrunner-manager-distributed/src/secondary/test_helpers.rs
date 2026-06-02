@@ -277,3 +277,40 @@ pub(super) fn make_secondary(
         FixedEstimator(100),
     )
 }
+
+/// Construct a SecondaryCoordinator over the unified transport with a
+/// [`RecordingPeer`] mesh stub, returning the coordinator + the shared
+/// broadcast log so a test can assert on the messages the failover
+/// terminal action (e.g. the `PromotePrimary { new = self }` re-point)
+/// fans out onto the mesh. `peer_count` configures the recorder's
+/// reported mesh cardinality.
+pub(super) fn make_secondary_recording(
+    config: SecondaryConfig,
+    peer_count: usize,
+) -> (
+    SecondaryCoordinator<
+        TestTransport<RecordingPeer<TestId>>,
+        ChannelManagerEnd,
+        ResourceStealingScheduler,
+        FixedEstimator,
+        TestId,
+    >,
+    Rc<RefCell<Vec<DistributedMessage<TestId>>>>,
+) {
+    let secondary_id = config.secondary_id.clone();
+    let (sec_to_pri_tx, _sec_to_pri_rx) = tokio_mpsc::unbounded_channel();
+    let (_pri_to_sec_tx, pri_to_sec_rx) = tokio_mpsc::unbounded_channel();
+    let uplink = ChannelPrimaryTransportEnd {
+        tx: sec_to_pri_tx,
+        rx: pri_to_sec_rx,
+    };
+    let recorder = RecordingPeer::<TestId>::new(peer_count);
+    let log = recorder.log_handle();
+    let coord = SecondaryCoordinator::new(
+        config,
+        make_transport(&secondary_id, uplink, recorder),
+        ResourceStealingScheduler::memory(),
+        FixedEstimator(100),
+    );
+    (coord, log)
+}

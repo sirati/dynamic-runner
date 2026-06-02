@@ -256,14 +256,13 @@ where
                     // failover the same way the recv-arm path does.
                     self.check_primary_link_threshold();
                     // Re-poll any worker that's been idle since its
-                    // last unsatisfied request. Per-phase retry
-                    // re-injection is driven inline by the cascade
-                    // inside `process_primary_phase_lifecycle`
-                    // (fires from `note_primary_item_completed`
-                    // / `note_primary_item_failed` at each phase
-                    // drain edge), so this keepalive arm no longer
-                    // needs a separate retry-pass call — only the
-                    // safety-net idle-worker re-poll remains.
+                    // last unsatisfied request. The secondary holds no
+                    // retry machine: per-phase retry re-injection is the
+                    // AUTHORITY's concern (the live primary, or this
+                    // node's co-located primary once promoted), driven by
+                    // its phase-drain cascade — so this keepalive arm
+                    // needs no retry-pass call, only the safety-net
+                    // idle-worker re-poll.
                     // Re-poll any worker that's been idle since its
                     // last unsatisfied request. The per-worker rate
                     // limit (in `primary_link`, doubles on each
@@ -372,6 +371,41 @@ where
                 return Err(reason);
             }
 
+            // Setup-discovery yield: in pre-staged mode the authority
+            // deferred task discovery to the corpus-mounting secondaries
+            // (it sent an empty `InitialAssignment { pre_staged_mode: true }`
+            // rather than seeding the ledger). With the ledger still
+            // empty and no discovery run on this node yet, yield back to
+            // the caller (the PyO3 secondary wrapper) so it can
+            // re-acquire the GIL, run Python's `task.discover_items`
+            // against the locally bind-mounted corpus, and feed the
+            // result back via `ingest_setup_discovery` — which broadcasts
+            // `PhaseDepsSet + TaskAdded` onto the mesh (the co-located
+            // primary picks them up as a mesh member, refreshes
+            // `total_tasks`, and its CRDT-derived `setup_pending()` gate
+            // flips false) and latches the fire-once guard. On re-entry
+            // `setup_discovery_pending()` is false (ledger seeded OR the
+            // latch is set), so the loop proceeds normally.
+            //
+            // The discriminator lives entirely in
+            // `setup_discovery_pending()` (`coordinator.rs`) — this site
+            // only reads the predicate. Placed AFTER `fatal_exit`
+            // (genuine errors take priority) but BEFORE the run-complete
+            // / drain checks, which would all be no-ops here anyway (the
+            // ledger is empty, the uplink is alive, nothing to drain).
+            //
+            // Cancel-safety: every awaiting arm in the `select!` above is
+            // cancel-safe (mpsc recv + tokio interval ticks), so breaking
+            // out here just abandons whichever in-flight future was being
+            // awaited; re-entry rebuilds a fresh `select!`.
+            if self.setup_discovery_pending() {
+                tracing::info!(
+                    "setup-discovery pending (pre-staged mode, empty ledger); \
+                     yielding from process_tasks so caller can run \
+                     task.discover_items and call ingest_setup_discovery"
+                );
+                return Ok(RunOutcome::SetupPending);
+            }
 
             // Run-complete exit: the primary broadcast
             // `ClusterMutation::RunComplete` just before returning

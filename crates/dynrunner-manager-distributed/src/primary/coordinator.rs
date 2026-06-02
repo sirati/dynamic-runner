@@ -1088,6 +1088,26 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         self.command_rx = Some(rx);
     }
 
+    /// Pre-register the per-phase lifecycle callbacks for a PARKED
+    /// primary ([`Self::run_parked`]).
+    ///
+    /// The bootstrap path takes these as `run()` arguments; `run_parked`
+    /// has no such arguments (it activates off a gate, not a fresh
+    /// pool-build), so the composed runtime sets them here before
+    /// spawning the parked future. The operational loop + finalize tail
+    /// read `self.on_phase_*` directly, so a parked primary that
+    /// activates fires the same `on_phase_start` / `on_phase_end`
+    /// callbacks the bootstrap primary would. On a node where this
+    /// primary is never promoted the callbacks are never invoked.
+    pub fn register_phase_lifecycle_callbacks(
+        &mut self,
+        on_phase_start: OnPhaseStart,
+        on_phase_end: OnPhaseEnd,
+    ) {
+        self.on_phase_start = Some(on_phase_start);
+        self.on_phase_end = Some(on_phase_end);
+    }
+
     /// Set the per-task budget cap for
     /// `PrimaryCommand::ReinjectTask` after construction. The CLI and
     /// PyO3 surfaces wire this through to the underlying
@@ -1947,47 +1967,9 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // setup-promote-deadline backstop; the setup-deferred discovery
         // feed (`ingest_setup_discovery`) seeds the ledger that flips it.
 
-        // Spawn the peer-lifecycle dispatcher BEFORE any wire mutation
-        // can land. The (sender, receiver) pair was built in `new()`
-        // and the sender already installed on `cluster_state`; here
-        // we hand the receiver and the registered listeners to the
-        // dispatcher task. `spawn_local` matches the rest of the
-        // coordinator's LocalSet-bound spawn pattern. If the receiver
-        // has already been taken (defensive — `run()` is single-shot
-        // by contract; this branch covers a future caller that
-        // re-enters), the dispatcher is silently skipped.
-        //
-        // The returned `JoinHandle` is stored on `self` so
-        // `cleanup_lifecycle_dispatcher` (called from the `run()`
-        // outer wrapper on every exit path) can abort the task and
-        // await its termination, preventing a leaked dispatcher
-        // when `run()` returns Err with the coordinator still alive
-        // (the dispatcher's input channel sender lives on
-        // `cluster_state`, so it would otherwise never observe a
-        // closed-channel `None`).
-        if let Some(rx) = self.lifecycle_rx.take() {
-            let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
-            let handle = tokio::task::spawn_local(
-                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
-            );
-            self.lifecycle_dispatcher_handle = Some(handle);
-        }
-
-        // Same shape as the peer-lifecycle dispatcher spawn: hand the
-        // (rx, listeners) pair to the task-completion dispatcher
-        // BEFORE any wire mutation can land. The (sender, receiver)
-        // pair was built in `new()` and the sender already installed
-        // on `cluster_state`. The returned `JoinHandle` is stored on
-        // `self` so `cleanup_task_completed_dispatcher` aborts + joins
-        // on every `run()` exit path (same dispatcher-leak defence
-        // documented for the peer-lifecycle handle).
-        if let Some(rx) = self.task_completed_rx.take() {
-            let listeners = std::mem::take(&mut self.task_completed_listeners);
-            let handle = tokio::task::spawn_local(
-                crate::task_completed::run_task_completed_dispatcher(rx, listeners),
-            );
-            self.task_completed_dispatcher_handle = Some(handle);
-        }
+        // Spawn the peer-lifecycle + task-completion dispatchers BEFORE
+        // any wire mutation can land. See `spawn_run_dispatchers`.
+        self.spawn_run_dispatchers();
 
         // Discover the phase set: union of (1) every phase referenced
         // by an item, (2) every phase mentioned as a key or parent in
@@ -2225,6 +2207,34 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // pre-loop chain.
         self.command_rx = command_rx;
 
+        // Hand off to the shared operational-loop-and-finalize tail.
+        // Bootstrap (this path) and failover (`run_parked`) converge
+        // here: both run the same operational loop + retry passes +
+        // accounting + RunComplete broadcast. The only difference is
+        // the seeding that precedes it (bootstrap built the pool from
+        // `binaries`; the parked path hydrates from the replicated
+        // CRDT at activation) — `total` is captured from
+        // `self.total_tasks` so the accounting is identical regardless
+        // of which path seeded the pool.
+        self.run_operational_and_finalize(total).await
+    }
+
+    /// Shared operational-loop-and-finalize tail. The single mechanism
+    /// both handoff sides converge on once their pool is seeded:
+    /// bootstrap (`run_pipeline`, pool built from `binaries`) and
+    /// failover (`run_parked`, pool hydrated from the replicated CRDT
+    /// at `activate_local_primary`). Runs the main operational loop,
+    /// the structured-abort checks (panik / worker-mgmt-fail /
+    /// setup-deadline), the retry passes, final accounting, and the
+    /// `RunComplete` broadcast + settle window.
+    ///
+    /// `total` is the run's task count, captured by the caller from
+    /// `self.total_tasks` after seeding so the stranded accounting is
+    /// identical on both paths.
+    async fn run_operational_and_finalize(
+        &mut self,
+        total: usize,
+    ) -> Result<(), RunError> {
         // Operational loop (main pass).
         self.operational_loop().await?;
 
@@ -2394,6 +2404,156 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         );
 
         Ok(())
+    }
+
+    /// Spawn the peer-lifecycle + task-completion dispatcher tasks.
+    ///
+    /// The (sender, receiver) pairs were built in `new()` and the
+    /// senders already installed on `cluster_state`; here we hand each
+    /// receiver and its registered listeners to a `spawn_local`'d
+    /// dispatcher task. The returned `JoinHandle`s are stored on `self`
+    /// so the `run`/`run_parked` outer wrappers can abort + join them
+    /// on every exit path (a leaked dispatcher would otherwise block
+    /// forever on its input channel, whose sender lives on
+    /// `cluster_state` which the coordinator still owns post-run).
+    ///
+    /// Single-shot by contract: the `take()`s leave `None` behind, so a
+    /// re-entrant caller silently skips. Called by both the bootstrap
+    /// (`run_pipeline`) and failover (`run_parked_pipeline`) paths
+    /// BEFORE any wire mutation can land.
+    fn spawn_run_dispatchers(&mut self) {
+        if let Some(rx) = self.lifecycle_rx.take() {
+            let listeners = std::mem::take(&mut self.peer_lifecycle_listeners);
+            let handle = tokio::task::spawn_local(
+                crate::peer_lifecycle::run_peer_lifecycle_dispatcher(rx, listeners),
+            );
+            self.lifecycle_dispatcher_handle = Some(handle);
+        }
+        if let Some(rx) = self.task_completed_rx.take() {
+            let listeners = std::mem::take(&mut self.task_completed_listeners);
+            let handle = tokio::task::spawn_local(
+                crate::task_completed::run_task_completed_dispatcher(rx, listeners),
+            );
+            self.task_completed_dispatcher_handle = Some(handle);
+        }
+    }
+
+    /// Run a PARKED co-located primary: the failover side of the unified
+    /// composition. A node that is also a secondary builds this
+    /// `PrimaryCoordinator` up front and parks it here, behind the
+    /// `promote_rx` "promoted" gate, while its `SecondaryCoordinator`
+    /// drives the run as a follower. The two coordinators share one
+    /// `LocalSet`; this parked future is `spawn_local`'d alongside the
+    /// secondary's.
+    ///
+    /// On the gate firing — the secondary's election reached its terminal
+    /// `Promoted` transition and signalled activation (see
+    /// `SecondaryCoordinator::record_promotion_confirm`'s terminal
+    /// action) — this enters the SEEDED resume: `activate_local_primary`
+    /// hydrates the pool + unified `in_flight` ledger from the
+    /// continuously-replicated `cluster_state`, then the SAME
+    /// operational-loop-and-finalize tail bootstrap runs. The connect /
+    /// mesh-ready handshake is BYPASSED entirely — a parked primary
+    /// inherits an already-formed mesh (it was a secondary on it), so
+    /// there is nothing to wait for.
+    ///
+    /// If the gate is dropped without firing (the run finished without
+    /// this node ever being promoted — the common case for every
+    /// non-winning secondary), the parked future returns `Ok(())`
+    /// without ever touching the pool. The outer wrapper still runs
+    /// dispatcher cleanup so no task leaks.
+    ///
+    /// The gate carries a [`crate::cluster_state::ClusterStateSnapshot`]:
+    /// a parked primary's own `cluster_state` is empty (it never
+    /// bootstrapped and the role-aware inbound tap does not feed it CRDT
+    /// mirror frames), so the secondary hands it a snapshot of the
+    /// continuously-mirrored ledger at promotion. `run_parked` `restore`s
+    /// it before `activate_local_primary`, so the seeded resume rebuilds
+    /// the pool from the FULL replicated ledger — the brief's "restore
+    /// cluster_state snapshot + hydrate_from_cluster_state".
+    pub async fn run_parked(
+        &mut self,
+        promote_rx: tokio::sync::oneshot::Receiver<
+            crate::cluster_state::ClusterStateSnapshot<I>,
+        >,
+    ) -> Result<(), RunError> {
+        let result = self.run_parked_pipeline(promote_rx).await;
+        self.cleanup_lifecycle_dispatcher().await;
+        self.cleanup_task_completed_dispatcher().await;
+        result
+    }
+
+    /// Body of [`Self::run_parked`], factored out so the wrapper can
+    /// drive dispatcher cleanup regardless of how this returns (mirrors
+    /// the `run` / `run_pipeline` split).
+    async fn run_parked_pipeline(
+        &mut self,
+        promote_rx: tokio::sync::oneshot::Receiver<
+            crate::cluster_state::ClusterStateSnapshot<I>,
+        >,
+    ) -> Result<(), RunError> {
+        // Per-run resets — identical to `run_pipeline`'s, so a parked
+        // primary that activates starts every counter from zero.
+        self.stranded_count = 0;
+        self.setup_deadline_outcome = None;
+        self.worker_mgmt_fail_outcome = None;
+
+        // Dispatchers must be live BEFORE activation so the first
+        // `PeerJoined` / `TaskCompleted` mutation the replicated ledger
+        // applies post-hydration is observed. They run for the whole
+        // parked lifetime (even pre-activation): the secondary's
+        // co-located run is feeding `cluster_state` mutations across the
+        // mesh, and a registered task-completion listener should see
+        // them regardless of which coordinator currently holds
+        // authority.
+        self.spawn_run_dispatchers();
+
+        // Park behind the promoted gate. `Err(_)` means the sender was
+        // dropped without firing — the run completed without this node
+        // being promoted (every non-winning secondary's parked primary
+        // lands here). Return cleanly without touching the pool; the
+        // wrapper still runs dispatcher cleanup.
+        let snapshot = match promote_rx.await {
+            Ok(snap) => snap,
+            Err(_) => {
+                tracing::debug!(
+                    node = %self.config.node_id,
+                    "parked co-located primary: promote gate closed without firing \
+                     (this node was never promoted); exiting parked future cleanly"
+                );
+                return Ok(());
+            }
+        };
+
+        tracing::info!(
+            node = %self.config.node_id,
+            "parked co-located primary: promotion gate fired; restoring the \
+             replicated ledger snapshot and activating (seeded resume, \
+             bypassing connect/mesh-ready)"
+        );
+
+        // Restore the cluster-state snapshot the secondary handed us at
+        // promotion. The parked primary's own cluster_state was empty
+        // (the role-aware tap does not feed it CRDT mirror frames), so
+        // this restore is what seeds the ledger that
+        // `hydrate_from_cluster_state` (inside `activate_local_primary`)
+        // rebuilds the pool + in-flight ledger from. CRDT `restore` is
+        // idempotent / last-writer-wins per field.
+        self.cluster_state.restore(snapshot);
+
+        // Seeded resume: hydrate the pool + unified in-flight ledger
+        // from the now-restored CRDT and set `total_tasks`. The connect /
+        // mesh-ready handshake is bypassed — a parked primary inherited a
+        // formed mesh. See `activate_local_primary`.
+        self.activate_local_primary()
+            .await
+            .map_err(RunError::Other)?;
+
+        // Converge on the shared operational-loop-and-finalize tail.
+        // `total` comes from `self.total_tasks`, which
+        // `hydrate_from_cluster_state` set from the replicated ledger.
+        let total = self.total_tasks;
+        self.run_operational_and_finalize(total).await
     }
 
     /// Fire `on_phase_start` for every phase the pool currently

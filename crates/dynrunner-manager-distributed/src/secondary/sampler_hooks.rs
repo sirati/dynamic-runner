@@ -15,9 +15,11 @@
 //!   * `secondary/setup.rs::handle_initial_assignment` — initial
 //!     dispatch the primary handed us at startup.
 //!   * `secondary/dispatch/router.rs` (`TaskAssignment` arm) — every
-//!     peer-routed in-loop assignment.
-//!   * `secondary/primary/task_request.rs::handle_primary_task_request`
-//!     — primary-self-assign while this node holds primary authority.
+//!     in-loop assignment (a `TaskAssignment` addressed to this node's
+//!     own worker arrives here whether it came over the wire from the
+//!     authority or via the co-located primary's loopback — the unified
+//!     transport made the origin opaque, subsuming the old
+//!     self-assign-vs-wire split).
 //!   * `secondary/processing/worker_event.rs` (`WorkerEvent::Ready`
 //!     arm) — post-respawn pending-first-bind dispatch.
 //!   * `secondary/processing/worker_event.rs` (`TaskCompleted` and

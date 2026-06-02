@@ -8,9 +8,15 @@
 //! exactly that surface; every authority-mirror test (command_channel,
 //! phase_lifecycle_callback, keyed_outputs_apply_race,
 //! retry_bucket_cascade, cascade, singleton_type_shift,
-//! result_data_plumbing, promoted_primary_quiesce_gate,
-//! setup_promote_discriminator) was retired with the authority mirror
-//! it tested.
+//! result_data_plumbing, promoted_primary_quiesce_gate) was retired
+//! with the authority mirror it tested.
+//!
+//! Setup-discovery is NOT an authority-mirror concern and is restored
+//! in its correct shape: the secondary is the PRODUCER of the discovery
+//! result (it mounts the corpus), broadcasting `PhaseDepsSet + TaskAdded`
+//! onto the mesh for the co-located authoritative primary to pick up. It
+//! holds no dispatch authority over the discovered tasks — see
+//! [`setup_discovery_yield`].
 //!
 //! Split per-concern:
 //!
@@ -32,6 +38,10 @@
 //!   NOTHING, holds the FULL CRDT, exits ONLY on `run_complete()`;
 //!   late-joining observer AND worker each get the full snapshot with
 //!   the CORRECT role; N concurrent observers.
+//! - [`setup_discovery_yield`] — the pre-staged-mode `SetupPending`
+//!   yield discriminator + the fire-once latch (`ingest_setup_discovery`
+//!   broadcasts `PhaseDepsSet + TaskAdded`, seeds the local ledger, and
+//!   suppresses re-yield even on an empty discovery).
 
 #![cfg(test)]
 
@@ -44,3 +54,4 @@ mod peer_mesh_watchdog;
 mod processing;
 mod pure_observer;
 mod r1;
+mod setup_discovery_yield;

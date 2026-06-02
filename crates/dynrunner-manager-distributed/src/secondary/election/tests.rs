@@ -390,3 +390,119 @@
             "observer election tick must originate no broadcast",
         );
     }
+
+    // ── Failover terminal action: record_promotion_confirm → activation ──
+
+    use super::super::test_helpers::make_secondary_recording;
+
+    /// The election-win terminal action: once `record_promotion_confirm`
+    /// returns `true` (quorum crossed, state → `Promoted`), the message
+    /// handler's terminal action `fire_local_promotion` MUST (1) fire the
+    /// co-located parked primary's activation gate and (2) broadcast
+    /// `PromotePrimary { new = self }` so surviving secondaries re-point
+    /// `Role::Primary` onto this winner. Pre-fix the `true` was discarded
+    /// and the failover path dead-ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
+        // peer_count = 2 → quorum = 2 (self + one confirm).
+        let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 2);
+        let (promote_tx, promote_rx) = tokio::sync::oneshot::channel();
+        sec.register_promote_activation(promote_tx);
+
+        // Drive sec-a into Candidate(round=1) so the confirm tally has a
+        // matching round to credit.
+        sec.peer_keepalives.insert("sec-b".into(), 0.0);
+        sec.peer_keepalives.insert("sec-c".into(), 0.0);
+        sec.record_primary_message();
+        tokio::time::sleep(PAST_DEATH).await;
+        sec.run_election_tick(); // → Suspecting
+        tokio::time::sleep(ONE_INTERVAL).await;
+        sec.record_timeout_response("sec-b".into(), None);
+        sec.record_timeout_response("sec-c".into(), None);
+        sec.run_election_tick(); // → Candidate { round: 1 }
+        assert!(matches!(sec.election, ElectionState::Candidate { .. }));
+
+        // One peer confirms — self + sec-b = quorum (2). The terminal
+        // action mirrors the message-handler arm: on `true`, fire.
+        let promoted = sec.record_promotion_confirm("sec-b".into(), "sec-a".into(), 1);
+        assert!(promoted, "quorum confirm must promote");
+        assert!(matches!(sec.election, ElectionState::Promoted));
+        sec.fire_local_promotion().await;
+
+        // (1) The activation gate fired exactly once, carrying the
+        // cluster-state snapshot the parked primary restores.
+        assert!(
+            promote_rx.await.is_ok(),
+            "fire_local_promotion must wake the parked co-located primary \
+             with a cluster_state snapshot",
+        );
+
+        // (2) A `PromotePrimary { new = self }` landed on the mesh, with a
+        // strictly-superseding epoch and required_setup=false (failover).
+        let promote = log
+            .borrow()
+            .iter()
+            .find_map(|m| match m {
+                DistributedMessage::PromotePrimary {
+                    new_primary_id,
+                    epoch,
+                    required_setup,
+                    ..
+                } => Some((new_primary_id.clone(), *epoch, *required_setup)),
+                _ => None,
+            });
+        let (new_primary, epoch, required_setup) =
+            promote.expect("a PromotePrimary must be broadcast on promotion");
+        assert_eq!(new_primary, "sec-a", "must name self as new primary");
+        assert!(epoch >= 1, "epoch must supersede the prior identity (epoch+1)");
+        assert!(!required_setup, "failover promotion is not a setup-defer");
+    }
+
+    /// The activation gate is FIRE-ONCE across the two paths that reach
+    /// `Promoted`: winning the own election AND being named by a
+    /// `PromotePrimary`. A second `fire_local_promotion` (or the router's
+    /// `activate_co_located_primary`) must NOT panic or double-send on the
+    /// already-consumed gate. The `oneshot::Sender` `take()` guarantees
+    /// this; the test asserts the second call is a clean no-op.
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_gate_is_fire_once() {
+        let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+        let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
+        sec.register_promote_activation(promote_tx);
+
+        // First activation consumes the gate (delivering a snapshot).
+        sec.activate_co_located_primary();
+        assert!(
+            promote_rx.try_recv().is_ok(),
+            "first activation must deliver the gate signal (snapshot)",
+        );
+
+        // Second activation (e.g. own broadcast echoed back through the
+        // router's PromotePrimary arm) is a clean no-op — the sender was
+        // already taken, so nothing is sent and nothing panics.
+        sec.activate_co_located_primary();
+        sec.fire_local_promotion().await;
+        assert!(
+            matches!(
+                promote_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "no second gate signal; the sender was consumed and dropped",
+        );
+    }
+
+    /// With no co-located primary composed (Rust-only / legacy callers),
+    /// the terminal action must not panic on the absent gate: the
+    /// broadcast still fires so the mesh records the new authority.
+    #[tokio::test(flavor = "current_thread")]
+    async fn promotion_without_composed_primary_still_broadcasts() {
+        let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
+        // No `register_promote_activation` — promote_activation_tx stays None.
+        sec.fire_local_promotion().await;
+        assert!(
+            log.borrow()
+                .iter()
+                .any(|m| matches!(m, DistributedMessage::PromotePrimary { .. })),
+            "PromotePrimary must broadcast even when no co-located primary exists",
+        );
+    }
