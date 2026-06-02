@@ -61,7 +61,7 @@ fn cascade_drain_done_unblocks_dependent_when_parent_phase_is_empty() {
     assert_eq!(pool.phase_state(&phase_a), Some(PhaseState::Active));
     assert_eq!(pool.phase_state(&phase_b), Some(PhaseState::Blocked));
 
-    super::super::primary::cascade_drain_done(&mut pool);
+    super::super::origination::cascade_drain_done(&mut pool);
 
     // Post-cascade: phase-A is Done (0 queued, 0 in_flight ⇒ Drained
     // ⇒ Done) and phase-B is Active (parent is Done).

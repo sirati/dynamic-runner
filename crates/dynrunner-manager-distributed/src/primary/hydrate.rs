@@ -28,7 +28,7 @@ use dynrunner_scheduler_api::{PendingPool, ResourceEstimator, Scheduler};
 
 use crate::cluster_state::TaskState;
 use crate::primary::PrimaryCoordinator;
-use crate::secondary::primary::cascade_drain_done;
+use crate::secondary::origination::cascade_drain_done;
 
 impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifier> PrimaryCoordinator<T, P, S, E, I> {
     /// Build a fresh `PendingPool` for the authoritative primary view
