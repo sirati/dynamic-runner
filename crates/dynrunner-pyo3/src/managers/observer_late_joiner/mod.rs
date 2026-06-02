@@ -70,6 +70,7 @@ use crate::config::distributed::DistributedConfig;
 use crate::config::scheduler::SchedulerConfig;
 use crate::task_def::LoadedTopology;
 
+mod failure_policies;
 mod helpers;
 mod new;
 mod reporter;

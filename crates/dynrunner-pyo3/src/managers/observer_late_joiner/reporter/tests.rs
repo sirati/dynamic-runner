@@ -168,6 +168,60 @@ fn stats_unfulfillable_reads_counts_not_outcome() {
 }
 
 #[test]
+fn stats_invalid_task_reads_counts_not_outcome() {
+    // TRAP (sibling of `stats_unfulfillable_reads_counts_not_outcome`):
+    // outcome_counts() folds the discrete TaskState::InvalidTask into
+    // fail_final. The snapshot must read counts().invalid_task for its
+    // own line and net it OUT of fail_final so the two lines are
+    // disjoint — a single invalid task is one metric, not two.
+    let s = seed_state(
+        &[],
+        &[(
+            task("inv", "P", &[]),
+            Seed::Failed(ErrorType::InvalidTask {
+                reason: "missing dep nope".to_string().into(),
+            }),
+        )],
+    );
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.invalid_task, 1, "discrete InvalidTask counted");
+    assert_eq!(
+        snap.fail_final, 0,
+        "InvalidTask must NOT also land in fail_final"
+    );
+}
+
+#[test]
+fn stats_invalid_task_unfulfillable_and_final_are_pairwise_disjoint() {
+    // All three terminal-failure lines coexist on one ledger; assert
+    // each tallies exactly its own and none cross-contaminates. This
+    // pins the double-netting in `from_cluster_state` (subtract BOTH
+    // unfulfillable AND invalid_task out of the folded fail_final).
+    let s = seed_state(
+        &[],
+        &[
+            (task("nf", "P", &[]), Seed::Failed(ErrorType::NonRecoverable)),
+            (
+                task("u", "P", &[]),
+                Seed::Failed(ErrorType::Unfulfillable {
+                    reason: "no resource".to_string().into(),
+                }),
+            ),
+            (
+                task("inv", "P", &[]),
+                Seed::Failed(ErrorType::InvalidTask {
+                    reason: "dup id".to_string().into(),
+                }),
+            ),
+        ],
+    );
+    let snap = Snap::from_cluster_state(&s);
+    assert_eq!(snap.fail_final, 1, "only the NonRecoverable task");
+    assert_eq!(snap.unfulfillable, 1, "only the Unfulfillable task");
+    assert_eq!(snap.invalid_task, 1, "only the InvalidTask task");
+}
+
+#[test]
 fn stats_blocked_is_separate_from_waiting_on_deps() {
     // `up` is Unfulfillable; `dep_blocked` is its dependent and cascades
     // to TaskState::Blocked (a separate category). `waiter` is a Pending

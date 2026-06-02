@@ -111,6 +111,12 @@ pub fn render_report(cur: &StatsSnapshot, prev: &StatsSnapshot) -> Option<String
             show_delta: true,
         },
         MetricLine {
+            label: "invalid_task",
+            total: cur.invalid_task,
+            delta: delta(cur.invalid_task, prev.invalid_task),
+            show_delta: true,
+        },
+        MetricLine {
             label: "in-flight",
             total: cur.in_flight,
             delta: delta(cur.in_flight, prev.in_flight),
