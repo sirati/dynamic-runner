@@ -74,12 +74,11 @@ impl SharedSnapshotSource {
     /// next tick. Lock-poison-recovering (a panicked prior holder must
     /// not wedge the reporter).
     ///
-    /// The production caller is the observer run loop's live-feed seam
-    /// (see `from_cluster_state` + the seam doc in
-    /// `observer_late_joiner/run.rs`); until that lands the only caller
-    /// is the reporter's test suite, so `allow(dead_code)` documents
-    /// the deliberate not-yet-wired status rather than an orphan.
-    #[allow(dead_code)]
+    /// The production caller is the observer run loop's live-feed seam:
+    /// it pushes a `StatsSnapshot::from_cluster_state(...)` projection
+    /// right after the snapshot restore and on each
+    /// `run_until_setup_or_done` return (see the live-feed doc in
+    /// `observer_late_joiner/run.rs`).
     pub fn publish(&self, snapshot: StatsSnapshot) {
         let mut guard = self.cell.lock().unwrap_or_else(|p| p.into_inner());
         *guard = snapshot;
