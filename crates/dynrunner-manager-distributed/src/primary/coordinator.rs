@@ -2144,16 +2144,16 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // secondary's silence must not stall the run).
         self.wait_for_mesh_ready(&mut command_rx).await?;
 
-        // Promote primary (atomic role-flip). The chosen secondary's
-        // role-change is broadcast to every node; each node's
-        // `cluster_state` mirror applies `PrimaryChanged` and each
-        // node's `primary_link` re-routes operational sends. Post-
-        // Phase-B the promoted secondary draws its pending pool
-        // straight from `cluster_state` — no separate state-transfer
-        // wire path. The continuously-replicated ledger (seeded by
-        // `seed_cluster_state` and maintained by ClusterMutation
-        // broadcasts) is the only source of truth.
-        self.promote_primary().await?;
+        // Activate THIS node's co-located primary as the sole
+        // authority. In the unified model the authority is the node the
+        // secondaries dialled (their transport uplink), so there is no
+        // remote `PromotePrimary` hand-off and no role re-point — every
+        // secondary keeps routing `Role::Primary` to its uplink (this
+        // node). The continuously-replicated ledger is the only source
+        // of truth; `wait_for_mesh_ready` above already held until the
+        // peer mesh settled so cross-node dispatch never routes into a
+        // still-forming mesh. See `activate_local_primary`.
+        self.activate_local_primary().await?;
 
         // Put the command-channel receiver back on `self` so
         // `operational_loop`'s own `self.command_rx.take()` picks

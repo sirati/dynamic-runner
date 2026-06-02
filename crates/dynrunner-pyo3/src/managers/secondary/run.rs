@@ -378,10 +378,23 @@ impl PySecondaryCoordinator {
                     child_processes: Vec::new(),
                 };
 
-                let mut secondary: SecondaryCoordinator<_, _, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(
-                    config,
+                // Compose the opaque secondary transport: the WSS/QUIC
+                // `NetworkClient` is the uplink to the node this
+                // secondary dialled (the original primary), the
+                // `peer_network` is the mesh. `UnifiedSecondaryTransport`
+                // makes the physical location of the primary opaque —
+                // `Address::Role(Role::Primary)` resolves to the uplink
+                // while the role cache is cold and re-points to a mesh
+                // peer once a `PromotePrimary` (failover) lands. See the
+                // crate docs on `UnifiedSecondaryTransport`.
+                let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
+                    secondary_id.clone(),
                     client,
                     peer_network,
+                );
+                let mut secondary: SecondaryCoordinator<_, _, _, _, RunnerIdentifier> = SecondaryCoordinator::new(
+                    config,
+                    unified,
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );

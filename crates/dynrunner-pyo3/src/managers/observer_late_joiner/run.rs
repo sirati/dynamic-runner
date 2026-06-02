@@ -133,8 +133,14 @@ impl PyObserverLateJoiner {
                 //    snapshot request + reply wait. Errors get
                 //    typed strings; we PyErr them with the snapshot
                 //    JSON context so the operator can correlate.
+                // `is_observer = true`: this late-joiner is a strict
+                // observer. The flag rides the snapshot RPC so the
+                // responder records the joiner's ACTUAL role in the
+                // replicated `PeerJoined` (R3's responder-carries-real-
+                // role fix), rather than every late-joiner being
+                // hardcoded as an observer.
                 let snapshot_json = peer_network
-                    .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT)
+                    .join_running_cluster(&seed, DEFAULT_JOIN_TIMEOUT, true)
                     .await
                     .map_err(|e| {
                         pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -248,8 +254,22 @@ impl PyObserverLateJoiner {
                     child_processes: Vec::new(),
                 };
 
-                let mut secondary: SecondaryCoordinator<
+                // Compose the opaque secondary transport. A late-joining
+                // observer never dialled an original primary, so the
+                // uplink is the `NoPrimaryTransport` stub (its `recv`
+                // pends forever — there is no setup-phase frame to read);
+                // the `peer_network` is the mesh it bootstrapped onto via
+                // the snapshot RPC. `Address::Role(Role::Primary)`
+                // resolves to a mesh peer once the role cache warms from
+                // the replicated `PrimaryChanged`; until then the
+                // observer originates nothing and routes nowhere. See
+                // `UnifiedSecondaryTransport`.
+                let unified = dynrunner_transport_tunnel::UnifiedSecondaryTransport::new(
+                    observer_id.clone(),
                     NoPrimaryTransport,
+                    peer_network,
+                );
+                let mut secondary: SecondaryCoordinator<
                     _,
                     _,
                     _,
@@ -257,8 +277,7 @@ impl PyObserverLateJoiner {
                     RunnerIdentifier,
                 > = SecondaryCoordinator::new(
                     config,
-                    NoPrimaryTransport,
-                    peer_network,
+                    unified,
                     scheduler_config.build_memory_scheduler(),
                     estimator,
                 );

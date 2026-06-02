@@ -61,18 +61,15 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
         );
 
         // Mirror what `run()` would set up: empty pool, default phase
-        // tracked, no binaries, `total_tasks = 0`. demoted=false: this
-        // test pins the `setup_pending` gate on the !partial_view
-        // counter exit path. With `required_setup_on_promote = true
-        // && demoted = true` the `partial_view` gate
-        // (lifecycle.rs `let partial_view = self.demoted &&
-        // self.config.required_setup_on_promote`) would suppress
-        // the counter exit entirely, making the test hang — and
-        // the partial-view race is covered separately by
-        // `demoted_primary_ignores_partial_crdt_view_waits_for_run_complete`.
-        // `self.secondaries` is empty in this synthetic setup, so
-        // `process_heartbeat_tick` walks empty hashmaps and is a
-        // no-op even on the !demoted path; no race.
+        // tracked, no binaries, `total_tasks = 0`. This pins the
+        // `run_complete_check` counter exit being gated by the
+        // CRDT-derived `setup_pending()` predicate
+        // (`required_setup_on_promote && cluster_state.task_count() == 0`)
+        // — while the gate holds, the `0+0 >= 0` counter trip is
+        // suppressed so the loop does not declare the run done before
+        // discovery seeds the ledger. `self.secondaries` is empty in
+        // this synthetic setup, so `process_heartbeat_tick` walks empty
+        // hashmaps and is a no-op; no death-eval race.
         let phase = dynrunner_core::PhaseId::from("default");
         let pool = dynrunner_scheduler_api::PendingPool::<TestId>::new(
             [phase.clone()],
@@ -107,14 +104,24 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
                 }],
             })
             .unwrap();
+        // The completion arrives as a `TaskComplete` wire report — the
+        // shape the co-located secondary's worker uses to report to the
+        // authoritative primary in the composed model. The authority's
+        // `handle_task_complete` inserts the hash into `completed_tasks`
+        // (the set the operational-loop counter exit reads) and
+        // broadcasts the CRDT `TaskCompleted`. The hash is not locally
+        // in-flight (the TaskAdded above mirrored into `cluster_state`,
+        // not the pool), so `free_slot_on_terminal` no-ops on the slot
+        // and the per-phase cascade is skipped — only the
+        // `completed_tasks` insert + the counter exit matter here.
         incoming_tx
-            .send(DistributedMessage::ClusterMutation {
+            .send(DistributedMessage::TaskComplete {
                 sender_id: "sec-promoted".into(),
                 timestamp: 0.0,
-                mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
-                    hash: hash.clone(),
-                    result_data: None,
-                }],
+                secondary_id: "sec-promoted".into(),
+                worker_id: 0,
+                task_hash: hash.clone(),
+                result_data: None,
             })
             .unwrap();
         // Hold the sender open so the loop's exit MUST come from the
@@ -125,11 +132,10 @@ async fn setup_pending_blocks_immediate_exit_then_proceeds_on_task_added() {
 
         // Bounded wait. Pre-fix the loop exits on iteration 1 (the
         // counter check fires at `0+0 >= 0` before any recv runs).
-        // Post-fix the loop must process both mutations before the
+        // Post-fix the loop must process both wire messages before the
         // counter check trips; that completes in single-digit ms on
         // an in-process channel transport. 5s ceiling for CI flake
-        // tolerance — matches the existing
-        // `demoted_primary_exits_on_run_complete_broadcast` test.
+        // tolerance.
         let exit = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             primary.operational_loop(),
@@ -531,8 +537,9 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
         // `if self.pending.is_some() { reinject }` arm in
         // handle_cluster_mutation: it gates on TasksSpawned, not
         // TaskAdded). The locally-empty phases are therefore the
-        // right cascade subject — and exactly the shape the
-        // demoted-primary observer view exhibits.
+        // right cascade subject — the shape a setup-defer authority
+        // sees while discovery has seeded the CRDT but not the local
+        // pool.
         primary.process_phase_lifecycle(&mut None).await;
 
         // Assertion (3): on_phase_end fires exactly once per declared
@@ -566,55 +573,48 @@ async fn setup_pending_suppresses_initial_phase_cascade_until_task_added() {
     }).await;
 }
 
-/// Regression for the asm-tokenizer `--source-already-staged` 4-hour
-/// hang surfaced after the #169 (`9ad3cd9`) gate landed.
+/// Regression for the `--source-already-staged` long-hang class: a
+/// setup-defer authority whose discovery feed never seeds the ledger.
 ///
-/// Scenario (post-#169 setup-promote silent-secondary):
-///   - Local submitter is the demoted primary
-///     (`required_setup_on_promote = true`), so `setup_pending = true`
+/// Scenario (setup-promote, discovery never lands):
+///   - The authority is in setup-defer mode
+///     (`required_setup_on_promote = true`), so `setup_pending()` is true
 ///     and `total_tasks = 0` at operational-loop entry.
-///   - The promoted secondary never broadcasts TaskAdded / TasksSpawned
-///     / RunComplete (e.g. its `discover_items` Python callback is
-///     hung, or its SLURM job died before the first broadcast).
-///   - Every other operational-loop exit path is structurally
-///     unavailable on a demoted setup-promoted primary: the counter-
-///     based exit is gated by `partial_view`, the pool-drain exit by
-///     `setup_pending`, the heartbeat-driven dead-detection by
-///     `!self.demoted`, the fleet-dead timer by `secondaries.is_empty()`.
-///     Pre-fix this is a guaranteed 4+ hour hang (until SLURM kills
-///     the wrapper container).
+///   - The discovery feed never broadcasts TaskAdded / TasksSpawned /
+///     RunComplete (e.g. the `discover_items` Python callback hung, or
+///     the discovering node died before its first broadcast).
+///   - While `setup_pending()` holds, the counter exit and the
+///     pool-drain exit in `run_complete_check` are both suppressed (the
+///     `0+0 >= 0` trip would otherwise declare the run done before any
+///     task exists). With `secondaries` empty the fleet-dead timer never
+///     starts either. Without a backstop this is an unbounded hang.
 ///
-/// Post-fix invariants pinned here:
-///   (A) `operational_loop` returns `Ok(())` (the new arm exits via
-///       `break`, never via Err — Err would propagate through `?` and
-///       lose the diagnostic Duration).
+/// Post-fix invariants pinned here (the restored setup-promote-deadline
+/// arm in `operational_loop`):
+///   (A) `operational_loop` returns `Ok(())` (the arm exits via `break`,
+///       never via Err — Err would propagate through `?` and lose the
+///       diagnostic Duration).
 ///   (B) `setup_deadline_outcome` is `Some(elapsed)` with
 ///       `elapsed >= deadline` and `elapsed < deadline + slack`. The
 ///       outer `run_pipeline` then surfaces this as
 ///       `RunError::SetupDeadlineExpired { elapsed }`; tested via the
 ///       Display impl below.
-///   (C) `setup_pending` was NOT cleared (defensive: the arm is
-///       supposed to consult the latch at fire time and treat a
-///       cleared latch as a no-op — pinning that the arm's exit was
-///       driven by genuine deadline expiry, not a race where a
-///       TaskAdded mutation landed concurrently and the loop exited
-///       via the counter check).
-///   (D) The deadline arm DOES NOT fire when the latch clears in
-///       time. Covered by the existing
-///       `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`
-///       test (which uses a 5-second budget — well below 600s default
-///       — and observes a clean exit through the counter path).
+///   (C) `setup_pending()` was still true at fire time (defensive: the
+///       arm re-checks the gate at fire time and treats a cleared gate
+///       as a no-op — pinning that the exit was driven by genuine
+///       deadline expiry, not a race where a TaskAdded landed
+///       concurrently and the loop exited via the counter check).
+///   (D) The deadline arm DOES NOT fire when the gate clears in time.
+///       Covered by the sibling
+///       `setup_deadline_does_not_fire_when_taskadded_arrives_in_time`
+///       test (clean exit through the counter path well before the
+///       deadline).
 ///
 /// Test rig:
-///   - Short `setup_promote_deadline` (200ms) so the test completes
-///     in well under 1s on every test runner. A `tokio::time::timeout`
+///   - Short `setup_promote_deadline` (200ms) so the test completes in
+///     well under 1s on every test runner. A `tokio::time::timeout`
 ///     wraps the call with a 5s ceiling so a stuck loop fails loudly
 ///     (rather than hanging the test runner).
-///   - `demoted = false` so the counter check is on the
-///     `!partial_view` path; this isolates the new arm as the ONLY
-///     exit cue. (The full demoted+setup-pending+partial-view path
-///     is exercised by the existing setup-promote e2e tests; this
-///     test pins the arm-level invariant.)
 ///   - No transport activity: the channel transport's incoming queue
 ///     stays empty so no message arm can resolve.
 #[tokio::test(flavor = "current_thread")]
@@ -675,8 +675,8 @@ async fn setup_deadline_fires_when_promoted_secondary_silent() {
 
         // Mirror what `run()` would set up before the operational
         // loop entry: empty pool, default phase tracked, no binaries,
-        // `total_tasks = 0`. `demoted = false` so the !partial_view
-        // path is what gates the counter exit; this isolates the
+        // `total_tasks = 0`. The CRDT-derived `setup_pending()` gate
+        // suppresses the counter exit; this isolates the
         // deadline arm as the ONLY non-trivial exit cue (the counter
         // / pool-drain / run_complete / fleet_dead / transport-closed
         // arms are all structurally unavailable: total_tasks=0 is
@@ -844,14 +844,19 @@ async fn setup_deadline_does_not_fire_when_taskadded_arrives_in_time() {
                 }],
             })
             .unwrap();
+        // Completion as a `TaskComplete` wire report — the composed
+        // authority's `handle_task_complete` populates `completed_tasks`
+        // (counter-exit input) and broadcasts the CRDT mutation. See the
+        // matching note in
+        // `setup_pending_blocks_immediate_exit_then_proceeds_on_task_added`.
         incoming_tx
-            .send(DistributedMessage::ClusterMutation {
+            .send(DistributedMessage::TaskComplete {
                 sender_id: "sec-promoted".into(),
                 timestamp: 0.0,
-                mutations: vec![ClusterMutation::<TestId>::TaskCompleted {
-                    hash: hash.clone(),
-                    result_data: None,
-                }],
+                secondary_id: "sec-promoted".into(),
+                worker_id: 0,
+                task_hash: hash.clone(),
+                result_data: None,
             })
             .unwrap();
         // Hold the sender so the channel doesn't close (which would

@@ -11,8 +11,10 @@
 //!   split without leaking borrow-checker state across modules.
 //! - [`dispatch`] — `dispatch_to_idle_workers` (the per-tick
 //!   dispatch fan-out).
-//! - [`promotion`] — `wait_for_mesh_ready` + `promote_primary`
-//!   (the Phase 6.5 + Phase 7 atomic role flip).
+//! - [`promotion`] — `wait_for_mesh_ready` + `activate_local_primary`
+//!   (the mesh-settle gate + the single composition mechanism that
+//!   activates THIS node's co-located primary as the authority; no
+//!   remote role hand-off — see `activate_local_primary`).
 //!
 //! `dispatch_order` (free fn) lives here because every sub-module
 //! consumes it; it has no `&self` so it can't sit on the inherent

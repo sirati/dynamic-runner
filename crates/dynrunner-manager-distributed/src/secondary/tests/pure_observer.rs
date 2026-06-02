@@ -326,3 +326,66 @@ fn n_concurrent_observers_all_hold_the_full_crdt() {
         );
     }
 }
+
+/// P3 replication-invariant fatality (R3-audit gap): a `ClusterSnapshot`
+/// whose JSON payload fails to deserialize is a HARD error, not a
+/// swallow. A bootstrapping observer requested the snapshot precisely to
+/// populate its CRDT; continuing to "observe" an un-restored (empty)
+/// CRDT would report a lie (premature run-complete, wrong counts). The
+/// `ClusterSnapshot` arm must latch `fatal_exit` so the operational loop
+/// aborts the run instead. Pins: (a) the malformed payload does NOT
+/// restore (the CRDT stays empty), and (b) `fatal_exit` is set with the
+/// malformed-payload reason.
+#[tokio::test(flavor = "current_thread")]
+async fn malformed_cluster_snapshot_latches_fatal_exit() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut observer, _peer_log, _uplink_rx) =
+                make_observer_with_recorder("obs-malformed");
+
+            // Precondition: nothing restored yet.
+            assert_eq!(
+                observer.cluster_state.task_count(),
+                0,
+                "fresh observer starts with an empty CRDT"
+            );
+            assert!(
+                observer.fatal_exit.is_none(),
+                "fresh observer has no fatal_exit latched"
+            );
+
+            // A ClusterSnapshot whose payload is not a valid
+            // `ClusterStateSnapshot<TestId>` JSON. `serde_json::from_str`
+            // rejects it; the arm must latch `fatal_exit` rather than
+            // silently leave the CRDT empty.
+            let mut factory = FakeWorkerFactory;
+            observer
+                .handle_inbound(
+                    DistributedMessage::ClusterSnapshot {
+                        sender_id: "primary-peer".into(),
+                        timestamp: 0.0,
+                        snapshot_json: "{ this is not valid snapshot json ]".into(),
+                    },
+                    &mut factory,
+                )
+                .await;
+
+            // (a) The malformed payload did NOT restore anything.
+            assert_eq!(
+                observer.cluster_state.task_count(),
+                0,
+                "a malformed snapshot must NOT partially restore the CRDT"
+            );
+            // (b) The fatality latched.
+            let reason = observer
+                .fatal_exit
+                .as_ref()
+                .expect("malformed ClusterSnapshot must latch fatal_exit");
+            assert!(
+                reason.contains("malformed snapshot"),
+                "fatal_exit reason should name the malformed snapshot; got: {reason}"
+            );
+        })
+        .await;
+}

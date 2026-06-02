@@ -2,8 +2,7 @@ use std::collections::HashSet;
 
 use dynrunner_core::Identifier;
 use dynrunner_protocol_primary_secondary::{
-    ClusterMutation, DistributedMessage, PeerTransport,
-    SecondaryTransport,
+    PeerTransport, SecondaryTransport,
 };
 use dynrunner_scheduler_api::{
     ResourceEstimator, Scheduler,
@@ -12,7 +11,6 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::primary::PrimaryCoordinator;
 use crate::primary::command_channel::PrimaryCommand;
-use crate::primary::wire::timestamp_now;
 
 
 
@@ -123,78 +121,52 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         }
     }
 
-    pub(crate) async fn promote_primary(&mut self) -> Result<(), String> {
-        if let Some(first_id) = self.secondaries.keys().next().cloned() {
-            self.primary_id = Some(first_id.clone());
-            // Monotonic per-promotion epoch carried on the wire and
-            // fed into `ClusterState::PrimaryChanged`'s last-writer-
-            // wins resolver. Starting from the local mirror's current
-            // epoch + 1 is sufficient at the bootstrap promotion
-            // (epoch starts at 0 cluster-wide); the failover election
-            // protocol's own `round` will supersede this when it
-            // re-elects.
-            let new_epoch = self.cluster_state.primary_epoch() + 1;
-            tracing::info!(primary = %first_id, epoch = new_epoch, "promoting secondary to primary");
-
-            // Apply locally so the originator's mirror flips atomically
-            // with the broadcast, not after the broadcast round-trips
-            // back to us. Lower-epoch races no-op against the higher
-            // epoch we just installed.
-            self.cluster_state.apply(ClusterMutation::PrimaryChanged {
-                new: first_id.clone(),
-                epoch: new_epoch,
-            });
-
-            let msg = DistributedMessage::<I>::PromotePrimary {
-                sender_id: self.config.node_id.clone(),
-                timestamp: timestamp_now(),
-                new_primary_id: first_id.clone(),
-                epoch: new_epoch,
-                // Bootstrap-promote discriminator: when this primary
-                // skipped `seed_cluster_state` + `perform_initial_assignment`
-                // (setup-defer mode driven by `--source-already-staged`,
-                // i.e. `required_setup_on_promote = true`), the chosen
-                // secondary needs to know it's the one doing discovery
-                // + ledger seed after promotion. The election/failover
-                // sites in `secondary/election.rs` unconditionally
-                // pass `false` because, by election time, the local
-                // ledger is already non-empty (seeded either by the
-                // original setup-defer secondary or by a pre-seeded
-                // submitter — `required_setup_on_promote = false`,
-                // a fully production-supported path), so re-running
-                // discovery would double-seed.
-                required_setup: self.config.required_setup_on_promote,
-            };
-            // Broadcast to every secondary, not unicast to the elected
-            // node: every secondary needs the role-change to update
-            // its `primary_link` routing target and clear its per-
-            // worker backoff so idle workers re-issue at the new
-            // primary on their next tick (otherwise the new primary's
-            // peers stay quiet for one stale-window). The pre-Phase-P
-            // unicast was Bug 2 in the trace at `feb1052` — only the
-            // elected node logged the role change because only it
-            // received the message.
-            if let Err(failures) = self.transport.broadcast(msg).await {
-                for (secondary_id, error) in &failures {
-                    tracing::warn!(
-                        secondary = %secondary_id,
-                        error = %error,
-                        "PromotePrimary broadcast delivery failed"
-                    );
-                }
-            }
-
-            // Hand-off complete: the `PrimaryChanged` apply + the
-            // `PromotePrimary` broadcast moved authority to the chosen
-            // secondary. The local node's transition to a pure-observer
-            // posture (snapshot-at-demotion + the passive observe loop)
-            // is R3's concern, wired through the unified composition;
-            // there is no `demoted` self-flag to set here.
-            tracing::info!(
-                primary = %first_id,
-                "promoted secondary is sole authoritative primary"
-            );
-        }
+    /// Activate THIS node's co-located primary as the authoritative
+    /// primary. The single composition mechanism both handoff sides
+    /// converge on (the brief's `activate_local_primary`): bootstrap
+    /// (the run pipeline reaches its operational loop) and failover (the
+    /// election's terminal `Promoted` transition) both call this.
+    ///
+    /// # Why this does NOT broadcast a remote `PromotePrimary`
+    ///
+    /// In the unified model every node runs one `PrimaryCoordinator` +
+    /// one `SecondaryCoordinator`; the authority is the node the
+    /// secondaries already dialled (their `UnifiedSecondaryTransport`
+    /// uplink). A secondary routes `Address::Role(Role::Primary)` to its
+    /// uplink while its role cache is COLD — which is exactly "the
+    /// original primary I dialled". Broadcasting `PromotePrimary { new =
+    /// <some secondary id> }` here was the LEGACY submitter→secondary
+    /// hand-off: it re-pointed every secondary's role cache at the named
+    /// node, so the chosen secondary's own `Role::Primary` resolved to
+    /// LOOPBACK — and with the secondary-internal primary mirror now
+    /// demolished, that loopback had no primary to receive the
+    /// secondary's own keepalives / completions / requests. They looped
+    /// back and died, the authority saw the secondary go silent, and the
+    /// fleet-dead timeout stranded the run. The composed authority IS the
+    /// original primary, so no role re-point is needed: leaving every
+    /// secondary's cache cold keeps `Role::Primary` routed to the uplink
+    /// (this node).
+    ///
+    /// The genuine FAILOVER re-point — a *new* node taking over from a
+    /// dead original primary — is owned by the election winner's
+    /// authoritative `PrimaryChanged` apply (broadcast on the
+    /// `PromotePrimary` it emits after winning, in
+    /// `record_promotion_confirm`'s terminal action), which the
+    /// surviving secondaries' role-change hook applies to re-point
+    /// `Role::Primary` from the dead uplink to the winner's mesh peer.
+    /// That is a distinct concern from this bootstrap activation.
+    ///
+    /// `primary_id` is set to this node's own id for the heartbeat
+    /// requeue path's "did the primary just die?" check — which can
+    /// never match a secondary id, so the standalone authority never
+    /// self-clears the pointer.
+    pub(crate) async fn activate_local_primary(&mut self) -> Result<(), String> {
+        self.primary_id = Some(self.config.node_id.clone());
+        tracing::info!(
+            node = %self.config.node_id,
+            "co-located primary activated as sole authority; secondaries route \
+             Role::Primary to their uplink (this node) — no remote PromotePrimary"
+        );
         Ok(())
     }
 

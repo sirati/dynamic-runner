@@ -58,10 +58,24 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // guarantees we only exit when every dispatched
         // assignment has been reconciled.
         let active_workers = self.workers.iter().filter(|w| !w.is_idle()).count();
+        // Setup-defer gate: while `setup_pending()` is true the
+        // discovery feed has not yet seeded the ledger, so `total_tasks`
+        // is 0 and every declared phase is a transiently-empty `Active`.
+        // The counter exit (`0+0 >= 0`) and the pool-drain exit would
+        // both false-fire "the run is done" before any task exists. Both
+        // are skipped together until the first `TaskAdded` lands (the
+        // CRDT-derived `setup_pending()` predicate flips false). On the
+        // legacy bootstrap path (`required_setup_on_promote = false`)
+        // the predicate is permanently false and these exits run
+        // unchanged. The replicated-ledger `RunComplete` arm below is a
+        // real terminal cue and is NOT gated — an external authority's
+        // RunComplete must still exit even in setup-defer mode.
+        let setup_pending = self.setup_pending();
         // Counter-based exit: every task accounted for (completed or
         // failed) and no worker mid-dispatch. Re-read every iteration
         // so lazy `spawn_tasks` / `TasksSpawned` growth is absorbed.
-        if self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
+        if !setup_pending
+            && self.completed_tasks.len() + self.failed_tasks.len() >= self.total_tasks
             && active_workers == 0
         {
             tracing::info!("all tasks completed or failed");
@@ -74,7 +88,7 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // where in-flight is zero but a worker hasn't reported
         // completion yet (mostly defensive — `on_item_finished`
         // runs synchronously off the wire message).
-        if self.pool().is_run_complete() && active_workers == 0 {
+        if !setup_pending && self.pool().is_run_complete() && active_workers == 0 {
             tracing::info!("pool drained and no active workers");
             return true;
         }
@@ -172,6 +186,32 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // iterations re-park on `pending().await`, mirroring the
         // secondary's panik arm.
         let mut panik_signal_rx = self.panik_signal_rx.take();
+
+        // Setup-promote-deadline timer. In setup-defer mode
+        // (`config.required_setup_on_promote`) the ledger stays empty
+        // until the discovery feed broadcasts its first `TaskAdded`;
+        // `setup_pending()` gates the run-complete exits above so the
+        // loop does not declare the run done before any task exists. The
+        // backstop: if discovery NEVER seeds the ledger (a wedged
+        // discovery feed), the loop would otherwise idle forever. The
+        // deadline arm below fires once `config.setup_promote_deadline`
+        // elapses while `setup_pending()` is still true, records the
+        // elapsed on `setup_deadline_outcome`, and breaks — the outer
+        // `run_pipeline` surfaces `RunError::SetupDeadlineExpired`.
+        //
+        // `setup_promote_loop_start` is captured locally (not on `self`)
+        // so each loop entry — including a retry-pass re-entry — measures
+        // from its own start.
+        let setup_promote_loop_start = Instant::now();
+        let setup_promote_deadline_at =
+            setup_promote_loop_start + self.config.setup_promote_deadline;
+        // One-shot gate so the arm fires at most once per loop entry.
+        // After firing (whether on a real expiry OR because
+        // `setup_pending()` cleared in the same tick window) the flag
+        // flips true and the arm parks on `pending().await` for the rest
+        // of this loop entry, preventing a spurious second fire after a
+        // retry-pass legitimately re-runs the loop with the latch clear.
+        let mut setup_promote_deadline_consumed = false;
 
         loop {
             // Run-completion exit decision. The counter exit, the
@@ -538,6 +578,51 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
                         tracing::warn!(
                             "primary operational loop exiting via panik path"
                         );
+                        break;
+                    }
+                }
+                // Setup-promote-deadline arm. Gated by
+                // `self.setup_pending() && !setup_promote_deadline_consumed`
+                // (the same arm-condition shape `matcher_trigger_rx`
+                // uses) so the arm is DISABLED the moment the
+                // setup-defer gate clears — a long-but-eventually-
+                // successful discovery does NOT false-fire — and so a
+                // coordinator re-entering the loop on a retry pass with
+                // the gate already clear doesn't observe a stale
+                // resolved sleep.
+                //
+                // Single-concern: this arm OWNS the
+                // setup-promote-deadline timer. It reads only
+                // `setup_pending()` (the CRDT-derived gate the rest of
+                // the primary already maintains) and writes only
+                // `setup_deadline_outcome` (the field the outer
+                // `run_pipeline` consumes). It touches no dead-detection,
+                // heartbeat, or transport-teardown concern.
+                //
+                // Cancellation safety: `tokio::time::sleep_until` is
+                // one-shot cancel-safe per tokio docs (same primitive
+                // `wait_for_connections` / `wait_for_mesh_ready` use).
+                _ = tokio::time::sleep_until(setup_promote_deadline_at.into()),
+                    if self.setup_pending() && !setup_promote_deadline_consumed => {
+                    setup_promote_deadline_consumed = true;
+                    // Re-check the gate at fire time: `select!` does not
+                    // guarantee the arm-condition held at the exact
+                    // moment the sleep resolved — a TaskAdded mutation
+                    // could land on a recv arm in the same tick the
+                    // sleep elapses. If the gate cleared, treat the
+                    // firing as a no-op and let the next iteration's
+                    // exit checks decide.
+                    if self.setup_pending() {
+                        let elapsed = setup_promote_loop_start.elapsed();
+                        tracing::error!(
+                            elapsed_s = elapsed.as_secs_f64(),
+                            deadline_s = self.config.setup_promote_deadline.as_secs_f64(),
+                            "setup-promote deadline expired: discovery feed never \
+                             seeded the ledger (no TaskAdded / TasksSpawned / \
+                             RunComplete). Exiting operational loop; outer \
+                             run_pipeline will surface RunError::SetupDeadlineExpired."
+                        );
+                        self.setup_deadline_outcome = Some(elapsed);
                         break;
                     }
                 }

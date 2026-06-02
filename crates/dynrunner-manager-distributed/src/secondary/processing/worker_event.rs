@@ -1,17 +1,20 @@
 //! Worker-event handler: convert one inbound `WorkerEvent` (task
-//! completed, task failed, worker exited unexpectedly, etc.) into the
-//! appropriate cluster-mutation broadcast, per-pool bookkeeping, and
-//! primary-side ledger update.
+//! completed, task failed, worker exited unexpectedly, etc.) into local
+//! per-pool bookkeeping plus a CLASS-1 terminal report to the primary
+//! role.
 //!
-//! Single concern: the secondary's worker→cluster bridge. Drives the
-//! cluster-mutation apply-and-broadcast path for every authoritative
-//! task-outcome the local worker emits.
+//! Single concern: the secondary's OWN-worker → primary bridge. The
+//! secondary holds NO authority — it originates no CRDT mutation and
+//! drives no phase machine. Each terminal worker outcome is reported to
+//! whoever currently holds the primary role via `send_to_primary`
+//! (`Address::Role(Role::Primary)`); the authoritative
+//! `PrimaryCoordinator` owns the `ClusterMutation` origination and the
+//! mesh broadcast.
 
 use std::time::Duration;
 
 use dynrunner_core::{ErrorType, Identifier, WorkerId};
 use dynrunner_manager_local::oom::{classify_disconnect, OomWatcher};
-use dynrunner_manager_local::WorkerFactory;
 use dynrunner_manager_local::worker::WorkerEvent;
 use dynrunner_protocol_manager_worker::ManagerEndpoint;
 use dynrunner_protocol_primary_secondary::{DistributedMessage, PeerTransport};
@@ -45,7 +48,6 @@ where
     pub(in crate::secondary) async fn handle_worker_event(
         &mut self,
         event: WorkerEvent<I>,
-        factory: &mut impl WorkerFactory<M>,
         oom_watcher: &OomWatcher,
     ) -> Result<Option<WorkerId>, String> {
         match event {
@@ -161,7 +163,7 @@ where
                         // authority reinjects and re-dispatches to this
                         // node reaches an idle worker on the next tick
                         // rather than waiting a full keepalive interval.
-                        self.repoll_idle_workers(factory).await;
+                        self.repoll_idle_workers().await;
                         // Report error to the current primary. CLASS-1
                         // own-worker report: the authority owns the
                         // failure accounting, the retry-bucket cascade,
@@ -184,7 +186,7 @@ where
                     }
 
                     // Request next task for this worker
-                    self.request_task_for_worker(worker_id, factory).await?;
+                    self.request_task_for_worker(worker_id).await?;
                 }
 
                 // Operator-facing INFO: did the worker finish a
@@ -517,7 +519,7 @@ where
                 // Errors are propagated through `?` since a
                 // send-to-primary failure here is the same wire
                 // error class as elsewhere in this handler.
-                self.request_task_for_worker(worker_id, factory).await?;
+                self.request_task_for_worker(worker_id).await?;
                 tracing::debug!(worker_id, "worker ready (post-respawn reclaim)");
                 Ok(None)
             }

@@ -78,7 +78,7 @@ where
         // Request tasks only for workers that didn't get initial assignments
         for i in 0..self.pool.workers.len() {
             if self.pool.workers[i].is_idle_state() {
-                self.request_task_for_worker(i as WorkerId, factory).await?;
+                self.request_task_for_worker(i as WorkerId).await?;
             }
         }
 
@@ -144,7 +144,7 @@ where
             tokio::select! {
                 event = self.pool.recv_event() => {
                     if let Some(event) = event {
-                        let restart = self.handle_worker_event(event, factory, &oom_watcher).await?;
+                        let restart = self.handle_worker_event(event, &oom_watcher).await?;
                         if let Some(wid) = restart {
                             workers_to_restart.push(wid);
                         }
@@ -281,7 +281,7 @@ where
                     // primary path doesn't track per-peer worker
                     // idleness, so the periodic re-poll is the
                     // failover-safe wakeup.
-                    self.repoll_idle_workers(factory).await;
+                    self.repoll_idle_workers().await;
                     let actions = self.run_election_tick();
                     for msg in actions.broadcast {
                         let _ = self
@@ -430,7 +430,7 @@ where
                     tracing::error!(worker_id = wid, error = %e, "secondary worker restart failed");
                     continue;
                 }
-                let _ = self.request_task_for_worker(wid, factory).await;
+                let _ = self.request_task_for_worker(wid).await;
             }
         }
 
