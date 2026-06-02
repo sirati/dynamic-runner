@@ -67,9 +67,9 @@ pub(super) fn task_file_hash<I: Identifier>(item: &TaskInfo<I>) -> String {
 /// "drain a freshly-seeded pool to quiescence".
 ///
 /// Relocated faithfully from the removed `secondary/primary/mod.rs`.
-// R4 SEAM: the only caller is the primary-side `hydrate_from_cluster_state`
-// (itself reached only from the composed primary's seeded resume).
-#[allow(dead_code)] // TODO(R4): reached via hydrate_from_cluster_state (P4 composition)
+/// The sole caller is the primary-side `hydrate_from_cluster_state`,
+/// reached from the composed primary's seeded resume (failover
+/// activation).
 pub(crate) fn cascade_drain_done<I: Identifier>(pool: &mut PendingPool<I>) {
     loop {
         pool.drain_empty_active_phases();
@@ -306,13 +306,18 @@ where
     /// from a wrapper retry on transport hiccup) doesn't re-broadcast
     /// the same batch.
     ///
-    /// TODO(R4): feed the composed authoritative `PrimaryCoordinator`
-    ///   over the loopback so its dispatch pool is hydrated from the
-    ///   now-populated `cluster_state` and the setup-defer gate is
-    ///   cleared. The pre-demolition `setup_pending = false` +
-    ///   `populate_primary_from_cluster_state()` steps lived on the
-    ///   secondary's deleted authority mirror; under P4 composition the
-    ///   co-located primary owns that hydration + gate.
+    /// Feed to the composed authoritative primary: the `TaskAdded`
+    /// broadcast reaches the co-located primary as any mesh member would
+    /// receive it (the discovering node and the authority are both mesh
+    /// members). The primary's `handle_cluster_mutation` applies the
+    /// batch to its `cluster_state`, refreshes `total_tasks` from the
+    /// now-populated ledger, and the CRDT-derived `setup_pending()` gate
+    /// flips false — re-enabling the run-complete exits the gate had
+    /// suppressed. No separate loopback hydration call is needed: the
+    /// mesh broadcast IS the feed (the pre-demolition `setup_pending =
+    /// false` + `populate_primary_from_cluster_state()` steps lived on
+    /// the secondary's deleted authority mirror; the composed primary
+    /// reaches the same state reactively off the replicated ledger).
     pub async fn ingest_setup_discovery(
         &mut self,
         binaries: Vec<TaskInfo<I>>,

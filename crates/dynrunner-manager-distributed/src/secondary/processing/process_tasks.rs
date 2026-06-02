@@ -120,13 +120,12 @@ where
         // channel: the externally-issued `PrimaryCommand`s
         // (FailPermanent / ReinjectTask / UpdatePreferredSecondaries /
         // SpawnTasks) are authority mutations whose only correct owner
-        // is the co-located `PrimaryCoordinator`. The `command_tx` /
-        // `command_rx` fields stay on the struct purely as a wiring
-        // anchor for the PyO3 `PrimaryHandle`; R4's composition re-homes
-        // that handle onto the authoritative `PrimaryCoordinator` over
-        // the loopback, so this loop never drains the channel.
-        // TODO(R4): re-home the command channel to the co-located
-        //   `PrimaryCoordinator` (P4 composition).
+        // is the co-located `PrimaryCoordinator` (which runs the command
+        // arm in its own operational loop). The `command_tx` /
+        // `command_rx` fields stay on the struct as the registration
+        // anchor keeping the PyO3 `PrimaryHandle` clone a stable type;
+        // the composed-primary runtime hands the receiver to the
+        // primary's command loop. This secondary loop never drains it.
 
         loop {
             // Workers that need restart after disconnect

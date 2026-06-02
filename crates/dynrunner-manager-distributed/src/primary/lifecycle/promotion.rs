@@ -160,8 +160,46 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// requeue path's "did the primary just die?" check — which can
     /// never match a secondary id, so the standalone authority never
     /// self-clears the pointer.
+    ///
+    /// # Seeded resume (failover activation)
+    ///
+    /// Two activation shapes converge here:
+    ///
+    ///   * **Bootstrap**: `run_pipeline` already built the pool from the
+    ///     `binaries` argument and set `total_tasks` before reaching this
+    ///     call. Nothing to seed — the local pool IS the source of truth.
+    ///   * **Failover resume**: a node whose co-located primary was
+    ///     PARKED (it never ran `run_pipeline`'s pool-build) activates
+    ///     after the election. Its pool is unseeded but the continuously-
+    ///     replicated `cluster_state` already holds the full ledger. It
+    ///     must rebuild its `PendingPool` + unified `in_flight` ledger +
+    ///     `completed_tasks` from that CRDT (`hydrate_from_cluster_state`)
+    ///     so dispatch resumes seeded, BYPASSING the connect / mesh-ready
+    ///     handshake (it inherited a formed mesh). The discriminator is
+    ///     "the CRDT holds tasks the local pool does not reflect"
+    ///     (`total_tasks == 0 && cluster_state.task_count() > 0`): true
+    ///     only on the parked-then-activated path, false for bootstrap
+    ///     (where `total_tasks` was set from `binaries`) and for the
+    ///     setup-defer authority (whose CRDT is still empty at activation
+    ///     — discovery seeds it later via the feed).
     pub(crate) async fn activate_local_primary(&mut self) -> Result<(), String> {
         self.primary_id = Some(self.config.node_id.clone());
+
+        // Seeded-resume hydration. See the doc above for the
+        // discriminator's rationale; the bootstrap and setup-defer paths
+        // both leave this false, so this is reached ONLY by a parked
+        // co-located primary activating into an already-replicated
+        // ledger.
+        if self.total_tasks == 0 && self.cluster_state.task_count() > 0 {
+            tracing::info!(
+                node = %self.config.node_id,
+                crdt_tasks = self.cluster_state.task_count(),
+                "co-located primary activating on a replicated ledger; \
+                 hydrating pool + in-flight ledger from cluster_state"
+            );
+            self.hydrate_from_cluster_state();
+        }
+
         tracing::info!(
             node = %self.config.node_id,
             "co-located primary activated as sole authority; secondaries route \

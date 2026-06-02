@@ -1329,9 +1329,8 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// path. Folds in the deleted `pre_owned_in_flight` concept: the
     /// terminal cascade reads this entry BY HASH exactly like a
     /// locally-dispatched one.
-    // R4 SEAM: only reached from `hydrate_from_cluster_state`, itself an
-    // R4 seam (the composed primary's seeded resume).
-    #[allow(dead_code)] // TODO(R4): reachable via hydrate_from_cluster_state (P4 composition)
+    // Reached from `hydrate_from_cluster_state` (the composed primary's
+    // seeded resume on failover activation).
     pub(super) fn seed_inflight(
         &mut self,
         task_hash: String,
@@ -1618,9 +1617,12 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
     /// false`) this is always `false`, so the gate is permanently
     /// satisfied and the normal exit/drain logic runs.
     ///
-    /// TODO(R4): the authoritative co-located primary owns this gate
-    ///   under P4 composition; the setup-deferred discovery feed
-    ///   hydrates its pool over the loopback.
+    /// The authoritative co-located primary owns this gate: it suppresses
+    /// `run_complete_check`'s counter / pool-drain exits while discovery
+    /// is pending (see `lifecycle/operational_loop.rs`) and arms the
+    /// setup-promote-deadline backstop. The setup-deferred discovery feed
+    /// (`ingest_setup_discovery`) seeds the ledger; the first `TaskAdded`
+    /// flips this predicate false and normal dispatch resumes.
     pub(super) fn setup_pending(&self) -> bool {
         self.config.required_setup_on_promote && self.cluster_state.task_count() == 0
     }
@@ -1868,20 +1870,17 @@ impl<T: SecondaryTransport<I>, P: PeerTransport<I>, S: Scheduler<I>, E: Resource
         // re-used across runs must not inherit a stale outcome).
         self.setup_deadline_outcome = None;
 
-        // The setup-pending gate is now a CRDT-derived predicate
+        // The setup-pending gate is a CRDT-derived predicate
         // (`Self::setup_pending`) rather than a stateful latch field: in
         // setup-promote mode (`config.required_setup_on_promote`) it
-        // stays true until the chosen secondary broadcasts its first
-        // task into the replicated ledger (`cluster_state.task_count() >
-        // 0`) — the same flip condition the old latch used, derived from
-        // the CRDT every replica converges to. No per-run reset is
-        // needed because the predicate reads live state.
-        //
-        // TODO(R4): under P4 composition the co-located authoritative
-        //   primary owns this gate; the setup-deferred discovery feed
-        //   (`ingest_setup_discovery`) hydrates its pool over the
-        //   loopback. This predicate is the interim gate until that
-        //   wiring lands.
+        // stays true until the first task lands in the replicated ledger
+        // (`cluster_state.task_count() > 0`), derived from the CRDT every
+        // replica converges to. No per-run reset is needed because the
+        // predicate reads live state. The co-located authoritative
+        // primary owns this gate: `run_complete_check` suppresses its
+        // exits while it holds and the operational loop arms the
+        // setup-promote-deadline backstop; the setup-deferred discovery
+        // feed (`ingest_setup_discovery`) seeds the ledger that flips it.
 
         // Spawn the peer-lifecycle dispatcher BEFORE any wire mutation
         // can land. The (sender, receiver) pair was built in `new()`
