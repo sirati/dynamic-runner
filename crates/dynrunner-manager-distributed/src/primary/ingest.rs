@@ -78,7 +78,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
                  (the 3a/3b discriminator); a non-empty phase_started_emitted \
                  here means the ingest order regressed"
             );
-            let ids: Vec<String> = partition
+            let reasons: Vec<String> = partition
                 .duplicates
                 .iter()
                 .map(|(_, reason)| reason.clone())
@@ -86,7 +86,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             let reason = format!(
                 "{} duplicate task identity/identities in the initial batch: {}",
                 partition.duplicates.len(),
-                ids.join("; ")
+                reasons.join("; ")
             );
             tracing::error!(reason = %reason, "initial-batch duplicate detected; aborting run");
             self.pending_run_abort = Some(reason);
@@ -151,9 +151,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
         }])
         .await;
         // Brief settle window so the broadcast lands before the
-        // dispatcher tears down its transport — mirrors the
-        // `RunComplete` settle window in `run_retry_passes`.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // dispatcher tears down its transport — the same
+        // `PRIMARY_BROADCAST_SETTLE` window the `RunComplete` path uses.
+        tokio::time::sleep(crate::primary::PRIMARY_BROADCAST_SETTLE).await;
         Err(RunError::DuplicateTaskIdPrePhase { reason })
     }
 
