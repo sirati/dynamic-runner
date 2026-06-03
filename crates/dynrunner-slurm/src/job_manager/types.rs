@@ -61,6 +61,15 @@ pub struct SlurmJobManager<G: Gateway> {
     /// uploaded binary is referenced by the same path every secondary
     /// the run produces uses.
     pub(super) shutdown_manager_remote_path: Option<String>,
+    /// Remote (gateway-side) absolute path of the uploaded
+    /// `dynrunner-slurm-wrapper` binary, or `None` until
+    /// [`SlurmJobManager::upload_wrapper_binary_from`] runs
+    /// successfully. Populated once during preparation; subsequent
+    /// wrapper-script renders (initial cohort + respawn) read it via
+    /// [`SlurmJobManager::wrapper_bin_remote_path`] so every per-job
+    /// stub `exec`s the binary at the same path. Mirrors
+    /// `shutdown_manager_remote_path`.
+    pub(super) wrapper_bin_remote_path: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -83,4 +92,13 @@ pub enum SlurmError {
     /// surfaces only after the first stuck container.
     #[error("shutdown-manager source binary not found: {0}")]
     ShutdownBinaryNotFound(std::path::PathBuf),
+    /// Local-source path supplied to
+    /// [`SlurmJobManager::upload_wrapper_binary_from`] did not exist
+    /// on the dispatcher filesystem. Hard error for the same reasons
+    /// as [`SlurmError::ShutdownBinaryNotFound`]: the SLURM dispatch
+    /// path always renders the wrapper stub against this binary, so a
+    /// missing source is misconfiguration or a broken framework wheel,
+    /// not a benign skip.
+    #[error("wrapper source binary not found: {0}")]
+    WrapperBinaryNotFound(std::path::PathBuf),
 }

@@ -162,6 +162,8 @@ pub(super) fn build_slurm_respawn_kwargs<'py>(
         use_reverse_connection,
         outcome.run_log_dir.clone(),
         outcome.shutdown_manager_remote_path.clone(),
+        outcome.name_prefix.clone(),
+        outcome.wrapper_bin_remote_path.clone(),
         mem_manager_reserved_bytes,
     );
 

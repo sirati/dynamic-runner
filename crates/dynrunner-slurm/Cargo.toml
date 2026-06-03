@@ -15,6 +15,7 @@ readme.workspace       = true
 dynrunner-core = { workspace = true }
 dynrunner-gateway = { workspace = true }
 dynrunner-manager-distributed = { workspace = true }
+dynrunner-slurm-wrapper-config = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -31,6 +32,13 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # build/transfer events land on `crate::IMPORTANT_TARGET`, which
 # `tracing-test`'s untargeted `logs_contain` cannot verify.
 tracing-subscriber = { workspace = true }
+# `cli` feature ON for tests only: the renderer↔binary round-trip test
+# (`wrapper_script::tests::binary_stub`) parses the stub's emitted args
+# back through the same clap parser the wrapper binary uses, asserting
+# the `WrapperConfig` reconstructs to what the renderer fed in. The
+# non-test build never enables `cli` (the renderer links only
+# `to_args()`); this dev-dep line scopes clap to the test binary.
+dynrunner-slurm-wrapper-config = { workspace = true, features = ["cli"] }
 
 [lints]
 workspace = true

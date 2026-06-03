@@ -123,6 +123,8 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
     reverse_connection: bool,
     run_log_dir: String,
     shutdown_manager_bin_path: Option<String>,
+    name_prefix: String,
+    wrapper_bin_path: Option<String>,
     mem_manager_reserved_bytes: Option<u64>,
 ) -> WrapperScriptGenerator {
     Arc::new(move |spec: &SecondarySpawnSpec| -> Result<String, String> {
@@ -158,6 +160,11 @@ pub(crate) fn wrapper_script_generator_from_pyobj(
                 "shutdown_manager_bin_path",
                 shutdown_manager_bin_path.as_deref(),
             )?;
+            // Same program-identity prefix + wrapper-binary path the
+            // initial cohort used, so respawned secondaries render the
+            // identical `exec`-stub against the same gateway-side binary.
+            kwargs.set_item("name_prefix", &name_prefix)?;
+            kwargs.set_item("wrapper_bin_path", wrapper_bin_path.as_deref())?;
             if let Some(reserved) = mem_manager_reserved_bytes {
                 kwargs.set_item("mem_manager_reserved_bytes", reserved)?;
             }
@@ -232,6 +239,8 @@ mod tests {
             true,
             "/log/run-1".to_owned(),
             None,
+            "asm".to_owned(),
+            Some("/gw/dynrunner-slurm-wrapper".to_owned()),
             None,
         );
 
@@ -322,6 +331,8 @@ mod tests {
             true,
             "/log/run-1".to_owned(),
             None,
+            "asm".to_owned(),
+            Some("/gw/dynrunner-slurm-wrapper".to_owned()),
             None,
         );
 

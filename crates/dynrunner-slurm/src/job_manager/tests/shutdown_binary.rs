@@ -211,6 +211,8 @@ fn wrapper_render_includes_uploaded_path_when_manager_has_remote_path() {
     let bin_path = Path::new(remote);
     let cfg = WrapperScriptConfig {
         slurm_config: &config,
+        name_prefix: "asm",
+        wrapper_bin_path: None,
         image_path: "/srv/slurm/image_bin/app.tar.gz",
         secondary_id: "sec-0",
         image_name: "app",

@@ -43,6 +43,11 @@ pub(super) struct PreparationOutcome {
     /// `drive_rust_primary` doesn't need to re-import the gateway
     /// reference.
     pub(super) gateway_host: String,
+    /// Consumer program-identity prefix (deployment spec
+    /// `effective_job_name_prefix`) for the scratch dir + container
+    /// name. Captured here so the per-respawn wrapper-script generator
+    /// closure threads the same prefix the initial cohort used.
+    pub(super) name_prefix: String,
     /// Run-scoped log dir. The per-respawn `submit_job` call uses it
     /// for the regenerated `--output=`/`--error=` paths.
     pub(super) run_log_dir: String,
@@ -57,6 +62,14 @@ pub(super) struct PreparationOutcome {
     /// received into every respawned secondary's wrapper, without
     /// re-uploading the binary.
     pub(super) shutdown_manager_remote_path: Option<String>,
+    /// Gateway-side path of the uploaded `dynrunner-slurm-wrapper`
+    /// binary. Always populated on a successful preparation run (the
+    /// Python bridge raises on missing source rather than skipping).
+    /// Threaded into every wrapper render (initial cohort + respawn)
+    /// as the `wrapper_bin_path` kwarg so each per-job stub `exec`s the
+    /// binary at the same path. Mirrors
+    /// `shutdown_manager_remote_path`.
+    pub(super) wrapper_bin_remote_path: Option<String>,
 }
 
 /// Drive the SLURM preparation steps in order, directly from the
@@ -121,6 +134,21 @@ pub(super) fn run_preparation<'py>(
     // sees the same path without re-uploading the binary.
     let shutdown_manager_remote_path: Option<String> = job_manager
         .call_method0("upload_shutdown_manager_binary")?
+        .extract()?;
+
+    // Stage the `dynrunner-slurm-wrapper` musl-static binary on the
+    // gateway so each per-job wrapper-script stub can `exec` it to run
+    // the full secondary lifecycle (replacing the legacy inline bash).
+    // Same bridge contract as the shutdown-manager upload: the Python
+    // side resolves the local source path
+    // (`DYNRUNNER_SLURM_WRAPPER_BIN_SOURCE` override > wheel-bundled
+    // artifact under `dynamic_runner/_wrapper_manager/`) and raises on
+    // missing source. The resolved gateway-side path is stored on the
+    // Rust manager and surfaced via `wrapper_bin_remote_path` so every
+    // wrapper render in this run (initial cohort + respawn) emits the
+    // stub against the same binary path.
+    let wrapper_bin_remote_path: Option<String> = job_manager
+        .call_method0("upload_wrapper_binary")?
         .extract()?;
 
     // Image build + transfer, or skip-build path. Mirrors the legacy
@@ -216,6 +244,17 @@ pub(super) fn run_preparation<'py>(
             "shutdown_manager_bin_path",
             shutdown_manager_remote_path.as_deref(),
         )?;
+        // Consumer program-identity prefix for the scratch dir +
+        // container name. Sourced from the deployment spec's
+        // `effective_job_name_prefix` (`slurm_job_name_prefix` or
+        // `image_name`) — the same field that already names the SLURM
+        // job `{prefix}-{secondary_id}`, so the prefix the operator
+        // sees in squeue matches the one in `/tmp/<prefix>-…` and the
+        // container name. Replaces the framework's old hardcoded `asm`.
+        wrapper_kwargs.set_item("name_prefix", &job_name_prefix)?;
+        // Gateway-side path of the uploaded wrapper binary → renderer
+        // emits the `exec`-stub body. Always Some on a successful prep.
+        wrapper_kwargs.set_item("wrapper_bin_path", wrapper_bin_remote_path.as_deref())?;
         if let Some(reserved) = mem_manager_reserved_bytes {
             wrapper_kwargs.set_item("mem_manager_reserved_bytes", reserved)?;
         }
@@ -320,8 +359,10 @@ pub(super) fn run_preparation<'py>(
             mode_specific_data: mode_specific_data.unbind(),
             image_metadata: Some(image_metadata.clone().unbind()),
             gateway_host: gateway_host.clone(),
+            name_prefix: job_name_prefix.clone(),
             run_log_dir: run_log_dir.clone(),
             shutdown_manager_remote_path: shutdown_manager_remote_path.clone(),
+            wrapper_bin_remote_path: wrapper_bin_remote_path.clone(),
         },
         tunnel_manager_handle,
     ))

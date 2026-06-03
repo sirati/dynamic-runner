@@ -53,12 +53,22 @@
           # derivation against the consumer's nixpkgs.
           shutdown-manager-bin = pkgs.callPackage ./nix/shutdown-manager-bin.nix { };
 
+          # Musl-static slurm-wrapper binary. Single source of truth
+          # (derivation body + rationale) lives in
+          # `./nix/wrapper-bin.nix` so the consumer overlay
+          # (`./nix/overlay.nix`) can `callPackage` the same derivation
+          # against the consumer's nixpkgs.
+          wrapper-bin = pkgs.callPackage ./nix/wrapper-bin.nix { };
+
           # The wheel/Python-package derivation. Pass the built
-          # shutdown-manager binary so the wheel's `postInstall` can
-          # drop it into `dynamic_runner/_shutdown_manager/` inside
-          # the site-packages tree (see `nix/wheel.nix`).
+          # shutdown-manager + slurm-wrapper binaries so the wheel's
+          # `postInstall` can drop them into
+          # `dynamic_runner/_shutdown_manager/` and
+          # `dynamic_runner/_wrapper_manager/` inside the
+          # site-packages tree (see `nix/wheel.nix`).
           dynamic-runner = pkgs.python3Packages.callPackage ./nix/wheel.nix {
             shutdownManagerBin = shutdown-manager-bin;
+            wrapperManagerBin = wrapper-bin;
           };
 
           # E2E test_consumer container. Built with `nix build .#dockerImage`
@@ -81,6 +91,10 @@
             # exact artefact the wheel embeds without unpacking the
             # site-packages tree.
             dynrunner-slurm-shutdown = shutdown-manager-bin;
+            # Sibling output for the bundled slurm-wrapper binary —
+            # exposed so consumers can `nix build .#dynrunner-slurm-wrapper`
+            # and inspect the exact artefact the wheel embeds.
+            dynrunner-slurm-wrapper = wrapper-bin;
             default = dynamic-runner;
           };
 
