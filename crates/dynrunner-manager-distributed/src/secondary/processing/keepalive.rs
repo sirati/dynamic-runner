@@ -50,10 +50,11 @@ where
     /// (`first_failure_at.is_none()`); backdating to a fixed past
     /// instant is a no-op on repeat (same value re-stored).
     pub(in crate::secondary) fn check_primary_link_threshold(&mut self) {
-        if !self.primary_link.is_link_failing() {
+        let op = self.op_mut();
+        if !op.primary_link.is_link_failing() {
             return;
         }
-        if !self.primary_link.should_arm_failover() {
+        if !op.primary_link.should_arm_failover() {
             return;
         }
         tracing::warn!(
@@ -65,7 +66,7 @@ where
             .config
             .keepalive_interval
             .saturating_mul(self.config.keepalive_miss_threshold + 1);
-        self.primary_last_seen = Some(
+        self.op_mut().primary_last_seen = Some(
             Instant::now()
                 .checked_sub(backdate)
                 .unwrap_or_else(Instant::now),
@@ -95,6 +96,7 @@ where
             return;
         }
         let active_count = self
+            .op_mut()
             .pool
             .workers
             .iter()
@@ -112,7 +114,7 @@ where
         //   2. the peer mesh — so other secondaries refresh this node's
         //      `peer_keepalives` entry (drives their election timing).
         let _ = self.send_to_primary(msg.clone()).await;
-        if self.peer_mesh_degraded {
+        if self.is_mesh_degraded() {
             return;
         }
         let _ = self.send_to(Destination::All, msg).await;

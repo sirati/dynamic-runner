@@ -222,6 +222,15 @@ pub(in crate::secondary) struct ConfiguringState<M: ManagerEndpoint, I: Identifi
     /// Carried forward into [`OperationalState`] so the yield fires at most
     /// once per node across re-entry.
     pub(in crate::secondary) setup_discovery_done: bool,
+
+    /// This node's OWN in-flight worker assignments: `file_hash ->
+    /// worker_id`. Populated during the `InitialAssignment` dispatch,
+    /// which runs in `Configuring` (`wait_for_setup` →
+    /// `handle_initial_assignment`), BEFORE the `Configuring → Operational`
+    /// transition — so the map must exist from `Configuring` onward and is
+    /// carried forward into [`OperationalState`] at `enter_operational`.
+    /// Own-worker management, not authority.
+    pub(in crate::secondary) active_tasks: HashMap<String, WorkerId>,
 }
 
 /// State data for [`SecondaryLifecycle::Operational`].
@@ -331,6 +340,22 @@ pub(in crate::secondary) struct MeshFormation {
     pub(in crate::secondary) degraded: bool,
 }
 
+impl Default for MeshFormation {
+    /// The pre-dial resting state, identical to the flat-field defaults
+    /// the coordinator's `new()` used to set: no watchdog armed, zero
+    /// dials attempted, `MeshReady` not yet emitted, not degraded. The
+    /// orthogonal mesh sub-concern starts here in `Connecting` and
+    /// evolves as `connect_to_peers` fires and the watchdog runs.
+    fn default() -> Self {
+        Self {
+            peer_mesh_check_at: None,
+            peer_dial_count: 0,
+            mesh_ready_sent: false,
+            degraded: false,
+        }
+    }
+}
+
 /// The take-once runtime latches surrendered at the single
 /// [`SecondaryLifecycle::enter_operational`] boundary.
 ///
@@ -389,6 +414,43 @@ pub(in crate::secondary) struct OperationalLatches<I: Identifier> {
     /// Periodic cluster-state refresh callback. `None` when no consumer
     /// registered.
     pub(in crate::secondary) on_cluster_state_refresh: Option<ClusterStateRefreshFn<I>>,
+
+    /// Co-located primary LOOPBACK receiver (channel CH1). `Some` only on
+    /// a multi-role host whose pyo3 composition registered it (see
+    /// `SecondaryCoordinator::register_colocated_loopback_inbound`); the
+    /// secondary drains it in its operational `select!` loop alongside
+    /// `transport.recv_peer`, feeding each frame through `handle_inbound`
+    /// as a wire frame. `None` on every non-co-located path — the drain
+    /// arm parks on `pending()`. Surrendered at the same single fire-once
+    /// `enter_operational` boundary as the other take-once latches.
+    pub(in crate::secondary) colocated_loopback_inbound_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<DistributedMessage<I>>>,
+}
+
+impl<I: Identifier> OperationalLatches<I> {
+    /// An all-`None` latch carrier.
+    ///
+    /// Used by the pure-observer / late-joiner construction
+    /// ([`SecondaryLifecycle::operational_observer`] via
+    /// `restore_from_snapshot_and_skip_setup`): that path builds the
+    /// `Operational` state shell BEFORE the operational loop and must NOT
+    /// consume the coordinator's real take-once receivers — those are
+    /// surrendered at the single `process_tasks`-entry boundary, uniform
+    /// with the normal path. Passing this empty carrier and discarding the
+    /// returned one keeps the real `Option` fields intact on the
+    /// coordinator for that single consumption site.
+    pub(in crate::secondary) fn empty() -> Self {
+        Self {
+            lifecycle_rx: None,
+            task_completed_rx: None,
+            announcer_outbox_rx: None,
+            panik_signal_rx: None,
+            fatal_exit_signal_rx: None,
+            command_rx: None,
+            on_cluster_state_refresh: None,
+            colocated_loopback_inbound_rx: None,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -460,6 +522,7 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done: false,
+                    active_tasks: HashMap::new(),
                 }))
             }
             other => other,
@@ -499,7 +562,6 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         primary_last_seen: Option<Instant>,
         peer_keepalives: HashMap<String, f64>,
         primary_link: PrimaryLink,
-        active_tasks: HashMap<String, WorkerId>,
         pending_peer_messages: Vec<(String, DistributedMessage<I>)>,
         pending_worker_restarts: HashSet<WorkerId>,
         pending_first_bind: HashMap<WorkerId, PendingFirstBind<I>>,
@@ -512,6 +574,10 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
                     pre_staged_mode,
                     uses_file_based_items,
                     setup_discovery_done,
+                    // The initial-assignment dispatch (run in `Configuring`)
+                    // already populated `active_tasks`; carry it forward
+                    // rather than overwrite it with an empty map.
+                    active_tasks,
                 } = *cfg;
                 let next = SecondaryLifecycle::Operational(Box::new(OperationalState {
                     pool,
@@ -666,6 +732,20 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         }
     }
 
+    /// `&` (shared) access to the operational state, iff the lifecycle
+    /// has reached `Operational`. The read-only sibling of
+    /// [`Self::operational_mut`]: the read-only paths that may run before
+    /// the loop is fully operational (the mesh watchdog's
+    /// keepalive-active worker count, the keepalive emitter's
+    /// active-worker tally) borrow the pool / counts through this without
+    /// asserting `Operational`.
+    pub(in crate::secondary) fn operational_ref(&self) -> Option<&OperationalState<M, I>> {
+        match self {
+            SecondaryLifecycle::Operational(state) => Some(state),
+            _ => None,
+        }
+    }
+
     /// `&mut` access to the configuring state, iff the lifecycle is
     /// `Configuring`. The config-phase handlers (`InitialAssignment` /
     /// `TransferComplete` ingestion) are written against this and are thus
@@ -675,6 +755,114 @@ impl<M: ManagerEndpoint + 'static, I: Identifier> SecondaryLifecycle<M, I> {
         match self {
             SecondaryLifecycle::Configuring(state) => Some(state),
             _ => None,
+        }
+    }
+
+    /// `&mut` access to the worker pool from EITHER state that carries it
+    /// (`Configuring` or `Operational`). `None` in `Connecting` /
+    /// `AwaitingPrimary` (no pool spawned yet) and in terminal states.
+    ///
+    /// This is the accessor for the handlers that legitimately run in
+    /// BOTH the configuration and the operational phase and touch only
+    /// the pool — notably the shared `report_unresolvable_task` fail-loud
+    /// guard, reached from `handle_initial_assignment` (Configuring) AND
+    /// from the operational `TaskAssignment` dispatch (Operational). The
+    /// pool exists from `Configuring` onward, so a state-agnostic pool
+    /// borrow is exactly "pool exists" — which is the same structural
+    /// guarantee `op_mut`/`configuring_mut` give for their own state's
+    /// full surface, narrowed to the one field both states share.
+    pub(in crate::secondary) fn pool_mut(&mut self) -> Option<&mut WorkerPool<M, I>> {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => Some(&mut cfg.pool),
+            SecondaryLifecycle::Operational(op) => Some(&mut op.pool),
+            _ => None,
+        }
+    }
+
+    /// `&` (shared) sibling of [`Self::pool_mut`]: the worker pool from
+    /// `Configuring` or `Operational`. `None` pre-`Configuring` and in
+    /// terminal states. Used by the read-only sampler hooks, which fire
+    /// from both the initial-assignment (Configuring) and operational
+    /// dispatch sites and need the worker's cgroup-leaf path off the pool
+    /// without asserting a specific state.
+    pub(in crate::secondary) fn pool_ref(&self) -> Option<&WorkerPool<M, I>> {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => Some(&cfg.pool),
+            SecondaryLifecycle::Operational(op) => Some(&op.pool),
+            _ => None,
+        }
+    }
+
+    /// `&mut` access to the OWN-worker `active_tasks` map from whichever
+    /// state carries it (`Configuring` or `Operational`). It is first
+    /// populated by the `InitialAssignment` dispatch in `Configuring` and
+    /// carried forward into `Operational`, so own-worker management
+    /// touches it across both states. `None` pre-`Configuring` / terminal.
+    pub(in crate::secondary) fn active_tasks_mut(
+        &mut self,
+    ) -> Option<&mut HashMap<String, WorkerId>> {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => Some(&mut cfg.active_tasks),
+            SecondaryLifecycle::Operational(op) => Some(&mut op.active_tasks),
+            _ => None,
+        }
+    }
+
+    /// Read the pre-staged-source-mode flag from whichever state carries
+    /// it (`Configuring` or `Operational` — it is seeded in `Configuring`
+    /// and carried forward into `Operational`). `false` before
+    /// `Configuring` (no `InitialAssignment` seen yet), which matches the
+    /// historical pre-InitialAssignment default.
+    pub(in crate::secondary) fn pre_staged_mode(&self) -> bool {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => cfg.pre_staged_mode,
+            SecondaryLifecycle::Operational(op) => op.pre_staged_mode,
+            _ => false,
+        }
+    }
+
+    /// Read the file-based-items flag from whichever state carries it.
+    /// Defaults to `true` before `Configuring` (the historical
+    /// pre-`InitialAssignment` contract: items are real files until an
+    /// `InitialAssignment` says otherwise).
+    pub(in crate::secondary) fn uses_file_based_items(&self) -> bool {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => cfg.uses_file_based_items,
+            SecondaryLifecycle::Operational(op) => op.uses_file_based_items,
+            _ => true,
+        }
+    }
+
+    /// Read the setup-discovery fire-once latch from whichever state
+    /// carries it. `false` before `Configuring`.
+    pub(in crate::secondary) fn setup_discovery_done(&self) -> bool {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => cfg.setup_discovery_done,
+            SecondaryLifecycle::Operational(op) => op.setup_discovery_done,
+            _ => false,
+        }
+    }
+
+    /// Set the pre-staged-source-mode flag on the carrying state. Written
+    /// from `wait_for_setup`'s `InitialAssignment` handler, which runs in
+    /// `Configuring`. A no-op pre-`Configuring` / terminal (no state to
+    /// carry it) — defensive; the only caller runs in `Configuring`.
+    pub(in crate::secondary) fn set_pre_staged_mode(&mut self, on: bool) {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => cfg.pre_staged_mode = on,
+            SecondaryLifecycle::Operational(op) => op.pre_staged_mode = on,
+            _ => {}
+        }
+    }
+
+    /// Set the file-based-items flag on the carrying state. Same
+    /// `Configuring`-phase write site / no-op-otherwise disposition as
+    /// [`Self::set_pre_staged_mode`].
+    pub(in crate::secondary) fn set_uses_file_based_items(&mut self, on: bool) {
+        match self {
+            SecondaryLifecycle::Configuring(cfg) => cfg.uses_file_based_items = on,
+            SecondaryLifecycle::Operational(op) => op.uses_file_based_items = on,
+            _ => {}
         }
     }
 }

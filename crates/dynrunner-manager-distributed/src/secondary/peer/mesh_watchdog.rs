@@ -70,7 +70,7 @@ where
     /// `cluster_state.apply(RunComplete)` site, so call sites stay
     /// agnostic to peer-mesh policy.
     pub(in crate::secondary) async fn check_peer_mesh_watchdog(&mut self) {
-        let deadline = match self.peer_mesh_check_at {
+        let deadline = match self.mesh.peer_mesh_check_at {
             Some(d) => d,
             None => return,
         };
@@ -83,41 +83,81 @@ where
             // failure twin of `run_complete`; both terminate the run,
             // so both disarm the watchdog — single source of truth here
             // rather than at every apply site.)
-            self.peer_mesh_check_at = None;
+            self.mesh.peer_mesh_check_at = None;
             return;
         }
-        // peer_count drains new connections internally; calling it
-        // BEFORE the deadline check lets a fresh connection clear
-        // the watchdog without firing the fault.
-        let connected = self.transport.peer_count();
-        if connected > 0 {
-            self.peer_mesh_check_at = None;
-            // Mesh formed for the first time — tell the primary so
-            // it can release `PromotePrimary`. Idempotent via
-            // `mesh_ready_sent`.
+        // Real peer-secondary count — drains new connections internally
+        // (`real_peer_count` calls `peer_count`), then EXCLUDES the
+        // folded primary at this edge: the transport is role-blind
+        // (de-role removed the in-transport primary exclusion), so its
+        // raw `peer_count` now includes the primary as an ordinary mesh
+        // peer. The watchdog asks "did the peer-SECONDARY mesh form?", so
+        // it must not count the primary; a primary-only / firewalled
+        // fleet (zero real peer-secondaries) would otherwise falsely
+        // report "mesh formed". Edge-side exclusion keeps TRANSPORT⊥ROLES
+        // (the transport stays role-blind). Read BEFORE the deadline
+        // check so an all-expected connection clears the watchdog without
+        // firing.
+        //
+        // FULL-FORMED happy path: clear the watchdog early ONLY when
+        // EVERY expected real peer is connected (`connected ==
+        // peer_dial_count`). `peer_dial_count` already counts only the
+        // PeerInfo secondaries (the primary is NOT in the dial list — see
+        // A4), so this is apples-to-apples with `real_peer_count`. A
+        // PARTIAL mesh (0 < connected < expected) does NOT clear early:
+        // it waits for the deadline, where it is reported as
+        // formed-but-not-degraded (still failover-capable with ≥1 peer) —
+        // the intended degraded-but-proceed path. (Pre-change this
+        // cleared on `connected > 0`; the refinement is "all expected"
+        // with timeout as the fallback.)
+        let connected = self.real_peer_count();
+        if connected == self.mesh.peer_dial_count as usize {
+            self.mesh.peer_mesh_check_at = None;
+            // Full mesh formed — tell the primary so it can release
+            // `PromotePrimary`. Idempotent via `mesh_ready_sent`.
             self.report_mesh_ready_if_needed().await;
             return;
         }
         if std::time::Instant::now() < deadline {
             return;
         }
-        // Latch the watchdog off first so it never re-fires.
-        self.peer_mesh_check_at = None;
-        self.peer_mesh_degraded = true;
+        // Deadline elapsed without a full mesh. Latch the watchdog off
+        // first so it never re-fires.
+        self.mesh.peer_mesh_check_at = None;
+        // Degraded IFF truly lone: zero real peers connected. Threshold
+        // is behaviourally UNCHANGED from before the primary-exclusion
+        // edit (`== 0`), only the count now excludes the folded primary.
+        // A partial mesh (≥1 real peer) is NOT degraded — two
+        // fully-meshed secondaries can still elect (candidate + 1 voter),
+        // so failover stays available; only a secondary that is alone
+        // (no peer to gather quorum from) latches degraded so
+        // `run_election_tick` bails clearly instead of self-promoting
+        // solo.
+        if connected == 0 {
+            self.mesh.degraded = true;
+            tracing::warn!(
+                attempted = self.mesh.peer_dial_count,
+                connected = 0,
+                "peer mesh did not form — failover and inter-secondary \
+                 keepalive paths are unavailable; run will continue but \
+                 is fragile (tasks dispatched via primary→secondary WSS \
+                 still flow)"
+            );
+        } else {
+            tracing::warn!(
+                attempted = self.mesh.peer_dial_count,
+                connected,
+                "peer mesh formed only partially before the deadline — \
+                 proceeding degraded-but-capable (≥1 peer can still gather \
+                 failover quorum); further peers may still arrive"
+            );
+        }
 
-        tracing::warn!(
-            attempted = self.peer_dial_count,
-            connected = 0,
-            "peer mesh did not form — failover and inter-secondary \
-             keepalive paths are unavailable; run will continue but \
-             is fragile (tasks dispatched via primary→secondary WSS \
-             still flow)"
-        );
-
-        // Report mesh-ready (with peer_count=0) so the primary's
-        // `wait_for_mesh_ready` step releases `PromotePrimary`
-        // instead of blocking the full mesh-ready timeout on a
-        // secondary that will never see peers. Idempotent via
+        // Report mesh-ready (with the real-peer count, which is 0 in the
+        // lone case) so the primary's `wait_for_mesh_ready` step releases
+        // `PromotePrimary` instead of blocking the full mesh-ready
+        // timeout. Fires in EVERY terminal case — full, partial, or lone
+        // — so the primary always unblocks. Idempotent via
         // `mesh_ready_sent`.
         self.report_mesh_ready_if_needed().await;
     }
@@ -145,7 +185,7 @@ where
         if self.config.is_observer {
             return;
         }
-        if self.mesh_ready_sent {
+        if self.mesh.mesh_ready_sent {
             return;
         }
         // Three reportable states, all coalesced by this single
@@ -153,19 +193,26 @@ where
         //   - peer_dial_count == 0: no peers were expected (single-
         //     secondary run, or empty PeerInfo). Mesh is trivially
         //     "ready" the moment we reach the operational loop.
-        //   - peer_count > 0: at least one dial landed; mesh has
-        //     formed (further peers may keep arriving but the
-        //     primary just needs the first non-empty signal).
+        //   - real-peer count > 0: at least one peer-SECONDARY dial
+        //     landed; mesh has formed (further peers may keep arriving
+        //     but the primary just needs the first non-empty signal).
         //   - peer_mesh_check_at is None AND peer_dial_count > 0:
         //     the watchdog has already cleared the deadline (either
         //     mesh formed, in which case the previous branch fired,
         //     or it elapsed with zero peers). The fully-failed case
         //     still reports so the primary doesn't wait the full
         //     mesh-ready timeout for nothing.
-        let connected = self.transport.peer_count() as u32;
-        let no_peers_expected = self.peer_dial_count == 0;
+        //
+        // The count EXCLUDES the folded primary (de-role made the
+        // transport role-blind, so its raw `peer_count` includes the
+        // primary). Both the `mesh_formed` test and the reported
+        // `peer_count` use the real-peer count so a primary-only fleet
+        // reads as zero peers, matching the primary's `wait_for_mesh_ready`
+        // which counts secondaries.
+        let connected = self.real_peer_count() as u32;
+        let no_peers_expected = self.mesh.peer_dial_count == 0;
         let mesh_formed = connected > 0;
-        let watchdog_done = self.peer_dial_count > 0 && self.peer_mesh_check_at.is_none();
+        let watchdog_done = self.mesh.peer_dial_count > 0 && self.mesh.peer_mesh_check_at.is_none();
         if !(no_peers_expected || mesh_formed || watchdog_done) {
             return;
         }
@@ -189,6 +236,36 @@ where
         } else {
             tracing::debug!(connected, "MeshReady sent to primary");
         }
-        self.mesh_ready_sent = true;
+        self.mesh.mesh_ready_sent = true;
+    }
+
+    /// Count of connected REAL peer-secondaries — the transport's
+    /// connected-peer cardinality with the folded primary excluded.
+    ///
+    /// The transport is role-blind (de-role removed its in-transport
+    /// primary exclusion), so `transport.peer_count()` now counts the
+    /// primary as an ordinary mesh peer. The peer-mesh-formation concern
+    /// asks specifically about peer-SECONDARY connectivity, so this edge
+    /// helper subtracts the primary when it is itself a connected mesh
+    /// peer (`has_peer(current_primary)`). Keeping the exclusion at this
+    /// edge — not in the transport — preserves TRANSPORT⊥ROLES.
+    ///
+    /// Robust across the de-role cutover: when the primary is NOT a
+    /// transport peer (the pre-de-role world, or any fleet where the
+    /// primary link is a separate leg), `has_peer(primary)` is false and
+    /// this is exactly `peer_count()`. When it IS a peer (post-de-role),
+    /// it is `peer_count() - 1`.
+    pub(in crate::secondary) fn real_peer_count(&self) -> usize {
+        let raw = self.transport.peer_count();
+        let primary_is_peer = self
+            .cluster_state
+            .current_primary()
+            .map(|p| {
+                self.transport.has_peer(
+                    &dynrunner_protocol_primary_secondary::PeerId::from(p.to_string()),
+                )
+            })
+            .unwrap_or(false);
+        raw.saturating_sub(primary_is_peer as usize)
     }
 }

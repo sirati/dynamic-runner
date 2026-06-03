@@ -63,25 +63,35 @@ where
             SendTarget::Peer(peer) => self.transport.send_to_peer(peer.as_str(), msg).await,
             SendTarget::Broadcast => self.transport.broadcast(msg).await,
             // Loopback: the resolved primary host id == this node's id —
-            // a self-promoted secondary that transiently still addresses
-            // `Destination::Primary` while handing off to its co-located
-            // primary. REAL in-process delivery to that co-located
-            // primary coordinator is the multi-role-host single-transport
-            // concern (A8); until it lands, the parked-primary
-            // composition is itself gated off (the A8 `unimplemented!()`
-            // in `activate_co_located_primary`'s wiring), so there is no
-            // local primary coordinator to receive this frame. A no-op
-            // is faithful — the authoritative terminal/ledger state this
-            // frame would carry is reconciled via the CRDT broadcast the
-            // promoted primary originates, not this self-report. Do NOT
-            // fall back to `send_to_peer(self_id)` (NoRoute — a node has
-            // no self-connection).
+            // a self-promoted secondary addressing `Destination::Primary`
+            // while its co-located primary holds authority. In-process
+            // delivery to that co-located primary is the host's single
+            // mesh-transport concern (A8): the secondary pushes the frame
+            // into the co-located primary's inbound channel (CH2), where
+            // the primary's `recv_peer` drains it. Do NOT fall back to
+            // `send_to_peer(self_id)` (NoRoute — a node has no
+            // self-connection).
+            //
+            // `None` when no co-located primary was composed (every
+            // non-pyo3 path): the frame is dropped, which is faithful —
+            // the authoritative terminal/ledger state it would carry is
+            // reconciled via the CRDT broadcast the promoted primary
+            // originates, not this self-report.
             SendTarget::Loopback => {
-                tracing::debug!(
-                    "Destination::Primary resolved to self; in-process loopback delivery to a \
-                     co-located primary is owned by the multi-role-host single-transport leaf — \
-                     dropping (no co-located primary composed yet)"
-                );
+                if let Some(tx) = self.colocated_primary_inbound_tx.as_ref() {
+                    // Unbounded; a closed receiver means the co-located
+                    // primary is gone (host tearing down) — drop best-effort.
+                    let _ = tx.send(msg);
+                    tracing::trace!(
+                        "Destination::Primary resolved to self; delivered own-host report to \
+                         co-located primary inbound (CH2 loopback)"
+                    );
+                } else {
+                    tracing::debug!(
+                        "Destination::Primary resolved to self but no co-located primary \
+                         composed; dropping own-host report (reconciled via CRDT broadcast)"
+                    );
+                }
                 Ok(())
             }
         }
@@ -123,7 +133,7 @@ where
             // probe. `record_recv_failure` anchors the failure window
             // on the first breach and returns true once the count- or
             // time-axis threshold is crossed.
-            let armed = self.primary_link.record_recv_failure();
+            let armed = self.op_mut().primary_link.record_recv_failure();
             if armed {
                 tracing::warn!(
                     error = %e,
@@ -134,7 +144,7 @@ where
                     .config
                     .keepalive_interval
                     .saturating_mul(self.config.keepalive_miss_threshold + 1);
-                self.primary_last_seen = Some(
+                self.op_mut().primary_last_seen = Some(
                     std::time::Instant::now()
                         .checked_sub(backdate)
                         .unwrap_or_else(std::time::Instant::now),
@@ -193,7 +203,15 @@ where
         factory: &mut impl WorkerFactory<M>,
     ) {
         let max = self.max_resources();
-        let result = watcher.on_decision(&mut self.pool, &self.scheduler, &max, false);
+        // Clone the scheduler before borrowing the operational pool: the
+        // pool now lives inside `OperationalState` (reached via
+        // `op_mut()`, a full `&mut self` borrow), so a simultaneous
+        // `&self.scheduler` shared borrow would conflict. The scheduler
+        // is `Clone`-bounded in this impl and cheap to clone (a
+        // config-shaped value); cloning once per decision tick keeps the
+        // disjoint borrows clean without a manual struct destructure.
+        let scheduler = self.scheduler.clone();
+        let result = watcher.on_decision(&mut self.op_mut().pool, &scheduler, &max, false);
         self.handle_resource_pressure_result(result, factory).await;
     }
 
@@ -228,14 +246,15 @@ where
                 worker_id, reason, ..
             } => {
                 // Find and report the task as failed
-                let file_hash = self
+                let op = self.op_mut();
+                let file_hash = op
                     .active_tasks
                     .iter()
                     .find(|&(_, &wid)| wid == worker_id)
                     .map(|(hash, _)| hash.clone());
 
                 if let Some(hash) = file_hash {
-                    self.active_tasks.remove(&hash);
+                    self.op_mut().active_tasks.remove(&hash);
 
                     let (error_type, error_message) = if reason.is_no_fault() {
                         (ErrorType::Recoverable, NO_FAULT_PREEMPT_WIRE_MESSAGE.into())
@@ -266,7 +285,12 @@ where
                 }
 
                 // Restart the worker and request a new task
-                if let Err(e) = self.pool.restart_worker(worker_id, factory, false).await {
+                if let Err(e) = self
+                    .op_mut()
+                    .pool
+                    .restart_worker(worker_id, factory, false)
+                    .await
+                {
                     tracing::error!(worker_id, error = %e, "secondary OOM-restart failed");
                     return;
                 }
@@ -291,12 +315,12 @@ where
         &mut self,
         worker_id: WorkerId,
     ) -> Result<(), String> {
-        if !self.primary_link.should_request_now(worker_id) {
+        if !self.op_mut().primary_link.should_request_now(worker_id) {
             return Ok(());
         }
 
-        let available_memory = if (worker_id as usize) < self.pool.workers.len() {
-            self.pool.workers[worker_id as usize]
+        let available_memory = if (worker_id as usize) < self.op_mut().pool.workers.len() {
+            self.op_mut().pool.workers[worker_id as usize]
                 .reserved_budgets
                 .get(&dynrunner_core::ResourceKind::memory())
         } else {
@@ -316,7 +340,7 @@ where
                 amount: available_memory,
             }],
         };
-        self.primary_link.note_request_sent(worker_id);
+        self.op_mut().primary_link.note_request_sent(worker_id);
 
         self.send_to_primary(msg).await
     }
@@ -336,9 +360,13 @@ where
     /// them). Regular live-primary runs see most polls suppressed by
     /// the backoff because the kickstart already covers the path.
     pub(super) async fn repoll_idle_workers(&mut self) {
-        let n = self.pool.workers.len();
+        let n = self.op_mut().pool.workers.len();
         for wid in 0..n {
-            if self.pool.workers[wid].is_idle_state() {
+            // Re-borrow per iteration: the idle-state read (an `op_mut`
+            // borrow) must end before the `request_task_for_worker`
+            // await (which re-borrows `op_mut` internally for the
+            // rate-limiter + capacity read).
+            if self.op_mut().pool.workers[wid].is_idle_state() {
                 let _ = self.request_task_for_worker(wid as WorkerId).await;
             }
         }

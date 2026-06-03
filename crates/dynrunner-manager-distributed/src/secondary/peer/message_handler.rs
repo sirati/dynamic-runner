@@ -63,6 +63,34 @@ where
         msg: DistributedMessage<I>,
         factory: &mut impl WorkerFactory<M>,
     ) {
+        // Co-located inbound demux (CH2). When THIS host also runs the
+        // primary role, a primary-facing frame the secondary observed on
+        // the mesh (a peer's TaskRequest / terminal report / MeshReady /
+        // SecondaryFatalError — `is_primary_facing`) belongs to the
+        // co-located `PrimaryCoordinator`, not the secondary: forward it
+        // into the primary's inbound channel and stop (the secondary must
+        // NOT also process it — that would double-handle a report it has
+        // no authority over). Demux at the ingress EDGE, never inside the
+        // transport (TRANSPORT⊥ROLES). The gate is the same recognition
+        // the Keepalive arm uses (`current_primary() == self`), so no new
+        // role machinery. `ClusterMutation` / `Keepalive` are NOT
+        // primary-facing — both roles consume them, so they always stay
+        // on the secondary path (the co-located primary observes the CRDT
+        // via its own mesh-member broadcast receipt). No co-located
+        // primary composed (`colocated_primary_inbound_tx` is `None`,
+        // every non-pyo3 path) ⇒ this is inert and the frame is handled
+        // secondary-side exactly as before.
+        if msg.is_primary_facing()
+            && self.colocated_primary_inbound_tx.is_some()
+            && self.cluster_state.current_primary() == Some(self.config.secondary_id.as_str())
+        {
+            // Unbounded send; a closed receiver means the co-located
+            // primary is gone — drop best-effort.
+            if let Some(tx) = self.colocated_primary_inbound_tx.as_ref() {
+                let _ = tx.send(msg);
+            }
+            return;
+        }
         match msg {
             DistributedMessage::Keepalive {
                 secondary_id,
@@ -112,7 +140,9 @@ where
                         }
                     }
                     KeepaliveRole::Secondary => {
-                        self.peer_keepalives.insert(secondary_id.clone(), timestamp);
+                        self.op_mut()
+                            .peer_keepalives
+                            .insert(secondary_id.clone(), timestamp);
                         tracing::trace!(
                             peer = %secondary_id,
                             active_workers,
@@ -190,7 +220,7 @@ where
                 ..
             } => {
                 // Respond with our last known keepalive for the queried node.
-                let last_keepalive = self.peer_keepalives.get(&query_node_id).copied();
+                let last_keepalive = self.op_mut().peer_keepalives.get(&query_node_id).copied();
                 let response: DistributedMessage<I> = DistributedMessage::TimeoutResponse {
                     sender_id: self.config.secondary_id.clone(),
                     timestamp: timestamp_now(),
@@ -199,7 +229,7 @@ where
                 };
                 tracing::debug!(peer = %sender_id, "timeout query received, queueing response");
                 // Queue for async send — will be flushed in the main loop
-                self.pending_peer_messages.push((sender_id, response));
+                self.op_mut().pending_peer_messages.push((sender_id, response));
             }
             DistributedMessage::TimeoutResponse {
                 sender_id,
@@ -216,7 +246,7 @@ where
                 ..
             } => {
                 if let Some(reply) = self.record_promotion_vote(candidate_id, vote_round) {
-                    self.pending_peer_messages.push((sender_id, reply));
+                    self.op_mut().pending_peer_messages.push((sender_id, reply));
                 }
             }
             DistributedMessage::PromotionConfirm {

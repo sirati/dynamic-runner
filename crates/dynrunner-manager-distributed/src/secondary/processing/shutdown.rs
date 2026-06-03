@@ -22,6 +22,14 @@ where
     I: Identifier,
 {
     pub(in crate::secondary) async fn stop_all_workers(&mut self) {
-        self.pool.stop_all().await;
+        // The pool exists only from `Configuring` onward. A teardown
+        // reached before the pool was spawned (e.g. a setup-handshake
+        // failure in `AwaitingPrimary`, or the late-joiner/terminal
+        // paths) has nothing to stop — `pool_mut()` is `None` there and
+        // this is a no-op. From `Configuring`/`Operational` it stops the
+        // real pool, exactly as before.
+        if let Some(pool) = self.lifecycle.pool_mut() {
+            pool.stop_all().await;
+        }
     }
 }
