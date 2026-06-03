@@ -14,7 +14,7 @@ use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
 use super::super::wire::timestamp_now;
-use super::{ElectionState, ElectionTickActions, next_round, primary_node_id};
+use super::{ElectionState, ElectionTickActions, next_round};
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -77,34 +77,23 @@ where
         }
     }
 
-    /// The node id whose keepalives count as PRIMARY-liveness assertions
-    /// for failover, as a TOTAL function — recognition never has a "no
-    /// primary" hole.
+    /// The live mesh peers for failover quorum/candidate reasoning: the
+    /// keys of `peer_keepalives` MINUS the current primary's host id.
     ///
-    /// This is the RECOGNITION concern, deliberately decoupled from the
-    /// ROUTING concern. Routing (how to physically reach the primary) reads
-    /// `role_table.primary` / the transport `RoleCache`, which is COLD on
-    /// bootstrap on purpose so traffic flows over the uplink — that COLD
-    /// state mirrors as `cluster_state.current_primary() == None`. But the
-    /// bootstrap primary's IDENTITY is not unknown: it is the well-known
-    /// canonical `primary_node_id()` constant — the same value election
-    /// stamps into `TimeoutQuery::query_node_id` and the bootstrap primary
-    /// stamps onto every keepalive it broadcasts. So recognition resolves
-    /// `current_primary()` when a failover has named a concrete winner, and
-    /// otherwise falls back to that canonical bootstrap identity. The
-    /// `None`-means-routes-via-uplink artifact must NOT leak into
-    /// recognition, or the bootstrap primary's keepalives are never
-    /// recognized and primary liveness stays parasitic on dispatch traffic.
-    ///
-    /// The fallback is DISABLED once a failover commits a concrete primary
-    /// (`current_primary() == Some(winner)`): a zombie/demoted old bootstrap
-    /// primary's keepalives (still stamped `primary_node_id()`) then no
-    /// longer match, so they correctly fall through to `peer_keepalives`.
-    pub(in crate::secondary) fn recognized_primary_id(&self) -> String {
-        self.cluster_state
-            .current_primary()
-            .map(str::to_owned)
-            .unwrap_or_else(primary_node_id)
+    /// A co-located primary+secondary host emits a `Secondary` keepalive
+    /// that lands in `peer_keepalives` even though its id is the current
+    /// primary (the recognition arm tracks a multi-role host as BOTH). That
+    /// entry is correct as peer-mesh liveness but must NEVER inflate
+    /// election counts — the primary is the role being failed-over FROM, not
+    /// a peer that could vote for or become a candidate. Excluding it here
+    /// is the single quorum-side counterpart to the peer-timeout sweep's
+    /// own current-primary skip (`check_peer_timeouts`), both keyed on the
+    /// single source of "who is primary now" (`current_primary()`).
+    pub(in crate::secondary) fn live_peer_ids(&self) -> impl Iterator<Item = &String> {
+        let current_primary = self.cluster_state.current_primary();
+        self.peer_keepalives
+            .keys()
+            .filter(move |id| Some(id.as_str()) != current_primary)
     }
 
     /// Advance the election state. Called once per processing-loop tick.
@@ -134,27 +123,27 @@ where
         // `primary_silent` is the SOLE liveness predicate for whoever
         // currently holds the primary role — co-located OR a promoted
         // peer. `primary_last_seen` is refreshed by
-        // `record_primary_message`, and post-A-M0a the recognition path
-        // in `handle_inbound`'s Keepalive arm routes EVERY keepalive
-        // whose originator IS the current primary (resolved via
-        // `cluster_state.current_primary()`, the single source of "who
-        // is primary now") through `record_primary_message`. So a
-        // promoted peer's keepalives refresh `primary_last_seen` exactly
-        // like the co-located primary's dispatch traffic once did, and a
-        // genuinely-dead promoted primary trips `primary_silent` once its
-        // keepalives stop — there is no longer a separate
-        // promoted-peer-primary liveness axis to track.
+        // `record_primary_message`, driven by the role-tagged recognition
+        // path in `handle_inbound`'s Keepalive arm: a `Primary`-tagged
+        // keepalive whose originator IS the current primary (resolved via
+        // `cluster_state.current_primary()`, the single source of "who is
+        // primary now") refreshes `primary_last_seen`. So a promoted peer's
+        // primary keepalives refresh it exactly like the co-located
+        // primary's dispatch traffic once did, and a genuinely-dead primary
+        // trips `primary_silent` once its primary keepalives stop — there is
+        // no longer a separate promoted-peer-primary liveness axis to track.
         //
         // This subsumes the former cascade trigger (`primary_peer_silent`,
-        // which read the promoted primary's `peer_keepalives` entry):
-        // that branch is both REDUNDANT (the recognition path now keeps
-        // `primary_last_seen` fresh for a promoted peer) and BROKEN (post-
-        // A-M0a the current primary's keepalives no longer populate
-        // `peer_keepalives`, so its `unwrap_or(true)` fired against a
-        // HEALTHY just-promoted primary and stormed `TimeoutQuery`,
-        // risking double-promotion). The cascade (promoted-peer-died)
-        // case Dataset's K=2 run hit is now covered by `primary_silent`
-        // via the A-M0a recognition path.
+        // which read the promoted primary's `peer_keepalives` entry): that
+        // branch is both REDUNDANT (the recognition path keeps
+        // `primary_last_seen` fresh via the Primary keepalive) and BROKEN
+        // (it would fire against a HEALTHY just-promoted primary and storm
+        // `TimeoutQuery`, risking double-promotion). The cascade
+        // (promoted-peer-died) case Dataset's K=2 run hit is covered by
+        // `primary_silent`. A co-located primary's Secondary keepalive DOES
+        // land in `peer_keepalives` (it is a live mesh peer), but that
+        // entry is excluded from quorum/candidate counts by `live_peer_ids`,
+        // so peer liveness and primary liveness stay cleanly separate.
         let primary_silent = self
             .primary_last_seen
             .map(|t| Instant::now().duration_since(t) > deadline)
@@ -176,11 +165,14 @@ where
                 // node to coordinate with, so the cluster is
                 // already unsalvageable. Bail with a clear reason
                 // instead of pretending the election succeeded.
-                // Diagnostic only: who the silent primary was (co-located
-                // or a promoted peer). Read inline from the single source
-                // of "who is primary now"; it drives no decision — the
-                // decision is `primary_silent` alone.
-                let current_primary_id = self.cluster_state.current_primary();
+                // Who the silent primary was (co-located or a promoted
+                // peer). Read from the single source of "who is primary
+                // now"; post-uniform-announce this is always `Some` before
+                // any election runs, so it is BOTH the diagnostic identity
+                // and the `TimeoutQuery::query_node_id` the peers reply
+                // about — no separate canonical constant. It drives no
+                // election decision (that is `primary_silent` alone).
+                let current_primary_id = self.cluster_state.current_primary().map(str::to_owned);
                 if self.peer_mesh_degraded {
                     let reason = format!(
                         "peer mesh required for failover but not \
@@ -209,11 +201,13 @@ where
                     since: Instant::now(),
                     responses: HashMap::new(),
                 };
-                actions.broadcast.push(DistributedMessage::TimeoutQuery {
-                    sender_id: self.config.secondary_id.clone(),
-                    timestamp: timestamp_now(),
-                    query_node_id: primary_node_id(),
-                });
+                if let Some(query_node_id) = current_primary_id {
+                    actions.broadcast.push(DistributedMessage::TimeoutQuery {
+                        sender_id: self.config.secondary_id.clone(),
+                        timestamp: timestamp_now(),
+                        query_node_id,
+                    });
+                }
             }
             ElectionState::Suspecting { since, responses } => {
                 // Wait at least `keepalive_interval` to gather peer responses
@@ -222,7 +216,7 @@ where
                 if since.elapsed() < self.config.keepalive_interval {
                     return actions;
                 }
-                let peer_count = self.peer_keepalives.len();
+                let peer_count = self.live_peer_ids().count();
                 let agreeing = responses
                     .values()
                     .filter(|last| {
@@ -260,8 +254,7 @@ where
                 // broadcast path.
                 let observers = &self.cluster_state.role_table().observers;
                 let lowest_alive = self
-                    .peer_keepalives
-                    .keys()
+                    .live_peer_ids()
                     .filter(|id| !observers.contains(*id))
                     .chain(
                         std::iter::once(&self.config.secondary_id)
@@ -294,7 +287,7 @@ where
                 // peer_mesh_degraded guard above catches the
                 // pathological "alone and primary's dead" case.
                 if self.config.is_observer && we_lead {
-                    let next_lowest = self.peer_keepalives.keys().min().cloned();
+                    let next_lowest = self.live_peer_ids().min().cloned();
                     tracing::info!(
                         observer = %self.config.secondary_id,
                         ?next_lowest,
@@ -405,8 +398,7 @@ where
             return None;
         }
         let lowest = self
-            .peer_keepalives
-            .keys()
+            .live_peer_ids()
             .chain(std::iter::once(&self.config.secondary_id))
             .min()
             .cloned();
@@ -448,7 +440,7 @@ where
         if target != self.config.secondary_id {
             return false;
         }
-        let peer_count = self.peer_keepalives.len();
+        let peer_count = self.live_peer_ids().count();
         let quorum = peer_count.div_ceil(2) + 1;
         let promoted = match &mut self.election {
             ElectionState::Candidate {
