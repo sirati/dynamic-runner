@@ -145,9 +145,9 @@ impl<I: Identifier> PeerTransport<I> for RecordingPeer<I> {
 }
 
 /// PeerTransport that drops every message and never produces input.
-// Retained for the channel→mesh fold leaf: the `spawn_real_secondary*`
-// helpers that constructed it are `unimplemented!()` until that leaf
-// rebuilds the channel-backed mesh harness.
+// Unused since `spawn_real_secondary*` moved to the channel-backed mesh
+// harness (`channel_mesh_secondary_ends`); kept as a drop-everything
+// stub for ad-hoc isolation tests.
 #[allow(dead_code)]
 pub(super) struct NoPeers;
 
@@ -179,8 +179,9 @@ impl<I: Identifier> PeerTransport<I> for NoPeers {
     async fn connect_to_peers(&mut self, _peers: &[PeerConnectionInfo]) {}
 }
 
-/// Factory that spawns fake workers via channel transport.
-// Retained for the channel→mesh fold leaf (see `NoPeers`).
+/// Factory that spawns fake workers via channel transport. Drives the
+/// real secondaries the channel-backed mesh harness stands up
+/// (`spawn_real_secondary`).
 #[allow(dead_code)]
 pub(super) struct FakeWorkerFactory;
 
@@ -219,7 +220,7 @@ impl WorkerFactory<ChannelManagerEnd> for FakeWorkerFactory {
 /// style fixture names with no extra plumbing into the wire shape.
 ///
 /// Single-threaded (`Rc`); only safe inside a `tokio::task::LocalSet`.
-// Retained for the channel→mesh fold leaf (see `NoPeers`).
+// Drives `spawn_real_secondary_slow` in the channel-backed mesh harness.
 #[allow(dead_code)]
 #[derive(Clone)]
 pub(super) struct SlowFakeWorkerFactory {
