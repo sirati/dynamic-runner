@@ -223,6 +223,21 @@ impl<I: Identifier> TunneledPeerTransport<I> {
             .insert(reg.peer_id, reg.outgoing_tx);
     }
 
+    /// Drain every accept-loop registration already queued on
+    /// `new_conn_rx` into the shared `outgoing` table, non-blocking.
+    /// The single owner of "apply all pending registrations now";
+    /// `recv_peer` (its eager pre-yield drain), `try_recv_peer`, and
+    /// `broadcast` all call it so the writer table is current before
+    /// each peeks/iterates. Mirrors `PeerNetwork::drain_new_connections`
+    /// — the broadcast fan-out must drain first so a secondary whose
+    /// handshake completed since the last poll (its registration still
+    /// on `new_conn_rx`, not yet in `outgoing`) is not silently skipped.
+    fn drain_registrations(&mut self) {
+        while let Ok(reg) = self.new_conn_rx.try_recv() {
+            self.register_peer(reg);
+        }
+    }
+
     /// Role-layer interceptor — mirrors
     /// `PeerNetwork::handle_role_layer`. The
     /// `decide_role_addressed_with_cache` decision is the single
@@ -368,27 +383,63 @@ impl<I: Identifier> TunneledPeerTransport<I> {
 
 impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
     async fn broadcast(&mut self, msg: DistributedMessage<I>) -> Result<(), String> {
+        // ONE broadcast topology, exactly-once. This is a direct
+        // fan-out over the SAME Router-backed `outgoing` connection
+        // table the Router relays through — NOT a per-peer
+        // `router.send_to_peer`, and NOT a separate writer set. The
+        // exactly-once guarantee for a global-state (CRDT) broadcast
+        // is structural: each connected peer gets exactly ONE plain
+        // `msg.clone()` send (not a `Relay` envelope), so no peer is
+        // reachable both directly AND as a relay forwarder for the
+        // same frame — there is no direct+relay double-delivery and no
+        // re-broadcast (receivers apply the CRDT idempotently and never
+        // re-fan-out). The idempotent epoch-LWW apply is a safety net,
+        // not a license to send twice. Mirrors
+        // `PeerNetwork::broadcast` step-for-step.
+        //
+        // Drain pending accept-loop registrations FIRST so a secondary
+        // whose handshake completed since the last `recv_peer` poll —
+        // its writer still queued on `new_conn_rx`, not yet in
+        // `outgoing` — receives this broadcast too (else it would be
+        // silently skipped: a missed delivery). Same ordering rationale
+        // as `PeerNetwork::broadcast`'s leading `drain_new_connections`.
+        self.drain_registrations();
         // Memory hygiene: even when this node only broadcasts (no
         // `send_to_peer` / `recv_peer` traffic), relay routing state
         // accumulated by past forwarding needs sweeping — mirrors
-        // `PeerNetwork::broadcast`. The per-secondary fan-out topology
-        // is unchanged here (that unification is a separate concern);
-        // this only sweeps the relay state added with the Router.
+        // `PeerNetwork::broadcast`.
         self.router.prune(Instant::now());
-        // Snapshot the senders out of the shared map behind a
-        // bounded borrow, then iterate the clones without holding
-        // the RefCell across `.await`. `UnboundedSender::send` is
-        // itself synchronous (no await), but we keep the explicit
-        // clone-and-drop pattern so any future shape change (a
-        // bounded channel, an alternative dispatch primitive) stays
-        // compatible with the workspace's "no RefCell borrow held
-        // across await" lint.
-        let senders: Vec<mpsc::UnboundedSender<DistributedMessage<I>>> =
-            self.outgoing.borrow().values().cloned().collect();
-        for tx in senders {
-            // Closed peers are tolerated — the secondary went away.
-            // Matches `ChannelPeerTransport::broadcast`'s contract.
-            let _ = tx.send(msg.clone());
+        // Snapshot `(peer_id, sender)` out of the shared map behind a
+        // bounded borrow, then iterate the clones without holding the
+        // RefCell across `.await`. `UnboundedSender::send` is itself
+        // synchronous (no await), but the explicit clone-and-drop keeps
+        // any future shape change compatible with the workspace's "no
+        // RefCell borrow held across await" lint. We carry the id
+        // alongside the sender so a dead writer can be removed below.
+        let senders: Vec<(String, mpsc::UnboundedSender<DistributedMessage<I>>)> = self
+            .outgoing
+            .borrow()
+            .iter()
+            .map(|(id, tx)| (id.clone(), tx.clone()))
+            .collect();
+        let mut dead: Vec<String> = Vec::new();
+        for (peer_id, tx) in senders {
+            // A closed writer means the secondary went away. Collect it
+            // for removal so the table stays an accurate membership view
+            // (`has_peer`/`peer_count`) and a later broadcast does not
+            // re-attempt a dead writer. The submitter has NO dial path
+            // (see the `router` field doc + `connect_to_peers` no-op),
+            // so — unlike `PeerNetwork::broadcast` — there is no redial
+            // to kick on detection; removal is the whole disposition.
+            if tx.send(msg.clone()).is_err() {
+                dead.push(peer_id);
+            }
+        }
+        if !dead.is_empty() {
+            let mut outgoing = self.outgoing.borrow_mut();
+            for peer_id in &dead {
+                outgoing.remove(peer_id);
+            }
         }
         Ok(())
     }
@@ -437,9 +488,7 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
                     // a same-tick reply would find no route. Mirrors the
                     // legacy `NetworkServer::recv`, which called
                     // `drain_new_connections()` on every inbound yield.
-                    while let Ok(reg) = self.new_conn_rx.try_recv() {
-                        self.register_peer(reg);
-                    }
+                    self.drain_registrations();
                     msg?
                 }
                 reg = self.new_conn_rx.recv(), if self.registrations_open => {
@@ -486,9 +535,7 @@ impl<I: Identifier> PeerTransport<I> for TunneledPeerTransport<I> {
         // Non-blocking drain. Apply any pending registrations first
         // (so the writer table is current before a synchronous peek of
         // the inbound stream), then surface the next inbound frame.
-        while let Ok(reg) = self.new_conn_rx.try_recv() {
-            self.register_peer(reg);
-        }
+        self.drain_registrations();
         let clocks = now_clocks();
         self.router.prune(clocks.now);
         loop {
