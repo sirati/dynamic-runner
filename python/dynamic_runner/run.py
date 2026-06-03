@@ -320,7 +320,7 @@ def _dispatch_local(task, args, config, logger) -> None:
     cfg = _rs.LocalManagerConfig(
         num_workers=num_cores,
         max_resources=_rs.ResourceMap({"memory": max_memory}),
-        always_restart_worker=args.always_restart_worker,
+        reuse_workers=args.reuse_workers,
         print_pid=args.pid,
         log_oom_watcher=getattr(args, "log_oom_watcher", False),
         scheduler_config=scheduler_config,

@@ -115,7 +115,10 @@ pub(super) fn test_config(num_workers: u32) -> LocalManagerConfig {
     LocalManagerConfig {
         num_workers,
         max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
-        always_restart_worker: false,
+        // Reuse the worker slot across tasks: keeps the broad test suite on
+        // the historical "no per-task respawn" behavior so spawn-count
+        // assertions stay focused on the path each test actually exercises.
+        reuse_workers: true,
         restart_predicate: None,
         retry_max_attempts: 1,
         print_pid: false,

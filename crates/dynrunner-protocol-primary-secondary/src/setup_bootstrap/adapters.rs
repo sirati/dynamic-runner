@@ -1,23 +1,17 @@
 //! Adapter structs that wrap the existing
-//! `MessageSender + MessageReceiver` / [`SecondaryTransport`] surface
-//! and narrow it to [`SetupBootstrapMessage`] for the setup-phase
-//! window.
+//! `MessageSender + MessageReceiver` / [`PeerTransport`] surface and
+//! narrow it to [`SetupBootstrapMessage`] for the setup-phase window.
 //!
 //! - [`SecondarySetupBootstrap`] — secondary side, borrows the same
 //!   underlying primary-bound transport the operational path uses.
-//! - [`PrimarySetupBootstrap`] — primary side, borrows the
-//!   `SecondaryTransport` fan-out the operational path uses.
-//!
-//! The `format_partial_failures` helper at the bottom renders the
-//! structured per-secondary failure list (which the underlying
-//! broadcast surfaces) into a single `String` summary for the trait
-//! shape.
+//! - [`PrimaryPeerSetupBootstrap`] — primary side, borrows the unified
+//!   [`PeerTransport`] mesh fan-out the operational path uses.
 
 use dynrunner_core::{Identifier, MessageReceiver, MessageSender};
 
 use crate::setup_bootstrap::message::SetupBootstrapMessage;
 use crate::setup_bootstrap::trait_defs::{SetupBootstrap, SetupBootstrapBroadcast};
-use crate::{DistributedMessage, PeerTransport, SecondaryTransport};
+use crate::{DistributedMessage, PeerTransport};
 
 /// Secondary-side adapter: wraps a `&mut T` (any
 /// `MessageSender<DistributedMessage<I>> + MessageReceiver<DistributedMessage<I>>`)
@@ -88,74 +82,9 @@ where
     }
 }
 
-/// Primary-side adapter: wraps a `&mut T: SecondaryTransport<I>` and
-/// narrows its broadcast/recv to [`SetupBootstrapMessage`].
-///
-/// The same constructional / lifetime trade-off as
-/// [`SecondarySetupBootstrap`] applies — build briefly, drop after the
-/// setup send/recv, let the operational path keep using the underlying
-/// transport.
-pub struct PrimarySetupBootstrap<'a, T> {
-    transport: &'a mut T,
-}
-
-impl<'a, T> PrimarySetupBootstrap<'a, T> {
-    pub fn new(transport: &'a mut T) -> Self {
-        Self { transport }
-    }
-}
-
-impl<T, I> SetupBootstrapBroadcast<I> for PrimarySetupBootstrap<'_, T>
-where
-    I: Identifier,
-    T: SecondaryTransport<I>,
-{
-    async fn broadcast(&mut self, msg: SetupBootstrapMessage) -> Result<(), String> {
-        let wire: DistributedMessage<I> = msg.into();
-        // The underlying `SecondaryTransport::broadcast` preserves the
-        // structured per-secondary failure list; we walk it here to
-        // emit the same per-secondary warn breadcrumbs the
-        // pre-Step-10 `send_peer_lists` emitted (preserving the
-        // structured key-value log shape that log aggregators
-        // consume) before folding the list into the single-String
-        // summary the trait shape exposes. This keeps the operator-
-        // visible log line shape identical across the refactor while
-        // still exposing the count/summary upstream.
-        match self.transport.broadcast(wire).await {
-            Ok(()) => Ok(()),
-            Err(failures) => {
-                for (secondary_id, error) in &failures {
-                    tracing::warn!(
-                        secondary = %secondary_id,
-                        error = %error,
-                        "setup bootstrap broadcast: per-secondary delivery failed"
-                    );
-                }
-                Err(format_partial_failures(&failures))
-            }
-        }
-    }
-
-    async fn recv(&mut self) -> Option<SetupBootstrapMessage> {
-        loop {
-            let msg = self.transport.recv().await?;
-            match SetupBootstrapMessage::try_from(msg) {
-                Ok(setup) => return Some(setup),
-                Err(other) => {
-                    tracing::warn!(
-                        kind = ?other.msg_type(),
-                        "SetupBootstrapBroadcast.recv dropped non-setup frame during setup window"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Primary-side adapter over the UNIFIED `Tr: PeerTransport<I>` —
-/// the post-collapse sibling of [`PrimarySetupBootstrap`]. Narrows the
-/// transport's mesh broadcast/recv to [`SetupBootstrapMessage`] for the
-/// setup-phase window.
+/// Primary-side adapter over the UNIFIED `Tr: PeerTransport<I>`.
+/// Narrows the transport's mesh broadcast/recv to
+/// [`SetupBootstrapMessage`] for the setup-phase window.
 ///
 /// Same constructional / lifetime trade-off as the other two adapters:
 /// build briefly, drop after the setup send/recv, let the operational
@@ -163,9 +92,8 @@ where
 /// `Address::Broadcast(Scope::AllSecondaries)` (every peer of the
 /// primary is a secondary, so this reaches the full fleet), and the
 /// peer transport already collapses per-secondary delivery failures
-/// into one `String` — so no `format_partial_failures` walk is needed
-/// here (the per-secondary signal is the heartbeat monitor, not the
-/// setup broadcast result).
+/// into one `String` at the trait boundary (the per-secondary signal is
+/// the heartbeat monitor, not the setup broadcast result).
 pub struct PrimaryPeerSetupBootstrap<'a, Tr> {
     transport: &'a mut Tr,
 }
@@ -211,23 +139,4 @@ where
             }
         }
     }
-}
-
-/// Render a per-secondary partial-failure list as a compact summary
-/// string. The structured form
-/// (`Vec<(secondary_id, error_message)>`) lives on
-/// [`SecondaryTransport::broadcast`]'s return; the narrow
-/// [`SetupBootstrapBroadcast::broadcast`] surface collapses it to a
-/// String at the trait boundary. Callers that need per-peer diagnostics
-/// should use the underlying [`SecondaryTransport`] directly — those
-/// callers (heartbeat, keepalive, …) are explicitly NOT setup-phase
-/// and have no business going through this adapter.
-fn format_partial_failures(failures: &[(String, String)]) -> String {
-    let count = failures.len();
-    let summary = failures
-        .iter()
-        .map(|(id, err)| format!("{id}={err}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("setup bootstrap broadcast: {count} secondaries failed: {summary}")
 }

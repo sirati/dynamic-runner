@@ -106,15 +106,10 @@ impl StatsSnapshot {
     ///
     /// This is the projection the observer run loop publishes into the
     /// reporter's `SharedSnapshotSource` whenever it applies a mesh
-    /// broadcast. Wiring that push requires a `&self` CRDT-read
-    /// accessor on `SecondaryCoordinator` (the run loop owns the CRDT
-    /// `&mut` for its whole lifetime), which is outside this subtask's
-    /// file scope — see the seam doc in `observer_late_joiner/run.rs`.
-    /// Until that producer lands, the only caller is the reporter's
-    /// own test suite; `allow(dead_code)` documents that the function
-    /// is deliberately production-reachable-but-not-yet-wired rather
-    /// than accidentally orphaned.
-    #[allow(dead_code)]
+    /// broadcast. The producer is `observer_late_joiner/run.rs`, which
+    /// calls this on every CRDT-read tick and pushes the result into the
+    /// reporter's snapshot source (the reporter's own test suite also
+    /// exercises it directly).
     pub fn from_cluster_state<I: Identifier>(state: &ClusterState<I>) -> Self {
         let outcome = state.outcome_counts();
         let counts = state.counts();
@@ -230,18 +225,14 @@ impl StatsSnapshot {
     }
 }
 
-// These helpers are reached only through `from_cluster_state`, so they
-// share its "production-reachable-but-not-yet-wired" status (the live
-// CRDT-projection feed is the integration seam — see the function's
-// doc). Test builds DO call `from_cluster_state` and thus exercise
-// every helper; the `allow` only silences the plain-`build` lib pass.
+// These helpers are reached only through `from_cluster_state`, the live
+// CRDT-projection feed (producer: `observer_late_joiner/run.rs`).
 
 /// True iff `state` is a terminal state for dependency-resolution
 /// purposes (the pool resolves a dep once its prereq is `Completed` OR
 /// permanently failed; in the CRDT the permanent-failure set is
 /// `Failed` ∪ `Unfulfillable` ∪ `InvalidTask`). `Blocked` is
 /// cascade-paused, not terminal.
-#[allow(dead_code)]
 fn is_terminal<I>(state: &TaskState<I>) -> bool {
     matches!(
         state,
@@ -252,12 +243,10 @@ fn is_terminal<I>(state: &TaskState<I>) -> bool {
     )
 }
 
-#[allow(dead_code)]
 fn task_id_of<I>(state: &TaskState<I>) -> &str {
     task_of(state).task_id.as_str()
 }
 
-#[allow(dead_code)]
 fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
     match state {
         TaskState::Pending { task }
@@ -279,7 +268,6 @@ fn task_of<I>(state: &TaskState<I>) -> &dynrunner_core::TaskInfo<I> {
 /// predicate; a phase absent from the map (no entries) is vacuously
 /// satisfied (`false`). The walk is depth-bounded by the dep graph,
 /// which `PendingPool::new` already cycle-rejects, so this terminates.
-#[allow(dead_code)]
 fn phase_dispatchable(
     phase: &PhaseId,
     phase_deps: &HashMap<PhaseId, Vec<PhaseId>>,

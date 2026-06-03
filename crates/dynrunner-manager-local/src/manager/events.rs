@@ -265,9 +265,10 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             self.stats.errored += 1;
         }
 
-        // Restart worker after successful completion if either the coarse
-        // always_restart_worker flag is set or the optional restart_predicate
-        // returns true; only when there's still pending work.
+        // Restart worker after successful completion unless the coarse
+        // `reuse_workers` opt-in keeps the slot — the optional
+        // restart_predicate still forces a restart even when reusing;
+        // only when there's still pending work.
         if result.success && !self.pool_ref().is_empty() {
             let predicate_says_restart = if let (Some(predicate), Some(b)) =
                 (self.config.restart_predicate.as_ref(), binary.as_ref())
@@ -283,7 +284,7 @@ impl<M: ManagerEndpoint + 'static, S: Scheduler<I>, E: ResourceEstimator<I>, I: 
             } else {
                 false
             };
-            if self.config.always_restart_worker || predicate_says_restart {
+            if !self.config.reuse_workers || predicate_says_restart {
                 tracing::info!(worker_id, "restarting worker after successful completion");
                 self.restart_worker(worker_id, factory).await;
                 self.pending_worker_assignments.insert(worker_id);

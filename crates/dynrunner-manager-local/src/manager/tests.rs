@@ -339,7 +339,7 @@ async fn cross_phase_same_task_id_both_run_local() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn always_restart_worker_respawns_after_success() {
+async fn default_restart_respawns_after_success() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -378,8 +378,11 @@ async fn always_restart_worker_respawns_after_success() {
             let spawn_count = Arc::new(AtomicU32::new(0));
             let spawn_count_clone = spawn_count.clone();
 
+            // Default policy (reuse_workers = false) restarts the worker
+            // after every successful task; override the test helper's
+            // reuse-true default back to the framework default here.
             let mut config = test_config(1);
-            config.always_restart_worker = true;
+            config.reuse_workers = false;
 
             let mut manager = LocalManager::new(
                 config,
@@ -411,7 +414,7 @@ async fn always_restart_worker_respawns_after_success() {
             assert_eq!(manager.stats().total, 3);
             assert!(manager.failed_tasks().is_empty());
 
-            // With always_restart_worker=true and 3 binaries with 1 worker:
+            // With reuse_workers=false (the default) and 3 binaries with 1 worker:
             // 1 initial spawn + 1 type-shift respawn (worker's loaded_type_id
             // starts None; `ensure_worker_for_type` cannot prove the factory
             // chose the right type so it respawns once to bind the slot)
@@ -423,6 +426,94 @@ async fn always_restart_worker_respawns_after_success() {
             assert_eq!(
                 spawns, 4,
                 "expected 4 spawns (1 initial + 1 first-task type-bind + 2 restarts), got {spawns}"
+            );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reuse_workers_keeps_slot_across_successes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountingFactory {
+        spawn_count: Arc<AtomicU32>,
+    }
+
+    impl WorkerFactory<ChannelManagerEnd> for CountingFactory {
+        fn spawn_worker(
+            &mut self,
+            _worker_id: WorkerId,
+            _subcgroup: Option<&crate::cgroup::SubcgroupHandle>,
+        ) -> Result<(ChannelManagerEnd, Option<u32>), String> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            let (manager_end, runner_end) = channel_pair();
+            tokio::task::spawn_local(async move {
+                let mut runner = runner_end;
+                let _ = runner.send(Response::Ready).await;
+                loop {
+                    match MessageReceiver::<Command>::recv(&mut runner).await {
+                        Some(Command::Stop) => break,
+                        Some(Command::ProcessTask { .. }) => {
+                            let _ = runner.send(Response::Done { result_data: None }).await;
+                        }
+                        None => break,
+                    }
+                }
+            });
+            Ok((manager_end, Some(42)))
+        }
+    }
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let spawn_count = Arc::new(AtomicU32::new(0));
+            let spawn_count_clone = spawn_count.clone();
+
+            // Opt into reuse: the worker slot is recycled in place, so no
+            // per-task respawn fires after a successful completion.
+            let mut config = test_config(1);
+            config.reuse_workers = true;
+
+            let mut manager = LocalManager::new(
+                config,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            let mut factory = CountingFactory {
+                spawn_count: spawn_count_clone,
+            };
+
+            let binaries = vec![
+                make_binary("a", 50),
+                make_binary("b", 60),
+                make_binary("c", 70),
+            ];
+
+            manager
+                .process_binaries(
+                    binaries,
+                    std::collections::HashMap::new(),
+                    |_phase| {},
+                    |_phase, _completed, _failed| {},
+                    &mut factory,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(manager.stats().completed, 3);
+            assert_eq!(manager.stats().total, 3);
+            assert!(manager.failed_tasks().is_empty());
+
+            // With reuse_workers=true and 3 same-type binaries on 1 worker:
+            // 1 initial spawn + 1 first-task type-bind respawn (loaded_type_id
+            // starts None) and then NO per-task restarts — all three tasks run
+            // on the recycled slot.
+            let spawns = spawn_count.load(Ordering::SeqCst);
+            assert_eq!(
+                spawns, 2,
+                "expected 2 spawns (1 initial + 1 first-task type-bind, no per-task restarts), got {spawns}"
             );
         })
         .await;
@@ -442,7 +533,7 @@ async fn memuse_log_written() {
             let config = LocalManagerConfig {
                 num_workers: 1,
                 max_resources: ResourceMap::from([(ResourceKind::memory(), 1024 * 1024 * 1024)]),
-                always_restart_worker: false,
+                reuse_workers: true,
                 restart_predicate: None,
                 retry_max_attempts: 1,
                 print_pid: false,

@@ -17,11 +17,13 @@ use tracing::Metadata;
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::layer::{Context, Layer};
 
-/// The importance marker target, duplicated here as a test constant so
-/// the capture layer has no dependency on a particular emitter module's
-/// `pub(crate)` const. Equal by contract to every emitter's
-/// `IMPORTANT_TARGET` and to `dynrunner-pyo3`'s `logging::IMPORTANT_TARGET`.
-pub(crate) const IMPORTANT_TARGET: &str = "dynrunner_important";
+/// The importance marker target — the single canonical const from
+/// `dynrunner_core`, re-exported here so the capture layer + filter
+/// reference it by name without re-deriving the literal (and without
+/// reaching into any emitter module's `pub(crate)` const). Equal by
+/// contract to every emitter's `IMPORTANT_TARGET` and to `dynrunner-pyo3`'s
+/// `logging::IMPORTANT_TARGET`.
+pub(crate) use dynrunner_core::IMPORTANT_TARGET;
 
 /// One captured important event.
 #[derive(Clone, Debug, Default)]

@@ -148,27 +148,7 @@ impl CollectorPolicy for ErrorAggregationPolicy {
 fn render_failures(failures: &[&CollectedFailure]) -> String {
     failures
         .iter()
-        .map(|f| {
-            let msg = f
-                .representative
-                .last_error
-                .as_deref()
-                .unwrap_or("<no message>");
-            let kind = f
-                .representative
-                .error_kind
-                .as_deref()
-                .unwrap_or("<unknown>");
-            let repeat = if f.repeat_count > 0 {
-                format!(" (x{} other tasks)", f.repeat_count)
-            } else {
-                String::new()
-            };
-            format!(
-                "  - task {} [{}]: {}{}",
-                f.representative.task_id, kind, msg, repeat
-            )
-        })
+        .map(|f| f.render_detail_line("<unknown>"))
         .collect::<Vec<_>>()
         .join("\n")
 }
