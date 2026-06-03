@@ -53,20 +53,20 @@ pub struct PrimaryConfig {
     /// `true` outside the opt-out (default).
     pub uses_file_based_items: bool,
 
-    /// Setup-promote intent for the bootstrap `PromotePrimary` this
-    /// coordinator emits. When `true`, the submitter has deferred
-    /// task discovery / upload / ledger seeding to the chosen
-    /// secondary (the `--source-already-staged` path: files live on
-    /// the cluster, not on the submitter) and the wire's
-    /// `PromotePrimary.required_setup` is forwarded accordingly.
-    /// This is the *intent* flag; the wire field is the discriminator
-    /// the secondary actually keys off (see
-    /// `DistributedMessage::PromotePrimary.required_setup` for the
-    /// three-reason classification — pre-seeded bootstrap, setup-
-    /// promote, failover). Failover election deliberately ignores
-    /// this field:
-    /// at election time the local ledger is already non-empty, so
-    /// re-running discovery would double-seed.
+    /// Setup-promote intent for THIS coordinator's bootstrap. When
+    /// `true`, the submitter has deferred task discovery / upload /
+    /// ledger seeding to the chosen compute peer (the
+    /// `--source-already-staged` path: files live on the cluster, not
+    /// on the submitter). The discovery-yield is carried on the wire by
+    /// `InitialAssignment.pre_staged_mode` (the chosen peer's
+    /// `setup_discovery_pending` discriminator), NOT by the
+    /// primary-changed announcement. On THIS primary the flag drives
+    /// `setup_pending()` (suppresses the run-complete exits while
+    /// discovery is pending) and `emit_setup_defer_handshake` (sends
+    /// the degenerate empty `InitialAssignment { pre_staged_mode: true }`
+    /// instead of seeding the ledger). Failover election deliberately
+    /// ignores this field: at election time the local ledger is already
+    /// non-empty, so re-running discovery would double-seed.
     pub required_setup_on_promote: bool,
 
     /// Per-type global concurrency caps. When a `TypeId` is present
@@ -147,13 +147,13 @@ pub struct PrimaryConfig {
     pub fleet_dead_timeout: Duration,
 
     /// Maximum time to wait for every connected secondary to send
-    /// `MeshReady` before issuing `PromotePrimary`. Secondaries
-    /// emit `MeshReady` once their peer-mesh has settled (mesh
-    /// formed, watchdog elapsed, or no peers were expected for
+    /// `MeshReady` before issuing the `PrimaryChanged` announcement.
+    /// Secondaries emit `MeshReady` once their peer-mesh has settled
+    /// (mesh formed, watchdog elapsed, or no peers were expected for
     /// single-secondary runs). Without the wait, the primary
-    /// previously fired `PromotePrimary` ~750µs after every
+    /// previously announced `PrimaryChanged` ~750µs after every
     /// secondary completed cert-exchange — that left the
-    /// promoted secondary "authoritative" against an empty peer
+    /// newly-named primary "authoritative" against an empty peer
     /// mesh for the full per-peer dial budget (10s QUIC + 10s
     /// WSS), with every pre-mesh-formation message routed into
     /// the void. Default `60s` — comfortably larger than the

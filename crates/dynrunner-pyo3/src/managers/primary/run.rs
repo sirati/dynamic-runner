@@ -118,7 +118,7 @@ impl PyPrimaryCoordinator {
         // has not supplied any pre-discovered binaries (the pipeline
         // skips its own `task.discover_items` walk in pre-staged mode
         // and hands an empty list to `run()`), the submitter primary
-        // owes no setup work. The bootstrap `PromotePrimary` it emits
+        // owes no setup work. The bootstrap announcement it emits
         // carries `required_setup=true`, and the chosen secondary
         // runs discovery + ledger-seed on its bind-mounted
         // `src_network` instead. Either signal alone is insufficient:

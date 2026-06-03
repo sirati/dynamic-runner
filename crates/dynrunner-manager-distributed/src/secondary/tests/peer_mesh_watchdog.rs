@@ -100,7 +100,7 @@ fn arm_watchdog_no_peers(
 ///   1. `fatal_exit` is NOT set,
 ///   2. `peer_mesh_degraded` is true,
 ///   3. `MeshReady` is sent with `peer_count=0` so the primary's
-///      `wait_for_mesh_ready` releases `PromotePrimary`,
+///      `wait_for_mesh_ready` releases the `PrimaryChanged` announcement,
 ///   4. NO `SecondaryFatalError` lands on the primary channel,
 ///   5. `peer_mesh_check_at` is cleared so the watchdog never
 ///      re-fires.
@@ -150,7 +150,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
                 assert_eq!(secondary_id, "sec-x");
                 assert_eq!(
                     peer_count, 0,
-                    "degraded path reports zero peers so primary releases PromotePrimary"
+                    "degraded path reports zero peers so primary releases its PrimaryChanged announcement"
                 );
                 saw_mesh_ready = true;
             }
@@ -165,7 +165,7 @@ async fn peer_mesh_watchdog_enters_degraded_mode_when_no_peers() {
     }
     assert!(
         saw_mesh_ready,
-        "MeshReady (peer_count=0) must be sent so primary releases PromotePrimary"
+        "MeshReady (peer_count=0) must be sent so primary releases its PrimaryChanged announcement"
     );
 
     // Re-firing the watchdog is a no-op (single-shot contract).

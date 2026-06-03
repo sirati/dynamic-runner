@@ -15,7 +15,9 @@ use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, 
 use dynrunner_scheduler_api::{ResourceEstimator, Scheduler};
 
 use super::super::SecondaryCoordinator;
+use super::super::election::ElectionState;
 use super::super::wire::timestamp_now;
+use crate::cluster_state::ApplyOutcome;
 
 impl<Tr, M, S, E, I> SecondaryCoordinator<Tr, M, S, E, I>
 where
@@ -26,32 +28,166 @@ where
     I: Identifier,
 {
     /// Mirror a batch of `ClusterMutation`s into the local replicated
-    /// CRDT. Shared between the operational `dispatch_message` /
-    /// `handle_inbound` arms and `wait_for_setup`'s receive loop — every
-    /// site observes the same wire variant and must apply with identical
-    /// semantics. CRDT idempotency makes repeated apply safe (duplicates
-    /// and late-after-terminal arrivals NoOp by precondition).
+    /// CRDT AND react to a primary-identity change that names THIS node.
+    /// Shared between the operational `dispatch_message` /
+    /// `handle_inbound` arms, the peer-mesh relay, and `wait_for_setup`'s
+    /// receive loop — every site observes the same wire variant and must
+    /// apply with identical semantics. CRDT idempotency makes repeated
+    /// apply safe (duplicates and late-after-terminal arrivals NoOp by
+    /// precondition).
     ///
-    /// This is a PURE CRDT mirror: the secondary holds no authority and
-    /// no dispatch pool, so there is no pool-growth side effect. The
-    /// authoritative dispatch-pool coherence (re-injecting freshly-
-    /// `Pending` tasks surfaced by a `TasksSpawned` apply) is the
-    /// `PrimaryCoordinator`'s concern, driven on the authority's own
-    /// pool. A non-authority node simply converges its CRDT mirror; it
-    /// never decides what to dispatch from it.
+    /// For every non-`PrimaryChanged` variant this is a PURE CRDT mirror:
+    /// the secondary holds no authority and no dispatch pool, so there is
+    /// no pool-growth side effect. The authoritative dispatch-pool
+    /// coherence (re-injecting freshly-`Pending` tasks surfaced by a
+    /// `TasksSpawned` apply) is the `PrimaryCoordinator`'s concern, driven
+    /// on the authority's own pool. A non-authority node simply converges
+    /// its CRDT mirror; it never decides what to dispatch from it.
+    ///
+    /// `PrimaryChanged` is the SINGLE primary-activation frame. Applying
+    /// it is also the ONE wake path: this hook runs
+    /// [`Self::apply_primary_changed`] per such mutation so a
+    /// `PrimaryChanged { new = self }` arriving over ANY receive path
+    /// (operational dispatch, peer relay, or setup-time) wakes the
+    /// co-located parked primary and resets the failover election. It
+    /// keys on identity, not on election history — a node that never
+    /// suspected/voted still activates when named.
+    ///
+    /// Returns `true` iff a `PrimaryChanged` genuinely advanced the
+    /// primary identity (an `Applied`, not a stale-epoch NoOp or an
+    /// observer rejection). The async operational receive arms react to
+    /// that signal by reviving the worker-pull rate-limiter (backoff
+    /// accrued against the PRIOR primary is stale the moment the role
+    /// changes) and immediately re-polling idle workers so a freshly-
+    /// identified primary gets TaskRequests without a keepalive-interval
+    /// delay. Reviving the pull semantic touches the worker pool, so it
+    /// is the caller's (async, operational) concern — this sync hook only
+    /// reports that the identity moved.
     pub(in crate::secondary) fn apply_cluster_mutations(
         &mut self,
         mutations: Vec<ClusterMutation<I>>,
-    ) {
+    ) -> bool {
         let count = mutations.len();
+        let mut primary_changed = false;
         for m in mutations {
-            self.cluster_state.apply(m);
+            match m {
+                ClusterMutation::PrimaryChanged { new, epoch } => {
+                    primary_changed |= self.apply_primary_changed(new, epoch);
+                }
+                other => {
+                    self.cluster_state.apply(other);
+                }
+            }
         }
         tracing::debug!(
             secondary = %self.config.secondary_id,
             applied = count,
             "mirrored cluster mutations into local CRDT"
         );
+        primary_changed
+    }
+
+    /// The unified primary-activation apply hook for a
+    /// `ClusterMutation::PrimaryChanged { new, epoch }` observed on any
+    /// receive path. The SINGLE place the secondary reacts to a
+    /// primary-identity change:
+    ///
+    ///   1. **Observer-not-primary guard.** An observer cannot host the
+    ///      primary role (no workers, no dispatch authority). If `new`
+    ///      names an observer — this node when `is_observer` set, or any
+    ///      peer in the replicated `RoleTable.observers` — REJECT loud and
+    ///      do NOT install it as `current_primary`. This guard protects
+    ///      the single-source-of-truth `current_primary()` against a
+    ///      forged or racy announcement naming an observer.
+    ///   2. **Epoch-LWW apply.** The CRDT `PrimaryChanged` arm is
+    ///      last-writer-wins on `(epoch, primary_id)`, so a stale
+    ///      lower-epoch announcement NoOps against an already-installed
+    ///      higher epoch. Every side effect below is gated on the apply
+    ///      actually advancing state (`Applied`), so a no-op announcement
+    ///      neither wakes nor resets.
+    ///   3. **Self-named → activate + reset.** When `new` is THIS node and
+    ///      this node is primary-capable (a `promote_activation_tx` is
+    ///      registered) and not an observer, fire the co-located parked
+    ///      primary's activation gate (fire-once via `take()`, so the
+    ///      own-election-win self-apply and a peer-echoed re-announce
+    ///      converge on one activation) and reset the failover election to
+    ///      `Normal` (a primary now exists on this host — there is no
+    ///      lingering Promoted state to name).
+    ///   4. **Peer-named → reset.** When `new` is a PEER, a primary now
+    ///      exists, so any in-flight failover election on this node is
+    ///      stale: reset it to `Normal`.
+    ///
+    /// Returns `true` iff the apply genuinely advanced the primary
+    /// identity (`Applied`); `false` on an observer rejection or a
+    /// stale-epoch NoOp. The worker-pull revive is the caller's concern
+    /// (see [`Self::apply_cluster_mutations`]).
+    fn apply_primary_changed(&mut self, new: String, epoch: u64) -> bool {
+        // (1) Observer guard — reject naming an observer before the apply
+        // moves `current_primary`.
+        let observers = &self.cluster_state.role_table().observers;
+        let names_observer = (self.config.is_observer && new == self.config.secondary_id)
+            || observers.contains(&new);
+        if names_observer {
+            tracing::error!(
+                secondary = %self.config.secondary_id,
+                target = %new,
+                epoch,
+                self_is_observer = self.config.is_observer,
+                target_in_role_table_observers = observers.contains(&new),
+                "REJECTED PrimaryChanged naming an observer — observers \
+                 cannot host the primary role (no workers, no dispatch \
+                 authority). Ignoring; the cluster's election should retry \
+                 with the observer filtered out."
+            );
+            return false;
+        }
+
+        // (2) Epoch-LWW apply. Side effects below only on a genuine
+        // identity advance.
+        let outcome = self.cluster_state.apply(ClusterMutation::PrimaryChanged {
+            new: new.clone(),
+            epoch,
+        });
+        if outcome == ApplyOutcome::NoOp {
+            tracing::debug!(
+                new_primary = %new,
+                epoch,
+                "ignoring stale PrimaryChanged superseded by higher epoch"
+            );
+            return false;
+        }
+
+        if new == self.config.secondary_id {
+            // (3) This node is the new primary. Wake the co-located parked
+            // primary (fire-once; no-op when none was composed or the gate
+            // was already consumed by the own-election-win self-apply) and
+            // reset the election: a primary now exists on this host, so
+            // there is no lingering Promoted state.
+            self.activate_co_located_primary();
+            self.reset_election_to_normal();
+        } else {
+            // (4) A peer is the new primary, so any in-flight election on
+            // this node is stale: a primary now exists. Reset it.
+            self.reset_election_to_normal();
+        }
+        tracing::info!(
+            new_primary = %new,
+            epoch,
+            "primary role changed"
+        );
+        true
+    }
+
+    /// Reset the failover election to `Normal` iff this node has reached
+    /// `Operational` (the only lifecycle state that carries an
+    /// `ElectionState`). Pre-`Operational` receive paths
+    /// (`wait_for_setup`) hold no election, so this is a no-op there —
+    /// using `operational_mut()` rather than `op_mut()` keeps the
+    /// pre-`Operational` apply path panic-free.
+    fn reset_election_to_normal(&mut self) {
+        if let Some(op) = self.lifecycle.operational_mut() {
+            op.election = ElectionState::Normal;
+        }
     }
 
     /// Run a `stage_file` copy + register the result in

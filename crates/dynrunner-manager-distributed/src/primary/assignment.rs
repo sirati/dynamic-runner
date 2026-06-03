@@ -323,11 +323,11 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// true`, `uses_file_based_items` carried through — so each
     /// secondary's `wait_for_setup` loop sees the expected
     /// PeerInfo + InitialAssignment + TransferComplete triple and falls
-    /// through to operational mode. The chosen-secondary's
-    /// `PromotePrimary { required_setup: true }` (broadcast by
-    /// `lifecycle::promote_primary`) is the discriminator that flips
-    /// the post-handshake secondary into setup-pending mode instead of
-    /// the usual hydrate-from-cluster-state path.
+    /// through to operational mode. The `pre_staged_mode: true` field on
+    /// that `InitialAssignment` is the discriminator (the secondary's
+    /// `setup_discovery_pending` latch) that flips the post-handshake
+    /// secondary into setup-pending mode instead of the usual
+    /// hydrate-from-cluster-state path.
     ///
     /// Also performs the InitialAssigning → Operational typestate
     /// transition and seeds the per-secondary keepalive clock — the

@@ -54,7 +54,7 @@ where
         // transitional routing target to clear — routing always
         // resolves `Destination::Primary` at the egress edge over
         // `cluster_state.current_primary()`, which still names the
-        // original primary (no `PromotePrimary` committed during the
+        // original primary (no `PrimaryChanged` committed during the
         // aborted election, per the drop-the-transitional-hint design).
         if matches!(
             op.election,
@@ -402,10 +402,10 @@ where
                     if let Some(candidate) = next_lowest {
                         // No transitional routing target: `Role::Primary`
                         // is re-pointed only by the winner's
-                        // authoritative `PrimaryChanged` (applied on the
-                        // `PromotePrimary` it broadcasts after winning),
-                        // never by an in-flight Voting transition. See
-                        // the P2 drop-the-transitional-hint design.
+                        // authoritative `PrimaryChanged` (broadcast +
+                        // applied after winning), never by an in-flight
+                        // Voting transition. See the P2
+                        // drop-the-transitional-hint design.
                         op.election = ElectionState::Voting { round, candidate };
                     }
                     // No next_lowest = we're the only one alive AND
@@ -422,8 +422,8 @@ where
                     // No transitional self-as-primary routing target —
                     // authority is committed only once this candidate
                     // wins quorum (`record_promotion_confirm` reaches
-                    // `Promoted`). The failover re-point — broadcasting
-                    // `PromotePrimary { new = self }` so surviving
+                    // `Promoted`). The failover re-point — broadcasting +
+                    // applying `PrimaryChanged { new = self }` so surviving
                     // secondaries' `cluster_state.current_primary()` moves
                     // onto this winner's mesh peer-id — is the composed
                     // runtime's terminal action on that transition, not a
@@ -580,13 +580,15 @@ where
     /// its seeded resume (`activate_local_primary` → hydrate-from-CRDT →
     /// operational loop).
     ///
-    /// `take()` makes this idempotent across the TWO paths that reach
-    /// the terminal `Promoted` state: winning this node's OWN election
-    /// (`record_promotion_confirm` → true, via `fire_local_promotion`)
-    /// and being NAMED primary by a `PromotePrimary` broadcast (the
-    /// `dispatch/router` arm). Only the first consumes the sender; the
-    /// second is a no-op on the gate. No-op entirely when no co-located
-    /// primary was composed (`promote_activation_tx` is `None`).
+    /// `take()` makes this idempotent across the paths that name this
+    /// node primary: winning this node's OWN election
+    /// (`record_promotion_confirm` → true → `fire_local_promotion`, which
+    /// applies `PrimaryChanged { new = self }` locally) and being NAMED
+    /// primary by a `PrimaryChanged` broadcast applied through the
+    /// `apply_cluster_mutations` hook. Only the first consumes the sender;
+    /// any later apply of the same frame is a no-op on the gate. No-op
+    /// entirely when no co-located primary was composed
+    /// (`promote_activation_tx` is `None`).
     pub(in crate::secondary) fn activate_co_located_primary(&mut self) {
         if let Some(tx) = self.promote_activation_tx.take() {
             // Hand the parked primary a SNAPSHOT of this secondary's
@@ -612,53 +614,59 @@ where
         }
     }
 
-    /// Terminal action for THIS node reaching the `Promoted` state: wake
-    /// the co-located parked primary into its seeded resume and re-point
-    /// every surviving secondary's `Role::Primary` onto this winner.
+    /// Terminal action for THIS node winning its failover election:
+    /// originate the single primary-activation frame
+    /// `ClusterMutation::PrimaryChanged { new = self, epoch =
+    /// primary_epoch + 1 }`, apply it locally so this winner's OWN apply
+    /// hook fires, and broadcast it so every surviving peer re-points.
     ///
-    /// Two side effects, both idempotent on a second call:
-    ///   1. Fire the promotion-activation gate (`promote_activation_tx`,
-    ///      registered by the composed runtime). The parked
-    ///      `PrimaryCoordinator::run_parked` is waiting on the matching
-    ///      oneshot; firing it triggers `activate_local_primary`
-    ///      (hydrate-from-CRDT seeded resume) + the operational loop.
-    ///      `take()` makes this fire-once: the own-election-win path
-    ///      (`record_promotion_confirm` → true) and the peer-named path
-    ///      (the `PromotePrimary { new = self }` router arm) both call
-    ///      here, but only the first consumes the sender.
-    ///   2. Broadcast `PromotePrimary { new = self, epoch =
-    ///      primary_epoch + 1 }` onto the mesh. Surviving secondaries
-    ///      apply it as `ClusterMutation::PrimaryChanged`, moving their
-    ///      `cluster_state.current_primary()` onto this winner's mesh
-    ///      peer-id. Their next `Destination::Primary` send then resolves
-    ///      to this winner at the egress edge — the entire failover
-    ///      re-route. `epoch + 1` strictly supersedes the prior identity
-    ///      (last-writer-wins on epoch), so a delayed lower-epoch
-    ///      broadcast cannot un-elect this winner.
+    /// Unified onto the `PrimaryChanged` apply hook
+    /// (`apply_cluster_mutations` → `apply_primary_changed`): there is no
+    /// separate role-flip wire frame and no separate direct activation
+    /// call — the single `PrimaryChanged` frame carries both. The flow:
+    ///   1. **Local apply** via `apply_cluster_mutations` — the winner's
+    ///      own apply hook runs, firing the co-located parked primary's
+    ///      activation gate (fire-once via `promote_activation_tx.take()`)
+    ///      and resetting this node's election to `Normal` (a primary now
+    ///      exists on this host — no lingering `Promoted`). `take()` makes
+    ///      this self-apply idempotent if the broadcast is later echoed
+    ///      back through the mesh receive path. No-op on the gate when no
+    ///      co-located primary was composed (Rust-only tests / legacy
+    ///      callers): the broadcast still fires so the mesh learns the new
+    ///      authority.
+    ///   2. **Broadcast** the same `PrimaryChanged` onto the mesh
+    ///      (`Destination::All`). Surviving secondaries apply it via the
+    ///      SAME hook, moving their `cluster_state.current_primary()` onto
+    ///      this winner's mesh peer-id. Their next `Destination::Primary`
+    ///      send then resolves to this winner at the egress edge — the
+    ///      entire failover re-route. `epoch + 1` strictly supersedes the
+    ///      prior identity (last-writer-wins on epoch), so a delayed
+    ///      lower-epoch broadcast cannot un-elect this winner.
     ///
     /// The OLD primary, observing this `PrimaryChanged`, becomes a pure
     /// observer (it no longer holds `Role::Primary`) — R3's observe path.
-    ///
-    /// No-op on the gate when no co-located primary was composed
-    /// (Rust-only tests / legacy callers): `promote_activation_tx` is
-    /// `None`; the broadcast still fires so the mesh learns the new
-    /// authority.
+    /// This is the same originate-apply-broadcast shape the live primary's
+    /// `apply_and_broadcast_cluster_mutations` uses; the only difference
+    /// is the local apply routes through `apply_cluster_mutations` so the
+    /// secondary-side wake hook fires.
     pub(in crate::secondary) async fn fire_local_promotion(&mut self) {
-        // (1) Wake the parked co-located primary (fire-once).
-        self.activate_co_located_primary();
-
-        // (2) Broadcast the failover re-point. epoch+1 strictly
-        // supersedes the prior primary identity.
         let epoch = self.cluster_state.primary_epoch() + 1;
-        let msg = DistributedMessage::PromotePrimary {
+        let mutation = dynrunner_protocol_primary_secondary::ClusterMutation::PrimaryChanged {
+            new: self.config.secondary_id.clone(),
+            epoch,
+        };
+
+        // (1) Apply locally through the unified hook so THIS winner's own
+        // apply hook fires (activate co-located primary + reset election).
+        self.apply_cluster_mutations(vec![mutation.clone()]);
+
+        // (2) Broadcast the re-point so surviving peers apply the same
+        // frame through the same hook. epoch+1 strictly supersedes the
+        // prior primary identity.
+        let msg = DistributedMessage::ClusterMutation {
             sender_id: self.config.secondary_id.clone(),
             timestamp: timestamp_now(),
-            new_primary_id: self.config.secondary_id.clone(),
-            epoch,
-            // Failover after primary loss: the ledger is CRDT-merged
-            // from the in-flight broadcasts, NOT a fresh setup-defer
-            // discovery. `required_setup = false`.
-            required_setup: false,
+            mutations: vec![mutation],
         };
         if let Err(e) = self
             .send_to(dynrunner_protocol_primary_secondary::Destination::All, msg)
@@ -667,7 +675,7 @@ where
             tracing::warn!(
                 secondary = %self.config.secondary_id,
                 error = %e,
-                "PromotePrimary(new=self) failover broadcast failed; \
+                "PrimaryChanged(new=self) failover broadcast failed; \
                  surviving secondaries will re-point on the next election \
                  round or via CRDT snapshot reconciliation"
             );

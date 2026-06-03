@@ -181,60 +181,14 @@ pub enum DistributedMessage<I> {
         src_path: String,
         dest_path: String,
     },
-    PromotePrimary {
-        sender_id: String,
-        timestamp: f64,
-        new_primary_id: String,
-        /// Monotonic epoch for the role-flip. Receivers feed this
-        /// into the replicated `ClusterState::PrimaryChanged`
-        /// mutation, which is last-writer-wins on (epoch,
-        /// primary_id). Higher epochs strictly win, matching the
-        /// election protocol's tiebreaker semantics: a partition
-        /// that re-elects with a higher epoch supersedes the
-        /// previous identity unconditionally.
-        epoch: u64,
-        /// "You also own setup". Set by the submitter primary when
-        /// it skipped its own discovery/upload/seed pass (because
-        /// `--source-already-staged` told it the source data is on
-        /// the cluster-shared filesystem, not on its local host).
-        /// The receiving secondary, when it becomes primary, runs
-        /// `task.discover_items` against its own bind-mounted
-        /// source path, broadcasts the resulting `TaskAdded`
-        /// mutations, and only then hydrates its pending pool from
-        /// the now-seeded ledger.
-        ///
-        /// This is the SOLE wire signal that distinguishes the
-        /// three reasons a secondary becomes primary:
-        ///   1. Legacy bootstrap (submitter did setup):
-        ///      `required_setup=false`, ledger already seeded.
-        ///   2. Setup-promote (this field set):
-        ///      `required_setup=true`, secondary runs discovery.
-        ///   3. Failover after primary loss (election emits the
-        ///      PromotePrimary from a peer): `required_setup=false`,
-        ///      ledger is CRDT-merged from in-flight broadcasts.
-        ///
-        /// "Is `cluster_state` empty?" is NOT a sufficient
-        /// discriminator: failover-at-startup can legitimately
-        /// observe an empty ledger and must not be misclassified
-        /// as a setup promotion. The wire flag is the only
-        /// reliable signal because only the submitter primary knows
-        /// at promote-time whether it skipped its own setup pass.
-        ///
-        /// `#[serde(default)]` keeps pre-fix wire-senders forward-
-        /// compatible: their `PromotePrimary` decodes with
-        /// `required_setup=false` and takes the legacy path
-        /// unchanged.
-        #[serde(default)]
-        required_setup: bool,
-    },
     /// Secondary -> Primary: "my peer-mesh has finished forming
     /// (or was empty / fully failed to form)". Emitted once per
     /// secondary, after `connect_to_peers` has either landed at
     /// least one peer connection or the per-secondary peer-mesh
     /// watchdog has elapsed; for single-secondary runs (no peers
     /// to dial) it fires immediately at operational-loop entry.
-    /// The primary defers `PromotePrimary` until every secondary
-    /// has reported, so the promoted secondary never
+    /// The primary defers its bootstrap primary announcement until
+    /// every secondary has reported, so a newly-named primary never
     /// becomes authoritative against an empty peer mesh — closing
     /// the 750µs ↔ 30s gap where pre-mesh-formation messages
     /// would be sent into a void. `peer_count` carries the

@@ -359,7 +359,7 @@ async fn r1_no_mesh_rebuild_during_arming() {
         "arming must not mutate peer keepalives"
     );
 
-    // The replicated current_primary stays None (no PromotePrimary
+    // The replicated current_primary stays None (no PrimaryChanged
     // observed) — arming alone doesn't pick a candidate; that's the
     // election's job.
     assert!(

@@ -173,7 +173,7 @@ where
     /// any peer re-polls (production keepalive default = 5s), so peer
     /// `local_tasks_run` stays 0; post-fix every secondary's idle
     /// workers retry against the freshly-identified primary inside
-    /// the PromotePrimary dispatch tick and pick up work.
+    /// the `PrimaryChanged` apply tick and pick up work.
     #[cfg(test)]
     local_tasks_run: usize,
 
@@ -401,16 +401,15 @@ where
     /// coordinators on one `LocalSet` and parks the primary behind
     /// `PrimaryCoordinator::run_parked`'s oneshot gate; the matching
     /// sender is registered here via
-    /// [`Self::register_promote_activation`]. When THIS node's election
-    /// reaches its terminal `Promoted` transition — either by winning
-    /// its own election ([`election::coordinator`]'s
-    /// `record_promotion_confirm` returning `true`) or by a peer's
-    /// `PromotePrimary` naming this node (the `dispatch/router`
-    /// `PromotePrimary` arm) — [`Self::fire_local_promotion`] fires this
-    /// gate (waking the parked primary into its seeded resume) and
-    /// broadcasts `PromotePrimary { new = self }` so surviving
-    /// secondaries' `PrimaryChanged` role-change hook re-points
-    /// `Role::Primary` off the dead uplink onto this winner's mesh peer.
+    /// [`Self::register_promote_activation`]. The gate is fired when THIS
+    /// node is named primary — either by winning its own election
+    /// ([`election::coordinator`]'s `record_promotion_confirm` returning
+    /// `true` → [`Self::fire_local_promotion`], which originates +
+    /// locally applies `PrimaryChanged { new = self }`) or by a peer's
+    /// `PrimaryChanged` naming this node, applied through the unified
+    /// `apply_cluster_mutations` hook. The same hook also broadcasts (on
+    /// the own-win path) `PrimaryChanged { new = self }` so surviving
+    /// secondaries re-point `Role::Primary` onto this winner's mesh peer.
     ///
     /// The gate carries a [`crate::cluster_state::ClusterStateSnapshot`]
     /// — NOT a bare `()`. A parked co-located primary's `cluster_state`

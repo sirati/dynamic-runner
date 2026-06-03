@@ -144,7 +144,7 @@ async fn promoted_state_survives_late_primary_message() {
     assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
 }
 
-/// Regression: PromotePrimary's routing target survives
+/// Regression: a `PrimaryChanged` routing target survives
 /// subsequent live-primary keepalives. Pre-fix
 /// `record_primary_message` unconditionally cleared the
 /// current-primary identity whenever the live primary kept
@@ -157,25 +157,27 @@ async fn promoted_state_survives_late_primary_message() {
 /// transport closed (laptop suspend / SSH idle) the relay
 /// vanished and TaskRequests stopped reaching the SLURM-primary,
 /// idling the entire fleet. Surfaced in dataset's K=2 hello run
-/// after 95b9f32 — synchronous PromotePrimary state-sync was
+/// after 95b9f32 — synchronous primary-changed state-sync was
 /// correct but the very next keepalive clobbered the routing
 /// target.
 #[tokio::test(flavor = "current_thread")]
 async fn promote_primary_routing_survives_keepalive() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
-    // Receive PromotePrimary naming a peer (sec-a) as the
+    // Receive a `PrimaryChanged` naming a peer (sec-a) as the
     // SLURM-primary; sec-b is a regular peer.
-    let promote = DistributedMessage::PromotePrimary {
+    let promote = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-a".into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 1,
+        }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
     // The (still-alive, now-demoted) local primary keeps sending
     // keepalives. A live-primary keepalive resets the election but
@@ -189,65 +191,80 @@ async fn promote_primary_routing_survives_keepalive() {
     );
 }
 
-/// Regression: pre-designated primary's election state stays
-/// Promoted even when the local-machine primary's keepalives go
-/// silent. Pre-fix the `PromotePrimary` handler set
-/// `is_primary=true` but left `election=Normal`, so the
-/// keepalive-tick path's `if Promoted return` early-return did
-/// nothing for the pre-designated primary — the local primary's
-/// transport going silent post-promotion (its observer-mode
-/// demotion) drove the SLURM-primary itself into Suspecting and
-/// then Candidate, dropping its in-flight ledger via a self-re-
-/// promotion cascade. Surfaced in tokenizer's v6 trace.
+/// A node NAMED primary by a `PrimaryChanged { new = self }`
+/// installs itself as `current_primary` AND resets its failover
+/// election to `Normal` (NOT `Promoted`): a peer becomes primary by
+/// its HOST spawning a primary coordinator alongside its unchanged
+/// normal secondary, and after the spawn the election state resets —
+/// there is no lingering `Promoted`. Post-reset, the co-located
+/// primary's OWN keepalives (recognized because `current_primary()`
+/// names this node) keep `primary_last_seen` fresh, so the node stays
+/// `Normal` and drives no self-re-promotion cascade.
 ///
-/// Drives the real `dispatch_message` PromotePrimary arm so the
-/// test would fail without the dispatch.rs fix that syncs
-/// `election` with `is_primary`.
+/// Drives the real `dispatch_message` `ClusterMutation` arm so the
+/// test exercises the unified `apply_primary_changed` hook.
 #[tokio::test(flavor = "current_thread")]
-async fn pre_designated_primary_ignores_silent_local_primary() {
+async fn self_named_primary_resets_election_to_normal() {
+    use dynrunner_protocol_primary_secondary::{ClusterMutation, KeepaliveRole};
     let mut sec = make_secondary(election_config("sec-a"));
     sec.enter_operational_for_test();
-    // Pre-promotion: Normal state, this node is not yet primary.
+    // Pre-naming: Normal state, this node is not yet primary.
     assert!(matches!(sec.op_mut().election, ElectionState::Normal));
     assert!(sec.cluster_state.current_primary().is_none());
 
-    // Receive PromotePrimary naming this node — exercises the
-    // dispatch.rs handler that installs the role into the CRDT
-    // (so `current_primary()` now names this node) AND flips the
-    // election state to Promoted in lockstep.
-    let promote = DistributedMessage::PromotePrimary {
+    // Receive a `PrimaryChanged` naming this node — exercises the
+    // unified hook that installs the role into the CRDT (so
+    // `current_primary()` now names this node) AND resets the election
+    // to Normal (no lingering Promoted).
+    let promote = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-a".into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 1,
+        }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
-    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Normal),
+        "self-named primary resets to Normal, not Promoted"
+    );
 
-    // Local primary stops sending keepalives — its observer-mode
-    // demotion is benign post-promotion.
-    sec.op_mut().primary_last_seen =
-        Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
-
-    // Pre-fix this would have entered Suspecting and started a
-    // self-re-promotion cascade. Post-fix the early-return fires.
-    let actions = sec.run_election_tick();
-    assert!(actions.broadcast.is_empty());
-    assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
+    // The co-located primary's own keepalives (recognized: `from` ==
+    // current_primary == self) keep `primary_last_seen` fresh — the
+    // node stays Normal and originates no election even after the
+    // keepalive cadence ticks.
+    for _ in 0..5 {
+        sec.handle_inbound(
+            keepalive_from("sec-a", KeepaliveRole::Primary),
+            &mut FakeWorkerFactory,
+        )
+        .await;
+        let actions = sec.run_election_tick();
+        assert!(
+            matches!(sec.op_mut().election, ElectionState::Normal),
+            "a self-named primary fed its own keepalives stays Normal; got {:?}",
+            std::mem::discriminant(&sec.op_mut().election),
+        );
+        assert!(
+            actions.broadcast.is_empty(),
+            "no spurious election broadcast while the co-located primary is healthy",
+        );
+    }
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 }
 
-/// Phase P: PromotePrimary clears any per-worker backoff accrued
+/// Phase P: a `PrimaryChanged` clears any per-worker backoff accrued
 /// against the previous primary. Without this, idle workers sit
 /// through a stale window before re-issuing at the new primary,
 /// reproducing the dispatch-silence symptom from the trace at
 /// `feb1052`.
 #[tokio::test(flavor = "current_thread")]
-async fn promote_primary_clears_per_worker_backoff() {
+async fn primary_changed_clears_per_worker_backoff() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
     // Simulate per-worker backoff accrued against the old primary.
@@ -256,16 +273,17 @@ async fn promote_primary_clears_per_worker_backoff() {
     assert!(!sec.op_mut().primary_link.should_request_now(0));
     assert!(!sec.op_mut().primary_link.should_request_now(1));
 
-    let promote = DistributedMessage::PromotePrimary {
+    let promote = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-a".into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 1,
+        }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
 
     // Both workers can fire a fresh request immediately at the
     // new primary.
@@ -273,37 +291,39 @@ async fn promote_primary_clears_per_worker_backoff() {
     assert!(sec.op_mut().primary_link.should_request_now(1));
 }
 
-/// Phase P: PromotePrimary feeds (epoch, primary) into the
+/// Phase P: a `PrimaryChanged` feeds (epoch, primary) into the
 /// replicated `cluster_state`, where last-writer-wins on
 /// `(epoch, primary_id)` makes a stale lower-epoch broadcast a
-/// no-op against an already-installed higher-epoch promotion.
+/// no-op against an already-installed higher-epoch change.
 #[tokio::test(flavor = "current_thread")]
-async fn promote_primary_applies_primary_changed_with_epoch() {
+async fn primary_changed_applies_with_epoch_lww() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
 
-    let high = DistributedMessage::PromotePrimary {
+    let high = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-c".into(),
-        epoch: 5,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-c".into(),
+            epoch: 5,
+        }],
     };
     sec.dispatch_message(high, &mut FakeWorkerFactory)
         .await
         .unwrap();
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
     assert_eq!(sec.cluster_state.primary_epoch(), 5);
-    assert_eq!(sec.cluster_state.current_primary(), Some("sec-c"));
 
     // A late lower-epoch broadcast must not clobber the higher
     // epoch already installed.
-    let stale = DistributedMessage::PromotePrimary {
+    let stale = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-a".into(),
-        epoch: 2,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 2,
+        }],
     };
     sec.dispatch_message(stale, &mut FakeWorkerFactory)
         .await
@@ -311,7 +331,7 @@ async fn promote_primary_applies_primary_changed_with_epoch() {
     assert_eq!(
         sec.cluster_state.current_primary(),
         Some("sec-c"),
-        "stale lower-epoch PromotePrimary must not supersede higher epoch"
+        "stale lower-epoch PrimaryChanged must not supersede higher epoch"
     );
     assert_eq!(sec.cluster_state.primary_epoch(), 5);
 }
@@ -427,13 +447,16 @@ use super::super::test_helpers::make_secondary_recording;
 
 /// The election-win terminal action: once `record_promotion_confirm`
 /// returns `true` (quorum crossed, state → `Promoted`), the message
-/// handler's terminal action `fire_local_promotion` MUST (1) fire the
-/// co-located parked primary's activation gate and (2) broadcast
-/// `PromotePrimary { new = self }` so surviving secondaries re-point
-/// `Role::Primary` onto this winner. Pre-fix the `true` was discarded
-/// and the failover path dead-ended.
+/// handler's terminal action `fire_local_promotion` originates a single
+/// `ClusterMutation::PrimaryChanged { new = self }`, applies it locally
+/// through the unified hook — which MUST (1) fire the co-located parked
+/// primary's activation gate and reset the election to `Normal` — and
+/// (2) broadcast that SAME `PrimaryChanged` so surviving secondaries
+/// re-point `Role::Primary` onto this winner. Pre-fix the `true` was
+/// discarded and the failover path dead-ended.
 #[tokio::test(flavor = "current_thread")]
 async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     // peer_count = 2 → quorum = 2 (self + one confirm).
     let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 2);
     sec.enter_operational_for_test();
@@ -460,38 +483,51 @@ async fn promotion_confirm_true_fires_activation_and_rebroadcasts() {
     assert!(matches!(sec.op_mut().election, ElectionState::Promoted));
     sec.fire_local_promotion().await;
 
-    // (1) The activation gate fired exactly once, carrying the
-    // cluster-state snapshot the parked primary restores.
+    // (1) The local self-apply of `PrimaryChanged { new = self }` fired
+    // the activation gate exactly once, carrying the cluster-state
+    // snapshot the parked primary restores, AND installed self as the
+    // current primary AND reset the election to Normal (no lingering
+    // Promoted — the host now runs a primary coordinator).
     assert!(
         promote_rx.await.is_ok(),
         "fire_local_promotion must wake the parked co-located primary \
              with a cluster_state snapshot",
     );
+    assert_eq!(
+        sec.cluster_state.current_primary(),
+        Some("sec-a"),
+        "the local self-apply installs self as current primary"
+    );
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Normal),
+        "the winner's own apply hook resets the election to Normal"
+    );
 
-    // (2) A `PromotePrimary { new = self }` landed on the mesh, with a
-    // strictly-superseding epoch and required_setup=false (failover).
-    let promote = log.borrow().iter().find_map(|m| match m {
-        DistributedMessage::PromotePrimary {
-            new_primary_id,
-            epoch,
-            required_setup,
-            ..
-        } => Some((new_primary_id.clone(), *epoch, *required_setup)),
+    // (2) The SAME `PrimaryChanged { new = self }` landed on the mesh,
+    // carried in a `ClusterMutation` envelope, with a strictly-
+    // superseding epoch.
+    let change = log.borrow().iter().find_map(|m| match m {
+        DistributedMessage::ClusterMutation { mutations, .. } => {
+            mutations.iter().find_map(|mu| match mu {
+                ClusterMutation::PrimaryChanged { new, epoch } => Some((new.clone(), *epoch)),
+                _ => None,
+            })
+        }
         _ => None,
     });
-    let (new_primary, epoch, required_setup) =
-        promote.expect("a PromotePrimary must be broadcast on promotion");
+    let (new_primary, epoch) =
+        change.expect("a PrimaryChanged must be broadcast on promotion");
     assert_eq!(new_primary, "sec-a", "must name self as new primary");
     assert!(
         epoch >= 1,
         "epoch must supersede the prior identity (epoch+1)"
     );
-    assert!(!required_setup, "failover promotion is not a setup-defer");
 }
 
-/// The activation gate is FIRE-ONCE across the two paths that reach
-/// `Promoted`: winning the own election AND being named by a
-/// `PromotePrimary`. A second `fire_local_promotion` (or the router's
+/// The activation gate is FIRE-ONCE across the paths that name this
+/// node primary: winning the own election AND being named by a
+/// `PrimaryChanged` applied through the hook. A second
+/// `fire_local_promotion` (or a second apply of the same frame via
 /// `activate_co_located_primary`) must NOT panic or double-send on the
 /// already-consumed gate. The `oneshot::Sender` `take()` guarantees
 /// this; the test asserts the second call is a clean no-op.
@@ -508,8 +544,8 @@ async fn activation_gate_is_fire_once() {
         "first activation must deliver the gate signal (snapshot)",
     );
 
-    // Second activation (e.g. own broadcast echoed back through the
-    // router's PromotePrimary arm) is a clean no-op — the sender was
+    // Second activation (e.g. the own broadcast echoed back through the
+    // `apply_cluster_mutations` hook) is a clean no-op — the sender was
     // already taken, so nothing is sent and nothing panics.
     sec.activate_co_located_primary();
     sec.fire_local_promotion().await;
@@ -522,19 +558,158 @@ async fn activation_gate_is_fire_once() {
     );
 }
 
+// ── The unified wake frame: `apply_cluster_mutations` apply hook ──
+
+/// The highest-value wake-frame unit test. A primary-capable secondary
+/// with a registered `promote_activation_tx`, applying
+/// `ClusterMutation::PrimaryChanged { new = self }` through the unified
+/// `apply_cluster_mutations` hook:
+///   (a) fires `activate_co_located_primary` (gate consumed) AND resets
+///       the failover election to `Normal` afterwards;
+///   (b) NEVER went through Suspecting/Candidate first — the hook keys on
+///       identity, not election history.
+#[tokio::test(flavor = "current_thread")]
+async fn wake_frame_self_named_fires_gate_and_resets_to_normal() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+    sec.enter_operational_for_test();
+    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
+    sec.register_promote_activation(promote_tx);
+
+    // No prior election excursion — the node has never suspected/voted.
+    assert!(matches!(sec.op_mut().election, ElectionState::Normal));
+
+    let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        new: "sec-a".into(),
+        epoch: 1,
+    }]);
+
+    assert!(changed, "a genuine PrimaryChanged advance returns true");
+    assert!(
+        promote_rx.try_recv().is_ok(),
+        "self-named PrimaryChanged must fire the co-located primary's gate",
+    );
+    assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
+    assert!(
+        matches!(sec.op_mut().election, ElectionState::Normal),
+        "the election resets to Normal after self-activation (no lingering Promoted)",
+    );
+}
+
+/// `PrimaryChanged { new = other }` applied through the hook installs
+/// the peer as primary but does NOT fire this node's activation gate —
+/// the gate is consumed ONLY when the frame names self.
+#[tokio::test(flavor = "current_thread")]
+async fn wake_frame_peer_named_does_not_fire_gate() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+    sec.enter_operational_for_test();
+    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
+    sec.register_promote_activation(promote_tx);
+
+    let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        new: "sec-b".into(),
+        epoch: 1,
+    }]);
+
+    assert!(changed, "a peer-named PrimaryChanged still advances the identity");
+    assert_eq!(sec.cluster_state.current_primary(), Some("sec-b"));
+    assert!(
+        matches!(
+            promote_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the gate must NOT fire when a PEER is named primary",
+    );
+}
+
+/// Applying `PrimaryChanged { new = self }` TWICE is fire-once: the
+/// second apply consumes nothing (the gate was already taken on the
+/// first) and does not panic. The second is also a stale-epoch NoOp at
+/// the CRDT level (same epoch+id), so it reports `false`.
+#[tokio::test(flavor = "current_thread")]
+async fn wake_frame_double_apply_is_fire_once() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let (mut sec, _log) = make_secondary_recording(election_config("sec-a"), 1);
+    sec.enter_operational_for_test();
+    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
+    sec.register_promote_activation(promote_tx);
+
+    let first = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        new: "sec-a".into(),
+        epoch: 1,
+    }]);
+    assert!(first, "first apply advances the identity");
+    assert!(promote_rx.try_recv().is_ok(), "first apply fires the gate");
+
+    // Second apply of the identical frame: fire-once gate (already
+    // taken) + CRDT NoOp (same epoch+id). No panic, no second signal.
+    let second = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        new: "sec-a".into(),
+        epoch: 1,
+    }]);
+    assert!(!second, "a re-applied identical PrimaryChanged is a NoOp");
+    assert!(
+        matches!(
+            promote_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ),
+        "no second gate signal; the sender was consumed and dropped on the first apply",
+    );
+}
+
+/// The observer-not-primary guard moved into the apply hook: applying
+/// `PrimaryChanged` naming an observer (here, self when `is_observer`)
+/// is REJECTED — `current_primary` is NOT installed and the gate does
+/// not fire. The hook returns `false` (no genuine advance).
+#[tokio::test(flavor = "current_thread")]
+async fn wake_frame_self_observer_is_rejected() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
+    let mut cfg = election_config("obs-a");
+    cfg.is_observer = true;
+    let (mut sec, _log) = make_secondary_recording(cfg, 1);
+    sec.enter_operational_for_test();
+    let (promote_tx, mut promote_rx) = tokio::sync::oneshot::channel();
+    sec.register_promote_activation(promote_tx);
+
+    let changed = sec.apply_cluster_mutations(vec![ClusterMutation::PrimaryChanged {
+        new: "obs-a".into(),
+        epoch: 1,
+    }]);
+
+    assert!(!changed, "naming an observer is rejected — no genuine advance");
+    assert!(
+        sec.cluster_state.current_primary().is_none(),
+        "an observer must NOT be installed as current primary",
+    );
+    assert!(
+        matches!(
+            promote_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the gate must NOT fire for a rejected observer naming",
+    );
+}
+
 /// With no co-located primary composed (Rust-only / legacy callers),
 /// the terminal action must not panic on the absent gate: the
-/// broadcast still fires so the mesh records the new authority.
+/// `PrimaryChanged` broadcast still fires so the mesh records the new
+/// authority.
 #[tokio::test(flavor = "current_thread")]
 async fn promotion_without_composed_primary_still_broadcasts() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     let (mut sec, log) = make_secondary_recording(election_config("sec-a"), 1);
     // No `register_promote_activation` — promote_activation_tx stays None.
     sec.fire_local_promotion().await;
     assert!(
-        log.borrow()
-            .iter()
-            .any(|m| matches!(m, DistributedMessage::PromotePrimary { .. })),
-        "PromotePrimary must broadcast even when no co-located primary exists",
+        log.borrow().iter().any(|m| matches!(
+            m,
+            DistributedMessage::ClusterMutation { mutations, .. }
+                if mutations
+                    .iter()
+                    .any(|mu| matches!(mu, ClusterMutation::PrimaryChanged { .. }))
+        )),
+        "PrimaryChanged must broadcast even when no co-located primary exists",
     );
 }
 
@@ -570,7 +745,7 @@ fn keepalive_from(
     }
 }
 
-/// Drive a real `PromotePrimary` naming a PEER as the new primary, then
+/// Drive a real `PrimaryChanged` naming a PEER as the new primary, then
 /// stream that peer's keepalives (recognized → `primary_last_seen` kept
 /// fresh): `run_election_tick` MUST NOT enter Suspecting or broadcast a
 /// `TimeoutQuery` while the promoted primary is healthy. Then simulate
@@ -582,11 +757,11 @@ fn keepalive_from(
 ///
 /// Deterministic time: the staleness predicate (`primary_silent`) reads
 /// `std::time::Instant` (NOT a tokio timer), so death is simulated by an
-/// explicit backdated `primary_last_seen`, mirroring
-/// `pre_designated_primary_ignores_silent_local_primary` — no wall-clock
-/// racing, no dependence on the tokio paused-time clock.
+/// explicit backdated `primary_last_seen` — no wall-clock racing, no
+/// dependence on the tokio paused-time clock.
 #[tokio::test(flavor = "current_thread")]
 async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
     // A surviving mesh peer so the election path is non-degraded and
@@ -594,16 +769,17 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
     sec.op_mut().peer_keepalives.insert("sec-c".into(), timestamp_now());
 
     // A peer (sec-a) is promoted to primary via the real apply path.
-    let promote = DistributedMessage::PromotePrimary {
+    let promote = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-a".into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 1,
+        }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     // Healthy: each beat the promoted primary's keepalive is recognized
@@ -661,6 +837,7 @@ async fn promoted_peer_primary_healthy_no_election_then_dead_fires() {
 /// not a blanket disable.
 #[tokio::test(flavor = "current_thread")]
 async fn check_peer_timeouts_skips_alive_promoted_primary() {
+    use dynrunner_protocol_primary_secondary::ClusterMutation;
     let mut sec = make_secondary(election_config("sec-b"));
     sec.enter_operational_for_test();
     // Both entries are unconditionally stale (epoch timestamp ≪ the
@@ -671,16 +848,17 @@ async fn check_peer_timeouts_skips_alive_promoted_primary() {
 
     // sec-a is promoted to primary via the real apply path. Its
     // pre-promotion `peer_keepalives` entry is now stale-but-alive.
-    let promote = DistributedMessage::PromotePrimary {
+    let promote = DistributedMessage::ClusterMutation {
         sender_id: "primary".into(),
         timestamp: 0.0,
-        new_primary_id: "sec-a".into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: "sec-a".into(),
+            epoch: 1,
+        }],
     };
     sec.dispatch_message(promote, &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     sec.check_peer_timeouts();

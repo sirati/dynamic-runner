@@ -349,7 +349,7 @@ pub(super) fn make_secondary(
 /// Construct a SecondaryCoordinator over the unified transport with a
 /// [`RecordingPeer`] mesh stub, returning the coordinator + the shared
 /// broadcast log so a test can assert on the messages the failover
-/// terminal action (e.g. the `PromotePrimary { new = self }` re-point)
+/// terminal action (e.g. the `PrimaryChanged { new = self }` re-point)
 /// fans out onto the mesh. `peer_count` configures the recorder's
 /// reported mesh cardinality.
 #[allow(clippy::type_complexity)]

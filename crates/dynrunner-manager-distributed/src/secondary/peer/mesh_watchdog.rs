@@ -48,7 +48,7 @@ where
     ///      keepalives) can fail loud or skip — the contract is
     ///      owned by those callers, not by this watchdog.
     ///   2. `MeshReady` is sent with `peer_count=0` so the primary's
-    ///      `wait_for_mesh_ready` step releases `PromotePrimary` and
+    ///      `wait_for_mesh_ready` step releases its `PrimaryChanged` announcement and
     ///      operational dispatch (over WSS, not the peer mesh) can
     ///      flow. Without this the whole run blocks on the missing
     ///      mesh signal.
@@ -117,7 +117,8 @@ where
         if connected == self.mesh.peer_dial_count as usize {
             self.mesh.peer_mesh_check_at = None;
             // Full mesh formed — tell the primary so it can release
-            // `PromotePrimary`. Idempotent via `mesh_ready_sent`.
+            // its `PrimaryChanged` announcement. Idempotent via
+            // `mesh_ready_sent`.
             self.report_mesh_ready_if_needed().await;
             return;
         }
@@ -159,7 +160,7 @@ where
 
         // Report mesh-ready (with the real-peer count, which is 0 in the
         // lone case) so the primary's `wait_for_mesh_ready` step releases
-        // `PromotePrimary` instead of blocking the full mesh-ready
+        // its `PrimaryChanged` announcement instead of blocking the full mesh-ready
         // timeout. Fires in EVERY terminal case — full, partial, or lone
         // — so the primary always unblocks. Idempotent via
         // `mesh_ready_sent`.
@@ -181,7 +182,7 @@ where
     /// (peer.rs owns peer-mesh status; processing.rs just calls).
     pub(in crate::secondary) async fn report_mesh_ready_if_needed(&mut self) {
         // Strict-observer suppression: MeshReady is a worker-secondary
-        // signal — the primary defers `PromotePrimary` until every
+        // signal — the primary defers its `PrimaryChanged` announcement until every
         // worker secondary's mesh has settled. An observer has no
         // workers and is never a promotion candidate, so it must
         // originate NOTHING here (the mesh-ready concern's own role-gate,

@@ -210,7 +210,7 @@ pub(crate) fn run_slurm_pipeline<'py>(
     // coordinator an empty list; the Step 6 PyO3 wrapper reads
     // `binaries.is_empty() && source_pre_staged_root.is_some()` to
     // derive `required_setup_on_promote = true`, which in turn makes
-    // the bootstrap `PromotePrimary` carry `required_setup=true` so
+    // the bootstrap setup-defer handshake carry `pre_staged_mode=true` so
     // the chosen secondary runs `task.discover_items` against its
     // bind-mounted `src_network` and seeds the cluster ledger.
     let binaries = PyList::empty(py);

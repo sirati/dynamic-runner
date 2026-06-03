@@ -354,8 +354,8 @@ pub(in crate::secondary) struct MeshFormation {
     pub(in crate::secondary) peer_dial_count: u32,
 
     /// One-shot guard: has `MeshReady` already been emitted to the primary?
-    /// The primary defers `PromotePrimary` until every secondary reports,
-    /// so this enforces "exactly once per secondary".
+    /// The primary defers its `PrimaryChanged` announcement until every
+    /// secondary reports, so this enforces "exactly once per secondary".
     pub(in crate::secondary) mesh_ready_sent: bool,
 
     /// The `degraded` latch: set true once the watchdog deadline elapsed

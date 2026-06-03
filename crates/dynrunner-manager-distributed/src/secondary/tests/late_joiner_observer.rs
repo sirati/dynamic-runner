@@ -187,8 +187,9 @@ fn restore_is_idempotent_on_second_call() {
 /// Observer config sanity: an observer's `is_observer=true` flag
 /// reaches the coordinator's `config` so downstream consumers
 /// (the election filter at `election.rs::run_election_tick`'s
-/// `we_lead` branch, the dispatch defensive reject at
-/// `dispatch.rs::handle_promote_primary`) see the flag.
+/// `we_lead` branch, the `PrimaryChanged` apply-hook defensive
+/// reject at `dispatch/helpers.rs::apply_primary_changed`) see the
+/// flag.
 #[test]
 fn observer_config_propagated_to_coordinator() {
     let sec = make_observer_secondary("observer-1");

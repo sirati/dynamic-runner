@@ -13,8 +13,9 @@ use pyo3::prelude::*;
 /// `retry_max_passes` governs both the live primary's `run_retry_passes`
 /// and (post-demotion) the promoted secondary's
 /// `primary_drain_check_and_retry`. The live primary owns retry
-/// while it's authoritative; once it sends `PromotePrimary` and demotes,
-/// the primary takes over retry for tasks IT dispatched. Same knob
+/// while it's authoritative; once it relinquishes the role via
+/// `PrimaryChanged` and demotes, the promoted primary takes over retry
+/// for tasks IT dispatched. Same knob
 /// drives both sides so the cluster-level retry budget stays consistent
 /// across the handover.
 #[pyclass(name = "DistributedConfig", get_all, set_all, from_py_object)]

@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant};
 
 use super::super::test_helpers::{FakeWorkerFactory, TestId, election_config, make_secondary};
-use dynrunner_protocol_primary_secondary::{DistributedMessage, KeepaliveRole};
+use dynrunner_protocol_primary_secondary::{ClusterMutation, DistributedMessage, KeepaliveRole};
 
 /// Build a runtime `Keepalive` originated by `origin`, tagged with the
 /// emitter `role`. The wire shape sets `sender_id == secondary_id ==
@@ -32,16 +32,17 @@ fn keepalive(origin: &str, role: KeepaliveRole) -> DistributedMessage<TestId> {
     }
 }
 
-/// `PromotePrimary` naming `primary_id` as the cluster primary. Driving
+/// A `PrimaryChanged` naming `primary_id` as the cluster primary. Driving
 /// the real apply path is the single source of `current_primary` (and is
 /// what every other secondary test uses to install a primary identity).
 fn promote(primary_id: &str) -> DistributedMessage<TestId> {
-    DistributedMessage::PromotePrimary {
+    DistributedMessage::ClusterMutation {
         sender_id: "promoter".into(),
         timestamp: 0.0,
-        new_primary_id: primary_id.into(),
-        epoch: 1,
-        required_setup: false,
+        mutations: vec![ClusterMutation::PrimaryChanged {
+            new: primary_id.into(),
+            epoch: 1,
+        }],
     }
 }
 
@@ -53,13 +54,14 @@ async fn primary_keepalive_refreshes_primary_last_seen() {
     sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     // Stamp a known-stale baseline so "advanced" is observable: the
     // keepalive must move `primary_last_seen` strictly forward of it.
-    // (`PromotePrimary` is itself a primary-facing frame whose dispatch
-    // refreshes liveness, so we re-baseline rather than assume `None`.)
+    // (Any `dispatch_message` runs the `record_primary_message` pre-amble
+    // which refreshes liveness, so we re-baseline rather than assume
+    // `None`.)
     let stale = Instant::now() - Duration::from_secs(60);
     sec.op_mut().primary_last_seen = Some(stale);
 
@@ -84,7 +86,7 @@ async fn peer_keepalive_does_not_touch_primary_last_seen() {
     sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     let baseline = Instant::now() - Duration::from_secs(60);
@@ -117,7 +119,7 @@ async fn colocated_host_tracked_as_both_primary_and_peer() {
     sec.enter_operational_for_test();
     sec.dispatch_message(promote("sec-a"), &mut FakeWorkerFactory)
         .await
-        .expect("PromotePrimary handler succeeds");
+        .expect("PrimaryChanged handler succeeds");
     assert_eq!(sec.cluster_state.current_primary(), Some("sec-a"));
 
     let stale = Instant::now() - Duration::from_secs(60);

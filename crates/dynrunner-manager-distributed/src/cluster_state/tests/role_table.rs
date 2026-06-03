@@ -104,9 +104,9 @@ fn role_change_hook_fires_after_apply() {
 /// the peer into the replicated observer set with set semantics
 /// (idempotent) and fires role-change hooks when (and only when)
 /// the set actually changes. Pins the "observer-set replicated
-/// through RoleTable" contract that election filtering and
-/// PromotePrimary defense both rely on, now flowing through the
-/// single-writer CRDT apply path.
+/// through RoleTable" contract that election filtering and the
+/// PrimaryChanged observer-rejection defense both rely on, now
+/// flowing through the single-writer CRDT apply path.
 #[test]
 fn peer_joined_observer_inserts_into_role_table_and_fires_hooks_on_change() {
     use std::sync::Mutex;

@@ -9,8 +9,7 @@
 //!   - [`binary_info`] — `DistributedBinaryInfo` wire-shape tests
 //!     (flattened identifier, phase tags, legacy default-decoding,
 //!     empty-field omission).
-//!   - [`stage_promote`] — `StageFile` and `PromotePrimary`
-//!     (incl. `required_setup` backcompat).
+//!   - [`stage`] — `StageFile` wire-shape round-trip.
 
 use super::*;
 use crate::messages::*;
@@ -21,7 +20,7 @@ mod binary_info;
 mod cluster_mutation;
 mod frame;
 mod roundtrip;
-mod stage_promote;
+mod stage;
 
 /// Test identifier matching the tokenizer's wire format.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

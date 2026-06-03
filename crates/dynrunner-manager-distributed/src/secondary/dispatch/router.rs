@@ -36,15 +36,16 @@ where
 {
     /// Wire-frame dispatcher for the frame types the role-aware
     /// `handle_inbound` base does not own directly (TaskAssignment,
-    /// StageFile, PromotePrimary, RequestClusterSnapshot,
-    /// ClusterSnapshot, PeerInfo, plus the test-reachable
-    /// TaskComplete/TaskFailed arms). The secondary holds NO authority:
-    /// every arm here is either own-worker management, a CRDT mirror
-    /// apply, or a CLASS-1 report to the primary role.
+    /// StageFile, RequestClusterSnapshot, ClusterSnapshot, PeerInfo,
+    /// ClusterMutation, plus the test-reachable TaskComplete/TaskFailed
+    /// arms). The secondary holds NO authority: every arm here is either
+    /// own-worker management, a CRDT mirror apply, or a CLASS-1 report to
+    /// the primary role.
     ///
     /// State contract (NOT a compile-time guarantee). The pool-touching
-    /// arms (`TaskAssignment`, the `PromotePrimary` repoll/backoff resets)
-    /// reach the worker pool / operational fields through the
+    /// arms (`TaskAssignment`, the `ClusterMutation` repoll/backoff resets
+    /// on a `PrimaryChanged`) reach the worker pool / operational fields
+    /// through the
     /// `op_mut()` / `pool_mut()` typed accessors. Those accessors are
     /// `#[track_caller]` `.expect(...)` RUNTIME asserts on the lifecycle
     /// state, NOT a type-level "unrepresentable by construction" — making
@@ -406,126 +407,6 @@ where
                 self.stage_and_register(&file_hash, &content_hash, &src_path, &dest_path);
                 Ok(())
             }
-            DistributedMessage::PromotePrimary {
-                new_primary_id,
-                epoch,
-                required_setup,
-                ..
-            } => {
-                // Task #36 / Step 7 defensive guard: an observer MUST
-                // NOT be promoted. If we receive a PromotePrimary
-                // naming an observer (either us, or a peer in the
-                // replicated `RoleTable.observers` set), reject loud
-                // — this should not happen now that `is_observer`
-                // rides PeerInfo end-to-end into `role_table.observers`
-                // (Step 7 closed the wire-level race window the
-                // prior comment flagged: "PeerInfo broadcast carrying
-                // is_observer was lost"). The rejection remains as
-                // belt-and-suspenders against a misconfigured peer
-                // or a forged PromotePrimary on the wire.
-                let observers = &self.cluster_state.role_table().observers;
-                let names_observer = (self.config.is_observer
-                    && new_primary_id == self.config.secondary_id)
-                    || observers.contains(&new_primary_id);
-                if names_observer {
-                    tracing::error!(
-                        secondary = %self.config.secondary_id,
-                        target = %new_primary_id,
-                        epoch,
-                        self_is_observer = self.config.is_observer,
-                        target_in_role_table_observers = observers.contains(&new_primary_id),
-                        "REJECTED PromotePrimary naming an observer — observers \
-                         cannot host primary role (no workers, no dispatch \
-                         authority). With Step 7's `is_observer` ride-along on \
-                         PeerInfo, this should only fire for a forged \
-                         PromotePrimary or a peer that promoted before \
-                         processing the latest PeerInfo broadcast. Ignoring; \
-                         the cluster's election should retry with the observer \
-                         filtered out."
-                    );
-                    return Ok(());
-                }
-                // Apply to the replicated ledger first: last-writer-
-                // wins on (epoch, primary_id) makes a stale lower-
-                // epoch broadcast a no-op against an already-installed
-                // higher-epoch promotion (e.g. a delayed bootstrap
-                // PromotePrimary arriving after a failover round).
-                // If the ledger rejects it, every other side-effect
-                // must short-circuit too — otherwise the routing
-                // target diverges from the cluster's authoritative
-                // primary identity.
-                let outcome = self.cluster_state.apply(ClusterMutation::PrimaryChanged {
-                    new: new_primary_id.clone(),
-                    epoch,
-                });
-                if outcome == crate::cluster_state::ApplyOutcome::NoOp {
-                    tracing::debug!(
-                        new_primary = %new_primary_id,
-                        epoch,
-                        "ignoring stale PromotePrimary superseded by higher epoch"
-                    );
-                    return Ok(());
-                }
-                // The `PrimaryChanged` apply above updated
-                // `cluster_state.current_primary()` — the single source
-                // of "who is primary". The promotion re-route is implicit:
-                // the next `Destination::Primary` send re-resolves at the
-                // egress edge (`send_to` → `resolve_destination`, reading
-                // `current_primary()`) to the newly-named host id. The
-                // transport never resolves a role and holds no RoleCache.
-                // The secondary manager carries NO self-promotion
-                // machinery: there is no separate
-                // promoted-secondary-as-primary mirror to activate.
-                let _ = required_setup;
-                // Sync the FAILOVER ELECTION state with the role
-                // identity when this node is the one named primary: its
-                // election goes terminal `Promoted` so a subsequently-
-                // silent (now-demoted) local primary does NOT drive THIS
-                // node into Suspecting → Candidate and a self-re-promote
-                // cascade (the early-return in `run_election_tick` keys
-                // off `Promoted`). The peer-named case needs nothing
-                // extra: the `record_primary_message` pre-amble at the
-                // top of `dispatch_message` already reset the election
-                // to `Normal` (this node is a settled follower).
-                if new_primary_id == self.config.secondary_id {
-                    self.op_mut().election = super::super::election::ElectionState::Promoted;
-                    // Wake the co-located parked primary: this node is
-                    // now the authority. Gate-only (no re-broadcast) —
-                    // this PromotePrimary IS the broadcast that named
-                    // us, so re-emitting it would loop. Fire-once via
-                    // `take()`, so the own-election-win path
-                    // (`fire_local_promotion`) and this peer-named path
-                    // converge on a single activation. Idempotent when
-                    // this is our OWN echoed broadcast (the gate is
-                    // already consumed) or when no primary was composed.
-                    self.activate_co_located_primary();
-                }
-                tracing::info!(
-                    new_primary = %new_primary_id,
-                    epoch,
-                    "primary role changed"
-                );
-                // Clear every worker's per-request backoff: it accrued
-                // against the PRIOR primary identity, so it is stale the
-                // moment the role changes. Without this the repoll below
-                // is suppressed by `should_request_now` and idle workers
-                // sit through a stale backoff window before re-issuing
-                // at the new primary (the dispatch-silence symptom).
-                // Mirrors the pre-unification `on_primary_changed` reset
-                // — the rule is "any observable primary-identity change
-                // revives the slot's pull semantic and resets the
-                // rate-limiter". Keyed off the backoff maps (not the
-                // pool) so it fires even before `initialize_workers`.
-                self.op_mut().primary_link.reset_all_backoff();
-                // Immediate repoll: every idle worker re-issues its
-                // pending `TaskRequest` against the freshly-identified
-                // primary (`Destination::Primary` re-resolved at the
-                // egress edge from `cluster_state.current_primary()`,
-                // updated by the `PrimaryChanged` apply above) instead of
-                // waiting up to a keepalive interval.
-                self.repoll_idle_workers().await;
-                Ok(())
-            }
             DistributedMessage::TaskComplete { task_hash, .. } => {
                 // A `TaskComplete` REPORT frame is a peer's own-worker
                 // terminal report to the authority — not a CRDT
@@ -655,7 +536,25 @@ where
                 Ok(())
             }
             DistributedMessage::ClusterMutation { mutations, .. } => {
-                self.apply_cluster_mutations(mutations);
+                // `apply_cluster_mutations` mirrors the batch and, for a
+                // `PrimaryChanged`, runs the unified primary-activation
+                // hook (wake co-located primary + reset election + observer
+                // guard). It returns whether a primary-identity change was
+                // genuinely applied; when it was, revive the worker-pull
+                // rate-limiter — backoff accrued against the PRIOR primary
+                // is stale the moment the role changes, so without this the
+                // repoll is suppressed by `should_request_now` and idle
+                // workers sit through a stale window before re-issuing at
+                // the new primary (the dispatch-silence symptom). Keyed off
+                // the backoff maps (not the pool) so it fires even before
+                // `initialize_workers`. Then immediate repoll so every idle
+                // worker re-issues its `TaskRequest` against the freshly-
+                // identified primary (`Destination::Primary` re-resolved at
+                // the egress edge) instead of waiting a keepalive interval.
+                if self.apply_cluster_mutations(mutations) {
+                    self.op_mut().primary_link.reset_all_backoff();
+                    self.repoll_idle_workers().await;
+                }
                 Ok(())
             }
             DistributedMessage::PeerInfo { peers: _, .. } => {

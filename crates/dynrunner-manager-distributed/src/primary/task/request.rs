@@ -208,7 +208,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             // msg)` — but `self.primary_id` is the post-promotion
             // PROMOTED-PEER's id while the writer-task on the other
             // side of that per-secondary channel exits the moment it
-            // observes `PromotePrimary`. The pre-Step-5 hotfix
+            // observes the `PrimaryChanged` re-point. The pre-Step-5 hotfix
             // (commit 7845851) guarded this branch with
             // `!self.demoted` to drop the relay outright after
             // demotion — benign but lossy: the requesting secondary

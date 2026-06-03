@@ -277,7 +277,9 @@ where
     }
 
     /// Ingest the result of Python's `task.discover_items` after a
-    /// `PromotePrimary { required_setup: true }` promotion.
+    /// setup-defer promotion (the chosen peer received an
+    /// `InitialAssignment { pre_staged_mode: true }` and yielded
+    /// `SetupPending`).
     ///
     /// The outer process-tasks loop yielded back to the PyO3 wrapper,
     /// which ran `task.discover_items` against the locally bind-mounted

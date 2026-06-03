@@ -134,8 +134,8 @@ impl PyDistributedManager {
         let source_pre_staged_root = self.source_pre_staged_root.clone();
         // Pre-staged mode: the submitter has no local view of the
         // staged corpus, so `_dispatch_single_process` handed us an
-        // empty binaries list and the bootstrap `PromotePrimary` must
-        // tell the chosen secondary to run discovery + ledger-seed on
+        // empty binaries list and the bootstrap setup-defer handshake
+        // must tell the chosen secondary to run discovery + ledger-seed on
         // its bind-mounted `src_network`. The Python dispatch layer is
         // the single source of truth for "binaries empty" here — when
         // `source_pre_staged_root.is_some()` the helper has already
@@ -561,7 +561,7 @@ impl PyDistributedManager {
                     // helper has already returned an empty
                     // `binaries` list in pre-staged mode, so the
                     // chosen secondary owns the discovery + ledger-
-                    // seed via the bootstrap `PromotePrimary`.
+                    // seed via the bootstrap setup-defer handshake.
                     source_pre_staged_root: source_pre_staged_root.clone(),
                     uses_file_based_items,
                     required_setup_on_promote,

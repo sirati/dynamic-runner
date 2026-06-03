@@ -200,8 +200,9 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     /// Record a secondary's `MeshReady` report. The
     /// `wait_for_mesh_ready` step blocks on this set covering every
-    /// connected secondary before it lets `promote_primary`
-    /// fire. A stray `MeshReady` after the wait already cleared is
+    /// connected secondary before it lets the `PrimaryChanged`
+    /// announcement fire. A stray `MeshReady` after the wait already
+    /// cleared is
     /// idempotent — the set just stays full and the message is a
     /// no-op.
     pub(super) fn handle_mesh_ready(&mut self, msg: DistributedMessage<I>) {

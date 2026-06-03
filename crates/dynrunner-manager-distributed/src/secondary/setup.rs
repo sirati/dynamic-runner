@@ -103,7 +103,7 @@ where
         // variants, so a runtime frame here fails at compile time),
         // but routing is OPAQUE: the frame ships over the one mesh
         // addressed to `Destination::Primary`. The role cache is cold
-        // this early (no `PromotePrimary` observed), so it resolves to
+        // this early (no `PrimaryChanged` observed), so it resolves to
         // the bootstrap primary host — exactly the primary this welcome
         // is for. Wire bytes are identical (the
         // `From<SetupBootstrapMessage>` conversion is lossless).
