@@ -16,6 +16,11 @@
 //! - [`dispatch_decoupling`] — dispatch is a parked recheck woken by a
 //!   `WorkerMgmtSignal::TasksAdded`; positive + negative-control +
 //!   is_idle-advisory + coalesce.
+//! - [`relocate_e2e`] — running channel-mesh proof of the full bootstrap
+//!   hand-off: submitter relocates to a primary-capable secondary whose
+//!   on-demand `PrimaryCoordinator` dispatches the residual workload;
+//!   submitter observes + exits on `RunComplete`. Plus the no-capable-peer
+//!   → submitter-stays-primary case.
 
 mod basic;
 mod coordinator_setup;
@@ -28,6 +33,7 @@ mod phase_decision;
 mod phase_ordering;
 mod preferred_secondaries;
 mod promotion;
+mod relocate_e2e;
 mod relocate_observe;
 mod result_data_plumbing;
 mod retry;
@@ -236,6 +242,199 @@ pub(super) fn spawn_real_secondary_slow(
     });
 
     (pri_to_sec_tx, sec_to_pri_rx, handle)
+}
+
+/// The result handle a [`spawn_real_secondary_primary_capable`] secondary
+/// hands back: the count of tasks its CO-LOCATED primary credited to the
+/// replicated ledger (`completed_count()`), captured the instant
+/// `run_activated` returns. `None` means the on-demand activator never
+/// fired (this node was never named primary). This is the per-host primary
+/// attribution the relocation e2e asserts on — proof that the CHOSEN peer's
+/// own authority dispatched + drove the run to completion, not merely that
+/// cluster totals reconcile.
+pub(super) type ActivatedPrimaryResult = std::rc::Rc<std::cell::Cell<Option<usize>>>;
+
+/// Like [`spawn_real_secondary`] but PRIMARY-CAPABLE: the secondary joins
+/// with `can_be_primary = true` and registers a [`PrimaryActivator`] that,
+/// the moment a bootstrap `PrimaryChanged { reason: Transferred, new =
+/// self }` names it, builds a real [`PrimaryCoordinator`] over a
+/// `ChannelPeerTransport` ON DEMAND and `spawn_local`s its `run_activated`.
+///
+/// This is the channel-mesh analog of the pyo3 runtime's activator
+/// (`managers/secondary/run.rs`): same closure SHAPE (build transport →
+/// `PrimaryCoordinator::new` → `register_colocated_loopback` → transfer
+/// command/phase wiring → `spawn_local(run_activated(snapshot))`) but the
+/// transport is a net-new `ChannelPeerTransport` instead of the QUIC
+/// `MeshHandleTransport` — TRANSPORT⊥ROLES holds, the secondary never names
+/// the primary's transport type.
+///
+/// Mesh topology (caller supplies `peer_outboxes` = an outbox to EVERY
+/// other peer, keyed by id):
+///   * The SECONDARY transport's `outgoing` = `peer_outboxes` (so its
+///     pre-relocation `Destination::Primary` reaches the submitter keyed
+///     `"primary"`, and post-relocation a peer secondary's frames it must
+///     relay route over the mesh); its inbound is `inbound_rx` (the wire
+///     traffic this peer receives).
+///   * The co-located PRIMARY transport's `outgoing` = a CLONE of
+///     `peer_outboxes` (so `Destination::Secondary(other)` /
+///     `Destination::All` reach the other secondaries + the
+///     submitter-observer keyed `"primary"`); its inbound is CH2 — the
+///     demuxed primary-facing frames the secondary's `handle_inbound`
+///     forwards while `current_primary() == self`. Own-secondary delivery
+///     is the egress-edge loopback (CH1), NOT a transport leg.
+///
+/// `keepalive_interval` is short in the relocation harness so peer
+/// keepalives flow fast — the two secondaries recognise each other as alive
+/// (`alive_secondary_count` ⇒ full mesh), each reports `MeshReady`, and the
+/// submitter's `wait_for_mesh_ready` releases its hand-off fork promptly.
+/// `slow_markers` (a [`SlowFakeWorkerFactory`] marker set) gives every task
+/// a small per-task latency so the workload stays IN-FLIGHT across the
+/// relocation window — the residual tasks the submitter's one-per-worker
+/// initial assignment didn't place are then dispatched by the CHOSEN peer's
+/// on-demand primary, making the dispatch attribution deterministic rather
+/// than a "submitter finished everything in the fast-channel gap before it
+/// could relocate" race.
+///
+/// Returns the secondary's own-work `JoinHandle` plus the
+/// [`ActivatedPrimaryResult`] cell.
+#[allow(clippy::type_complexity)]
+pub(super) fn spawn_real_secondary_primary_capable(
+    secondary_id: String,
+    num_workers: u32,
+    max_resources: dynrunner_core::ResourceMap,
+    keepalive_interval: Duration,
+    slow_markers: Vec<(String, Duration)>,
+    inbound_rx: tokio_mpsc::UnboundedReceiver<DistributedMessage<TestId>>,
+    peer_outboxes: HashMap<String, tokio_mpsc::UnboundedSender<DistributedMessage<TestId>>>,
+) -> (tokio::task::JoinHandle<usize>, ActivatedPrimaryResult) {
+    // CH1 (primary→secondary loopback) + CH2 (secondary→primary inbound):
+    // the two co-located-composition channels, identical in shape to the
+    // pyo3 wrapper's. CH1's rx drains in the secondary's operational loop;
+    // CH2's rx is the on-demand primary transport's inbound.
+    let (loopback_to_secondary_tx, loopback_to_secondary_rx) = tokio_mpsc::unbounded_channel();
+    let (primary_inbound_tx, primary_inbound_rx) = tokio_mpsc::unbounded_channel();
+
+    let activated_result: ActivatedPrimaryResult = std::rc::Rc::new(std::cell::Cell::new(None));
+    let activated_result_for_closure = activated_result.clone();
+
+    let handle = tokio::task::spawn_local(async move {
+        // The SECONDARY transport: every other peer is an ordinary mesh
+        // member in `outgoing`, the wire inbound is `inbound_rx`. The
+        // submitter (keyed `"primary"`) is one such member, folded in the
+        // same way `register_primary_link` does — but since the caller
+        // already put it in `peer_outboxes`, we just hand the whole table
+        // to `from_raw_channels`.
+        let mut transport = ChannelPeerTransport::from_raw_channels(
+            secondary_id.clone(),
+            peer_outboxes.clone(),
+            inbound_rx,
+        );
+        // `local_id` keying aside, mark the submitter link as the primary
+        // link so `register_primary_link`'s contract (the folded primary is
+        // a directed member) is honoured symmetrically with the bare
+        // `spawn_real_secondary` path. The outbox is already present; this
+        // re-insert is idempotent.
+        if let Some(to_primary) = peer_outboxes.get("primary") {
+            transport.register_primary_link("primary".into(), to_primary.clone());
+        }
+
+        let config = SecondaryConfig {
+            secondary_id: secondary_id.clone(),
+            num_workers,
+            max_resources,
+            hostname: "test-host".into(),
+            keepalive_interval,
+            src_network: None,
+            src_tmp: None,
+            peer_timeout: Duration::from_secs(120),
+            keepalive_miss_threshold: 3,
+            retry_max_passes: 1,
+            oom_retry_max_passes: 1,
+            primary_link_failure_threshold: 5,
+            primary_link_failure_window: Duration::from_secs(30),
+            unconfigured_deadline: Duration::from_secs(600),
+            is_observer: false,
+            // Opt-in primary capability: advertised in `SecondaryWelcome`,
+            // recorded by the submitter as `PeerJoined { can_be_primary:
+            // true }`, so `select_bootstrap_primary` may relocate to it.
+            can_be_primary: true,
+            resource_check_interval: Duration::from_millis(100),
+            log_oom_watcher: false,
+            promoted_primary_quiesce_grace: Duration::from_millis(100),
+            unfulfillable_reinject_max_per_task: None,
+            mem_manager_reserved_bytes: None,
+            output_dir: None,
+            memuse_log_path: None,
+        };
+        let mut secondary = SecondaryCoordinator::new(
+            config,
+            transport,
+            ResourceStealingScheduler::memory(),
+            FixedEstimator(100),
+        );
+        secondary.set_bootstrap_primary_id("primary".to_string());
+
+        // Co-located composition wiring (secondary side), the pre-run
+        // one-shot registrations the pyo3 wrapper performs: CH2's sender
+        // (the demux target the egress `Loopback` arm + `handle_inbound`
+        // forward into) and CH1's receiver (the loopback the operational
+        // loop drains).
+        secondary.register_colocated_primary_inbound(primary_inbound_tx);
+        secondary.register_colocated_loopback_inbound(loopback_to_secondary_rx);
+
+        // Build the ON-DEMAND primary-activator. Same closure SHAPE as the
+        // pyo3 reference; the transport is a `ChannelPeerTransport` over the
+        // captured peer outboxes (remote send) + CH2 (demuxed inbound).
+        let primary_node_id = secondary_id.clone();
+        let primary_peer_outboxes = peer_outboxes;
+        let activator: crate::secondary::PrimaryActivator<TestId> = Box::new(move |snapshot| {
+            let primary_transport = ChannelPeerTransport::from_raw_channels(
+                primary_node_id.clone(),
+                primary_peer_outboxes,
+                primary_inbound_rx,
+            );
+            let primary_config = PrimaryConfig {
+                node_id: primary_node_id,
+                ..PrimaryConfig::default()
+            };
+            let mut primary = PrimaryCoordinator::new(
+                primary_config,
+                primary_transport,
+                ResourceStealingScheduler::memory(),
+                FixedEstimator(100),
+            );
+            // Own-secondary loopback (CH1): `Destination::Secondary(own_id)`
+            // + the own-secondary leg of every `Destination::All` broadcast
+            // reach the co-located secondary through this sender.
+            primary.register_colocated_loopback(loopback_to_secondary_tx);
+            tokio::task::spawn_local(async move {
+                let outcome = primary.run_activated(snapshot).await;
+                // Capture the per-host attribution: the count THIS primary's
+                // own replicated ledger credited, read the instant the run
+                // finalizes. Recorded even on error so a hang vs a failed
+                // run are distinguishable (a hang never reaches here).
+                activated_result_for_closure.set(Some(primary.completed_count()));
+                if let Err(e) = outcome {
+                    tracing::error!(error = %e, "co-located primary (channel-mesh) failed");
+                }
+            })
+        });
+        secondary.register_primary_activator(activator);
+
+        let mut factory = SlowFakeWorkerFactory::with_markers(slow_markers);
+        secondary.run(&mut factory).await.unwrap();
+        // Join the on-demand-built primary (if this node was activated) so
+        // the run is fully wound down — and the `activated_result` cell is
+        // set — before this handle resolves. `None` on a node never named
+        // primary. The activated future never errors out of the join (its
+        // body swallows the `run_activated` Err after recording the count).
+        if let Some(primary_handle) = secondary.take_activated_primary_handle() {
+            let _ = primary_handle.await;
+        }
+        secondary.local_tasks_run_for_test()
+    });
+
+    (handle, activated_result)
 }
 
 #[allow(clippy::type_complexity)]
