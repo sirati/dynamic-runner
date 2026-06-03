@@ -412,6 +412,7 @@ async fn cold_start_exits_when_primary_unreachable_and_no_peers() {
                 primary_link_failure_window: Duration::from_secs(30),
                 // Tight deadline so the test reaps in ~200ms.
                 setup_deadline: Duration::from_millis(200),
+                unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
@@ -510,6 +511,7 @@ async fn cold_start_with_peers_emits_distinct_error() {
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_millis(200),
+                unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,
@@ -598,6 +600,7 @@ async fn handle_peer_message_dispatches_task_assignment_to_worker() {
                 primary_link_failure_threshold: 5,
                 primary_link_failure_window: Duration::from_secs(30),
                 setup_deadline: Duration::from_secs(60),
+                unconfigured_deadline: Duration::from_secs(600),
                 is_observer: false,
                 resource_check_interval: Duration::from_millis(100),
                 log_oom_watcher: false,

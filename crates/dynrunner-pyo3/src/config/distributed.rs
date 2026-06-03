@@ -79,6 +79,17 @@ pub(crate) struct DistributedConfig {
     /// connection retries hang for ~6min before container teardown
     /// reaps the secondary; this deadline reaps it in 60s instead.
     setup_deadline_secs: f64,
+    /// Maximum wall-clock a secondary will spend NOT-YET-CONFIGURED —
+    /// in the pre-`Operational` lifecycle states (`AwaitingPrimary` +
+    /// `Configuring`), before the primary has announced itself and
+    /// driven this secondary to `Operational`. Defaults to 600s
+    /// (10 minutes). Distinct from `setup_deadline_secs` (which bounds
+    /// the legacy setup-loop boot path): this governs how long a typed
+    /// secondary waits for the primary's first announcement while it
+    /// forms the peer mesh but cannot yet spawn workers, accept tasks,
+    /// run an election, or send a keepalive. Set this large when the
+    /// authority's `discover_items` walk is genuinely slow.
+    unconfigured_deadline_secs: f64,
     /// Per-secondary OOM resource-check decision cadence in seconds.
     /// Mirrors `LocalManagerConfig.resource_check_interval_secs`.
     /// Default 0.1 (100ms). Pre-extraction this was a hardcoded
@@ -124,6 +135,7 @@ impl Default for DistributedConfig {
             primary_link_failure_threshold: 5,
             primary_link_failure_window_secs: 30.0,
             setup_deadline_secs: 60.0,
+            unconfigured_deadline_secs: 600.0,
             resource_check_interval_secs: 0.1,
             log_oom_watcher: false,
             setup_promote_deadline_secs: 600.0,
@@ -148,6 +160,7 @@ impl DistributedConfig {
         primary_link_failure_threshold = None,
         primary_link_failure_window_secs = None,
         setup_deadline_secs = None,
+        unconfigured_deadline_secs = None,
         resource_check_interval_secs = None,
         log_oom_watcher = None,
         setup_promote_deadline_secs = None,
@@ -169,6 +182,7 @@ impl DistributedConfig {
         primary_link_failure_threshold: Option<u32>,
         primary_link_failure_window_secs: Option<f64>,
         setup_deadline_secs: Option<f64>,
+        unconfigured_deadline_secs: Option<f64>,
         resource_check_interval_secs: Option<f64>,
         log_oom_watcher: Option<bool>,
         setup_promote_deadline_secs: Option<f64>,
@@ -197,6 +211,8 @@ impl DistributedConfig {
             primary_link_failure_window_secs: primary_link_failure_window_secs
                 .unwrap_or(d.primary_link_failure_window_secs),
             setup_deadline_secs: setup_deadline_secs.unwrap_or(d.setup_deadline_secs),
+            unconfigured_deadline_secs: unconfigured_deadline_secs
+                .unwrap_or(d.unconfigured_deadline_secs),
             resource_check_interval_secs: resource_check_interval_secs
                 .unwrap_or(d.resource_check_interval_secs),
             log_oom_watcher: log_oom_watcher.unwrap_or(d.log_oom_watcher),
@@ -246,6 +262,9 @@ impl DistributedConfig {
     pub(crate) fn setup_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.setup_deadline_secs)
     }
+    pub(crate) fn unconfigured_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.unconfigured_deadline_secs)
+    }
     pub(crate) fn setup_promote_deadline(&self) -> std::time::Duration {
         std::time::Duration::from_secs_f64(self.setup_promote_deadline_secs)
     }
@@ -254,5 +273,49 @@ impl DistributedConfig {
     }
     pub(crate) fn log_oom_watcher(&self) -> bool {
         self.log_oom_watcher
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the kwarg default: omitting `unconfigured_deadline_secs`
+    /// yields the 10-minute pre-config deadline at the `Duration`
+    /// accessor a `SecondaryConfig` reads.
+    #[test]
+    fn unconfigured_deadline_defaults_to_600s() {
+        assert_eq!(
+            DistributedConfig::default().unconfigured_deadline(),
+            std::time::Duration::from_secs(600)
+        );
+        // And via the kwarg-merge constructor with everything omitted.
+        let cfg = DistributedConfig::new(
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            /* unconfigured_deadline_secs */ None,
+            None, None, None,
+        );
+        assert_eq!(
+            cfg.unconfigured_deadline(),
+            std::time::Duration::from_secs(600)
+        );
+    }
+
+    /// Pins a NON-default value through the merge layer: a passed
+    /// `unconfigured_deadline_secs` propagates to the `Duration`
+    /// accessor instead of being silently dropped (which the default
+    /// would mask). This is the load-bearing end-of-plumb check at the
+    /// pyo3 kwarg boundary.
+    #[test]
+    fn unconfigured_deadline_kwarg_propagates() {
+        let cfg = DistributedConfig::new(
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            /* unconfigured_deadline_secs */ Some(123.0),
+            None, None, None,
+        );
+        assert_eq!(
+            cfg.unconfigured_deadline(),
+            std::time::Duration::from_secs(123)
+        );
     }
 }

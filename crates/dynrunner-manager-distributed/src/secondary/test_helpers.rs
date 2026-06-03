@@ -229,6 +229,10 @@ pub(super) fn election_config(secondary_id: &str) -> SecondaryConfig {
         // 60s is the production default and well outside any test's
         // wall-clock budget, so it never fires accidentally.
         setup_deadline: Duration::from_secs(60),
+        // Production pre-config default; tests driving election state
+        // never sit in the unconfigured states long enough for this to
+        // fire, so the 10-min default is well outside any test budget.
+        unconfigured_deadline: Duration::from_secs(600),
         is_observer: false,
         resource_check_interval: Duration::from_millis(100),
         log_oom_watcher: false,

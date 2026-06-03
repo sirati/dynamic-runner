@@ -205,6 +205,27 @@ pub struct SecondaryConfig {
     /// setup-loop comment warns about does not arise.
     pub setup_deadline: Duration,
 
+    /// Maximum wall-clock a secondary will spend NOT-YET-CONFIGURED —
+    /// in the pre-`Operational` lifecycle states (`AwaitingPrimary` +
+    /// `Configuring`), i.e. before the primary has announced itself and
+    /// driven this secondary to `Operational`. Default 600s (10 min).
+    ///
+    /// Concern: a not-yet-configured secondary forms the peer mesh as far
+    /// as it can but cannot spawn workers, accept a `TaskAssignment`, run
+    /// an election, or send a keepalive (those capabilities are gated on
+    /// `Operational`). The long pre-config deadline bounds how long the
+    /// secondary waits for the primary to announce before concluding the
+    /// cluster never came up; the short election deadline
+    /// (`keepalive_interval × keepalive_miss_threshold`) is a property of
+    /// `Operational` and physically cannot fire pre-`Operational`. This
+    /// is generous (10 min) because a genuinely slow `discover_items` walk
+    /// on the authority can legitimately delay the first announcement.
+    ///
+    /// This field is additive plumbing for the typed secondary lifecycle;
+    /// it carries the configured default down to the state machine, which
+    /// reads it once it owns the pre-config deadline.
+    pub unconfigured_deadline: Duration,
+
     /// Legacy post-promotion quiesce grace (default 2 s).
     ///
     /// INERT on the `SecondaryCoordinator` post-unification: the
@@ -341,6 +362,7 @@ impl Default for SecondaryConfig {
             resource_check_interval: Duration::from_millis(100),
             log_oom_watcher: false,
             setup_deadline: Duration::from_secs(60),
+            unconfigured_deadline: Duration::from_secs(600),
             promoted_primary_quiesce_grace: Duration::from_secs(2),
             unfulfillable_reinject_max_per_task: None,
             mem_manager_reserved_bytes: None,
@@ -355,4 +377,34 @@ pub struct PeerCertInfo {
     pub ipv4_address: Option<String>,
     pub ipv6_address: Option<String>,
     pub quic_port: u16,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the additive default: a `SecondaryConfig` built without
+    /// touching `unconfigured_deadline` carries the 10-minute pre-config
+    /// deadline. Guards against the default silently changing or the
+    /// field being dropped from the `Default` impl.
+    #[test]
+    fn unconfigured_deadline_defaults_to_600s() {
+        assert_eq!(
+            SecondaryConfig::default().unconfigured_deadline,
+            Duration::from_secs(600)
+        );
+    }
+
+    /// Pins a NON-default value end of the plumb: a `Duration` set on the
+    /// struct is read back unchanged. A default-only test would pass even
+    /// if a caller layer dropped the value (the default would mask it), so
+    /// this exercises that the field actually carries a distinct value.
+    #[test]
+    fn unconfigured_deadline_carries_a_passed_value() {
+        let cfg = SecondaryConfig {
+            unconfigured_deadline: Duration::from_secs(42),
+            ..SecondaryConfig::default()
+        };
+        assert_eq!(cfg.unconfigured_deadline, Duration::from_secs(42));
+    }
 }

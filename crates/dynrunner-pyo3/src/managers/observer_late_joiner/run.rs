@@ -71,6 +71,7 @@ impl PyObserverLateJoiner {
         let dist_primary_link_failure_window =
             self.distributed_config.primary_link_failure_window();
         let dist_setup_deadline = self.distributed_config.setup_deadline();
+        let dist_unconfigured_deadline = self.distributed_config.unconfigured_deadline();
         // Take the Python peer-lifecycle listener (if any) out of
         // `self` so it can move into the detached tokio runtime.
         // Wrapped through `PyPeerLifecycleListener::new` into a
@@ -194,6 +195,7 @@ impl PyObserverLateJoiner {
                         primary_link_failure_threshold: dist_primary_link_failure_threshold,
                         primary_link_failure_window: dist_primary_link_failure_window,
                         setup_deadline: dist_setup_deadline,
+                        unconfigured_deadline: dist_unconfigured_deadline,
                         is_observer: true,
                         // Observer has zero workers — the watcher's
                         // decision arm short-circuits on an empty pool
