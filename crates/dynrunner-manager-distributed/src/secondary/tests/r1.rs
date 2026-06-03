@@ -111,6 +111,10 @@ mod r1_helpers {
 /// and backdates `primary_last_seen`; the next election tick enters
 /// Suspecting. Replaces the deleted recv-None arming path; the count
 /// axis keeps the test deterministic (no wall-clock).
+#[ignore = "send-side no-route probe: post-A0 send_to_primary resolves Destination::Primary to \
+            current_primary and sends via the mesh; the FixedPeerCount stub models a count not ids \
+            (no-op Ok send), so it cannot express no-route. Needs the routing-aware channel-backed \
+            mesh stub — channel-mesh-fold #133 (un-ignore + assert real NoRoute there)."]
 #[tokio::test(flavor = "current_thread")]
 async fn r1_promotion_on_no_route_count_axis() {
     use super::super::election::ElectionState;
