@@ -66,7 +66,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// `extend()`'s validation rejects every variant whose toolchain
     /// finished pre-composition as `UnknownTaskDep`.
     /// Called from [`PrimaryCoordinator::activate_local_primary`] on the
-    /// seeded-resume path (a parked co-located primary activating into an
+    /// seeded-resume path (an on-demand co-located primary activating into an
     /// already-replicated cluster ledger after failover), and exercised
     /// directly by the hydrate tests.
     pub(crate) fn hydrate_from_cluster_state(&mut self) {
@@ -237,7 +237,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
         // Reconstruct the secondary roster (`self.secondaries` +
         // `self.secondary_keepalives`) from the same CRDT source. The
-        // parked-promotion path bypasses connect.rs / peer_setup.rs (the
+        // on-demand promotion path bypasses connect.rs / peer_setup.rs (the
         // only writers of `self.secondaries`), so without this a promoted
         // primary's roster is empty: `broadcast_primary_keepalive`
         // early-returns (the promoted primary emits NO keepalives →
@@ -446,7 +446,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
     /// owning its own cache (workers vs. secondary connections), so neither
     /// reaches into the other's. Today `self.secondaries` is written ONLY
     /// by `connect.rs` / `peer_setup.rs` (the bootstrap handshake); the
-    /// parked-promotion path bypasses both, so before this a promoted
+    /// on-demand promotion path bypasses both, so before this a promoted
     /// primary's `self.secondaries` was empty and
     /// `broadcast_primary_keepalive` / `record_keepalive` /
     /// `collect_heartbeat_report` all degraded. This makes the roster a

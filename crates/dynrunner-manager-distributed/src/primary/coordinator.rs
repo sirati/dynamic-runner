@@ -234,9 +234,9 @@ pub(crate) struct InFlightEntry<I: Identifier> {
 /// transport is real-by-construction in every primary construction path
 /// (`TunneledPeerTransport` for the submitter, `ChannelPeerTransport`
 /// in-process / tests, the role-blind `MeshHandleTransport` over the
-/// host's shared mesh for the parked failover authority) — there is no
+/// host's shared mesh for the on-demand co-located authority) — there is no
 /// no-op send path and no per-site "which transport is real" hazard. The
-/// parked failover primary's own-secondary loopback is NOT a transport
+/// on-demand co-located primary's own-secondary loopback is NOT a transport
 /// leg: it is delivered at the egress edge (`SendTarget::Loopback` +
 /// the `Destination::All` broadcast loopback leg), so the transport
 /// itself stays role-blind. This mirrors the secondary side's collapse
@@ -253,7 +253,7 @@ pub struct PrimaryCoordinator<
     /// primary send (`Address`-routed) and the single `recv_peer()`
     /// inbound surface. For the submitter primary its backend is the
     /// per-secondary tunnel writers + the relocated `NetworkServer`
-    /// inbound demux; for the parked failover primary its backend is
+    /// inbound demux; for the on-demand co-located primary its backend is
     /// the co-located loopback + shared mesh — in both cases a real
     /// send path.
     pub(super) transport: Tr,
@@ -746,7 +746,7 @@ pub struct PrimaryCoordinator<
 
     /// Loopback sender into a CO-LOCATED secondary's inbound, present
     /// ONLY when this primary shares a host with a secondary it must
-    /// deliver to in-process (the composed parked-failover primary). The
+    /// deliver to in-process (the on-demand co-located primary). The
     /// egress edge ([`Self::send_to`]) writes here whenever
     /// [`dynrunner_protocol_primary_secondary::SendTarget::Loopback`]
     /// resolves (a `Destination` whose host id == this node's own id —
@@ -970,8 +970,8 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
             }
             // Loopback: the resolved host id == this primary's own id.
             //
-            // With a CO-LOCATED secondary composed (the parked-failover
-            // primary): deliver in-process to the own-secondary's inbound.
+            // With a CO-LOCATED secondary composed (the on-demand
+            // co-located primary): deliver in-process to the own-secondary's inbound.
             // This is the dominant own-host path — a `TaskAssignment` to
             // `Destination::Secondary(own_id)` resolves here, so dropping
             // it would lose the co-located secondary's work.
@@ -1037,7 +1037,7 @@ impl<Tr: PeerTransport<I>, S: Scheduler<I>, E: ResourceEstimator<I>, I: Identifi
 
     /// Register the in-process loopback sender into a CO-LOCATED
     /// secondary's inbound. Set ONLY by the multi-role-host composition
-    /// (the parked-failover primary), where this primary shares a host
+    /// (the on-demand co-located primary), where this primary shares a host
     /// with a secondary it must deliver to without a wire hop. Pre-run
     /// contract, same one-shot shape as the other `register_*` setters.
     ///
